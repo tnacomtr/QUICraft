@@ -10,7 +10,7 @@ import java.util.concurrent.TimeUnit;
 public final class TransportConfig {
     public enum CongestionControl { RENO, CUBIC, BBR }
 
-    /** v1 values. Provisional ones are tuned by the Phase 1 benchmark. */
+    /** v1 values. Provisional ones come from the Phase 1 benchmark (docs/benchmarks.md). */
     public static final TransportConfig DEFAULT = builder().build();
 
     final long maxIdleTimeoutMillis;
@@ -39,7 +39,7 @@ public final class TransportConfig {
         private long maxIdleTimeoutMillis = TimeUnit.SECONDS.toMillis(60);
         private long initialMaxData = 16L << 20;
         private long initialMaxStreamData = 8L << 20;
-        private CongestionControl congestionControl = CongestionControl.CUBIC;
+        private CongestionControl congestionControl = CongestionControl.BBR;
         private boolean earlyData = true;
 
         public Builder maxIdleTimeout(long value, TimeUnit unit) {

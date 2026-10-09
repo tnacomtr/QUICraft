@@ -198,3 +198,49 @@ results. It picks the v1 congestion-control default and supplies the data for th
   every round, so each sees the same conditions.
 - **Comparison:** each QUIC variant against TCP from the same run. A difference counts only if
   the bootstrap 95% CI (5000 resamples) of the difference of medians excludes zero.
+
+### Results, run `transport-20261009T191726Z` (2026-10-09)
+
+Commit `2a4bfe0`, same host as the baseline. 0 failed runs.
+
+| Profile | Metric | TCP | QUIC Reno | QUIC CUBIC | QUIC BBR |
+| --- | --- | --- | --- | --- | --- |
+| clean | handshake (ms) | 0.3 | 2.8 (**+2.6 [+2.4, +3.0]**) | 2.8 (**+2.6 [+2.4, +3.0]**) | 2.8 (**+2.6 [+2.5, +2.9]**) |
+| clean | login+chunk burst (ms) | 3.5 | 7.9 (**+4.4 [+2.8, +5.0]**) | 8.0 (**+4.5 [+2.8, +5.2]**) | 8.0 (**+4.5 [+2.8, +6.4]**) |
+| clean | play RTT (ms) | 0.4 | 0.8 (**+0.4 [+0.3, +0.4]**) | 0.8 (**+0.4 [+0.3, +0.4]**) | 0.8 (**+0.4 [+0.3, +0.4]**) |
+| delay | handshake (ms) | 150.5 | 303.4 (**+152.9 [+152.4, +153.1]**) | 303.3 (**+152.8 [+152.7, +153.1]**) | 303.3 (**+152.8 [+152.6, +153.0]**) |
+| delay | login+chunk burst (ms) | 2179.1 | 4216.1 (**+2037.0 [+1662.3, +2413.7]**) | 3465.7 (**+1286.6 [+1059.9, +1662.8]**) | 1669.7 (**-509.4 [-746.9, -122.1]**) |
+| delay | play RTT (ms) | 150.5 | 150.7 (**+0.2 [+0.2, +0.3]**) | 150.8 (**+0.3 [+0.2, +0.3]**) | 150.7 (**+0.2 [+0.1, +0.3]**) |
+| loss | handshake (ms) | 0.3 | 3.0 (**+2.7 [+2.5, +2.9]**) | 2.8 (**+2.6 [+2.5, +3.1]**) | 2.8 (**+2.6 [+2.5, +3.2]**) |
+| loss | login+chunk burst (ms) | 5.8 | 13.5 (+7.6 [-93.9, +11.7]) | 10.5 (+4.7 [-96.6, +7.6]) | 9.0 (+3.2 [-98.0, +5.8]) |
+| loss | play RTT (ms) | 0.4 | 0.7 (**+0.3 [+0.3, +0.4]**) | 0.8 (**+0.3 [+0.3, +0.4]**) | 0.8 (**+0.4 [+0.3, +0.4]**) |
+| reorder | handshake (ms) | 20.4 | 42.8 (**+22.4 [+15.5, +23.0]**) | 43.2 (**+22.8 [+17.6, +23.3]**) | 33.3 (**+13.0 [+12.5, +22.6]**) |
+| reorder | login+chunk burst (ms) | 683.0 | 3602.6 (**+2919.7 [+2693.2, +3305.1]**) | 2120.3 (**+1437.3 [+1154.4, +1816.4]**) | 2644.7 (**+1961.7 [+1735.3, +2276.5]**) |
+| reorder | play RTT (ms) | 20.7 | 20.8 (**+0.1 [+0.1, +0.2]**) | 20.8 (**+0.2 [+0.1, +0.2]**) | 20.8 (**+0.1 [+0.1, +0.2]**) |
+
+Cells: median (difference to TCP [bootstrap 95% CI]); **bold** where the CI excludes zero.
+
+| Profile | QUIC handshake p50 | p90 | p99 | max | TCP connect p50 |
+| --- | --- | --- | --- | --- | --- |
+| clean | 2.8 | 3.5 | 4.0 | 4.0 | 0.3 |
+| delay | 303.3 | 303.8 | 304.1 | 304.4 | 150.5 |
+| loss | 2.9 | 4.0 | 1005.3 | 1006.1 | 0.3 |
+| reorder | 42.7 | 43.7 | 44.0 | 44.0 | 20.4 |
+
+Failed runs: 0
+
+Reading:
+
+- **Congestion control: BBR** is the only variant that beats TCP anywhere (2.2 MiB burst at
+  +150 ms RTT: −509 ms, CI [−747, −122]). Reno and CUBIC are 1.3–2 s slower than TCP there.
+  BBR becomes the provisional v1 default.
+- **Reorder** (25% of packets overtaking by 10 ms) is a weakness: every QUIC variant is 1.4–2.9 s
+  slower than TCP on the burst. Cause not confirmed yet. The suspect is spurious loss detection:
+  quiche declares reordered packets lost, while Linux TCP detects and undoes such false alarms.
+  Next step: record quiche's loss and retransmission counters per run.
+- **Handshake: ~2 RTT** for every QUIC variant against 1 RTT for TCP (Netty completes the
+  connect one round trip after TLS finishes; docs/protocol.md §5). Under loss, the p99 (~1 s) is
+  a lost first Initial waiting for its retransmission timer.
+- **The loss profile has no added delay**, so loss recovery is nearly free and nothing differs
+  significantly. A loss+delay profile is needed to judge loss.
+- **Play RTT:** QUIC adds 0.1–0.4 ms (CPU cost per packet), immaterial next to the link RTT.
