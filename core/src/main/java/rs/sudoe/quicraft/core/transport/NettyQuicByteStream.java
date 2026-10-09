@@ -3,7 +3,6 @@ package rs.sudoe.quicraft.core.transport;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
-import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
@@ -13,9 +12,21 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicBoolean;
 import rs.sudoe.quicraft.core.Protocol;
 
-/** {@link QuicByteStream} over a Netty {@link QuicStreamChannel}. */
+/**
+ * {@link QuicByteStream} over a Netty {@link QuicStreamChannel}.
+ *
+ * <p>Writability is tracked here: Netty's QUIC stream doesn't count writes queued from other
+ * threads, so on its own it reports writable while megabytes pile up behind a slow peer. A
+ * stream is unwritable while more than {@link #HIGH_WATER} bytes are in flight (written but not
+ * yet accepted by quiche) and becomes writable again below {@link #LOW_WATER}.
+ */
 final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements QuicByteStream {
+    static final long HIGH_WATER = 1L << 20;
+    static final long LOW_WATER = 256L << 10;
+
     private final QuicStreamChannel channel;
+    private final java.util.concurrent.atomic.AtomicLong inFlight = new java.util.concurrent.atomic.AtomicLong();
+    private volatile boolean throttled;
     private final AtomicBoolean closedNotified = new AtomicBoolean();
     private volatile Listener listener;
 
@@ -42,9 +53,20 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
 
     @Override
     public void write(ByteBuffer data) {
-        ByteBuf copy = channel.alloc().buffer(data.remaining());
+        int length = data.remaining();
+        ByteBuf copy = channel.alloc().buffer(length);
         copy.writeBytes(data.duplicate());
-        channel.write(copy).addListener(ChannelFutureListener.FIRE_EXCEPTION_ON_FAILURE);
+        inFlight.addAndGet(length);
+        channel.write(copy).addListener(f -> {
+            long left = inFlight.addAndGet(-length);
+            if (!f.isSuccess()) {
+                channel.pipeline().fireExceptionCaught(f.cause());
+            }
+            if (throttled && left <= LOW_WATER) {
+                throttled = false;
+                notifyWritable();
+            }
+        });
     }
 
     @Override
@@ -54,7 +76,27 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
 
     @Override
     public boolean isWritable() {
-        return channel.isWritable();
+        if (inFlight.get() < HIGH_WATER) {
+            return channel.isWritable();
+        }
+        throttled = true;
+        // A write may have completed between the check and setting the flag; don't miss it.
+        if (inFlight.get() <= LOW_WATER) {
+            throttled = false;
+            return channel.isWritable();
+        }
+        return false;
+    }
+
+    long inFlightForTest() {
+        return inFlight.get();
+    }
+
+    private void notifyWritable() {
+        Listener l = listener;
+        if (l != null) {
+            l.onWritabilityChanged(true);
+        }
     }
 
     @Override
@@ -104,7 +146,7 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     public void channelWritabilityChanged(ChannelHandlerContext ctx) {
         Listener l = listener;
         if (l != null) {
-            l.onWritabilityChanged(channel.isWritable());
+            l.onWritabilityChanged(isWritable());
         }
         ctx.fireChannelWritabilityChanged();
     }

@@ -20,4 +20,6 @@ dependencyResolutionManagement {
 rootProject.name = "quicraft"
 
 include("core")
+include("bridge-netty41")
+include("bridge-netty42")
 include("testkit")
