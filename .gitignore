@@ -1,0 +1,17 @@
+# Gradle
+.gradle/
+build/
+.kotlin/
+# IDEs
+.idea/
+*.iml
+.vscode/
+out/
+# Fabric Loom / NeoForge: decompiled or remapped Minecraft sources and game files
+# (Mojang's, never committed; see CLAUDE.md "Start from scratch").
+run/
+.minecraft/
+**/genSources/
+*-sources.jar
+# Testkit: raw run output (summaries go to docs/benchmarks.md)
+testkit/results/
