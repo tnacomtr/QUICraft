@@ -1,0 +1,228 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+(This header only. The diff below changes Netty files, which stay under Netty's Apache-2.0
+licence. Each changed file carries a "Modified by the QUICraft project" note.)
+
+QUICraft patch for Netty netty-4.2.19.Final (commit 64cc10f38ea5f5bd7eae48507817c66680d0afdc):
+expose quiche's Config::set_enable_relaxed_loss_threshold.
+
+- QuicCodecBuilder.relaxedLossThreshold(boolean): new builder option, unset by default (quiche's
+  default, false). Throws UnsupportedOperationException if the native has no binding for it.
+- Quic.isRelaxedLossThresholdSupported(): probes the loaded native once, so callers can decide
+  before they touch the builder. Patched classes with an upstream native return false.
+- JNI: Quiche.quiche_config_set_enable_relaxed_loss_threshold, bound in netty_quic_quiche.c to
+  the C function that natives/patches/quiche/0001-ffi-relaxed-loss-threshold.patch adds.
+
+Applied by natives/build-netty-quic.sh with `git apply`, which ignores this text.
+
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java
+index 9cfd011..df53efc 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java
+@@ -12,6 +12,9 @@
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  * License for the specific language governing permissions and limitations
+  * under the License.
++ *
++ * Modified by the QUICraft project:
++ * adds isRelaxedLossThresholdSupported().
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -99,6 +102,33 @@ public final class Quic {
+         return UNAVAILABILITY_CAUSE;
+     }
+ 
++    /**
++     * Returns {@code true} if the loaded native library can set quiche's
++     * {@code enable_relaxed_loss_threshold} (see {@link QuicCodecBuilder#relaxedLossThreshold(boolean)}).
++     * A native library built without that binding returns {@code false}.
++     *
++     * @return {@code true} if supported, {@code false} otherwise.
++     */
++    public static boolean isRelaxedLossThresholdSupported() {
++        return isAvailable() && RelaxedLossThresholdSupport.SUPPORTED;
++    }
++
++    private static final class RelaxedLossThresholdSupport {
++        static final boolean SUPPORTED = probe();
++
++        private static boolean probe() {
++            long config = Quiche.quiche_config_new(Quiche.QUICHE_PROTOCOL_VERSION);
++            try {
++                Quiche.quiche_config_set_enable_relaxed_loss_threshold(config, false);
++                return true;
++            } catch (UnsatisfiedLinkError e) {
++                return false;
++            } finally {
++                Quiche.quiche_config_free(config);
++            }
++        }
++    }
++
+     static Map.Entry<ChannelOption<?>, Object>[] toOptionsArray(Map<ChannelOption<?>, Object> opts) {
+         return new HashMap<>(opts).entrySet().toArray(EMPTY_OPTION_ARRAY);
+     }
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicCodecBuilder.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicCodecBuilder.java
+index c787d4f..e2760d5 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicCodecBuilder.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicCodecBuilder.java
+@@ -12,6 +12,9 @@
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  * License for the specific language governing permissions and limitations
+  * under the License.
++ *
++ * Modified by the QUICraft project:
++ * adds relaxedLossThreshold(boolean).
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -47,6 +50,7 @@ public abstract class QuicCodecBuilder<B extends QuicCodecBuilder<B>> {
+     private Long maxAckDelay;
+     private Boolean disableActiveMigration;
+     private Boolean enableHystart;
++    private Boolean enableRelaxedLossThreshold;
+     private Boolean discoverPmtu;
+     private QuicCongestionControlAlgorithm congestionControlAlgorithm;
+     private Integer initialCongestionWindowPackets;
+@@ -87,6 +91,7 @@ public abstract class QuicCodecBuilder<B extends QuicCodecBuilder<B>> {
+         this.maxAckDelay = builder.maxAckDelay;
+         this.disableActiveMigration = builder.disableActiveMigration;
+         this.enableHystart = builder.enableHystart;
++        this.enableRelaxedLossThreshold = builder.enableRelaxedLossThreshold;
+         this.discoverPmtu = builder.discoverPmtu;
+         this.congestionControlAlgorithm = builder.congestionControlAlgorithm;
+         this.initialCongestionWindowPackets = builder.initialCongestionWindowPackets;
+@@ -356,6 +361,30 @@ public abstract class QuicCodecBuilder<B extends QuicCodecBuilder<B>> {
+         return self();
+     }
+ 
++    /**
++     * See
++     * <a href="https://docs.rs/quiche/latest/quiche/struct.Config.html#method.set_enable_relaxed_loss_threshold">
++     *     set_enable_relaxed_loss_threshold</a>.
++     *
++     * Configures whether loss detection relaxes its thresholds after a spurious loss (packet reordering): the
++     * packet threshold is dropped on the first spurious loss and the time threshold doubles on each further one,
++     * up to twice the RTT. In quiche 0.30 only the BBR (gcongestion) recovery implements it.
++     *
++     * The default value is {@code false}.
++     *
++     * @param enable  {@code true} if relaxed loss thresholds should be enabled.
++     * @return        the instance itself.
++     * @throws UnsupportedOperationException if {@link Quic#isRelaxedLossThresholdSupported()} is {@code false}.
++     */
++    public final B relaxedLossThreshold(boolean enable) {
++        if (!Quic.isRelaxedLossThresholdSupported()) {
++            throw new UnsupportedOperationException(
++                    "the loaded QUIC native library has no relaxed loss threshold binding");
++        }
++        this.enableRelaxedLossThreshold = enable;
++        return self();
++    }
++
+     /**
+      * See
+      * <a href="https://docs.rs/quiche/latest/quiche/struct.Config.html#method.discover_pmtu">
+@@ -486,7 +515,8 @@ public abstract class QuicCodecBuilder<B extends QuicCodecBuilder<B>> {
+                 maxIdleTimeout, maxSendUdpPayloadSize, maxRecvUdpPayloadSize, initialMaxData,
+                 initialMaxStreamDataBidiLocal, initialMaxStreamDataBidiRemote,
+                 initialMaxStreamDataUni, initialMaxStreamsBidi, initialMaxStreamsUni,
+-                ackDelayExponent, maxAckDelay, disableActiveMigration, enableHystart, discoverPmtu,
++                ackDelayExponent, maxAckDelay, disableActiveMigration, enableHystart,
++                enableRelaxedLossThreshold, discoverPmtu,
+                 congestionControlAlgorithm, initialCongestionWindowPackets, recvQueueLen, sendQueueLen,
+                 activeConnectionIdLimit, statelessResetToken);
+     }
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quiche.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quiche.java
+index e42725c..91cc0c5 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quiche.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quiche.java
+@@ -12,6 +12,9 @@
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  * License for the specific language governing permissions and limitations
+  * under the License.
++ *
++ * Modified by the QUICraft project:
++ * adds quiche_config_set_enable_relaxed_loss_threshold.
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -714,6 +717,13 @@ final class Quiche {
+      */
+     static native void quiche_config_enable_hystart(long configAddr, boolean value);
+ 
++    /**
++     * See quiche's {@code Config::set_enable_relaxed_loss_threshold}. Not part of quiche's own C API: the
++     * binding comes from a QUICraft patch to quiche's {@code ffi.rs}. Throws {@link UnsatisfiedLinkError} with a
++     * native library built without it.
++     */
++    static native void quiche_config_set_enable_relaxed_loss_threshold(long configAddr, boolean value);
++
+     /**
+      * See
+      * <a href="https://docs.rs/quiche/latest/quiche/struct.Config.html#method.discover_pmtu">
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheConfig.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheConfig.java
+index c3da950..6a6ff00 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheConfig.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheConfig.java
+@@ -12,6 +12,9 @@
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  * License for the specific language governing permissions and limitations
+  * under the License.
++ *
++ * Modified by the QUICraft project:
++ * passes enableRelaxedLossThreshold to quiche.
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -36,6 +39,7 @@ final class QuicheConfig {
+                  @Nullable Long maxAckDelay,
+                  @Nullable Boolean disableActiveMigration,
+                  @Nullable Boolean enableHystart,
++                 @Nullable Boolean enableRelaxedLossThreshold,
+                  @Nullable Boolean discoverPmtu,
+                  @Nullable QuicCongestionControlAlgorithm congestionControlAlgorithm,
+                  @Nullable Integer initialCongestionWindowPackets,
+@@ -87,6 +91,9 @@ final class QuicheConfig {
+             if (enableHystart != null) {
+                 Quiche.quiche_config_enable_hystart(config, enableHystart);
+             }
++            if (enableRelaxedLossThreshold != null) {
++                Quiche.quiche_config_set_enable_relaxed_loss_threshold(config, enableRelaxedLossThreshold);
++            }
+             if (discoverPmtu != null) {
+                 Quiche.quiche_config_discover_pmtu(config, discoverPmtu);
+             }
+diff --git a/codec-native-quic/src/main/c/netty_quic_quiche.c b/codec-native-quic/src/main/c/netty_quic_quiche.c
+index a8e8976..41e1086 100644
+--- a/codec-native-quic/src/main/c/netty_quic_quiche.c
++++ b/codec-native-quic/src/main/c/netty_quic_quiche.c
+@@ -12,6 +12,9 @@
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  * License for the specific language governing permissions and limitations
+  * under the License.
++ *
++ * Modified by the QUICraft project:
++ * adds quiche_config_set_enable_relaxed_loss_threshold.
+  */
+ #include <jni.h>
+ #include <stdint.h>
+@@ -1042,6 +1045,10 @@ static void netty_quiche_config_enable_hystart(JNIEnv* env, jclass clazz, jlong
+     quiche_config_enable_hystart((quiche_config*) config, value == JNI_TRUE ? true : false);
+ }
+ 
++static void netty_quiche_config_set_enable_relaxed_loss_threshold(JNIEnv* env, jclass clazz, jlong config, jboolean value) {
++    quiche_config_set_enable_relaxed_loss_threshold((quiche_config*) config, value == JNI_TRUE ? true : false);
++}
++
+ static void netty_quiche_config_discover_pmtu(JNIEnv* env, jclass clazz, jlong config, jboolean value) {
+     quiche_config_discover_pmtu((quiche_config*) config, value == JNI_TRUE ? true : false);
+ }
+@@ -1270,6 +1277,7 @@ static const JNINativeMethod fixed_method_table[] = {
+   { "quiche_config_set_cc_algorithm", "(JI)V", (void *) netty_quiche_config_set_cc_algorithm },
+   { "quiche_config_set_initial_congestion_window_packets", "(JI)V", (void *) netty_quiche_config_set_initial_congestion_window_packets },
+   { "quiche_config_enable_hystart", "(JZ)V", (void *) netty_quiche_config_enable_hystart },
++  { "quiche_config_set_enable_relaxed_loss_threshold", "(JZ)V", (void *) netty_quiche_config_set_enable_relaxed_loss_threshold },
+   { "quiche_config_discover_pmtu", "(JZ)V", (void *) netty_quiche_config_discover_pmtu },
+   { "quiche_config_set_active_connection_id_limit", "(JJ)V", (void *) netty_quiche_config_set_active_connection_id_limit },
+   { "quiche_config_set_stateless_reset_token", "(J[B)V", (void *) netty_quiche_config_set_stateless_reset_token },
