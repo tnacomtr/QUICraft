@@ -7,10 +7,10 @@ module and every new release.
 
 | Module | Covers | Loader / platform | Java bytecode | Status |
 | --- | --- | --- | --- | --- |
-| `core` | all | none (no Minecraft classes) | 8 | skeleton |
+| `core` | all | none (no Minecraft classes) | 8 | Phase 1 |
 | `testkit` | 26.1.x (protocol 775) | none (never shipped) | 25 | Phase 0 |
-| `bridge-netty42` | MC 1.21.11, 26.x; Velocity 4.2; testkit (MCProtocolLib) | none | 8 | Phase 1 |
-| `bridge-netty41` | MC 1.20.1, 1.21–1.21.10 | none | 8 | Phase 1 |
+| `bridge-netty42` | MC 1.21.11, 26.x; Velocity 4.2; testkit (MCProtocolLib) | none | 8 | tested on 4.2.1 |
+| `bridge-netty41` | MC 1.20.1, 1.21–1.21.10 | none | 8 | tested on 4.1.82 |
 | `bridge-netty40` | MC 1.8.9 | none | 8 | 1.8.9 phase |
 | `velocity` | client protocols Velocity accepts | Velocity 4.x | 25 | Phase 2 |
 | `fabric-*` (26.x + 1.21.11 hook group) | 26.1–26.3, 1.21.11 | Fabric | 25 / 21 | Phase 3 |
@@ -38,7 +38,9 @@ compiles against the **oldest** Netty among its consumers.
 | Velocity 4.2.0 | 25 | 4.2.18 | netty42 |
 | MCProtocolLib 26.1-1 (testkit) | 17+ | 4.2.1 | netty42 |
 
-So `bridge-netty42` compiles against 4.2.1 and `bridge-netty41` against 4.1.82. 1.21.11 already
+So `bridge-netty42` compiles against 4.2.1 and `bridge-netty41` against 4.1.82. The two share one
+source tree (`bridge-netty/`): `AbstractChannel`'s extension points are identical in 4.1.82 and
+4.2.1. Each module runs the same tests against its own Netty. 1.21.11 already
 uses Netty 4.2, the same generation as 26.x, which fits the shared 26.x + 1.21.11 hook group.
 
 ## Pinned dependencies

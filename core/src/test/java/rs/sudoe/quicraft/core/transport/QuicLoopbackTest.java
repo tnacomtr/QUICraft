@@ -177,6 +177,52 @@ class QuicLoopbackTest {
     }
 
     @Test
+    void aPeerThatDoesNotReadMakesTheStreamUnwritableUntilItDoes() throws Exception {
+        CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity, TransportConfig.DEFAULT,
+                accepted::complete)) {
+            QuicByteStream stream = QuicClient.connect(server.localAddress(), identity.fingerprint(),
+                    TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
+            java.util.concurrent.CountDownLatch writableAgain = new java.util.concurrent.CountDownLatch(1);
+            stream.setListener(new QuicByteStream.Listener() {
+                @Override
+                public void onData(ByteBuffer data) {}
+
+                @Override
+                public void onWritabilityChanged(boolean writable) {
+                    if (writable) {
+                        writableAgain.countDown();
+                    }
+                }
+
+                @Override
+                public void onClosed(Throwable cause) {}
+            });
+            byte[] chunk = new byte[16384];
+            long written = 0;
+            while (stream.isWritable() && written < (64L << 20)) {
+                stream.write(ByteBuffer.wrap(chunk));
+                stream.flush();
+                written += chunk.length;
+            }
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (stream.isWritable() && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertFalse(stream.isWritable(), "a stalled peer must make the stream unwritable");
+            assertTrue(((NettyQuicByteStream) stream).inFlightForTest() <= 2 * NettyQuicByteStream.HIGH_WATER + chunk.length,
+                    "in flight must stay bounded, was " + ((NettyQuicByteStream) stream).inFlightForTest());
+
+            Loopback.Collector reader = new Loopback.Collector();
+            QuicByteStream serverSide = accepted.get(5, TimeUnit.SECONDS);
+            serverSide.setListener(reader);
+            serverSide.setAutoRead(true);
+            assertTrue(writableAgain.await(10, TimeUnit.SECONDS), "writable again once the peer reads");
+            stream.close();
+        }
+    }
+
+    @Test
     void closingTheClientClosesTheServerStream() throws Exception {
         CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
         Loopback.Collector serverCollector = new Loopback.Collector();
