@@ -14,6 +14,13 @@ each release of the plugin.
   It builds the whole vanilla pipeline: `legacy-ping-decoder`, `frame-decoder`, `read-timeout`,
   `legacy-ping-encoder`, `frame-encoder`, `minecraft-decoder`, `minecraft-encoder`, then a
   `MinecraftConnection` with a `HandshakeSessionHandler` under `handler`.
+- Reaching it: `VelocityServer` holds the manager in a **private** field `cm` (no getter in
+  4.2.0), so the plugin needs one reflective read from the injected `ProxyServer` (cast to
+  `VelocityServer`). Guarded: if anything is missing, log one WARN, don't start the QUIC listener,
+  and leave Velocity as it is (TCP only).
+- Event loop: `ConnectionManager` exposes only its boss group. QUIC players get a dedicated
+  group made with Velocity's own `TransportType.createEventLoopGroup(Type.WORKER)`, so their
+  pipelines and backend connections don't share the single accept thread.
 - Plan: for each accepted QUIC stream, wrap it in `QuicBridgeChannel` (bridge-netty42, since
   Velocity bundles Netty 4.2.18), add `holder.get()` to its pipeline, and register it on Velocity's
   worker group. Velocity then treats it like any TCP connection. The remote address is the
