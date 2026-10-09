@@ -38,6 +38,13 @@ public interface QuicByteStream {
     /** Closes the stream and its connection with {@code CONNECTION_CLOSE} code 0. */
     void close();
 
+    /**
+     * The connection's QUIC counters (packets sent, received, lost, retransmitted, and bytes), for
+     * diagnostics and benchmarks. Keys: sent, recv, lost, retrans, sentBytes, recvBytes,
+     * lostBytes, streamRetransBytes.
+     */
+    java.util.concurrent.CompletableFuture<java.util.Map<String, Long>> connectionStats();
+
     /** Runs a task on the stream's thread. */
     void execute(Runnable task);
 

@@ -120,6 +120,31 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     }
 
     @Override
+    public java.util.concurrent.CompletableFuture<java.util.Map<String, Long>> connectionStats() {
+        java.util.concurrent.CompletableFuture<java.util.Map<String, Long>> result =
+                new java.util.concurrent.CompletableFuture<>();
+        channel.parent().collectStats().addListener(f -> {
+            if (!f.isSuccess()) {
+                result.completeExceptionally(f.cause());
+                return;
+            }
+            io.netty.handler.codec.quic.QuicConnectionStats st =
+                    (io.netty.handler.codec.quic.QuicConnectionStats) f.getNow();
+            java.util.Map<String, Long> m = new java.util.LinkedHashMap<>();
+            m.put("sent", st.sent());
+            m.put("recv", st.recv());
+            m.put("lost", st.lost());
+            m.put("retrans", st.retrans());
+            m.put("sentBytes", st.sentBytes());
+            m.put("recvBytes", st.recvBytes());
+            m.put("lostBytes", st.lostBytes());
+            m.put("streamRetransBytes", st.streamRetransBytes());
+            result.complete(m);
+        });
+        return result;
+    }
+
+    @Override
     public void execute(Runnable task) {
         channel.eventLoop().execute(task);
     }

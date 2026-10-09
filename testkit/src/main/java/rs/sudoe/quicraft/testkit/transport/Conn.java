@@ -25,12 +25,17 @@ abstract class Conn implements Closeable {
     static final byte PING = 6;
     static final byte PONG = 7;
     static final byte BYE = 8;
+    /** Server to client after BYE: the sender's counters as "key=value,…". */
+    static final byte STATS = 9;
 
     private DataInputStream in;
 
     abstract InputStream input();
 
     abstract OutputStream output();
+
+    /** Sender-side transport counters for this connection; empty if unknown. */
+    abstract java.util.Map<String, Long> senderStats();
 
     synchronized void send(byte type, byte[] payload) throws IOException {
         OutputStream out = output();
@@ -73,6 +78,11 @@ abstract class Conn implements Closeable {
             @Override
             OutputStream output() {
                 return out;
+            }
+
+            @Override
+            java.util.Map<String, Long> senderStats() {
+                return TcpCounters.snapshot();
             }
 
             @Override
@@ -151,6 +161,15 @@ abstract class Conn implements Closeable {
             @Override
             OutputStream output() {
                 return out;
+            }
+
+            @Override
+            java.util.Map<String, Long> senderStats() {
+                try {
+                    return stream.connectionStats().get(2, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    return java.util.Collections.emptyMap();
+                }
             }
 
             @Override
