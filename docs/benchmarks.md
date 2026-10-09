@@ -154,13 +154,18 @@ The two failures, and why more runs would not fix them:
   median 524.8 ms, 95% CI [464.7, 587.6] (±12%), p90 1156.9 ms.
 
 **Decision (user, 2026-10-09):** accept this run as the Phase 0 TCP baseline, with the two
-metrics above documented as noisy by nature rather than tuned further. The rule for later
-comparisons: a QUIC result on clean join or reorder chunk load only counts as different from TCP
-if it falls outside the pooled 95% CI above. Every other metric uses the ±10% / 5 ms tolerance.
+metrics above documented as noisy by nature rather than tuned further.
 
-**Faster method for later comparison runs** (to be recorded before each run, as here): play
-phase 3 s instead of 10 s, quiet window 1 s instead of 2 s. Play RTT is identical across every
-batch at 10 s, and a run then takes ~5 s instead of ~14 s.
+**How later QUIC-vs-TCP comparisons work.** The table below is a reference for what TCP does on
+this setup, not the comparator. Every comparison run measures TCP and QUIC in the **same run**,
+interleaved, with identical parameters. A difference counts only if the bootstrap 95% CI of the
+difference of medians, computed within that run, excludes zero. That keeps method changes (for
+example a shorter play phase) from leaking into the comparison. Each run's parameters are still
+recorded here before it starts.
+
+Possible faster parameters for such runs: play phase 3 s instead of 10 s (play RTT was identical
+across every batch at 10 s). The quiet window stays at 2 s: a shorter one could end chunk-load
+timing early in exactly the reorder tail, where TCP is backing off.
 
 #### Baseline reference values (TCP, attempt 2, pooled medians)
 
