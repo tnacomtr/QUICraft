@@ -27,7 +27,8 @@ import rs.sudoe.quicraft.testkit.Args;
  */
 public final class TransportClient {
     record Run(String transport, int run, boolean warmup, boolean ok, double handshakeMs, double burstMs,
-            double rttMedianMs, double rttP95Ms, int rttSamples, String error) {}
+            double rttMedianMs, double rttP95Ms, int rttSamples, java.util.Map<String, Long> senderStats,
+            String error) {}
 
     static final String[] TRANSPORTS = {"tcp", "quic-reno", "quic-cubic", "quic-bbr"};
 
@@ -95,12 +96,24 @@ public final class TransportClient {
             double burstMs = millis(System.nanoTime() - burstStart);
 
             ConcurrentLinkedQueue<Long> rtts = new ConcurrentLinkedQueue<>();
+            java.util.concurrent.CompletableFuture<java.util.Map<String, Long>> stats =
+                    new java.util.concurrent.CompletableFuture<>();
             Conn c = conn;
             Thread reader = Thread.ofVirtual().start(() -> {
                 try {
                     while (true) {
                         byte[] f = c.receive();
-                        if (f[0] == Conn.PONG) {
+                        if (f[0] == Conn.STATS) {
+                            java.util.Map<String, Long> m = new java.util.LinkedHashMap<>();
+                            String text = new String(f, 1, f.length - 1, StandardCharsets.US_ASCII);
+                            for (String kv : text.split(",")) {
+                                int eq = kv.indexOf('=');
+                                if (eq > 0) {
+                                    m.put(kv.substring(0, eq), Long.parseLong(kv.substring(eq + 1)));
+                                }
+                            }
+                            stats.complete(m);
+                        } else if (f[0] == Conn.PONG) {
                             long sent = 0;
                             for (int i = 1; i <= 8; i++) {
                                 sent = (sent << 8) | (f[i] & 0xFF);
@@ -126,12 +139,19 @@ public final class TransportClient {
             }
             Thread.sleep(500); // in-flight pongs
             c.send(Conn.BYE, new byte[0]);
+            java.util.Map<String, Long> senderStats;
+            try {
+                senderStats = stats.get(5, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                senderStats = java.util.Map.of();
+            }
             double[] sorted = rtts.stream().mapToDouble(TransportClient::millis).sorted().toArray();
             reader.interrupt();
             return new Run(transport, index, warmup, sorted.length > 0, handshakeMs, burstMs,
-                    percentile(sorted, 0.5), percentile(sorted, 0.95), sorted.length, sorted.length > 0 ? null : "no pongs");
+                    percentile(sorted, 0.5), percentile(sorted, 0.95), sorted.length, senderStats,
+                    sorted.length > 0 ? null : "no pongs");
         } catch (Exception e) {
-            return new Run(transport, index, warmup, false, -1, -1, -1, -1, 0, String.valueOf(e));
+            return new Run(transport, index, warmup, false, -1, -1, -1, -1, 0, java.util.Map.of(), String.valueOf(e));
         } finally {
             if (conn != null) {
                 try {

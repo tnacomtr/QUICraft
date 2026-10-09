@@ -7,6 +7,7 @@ import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -75,6 +76,7 @@ public final class TransportServer {
             if (hello[0] != Conn.HELLO) {
                 return;
             }
+            Map<String, Long> before = conn.senderStats();
             Random random = new Random(1); // incompressible-ish, same bytes every run
             byte[] login = new byte[LOGIN_MESSAGE];
             random.nextBytes(login);
@@ -102,11 +104,20 @@ public final class TransportServer {
                     System.arraycopy(frame, 1, payload, 0, payload.length);
                     conn.send(Conn.PONG, payload);
                 } else if (frame[0] == Conn.BYE) {
+                    Map<String, Long> after = conn.senderStats();
+                    // QUIC counters are per connection; TCP's are per namespace, so take deltas.
+                    Map<String, Long> stats = after.containsKey("lost") ? after : TcpCounters.delta(before, after);
+                    StringBuilder text = new StringBuilder();
+                    stats.forEach((k, v) -> text.append(text.length() == 0 ? "" : ",").append(k).append('=').append(v));
+                    conn.send(Conn.STATS, text.toString().getBytes(StandardCharsets.US_ASCII));
+                    Thread.sleep(200);
                     return;
                 }
             }
         } catch (IOException e) {
             // client went away
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } finally {
             if (entities != null) {
                 entities.cancel(false);

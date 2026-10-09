@@ -244,3 +244,21 @@ Reading:
 - **The loss profile has no added delay**, so loss recovery is nearly free and nothing differs
   significantly. A loss+delay profile is needed to judge loss.
 - **Play RTT:** QUIC adds 0.1–0.4 ms (CPU cost per packet), immaterial next to the link RTT.
+
+### Reorder diagnosis (2026-10-09)
+
+A one-round rerun of the reorder profile with sender-side counters
+(`QuicByteStream.connectionStats()` for QUIC, `/proc/net/{snmp,netstat}` deltas for TCP):
+
+| Transport | Sender counters for one 2.2 MiB burst run |
+| --- | --- |
+| TCP | RetransSegs 1, TCPSACKReorder 5, TCPTSReorder 1 (reordering detected and absorbed) |
+| QUIC Reno | lost 141 of 2333 packets sent, all retransmitted |
+| QUIC CUBIC | lost 480 of 2660 |
+| QUIC BBR | lost 488 of 2705 |
+
+The profile drops nothing, so every QUIC "loss" is spurious. quiche treats reordered packets as
+lost, retransmits them and backs off, while Linux TCP detects the reordering and adapts its
+threshold. The quiche inside Netty 4.2.19 contains an adaptive mode
+(`enable_relaxed_loss_threshold`), but Netty exposes no setter for it and the native exports no
+quiche config symbols. Turning it on needs a Netty change or our own native build.

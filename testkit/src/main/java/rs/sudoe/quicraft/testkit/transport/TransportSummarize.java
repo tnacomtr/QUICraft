@@ -40,6 +40,8 @@ public final class TransportSummarize {
         md.append("| Profile | Metric | TCP | QUIC Reno | QUIC CUBIC | QUIC BBR |\n| --- | --- | --- | --- | --- | --- |\n");
         StringBuilder handshakes = new StringBuilder(
                 "\n| Profile | QUIC handshake p50 | p90 | p99 | max | TCP connect p50 |\n| --- | --- | --- | --- | --- | --- |\n");
+        StringBuilder counters = new StringBuilder("\nSender-side counters (median per run):\n\n"
+                + "| Profile | Transport | Counters |\n| --- | --- | --- |\n");
         int failures = 0;
         for (Path file : files) {
             JsonObject doc = JsonParser.parseString(Files.readString(file, StandardCharsets.UTF_8)).getAsJsonObject();
@@ -71,6 +73,20 @@ public final class TransportSummarize {
                 }
                 md.append(" |\n");
             }
+            for (Map.Entry<String, List<JsonObject>> e : byTransport.entrySet()) {
+                Map<String, List<Double>> perKey = new java.util.TreeMap<>();
+                for (JsonObject r : e.getValue()) {
+                    if (r.has("senderStats")) {
+                        for (Map.Entry<String, JsonElement> kv : r.getAsJsonObject("senderStats").entrySet()) {
+                            perKey.computeIfAbsent(kv.getKey(), k -> new ArrayList<>()).add(kv.getValue().getAsDouble());
+                        }
+                    }
+                }
+                StringBuilder cells = new StringBuilder();
+                perKey.forEach((k, v) -> cells.append(cells.length() == 0 ? "" : ", ").append(k).append(' ')
+                        .append(String.format(Locale.ROOT, "%.0f", median(v.stream().mapToDouble(Double::doubleValue).toArray()))));
+                counters.append(String.format(Locale.ROOT, "| %s | %s | %s |%n", profile, e.getKey(), cells));
+            }
             List<Double> quicHs = new ArrayList<>();
             for (String t : new String[] {"quic-reno", "quic-cubic", "quic-bbr"}) {
                 for (double v : values(byTransport.get(t), "handshakeMs")) {
@@ -84,6 +100,7 @@ public final class TransportSummarize {
         }
         md.append("\nCells: median (difference to TCP [bootstrap 95% CI]); **bold** where the CI excludes zero.\n");
         md.append(handshakes);
+        md.append(counters);
         md.append(String.format(Locale.ROOT, "%nFailed runs: %d%n", failures));
         System.out.print(md);
         String out = args.string("markdown", null);
