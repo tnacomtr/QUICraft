@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Partial paper-global.yml: Paper fills in every key left out with its default.
+_version: 31
+chunk-loading-basic:
+  # Paper's default caps sending at 75 chunks/s per player, which would make chunk-load
+  # time measure Paper's limiter instead of the network. Uncapped for the testkit.
+  player-max-chunk-send-rate: -1.0
+  player-max-chunk-load-rate: -1.0
+proxies:
+  velocity:
+    enabled: true
+    online-mode: true
+    # Testkit-only secret; must match velocity/forwarding.secret.
+    secret: quicraft-testkit-forwarding-secret
+update-checker:
+  enabled: false
