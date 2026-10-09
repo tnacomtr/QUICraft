@@ -175,3 +175,26 @@ timing early in exactly the reorder tail, where TCP is backing off.
 | loss (2% each way) | 308.1 ms (p90 657.3) | 430.4 ms | 0.5 ms |
 | delay (+150 ms RTT) | 1437.9 ms | 1212.0 ms | 150.6 ms |
 | reorder (25%, 10 ms) | 417.1 ms | 524.8 ms (p90 1156.9) | 20.6 ms |
+
+## Transport benchmark: congestion control and head start (Phase 1)
+
+Transport level only: no Minecraft code, no game or proxy, so none of these numbers are game
+results. It picks the v1 congestion-control default and supplies the data for the head start H
+(docs/protocol.md §5, §9).
+
+### Method (recorded before the first full run)
+
+- `testkit/run-transport-bench.sh`: `transport-server` (TCP plus one QUIC listener each for
+  RENO, CUBIC and BBR, all on core's v1 transport parameters) and `transport-client` in the
+  netem-shaped bench container. Same four profiles as the baseline, applied to both directions.
+- Per run, over one transport: connect (QUIC: handshake plus the v1 stream; TCP: `connect`), then
+  the client sends HELLO and the server answers with a **200 KiB login burst** (32 KiB messages)
+  and a **2 MiB chunk burst** (4 KiB messages). Then **3 s of play**: the server sends 200-byte
+  entity updates at 20 Hz while the client sends 64-byte pings at 20 Hz, which the server echoes.
+  The burst sizes are rough stand-ins for configuration data and a view-distance-8 chunk load,
+  not measured Minecraft traffic.
+- Metrics: handshake time; burst time (HELLO until the end-of-burst marker); median ping RTT.
+- **N = 20** runs per transport per profile, after 1 warm-up round. The transports rotate within
+  every round, so each sees the same conditions.
+- **Comparison:** each QUIC variant against TCP from the same run. A difference counts only if
+  the bootstrap 95% CI (5000 resamples) of the difference of medians excludes zero.
