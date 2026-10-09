@@ -149,8 +149,8 @@ the RTT the server-list ping already measured.
 - No trust prompt before Phase 9. Minecraft's own encryption still protects the session, and an
   attacker who can strip the advertisement can force silent TCP anyway, so a warning would add
   scary UI without real protection.
-- The client records fingerprints per server silently, so pinning (TOFU, warn on change) can be
-  turned on in Phase 9.
+- The client records fingerprints per server silently, so pinning can be turned on later: in
+  online mode via channel binding (§12, Phase 5), in offline mode as TOFU (Phase 9).
 - Implementation note: Netty's `SelfSignedCertificate` needs BouncyCastle (license not in the
   project's table), JDK-internal `sun.security.x509` classes (blocked on modern JDKs), or the
   `keytool` binary (often missing). QUICraft encodes its one certificate itself.
@@ -164,7 +164,7 @@ the RTT the server-list ping already measured.
   reserved for later versions.
 - End of session: a stream FIN or connection close is treated like a TCP close.
 - Application close error codes: `0x0` normal, `0x1` protocol violation, `0x2` internal error.
-- Multi-stream (Phase 5) needs a separately reviewed encryption design.
+- Multi-stream (Phase 5) needs a separately reviewed encryption design; the proposed one is §12.
 
 ### 0-RTT *(user: allowed in v1)*
 
@@ -249,3 +249,83 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
   one is present byte for byte.
 - On a platform without a native, or if loading fails, the endpoint logs one INFO line and runs
   TCP-only. The client doesn't attempt QUIC; the server doesn't advertise it.
+
+## 12. Channel binding, pinning and dropping Minecraft's cipher (Phase 5 draft)
+
+**Status: proposed direction (user, 2026-10-09). Draft only: not part of v1. Needs a full spec
+here, the user's sign-off on that spec and a security review before any of it ships.**
+
+### Problem
+
+- v1 runs Minecraft's AES/CFB8 inside QUIC (§8). Every byte is encrypted twice, CFB8 has no
+  integrity, and its single continuous cipher state can't be split across streams, which blocks
+  multi-stream.
+- Simply switching Minecraft's cipher off after login is **unsafe**. The fingerprint arrives in an
+  unauthenticated, plain TCP ping (§1, §7). An active attacker who swaps it terminates QUIC/TLS on
+  both sides. Minecraft's login inside still succeeds end to end (the shared secret is
+  RSA-encrypted to the real server, and Mojang authenticates the player). But once the cipher is
+  off, the attacker reads and injects everything between the two TLS hops.
+- Encrypting the ping doesn't help either. Without a key the client already trusts,
+  encryption stops only passive eavesdroppers; an active attacker runs both exchanges.
+
+### Design: compound authentication over a TLS exporter (online mode)
+
+After an online-mode login completes over QUIC, still under Minecraft's encryption:
+
+1. Each side derives `E = TLS-Exporter(label = "EXPORTER-quicraft-binding", context = "", length = 32)`
+   from its QUIC TLS session (RFC 8446 §7.5). With no attacker both get the same `E`. Behind an
+   attacker there are two TLS sessions and two different values.
+2. Client → server (plugin message): `HMAC-SHA256(K, "quicraft client binding" ‖ E)`.
+3. Server → client: `HMAC-SHA256(K, "quicraft server binding" ‖ E)`, sent only if step 2
+   verified.
+4. `K` is derived from Minecraft's login shared secret, which only the real client and the real
+   server know (exact derivation to be specified, e.g. HKDF with a QUICraft-specific label).
+5. If both checks pass, both sides switch Minecraft's cipher off at an agreed packet boundary in
+   each direction, the same way vanilla switches it on. From then on QUIC/TLS alone protects the
+   session: authenticated encryption, one encryption layer, and per-stream protection for
+   multi-stream.
+6. If either check fails: disconnect, record the failure in the failure cache (§6), and log. The
+   attacker learns nothing beyond what vanilla exposes.
+
+The Minecraft login and the hash sent to Mojang's session server stay exactly as vanilla.
+
+### Pinning
+
+- A binding check that passes authenticates the server's QUIC certificate through Mojang's login.
+  The client then **pins** that fingerprint for the server, so the fingerprint is
+  authenticated without any TCP-first join: the first join can be over QUIC directly.
+- On a later join, a different advertised fingerprint is not trusted silently. Behaviour (TCP
+  fallback, re-binding, user-visible notice) to be specified, including legitimate key
+  rotation by the server owner.
+
+### Offline mode
+
+There is no Mojang-bound secret, so no binding is possible. QUIC/TLS stops passive
+eavesdropping only. Minecraft's cipher isn't used in offline mode anyway. Pinning is TOFU
+(Phase 9).
+
+### Optional, later
+
+CA-signed certificates for owners with a domain, validated like WebPKI, would authenticate even
+the first contact. Off by default.
+
+### Limits (unchanged from vanilla)
+
+- An attacker can always strip the advertisement and force TCP: the worst case equals vanilla.
+- The handshake and Login Start (player name, UUID) are visible to a fingerprint-swapping
+  attacker, as they are in plain vanilla TCP.
+
+### Considered and set aside
+
+- Per-stream Minecraft ciphers derived from the shared secret: keeps double encryption and CFB8's
+  lack of integrity.
+- Deriving Minecraft's shared secret from the TLS exporter: changes the Mojang hash input and the
+  vanilla login.
+- A TCP-first join, followed by a live handover to QUIC or a vanilla transfer packet: binding
+  makes a QUIC first join safe, so neither is needed.
+
+### Open points
+
+- Whether Netty's QUIC TLS engine exposes BoringSSL's exporter (`SSL_export_keying_material`).
+  If not, it's a small patch in the custom Netty build.
+- Exact key derivation, message format, the switch-off boundary, and pin storage and rotation.

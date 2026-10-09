@@ -15,3 +15,6 @@ run/
 *-sources.jar
 # Testkit: raw run output (summaries go to docs/benchmarks.md)
 testkit/results/
+
+# Claude Code agent worktrees
+.claude/worktrees/
