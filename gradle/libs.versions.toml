@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Every version bump here re-runs the license check (./gradlew checkLicense).
+# Netty upgrades also need the BoringSSL pin re-checked; see CLAUDE.md "Licensing".
+
+[versions]
+# 4.2.19.Final: BoringSSL d03dbc3e (2026-05-12, Apache-2.0), quiche be47c501, Java 8 bytecode.
+netty = "4.2.19.Final"
+junit = "5.14.4"
+slf4j = "2.0.17"
+# Testkit only. One MCProtocolLib release per tested protocol; see docs/version-matrix.md.
+mcprotocollib = "26.1-1"
+
+[libraries]
+netty-bom = { module = "io.netty:netty-bom", version.ref = "netty" }
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter" }
+junit-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
+mcprotocollib = { module = "org.geysermc.mcprotocollib:protocol", version.ref = "mcprotocollib" }

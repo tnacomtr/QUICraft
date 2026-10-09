@@ -49,6 +49,8 @@ Dependency status (each license file checked Oct 2026; re-check on every version
 | Paper (API and server internals) | GPL-3.0, some parts MIT | OK |
 | Minecraft | Proprietary | Not a dependency we ship; see the linking exception below |
 | MCProtocolLib (testkit only) | MIT | OK |
+| MCProtocolLib transitive deps (testkit only) | Apache-2.0 / MIT, checked Oct 2026 for 26.1-1. Its `net.raphimc:MinecraftAuth` (LGPL-3.0) is excluded; the testkit never logs in with a Microsoft account | OK |
+| JUnit 5 (tests only) | EPL-2.0 | OK for tests only, approved by the user (Oct 2026). Never in a shipped jar; the allowlist accepts EPL-2.0 only for `org.junit*` |
 
 Rules:
 
