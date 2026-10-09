@@ -17,6 +17,8 @@ dependencies {
     implementation(libs.mcprotocollib) {
         exclude(group = "net.raphimc", module = "MinecraftAuth")
     }
+    // Shaded core: its relocated Netty doesn't clash with MCProtocolLib's netty-all.
+    implementation(project(path = ":core", configuration = "shadowRuntimeElements"))
     implementation(libs.gson)
     runtimeOnly(libs.slf4j.simple)
 }

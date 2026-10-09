@@ -43,6 +43,18 @@ services:
     networks: [front]
     depends_on: [velocity]
 
+  # Transport benchmark server (testkit/run-transport-bench.sh): TCP and QUIC Reno/CUBIC/BBR.
+  transportserver:
+    image: quicraft-testkit-bench
+    profiles: [transport]
+    command: ["transport-server", "--port", "30000", "--fingerprint-file", "/results/transport-fp.txt"]
+    environment:
+      HOST_UID: ${HOST_UID:-0}
+      HOST_GID: ${HOST_GID:-0}
+    volumes:
+      - ../results:/results
+    networks: [front]
+
 networks:
   # Player side: the only link netem shapes.
   front: {}
