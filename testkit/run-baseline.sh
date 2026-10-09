@@ -32,7 +32,9 @@ compose=(docker compose -f "$here/docker/compose.yaml")
 
 wait_for_log() { # service, pattern, timeout seconds
     local deadline=$((SECONDS + $3))
-    until "${compose[@]}" logs --no-color "$1" 2>/dev/null | grep -q "$2"; do
+    # grep -c reads all input: grep -q would exit early, and under pipefail the SIGPIPE it
+    # causes in `docker compose logs` would fail the pipeline.
+    until "${compose[@]}" logs --no-color "$1" 2>/dev/null | grep -cF "$2" >/dev/null; do
         if ((SECONDS > deadline)); then
             echo "timed out waiting for $1" >&2
             "${compose[@]}" logs --no-color --tail 50 "$1" >&2
