@@ -48,6 +48,8 @@ jobs:
         env:
           BATCHES: ${{ inputs.batches || '1' }}
           RUNS: ${{ inputs.runs || '3' }}
+          RUNS_loss: ${{ inputs.runs || '3' }}
+          RUNS_reorder: ${{ inputs.runs || '3' }}
           PROFILES: ${{ inputs.profiles || 'clean loss delay reorder' }}
           PLAY_MS: "5000"
         run: testkit/run-baseline.sh
