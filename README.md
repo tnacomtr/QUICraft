@@ -4,7 +4,7 @@ QUIC transport for Minecraft: Java Edition. QUICraft is a client mod plus server
 plugins. When both sides have it, the game connection runs over QUIC (UDP). In every other case
 it runs over plain TCP, exactly like vanilla.
 
-> **Status: early development (Phase 0, groundwork).** Nothing is released yet and nothing in
+> **Status: early development (Phase 1, core transport).** Nothing is released yet and nothing in
 > this repository can be installed in a game yet. See [Roadmap](#roadmap).
 
 ## What it does, and what it doesn't
@@ -55,8 +55,8 @@ Exact version ranges per module: [`docs/version-matrix.md`](docs/version-matrix.
 
 | Phase | Scope | Status |
 | --- | --- | --- |
-| 0 | Build, license checks, CI, Docker testkit, TCP baseline | in progress |
-| 1 | `core`: QUIC client/listener, discovery, racing, fallback, fingerprint check | |
+| 0 | Build, license checks, CI, Docker testkit, TCP baseline | done ([baseline](docs/benchmarks.md)) |
+| 1 | `core`: QUIC client/listener, discovery, racing, fallback, fingerprint check | in progress |
 | 2 | Velocity plugin (single stream) | |
 | 3 | Fabric client + dedicated server for 26.x and 1.21.11 | |
 | 4 | Public alpha | |
