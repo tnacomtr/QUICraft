@@ -55,10 +55,13 @@ The client moves 0.1 blocks back and forth at 20 Hz for 10 s per run.
 
 These parameters were fixed before the first full baseline run:
 
-- **N = 20** measured joins per profile per batch, each after **2 warm-up joins** that are
-  discarded. Warm-up absorbs JIT and first-generation costs.
+- **N = 20** measured joins per profile per batch for clean and delay, and **N = 80** for loss
+  and reorder, each after **2 warm-up joins** that are discarded. Warm-up absorbs client JIT
+  costs. (Attempt 1 used N = 20 everywhere; the impaired profiles were too noisy at that size,
+  see below. Raised to 80 by the user's decision on 2026-10-09, from the bootstrap estimate that
+  ~4× the runs are needed for ±10%.)
 - **3 batches.** Each batch runs all four profiles in turn, so slow drift on the host hits every
-  profile instead of one.
+  profile instead of one. From attempt 2 on, the starting profile rotates from batch to batch.
 - **Statistic:** the median per batch. Medians, because join time has a long tail that comes
   from the server, not the network: Velocity's backend login to Paper normally takes ~150 ms and
   sometimes 0.4–1.5 s.
@@ -114,5 +117,5 @@ Analysis:
   [312, 461] (±21%), reorder chunk load 446.0 ms [415, 556] (±16%), reorder join 419.6 ms
   [389, 440] (±6%), clean join 311.7 ms [308.5, 313.5] (±0.8%).
 
-Next: a rerun on the pre-generated image is needed either way. Its N and tolerance for the
-impaired profiles are pending a decision by the user.
+Next: attempt 2 on the pre-generated image, with N = 80 for loss and reorder (method above),
+tolerance unchanged.

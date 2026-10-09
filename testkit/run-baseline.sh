@@ -4,7 +4,7 @@
 # Runs the TCP baseline: BATCHES x PROFILES, RUNS measured joins each (after WARMUP joins
 # that are discarded), then checks reproducibility. Method: docs/benchmarks.md.
 #
-#   testkit/run-baseline.sh                       # full baseline (3 batches x 4 profiles x 20 runs)
+#   testkit/run-baseline.sh                       # full baseline (see docs/benchmarks.md)
 #   BATCHES=1 RUNS=3 PROFILES=clean testkit/run-baseline.sh   # smoke test
 #
 # Results land in testkit/results/<UTC timestamp>/batch<k>/<profile>.json plus summary.md.
@@ -15,6 +15,10 @@ root="$(cd "$here/.." && pwd)"
 
 BATCHES="${BATCHES:-3}"
 RUNS="${RUNS:-20}"
+# Per-profile overrides: RUNS_<profile>. Join and chunk load are bimodal under loss and reorder,
+# so those profiles need more runs for a stable median (docs/benchmarks.md, attempt 1).
+RUNS_loss="${RUNS_loss:-80}"
+RUNS_reorder="${RUNS_reorder:-80}"
 WARMUP="${WARMUP:-2}"
 PROFILES="${PROFILES:-clean loss delay reorder}"
 ONLINE="${ONLINE:-true}"
@@ -59,7 +63,7 @@ wait_for_log velocity 'Done (' 120
 
 {
     echo "started: $stamp"
-    echo "batches=$BATCHES runs=$RUNS warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS"
+    echo "batches=$BATCHES runs=$RUNS runs_loss=$RUNS_loss runs_reorder=$RUNS_reorder warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS"
     echo "git: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo none)$(git -C "$root" diff --quiet 2>/dev/null || echo ' (dirty)')"
     echo "kernel: $(uname -r)"
     echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
@@ -68,12 +72,17 @@ wait_for_log velocity 'Done (' 120
 online_flag=()
 [[ "$ONLINE" == true ]] && online_flag=(--online)
 
+read -r -a profiles <<< "$PROFILES"
 for batch in $(seq 1 "$BATCHES"); do
-    for profile in $PROFILES; do
-        echo "== batch $batch/$BATCHES, profile $profile"
+    # Rotate the starting profile each batch so no profile always runs first.
+    for i in "${!profiles[@]}"; do
+        profile="${profiles[$(( (i + batch - 1) % ${#profiles[@]} ))]}"
+        runs_var="RUNS_$profile"
+        runs="${!runs_var:-$RUNS}"
+        echo "== batch $batch/$BATCHES, profile $profile ($runs runs)"
         "${compose[@]}" run --rm --no-deps -e NETEM_PROFILE="$profile" bench \
             bench --host velocity --port 25565 --profile "$profile" \
-            --runs "$RUNS" --warmup "$WARMUP" --play-ms "$PLAY_MS" "${online_flag[@]}" \
+            --runs "$runs" --warmup "$WARMUP" --play-ms "$PLAY_MS" "${online_flag[@]}" \
             --out "/results/$stamp/batch$batch/$profile.json" || echo "!! bench reported failed runs"
     done
 done
