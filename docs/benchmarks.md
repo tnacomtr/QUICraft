@@ -117,5 +117,56 @@ Analysis:
   [312, 461] (±21%), reorder chunk load 446.0 ms [415, 556] (±16%), reorder join 419.6 ms
   [389, 440] (±6%), clean join 311.7 ms [308.5, 313.5] (±0.8%).
 
-Next: attempt 2 on the pre-generated image, with N = 80 for loss and reorder (method above),
-tolerance unchanged.
+### TCP baseline, attempt 2 (2026-10-09): accepted, 14 of 16 checks pass
+
+Run `20261009T155427Z` at commit `a6398ca`, on the pre-generated world. Same host. 3 batches,
+N = 20 (clean, delay) and N = 80 (loss, reorder) per batch, 2 warm-ups each, rotating start
+profile, online mode. 600 of 600 measured joins completed, 0 disconnects.
+
+| Profile | Metric | Batch medians | All-batch median | Max deviation | Allowed | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| clean | join (ms) | 311.6, 265.0, 310.7 | 311.2 | 46.2 | 31.1 | **FAIL** |
+| clean | chunk load (ms) | 428.9, 430.9, 430.9 | 430.4 | 1.5 | 43.0 | pass |
+| clean | play RTT (ms) | 0.6, 0.5, 0.5 | 0.5 | 0.0 | 5.0 | pass |
+| clean | disconnects / failed runs | 0, 0, 0 | 0 / 0 of 60 | | 0 | pass |
+| delay | join (ms) | 1443.0, 1463.1, 1429.4 | 1437.9 | 25.3 | 143.8 | pass |
+| delay | chunk load (ms) | 1213.7, 1213.1, 1137.4 | 1212.0 | 74.5 | 121.2 | pass |
+| delay | play RTT (ms) | 150.6, 150.5, 150.6 | 150.6 | 0.0 | 15.1 | pass |
+| delay | disconnects / failed runs | 0, 0, 0 | 0 / 0 of 60 | | 0 | pass |
+| loss | join (ms) | 311.6, 305.2, 307.7 | 308.1 | 3.4 | 30.8 | pass |
+| loss | chunk load (ms) | 429.8, 430.4, 431.0 | 430.4 | 0.6 | 43.0 | pass |
+| loss | play RTT (ms) | 0.5, 0.5, 0.5 | 0.5 | 0.0 | 5.0 | pass |
+| loss | disconnects / failed runs | 0, 0, 0 | 0 / 0 of 240 | | 0 | pass |
+| reorder | join (ms) | 421.7, 418.9, 402.2 | 417.1 | 14.9 | 41.7 | pass |
+| reorder | chunk load (ms) | 479.2, 610.0, 519.3 | 524.8 | 85.2 | 52.5 | **FAIL** |
+| reorder | play RTT (ms) | 20.6, 20.5, 20.6 | 20.6 | 0.0 | 5.0 | pass |
+| reorder | disconnects / failed runs | 0, 0, 0 | 0 / 0 of 240 | | 0 | pass |
+
+The two failures, and why more runs would not fix them:
+
+- **Clean join: quantized by Paper's 50 ms tick.** Paper handles the backend login on its tick, so
+  the backend-login phase falls on discrete steps (~195, ~245, ~295 ms…). In batch 2, 11 of 20
+  runs hit the 195 ms step instead of the usual 6–7, and the median dropped to the lower step.
+  This is server-side and transport-independent: the Velocity→Paper leg stays TCP on the LAN
+  under QUIC too. Pooled: median 311.2 ms, 95% CI [265.3, 312.6], p90 411.2 ms.
+- **Reorder chunk load: heavy tail from TCP treating reordering as loss.** Runs either finish
+  at ~410 ms or take 500–1800 ms after spurious retransmits and backoff. Pooled over 240 runs:
+  median 524.8 ms, 95% CI [464.7, 587.6] (±12%), p90 1156.9 ms.
+
+**Decision (user, 2026-10-09):** accept this run as the Phase 0 TCP baseline, with the two
+metrics above documented as noisy by nature rather than tuned further. The rule for later
+comparisons: a QUIC result on clean join or reorder chunk load only counts as different from TCP
+if it falls outside the pooled 95% CI above. Every other metric uses the ±10% / 5 ms tolerance.
+
+**Faster method for later comparison runs** (to be recorded before each run, as here): play
+phase 3 s instead of 10 s, quiet window 1 s instead of 2 s. Play RTT is identical across every
+batch at 10 s, and a run then takes ~5 s instead of ~14 s.
+
+#### Baseline reference values (TCP, attempt 2, pooled medians)
+
+| Profile | Join | Chunk load (329 chunks) | Play RTT |
+| --- | --- | --- | --- |
+| clean | 311.2 ms | 430.4 ms | 0.5 ms |
+| loss (2% each way) | 308.1 ms (p90 657.3) | 430.4 ms | 0.5 ms |
+| delay (+150 ms RTT) | 1437.9 ms | 1212.0 ms | 150.6 ms |
+| reorder (25%, 10 ms) | 417.1 ms | 524.8 ms (p90 1156.9) | 20.6 ms |
