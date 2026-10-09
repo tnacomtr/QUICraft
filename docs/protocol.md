@@ -219,10 +219,18 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
 - QUIC runs on Netty's NIO datagram transport, so quiche (with BoringSSL) is the only native
   library shipped. Natives: linux-x86_64, linux-aarch_64, osx-x86_64, osx-aarch_64,
   windows-x86_64.
-- Netty is relocated by adding a prefix: `io.netty` → `rs.sudoe.quicraft.libs.io.netty`. Netty
-  derives the native library name from that prefix: dots become underscores, and existing
-  underscores become `_1`, a reason to keep underscores out of the prefix. So the shaded jar ships
-  `librs_sudoe_quicraft_libs_netty_quiche42_<os>_<arch>.<ext>`. Verified in
-  `NativeLibraryLoader.calculateMangledPackagePrefix` (netty-common 4.2.19).
+- Netty is relocated by adding a prefix: `io.netty` → `rs.sudoe.quicraft.shaded.io.netty`.
+  Netty derives the native library name from that prefix: dots become underscores, and existing
+  underscores become `_1`. So the shaded jar ships
+  `librs_sudoe_quicraft_shaded_netty_quiche42_<os>_<arch>.<ext>` (no `lib` on Windows). Verified in
+  `NativeLibraryLoader.calculateMangledPackagePrefix` (netty-common 4.2.19), and by
+  `core`'s `shadedTest`, which loads quiche from the shaded jar.
+- **The prefix must not contain `lib` or underscores.** The native code finds its JNI classes by
+  parsing the prefix back out of its own file name, starting from a `lib` match. A first attempt
+  with `rs.sudoe.quicraft.libs` loaded the library but then looked for classes under `s/io/netty/…`
+  and failed with `NoClassDefFoundError`.
+- Only the native jars carry Netty's licence and notice files (35 files: Netty, BoringSSL, quiche
+  and others). The build copies them into the shaded jar, and `checkShadedNotices` verifies every
+  one is present byte for byte.
 - On a platform without a native, or if loading fails, the endpoint logs one INFO line and runs
   TCP-only. The client doesn't attempt QUIC; the server doesn't advertise it.
