@@ -21,6 +21,16 @@ RUN echo "eula=true" > eula.txt
 COPY server.properties /srv/server.properties
 COPY config/paper-global.yml /srv/config/paper-global.yml
 
+# Pre-generate the world at build time (Chunky 1.5.3, GPL-3.0-only, removed again afterwards).
+# 256 blocks covers view distance 8 around spawn with margin for the spawn offset.
+ARG CHUNKY_SHA256=530d2c7430a96a39957391b7088be144daa3108f7665896d1c23aa8dd4af32f3
+ARG PREGEN_RADIUS=256
+ADD --checksum=sha256:${CHUNKY_SHA256} \
+    https://cdn.modrinth.com/data/fALzjamp/versions/MdY6JATr/Chunky-Bukkit-1.5.3.jar \
+    /srv/plugins/Chunky.jar
+COPY pregen.sh /usr/local/bin/pregen.sh
+RUN pregen.sh "${PREGEN_RADIUS}"
+
 EXPOSE 25565
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["java", "-Xms2G", "-Xmx2G", "-jar", "paper.jar", "--nogui"]

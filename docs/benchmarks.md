@@ -18,6 +18,9 @@ bench client ──(front network, netem)──▶ Velocity ──(back network,
 - **Backend:** Paper 26.1.2 build 74, fixed seed `quicraft-testkit`, view distance 8, creative +
   peaceful so the bench player can't die, Paper's per-player chunk send/load rate caps turned off
   so chunk-load time reflects the link rather than Paper's limiter (`testkit/docker/paper/`).
+- **World:** pre-generated into the Paper image at build time (Chunky, 256-block square around
+  spawn, 1089 chunks), so every run reads the same chunks from disk and none are generated
+  during a measurement.
 - **Login:** online mode against a mock session server, so Minecraft's AES/CFB8 encryption is on,
   as it is on real servers.
 - **Runtime:** every container runs Eclipse Temurin 25 JRE (image pinned by digest) on one host.
