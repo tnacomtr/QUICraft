@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Loads the quiche native from core's shaded jar on every platform we ship a native for
+# (CLAUDE.md: test natives loading in a CI matrix). Runs only when core, the build logic or
+# dependency versions change, or by hand: macOS minutes are expensive on a private repo.
+name: natives
+
+on:
+  push:
+    paths:
+      - "core/**"
+      - "build-logic/**"
+      - "gradle/**"
+      - "*.gradle.kts"
+      - ".github/workflows/natives.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shaded-natives:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, native: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, native: linux-aarch_64 }
+          - { os: macos-15-intel, native: osx-x86_64 }
+          - { os: macos-15, native: osx-aarch_64 }
+          - { os: windows-2025, native: windows-x86_64 }
+    name: ${{ matrix.native }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v6
+      - run: ./gradlew :core:shadedTest :core:checkShadedNotices
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shaded-test-${{ matrix.native }}
+          path: core/build/reports/tests/shadedTest/
