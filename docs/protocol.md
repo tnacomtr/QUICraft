@@ -100,6 +100,13 @@ Spectrum and similar) relay the ping, advertisement included, but drop UDP. The 
 5. A QUIC loss or failure is recorded in the failure cache (§6). Losing to TCP after the head
    start counts as a failure.
 
+Known limit (Netty 4.2.19, verified in `QuicLoopbackTest`): when the server rejects the
+handshake for lack of a common ALPN, no CONNECTION_CLOSE reaches the client. The error escapes
+quiche's send path in Netty before the close packet is produced, so the client only fails at its
+connect timeout (10 s). Step 2 still bounds the player's wait to H. A v1 client only offers an
+ALPN the server advertised, so this needs a wrong advertisement to happen. A fingerprint
+mismatch is detected on the client and fails at once (~20 ms on loopback).
+
 **H = 250 ms, provisional.** Measured in the Phase 1 transport benchmark (handshake time
 distribution under every testkit netem profile) and recorded here with its data.
 
