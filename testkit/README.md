@@ -57,8 +57,10 @@ when a join stalls.
 - Server jars are downloaded at image build time and checked against pinned sha256 sums (see the
   Dockerfiles). Paperclip downloads and patches the Mojang server jar during the build. Nothing
   from Mojang is committed.
-- The world lives in the `paper-world` volume and survives between runs. The first join on a
-  fresh volume generates terrain; warm-up joins absorb that.
+- The world is pre-generated when the Paper image is built: Paper starts once with Chunky
+  (GPL-3.0-only, removed afterwards) and generates a 256-block square around spawn (1089 chunks).
+  Every `up` starts from that same world, and nothing a run changes survives `down`. Without it,
+  a fresh environment such as CI measured world generation instead of chunk sending.
 - Paper sends no chunk-batch packets (its own chunk system paces sending). The bench acks batches
   anyway in case a backend does.
 - Join time has a server-side tail: Velocity's login to Paper usually takes ~150 ms and sometimes

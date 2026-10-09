@@ -15,8 +15,8 @@ services:
   paper:
     build: paper
     image: quicraft-testkit-paper
-    volumes:
-      - paper-world:/srv/world
+    # No volume: the world is pre-generated into the image, so every `up` starts from the
+    # same world and anything a run changes is gone after `down`.
     networks: [back]
     stop_grace_period: 60s
 
@@ -48,6 +48,3 @@ networks:
   front: {}
   # Proxy to backend: stays clean, like a LAN.
   back: {}
-
-volumes:
-  paper-world: {}
