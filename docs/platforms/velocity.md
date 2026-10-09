@@ -30,7 +30,10 @@ each release of the plugin.
   where server-list pings arrive.
 - Fail safe: any exception passes the original packet through unchanged.
   `Advertisement.insertInto` already leaves the response alone if it would exceed 32767
-  characters. Still to check: whether Velocity's encoder applies its own, different length limit.
+  characters. That guard is load-bearing here: `StatusResponsePacket.encode` calls
+  `ProtocolUtils.writeString(buf, CharSequence)` with no length check, so Velocity would send an
+  over-cap response and vanilla clients would fail to ping. The Phase 2 gate test (maximum-size
+  MOTD plus favicon) covers this.
 
 ## Query port
 
