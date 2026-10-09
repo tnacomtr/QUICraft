@@ -9,13 +9,37 @@ module and every new release.
 | --- | --- | --- | --- | --- |
 | `core` | all | none (no Minecraft classes) | 8 | skeleton |
 | `testkit` | 26.1.x (protocol 775) | none (never shipped) | 25 | Phase 0 |
-| `bridge-netty41`, `bridge-netty42`, … | by game Netty version | none | per game | Phase 1 |
+| `bridge-netty42` | MC 1.21.11, 26.x; Velocity 4.2; testkit (MCProtocolLib) | none | 8 | Phase 1 |
+| `bridge-netty41` | MC 1.20.1, 1.21–1.21.10 | none | 8 | Phase 1 |
+| `bridge-netty40` | MC 1.8.9 | none | 8 | 1.8.9 phase |
 | `velocity` | client protocols Velocity accepts | Velocity 4.x | 25 | Phase 2 |
 | `fabric-*` (26.x + 1.21.11 hook group) | 26.1–26.3, 1.21.11 | Fabric | 25 / 21 | Phase 3 |
 
 The 26.x + 1.21.11 Fabric hook group shares one source set but builds separate jars: 1.21.11 is
 obfuscated (Intermediary names, Java 21) and 26.1+ is not (Java 25). If the mixin targets turn out
 to differ, the actual split goes here.
+
+## Game and platform Netty versions
+
+From Mojang's version manifest (`piston-meta`) and the platform jars, Oct 2026. Each bridge
+compiles against the **oldest** Netty among its consumers.
+
+| Consumer | Java | Netty | Bridge |
+| --- | --- | --- | --- |
+| MC 1.8.9 | 8 | 4.0.23 | netty40 (later) |
+| MC 1.20.1 | 17 | 4.1.82 | netty41 |
+| MC 1.21–1.21.3 | 21 | 4.1.97 | netty41 |
+| MC 1.21.4 | 21 | 4.1.115 | netty41 |
+| MC 1.21.5–1.21.10 | 21 | 4.1.118 | netty41 |
+| MC 1.21.11 | 21 | 4.2.7 | netty42 |
+| MC 26.1–26.1.2 | 25 | 4.2.7 | netty42 |
+| MC 26.2 | 25 | 4.2.15 | netty42 |
+| MC 26.3 | 25 | 4.2.16 | netty42 |
+| Velocity 4.2.0 | 25 | 4.2.18 | netty42 |
+| MCProtocolLib 26.1-1 (testkit) | 17+ | 4.2.1 | netty42 |
+
+So `bridge-netty42` compiles against 4.2.1 and `bridge-netty41` against 4.1.82. 1.21.11 already
+uses Netty 4.2, the same generation as 26.x, which fits the shared 26.x + 1.21.11 hook group.
 
 ## Pinned dependencies
 
