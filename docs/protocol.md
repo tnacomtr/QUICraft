@@ -107,6 +107,11 @@ connect timeout (10 s). Step 2 still bounds the player's wait to H. A v1 client 
 ALPN the server advertised, so this needs a wrong advertisement to happen. A fingerprint
 mismatch is detected on the client and fails at once (~20 ms on loopback).
 
+Measured connect cost (Netty 4.2.19, `HandshakeFlightProbeTest`): the client has finished the
+TLS handshake after one round trip, but Netty only completes the connect when the server's next
+packet arrives, so a fresh QUIC connect takes about **2 RTT**, against 1 RTT for TCP connect.
+0-RTT resumption (§8) removes the handshake wait on rejoin.
+
 **H = 250 ms, provisional.** Measured in the Phase 1 transport benchmark (handshake time
 distribution under every testkit netem profile) and recorded here with its data.
 
