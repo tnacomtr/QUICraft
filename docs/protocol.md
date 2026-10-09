@@ -81,7 +81,14 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
 - Each value is held as a nullable boxed field. A value left unset is not passed to quiche, so
   quiche's own default applies. For the flow-control and stream limits that default is 0, which is
   why every limit must be set explicitly. To confirm with a loopback test in Phase 1.
-- Congestion control: `QuicCongestionControlAlgorithm` offers `RENO`, `CUBIC` and `BBR`.
+- Congestion control: `QuicCongestionControlAlgorithm` offers `RENO`, `CUBIC` and `BBR`. It is set
+  per codec builder and applies to connections created afterwards. No API to switch a live
+  connection was found. In QUIC the algorithm is sender-only and never negotiated, so changing it
+  needs no protocol version change. **How the default is chosen:** in Phase 1, a testkit transport
+  benchmark compares all three under every netem profile, using Minecraft-shaped traffic (login
+  burst, chunk burst, 20 Hz small packets). Phase 3 repeats the comparison with in-game joins
+  against the TCP baseline. The winner and its numbers are recorded here and in
+  docs/benchmarks.md (user request, 2026-10-09).
 - Retry/address validation: `QuicServerCodecBuilder.tokenHandler(QuicTokenHandler)`. Netty ships
   `InsecureQuicTokenHandler` (never to be used, per CLAUDE.md) and `NoQuicTokenHandler` (no
   validation). The interface is `writeToken(out, dcid, address)`, `validateToken(token, address)`
