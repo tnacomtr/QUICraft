@@ -112,8 +112,11 @@ TLS handshake after one round trip, but Netty only completes the connect when th
 packet arrives, so a fresh QUIC connect takes about **2 RTT**, against 1 RTT for TCP connect.
 0-RTT resumption (§8) removes the handshake wait on rejoin.
 
-**H = 250 ms, provisional.** Measured in the Phase 1 transport benchmark (handshake time
-distribution under every testkit netem profile) and recorded here with its data.
+**H = 250 ms, provisional.** Phase 1 transport benchmark: QUIC handshake p50/p99 was
+2.8/4.0 ms (clean), 303/304 ms (+150 ms RTT), 2.9/1005 ms (2% loss; the tail is a lost first
+Initial) and 43/44 ms (reorder). With H = 250 ms, QUIC still wins at +150 ms RTT (303 ms against
+250 + 150 ms for TCP), and a lost Initial costs at most H instead of ~1 s. Open idea: derive H from
+the RTT the server-list ping already measured.
 
 ## 6. Failure cache
 
@@ -194,7 +197,7 @@ flow control and stream counts, meaning nothing could be sent.
 | `initial_max_streams_uni` | 0 | |
 | `disable_active_migration` | true | No deliberate migration before Phase 9; NAT rebinding is still handled. |
 | Datagrams (RFC 9221) | off | Not used before a later version. |
-| Congestion control | CUBIC, **provisional** | Chosen in the Phase 1 benchmark among RENO, CUBIC and BBR (user request). Sender-side only, so changing it needs no protocol version. |
+| Congestion control | BBR, **provisional** | Phase 1 transport benchmark (docs/benchmarks.md): the only variant faster than TCP at +150 ms RTT (−509 ms on a 2.2 MiB burst). All three trail TCP badly under heavy reordering; under investigation. Sender-side only, so changing it needs no protocol version. |
 | Address validation (Retry) | when handshake rate exceeds a threshold | A real token handler is required before the public alpha (Phase 4). `InsecureQuicTokenHandler` is never used. |
 
 Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
