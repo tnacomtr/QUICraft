@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Testkit: bench client -> Velocity -> Paper, plus a mock Mojang session server.
+# Normally driven by testkit/run-baseline.sh; see testkit/README.md.
+name: quicraft-testkit
+
+services:
+  mocksession:
+    build:
+      context: ..
+      dockerfile: docker/bench/Dockerfile
+    image: quicraft-testkit-bench
+    command: ["mocksession", "--port", "8080"]
+    networks: [front, back]
+
+  paper:
+    build: paper
+    image: quicraft-testkit-paper
+    volumes:
+      - paper-world:/srv/world
+    networks: [back]
+    stop_grace_period: 60s
+
+  velocity:
+    build: velocity
+    image: quicraft-testkit-velocity
+    environment:
+      VELOCITY_ONLINE_MODE: ${VELOCITY_ONLINE_MODE:-true}
+    networks: [front, back]
+    depends_on: [paper, mocksession]
+    stop_grace_period: 30s
+
+  # One-shot client: `docker compose run --rm -e NETEM_PROFILE=loss bench bench --host velocity ...`
+  bench:
+    image: quicraft-testkit-bench
+    profiles: [bench]
+    cap_add: [NET_ADMIN]
+    environment:
+      NETEM_PROFILE: ${NETEM_PROFILE:-clean}
+      HOST_UID: ${HOST_UID:-0}
+      HOST_GID: ${HOST_GID:-0}
+    volumes:
+      - ../results:/results
+    networks: [front]
+    depends_on: [velocity]
+
+networks:
+  # Player side: the only link netem shapes.
+  front: {}
+  # Proxy to backend: stays clean, like a LAN.
+  back: {}
+
+volumes:
+  paper-world: {}

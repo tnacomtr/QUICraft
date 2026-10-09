@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Testkit Velocity config. Keys not listed keep Velocity's defaults.
+config-version = "2.9"
+bind = "0.0.0.0:25565"
+motd = "<gray>QUICraft testkit"
+show-max-players = 50
+online-mode = @ONLINE_MODE@
+# The mock session server issues no chat-signing keys.
+force-key-authentication = false
+prevent-client-proxy-connections = false
+player-info-forwarding-mode = "MODERN"
+forwarding-secret-file = "forwarding.secret"
+announce-forge = false
+kick-existing-players = true
+
+[servers]
+paper = "paper:25565"
+try = ["paper"]
+
+[forced-hosts]
+
+[advanced]
+compression-threshold = 256
+# The bench reconnects from one IP many times in a row.
+login-ratelimit = 0
+connection-timeout = 5000
+read-timeout = 30000
+
+[query]
+enabled = false

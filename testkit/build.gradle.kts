@@ -17,10 +17,13 @@ dependencies {
     implementation(libs.mcprotocollib) {
         exclude(group = "net.raphimc", module = "MinecraftAuth")
     }
+    implementation(libs.gson)
     runtimeOnly(libs.slf4j.simple)
 }
 
 application {
     mainClass = "rs.sudoe.quicraft.testkit.Main"
     applicationName = "quicraft-testkit"
+    // Netty loads its native transports.
+    applicationDefaultJvmArgs = listOf("--enable-native-access=ALL-UNNAMED")
 }
