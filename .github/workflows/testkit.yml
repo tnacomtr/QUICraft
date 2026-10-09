@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Testkit in Docker: Velocity + Paper + bench client under netem.
+#
+# On push/PR it runs a short smoke test (TCP joins work under every profile). Shared runners are
+# too noisy for the reproducibility gate; baseline numbers in docs/benchmarks.md come from a
+# dedicated host. A full run can still be started by hand.
+name: testkit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      batches:
+        description: Batches
+        default: "1"
+      runs:
+        description: Measured joins per profile per batch
+        default: "3"
+      profiles:
+        description: netem profiles
+        default: "clean loss delay reorder"
+
+permissions:
+  contents: read
+
+jobs:
+  testkit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Load netem and ifb kernel modules
+        run: |
+          sudo modprobe sch_netem && sudo modprobe ifb || {
+            sudo apt-get update
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+            sudo modprobe ifb
+          }
+      - name: Run testkit
+        env:
+          BATCHES: ${{ inputs.batches || '1' }}
+          RUNS: ${{ inputs.runs || '3' }}
+          PROFILES: ${{ inputs.profiles || 'clean loss delay reorder' }}
+          PLAY_MS: "5000"
+        run: testkit/run-baseline.sh
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: testkit-results
+          path: testkit/results/
