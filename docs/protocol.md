@@ -241,8 +241,9 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
 
 ## 11. Native library and platforms
 
-- QUIC runs on Netty's NIO datagram transport, so quiche (with BoringSSL) is the only native
-  library shipped. Natives: linux-x86_64, linux-aarch_64, osx-x86_64, osx-aarch_64,
+- On its own thread, core runs QUIC on Netty's NIO datagram transport, so quiche (with
+  BoringSSL) is the only native library shipped. Platforms normally use the hosted transport
+  below instead. Natives: linux-x86_64, linux-aarch_64, osx-x86_64, osx-aarch_64,
   windows-x86_64.
 - Netty is relocated by adding a prefix: `io.netty` → `rs.sudoe.quicraft.shaded.io.netty`.
   Netty derives the native library name from that prefix: dots become underscores, and existing
@@ -259,6 +260,30 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
   one is present byte for byte.
 - On a platform without a native, or if loading fails, the endpoint logs one INFO line and runs
   TCP-only. The client doesn't attempt QUIC; the server doesn't advertise it.
+
+### Hosted transport (platforms)
+
+Core's QUIC can run on the platform's own event loop instead of a thread of its own:
+`QuicServer.bind(HostLoop, HostDatagramSocket, …)` and `QuicClient.connect(HostLoop,
+HostDatagramSocket, …)`. Core puts its (relocated) Netty QUIC codec on a small adapter
+channel and event loop that execute on the host's loop. bridge-netty implements both interfaces
+over the game's Netty (`GameHost`): an `EventLoop`, and a `DatagramChannel` of the platform's
+own transport (epoll on Linux for Velocity and MCProtocolLib).
+
+Why: the UDP socket, QUIC and the game pipeline (on Velocity also the backend connection, which
+Velocity opens on the player's loop) then share one thread, as with TCP. On core's own thread,
+each round trip crossed four threads (game loop to QUIC loop and back on each side). On an idle
+loop every crossing costs a thread wake-up of about 80–90 µs, which made QUIC about 0.35 ms
+slower than TCP per round trip (`quicraft-testkit latency`, in-process loopback, 20 ms idle
+between pings, p50: TCP 352 µs, bridge on core's thread 739 µs, hosted 487 µs). What remains
+is quiche's per-packet work on cold caches, four packets per round trip; the wake-up segments
+match TCP's exactly.
+
+Datagrams are copied between the two Netty copies (one copy each way); nothing is shared.
+Datagrams that arrive before core starts the socket are dropped (QUIC retransmits). Closing the
+QUIC connection (client) or the listener (server) closes the socket. The proxy runs all QUIC
+connections on one loop (one UDP socket); spreading them over several loops needs
+connection-ID routing between sockets (Phase 9).
 
 ### QUICraft's Netty QUIC build
 
