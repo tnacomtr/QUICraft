@@ -28,7 +28,7 @@ QUICHE_COMMIT=be47c5011215b9f13bad06bd7627d3ae49888a19
 # Apache-2.0 since 33d1049b (2025-02-03); this pin is from 2026-05-12 (CLAUDE.md "Licensing").
 BORINGSSL_COMMIT=d03dbc3e5d7de44183ff17018af22323af650fbc
 # Bump the suffix whenever a patch, the lock file or a pin changes.
-QUICRAFT_VERSION=4.2.19.Final-quicraft1
+QUICRAFT_VERSION=4.2.19.Final-quicraft2
 GROUP_PATH=rs/sudoe/quicraft/netty
 QUICHE_FEATURES="ffi qlog custom-client-dcid"
 

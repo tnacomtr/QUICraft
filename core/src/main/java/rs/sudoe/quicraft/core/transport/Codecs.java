@@ -44,6 +44,15 @@ final class Codecs {
         }
     }
 
+    /**
+     * Closes a QUIC connection in a task on its event loop, never inside the caller's (possibly
+     * Netty-internal) call stack, e.g. from a connect listener inside Netty's connect processing.
+     */
+    static void closeLater(io.netty.handler.codec.quic.QuicChannel connection, boolean application, int code) {
+        connection.eventLoop().execute(
+                () -> connection.close(application, code, io.netty.buffer.Unpooled.EMPTY_BUFFER));
+    }
+
     /** NIO only: quiche is the single native QUICraft ships. Daemon threads. */
     static EventLoopGroup newGroup(String name, int threads) {
         return new MultiThreadIoEventLoopGroup(threads, new DefaultThreadFactory(name, true), NioIoHandler.newFactory());

@@ -2,7 +2,6 @@
 package rs.sudoe.quicraft.core.transport;
 
 import io.netty.bootstrap.Bootstrap;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -109,7 +108,7 @@ public final class QuicServer implements Closeable {
                         Connection connection = stream.parent().pipeline().get(Connection.class);
                         if (connection == null || stream.type() != QuicStreamType.BIDIRECTIONAL
                                 || stream.isLocalCreated()) {
-                            stream.parent().close(true, Protocol.CLOSE_PROTOCOL_VIOLATION, Unpooled.EMPTY_BUFFER);
+                            Codecs.closeLater(stream.parent(), true, Protocol.CLOSE_PROTOCOL_VIOLATION);
                             return;
                         }
                         connection.offer(new NettyQuicByteStream(stream));
@@ -179,10 +178,10 @@ public final class QuicServer implements Closeable {
         @Override
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
             if (cause instanceof javax.net.ssl.SSLHandshakeException) {
-                ((QuicChannel) ctx.channel()).close(false, CRYPTO_ERROR_HANDSHAKE_FAILURE, Unpooled.EMPTY_BUFFER);
+                Codecs.closeLater((QuicChannel) ctx.channel(), false, CRYPTO_ERROR_HANDSHAKE_FAILURE);
             } else {
                 LOG.log(Level.FINE, "QUIC connection error", cause);
-                ((QuicChannel) ctx.channel()).close(true, Protocol.CLOSE_INTERNAL_ERROR, Unpooled.EMPTY_BUFFER);
+                Codecs.closeLater((QuicChannel) ctx.channel(), true, Protocol.CLOSE_INTERNAL_ERROR);
             }
         }
 
