@@ -6,6 +6,10 @@
 #
 #   testkit/run-baseline.sh                       # full baseline (see docs/benchmarks.md)
 #   BATCHES=1 RUNS=3 PROFILES=clean testkit/run-baseline.sh   # smoke test
+#   TRANSPORT=quic BATCHES=1 RUNS=3 PROFILES=clean testkit/run-baseline.sh   # join over QUIC
+#
+# The QUICraft Velocity plugin is installed unless QUICRAFT_PLUGIN=false, so a TCP run also
+# checks that the plugin leaves TCP joins alone.
 #
 # Results land in testkit/results/<UTC timestamp>/batch<k>/<profile>.json plus summary.md.
 set -euo pipefail
@@ -26,12 +30,14 @@ PLAY_MS="${PLAY_MS:-10000}"
 TOLERANCE_PCT="${TOLERANCE_PCT:-10}"
 TOLERANCE_MS="${TOLERANCE_MS:-5}"
 KEEP_UP="${KEEP_UP:-false}"
+TRANSPORT="${TRANSPORT:-tcp}"
+QUICRAFT_PLUGIN="${QUICRAFT_PLUGIN:-true}"
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-results="$here/results/$stamp"
+results="$here/results/$stamp-$TRANSPORT"
 mkdir -p "$results"
 
-export VELOCITY_ONLINE_MODE="$ONLINE" HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+export VELOCITY_ONLINE_MODE="$ONLINE" QUICRAFT_PLUGIN HOST_UID="$(id -u)" HOST_GID="$(id -g)"
 compose=(docker compose -f "$here/docker/compose.yaml")
 
 wait_for_log() { # service, pattern, timeout seconds
@@ -55,7 +61,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$root/gradlew" -p "$root" -q :testkit:installDist
+"$root/gradlew" -p "$root" -q :testkit:installDist :velocity:testkitPlugin
 "${compose[@]}" build --quiet
 "${compose[@]}" up -d mocksession paper velocity
 wait_for_log paper 'Done (' 600
@@ -63,7 +69,7 @@ wait_for_log velocity 'Done (' 120
 
 {
     echo "started: $stamp"
-    echo "batches=$BATCHES runs=$RUNS runs_loss=$RUNS_loss runs_reorder=$RUNS_reorder warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS"
+    echo "batches=$BATCHES runs=$RUNS runs_loss=$RUNS_loss runs_reorder=$RUNS_reorder warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS transport=$TRANSPORT quicraft_plugin=$QUICRAFT_PLUGIN"
     echo "git: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo none)$(git -C "$root" diff --quiet 2>/dev/null || echo ' (dirty)')"
     echo "kernel: $(uname -r)"
     echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
@@ -81,9 +87,9 @@ for batch in $(seq 1 "$BATCHES"); do
         runs="${!runs_var:-$RUNS}"
         echo "== batch $batch/$BATCHES, profile $profile ($runs runs)"
         "${compose[@]}" run --rm --no-deps -e NETEM_PROFILE="$profile" bench \
-            bench --host velocity --port 25565 --profile "$profile" \
+            bench --host velocity --port 25565 --transport "$TRANSPORT" --profile "$profile" \
             --runs "$runs" --warmup "$WARMUP" --play-ms "$PLAY_MS" "${online_flag[@]}" \
-            --out "/results/$stamp/batch$batch/$profile.json" || echo "!! bench reported failed runs"
+            --out "/results/$stamp-$TRANSPORT/batch$batch/$profile.json" || echo "!! bench reported failed runs"
     done
 done
 

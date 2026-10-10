@@ -10,9 +10,10 @@ WORKDIR /srv
 ADD --checksum=sha256:${VELOCITY_SHA256} \
     https://fill-data.papermc.io/v1/objects/${VELOCITY_SHA256}/velocity-${VELOCITY_VERSION}-${VELOCITY_BUILD}.jar \
     /srv/velocity.jar
+COPY --from=quicraft quicraft-velocity.jar /srv/quicraft/quicraft-velocity.jar
 COPY velocity.toml /srv/velocity.toml.template
 COPY entrypoint.sh /usr/local/bin/velocity-entrypoint.sh
 
-EXPOSE 25565
+EXPOSE 25565 25565/udp
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/velocity-entrypoint.sh"]

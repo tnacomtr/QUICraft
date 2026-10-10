@@ -15,15 +15,22 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.LockSupport;
 import org.cloudburstmc.math.vector.Vector3d;
 import org.geysermc.mcprotocollib.auth.GameProfile;
 import org.geysermc.mcprotocollib.network.session.ClientNetworkSession;
 import org.geysermc.mcprotocollib.protocol.MinecraftConstants;
 import org.geysermc.mcprotocollib.protocol.MinecraftProtocol;
+import org.geysermc.mcprotocollib.protocol.codec.MinecraftCodec;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundMovePlayerPosPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ping.serverbound.ServerboundPingRequestPacket;
+import rs.sudoe.quicraft.core.discovery.Advertisement;
+import rs.sudoe.quicraft.core.transport.QuicByteStream;
+import rs.sudoe.quicraft.core.transport.QuicClient;
+import rs.sudoe.quicraft.core.transport.TransportConfig;
 import rs.sudoe.quicraft.testkit.Args;
 import rs.sudoe.quicraft.testkit.session.MockSessionService;
 
@@ -38,7 +45,7 @@ public final class BenchClient {
     private static final int PING_EVERY_TICKS = 5;
 
     private record Options(
-            String host, int port, String profile, int runs, int warmup, boolean online, URI sessionUrl,
+            String host, int port, String transport, String profile, int runs, int warmup, boolean online, URI sessionUrl,
             int viewDistance, long playNanos, long quietNanos, long timeoutNanos, Path out, boolean verbose) {}
 
     private BenchClient() {}
@@ -47,6 +54,7 @@ public final class BenchClient {
         Options o = new Options(
                 args.string("host", "localhost"),
                 args.integer("port", 25565),
+                args.string("transport", "tcp"),
                 args.string("profile", "unknown"),
                 args.integer("runs", 20),
                 args.integer("warmup", 2),
@@ -59,14 +67,17 @@ public final class BenchClient {
                 args.string("out", null) == null ? null : Path.of(args.string("out", null)),
                 args.flag("verbose"));
 
+        if (!o.transport().equals("tcp") && !o.transport().equals("quic")) {
+            throw new IllegalArgumentException("--transport must be tcp or quic");
+        }
         List<RunResult> results = new ArrayList<>();
         int total = o.warmup() + o.runs();
         for (int i = 0; i < total; i++) {
             boolean warmup = i < o.warmup();
             RunResult result = runOnce(o, i, warmup);
             results.add(result);
-            System.out.printf("[%s] run %d%s ok=%s join=%.1fms phases=%s chunks=%d chunkLoad=%.1fms rtt=%.2fms p95=%.2fms lost=%d%s%n",
-                    o.profile(), i, warmup ? " (warmup)" : "", result.ok(), result.joinMs(), Arrays.toString(result.phasesMs()), result.chunks(),
+            System.out.printf("[%s/%s] run %d%s ok=%s join=%.1fms phases=%s chunks=%d chunkLoad=%.1fms rtt=%.2fms p95=%.2fms lost=%d%s%n",
+                    o.profile(), o.transport(), i, warmup ? " (warmup)" : "", result.ok(), result.joinMs(), Arrays.toString(result.phasesMs()), result.chunks(),
                     result.chunkLoadMs(), result.rttMedianMs(), result.rttP95Ms(), result.rttLost(),
                     result.error() == null ? "" : " error=" + result.error());
             // Let the proxy and backend finish the previous player's logout.
@@ -78,6 +89,7 @@ public final class BenchClient {
             doc.addProperty("profile", o.profile());
             doc.addProperty("host", o.host());
             doc.addProperty("port", o.port());
+            doc.addProperty("transport", o.transport());
             doc.addProperty("online", o.online());
             doc.addProperty("viewDistance", o.viewDistance());
             doc.addProperty("playMs", TimeUnit.NANOSECONDS.toMillis(o.playNanos()));
@@ -101,13 +113,40 @@ public final class BenchClient {
         BenchSession bench = new BenchSession(protocol, o.viewDistance(), o.verbose());
         // Resolve before the clock starts, so DNS is not part of join time.
         InetSocketAddress address = new InetSocketAddress(o.host(), o.port());
-        ClientNetworkSession session = new ClientNetworkSession(address, protocol, Runnable::run, null, null);
+        Advertisement ad = null;
+        if (o.transport().equals("quic")) {
+            // As a client with a fresh server-list entry would: the advertisement is in hand
+            // before the player clicks Join, so the ping isn't part of join time.
+            try {
+                ad = Advertisement.extract(StatusPing.fetch(address, o.host(),
+                        MinecraftCodec.CODEC.getProtocolVersion(), 10_000)).orElse(null);
+            } catch (IOException e) {
+                return failure(index, warmup, bench, "status ping failed: " + e);
+            }
+            if (ad == null) {
+                return failure(index, warmup, bench, "server does not advertise QUIC");
+            }
+        }
+
+        long start = System.nanoTime();
+        ClientNetworkSession session;
+        if (ad != null) {
+            QuicByteStream stream;
+            try {
+                stream = QuicClient.connect(new InetSocketAddress(address.getAddress(), ad.port()), ad.fingerprint(),
+                        TransportConfig.DEFAULT).get(o.timeoutNanos(), TimeUnit.NANOSECONDS);
+            } catch (ExecutionException | TimeoutException e) {
+                return failure(index, warmup, bench, "QUIC connect failed: " + e);
+            }
+            session = new QuicClientSession(address, protocol, stream);
+        } else {
+            session = new ClientNetworkSession(address, protocol, Runnable::run, null, null);
+        }
         if (o.online()) {
             session.setFlag(MinecraftConstants.SESSION_SERVICE_KEY, new MockSessionService(o.sessionUrl()));
         }
         session.addListener(bench);
 
-        long start = System.nanoTime();
         try {
             session.connect(false);
             if (!bench.joined.await(o.timeoutNanos(), TimeUnit.NANOSECONDS) || bench.loginNanos == 0) {

@@ -21,10 +21,16 @@ services:
     stop_grace_period: 60s
 
   velocity:
-    build: velocity
+    build:
+      context: velocity
+      # The plugin jar, after `./gradlew :velocity:testkitPlugin`.
+      additional_contexts:
+        quicraft: ../../velocity/build/testkit
     image: quicraft-testkit-velocity
     environment:
       VELOCITY_ONLINE_MODE: ${VELOCITY_ONLINE_MODE:-true}
+      # false: plain Velocity, for a baseline without the plugin installed.
+      QUICRAFT_PLUGIN: ${QUICRAFT_PLUGIN:-true}
     networks: [front, back]
     depends_on: [paper, mocksession]
     stop_grace_period: 30s

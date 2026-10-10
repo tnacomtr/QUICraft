@@ -19,6 +19,8 @@ dependencies {
     }
     // Shaded core: its relocated Netty doesn't clash with MCProtocolLib's netty-all.
     implementation(project(path = ":core", configuration = "shadowRuntimeElements"))
+    // MCProtocolLib's Netty 4.2 channel over a QUIC stream (the QUIC join path).
+    implementation(project(":bridge-netty42"))
     implementation(libs.gson)
     runtimeOnly(libs.slf4j.simple)
 }
