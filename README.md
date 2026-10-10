@@ -65,11 +65,19 @@ Exact version ranges per module: [`docs/version-matrix.md`](docs/version-matrix.
 
 ## Building
 
-Requires JDK 25.
+Requires JDK 25 and Docker.
 
 ```sh
-./gradlew build     # compile, test, license check, SPDX header check
+natives/build-linux.sh   # once (and after natives/ changes): patched Netty QUIC jars, ~15 min cold
+./gradlew build          # compile, test, license check, SPDX header check
 ```
+
+`core` uses QUICraft's own build of Netty's QUIC classes and native
+([`natives/`](natives/), docs/protocol.md §11). It is upstream Netty 4.2.19 with two small
+patches: quiche's relaxed loss threshold exposed, and a client connect that completes one round
+trip sooner. The build script runs Netty's own Maven build in Docker. Its output stays in
+`natives/build/` and is never committed. Linux x86_64 uses the patched native. The other platforms
+use upstream Netty's native for now, where the relaxed loss threshold is unavailable.
 
 The Docker testkit (needs Docker and the `sch_netem` and `ifb` kernel modules on the host) is
 described in [`testkit/README.md`](testkit/README.md).
@@ -79,6 +87,7 @@ described in [`testkit/README.md`](testkit/README.md).
 QUICraft is free software under the **GNU General Public License v3.0 or later**
 ([`LICENSE`](LICENSE)). Release jars bundle Netty and its QUIC native library (quiche and
 BoringSSL), which are under Apache-2.0 and BSD-2-Clause; their license and notice files ship
-inside the jars.
+inside the jars. QUICraft's build of the native also carries the license files of every Rust crate
+it links, under `META-INF/license/quiche-deps/`.
 
 NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.
