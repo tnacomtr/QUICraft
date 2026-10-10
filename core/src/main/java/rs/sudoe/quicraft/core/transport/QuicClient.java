@@ -4,6 +4,8 @@ package rs.sudoe.quicraft.core.transport;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
@@ -30,10 +32,35 @@ public final class QuicClient {
     /**
      * Connects, checks the server certificate against {@code fingerprint}, and opens the v1
      * stream. Cancelling the returned future closes the attempt, including a stream that
-     * completes after the cancel.
+     * completes after the cancel. Runs on core's own QUIC thread.
      */
     public static CompletableFuture<QuicByteStream> connect(InetSocketAddress remote, Fingerprint fingerprint,
             TransportConfig config) {
+        return connect(codec -> new Bootstrap().group(group()).channel(NioDatagramChannel.class).handler(codec)
+                .bind(0), remote, fingerprint, config);
+    }
+
+    /**
+     * As {@link #connect(InetSocketAddress, Fingerprint, TransportConfig)}, but QUIC runs on the
+     * platform's {@code loop} over its {@code socket} (hosted transport, docs/protocol.md §11):
+     * no thread hop between the game pipeline and QUIC. The socket is closed with the
+     * connection, or when the attempt fails or is cancelled.
+     */
+    public static CompletableFuture<QuicByteStream> connect(HostLoop loop, HostDatagramSocket socket,
+            InetSocketAddress remote, Fingerprint fingerprint, TransportConfig config) {
+        return connect(codec -> {
+            HostedDatagramChannel udp = new HostedDatagramChannel(socket);
+            udp.pipeline().addLast(codec);
+            return new HostedEventLoop(loop).register(udp);
+        }, remote, fingerprint, config);
+    }
+
+    private interface UdpFactory {
+        ChannelFuture open(ChannelHandler codec);
+    }
+
+    private static CompletableFuture<QuicByteStream> connect(UdpFactory udpFactory, InetSocketAddress remote,
+            Fingerprint fingerprint, TransportConfig config) {
         CompletableFuture<QuicByteStream> result = new CompletableFuture<>();
         try {
             FingerprintTrustManager trust = new FingerprintTrustManager(fingerprint);
@@ -44,61 +71,74 @@ public final class QuicClient {
                     .applicationProtocols(Protocol.ALPN)
                     .earlyData(config.earlyData)
                     .build();
-            io.netty.channel.ChannelHandler codec = Codecs.apply(new QuicClientCodecBuilder(), config, false)
+            ChannelHandler codec = Codecs.apply(new QuicClientCodecBuilder(), config, false)
                     .sslContext(ssl)
                     .build();
-            Channel udp = new Bootstrap().group(group()).channel(NioDatagramChannel.class).handler(codec)
-                    .bind(0).syncUninterruptibly().channel();
-            result.whenComplete((stream, error) -> {
-                if (result.isCancelled() || error != null) {
-                    udp.close();
-                }
-            });
-            Future<QuicChannel> connecting = QuicChannel.newBootstrap(udp)
-                    // Upper bound for a silent server; racing normally decides much sooner.
-                    .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MILLIS)
-                    .handler(new ChannelInboundHandlerAdapter())
-                    .streamHandler(new ChannelInboundHandlerAdapter())
-                    .remoteAddress(remote)
-                    .connect();
-            connecting.addListener(f -> {
-                if (!f.isSuccess()) {
-                    Throwable cause = f.cause();
-                    if (trust.mismatch() != null) {
-                        trust.mismatch().addSuppressed(cause);
-                        cause = trust.mismatch();
-                    }
-                    result.completeExceptionally(cause);
+            udpFactory.open(codec).addListener((ChannelFuture opened) -> {
+                if (!opened.isSuccess()) {
+                    opened.channel().close();
+                    result.completeExceptionally(opened.cause());
                     return;
                 }
-                QuicChannel connection = (QuicChannel) f.getNow();
-                connection.closeFuture().addListener(closed -> udp.close());
-                if (result.isDone()) {
-                    connection.close(true, Protocol.CLOSE_NORMAL, Unpooled.EMPTY_BUFFER);
-                    return;
-                }
-                connection.createStream(QuicStreamType.BIDIRECTIONAL, new ChannelInboundHandlerAdapter())
-                        .addListener(s -> {
-                            if (!s.isSuccess()) {
-                                connection.close(true, Protocol.CLOSE_INTERNAL_ERROR, Unpooled.EMPTY_BUFFER);
-                                result.completeExceptionally(s.cause());
-                                return;
-                            }
-                            NettyQuicByteStream stream = new NettyQuicByteStream((QuicStreamChannel) s.getNow());
-                            if (!result.complete(stream)) {
-                                stream.close(); // cancelled meanwhile
-                            }
-                        });
-            });
-            result.whenComplete((stream, error) -> {
-                if (result.isCancelled()) {
-                    connecting.cancel(false);
-                }
+                connect(opened.channel(), trust, remote, result);
             });
         } catch (Throwable t) {
             result.completeExceptionally(t);
         }
         return result;
+    }
+
+    private static void connect(Channel udp, FingerprintTrustManager trust, InetSocketAddress remote,
+            CompletableFuture<QuicByteStream> result) {
+        result.whenComplete((stream, error) -> {
+            if (result.isCancelled() || error != null) {
+                udp.close();
+            }
+        });
+        if (result.isDone()) {
+            return; // cancelled while the socket opened
+        }
+        Future<QuicChannel> connecting = QuicChannel.newBootstrap(udp)
+                // Upper bound for a silent server; racing normally decides much sooner.
+                .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MILLIS)
+                .handler(new ChannelInboundHandlerAdapter())
+                .streamHandler(new ChannelInboundHandlerAdapter())
+                .remoteAddress(remote)
+                .connect();
+        connecting.addListener(f -> {
+            if (!f.isSuccess()) {
+                Throwable cause = f.cause();
+                if (trust.mismatch() != null) {
+                    trust.mismatch().addSuppressed(cause);
+                    cause = trust.mismatch();
+                }
+                result.completeExceptionally(cause);
+                return;
+            }
+            QuicChannel connection = (QuicChannel) f.getNow();
+            connection.closeFuture().addListener(closed -> udp.close());
+            if (result.isDone()) {
+                connection.close(true, Protocol.CLOSE_NORMAL, Unpooled.EMPTY_BUFFER);
+                return;
+            }
+            connection.createStream(QuicStreamType.BIDIRECTIONAL, new ChannelInboundHandlerAdapter())
+                    .addListener(s -> {
+                        if (!s.isSuccess()) {
+                            connection.close(true, Protocol.CLOSE_INTERNAL_ERROR, Unpooled.EMPTY_BUFFER);
+                            result.completeExceptionally(s.cause());
+                            return;
+                        }
+                        NettyQuicByteStream stream = new NettyQuicByteStream((QuicStreamChannel) s.getNow());
+                        if (!result.complete(stream)) {
+                            stream.close(); // cancelled meanwhile
+                        }
+                    });
+        });
+        result.whenComplete((stream, error) -> {
+            if (result.isCancelled()) {
+                connecting.cancel(false);
+            }
+        });
     }
 
     private static EventLoopGroup group() {
