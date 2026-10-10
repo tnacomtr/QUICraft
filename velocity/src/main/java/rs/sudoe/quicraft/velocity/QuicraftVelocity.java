@@ -3,12 +3,15 @@ package rs.sudoe.quicraft.velocity;
 
 import com.google.inject.Inject;
 import com.velocitypowered.api.event.Subscribe;
+import com.velocitypowered.api.event.connection.PluginMessageEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
+import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.config.ProxyConfig;
+import com.velocitypowered.api.proxy.messages.MinecraftChannelIdentifier;
 import com.velocitypowered.proxy.network.ConnectionManager;
 import com.velocitypowered.proxy.network.ServerChannelInitializerHolder;
 import com.velocitypowered.proxy.network.TransportType;
@@ -20,7 +23,9 @@ import java.net.InetSocketAddress;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
+import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.connect.FallbackReport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
@@ -38,6 +43,9 @@ public final class QuicraftVelocity {
     private EventLoopGroup workers;
     private QuicListener listener;
     private StatusAdvertiser advertiser;
+    /** Set while QUIC runs: clients that fell back to TCP report it here (docs/protocol.md §6). */
+    volatile FallbackReport.Log fallbackLog;
+    static final MinecraftChannelIdentifier FALLBACK_CHANNEL = MinecraftChannelIdentifier.from(Protocol.FALLBACK_CHANNEL);
 
     @Inject
     public QuicraftVelocity(ProxyServer proxy, Logger logger, @DataDirectory Path dataDirectory) {
@@ -60,6 +68,26 @@ public final class QuicraftVelocity {
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
         stop();
+    }
+
+    /**
+     * A player's {@code quicraft:fallback} report: untrusted, so it only feeds the rate-limited
+     * hint in the log, and it never reaches the backend.
+     */
+    @Subscribe
+    public void onPluginMessage(PluginMessageEvent event) {
+        try {
+            if (!FALLBACK_CHANNEL.equals(event.getIdentifier()) || !(event.getSource() instanceof Player)) {
+                return;
+            }
+            event.setResult(PluginMessageEvent.ForwardResult.handled());
+            FallbackReport.Log log = fallbackLog;
+            if (log != null) {
+                log.report(event.getData());
+            }
+        } catch (Throwable t) {
+            logger.debug("QUICraft: handling a fallback report failed", t);
+        }
     }
 
     @SuppressWarnings("deprecation") // ServerChannelInitializerHolder.set: internal, but the only hook
@@ -100,6 +128,8 @@ public final class QuicraftVelocity {
         advertiser = new StatusAdvertiser(
                 Advertisement.v1(listener.localAddress().getPort(), identity.fingerprint()), logger);
         holder.set(new AdvertisingInitializer(holder.get(), advertiser, logger));
+        fallbackLog = new FallbackReport.Log(listener.localAddress().getPort());
+        proxy.getChannelRegistrar().register(FALLBACK_CHANNEL);
         logger.info("QUICraft: QUIC listening on UDP {} (fingerprint {}); open this UDP port in your firewall",
                 listener.localAddress(), identity.fingerprint());
     }
@@ -129,6 +159,7 @@ public final class QuicraftVelocity {
     }
 
     private void stop() {
+        fallbackLog = null;
         if (advertiser != null) {
             advertiser.withdraw();
             advertiser = null;
