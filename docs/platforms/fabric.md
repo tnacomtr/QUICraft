@@ -65,7 +65,11 @@ The connect screen's call to `Connection.connect(address, holder, connection)` g
    registered after that, so `Connection.channelActive` fires as on TCP. A TCP winner of a race is
    already active: the pipeline is installed in a loop task (after Netty's own `channelActive`)
    and `Connection.channelActive` is called once by hand.
-4. The screen gets a future that completes when the `Connection` is active on the winner. Its
+4. Any QUICraft failure in steps 2–3 before the `Connection` is attached to a channel (core
+   throwing, the winner unusable) falls back to vanilla's own `Connection.connect`, in `auto`
+   mode; only a TCP failure (`ClientConnector.TcpConnectException`: the server is unreachable)
+   fails the join, with TCP's error, as vanilla would. `quic-only` fails with QUIC's error.
+5. The screen gets a future that completes when the `Connection` is active on the winner. Its
    Cancel button cancels the future, which abandons the race and closes whatever connects later.
    The future's `channel()` is a placeholder; the screen never uses it.
 
@@ -97,6 +101,7 @@ client and an in-process dedicated server with the mod, headless under Xvfb.
 | `QuicOnlyGameTest` | `quic-only` joins over QUIC; with a dead QUIC port it ends on the disconnected screen (no fallback, no hang) |
 | `JoinTimingGameTest` | opt-in (`-Pquicraft.joinTimings=N`): TCP vs QUIC join timings, see docs/benchmarks.md |
 | `FaultInjectionGameTest` | every hook throwing on client and server (`Hooks.setFaultInjection`): server list ping works, join over TCP, full play session |
+| `AsyncFaultInjectionGameTest` | each stage of the asynchronous connect throwing on its own (status query, QUIC connect, using the winner, installing a TCP winner): join over TCP each time |
 
 ```sh
 xvfb-run -a ./gradlew :fabric-26x:runClientGameTest :fabric-1.21.11:runClientGameTest

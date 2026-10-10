@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core.connect;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -50,7 +51,7 @@ class ClientConnectorTest {
     }
 
     /** A platform whose answers the test sets. */
-    static final class FakePlatform implements ClientConnector.Platform<String> {
+    static class FakePlatform implements ClientConnector.Platform<String> {
         CompletableFuture<Optional<Advertisement>> status = CompletableFuture.completedFuture(Optional.of(ad));
         CompletableFuture<QuicByteStream> quic = CompletableFuture.completedFuture(new FakeStream());
         CompletableFuture<String> tcp = CompletableFuture.completedFuture("tcp");
@@ -249,5 +250,46 @@ class ClientConnectorTest {
         assertTrue(p.quic.isCancelled(), "the QUIC attempt is cancelled");
         p.tcp.complete("late");
         assertEquals(java.util.Collections.singletonList("late"), p.tcpClosed);
+    }
+
+    @Test
+    void tcpFailuresAreMarkedSoThePlatformDoesNotRetry() throws Exception {
+        ConnectException refused = new ConnectException("Connection refused");
+        FakePlatform none = new FakePlatform();
+        none.status = CompletableFuture.completedFuture(Optional.<Advertisement>empty());
+        none.tcp = new CompletableFuture<>();
+        none.tcp.completeExceptionally(refused);
+        ExecutionException e = assertThrows(ExecutionException.class, () -> connector(new AdvertisementCache(),
+                FailureCache.load(null)).connect(SERVER, Mode.AUTO, none).get(5, TimeUnit.SECONDS));
+        assertTrue(e.getCause() instanceof ClientConnector.TcpConnectException);
+        assertSame(refused, e.getCause().getCause());
+        assertEquals("Connection refused", e.getCause().getMessage());
+
+        AdvertisementCache ads = new AdvertisementCache();
+        ads.record(SERVER, Optional.of(ad));
+        FakePlatform both = new FakePlatform();
+        both.quic = new CompletableFuture<>();
+        both.quic.completeExceptionally(new IOException("quic down"));
+        both.tcp = new CompletableFuture<>();
+        both.tcp.completeExceptionally(refused);
+        ExecutionException e2 = assertThrows(ExecutionException.class, () -> connector(ads, FailureCache.load(null))
+                .connect(SERVER, Mode.AUTO, both).get(5, TimeUnit.SECONDS));
+        assertTrue(e2.getCause() instanceof ClientConnector.TcpConnectException);
+        assertSame(refused, e2.getCause().getCause());
+    }
+
+    @Test
+    void aPlatformBugIsNotATcpFailure() throws Exception {
+        AdvertisementCache ads = new AdvertisementCache();
+        ads.record(SERVER, Optional.of(ad));
+        FakePlatform broken = new FakePlatform() {
+            @Override
+            public ConnectionRace.Tcp<String> tcp() {
+                throw new IllegalStateException("bug");
+            }
+        };
+        ExecutionException e = assertThrows(ExecutionException.class, () -> connector(ads, FailureCache.load(null))
+                .connect(SERVER, Mode.AUTO, broken).get(5, TimeUnit.SECONDS));
+        assertFalse(e.getCause() instanceof ClientConnector.TcpConnectException, "the platform falls back to vanilla");
     }
 }
