@@ -36,6 +36,7 @@ Defined in `testkit/netem/profiles.sh`; every value is per direction.
 | clean | none | Docker bridge only |
 | loss | `loss 2%` | 2% random loss each way |
 | delay | `delay 75ms` | +150 ms round trip, no jitter (jitter would also reorder) |
+| delayloss | `delay 75ms loss 2%` | both: loss recovery that has a real round trip to wait for |
 | reorder | `delay 10ms reorder 25% 50%` | 25% of packets (50% correlated) skip the 10 ms delay and overtake earlier ones |
 
 ### Metrics
@@ -507,12 +508,23 @@ single-use token (protocol.md §8; needs netty/0003, §11).
   (first login response 4.2 vs 4.5 ms, join 293.7 vs 294.4 ms; CIs span 0). QUIC's first login
   response stays ~2 ms behind TCP's (2.2 ms): the handshake's local cost, which a round trip
   saved doesn't touch at this RTT.
+- **Under loss** (`TRANSPORTS=quic-0rtt`, Velocity, online mode, run
+  `20261010T153059Z-velocity-quic-0rtt`, with the 10 s confirmation deadline): `loss` N=80 and
+  `delayloss` (+150 ms RTT and 2% loss each way) N=20. 100 of 100 joins succeeded, 0 disconnects,
+  0-RTT on all of them. delayloss: first login response 154.1 ms, join 1465.7 ms (median; max
+  2408.2). loss: 3.1 ms and 275.6 ms (max 1314.3).
+- **0-RTT the server rejects** (session ticket from before a server restart; `EarlyDataTest`,
+  relay at 200 ms RTT): the data is resent only once quiche's loss detection declares it lost,
+  so the first reply comes 4.18 RTT after the first datagram, against 2.03 RTT for a join
+  without 0-RTT. That is about +320 ms at 150 ms RTT, once, on the first rejoin after the server
+  restarted. Fix (not done): make quiche treat in-flight 0-RTT packets as lost as soon as the
+  server rejects them.
 - **Fallback after 0-RTT** (`SCENARIO=early-fallback`, clean, N=4 each): a 0-RTT attempt whose
   server-to-client UDP is dropped is abandoned after the head start, then the same player joins
   over TCP. Velocity offline and online, Fabric offline and online: 16 of 16 TCP joins succeeded.
   On Velocity the plugin closed the abandoned login each time (it had registered the player, in
-  offline mode); on Fabric the abandoned login timed out by itself ~3 s later without getting in
-  the way.
+  offline mode); on Fabric the abandoned login timed out by itself ~3 s later (the confirmation
+  deadline was 3 s in this run; now 10 s) without getting in the way.
 
 ### No desync, fault injection, fallback
 

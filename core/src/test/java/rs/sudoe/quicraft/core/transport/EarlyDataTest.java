@@ -86,7 +86,7 @@ class EarlyDataTest {
     @AfterEach
     void reset() {
         Faults.set();
-        QuicServer.confirmMillis = 3_000;
+        QuicServer.confirmMillis = 10_000;
     }
 
     @Test
@@ -206,17 +206,24 @@ class EarlyDataTest {
         InetSocketAddress address;
         try (GameServer game = new GameServer(identity)) {
             address = game.address();
-            Join.run(address, identity, "inputs", FLIGHT, null).closeAfterTicket(null);
         }
-        try (GameServer game = new GameServer(identity, address)) {
-            Join second = Join.run(address, identity, "inputs", FLIGHT, null);
-            assertTrue(second.early.sent());
-            second.stream.write(ByteBuffer.wrap(AFTER));
-            second.stream.flush();
-            assertArrayEquals(concat(FLIGHT, AFTER), second.collector.await(FLIGHT.length + AFTER.length, 5,
-                    TimeUnit.SECONDS));
-            assertArrayEquals(concat(FLIGHT, AFTER), game.received(0, FLIGHT.length + AFTER.length));
-            second.stream.close();
+        try (DelayRelay relay = new DelayRelay(address, 100)) {
+            try (GameServer game = new GameServer(identity, address)) {
+                Join.run(relay, identity, "inputs", FLIGHT).closeAfterTicket(relay);
+            }
+            // Restarted: new ticket keys, so the 0-RTT data is rejected and quiche resends it.
+            try (GameServer game = new GameServer(identity, address)) {
+                Join second = Join.run(relay, identity, "inputs", FLIGHT);
+                assertTrue(second.early.sent());
+                System.out.printf("rejected 0-RTT: first reply %.2f RTT after the first datagram%n",
+                        second.replyRtt(relay));
+                second.stream.write(ByteBuffer.wrap(AFTER));
+                second.stream.flush();
+                assertArrayEquals(concat(FLIGHT, AFTER), second.collector.await(FLIGHT.length + AFTER.length, 5,
+                        TimeUnit.SECONDS));
+                assertArrayEquals(concat(FLIGHT, AFTER), game.received(0, FLIGHT.length + AFTER.length));
+                second.stream.close();
+            }
         }
     }
 

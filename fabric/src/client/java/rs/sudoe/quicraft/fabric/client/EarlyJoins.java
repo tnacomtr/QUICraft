@@ -25,6 +25,8 @@ public final class EarlyJoins {
             @Nullable TransferState transferState) {}
 
     private static volatile @Nullable Request current;
+    /** The TCP address (cache key) of the join in progress, for the TCP retry. */
+    private static volatile @Nullable InetSocketAddress currentTcp;
     /** One join to this server (TCP address key) goes vanilla TCP: the retry after a mismatch. */
     private static volatile @Nullable InetSocketAddress tcpOnce;
 
@@ -41,6 +43,7 @@ public final class EarlyJoins {
      * version), or null if not known: then no 0-RTT and nothing recorded.
      */
     static @Nullable String joinInputs(InetSocketAddress address) {
+        currentTcp = ClientConnector.key(address);
         Request request = current;
         User user = Minecraft.getInstance().getUser();
         if (request == null || user == null) {
@@ -78,8 +81,8 @@ public final class EarlyJoins {
         Minecraft minecraft = Minecraft.getInstance();
         QuicraftFabric.LOG.info("QUICraft: joining {} again over TCP (the 0-RTT data didn't match the game's)",
                 request.address());
-        tcpOnce = ClientConnector.key(connection.getRemoteAddress() instanceof InetSocketAddress isa ? isa
-                : new InetSocketAddress(request.address().getHost(), request.address().getPort()));
+        // The TCP address, not the connection's: over QUIC that is the UDP port, which may differ.
+        tcpOnce = currentTcp;
         minecraft.setScreen(request.parent()); // startConnecting refuses while a ConnectScreen shows
         ConnectScreen.startConnecting(request.parent(), minecraft, request.address(), request.data(),
                 request.quickPlay(), request.transferState());

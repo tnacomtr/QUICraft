@@ -236,8 +236,11 @@ idea: derive H from the RTT the server-list ping already measured.
 - **Early release.** Stream data that arrives before the handshake has completed is passed to the
   game at once if its preamble carries a token the server holds. Otherwise (no token, unknown,
   used, expired) it waits until the handshake has completed, as without 0-RTT.
-- **Confirmation.** A connection passed early must complete its handshake within **3 s**. If
-  not, the server closes it with `0x3`, and the game sees an ordinary disconnect.
+- **Confirmation.** A connection passed early must complete its handshake within **10 s**. If
+  not, the server closes it with `0x3`, and the game sees an ordinary disconnect. Long enough
+  that a client which already counts QUIC as the winner (its handshake completed) gets its
+  Finished through to the server under loss and high RTT; a login it abandoned is closed sooner
+  where that matters (abandoned logins, below).
 - Not bound to the client's address: a rejoin after a network change still gets 0-RTT *(user)*.
 
 **0-RTT (client).**
@@ -264,7 +267,7 @@ idea: derive H from the RTT the server-list ping already measured.
   between 20 and 250 ms), so the close reaches the server before the TCP login. quiche sends that
   CONNECTION_CLOSE only if the client has received a packet from the server; a client that heard
   nothing (server-to-client UDP lost or blocked) closes silently, and the abandoned login lasts
-  until the server's 3 s confirmation deadline.
+  until the server's 10 s confirmation deadline.
 - **Abandoned logins on the server.** Velocity registers an offline-mode player before Login
   Acknowledged and refuses a second login with the same name ("already connected to this proxy")
   until the first connection closes. So a server platform that holds a name during login MUST,
@@ -286,11 +289,16 @@ idea: derive H from the RTT the server-list ping already measured.
   once; the original then waits for its handshake and gets in a round trip later. The copy stops
   where the game first needs the client: at the encryption response in online mode (nothing
   happens), at Login Acknowledged in offline mode, where the server has already started a login.
-  On Velocity in offline mode that login holds the player's name for up to 3 s, so the real join
-  is refused: an attacker on the path can make one join fail, which dropping packets would do as
-  well. The game sees the copy's source address, unvalidated, for up to 3 s.
+  On Velocity in offline mode that login holds the player's name until the real client's login
+  arrives, which then closes it (abandoned logins, above), or for up to 10 s: an attacker on the
+  path can make one join fail, which dropping packets would do as well. The game sees the copy's
+  source address, unvalidated, for up to 10 s.
 - Needs the security review before release (Phase 4): this changes the earlier rule that early
-  data never reached the game before the handshake completed.
+  data never reached the game before the handshake completed. Also for the review: the platforms'
+  close of unconfirmed early logins by IP and name (who can trigger it: anyone who can open a TCP
+  login with that name from that IP), and the token store under a connection flood (each accepted
+  stream issues a token; at 65 536 the oldest go, which only costs those clients their next 0-RTT;
+  Phase 4's per-IP and global limits bound the rate).
 
 ## 9. Transport parameters
 
