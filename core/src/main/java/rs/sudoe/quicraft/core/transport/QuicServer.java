@@ -111,7 +111,7 @@ public final class QuicServer implements Closeable {
     }
 
     /** Deadline for a connection passed early to complete its handshake. Tests shorten it. */
-    static volatile long confirmMillis = 3_000;
+    static volatile long confirmMillis = 10_000;
 
     private static io.netty.channel.ChannelHandler codec(ServerIdentity identity, TransportConfig config,
             StreamAcceptor acceptor, Unconfirmed unconfirmed) throws Exception {

@@ -8,6 +8,8 @@ netem_args() {
         clean)   echo "" ;;
         loss)    echo "loss 2%" ;;
         delay)   echo "delay 75ms" ;;
+        # The two together: loss recovery with a real round trip to wait for.
+        delayloss) echo "delay 75ms loss 2%" ;;
         # 25% of packets skip the 10 ms delay and overtake the ones queued before them.
         reorder) echo "delay 10ms reorder 25% 50%" ;;
         # Reordering as real paths produce it: delay jitter around a real base delay (each

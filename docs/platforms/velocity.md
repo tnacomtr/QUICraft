@@ -48,7 +48,7 @@ each release of the plugin.
   before Login Acknowledged (`AuthSessionHandler`, read in 4.2.0): in offline mode a login started
   by 0-RTT data holds the name right away. If the client then abandons that QUIC attempt (TCP won
   the race), its TCP login would be refused with "already connected to this proxy" until the
-  abandoned connection closes, up to the server's 3 s confirmation deadline.
+  abandoned connection closes, up to the server's 10 s confirmation deadline.
 - So the plugin subscribes to `PreLoginEvent` (public API, highest priority), which fires for every
   login before Velocity registers anything: it calls core's `closeUnconfirmedEarly(remote
   address, username)`, which closes unconfirmed early QUIC connections from the same IP with that

@@ -107,7 +107,7 @@ public final class ClientConnect {
                 if (outcome.quic() != null) {
                     QuicraftFabric.LOG.info("QUICraft: connected to {} over QUIC{}", outcome.quic().remoteAddress(),
                             outcome.quic() instanceof ClientStream cs && cs.sentEarlyData() ? " (0-RTT)" : "");
-                    useQuic(outcome.quic(), loop, connection, promise, attached);
+                    useQuic(outcome.quic(), loop, connection, promise, attached, mode);
                 } else {
                     if (outcome.fallback() != null) {
                         QuicraftFabric.LOG.info("QUICraft: connected to {} over TCP; QUIC failed ({})", address,
@@ -166,8 +166,9 @@ public final class ClientConnect {
     }
 
     private static void useQuic(QuicByteStream stream, EventLoop loop, Connection connection, ChannelPromise promise,
-            boolean[] attached) {
-        if (stream instanceof ClientStream early && early.sentEarlyData()) {
+            boolean[] attached, Mode mode) {
+        // quic-only fails with QUIC's error instead (docs/protocol.md §10): no TCP retry.
+        if (mode != Mode.QUIC_ONLY && stream instanceof ClientStream early && early.sentEarlyData()) {
             // Before the game writes: a first flight that differs from the 0-RTT one closes
             // QUIC, and the disconnect then starts the same join over TCP (EarlyJoins).
             early.onFirstFlightMismatch(() -> Transports.retryOverTcp(connection));

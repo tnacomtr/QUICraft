@@ -30,7 +30,7 @@ public class EarlyDataGameTest implements FabricClientGameTest {
         try (TestDedicatedServerContext server = GameTests.server(context)) {
             join(context, server, true, false, "first join: records the first flight");
             long released = server.computeOnServer(s -> ServerQuic.earlyReleases());
-            join(context, server, true, true, "rejoin: 0-RTT");
+            join(context, server, true, true, "rejoin: 0-RTT", true);
             check(server.computeOnServer(s -> ServerQuic.earlyReleases()) == released + 1,
                     "the server acted on the 0-RTT flight");
 
@@ -74,6 +74,12 @@ public class EarlyDataGameTest implements FabricClientGameTest {
 
     private static void join(ClientGameTestContext context, TestDedicatedServerContext server, boolean quic,
             boolean zeroRtt, String what) {
+        join(context, server, quic, zeroRtt, what, false);
+    }
+
+    /** {@code play}: the full scripted session (PlaySession), checking for desync after the 0-RTT start. */
+    private static void join(ClientGameTestContext context, TestDedicatedServerContext server, boolean quic,
+            boolean zeroRtt, String what, boolean play) {
         long start = System.nanoTime();
         try (var connection = server.connect()) {
             GameTests.waitForChunks(connection);
@@ -81,6 +87,9 @@ public class EarlyDataGameTest implements FabricClientGameTest {
             boolean used = context.computeOnClient(c -> c.getConnection() != null
                     && Transports.usedZeroRtt(c.getConnection().getConnection()));
             check(used == zeroRtt, what + ": 0-RTT " + (zeroRtt ? "used" : "not used"));
+            if (play) {
+                PlaySession.run(context, server, connection);
+            }
             context.waitTicks(10); // the session ticket and the next token arrive
         }
         QuicraftFabricTestLog.info(what + ": " + (System.nanoTime() - start) / 1_000_000 + " ms");
