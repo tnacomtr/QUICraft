@@ -17,6 +17,7 @@ import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.discovery.AdvertisementCache;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
+import rs.sudoe.quicraft.core.transport.EarlyFlight;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 
 /**
@@ -49,8 +50,13 @@ public final class ClientConnector {
         /** A status query over TCP, as vanilla's server list does; the advertisement in it, if any. */
         CompletableFuture<Optional<Advertisement>> queryStatus(InetSocketAddress server);
 
-        /** A QUIC connection to {@code target}, trusted only with {@code fingerprint}. */
-        CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint);
+        /**
+         * A QUIC connection to {@code target}, trusted only with {@code fingerprint}. Pass
+         * {@code early} on to {@link rs.sudoe.quicraft.core.transport.QuicClient}; it is null when
+         * the join has no 0-RTT inputs.
+         */
+        CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint,
+                EarlyFlight early);
 
         /** The platform's TCP connection, without the game protocol on it yet. */
         ConnectionRace.Tcp<T> tcp();
@@ -154,6 +160,15 @@ public final class ClientConnector {
      */
     public <T> CompletableFuture<Outcome<T>> connect(InetSocketAddress server, ConnectDecision.Mode mode,
             Platform<T> platform) {
+        return connect(server, mode, null, platform);
+    }
+
+    /**
+     * As {@link #connect(InetSocketAddress, ConnectDecision.Mode, Platform)}, with the join's 0-RTT
+     * inputs (docs/protocol.md §8; see {@link EarlyFlight}), or null for none.
+     */
+    public <T> CompletableFuture<Outcome<T>> connect(InetSocketAddress server, ConnectDecision.Mode mode,
+            String joinInputs, Platform<T> platform) {
         CompletableFuture<Outcome<T>> result = new CompletableFuture<>();
         InetSocketAddress key = key(server);
         Optional<Advertisement> cached = advertisements.fresh(key);
@@ -174,7 +189,7 @@ public final class ClientConnector {
             }
             Optional<Advertisement> found = error == null ? ad : Optional.<Advertisement>empty();
             try {
-                decided(server, mode, found, platform, result);
+                decided(server, mode, found, joinInputs, platform, result);
             } catch (Throwable t) {
                 result.completeExceptionally(t);
             }
@@ -191,10 +206,11 @@ public final class ClientConnector {
             query.completeExceptionally(t);
         }
         CompletableFuture<Optional<Advertisement>> bounded = new CompletableFuture<>();
-        ScheduledFuture<?> timeout = platform.scheduler().schedule(
-                () -> bounded.completeExceptionally(new TimeoutException("status query")),
-                statusQueryTimeoutMillis, TimeUnit.MILLISECONDS);
         final CompletableFuture<Optional<Advertisement>> running = query;
+        ScheduledFuture<?> timeout = platform.scheduler().schedule(() -> {
+            running.cancel(false); // before the connect goes on without it
+            bounded.completeExceptionally(new TimeoutException("status query"));
+        }, statusQueryTimeoutMillis, TimeUnit.MILLISECONDS);
         query.whenComplete((ad, error) -> {
             timeout.cancel(false);
             if (error == null) {
@@ -214,7 +230,8 @@ public final class ClientConnector {
     }
 
     private <T> void decided(InetSocketAddress server, ConnectDecision.Mode mode, Optional<Advertisement> ad,
-            Platform<T> platform, CompletableFuture<Outcome<T>> result) {
+            String joinInputs, Platform<T> platform, CompletableFuture<Outcome<T>> result) {
+        EarlyFlight early = joinInputs == null ? null : new EarlyFlight(joinInputs);
         boolean allowed = ad.isPresent() && allows(server, ad.get());
         ConnectDecision.Transport transport = ConnectDecision.decide(mode, quicAvailable.getAsBoolean(), ad, allowed);
         switch (transport) {
@@ -222,11 +239,11 @@ public final class ClientConnector {
                 tcpOnly(platform, result);
                 break;
             case QUIC_ONLY:
-                quicOnly(server, ad, platform, result);
+                quicOnly(server, ad, early, platform, result);
                 break;
             case RACE:
             default:
-                race(server, ad.get(), platform, result);
+                race(server, ad.get(), early, platform, result);
                 break;
         }
     }
@@ -243,8 +260,8 @@ public final class ClientConnector {
         });
     }
 
-    private <T> void quicOnly(InetSocketAddress server, Optional<Advertisement> ad, Platform<T> platform,
-            CompletableFuture<Outcome<T>> result) {
+    private <T> void quicOnly(InetSocketAddress server, Optional<Advertisement> ad, EarlyFlight early,
+            Platform<T> platform, CompletableFuture<Outcome<T>> result) {
         if (!ad.isPresent()) {
             result.completeExceptionally(new IOException("QUIC only: the server does not advertise QUIC"));
             return;
@@ -255,7 +272,7 @@ public final class ClientConnector {
             return;
         }
         CompletableFuture<QuicByteStream> attempt = platform.connectQuic(quicTarget(server, ad.get()),
-                ad.get().fingerprint());
+                ad.get().fingerprint(), early);
         result.whenComplete((o, e) -> {
             if (result.isCancelled()) {
                 attempt.cancel(false);
@@ -270,12 +287,13 @@ public final class ClientConnector {
         });
     }
 
-    private <T> void race(InetSocketAddress server, Advertisement ad, Platform<T> platform,
+    private <T> void race(InetSocketAddress server, Advertisement ad, EarlyFlight early, Platform<T> platform,
             CompletableFuture<Outcome<T>> result) {
         InetSocketAddress target = quicTarget(server, ad);
-        ConnectionRace.Tcp<T> tcp = platform.tcp();
+        TimedTcp<T> tcp = new TimedTcp<>(platform.tcp());
         CompletableFuture<ConnectionRace.Result<T>> race = ConnectionRace.race(
-                () -> platform.connectQuic(target, ad.fingerprint()), tcp, HEAD_START_MILLIS, platform.scheduler());
+                () -> platform.connectQuic(target, ad.fingerprint(), early), tcp, HEAD_START_MILLIS,
+                platform.scheduler());
         result.whenComplete((o, e) -> {
             if (result.isCancelled()) {
                 race.cancel(false);
@@ -291,13 +309,59 @@ public final class ClientConnector {
                 if (!result.complete(new Outcome<T>(r.quic(), null, null))) {
                     r.quic().close();
                 }
-            } else {
-                failures.recordFailure(target.getAddress(), target.getPort(), ad.fingerprint());
-                if (!result.complete(new Outcome<T>(null, r.tcp(), r.quicFailure()))) {
-                    tcp.close(r.tcp());
-                }
+                return;
+            }
+            failures.recordFailure(target.getAddress(), target.getPort(), ad.fingerprint());
+            Outcome<T> outcome = new Outcome<T>(null, r.tcp(), r.quicFailure());
+            if (early != null && early.sent()) {
+                // The server may have started a login on the 0-RTT flight. The lost QUIC attempt
+                // sends CONNECTION_CLOSE; give it one TCP round trip to arrive before the TCP login
+                // (docs/protocol.md §8, "TCP wins after 0-RTT went out").
+                long grace = Math.max(MIN_EARLY_GRACE_MILLIS, Math.min(MAX_EARLY_GRACE_MILLIS, tcp.connectMillis()));
+                platform.scheduler().schedule(() -> {
+                    if (!result.complete(outcome)) {
+                        tcp.close(r.tcp());
+                    }
+                }, grace, TimeUnit.MILLISECONDS);
+            } else if (!result.complete(outcome)) {
+                tcp.close(r.tcp());
             }
         });
+    }
+
+    /** Bounds of the wait after TCP beat a QUIC attempt that sent 0-RTT data. */
+    static final long MIN_EARLY_GRACE_MILLIS = 20;
+    static final long MAX_EARLY_GRACE_MILLIS = 250;
+
+    /** The platform's TCP, timing its connect: a round-trip estimate. */
+    private static final class TimedTcp<T> implements ConnectionRace.Tcp<T> {
+        private final ConnectionRace.Tcp<T> tcp;
+        private volatile long connectMillis = MAX_EARLY_GRACE_MILLIS;
+
+        TimedTcp(ConnectionRace.Tcp<T> tcp) {
+            this.tcp = tcp;
+        }
+
+        @Override
+        public CompletableFuture<T> connect() {
+            long start = System.nanoTime();
+            CompletableFuture<T> attempt = tcp.connect();
+            attempt.whenComplete((c, e) -> {
+                if (e == null) {
+                    connectMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                }
+            });
+            return attempt;
+        }
+
+        @Override
+        public void close(T connection) {
+            tcp.close(connection);
+        }
+
+        long connectMillis() {
+            return connectMillis;
+        }
     }
 
     private boolean allows(InetSocketAddress server, Advertisement ad) {

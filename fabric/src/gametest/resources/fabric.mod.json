@@ -9,6 +9,7 @@
     "fabric-client-gametest": [
       "rs.sudoe.quicraft.fabric.gametest.SettingsScreenGameTest",
       "rs.sudoe.quicraft.fabric.gametest.QuicJoinGameTest",
+      "rs.sudoe.quicraft.fabric.gametest.EarlyDataGameTest",
       "rs.sudoe.quicraft.fabric.gametest.FallbackGameTest",
       "rs.sudoe.quicraft.fabric.gametest.TcpOnlyGameTest",
       "rs.sudoe.quicraft.fabric.gametest.QuicOnlyGameTest",

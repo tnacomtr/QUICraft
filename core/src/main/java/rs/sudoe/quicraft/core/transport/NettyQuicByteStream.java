@@ -46,6 +46,10 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
         channel.pipeline().addLast(this);
     }
 
+    io.netty.handler.codec.quic.QuicChannel connection() {
+        return channel.parent();
+    }
+
     @Override
     public InetSocketAddress remoteAddress() {
         return (InetSocketAddress) channel.parent().remoteSocketAddress();
@@ -121,6 +125,11 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     @Override
     public void read() {
         channel.read();
+    }
+
+    /** For a close that bypasses {@link #close()}: isOpen() is false from now on. */
+    void markClosing() {
+        closeRequested = true;
     }
 
     @Override

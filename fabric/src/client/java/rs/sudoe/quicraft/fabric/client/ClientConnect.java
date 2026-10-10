@@ -33,6 +33,8 @@ import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 import rs.sudoe.quicraft.core.connect.ConnectionRace;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
+import rs.sudoe.quicraft.core.transport.ClientStream;
+import rs.sudoe.quicraft.core.transport.EarlyFlight;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
 import rs.sudoe.quicraft.fabric.Hooks;
@@ -57,7 +59,7 @@ public final class ClientConnect {
         try {
             Hooks.enter("connect");
             QuicraftClient client = QuicraftClient.get();
-            if (client != null
+            if (client != null && !EarlyJoins.takeTcpOnce(address)
                     && client.connector().plan(address, client.mode()) == ClientConnector.Plan.CONNECT) {
                 ours = start(client, address, holder, connection, vanilla);
             }
@@ -73,8 +75,15 @@ public final class ClientConnect {
         EventLoop loop = holder.eventLoopGroup().next();
         // The screen only syncs on and cancels this future, never asks for its channel.
         ChannelPromise promise = new DefaultChannelPromise(new EmbeddedChannel(), loop);
+        String joinInputs = null;
+        try {
+            Hooks.enter("early inputs");
+            joinInputs = EarlyJoins.joinInputs(address);
+        } catch (Throwable t) {
+            Hooks.failed("early inputs", t); // no 0-RTT this time
+        }
         CompletableFuture<ClientConnector.Outcome<Channel>> attempt = client.connector()
-                .connect(address, mode, new Platform(address, holder, loop));
+                .connect(address, mode, joinInputs, new Platform(address, holder, loop));
         promise.addListener(f -> {
             if (f.isCancelled()) {
                 attempt.cancel(false);
@@ -96,7 +105,8 @@ public final class ClientConnect {
             try {
                 Hooks.enter("connect outcome");
                 if (outcome.quic() != null) {
-                    QuicraftFabric.LOG.info("QUICraft: connected to {} over QUIC", outcome.quic().remoteAddress());
+                    QuicraftFabric.LOG.info("QUICraft: connected to {} over QUIC{}", outcome.quic().remoteAddress(),
+                            outcome.quic() instanceof ClientStream cs && cs.sentEarlyData() ? " (0-RTT)" : "");
                     useQuic(outcome.quic(), loop, connection, promise, attached);
                 } else {
                     if (outcome.fallback() != null) {
@@ -157,6 +167,11 @@ public final class ClientConnect {
 
     private static void useQuic(QuicByteStream stream, EventLoop loop, Connection connection, ChannelPromise promise,
             boolean[] attached) {
+        if (stream instanceof ClientStream early && early.sentEarlyData()) {
+            // Before the game writes: a first flight that differs from the 0-RTT one closes
+            // QUIC, and the disconnect then starts the same join over TCP (EarlyJoins).
+            early.onFirstFlightMismatch(() -> Transports.retryOverTcp(connection));
+        }
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
         attached[0] = true;
         installVanillaPipeline(channel, connection);
@@ -260,11 +275,12 @@ public final class ClientConnect {
         }
 
         @Override
-        public CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint) {
+        public CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint,
+                EarlyFlight early) {
             try {
                 Hooks.enter("quic connect"); // a throw here is a QUIC failure: TCP wins the race
                 return GameHost.connect(loop, GameHost.datagramChannelsLike(holder.channelCls()), target, fingerprint,
-                        TransportConfig.DEFAULT);
+                        TransportConfig.DEFAULT, early);
             } catch (Throwable t) {
                 CompletableFuture<QuicByteStream> failed = new CompletableFuture<>();
                 failed.completeExceptionally(t);

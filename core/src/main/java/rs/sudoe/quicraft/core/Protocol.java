@@ -15,6 +15,8 @@ public final class Protocol {
     public static final int CLOSE_NORMAL = 0x0;
     public static final int CLOSE_PROTOCOL_VIOLATION = 0x1;
     public static final int CLOSE_INTERNAL_ERROR = 0x2;
+    /** A connection passed to the game on 0-RTT data didn't complete its handshake in time. */
+    public static final int CLOSE_EARLY_UNCONFIRMED = 0x3;
 
     private Protocol() {}
 }

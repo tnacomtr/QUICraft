@@ -6,6 +6,7 @@
   "client": [
     "ClientHandshakePacketListenerImplMixin",
     "ConnectScreenConnectorMixin",
+    "ConnectScreenStartMixin",
     "DebugEntryTpsMixin",
     "JoinMultiplayerScreenMixin",
     "ServerStatusPingerMixin"

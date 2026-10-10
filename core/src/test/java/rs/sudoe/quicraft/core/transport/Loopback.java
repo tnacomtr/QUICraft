@@ -48,9 +48,17 @@ final class Loopback {
         private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         final CountDownLatch closed = new CountDownLatch(1);
         volatile Throwable closeCause;
+        private long firstDataNanos;
+
+        synchronized long firstDataNanos() {
+            return firstDataNanos;
+        }
 
         @Override
         public synchronized void onData(ByteBuffer data) {
+            if (firstDataNanos == 0) {
+                firstDataNanos = System.nanoTime();
+            }
             byte[] chunk = new byte[data.remaining()];
             data.get(chunk);
             bytes.write(chunk, 0, chunk.length);

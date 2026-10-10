@@ -60,6 +60,11 @@ final class QuicListener implements AutoCloseable {
         }
     }
 
+    /** See {@link QuicServer#closeUnconfirmedEarly}. */
+    java.util.concurrent.CompletableFuture<Integer> closeUnconfirmedEarly(InetSocketAddress login, String name) {
+        return server.closeUnconfirmedEarly(login, name);
+    }
+
     private static void accept(QuicByteStream stream, Supplier<ChannelInitializer<Channel>> initializer,
             EventLoopGroup loop, Logger logger) {
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
