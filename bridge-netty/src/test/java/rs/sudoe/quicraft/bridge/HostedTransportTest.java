@@ -169,6 +169,100 @@ class HostedTransportTest {
         server.close();
     }
 
+    /**
+     * Server that answers the client's first byte with {@code payload}, then closes once the
+     * write completed (like Velocity's disconnect: write, then close). A QUIC stream reaches the
+     * server only once the client sends on it; Minecraft's client always speaks first.
+     */
+    private QuicServer sendThenClose(DatagramChannel socket, byte[] payload) throws Exception {
+        return QuicServer.bind(GameHost.loop(serverLoop), GameHost.socket(socket), identity, TransportConfig.DEFAULT,
+                stream -> {
+                    QuicBridgeChannel ch = new QuicBridgeChannel(stream);
+                    ch.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                        private boolean sent;
+
+                        @Override
+                        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+                            io.netty.util.ReferenceCountUtil.release(msg);
+                            if (!sent) {
+                                sent = true;
+                                ctx.writeAndFlush(Unpooled.wrappedBuffer(payload))
+                                        .addListener(io.netty.channel.ChannelFutureListener.CLOSE);
+                            }
+                        }
+                    });
+                    serverLoop.register(ch);
+                });
+    }
+
+    /**
+     * A game that decodes slowly still gets everything the peer sent before it closed, before
+     * channelInactive, like TCP (a kick message must arrive).
+     */
+    @Test
+    void dataSentBeforeTheCloseReachesASlowPipelineBeforeInactive() throws Exception {
+        byte[] payload = new byte[2_000_000];
+        new Random(5).nextBytes(payload);
+        DatagramChannel serverUdp = udp(serverLoop);
+        try (QuicServer server = sendThenClose(serverUdp, payload)) {
+            DatagramChannel clientUdp = udp(clientLoop);
+            QuicByteStream stream = QuicClient.connect(GameHost.loop(clientLoop), GameHost.socket(clientUdp),
+                    serverUdp.localAddress(), identity.fingerprint(), TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
+            java.io.ByteArrayOutputStream got = new java.io.ByteArrayOutputStream();
+            CompletableFuture<Integer> atInactive = new CompletableFuture<>();
+            QuicBridgeChannel ch = new QuicBridgeChannel(stream);
+            ch.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                @Override
+                public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+                    io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) msg;
+                    buf.readBytes(got, buf.readableBytes());
+                    buf.release();
+                    Thread.sleep(0, 200_000); // a slow decoder
+                }
+
+                @Override
+                public void channelInactive(ChannelHandlerContext ctx) {
+                    atInactive.complete(got.size());
+                }
+            });
+            clientLoop.register(ch).sync();
+            ch.writeAndFlush(Unpooled.wrappedBuffer(new byte[] {1}));
+            assertTrue(atInactive.get(20, TimeUnit.SECONDS) == payload.length,
+                    () -> "only " + got.size() + " of " + payload.length + " bytes before inactive");
+            assertArrayEquals(payload, got.toByteArray());
+        }
+    }
+
+    /** With reading paused, what the bridge holds stays bounded: the stream pauses, QUIC flow control stops the peer. */
+    @Test
+    void heldDataIsBoundedWhileTheGameIsNotReading() throws Exception {
+        byte[] payload = new byte[24 << 20];
+        new Random(6).nextBytes(payload);
+        DatagramChannel serverUdp = udp(serverLoop);
+        try (QuicServer server = sendThenClose(serverUdp, payload)) {
+            DatagramChannel clientUdp = udp(clientLoop);
+            QuicByteStream stream = QuicClient.connect(GameHost.loop(clientLoop), GameHost.socket(clientUdp),
+                    serverUdp.localAddress(), identity.fingerprint(), TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
+            QuicBridgeChannelTest.Collector collector = new QuicBridgeChannelTest.Collector();
+            QuicBridgeChannel ch = new QuicBridgeChannel(stream);
+            ch.config().setAutoRead(false);
+            ch.pipeline().addLast(collector);
+            clientLoop.register(ch).sync();
+            collector.channel = ch;
+            ch.writeAndFlush(Unpooled.wrappedBuffer(new byte[] {1}));
+            long maxHeld = 0;
+            for (int i = 0; i < 30; i++) {
+                Thread.sleep(100);
+                maxHeld = Math.max(maxHeld, clientLoop.submit(ch::heldBytesForTest).get());
+            }
+            long bound = QuicBridgeChannel.HELD_HIGH + (16L << 20); // + one stream window in flight
+            long observed = maxHeld;
+            assertTrue(observed <= bound, () -> "held " + observed + " bytes");
+            ch.config().setAutoRead(true);
+            assertArrayEquals(payload, collector.await(payload.length));
+        }
+    }
+
     @Test
     void cancellingTheConnectClosesTheSocket() throws Exception {
         // Nothing answers on this socket: the attempt hangs until cancelled.

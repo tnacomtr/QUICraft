@@ -169,6 +169,13 @@ idea: derive H from the RTT the server-list ping already measured.
   once negotiated, all unchanged. The server MUST NOT open streams in v1. Other streams are
   reserved for later versions.
 - End of session: a stream FIN or connection close is treated like a TCP close.
+- **Closing, like TCP.** An endpoint that closes sends what it wrote, then FIN on stream 0, and
+  lets the peer close the connection: the peer reads FIN only after all the data before it, so
+  nothing is lost (e.g. a disconnect message sent right before the close). The peer that
+  receives FIN closes the connection with `0x0`. If no answer comes, the closing endpoint closes
+  the connection itself after 10 s. An endpoint that never wrote on the stream (e.g. a QUIC
+  attempt that lost the race, §5), or that already received FIN, closes the connection at once.
+  Closing the connection immediately instead would discard data still unsent or unacknowledged.
 - Application close error codes: `0x0` normal, `0x1` protocol violation, `0x2` internal error.
 - Multi-stream (Phase 5) needs a separately reviewed encryption design; the proposed one is §12.
 
@@ -288,15 +295,16 @@ connection-ID routing between sockets (Phase 9).
 ### QUICraft's Netty QUIC build
 
 `core` doesn't use Maven Central's `netty-codec-classes-quic`. It uses QUICraft's build,
-`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft1` from
+`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft2` from
 `natives/`. That is Netty `netty-4.2.19.Final` (64cc10f3), quiche `be47c501` and BoringSSL
-`d03dbc3e`, the same revisions as upstream 4.2.19, plus three patches:
+`d03dbc3e`, the same revisions as upstream 4.2.19, plus four patches:
 
 | Patch | What it does |
 | --- | --- |
 | `quiche/0001-ffi-relaxed-loss-threshold` | C FFI `quiche_config_set_enable_relaxed_loss_threshold`. quiche's C API lacks it, including master as of 2026-10-08. |
 | `netty/0001-relaxed-loss-threshold` | `QuicCodecBuilder.relaxedLossThreshold(boolean)`, its JNI binding, and `Quic.isRelaxedLossThresholdSupported()`, which probes the loaded native. |
-| `netty/0002-complete-connect-after-handshake-send` | Completes a client connect as soon as the handshake does (§5). |
+| `netty/0002-complete-connect-after-handshake-send` | Completes a client connect as soon as the handshake does (§5), in a task on the connection's event loop. |
+| `quiche/0002-backport-fc9fe129-handshake-close` | Upstream quiche fc9fe129 (2026-09-25), unchanged. Without it, an application close sent after the client's handshake completed but before HANDSHAKE_DONE (the window netty/0002 opens) never goes out, and the send loop spins forever. |
 
 - `natives/build-linux.sh` runs Netty's own Maven build unchanged in Docker, on AlmaLinux 8 with
   pinned GCC 13, Rust 1.98.0, CMake 3.31.9, Ninja 1.12.1 and Temurin 11. quiche commits no

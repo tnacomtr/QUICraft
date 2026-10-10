@@ -2,7 +2,6 @@
 package rs.sudoe.quicraft.core.transport;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
@@ -28,6 +27,17 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     private final java.util.concurrent.atomic.AtomicLong inFlight = new java.util.concurrent.atomic.AtomicLong();
     private volatile boolean throttled;
     private final AtomicBoolean closedNotified = new AtomicBoolean();
+    /** Hard close after this long if the peer never answers our FIN. */
+    static final long LINGER_MILLIS = 10_000;
+    private volatile boolean closeRequested;
+    /** Event loop only: the peer's FIN arrived. */
+    private boolean inputShutdown;
+    /** Event loop only: our FIN is queued. */
+    private boolean outputShutdown;
+    /** Event loop only: close() was called; FIN goes out once every write is in quiche. */
+    private boolean finWhenWritten;
+    /** Something was written: a close must not drop it. */
+    private volatile boolean wroteAny;
     private volatile Listener listener;
 
     NettyQuicByteStream(QuicStreamChannel channel) {
@@ -57,10 +67,14 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
         ByteBuf copy = channel.alloc().buffer(length);
         copy.writeBytes(data.duplicate());
         inFlight.addAndGet(length);
+        wroteAny = true;
         channel.write(copy).addListener(f -> {
             long left = inFlight.addAndGet(-length);
             if (!f.isSuccess()) {
                 channel.pipeline().fireExceptionCaught(f.cause());
+            }
+            if (left == 0 && finWhenWritten) {
+                sendFin();
             }
             if (throttled && left <= LOW_WATER) {
                 throttled = false;
@@ -111,12 +125,59 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
 
     @Override
     public boolean isOpen() {
-        return channel.isOpen() && !closedNotified.get();
+        return channel.isOpen() && !closedNotified.get() && !closeRequested;
     }
 
+    /**
+     * Closes like TCP (docs/protocol.md §8): what was written goes out first, followed by FIN,
+     * and the peer closes the connection once it has read everything. Closing the QUIC
+     * connection right away would drop data still unsent or unacknowledged, e.g. a disconnect
+     * message. If the peer never answers, the connection is closed after {@link #LINGER_MILLIS}.
+     * If the peer's FIN already arrived, or nothing was ever written, the connection closes now.
+     */
     @Override
     public void close() {
-        channel.parent().close(true, Protocol.CLOSE_NORMAL, Unpooled.EMPTY_BUFFER);
+        closeRequested = true;
+        // Always a task, even on the loop: see Codecs.closeLater.
+        channel.eventLoop().execute(this::close0);
+    }
+
+    private void close0() {
+        if (!channel.parent().isOpen()) {
+            return;
+        }
+        if (inputShutdown || !wroteAny || !channel.isActive()) {
+            // Nothing of ours to deliver (or the peer is already done): close now.
+            closeConnection();
+            return;
+        }
+        if (finWhenWritten) {
+            return;
+        }
+        finWhenWritten = true;
+        channel.flush();
+        channel.eventLoop().schedule(this::closeConnection, LINGER_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        if (inFlight.get() == 0) {
+            sendFin();
+        }
+        // Otherwise the last write's listener sends it: FIN before queued data would drop it.
+    }
+
+    /** Event loop only. */
+    private void sendFin() {
+        if (outputShutdown || !channel.isActive()) {
+            return;
+        }
+        outputShutdown = true;
+        channel.shutdownOutput().addListener(f -> {
+            if (!f.isSuccess()) {
+                closeConnection();
+            }
+        });
+    }
+
+    private void closeConnection() {
+        Codecs.closeLater(channel.parent(), true, Protocol.CLOSE_NORMAL);
     }
 
     @Override
@@ -179,9 +240,11 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     @Override
     public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
         if (evt instanceof ChannelInputShutdownReadComplete) {
-            // Peer sent FIN: like a TCP close (docs/protocol.md §8).
+            // Peer sent FIN, after all its data: like a TCP close (docs/protocol.md §8). Whoever
+            // receives the FIN closes the connection.
+            inputShutdown = true;
             notifyClosed(null);
-            close();
+            closeConnection();
         }
         ctx.fireUserEventTriggered(evt);
     }
@@ -195,7 +258,7 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
         notifyClosed(cause);
-        channel.parent().close(true, Protocol.CLOSE_INTERNAL_ERROR, Unpooled.EMPTY_BUFFER);
+        Codecs.closeLater(channel.parent(), true, Protocol.CLOSE_INTERNAL_ERROR);
     }
 
     private void notifyClosed(Throwable cause) {

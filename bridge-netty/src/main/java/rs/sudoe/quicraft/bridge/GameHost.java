@@ -43,11 +43,35 @@ public final class GameHost {
     }
 
     /**
+     * UDP socket buffer size requested for QUIC sockets, best effort: the kernel caps it (Linux:
+     * {@code net.core.rmem_max} / {@code wmem_max}, often 208 KiB). UDP has no flow control, so a
+     * burst bigger than the receive buffer while the loop is busy is dropped. System property
+     * {@code quicraft.udpBufferBytes}; 0 leaves the kernel default.
+     */
+    public static final int UDP_BUFFER_BYTES = Integer.getInteger("quicraft.udpBufferBytes", 4 << 20);
+
+    static final int MAX_DATAGRAMS_PER_READ = 128;
+
+    /**
      * A bound game {@link DatagramChannel}, registered on the loop QUIC will run on, as a
      * {@link HostDatagramSocket}. Datagrams that arrive before core starts the socket are
-     * dropped; QUIC retransmits.
+     * dropped; QUIC retransmits. Asks for {@link #UDP_BUFFER_BYTES} socket buffers.
      */
     public static HostDatagramSocket socket(DatagramChannel channel) {
+        if (UDP_BUFFER_BYTES > 0) {
+            try {
+                channel.config().setReceiveBufferSize(UDP_BUFFER_BYTES);
+                channel.config().setSendBufferSize(UDP_BUFFER_BYTES);
+            } catch (RuntimeException e) {
+                // Best effort: the kernel default still works, with more drops under bursts.
+            }
+        }
+        // Drain more of the socket per loop pass than Netty's default 16 datagrams; together with
+        // the bridge's sliced delivery this keeps a burst in quiche's buffer, not the kernel's.
+        io.netty.channel.RecvByteBufAllocator allocator = channel.config().getRecvByteBufAllocator();
+        if (allocator instanceof io.netty.channel.MaxMessagesRecvByteBufAllocator) {
+            ((io.netty.channel.MaxMessagesRecvByteBufAllocator) allocator).maxMessagesPerRead(MAX_DATAGRAMS_PER_READ);
+        }
         SocketHandler handler = new SocketHandler(channel);
         channel.pipeline().addLast(handler);
         return handler;
