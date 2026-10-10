@@ -304,3 +304,28 @@ Reading:
 - Core's `NativeFeaturesTest` shows the same effect on loopback through a relay that reorders
   both directions (25% overtake 10 ms): BBR declared 1778–1969 packets lost per 2 MiB without the
   option and 466–908 with it.
+
+## Phase 2 gate: joins through the Velocity plugin (2026-10-10)
+
+Setup as in the baseline (bench → Velocity 4.2.0 → Paper 26.1.2, online mode, so Minecraft's
+AES/CFB8 runs inside QUIC), with the QUICraft plugin installed in Velocity. Clean profile,
+1 warmup + 3 measured joins per transport: a functional check, not a comparison. N=3 says
+nothing about small differences.
+
+| Transport | Run | Joins OK | Join median | Chunk load median | Play RTT median | Disconnects |
+| --- | --- | --- | --- | --- | --- | --- |
+| QUIC (`--transport quic`) | `20261010T011255Z-quic` | 4 / 4 | 306.4 ms | 419.5 ms | 1.2 ms | 0 |
+| TCP, plugin installed | `20261010T011425Z-tcp` | 4 / 4 | 311.9 ms | 430.9 ms | 0.8 ms | 0 |
+| TCP baseline (attempt 2, no plugin) | | | 311.2 ms | 430.4 ms | 0.5 ms | |
+
+- QUIC: the client pings over TCP for the advertisement (outside the timed window, like a
+  server-list entry), connects QUIC to the advertised port, then runs MCProtocolLib's session
+  over a bridge channel. Every join loaded all 329 chunks, with no lost pings.
+- TCP with the plugin installed matches the TCP baseline. The plugin leaves TCP joins alone.
+- Join time is noisy at N=3 in both transports (warmups at 1.5–1.7 s, one QUIC run at 1559 ms in
+  the configuration phase, one TCP run at 510 ms). That's the clean-join quantization documented
+  in the baseline, not a transport effect.
+- Ping at the status length cap against the real Velocity 4.2.0-30 jar, with a 64×64 noise
+  favicon (16.5 KB PNG) and a MOTD sized around the cap (advertisement member: 136 characters):
+  MOTD 10449 → 32767 characters with the advertisement; 10450 → 32632, advertisement left out,
+  Velocity's response unchanged; 10585 → 32767 (Velocity's own response at the cap), left out.
