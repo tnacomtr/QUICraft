@@ -78,5 +78,7 @@ each release of the plugin.
   advertisement; a status ping over QUIC runs through Velocity's own pipeline on its native
   worker loop and returns the same JSON; the identity persists across restarts; with the UDP
   port taken, the plugin logs one WARN and Velocity runs TCP-only.
+- Phase 2 gate (2026-10-10): QUIC and TCP joins through the plugin in the Docker testkit, and the
+  status-length cap against the real jar; numbers in docs/benchmarks.md.
 - `Settings`: `enabled`, `port` (0 = game port), `alternative-port` (0 = game port + 1, used
   when `[query]` is on the same UDP port).
