@@ -38,7 +38,7 @@ public class QuicJoinGameTest implements FabricClientGameTest {
                 check(GameTests.connectedOverQuic(context), "joined over QUIC");
                 List<String> lines = GameTests.debugServerLines(context);
                 check(lines.contains("QUICraft: QUIC (auto)"), "F3 shows the transport: " + lines);
-                PlaySession.run(context, server);
+                PlaySession.run(context, server, connection);
                 // After the session, so the join toasts are gone: for people to look at.
                 context.getInput().pressKey(InputConstants.KEY_F3);
                 context.waitTicks(5);

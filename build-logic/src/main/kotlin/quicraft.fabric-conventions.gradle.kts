@@ -69,6 +69,10 @@ extensions.getByType<net.fabricmc.loom.api.fabricapi.FabricApiExtension>().confi
 // says to disable it for mods that work at the Netty level; tests wait in ticks instead.
 loom.runs.matching { it.name == "clientGameTest" }.configureEach {
     property("fabric.client.gametest.disableNetworkSynchronizer", "true")
+    // Opt-in join timing measurement (JoinTimingGameTest): -Pquicraft.joinTimings=N
+    providers.gradleProperty("quicraft.joinTimings").orNull?.let {
+        property("quicraft.gametest.joinTimings", it)
+    }
 }
 sourceSets.named("gametest") {
     java.setSrcDirs(listOf(shared.dir("gametest/java")))
@@ -147,4 +151,11 @@ tasks.named<ProcessResources>("processResources") {
 
 base {
     archivesName = "quicraft-${project.name}"
+}
+
+// Stable name for the testkit's Fabric image (testkit/docker/compose.yaml).
+tasks.register<Sync>("testkitMod") {
+    from(tasks.named(if (remapped) "remapJar" else "jar"))
+    into(layout.buildDirectory.dir("testkit"))
+    rename { "quicraft-fabric.jar" }
 }

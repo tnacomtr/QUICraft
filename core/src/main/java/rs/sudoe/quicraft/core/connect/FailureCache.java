@@ -102,6 +102,14 @@ public final class FailureCache {
         }
     }
 
+    /** Forgets every failure, e.g. after the player fixed their firewall. */
+    public synchronized void clear() {
+        if (!entries.isEmpty()) {
+            entries.clear();
+            save();
+        }
+    }
+
     private void save() {
         if (file == null) {
             return;

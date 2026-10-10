@@ -37,6 +37,24 @@ services:
     depends_on: [paper, mocksession]
     stop_grace_period: 30s
 
+  # Fabric dedicated server with the QUICraft mod (Phase 3), joined directly: TARGET=fabric in
+  # run-baseline.sh. World pre-generated at build time from the same seed as paper.
+  fabric:
+    build:
+      context: fabric
+      additional_contexts:
+        # The mod jar, after `./gradlew :fabric-26x:testkitMod`.
+        quicraft: ../../fabric-26x/build/testkit
+    image: quicraft-testkit-fabric
+    profiles: [fabric]
+    environment:
+      FABRIC_ONLINE_MODE: ${FABRIC_ONLINE_MODE:-true}
+      QUICRAFT_PLUGIN: ${QUICRAFT_PLUGIN:-true}
+      JAVA_OPTS: ${QUICRAFT_JAVA_OPTS:-}
+    networks: [front]
+    depends_on: [mocksession]
+    stop_grace_period: 60s
+
   # One-shot client: `docker compose run --rm -e NETEM_PROFILE=loss bench bench --host velocity ...`
   bench:
     image: quicraft-testkit-bench

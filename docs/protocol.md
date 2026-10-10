@@ -85,7 +85,12 @@ Spectrum and similar) relay the ping, advertisement included, but drop UDP. The 
 - An advertisement is **fresh** for **60 seconds** after it was received *(user)*. The server
   list's own pings refresh it.
 - With no fresh advertisement (e.g. direct connect), the client sends a status query first,
-  over TCP like vanilla, and decides from its response.
+  over TCP like vanilla, and decides from its response. The query is the game's own: handshake
+  with intent "status", the host name and port the game would send (virtual hosts route on
+  them) and the game's protocol version, then a status request. It is bounded by **5 seconds**;
+  no answer, an error or a malformed response means TCP. Its advertisement is cached like one
+  from the server list.
+- Cache key: the resolved IP and the TCP port, without any host name.
 
 ## 5. Racing and fallback
 

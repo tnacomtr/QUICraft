@@ -108,6 +108,11 @@ public final class ClientConnector {
         return advertisements;
     }
 
+    /** Lets QUIC be tried again everywhere (the player's "forget QUIC failures"). */
+    public void forgetFailures() {
+        failures.clear();
+    }
+
     /**
      * Whether QUIC could play any part in connecting to {@code server} (its resolved TCP
      * address). Vanilla TCP when the player chose TCP, QUIC can't run here, or a fresh

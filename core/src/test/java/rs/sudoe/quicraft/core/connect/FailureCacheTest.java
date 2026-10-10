@@ -60,6 +60,19 @@ class FailureCacheTest {
     }
 
     @Test
+    void clearForgetsEverythingAlsoOnDisk(@TempDir Path dir) {
+        Path file = dir.resolve("quic-failures.properties");
+        AtomicLong now = new AtomicLong(0);
+        FailureCache cache = FailureCache.load(file, now::get);
+        cache.recordFailure(ip, 25565, fp);
+        cache.recordFailure(ip, 25566, fp);
+        cache.clear();
+        assertTrue(cache.allows(ip, 25565, fp));
+        assertTrue(cache.allows(ip, 25566, fp));
+        assertTrue(FailureCache.load(file, now::get).allows(ip, 25565, fp), "cleared on disk too");
+    }
+
+    @Test
     void survivesARestart(@TempDir Path dir) {
         Path file = dir.resolve("quic-failures.properties");
         AtomicLong now = new AtomicLong(5_000_000);
