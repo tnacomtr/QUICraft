@@ -210,8 +210,8 @@ class QuicLoopbackTest {
                 Thread.sleep(10);
             }
             assertFalse(stream.isWritable(), "a stalled peer must make the stream unwritable");
-            assertTrue(((NettyQuicByteStream) stream).inFlightForTest() <= 2 * NettyQuicByteStream.HIGH_WATER + chunk.length,
-                    "in flight must stay bounded, was " + ((NettyQuicByteStream) stream).inFlightForTest());
+            assertTrue(((PreambleStream) stream).raw.inFlightForTest() <= 2 * NettyQuicByteStream.HIGH_WATER + chunk.length,
+                    "in flight must stay bounded, was " + ((PreambleStream) stream).raw.inFlightForTest());
 
             Loopback.Collector reader = new Loopback.Collector();
             QuicByteStream serverSide = accepted.get(5, TimeUnit.SECONDS);

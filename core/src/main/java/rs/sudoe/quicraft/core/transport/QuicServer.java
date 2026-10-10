@@ -16,18 +16,22 @@ import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.handler.codec.quic.QuicStreamType;
 import io.netty.handler.ssl.SslHandshakeCompletionEvent;
 import java.io.Closeable;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 /**
- * QUIC listener. Each client's v1 stream is handed to the {@link StreamAcceptor} only after the
- * QUIC handshake has completed. 0-RTT data that arrived earlier waits in the stream until then,
- * so a replayed first flight never reaches the game (docs/protocol.md §8).
+ * QUIC listener. Each client's v1 stream is handed to the {@link StreamAcceptor} once the QUIC
+ * handshake has completed, or, for 0-RTT data whose preamble carries an unused early token, at
+ * once; such a connection must then complete its handshake within {@link #confirmMillis} or is
+ * closed. A replayed first flight carries a used token, waits for a handshake that never
+ * completes, and never reaches the game (docs/protocol.md §8).
  */
 public final class QuicServer implements Closeable {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -41,21 +45,41 @@ public final class QuicServer implements Closeable {
 
     private final EventLoopGroup group;
     private final Channel channel;
+    private final Unconfirmed unconfirmed;
 
-    private QuicServer(EventLoopGroup group, Channel channel) {
+    private QuicServer(EventLoopGroup group, Channel channel, Unconfirmed unconfirmed) {
         this.group = group;
         this.channel = channel;
+        this.unconfirmed = unconfirmed;
+    }
+
+    /**
+     * Closes this listener's connections that were passed to the game on 0-RTT data, haven't
+     * completed their handshake, and came from {@code login}'s IP with a Login Start for
+     * {@code name} (case-insensitive), except a connection whose own address is {@code login}.
+     * The platform calls this for each login: for a TCP login, such a connection is the client's
+     * abandoned QUIC attempt, whose login would otherwise hold the name (docs/protocol.md §8).
+     * Completes, with how many were closed, once they are.
+     */
+    public CompletableFuture<Integer> closeUnconfirmedEarly(InetSocketAddress login, String name) {
+        return unconfirmed.close(login, name);
+    }
+
+    /** Streams passed to the game on 0-RTT data so far, for diagnostics and tests. */
+    public long earlyReleases() {
+        return unconfirmed.released.get();
     }
 
     /** Binds {@code address} and runs QUIC on core's own thread. */
     public static QuicServer bind(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
             StreamAcceptor acceptor) throws Exception {
-        io.netty.channel.ChannelHandler codec = codec(identity, config, acceptor);
+        Unconfirmed unconfirmed = new Unconfirmed();
+        io.netty.channel.ChannelHandler codec = codec(identity, config, acceptor, unconfirmed);
         EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
         try {
             Channel channel = new Bootstrap().group(group).channel(NioDatagramChannel.class).handler(codec)
                     .bind(address).sync().channel();
-            return new QuicServer(group, channel);
+            return new QuicServer(group, channel, unconfirmed);
         } catch (Exception | Error e) {
             group.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
             throw e;
@@ -70,8 +94,9 @@ public final class QuicServer implements Closeable {
     public static QuicServer bind(HostLoop loop, HostDatagramSocket socket, ServerIdentity identity,
             TransportConfig config, StreamAcceptor acceptor) throws Exception {
         HostedDatagramChannel channel = new HostedDatagramChannel(socket);
+        Unconfirmed unconfirmed = new Unconfirmed();
         try {
-            channel.pipeline().addLast(codec(identity, config, acceptor));
+            channel.pipeline().addLast(codec(identity, config, acceptor, unconfirmed));
         } catch (Exception | Error e) {
             socket.close();
             throw e;
@@ -82,11 +107,15 @@ public final class QuicServer implements Closeable {
         } else if (registered.isDone() && !registered.isSuccess()) {
             throw new IllegalStateException("registering the QUIC listener failed", registered.cause());
         }
-        return new QuicServer(null, channel);
+        return new QuicServer(null, channel, unconfirmed);
     }
 
+    /** Deadline for a connection passed early to complete its handshake. Tests shorten it. */
+    static volatile long confirmMillis = 3_000;
+
     private static io.netty.channel.ChannelHandler codec(ServerIdentity identity, TransportConfig config,
-            StreamAcceptor acceptor) throws Exception {
+            StreamAcceptor acceptor, Unconfirmed unconfirmed) throws Exception {
+        EarlyTokens tokens = new EarlyTokens();
         QuicSslContext ssl = QuicSslContextBuilder
                 .forServer(identity.privateKey(), null, identity.certificate())
                 .applicationProtocols(Protocol.ALPN)
@@ -99,7 +128,7 @@ public final class QuicServer implements Closeable {
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
-                        connection.pipeline().addLast(new Connection(acceptor));
+                        connection.pipeline().addLast(new Connection(acceptor, tokens, config.earlyData, unconfirmed));
                     }
                 })
                 .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
@@ -132,22 +161,64 @@ public final class QuicServer implements Closeable {
         }
     }
 
-    /** Per-connection state: holds streams back until the handshake has completed. */
+    /**
+     * Per-connection state: passes a stream to the game once its preamble is read and either the
+     * handshake has completed or the preamble redeemed an early token (docs/protocol.md §8).
+     */
     private static final class Connection extends ChannelInboundHandlerAdapter {
         private final StreamAcceptor acceptor;
-        private final List<NettyQuicByteStream> pending = new ArrayList<>(1);
+        private final EarlyTokens tokens;
+        private final boolean earlyData;
+        private final Unconfirmed unconfirmed;
+        private final List<ServerStream> waiting = new ArrayList<>(1);
+        private ChannelHandlerContext ctx;
         private boolean handshakeDone;
+        private java.util.concurrent.ScheduledFuture<?> confirmDeadline;
 
-        Connection(StreamAcceptor acceptor) {
+        Connection(StreamAcceptor acceptor, EarlyTokens tokens, boolean earlyData, Unconfirmed unconfirmed) {
             this.acceptor = acceptor;
+            this.tokens = tokens;
+            this.earlyData = earlyData;
+            this.unconfirmed = unconfirmed;
         }
 
-        /** Called on the connection's event loop. */
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) {
+            this.ctx = ctx;
+        }
+
+        /** Called on the connection's event loop. The stream reads the client's preamble first. */
         void offer(NettyQuicByteStream stream) {
+            new ServerStream(stream, this::onPreamble).start();
+        }
+
+        private void onPreamble(ServerStream stream, byte[] token) {
+            boolean redeemed = false;
+            if (token != null) {
+                try {
+                    rs.sudoe.quicraft.core.Faults.check(rs.sudoe.quicraft.core.Faults.EARLY_TOKEN_REDEEM);
+                    redeemed = tokens.redeem(token);
+                } catch (Throwable t) {
+                    LOG.log(Level.FINE, "early token check failed; the stream waits for the handshake", t);
+                }
+            }
             if (handshakeDone) {
                 deliver(stream);
+            } else if (redeemed && earlyData) {
+                QuicChannel early = (QuicChannel) ctx.channel();
+                Unconfirmed.Entry entry = unconfirmed.add(early, stream.remoteAddress());
+                stream.readNameThen(name -> entry.name = name);
+                deliver(stream);
+                if (confirmDeadline == null) {
+                    QuicChannel connection = early;
+                    confirmDeadline = ctx.executor().schedule(() -> {
+                        if (!handshakeDone) {
+                            Codecs.closeLater(connection, true, Protocol.CLOSE_EARLY_UNCONFIRMED);
+                        }
+                    }, confirmMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+                }
             } else {
-                pending.add(stream);
+                waiting.add(stream);
             }
         }
 
@@ -157,15 +228,25 @@ public final class QuicServer implements Closeable {
                 SslHandshakeCompletionEvent done = (SslHandshakeCompletionEvent) evt;
                 if (done.isSuccess()) {
                     handshakeDone = true;
-                    for (NettyQuicByteStream stream : pending) {
+                    unconfirmed.remove((QuicChannel) ctx.channel());
+                    if (confirmDeadline != null) {
+                        confirmDeadline.cancel(false);
+                    }
+                    for (ServerStream stream : waiting) {
                         deliver(stream);
                     }
-                    pending.clear();
+                    waiting.clear();
                 } else {
                     ctx.close();
                 }
             }
             ctx.fireUserEventTriggered(evt);
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) {
+            unconfirmed.remove((QuicChannel) ctx.channel());
+            ctx.fireChannelInactive();
         }
 
         /**
@@ -185,13 +266,67 @@ public final class QuicServer implements Closeable {
             }
         }
 
-        private void deliver(NettyQuicByteStream stream) {
+        private void deliver(ServerStream stream) {
+            byte[] next = null;
             try {
+                rs.sudoe.quicraft.core.Faults.check(rs.sudoe.quicraft.core.Faults.EARLY_TOKEN_ISSUE);
+                next = earlyData ? tokens.issue() : null;
+            } catch (Throwable t) {
+                LOG.log(Level.FINE, "issuing an early token failed; none this time", t);
+            }
+            try {
+                stream.writePreamble(next);
                 acceptor.accept(stream);
+                stream.openGate();
             } catch (Throwable t) {
                 LOG.log(Level.WARNING, "QUIC stream acceptor failed; closing the connection", t);
                 stream.close();
             }
+        }
+    }
+
+    /** Connections passed to the game on 0-RTT data whose handshake hasn't completed yet. */
+    static final class Unconfirmed {
+        static final class Entry {
+            final QuicChannel connection;
+            final InetSocketAddress address;
+            /** From the Login Start in the early data; null until read. */
+            volatile String name;
+
+            Entry(QuicChannel connection, InetSocketAddress address) {
+                this.connection = connection;
+                this.address = address;
+            }
+        }
+
+        private final java.util.Map<QuicChannel, Entry> entries = new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.concurrent.atomic.AtomicLong released = new java.util.concurrent.atomic.AtomicLong();
+
+        Entry add(QuicChannel connection, InetSocketAddress address) {
+            released.incrementAndGet();
+            Entry e = new Entry(connection, address);
+            entries.put(connection, e);
+            return e;
+        }
+
+        void remove(QuicChannel connection) {
+            entries.remove(connection);
+        }
+
+        CompletableFuture<Integer> close(InetSocketAddress login, String name) {
+            List<CompletableFuture<Void>> closing = new ArrayList<>();
+            for (Entry e : entries.values()) {
+                if (e.address.getAddress().equals(login.getAddress()) && !e.address.equals(login)
+                        && name.equalsIgnoreCase(e.name)) {
+                    entries.remove(e.connection);
+                    CompletableFuture<Void> closed = new CompletableFuture<>();
+                    e.connection.closeFuture().addListener(f -> closed.complete(null));
+                    Codecs.closeLater(e.connection, true, Protocol.CLOSE_EARLY_UNCONFIRMED);
+                    closing.add(closed);
+                }
+            }
+            int count = closing.size();
+            return CompletableFuture.allOf(closing.toArray(new CompletableFuture<?>[0])).thenApply(v -> count);
         }
     }
 }

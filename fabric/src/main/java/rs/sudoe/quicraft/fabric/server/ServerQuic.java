@@ -61,6 +61,12 @@ public final class ServerQuic {
         return s != null ? s.advertisement : null;
     }
 
+    /** Streams passed to the game on 0-RTT data so far (docs/protocol.md §8); 0 when QUIC isn't running. */
+    public static long earlyReleases() {
+        ServerQuic s = current;
+        return s != null ? s.server.earlyReleases() : 0;
+    }
+
     /**
      * Hook: vanilla's TCP child handler. Returns it wrapped so status responses carry the
      * advertisement once QUIC runs. On any failure, returns vanilla's handler unchanged.

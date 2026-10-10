@@ -83,12 +83,21 @@ class NativeFeaturesTest {
     @Test
     void relaxedThresholdCutsSpuriousLossesUnderReordering() throws Exception {
         assumeTrue(expected(), "needs the patched native");
-        long off = spuriousLosses(false);
-        long on = spuriousLosses(true);
-        System.out.printf("2 MiB through a reordering relay, BBR: lost %d without, %d with the relaxed threshold%n",
-                off, on);
+        // Measured 2-4x fewer (1884 -> 908, 1969 -> 897, 1778 -> 466); asserts a margin below that.
+        // The relay's timing is noisy on a busy host (seen: 2049 -> 1749 in 1 of ~5 runs), so a
+        // miss gets one more measurement; a native without the option misses both.
+        long off = 0;
+        long on = 0;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            off = spuriousLosses(false);
+            on = spuriousLosses(true);
+            System.out.printf("2 MiB through a reordering relay, BBR: lost %d without, %d with the relaxed threshold%n",
+                    off, on);
+            if (off >= 20 && on * 4 <= off * 3) {
+                break;
+            }
+        }
         assertTrue(off >= 20, "reordering should cause spurious losses without the option, got " + off);
-        // Measured 2-4x fewer (1884 -> 908, 1969 -> 897, 1778 -> 466); assert a margin below that.
         assertTrue(on * 4 <= off * 3, "relaxed threshold should cut spurious losses: " + off + " -> " + on);
     }
 

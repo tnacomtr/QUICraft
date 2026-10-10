@@ -2,7 +2,9 @@
 package rs.sudoe.quicraft.velocity;
 
 import com.google.inject.Inject;
+import com.velocitypowered.api.event.EventTask;
 import com.velocitypowered.api.event.Subscribe;
+import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent;
@@ -21,6 +23,7 @@ import io.netty.channel.socket.DatagramChannel;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import rs.sudoe.quicraft.core.Protocol;
@@ -88,6 +91,43 @@ public final class QuicraftVelocity {
         } catch (Throwable t) {
             logger.debug("QUICraft: handling a fallback report failed", t);
         }
+    }
+
+    /**
+     * Before Velocity registers a login's name: closes the same player's abandoned 0-RTT QUIC
+     * attempt from the same IP, if there is one (docs/protocol.md §8). Its login would otherwise
+     * hold the name until the server's 3 s deadline, and Velocity would refuse this one ("already
+     * connected to this proxy"). Waits until Velocity has let go of the name, at most 1 s.
+     */
+    @Subscribe(priority = Short.MAX_VALUE) // first: before any plugin acts on the name
+    public EventTask onPreLogin(PreLoginEvent event) {
+        try {
+            QuicListener l = listener;
+            if (l == null) {
+                return null;
+            }
+            String name = event.getUsername();
+            CompletableFuture<Void> done = l.closeUnconfirmedEarly(event.getConnection().getRemoteAddress(), name)
+                    .thenCompose(closed -> closed == 0 ? CompletableFuture.<Void>completedFuture(null)
+                            : whenNameFree(name, System.nanoTime() + TimeUnit.SECONDS.toNanos(1)))
+                    .completeOnTimeout(null, 2, TimeUnit.SECONDS)
+                    .exceptionally(t -> {
+                        logger.debug("QUICraft: closing an abandoned QUIC login failed", t);
+                        return null;
+                    });
+            return done.isDone() ? null : EventTask.resumeWhenComplete(done);
+        } catch (Throwable t) {
+            logger.debug("QUICraft: checking for an abandoned QUIC login failed", t);
+            return null;
+        }
+    }
+
+    private CompletableFuture<Void> whenNameFree(String name, long deadline) {
+        if (proxy.getPlayer(name).isEmpty() || System.nanoTime() > deadline) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return CompletableFuture.supplyAsync(() -> null,
+                CompletableFuture.delayedExecutor(10, TimeUnit.MILLISECONDS)).thenCompose(v -> whenNameFree(name, deadline));
     }
 
     @SuppressWarnings("deprecation") // ServerChannelInitializerHolder.set: internal, but the only hook

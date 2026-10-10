@@ -68,7 +68,8 @@ class ClientConnectorTest {
         }
 
         @Override
-        public CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint) {
+        public CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint,
+                rs.sudoe.quicraft.core.transport.EarlyFlight early) {
             quicAttempts.incrementAndGet();
             quicTarget = target;
             return quic;

@@ -26,6 +26,7 @@ import rs.sudoe.quicraft.core.transport.HostDatagramSocket;
 import rs.sudoe.quicraft.core.transport.HostLoop;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.QuicClient;
+import rs.sudoe.quicraft.core.transport.EarlyFlight;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
 
 /**
@@ -120,6 +121,13 @@ public final class GameHost {
     public static CompletableFuture<QuicByteStream> connect(EventLoop loop,
             ChannelFactory<? extends DatagramChannel> datagrams, InetSocketAddress remote, Fingerprint fingerprint,
             TransportConfig config) {
+        return connect(loop, datagrams, remote, fingerprint, config, null);
+    }
+
+    /** As above, with the join's 0-RTT request ({@link QuicClient}); null for none. */
+    public static CompletableFuture<QuicByteStream> connect(EventLoop loop,
+            ChannelFactory<? extends DatagramChannel> datagrams, InetSocketAddress remote, Fingerprint fingerprint,
+            TransportConfig config, EarlyFlight early) {
         CompletableFuture<QuicByteStream> result = new CompletableFuture<>();
         InetSocketAddress local;
         try {
@@ -142,7 +150,7 @@ public final class GameHost {
                 return;
             }
             CompletableFuture<QuicByteStream> attempt = QuicClient.connect(loop(loop),
-                    socket((DatagramChannel) f.channel()), remote, fingerprint, config);
+                    socket((DatagramChannel) f.channel()), remote, fingerprint, config, early);
             result.whenComplete((s, e) -> {
                 if (result.isCancelled()) {
                     attempt.cancel(false);
