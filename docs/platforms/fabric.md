@@ -76,6 +76,10 @@ The connect screen's call to `Connection.connect(address, holder, connection)` g
 Status pings from the server list refresh the advertisement cache, keyed by resolved IP and TCP
 port, so a join from the list usually skips the status query.
 
+QUIC session tickets stay in memory for the game session: a rejoin resumes the earlier TLS
+session and skips the certificate exchange (docs/protocol.md §8). The first join after a restart
+is a full handshake.
+
 Files in `config/quicraft/`: `client.properties` (`transport=auto|tcp-only|quic-only`),
 `quic-failures.properties` (the failure cache).
 
@@ -99,7 +103,7 @@ client and an in-process dedicated server with the mod, headless under Xvfb.
 | `FallbackGameTest` | advertisement with a dead UDP port, and one with another server's fingerprint: each joins over TCP, the server receives the fallback report, the failure cache backs off |
 | `TcpOnlyGameTest` | `tcp-only` joins an advertising server over TCP; F3 says so |
 | `QuicOnlyGameTest` | `quic-only` joins over QUIC; with a dead QUIC port it ends on the disconnected screen (no fallback, no hang) |
-| `JoinTimingGameTest` | opt-in (`-Pquicraft.joinTimings=N`): TCP vs QUIC join timings, see docs/benchmarks.md |
+| `JoinTimingGameTest` | opt-in (`-Pquicraft.joinTimings=N`): join timings over TCP, QUIC with a full handshake and QUIC resumed (checked to skip the certificate), see docs/benchmarks.md |
 | `FaultInjectionGameTest` | every hook throwing on client and server (`Hooks.setFaultInjection`): server list ping works, join over TCP, full play session |
 | `AsyncFaultInjectionGameTest` | each stage of the asynchronous connect throwing on its own (status query, QUIC connect, using the winner, installing a TCP winner): join over TCP each time |
 

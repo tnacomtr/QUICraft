@@ -41,7 +41,8 @@ public final class TransportClient {
 
     /**
      * Sender-side config for a QUIC transport. The relaxed loss threshold is set explicitly
-     * either way, since core's default turned it on; only quic-bbr-relaxed has it.
+     * either way, since core's default turned it on; only quic-bbr-relaxed has it. Session
+     * resumption is off: every run measures a full handshake, as in earlier runs.
      */
     static TransportConfig quicConfig(String transport) {
         boolean relaxed = transport.endsWith("-relaxed");
@@ -50,6 +51,7 @@ public final class TransportClient {
         return TransportConfig.builder()
                 .congestionControl(TransportConfig.CongestionControl.valueOf(cc.toUpperCase()))
                 .relaxedLossThreshold(relaxed)
+                .sessionResumption(false)
                 .build();
     }
 

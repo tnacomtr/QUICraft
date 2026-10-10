@@ -20,7 +20,8 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
  * QUICraft's patched build completes it as soon as the client has sent its Finished, one round
  * trip after the Initial (natives/patches/netty/0002-complete-connect-after-handshake-send.patch,
  * docs/protocol.md §5). Logs the flights and fails outside 0.9–1.6 RTT, so a regression to
- * ~2 RTT (or an implausibly fast connect) gets noticed.
+ * ~2 RTT (or an implausibly fast connect) gets noticed. A second connect resumes the first one's
+ * session (docs/protocol.md §8) and takes the same single round trip.
  */
 class HandshakeFlightProbeTest {
     @Test
@@ -59,15 +60,25 @@ class HandshakeFlightProbeTest {
             });
             pump.setDaemon(true);
             pump.start();
-            CompletableFuture<QuicByteStream> f = QuicClient.connect(
-                    (InetSocketAddress) relay.getLocalSocketAddress(), id.fingerprint(), TransportConfig.DEFAULT);
-            f.get(10, TimeUnit.SECONDS);
-            long millis = (System.nanoTime() - firstInitial.get()) / 1_000_000;
-            System.out.printf("connected %d ms after the first Initial (%.2f RTT)%n", millis, millis / 200.0);
-            org.junit.jupiter.api.Assertions.assertTrue(millis >= 180 && millis <= 320,
-                    "connect took " + millis + " ms after the first Initial at 200 ms RTT");
-            f.get().close();
-            Thread.sleep(500);
+            for (String kind : new String[] {"full", "resumed"}) {
+                firstInitial.set(0);
+                CompletableFuture<QuicByteStream> f = QuicClient.connect(
+                        (InetSocketAddress) relay.getLocalSocketAddress(), id.fingerprint(), TransportConfig.DEFAULT);
+                f.get(10, TimeUnit.SECONDS);
+                long millis = (System.nanoTime() - firstInitial.get()) / 1_000_000;
+                System.out.printf("%s handshake: connected %d ms after the first Initial (%.2f RTT)%n", kind, millis,
+                        millis / 200.0);
+                org.junit.jupiter.api.Assertions.assertTrue(millis >= 180 && millis <= 320,
+                        kind + " connect took " + millis + " ms after the first Initial at 200 ms RTT");
+                org.junit.jupiter.api.Assertions.assertEquals(1,
+                        QuicClient.certificateChecks(id.fingerprint(), TransportConfig.DEFAULT),
+                        "the second connect must resume");
+                // The server sends its session ticket once it has the client's Finished: it
+                // reaches the client about 2 RTT after the first Initial.
+                Thread.sleep(500);
+                f.get().close();
+                Thread.sleep(1000); // the closing exchange is over before the next client starts
+            }
         } finally {
             delay.shutdownNow();
         }

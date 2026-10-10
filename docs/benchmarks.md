@@ -453,8 +453,30 @@ certificate check, p50 2.7 ms in the transport benchmark) plus the asynchronous 
 the connect is level: on 1.21.11 play login and last chunk match within a millisecond. On 26.1.2
 the 5 ms are enough to miss the next lockstep server tick in 8 of 10 runs, so login and last chunk
 come 50 ms later; with a real server, whose ticks don't wait for the client, that is a 5 ms delay
-landing on a random tick phase, not a 50 ms one. Client-side 0-RTT resumption (protocol.md §8, not
-implemented yet) would take the handshake off rejoins.
+landing on a random tick phase, not a 50 ms one.
+
+### Session resumption (2026-10-10)
+
+The client now resumes TLS sessions (protocol.md §8). Two measurements, same host:
+
+- **Core, loopback, no game** (temporary test, not committed): 250 interleaved pairs after 50
+  warm-up pairs, connect future only. Full handshake p50 3.30 ms (p90 3.89), resumed p50 3.18 ms
+  (p90 3.75). Resumption saves ~0.1 ms: the QUIC handshake's time on loopback is not crypto.
+- **Real client** (`JoinTimingGameTest` now interleaves TCP, QUIC with a full handshake, and QUIC
+  resuming the full join's session, and checks that the resumed joins ran no certificate check):
+  in both versions every transport, TCP included, jumps to 33–38 ms connect → active halfway
+  through the run, so only the first five rounds say anything. 26.1.2: TCP 9.1–13.4 ms, QUIC
+  full 9.8–18.3 ms, QUIC resumed 14.1–18.2 ms. 1.21.11: TCP 19.0–19.7 ms, QUIC full 22.0–24.1 ms,
+  QUIC resumed 22.5–23.9 ms. No difference between full and resumed beyond the noise. The machine
+  was busier than in the run above (desktop load), so these don't compare with that table.
+- **Round trips:** `HandshakeFlightProbeTest` at 200 ms RTT: full 1.08–1.10 RTT, resumed 1.02 RTT.
+  The session ticket arrives about 2 RTT after the first Initial, so only a connection that lived
+  that long leaves a ticket behind.
+
+0-RTT early data would not save a round trip either while the server holds early data until the
+handshake completes (protocol.md §8, replay protection). The transport benchmark sets
+`sessionResumption(false)`, so its handshake numbers stay full handshakes, comparable with earlier
+runs.
 
 ### No desync, fault injection, fallback
 
