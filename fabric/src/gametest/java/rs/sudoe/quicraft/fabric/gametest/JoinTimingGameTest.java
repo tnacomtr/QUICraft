@@ -34,10 +34,23 @@ public class JoinTimingGameTest implements FabricClientGameTest {
         List<Long> quicLogin = new ArrayList<>();
         List<Long> tcpChunks = new ArrayList<>();
         List<Long> quicChunks = new ArrayList<>();
+        List<Long> tcpActive = new ArrayList<>();
+        List<Long> quicActive = new ArrayList<>();
         try (TestDedicatedServerContext server = GameTests.server(context)) {
             for (int i = 0; i < runs + 1; i++) {
                 for (Mode mode : new Mode[] {Mode.TCP_ONLY, Mode.AUTO}) {
                     client.setMode(mode);
+                    if (mode == Mode.AUTO) {
+                        // Keep the advertisement fresh (60 s TTL): no status query in the timing.
+                        rs.sudoe.quicraft.core.discovery.Advertisement ad =
+                                server.computeOnServer(s -> rs.sudoe.quicraft.fabric.server.ServerQuic.advertisement());
+                        int port = server.computeOnServer(s -> s.getPort());
+                        for (java.net.InetSocketAddress key : new java.net.InetSocketAddress[] {
+                                new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), port),
+                                new java.net.InetSocketAddress("::1", port)}) {
+                            client.connector().advertisements().record(key, java.util.Optional.of(ad));
+                        }
+                    }
                     JoinClock.reset();
                     long start = System.nanoTime();
                     try (var connection = server.connect()) {
@@ -49,6 +62,7 @@ public class JoinTimingGameTest implements FabricClientGameTest {
                             boolean q = mode == Mode.AUTO;
                             (q ? quic : tcp).add(micros);
                             (q ? quicLogin : tcpLogin).add((JoinClock.loginAt.get() - start) / 1_000);
+                            (q ? quicActive : tcpActive).add((JoinClock.activeAt.get() - start) / 1_000);
                             (q ? quicChunks : tcpChunks).add((JoinClock.lastChunkAt.get() - start) / 1_000);
                         }
                     }
@@ -65,6 +79,9 @@ public class JoinTimingGameTest implements FabricClientGameTest {
                 + "QUIC median %.2f ms; connect to last chunk: TCP median %.2f ms, QUIC median %.2f ms (%d chunks)",
                 median(tcpLogin) / 1000.0, median(quicLogin) / 1000.0, median(tcpChunks) / 1000.0,
                 median(quicChunks) / 1000.0, JoinClock.chunks.get()));
+        QuicraftFabricTestLog.info(String.format(Locale.ROOT, "connect to Connection active: TCP median %.2f ms, "
+                + "QUIC median %.2f ms", median(tcpActive) / 1000.0, median(quicActive) / 1000.0));
+        QuicraftFabricTestLog.info("active timings TCP " + tcpActive + " QUIC " + quicActive + " (µs)");
         QuicraftFabricTestLog.info("join timings TCP " + tcp + " QUIC " + quic + " (µs)");
         QuicraftFabricTestLog.info("login timings TCP " + tcpLogin + " QUIC " + quicLogin + " (µs)");
     }

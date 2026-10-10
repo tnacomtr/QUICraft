@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * quantized to game ticks (JoinTimingGameTest). Set by ConnectionTimingMixin.
  */
 public final class JoinClock {
+    static final AtomicLong activeAt = new AtomicLong();
     static final AtomicLong loginAt = new AtomicLong();
     static final AtomicLong lastChunkAt = new AtomicLong();
     static final AtomicInteger chunks = new AtomicInteger();
@@ -16,9 +17,14 @@ public final class JoinClock {
     private JoinClock() {}
 
     static void reset() {
+        activeAt.set(0);
         loginAt.set(0);
         lastChunkAt.set(0);
         chunks.set(0);
+    }
+
+    public static void active() {
+        activeAt.compareAndSet(0, System.nanoTime());
     }
 
     public static void login() {

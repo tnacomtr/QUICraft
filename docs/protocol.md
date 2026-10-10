@@ -53,8 +53,11 @@ Verified (Oct 2026), 26.1.2: `ClientboundStatusResponsePacket` reads and writes 
 with `ByteBufCodecs.lenientJson(32767)`. `Utf8String.read`/`write` enforce at most 32767 UTF-16
 code units (`String.length()`) and at most `ByteBufUtil.utf8MaxBytes(32767)` encoded bytes. The
 writer checks too, so an oversized response fails on the sending side as well. Checked in Paper
-26.1.2's server jar. Still to check: the vanilla client jar for every supported version, and
-Velocity's own status serializer.
+26.1.2's server jar, and in the decompiled 1.21.11 and 26.1.2 game (client and server use the same
+codec). Velocity's own serializer has no check (docs/platforms/velocity.md); the advertisement
+stays under the cap there through `Advertisement.insertInto`. Still to check: 26.2 and 26.3
+(their status codec wasn't read; the Fabric mod's classes are identical across 26.x, and the
+gametests ping successfully).
 
 ## 2. Port
 

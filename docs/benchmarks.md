@@ -439,15 +439,22 @@ each chunk arrive (117 chunks). The gametest harness runs the server's ticks in 
 the client's, so server-side steps land on 50 ms tick boundaries and the times come in 50 ms
 steps.
 
-| Version | Connect → play login (median) | Connect → last chunk (median) |
-| --- | --- | --- |
-| 1.21.11 | TCP 198.2 ms, QUIC 198.0 ms | TCP 744.2 ms, QUIC 744.5 ms |
-| 26.1.2 | TCP 154.1 ms, QUIC 203.9 ms | TCP 700.4 ms, QUIC 750.4 ms |
+| Version | Connect → `Connection` active | Connect → play login | Connect → last chunk |
+| --- | --- | --- | --- |
+| 1.21.11 | TCP 14.8 ms, QUIC 20.9 ms | TCP 201.1 ms, QUIC 196.8 ms | TCP 743.8 ms, QUIC 744.0 ms |
+| 26.1.2 | TCP 6.6 ms, QUIC 11.8 ms | TCP 154.3 ms, QUIC 204.3 ms | TCP 700.4 ms, QUIC 750.6 ms |
 
-On 26.1.2 QUIC lands one server tick later in 9 of 10 runs. QUIC's handshake costs about 3 ms
-more than a TCP connect on loopback (TLS; transport benchmark p50 2.7 ms), which is enough to miss
-a tick boundary with this lockstep scheduling. On 1.21.11 the same few milliseconds don't cross
-one. Client-side 0-RTT (§8, not implemented yet) would remove the handshake on rejoin.
+The advertisement is refreshed before each QUIC join, so no status query is in these times
+(direct connects without one add a status query: one TCP connect and one round trip).
+
+QUIC's connect costs 5–6 ms more than TCP's on loopback: the QUIC handshake (TLS 1.3 with
+certificate check, p50 2.7 ms in the transport benchmark) plus the asynchronous connect path
+(UDP socket bind, race bookkeeping, handing the winner to the screen's thread). Everything after
+the connect is level: on 1.21.11 play login and last chunk match within a millisecond. On 26.1.2
+the 5 ms are enough to miss the next lockstep server tick in 8 of 10 runs, so login and last chunk
+come 50 ms later; with a real server, whose ticks don't wait for the client, that is a 5 ms delay
+landing on a random tick phase, not a 50 ms one. Client-side 0-RTT resumption (protocol.md §8, not
+implemented yet) would take the handshake off rejoins.
 
 ### No desync, fault injection, fallback
 
