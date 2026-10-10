@@ -12,7 +12,9 @@ import com.velocitypowered.api.proxy.config.ProxyConfig;
 import com.velocitypowered.proxy.network.ConnectionManager;
 import com.velocitypowered.proxy.network.ServerChannelInitializerHolder;
 import com.velocitypowered.proxy.network.TransportType;
+import io.netty.channel.ChannelFactory;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.socket.DatagramChannel;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
@@ -82,9 +84,11 @@ public final class QuicraftVelocity {
                 : new InetSocketAddress(tcp.getHostString(), port);
 
         ServerIdentity identity = ServerIdentity.loadOrCreate(dataDirectory);
-        workers = TransportType.bestType().createEventLoopGroup(TransportType.Type.WORKER);
+        TransportType transport = TransportType.bestType();
+        workers = transport.createEventLoopGroup(TransportType.Type.WORKER);
         try {
-            listener = QuicListener.bind(udp, identity, TransportConfig.DEFAULT, holder, workers, logger);
+            listener = QuicListener.bind(udp, identity, TransportConfig.DEFAULT, holder, workers,
+                    datagramChannels(transport), logger);
         } catch (Exception e) {
             // docs/protocol.md §2: one WARN, no advertisement, TCP keeps running.
             logger.warn("QUICraft: could not bind UDP {} for QUIC ({}); not advertising QUIC, TCP only",
@@ -98,6 +102,23 @@ public final class QuicraftVelocity {
         holder.set(new AdvertisingInitializer(holder.get(), advertiser, logger));
         logger.info("QUICraft: QUIC listening on UDP {} (fingerprint {}); open this UDP port in your firewall",
                 listener.localAddress(), identity.fingerprint());
+    }
+
+    /**
+     * Velocity's datagram channel type for its transport (as used by its query listener), or
+     * null if this Velocity hides it: QUIC then runs on core's own thread.
+     */
+    @SuppressWarnings("unchecked")
+    private ChannelFactory<? extends DatagramChannel> datagramChannels(TransportType transport) {
+        try {
+            Field f = TransportType.class.getDeclaredField("datagramChannelFactory");
+            f.setAccessible(true);
+            return (ChannelFactory<? extends DatagramChannel>) f.get(transport);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            logger.info("QUICraft: no Velocity datagram channel for {} ({}); QUIC runs on its own thread",
+                    transport, e.toString());
+            return null;
+        }
     }
 
     private ConnectionManager connectionManager() throws ReflectiveOperationException {

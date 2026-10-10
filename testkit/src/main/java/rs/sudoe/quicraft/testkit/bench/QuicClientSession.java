@@ -1,25 +1,69 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.testkit.bench;
 
+import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFactory;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.EventLoop;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.socket.DatagramChannel;
 import java.net.InetSocketAddress;
+import java.util.concurrent.CompletableFuture;
+import org.geysermc.mcprotocollib.network.helper.TransportHelper;
 import org.geysermc.mcprotocollib.network.session.ClientNetworkSession;
 import org.geysermc.mcprotocollib.protocol.MinecraftProtocol;
+import rs.sudoe.quicraft.bridge.GameHost;
 import rs.sudoe.quicraft.bridge.QuicBridgeChannel;
+import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
+import rs.sudoe.quicraft.core.transport.QuicClient;
+import rs.sudoe.quicraft.core.transport.TransportConfig;
 
 /**
- * MCProtocolLib's client session over an already-connected QUIC stream: its Bootstrap gets a
- * {@link QuicBridgeChannel} instead of a TCP socket, and everything else (codec, encryption,
- * compression, game protocol) runs unchanged, as it would in the mod.
+ * MCProtocolLib's client session over QUIC: its Bootstrap gets a {@link QuicBridgeChannel}
+ * instead of a TCP socket, and everything else (codec, encryption, compression, game protocol)
+ * runs unchanged, as it would in the mod. QUIC is hosted on the session's own event loop, over
+ * a UDP socket of MCProtocolLib's transport (epoll on Linux), as the mod does on the game's.
  */
 final class QuicClientSession extends ClientNetworkSession {
-    private final QuicByteStream stream;
+    private EventLoop loop;
+    private QuicByteStream stream;
 
-    QuicClientSession(InetSocketAddress address, MinecraftProtocol protocol, QuicByteStream stream) {
+    QuicClientSession(InetSocketAddress address, MinecraftProtocol protocol) {
         super(address, protocol, Runnable::run, null, null);
-        this.stream = stream;
+    }
+
+    /** Opens the QUIC connection; call {@link #connect(boolean)} once it completes. */
+    CompletableFuture<QuicByteStream> openQuic(InetSocketAddress target, Fingerprint fingerprint,
+            TransportConfig config) {
+        loop = super.getEventLoopGroup().next();
+        ChannelFactory<? extends DatagramChannel> datagrams = TransportHelper.TRANSPORT_TYPE.datagramChannelFactory();
+        CompletableFuture<QuicByteStream> result = new CompletableFuture<>();
+        new Bootstrap().group(loop).channelFactory(datagrams).handler(new ChannelInboundHandlerAdapter())
+                .bind(0).addListener(f -> {
+                    if (!f.isSuccess()) {
+                        result.completeExceptionally(f.cause());
+                        return;
+                    }
+                    DatagramChannel udp = (DatagramChannel) ((io.netty.channel.ChannelFuture) f).channel();
+                    QuicClient.connect(GameHost.loop(loop), GameHost.socket(udp), target, fingerprint, config)
+                            .whenComplete((s, e) -> {
+                                if (e != null) {
+                                    result.completeExceptionally(e);
+                                } else {
+                                    stream = s;
+                                    result.complete(s);
+                                }
+                            });
+                });
+        return result;
+    }
+
+    /** The loop QUIC runs on: the bridge channel registers there too, so nothing crosses threads. */
+    @Override
+    protected EventLoopGroup getEventLoopGroup() {
+        return loop != null ? loop : super.getEventLoopGroup();
     }
 
     @Override

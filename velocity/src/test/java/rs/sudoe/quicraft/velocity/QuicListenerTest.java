@@ -14,6 +14,7 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
+import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.haproxy.HAProxyMessageDecoder;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -75,10 +76,19 @@ class QuicListenerTest {
     }
 
     @Test
-    void aQuicStreamRunsThroughTheProxyInitializerWithThePlayersAddress() throws Exception {
+    void hostedAQuicStreamRunsThroughTheProxyInitializerOnTheSocketsLoop() throws Exception {
+        run(true);
+    }
+
+    @Test
+    void onCoresThreadAQuicStreamRunsThroughTheProxyInitializer() throws Exception {
+        run(false);
+    }
+
+    private static void run(boolean hosted) throws Exception {
         ProxyInitializer velocity = new ProxyInitializer();
         try (QuicListener listener = QuicListener.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
-                identity, TransportConfig.DEFAULT, () -> velocity, workers,
+                identity, TransportConfig.DEFAULT, () -> velocity, workers, hosted ? NioDatagramChannel::new : null,
                 LoggerFactory.getLogger(QuicListenerTest.class))) {
             QuicByteStream client = QuicClient.connect(listener.localAddress(), identity.fingerprint(),
                     TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);

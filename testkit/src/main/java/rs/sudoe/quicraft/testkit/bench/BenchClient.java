@@ -28,8 +28,6 @@ import org.geysermc.mcprotocollib.protocol.codec.MinecraftCodec;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundMovePlayerPosPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ping.serverbound.ServerboundPingRequestPacket;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
-import rs.sudoe.quicraft.core.transport.QuicByteStream;
-import rs.sudoe.quicraft.core.transport.QuicClient;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
 import rs.sudoe.quicraft.testkit.Args;
 import rs.sudoe.quicraft.testkit.session.MockSessionService;
@@ -131,14 +129,14 @@ public final class BenchClient {
         long start = System.nanoTime();
         ClientNetworkSession session;
         if (ad != null) {
-            QuicByteStream stream;
+            QuicClientSession quic = new QuicClientSession(address, protocol);
             try {
-                stream = QuicClient.connect(new InetSocketAddress(address.getAddress(), ad.port()), ad.fingerprint(),
+                quic.openQuic(new InetSocketAddress(address.getAddress(), ad.port()), ad.fingerprint(),
                         TransportConfig.DEFAULT).get(o.timeoutNanos(), TimeUnit.NANOSECONDS);
             } catch (ExecutionException | TimeoutException e) {
                 return failure(index, warmup, bench, "QUIC connect failed: " + e);
             }
-            session = new QuicClientSession(address, protocol, stream);
+            session = quic;
         } else {
             session = new ClientNetworkSession(address, protocol, Runnable::run, null, null);
         }
