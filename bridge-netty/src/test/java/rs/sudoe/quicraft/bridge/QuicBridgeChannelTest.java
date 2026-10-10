@@ -154,9 +154,9 @@ class QuicBridgeChannelTest {
         CompletableFuture<Channel> serverChannel = new CompletableFuture<>();
         try (QuicServer server = echoServer(serverChannel)) {
             Collector c = clientChannel(server, new Collector());
-            c.channel.config().setOption(ChannelOption.TCP_NODELAY, true);
-            c.channel.config().setOption(ChannelOption.SO_KEEPALIVE, true);
-            c.channel.config().setOption(ChannelOption.IP_TOS, 0x18);
+            assertTrue(c.channel.config().setOption(ChannelOption.TCP_NODELAY, true));
+            assertTrue(c.channel.config().setOption(ChannelOption.SO_KEEPALIVE, true));
+            assertTrue(c.channel.config().setOption(ChannelOption.IP_TOS, 0x18));
             assertTrue(c.channel.config().setOption(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000));
             c.channel.close().sync();
         }

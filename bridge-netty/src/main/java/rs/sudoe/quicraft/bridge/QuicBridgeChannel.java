@@ -259,13 +259,24 @@ public final class QuicBridgeChannel extends AbstractChannel {
             super(channel);
         }
 
+        /**
+         * Socket options that a game or proxy sets on its TCP channels. They have no meaning on a
+         * QUIC stream, so they are accepted and ignored (returning false would make Bootstrap log
+         * an "Unknown channel option" warning for every connection).
+         */
         @Override
         public <T> boolean setOption(ChannelOption<T> option, T value) {
             try {
-                return super.setOption(option, value);
+                if (super.setOption(option, value)) {
+                    return true;
+                }
             } catch (RuntimeException e) {
                 return false;
             }
+            return option == ChannelOption.TCP_NODELAY || option == ChannelOption.IP_TOS
+                    || option == ChannelOption.SO_KEEPALIVE || option == ChannelOption.SO_SNDBUF
+                    || option == ChannelOption.SO_RCVBUF || option == ChannelOption.SO_LINGER
+                    || option == ChannelOption.SO_REUSEADDR;
         }
 
         @Override
