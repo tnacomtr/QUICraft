@@ -1,0 +1,15 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "rs.sudoe.quicraft.fabric.client.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "ClientHandshakePacketListenerImplMixin",
+    "ConnectScreenConnectorMixin",
+    "DebugEntryTpsMixin",
+    "ServerStatusPingerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

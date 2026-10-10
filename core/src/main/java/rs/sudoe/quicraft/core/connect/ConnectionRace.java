@@ -16,7 +16,8 @@ import rs.sudoe.quicraft.core.transport.QuicByteStream;
  * it completes later. The player never waits for a full QUIC timeout.
  *
  * <p>TCP is the platform's own connection type {@code T}; core never touches it beyond
- * starting and closing it.
+ * starting and closing it. Cancelling the result abandons the race and closes whatever
+ * completes afterwards.
  */
 public final class ConnectionRace<T> {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -78,7 +79,27 @@ public final class ConnectionRace<T> {
             long headStartMillis, ScheduledExecutorService scheduler) {
         ConnectionRace<T> race = new ConnectionRace<>(quic, tcp);
         race.start(headStartMillis, scheduler);
+        race.result.whenComplete((r, e) -> {
+            if (race.result.isCancelled()) {
+                race.onCancel();
+            }
+        });
         return race.result;
+    }
+
+    /**
+     * The caller gave up: stop the QUIC attempt and don't start TCP. A TCP connection already
+     * under way is closed when it completes ({@link #onTcp}); so is a late QUIC stream.
+     */
+    private void onCancel() {
+        CompletableFuture<QuicByteStream> attempt;
+        synchronized (this) {
+            cancelTimer();
+            attempt = quicFuture;
+        }
+        if (attempt != null) {
+            attempt.cancel(false);
+        }
     }
 
     private void start(long headStartMillis, ScheduledExecutorService scheduler) {

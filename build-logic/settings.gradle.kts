@@ -2,6 +2,11 @@
 dependencyResolutionManagement {
     repositories {
         gradlePluginPortal()
+        // Fabric Loom (fabric-*/ modules).
+        maven("https://maven.fabricmc.net/") {
+            name = "Fabric"
+            content { includeGroupAndSubgroups("net.fabricmc") }
+        }
     }
 }
 

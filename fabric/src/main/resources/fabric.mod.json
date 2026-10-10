@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "quicraft",
+  "version": "${version}",
+  "name": "QUICraft",
+  "description": "QUIC transport for Minecraft, with silent TCP fallback. Servers advertise QUIC; clients with this mod use it.",
+  "license": "GPL-3.0-or-later",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["rs.sudoe.quicraft.fabric.QuicraftFabric"],
+    "client": ["rs.sudoe.quicraft.fabric.client.QuicraftClient"]
+  },
+  "mixins": [
+    "quicraft.mixins.json",
+    { "config": "quicraft.client.mixins.json", "environment": "client" }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader}",
+    "minecraft": "${minecraftRange}",
+    "java": ">=${java}"
+  }
+}

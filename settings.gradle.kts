@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pluginManagement {
     includeBuild("build-logic")
+    repositories {
+        gradlePluginPortal()
+        // Fabric Loom, a dependency of build-logic (fabric-*/ modules).
+        maven("https://maven.fabricmc.net/") {
+            name = "Fabric"
+            content { includeGroupAndSubgroups("net.fabricmc") }
+        }
+    }
 }
 
 dependencyResolutionManagement {
@@ -35,4 +43,6 @@ include("core")
 include("bridge-netty41")
 include("bridge-netty42")
 include("velocity")
+include("fabric-26x")
+include("fabric-1.21.11")
 include("testkit")
