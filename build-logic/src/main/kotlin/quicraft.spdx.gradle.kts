@@ -19,6 +19,8 @@ val checkSpdxHeaders = tasks.register<SpdxHeaderCheck>("checkSpdxHeaders") {
             exclude(
                 "**/build/**", "**/.gradle/**", "**/.kotlin/**", "gradle/wrapper/**",
                 "testkit/results/**",
+                // Agent worktrees: other checkouts of this repo, checked in their own builds.
+                ".claude/**",
             )
         },
     )
