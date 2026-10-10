@@ -201,9 +201,22 @@ public final class QuicBridgeChannel extends AbstractChannel {
     }
 
     private final class BridgeUnsafe extends AbstractUnsafe {
+        /**
+         * The QUIC stream is connected before this channel exists, so connect() succeeds at once
+         * while the channel is open; the address is not used. That lets a client that connects
+         * through a {@code Bootstrap} (vanilla's client, MCProtocolLib) take this channel from a
+         * channel factory unchanged. channelActive has already fired at registration.
+         */
         @Override
         public void connect(SocketAddress remote, SocketAddress local, ChannelPromise promise) {
-            promise.setFailure(new UnsupportedOperationException("a QUIC bridge channel is already connected"));
+            if (!promise.setUncancellable()) {
+                return;
+            }
+            if (isActive()) {
+                promise.setSuccess();
+            } else {
+                promise.setFailure(new java.nio.channels.ClosedChannelException());
+            }
         }
     }
 
