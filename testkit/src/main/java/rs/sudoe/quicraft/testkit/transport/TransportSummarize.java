@@ -27,6 +27,10 @@ public final class TransportSummarize {
     };
     private static final int RESAMPLES = 5000;
 
+    /** Every QUIC transport, in TransportClient order. */
+    private static final String[] QUIC = java.util.Arrays.stream(TransportClient.TRANSPORTS)
+            .filter(t -> !t.equals("tcp")).toArray(String[]::new);
+
     private TransportSummarize() {}
 
     public static int run(Args args) throws Exception {
@@ -37,7 +41,11 @@ public final class TransportSummarize {
             files = s.filter(p -> p.toString().endsWith(".json")).sorted().toList();
         }
         Random random = new Random(1);
-        md.append("| Profile | Metric | TCP | QUIC Reno | QUIC CUBIC | QUIC BBR |\n| --- | --- | --- | --- | --- | --- |\n");
+        md.append("| Profile | Metric | TCP | QUIC Reno | QUIC CUBIC | QUIC BBR | QUIC BBR relaxed |\n"
+                + "| --- | --- | --- | --- | --- | --- | --- |\n");
+        StringBuilder relaxed = new StringBuilder("\nQUIC BBR with the relaxed loss threshold against plain QUIC BBR"
+                + " (difference of medians [bootstrap 95% CI]):\n\n| Profile | Metric | BBR | BBR relaxed | Difference |\n"
+                + "| --- | --- | --- | --- | --- |\n");
         StringBuilder handshakes = new StringBuilder(
                 "\n| Profile | QUIC handshake p50 | p90 | p99 | max | TCP connect p50 |\n| --- | --- | --- | --- | --- | --- |\n");
         StringBuilder counters = new StringBuilder("\nSender-side counters (median per run):\n\n"
@@ -64,7 +72,7 @@ public final class TransportSummarize {
             for (String[] metric : METRICS) {
                 double[] tcp = values(byTransport.get("tcp"), metric[0]);
                 md.append(String.format(Locale.ROOT, "| %s | %s | %.1f", profile, metric[1], median(tcp)));
-                for (String t : new String[] {"quic-reno", "quic-cubic", "quic-bbr"}) {
+                for (String t : QUIC) {
                     double[] q = values(byTransport.get(t), metric[0]);
                     double[] ci = diffCi(q, tcp, random);
                     String mark = ci[0] > 0 || ci[1] < 0 ? "**" : "";
@@ -72,6 +80,13 @@ public final class TransportSummarize {
                             median(q) - median(tcp), ci[0], ci[1], mark));
                 }
                 md.append(" |\n");
+                double[] bbr = values(byTransport.get("quic-bbr"), metric[0]);
+                double[] rel = values(byTransport.get("quic-bbr-relaxed"), metric[0]);
+                double[] rci = diffCi(rel, bbr, random);
+                String rmark = rci[0] > 0 || rci[1] < 0 ? "**" : "";
+                relaxed.append(String.format(Locale.ROOT, "| %s | %s | %.1f | %.1f | %s%+.1f [%+.1f, %+.1f]%s |%n",
+                        profile, metric[1], median(bbr), median(rel), rmark, median(rel) - median(bbr), rci[0],
+                        rci[1], rmark));
             }
             for (Map.Entry<String, List<JsonObject>> e : byTransport.entrySet()) {
                 Map<String, List<Double>> perKey = new java.util.TreeMap<>();
@@ -88,7 +103,7 @@ public final class TransportSummarize {
                 counters.append(String.format(Locale.ROOT, "| %s | %s | %s |%n", profile, e.getKey(), cells));
             }
             List<Double> quicHs = new ArrayList<>();
-            for (String t : new String[] {"quic-reno", "quic-cubic", "quic-bbr"}) {
+            for (String t : QUIC) {
                 for (double v : values(byTransport.get(t), "handshakeMs")) {
                     quicHs.add(v);
                 }
@@ -99,6 +114,7 @@ public final class TransportSummarize {
                     median(values(byTransport.get("tcp"), "handshakeMs"))));
         }
         md.append("\nCells: median (difference to TCP [bootstrap 95% CI]); **bold** where the CI excludes zero.\n");
+        md.append(relaxed);
         md.append(handshakes);
         md.append(counters);
         md.append(String.format(Locale.ROOT, "%nFailed runs: %d%n", failures));

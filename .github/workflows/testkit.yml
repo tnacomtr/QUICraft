@@ -36,6 +36,7 @@ jobs:
           distribution: temurin
           java-version: 25
       - uses: gradle/actions/setup-gradle@v6
+      - uses: ./.github/actions/netty-quic-linux
       - name: Load netem and ifb kernel modules
         run: |
           sudo modprobe sch_netem && sudo modprobe ifb || {

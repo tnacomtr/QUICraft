@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Puts QUICraft's patched Netty QUIC jars (classes + linux native for the runner's architecture)
+# into natives/build/out/repo, where core's build reads them. Restored from the cache when the
+# patches, pins and build scripts are unchanged; otherwise built in Docker (natives/build-linux.sh,
+# ~15 min cold).
+name: Patched Netty QUIC (Linux)
+description: Build or restore natives/build/out/repo
+runs:
+  using: composite
+  steps:
+    - id: cache
+      uses: actions/cache@v5
+      with:
+        path: natives/build/out
+        key: netty-quic-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('natives/Dockerfile', 'natives/*.sh', 'natives/*.py', 'natives/quiche-Cargo.lock', 'natives/patches/**') }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: natives/build-linux.sh

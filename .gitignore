@@ -15,6 +15,8 @@ run/
 *-sources.jar
 # Testkit: raw run output (summaries go to docs/benchmarks.md)
 testkit/results/
+# Patched Netty QUIC build (natives/build-linux.sh): sources, caches and jars, never committed
+natives/build/
 
 # Claude Code agent worktrees
 .claude/worktrees/

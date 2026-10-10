@@ -1,0 +1,46 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+(This header only. The diff below changes quiche files, which stay under quiche's BSD-2-Clause
+licence.)
+
+QUICraft patch for cloudflare/quiche be47c5011215b9f13bad06bd7627d3ae49888a19 (0.30.0): add a C
+FFI binding for Config::set_enable_relaxed_loss_threshold. quiche's C API lacks it, on master too
+as of 2026-10-08 (b60aff93). The name follows the existing
+quiche_config_set_enable_cubic_idle_restart_fix.
+
+Applied by natives/build-netty-quic.sh with `git apply`, which ignores this text.
+
+diff --git a/quiche/include/quiche.h b/quiche/include/quiche.h
+index 2791d7f..86fc2b9 100644
+--- a/quiche/include/quiche.h
++++ b/quiche/include/quiche.h
+@@ -252,6 +252,11 @@ void quiche_config_enable_hystart(quiche_config *config, bool v);
+ // Configures whether to enable pacing (enabled by default).
+ void quiche_config_enable_pacing(quiche_config *config, bool v);
+ 
++// Configures whether to enable relaxed loss detection on spurious loss
++// (disabled by default). Added by the QUICraft project.
++void quiche_config_set_enable_relaxed_loss_threshold(quiche_config *config,
++                                                     bool v);
++
+ // Configures whether to enable the CUBIC idle restart fix (enabled by default).
+ void quiche_config_set_enable_cubic_idle_restart_fix(quiche_config *config,
+                                                      bool v);
+diff --git a/quiche/src/ffi.rs b/quiche/src/ffi.rs
+index 435c515..59eb1a0 100644
+--- a/quiche/src/ffi.rs
++++ b/quiche/src/ffi.rs
+@@ -378,6 +378,14 @@ pub extern "C" fn quiche_config_enable_pacing(config: &mut Config, v: bool) {
+     config.enable_pacing(v);
+ }
+ 
++// Added by the QUICraft project.
++#[no_mangle]
++pub extern "C" fn quiche_config_set_enable_relaxed_loss_threshold(
++    config: &mut Config, v: bool,
++) {
++    config.set_enable_relaxed_loss_threshold(v);
++}
++
+ #[no_mangle]
+ pub extern "C" fn quiche_config_set_enable_cubic_idle_restart_fix(
+     config: &mut Config, v: bool,

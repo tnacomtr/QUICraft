@@ -107,16 +107,22 @@ connect timeout (10 s). Step 2 still bounds the player's wait to H. A v1 client 
 ALPN the server advertised, so this needs a wrong advertisement to happen. A fingerprint
 mismatch is detected on the client and fails at once (~20 ms on loopback).
 
-Measured connect cost (Netty 4.2.19, `HandshakeFlightProbeTest`): the client has finished the
-TLS handshake after one round trip, but Netty only completes the connect when the server's next
-packet arrives, so a fresh QUIC connect takes about **2 RTT**, against 1 RTT for TCP connect.
-0-RTT resumption (§8) removes the handshake wait on rejoin.
+Measured connect cost (QUICraft's Netty build, §11; `HandshakeFlightProbeTest`): a fresh QUIC
+connect completes **1.02 RTT** after the client's first Initial (203–204 ms at 200 ms RTT), like
+TCP connect. Upstream Netty 4.2.19 needed about **2 RTT**. Netty runs the certificate check as an
+SSL task after `quiche_conn_recv`. quiche finishes the handshake only in the next send, and Netty
+then didn't look again until the server's next packet arrived, one RTT later.
+`natives/patches/netty/0002-complete-connect-after-handshake-send.patch` completes the connect
+right after that send. In the transport benchmark at +150 ms RTT, QUIC handshake p50 went from
+303 ms (run `transport-20261009T191726Z`) to 153 ms (run `transport-20261010T010019Z`). This
+compares two runs; TCP connect was 150.5 and 150.4 ms in them. 0-RTT resumption (§8) removes the
+handshake wait on rejoin.
 
-**H = 250 ms, provisional.** Phase 1 transport benchmark: QUIC handshake p50/p99 was
-2.8/4.0 ms (clean), 303/304 ms (+150 ms RTT), 2.9/1005 ms (2% loss; the tail is a lost first
-Initial) and 43/44 ms (reorder). With H = 250 ms, QUIC still wins at +150 ms RTT (303 ms against
-250 + 150 ms for TCP), and a lost Initial costs at most H instead of ~1 s. Open idea: derive H from
-the RTT the server-list ping already measured.
+**H = 250 ms, provisional.** Transport benchmark with the connect fix: QUIC handshake p50/p99
+was 2.7/3.2 ms (clean), 153/155 ms (+150 ms RTT) and 23/24 ms (reorder). The earlier run measured
+2.9/1005 ms under 2% loss; the tail is a lost first Initial. With H = 250 ms, QUIC completes well
+inside the head start at +150 ms RTT, and a lost Initial costs at most H instead of ~1 s. Open
+idea: derive H from the RTT the server-list ping already measured.
 
 ## 6. Failure cache
 
@@ -197,7 +203,8 @@ flow control and stream counts, meaning nothing could be sent.
 | `initial_max_streams_uni` | 0 | |
 | `disable_active_migration` | true | No deliberate migration before Phase 9; NAT rebinding is still handled. |
 | Datagrams (RFC 9221) | off | Not used before a later version. |
-| Congestion control | BBR, **provisional** | Phase 1 transport benchmark (docs/benchmarks.md): the only variant faster than TCP at +150 ms RTT (−509 ms on a 2.2 MiB burst). All three trail TCP badly under heavy reordering; under investigation. Sender-side only, so changing it needs no protocol version. |
+| Congestion control | BBR, **provisional** | Phase 1 transport benchmark (docs/benchmarks.md): the only variant faster than TCP at +150 ms RTT (−509 ms on a 2.2 MiB burst). Reno, CUBIC and plain BBR trail TCP badly under heavy reordering; BBR with the relaxed loss threshold (next row) doesn't. Sender-side only, so changing it needs no protocol version. |
+| Relaxed loss threshold (quiche `enable_relaxed_loss_threshold`) | on, where the native supports it | Reordering makes quiche declare late packets lost and retransmit them. With this on, the first spurious loss disables the packet threshold, and each further one doubles the time-threshold overhead, up to 2× RTT. Transport benchmark, reorder profile (run `transport-20261010T010019Z`, N=5): 2.2 MiB burst 799 ms with it, 2754 ms without (−1955 ms [−2155, −1561]); TCP took 1212 ms. Lost packets per run were 93 against 579. No significant difference on a clean link or at +150 ms RTT. quiche 0.30 implements it only for BBR (gcongestion), so it does nothing under Reno or CUBIC. Sender-side only: no transport parameter, no protocol version. Needs QUICraft's patched native (§11). With an upstream native it is unavailable, and core logs one INFO line. |
 | Address validation (Retry) | when handshake rate exceeds a threshold | A real token handler is required before the public alpha (Phase 4). `InsecureQuicTokenHandler` is never used. |
 
 Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
@@ -211,6 +218,9 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
 - Each value is held as a nullable boxed field. A value left unset is not passed to quiche, so
   quiche's own default applies. A Phase 1 loopback test confirms that unset flow-control limits
   can't send.
+- QUICraft's build (§11) adds `relaxedLossThreshold(boolean)`, which throws
+  `UnsupportedOperationException` without the native binding, and
+  `Quic.isRelaxedLossThresholdSupported()`.
 - Congestion control: `QuicCongestionControlAlgorithm` offers `RENO`, `CUBIC` and `BBR`. It is set
   per codec builder and applies to connections created afterwards. No API to switch a live
   connection was found.
@@ -249,6 +259,39 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
   one is present byte for byte.
 - On a platform without a native, or if loading fails, the endpoint logs one INFO line and runs
   TCP-only. The client doesn't attempt QUIC; the server doesn't advertise it.
+
+### QUICraft's Netty QUIC build
+
+`core` doesn't use Maven Central's `netty-codec-classes-quic`. It uses QUICraft's build,
+`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft1` from
+`natives/`. That is Netty `netty-4.2.19.Final` (64cc10f3), quiche `be47c501` and BoringSSL
+`d03dbc3e`, the same revisions as upstream 4.2.19, plus three patches:
+
+| Patch | What it does |
+| --- | --- |
+| `quiche/0001-ffi-relaxed-loss-threshold` | C FFI `quiche_config_set_enable_relaxed_loss_threshold`. quiche's C API lacks it, including master as of 2026-10-08. |
+| `netty/0001-relaxed-loss-threshold` | `QuicCodecBuilder.relaxedLossThreshold(boolean)`, its JNI binding, and `Quic.isRelaxedLossThresholdSupported()`, which probes the loaded native. |
+| `netty/0002-complete-connect-after-handshake-send` | Completes a client connect as soon as the handshake does (§5). |
+
+- `natives/build-linux.sh` runs Netty's own Maven build unchanged in Docker, on AlmaLinux 8 with
+  pinned GCC 13, Rust 1.98.0, CMake 3.31.9, Ninja 1.12.1 and Temurin 11. quiche commits no
+  `Cargo.lock`, so `natives/quiche-Cargo.lock` pins the crate versions. Built jars stay in
+  `natives/build/` and are never committed.
+- **Platforms.** The patched classes are used everywhere. The patched native exists for
+  linux-x86_64 only, and the other four platforms use upstream Netty's native. A patched class
+  with an upstream native still works: the extra JNI method is simply unbound.
+  `Quic.isRelaxedLossThresholdSupported()` then returns false, and core leaves quiche's default
+  in place after one INFO line. `testUpstreamNative` checks this combination on every build.
+  `.github/workflows/netty-quic-natives.yml` builds all five platforms, but has not run yet.
+- **glibc.** The Linux native built on AlmaLinux 8 needs glibc 2.28 (`statx`), where upstream's
+  needs 2.16. On an older system it fails to load, and the endpoint runs TCP-only (above).
+- **Licences.** `natives/crate-licenses.py` checks every Rust crate the native links (38 for all
+  targets, from `cargo tree -e normal,no-proc-macro`) against CLAUDE.md's table, and fails the
+  build otherwise. It copies their licence files into the native jar under
+  `META-INF/license/quiche-deps/`, with an `INVENTORY.txt`, and `checkShadedNotices` carries them
+  into the shaded jar. BoringSSL at `d03dbc3e` is Apache-2.0, including the fiat-crypto code
+  compiled into libcrypto. As upstream, the native statically links libstdc++ and libgcc (GPL-3.0
+  with the GCC Runtime Library Exception).
 
 ## 12. Channel binding, pinning and dropping Minecraft's cipher (Phase 5 draft)
 

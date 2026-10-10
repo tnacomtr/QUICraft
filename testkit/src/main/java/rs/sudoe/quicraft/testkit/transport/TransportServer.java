@@ -16,12 +16,11 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.QuicServer;
-import rs.sudoe.quicraft.core.transport.TransportConfig;
 import rs.sudoe.quicraft.testkit.Args;
 
 /**
  * Transport benchmark server: TCP on {@code --port}, QUIC with RENO, CUBIC and BBR on the next
- * three ports. Each connection gets the same Minecraft-shaped session: a login burst, a chunk
+ * three ports (relaxed loss threshold off), and BBR with the relaxed loss threshold on the fourth. Each connection gets the same Minecraft-shaped session: a login burst, a chunk
  * burst, then 20 Hz entity updates while echoing the client's pings.
  */
 public final class TransportServer {
@@ -57,14 +56,16 @@ public final class TransportServer {
                 }
             }
         });
-        TransportConfig.CongestionControl[] ccs = TransportConfig.CongestionControl.values();
-        for (int i = 0; i < ccs.length; i++) {
-            TransportConfig config = TransportConfig.builder().congestionControl(ccs[i]).build();
-            QuicServer.bind(new InetSocketAddress(port + 1 + ccs[i].ordinal()), identity, config,
-                    stream -> Thread.ofVirtual().start(() -> serve(Conn.quic(stream))));
+        for (String transport : TransportClient.TRANSPORTS) {
+            if (!transport.equals("tcp")) {
+                QuicServer.bind(new InetSocketAddress(TransportClient.quicPort(port, transport)), identity,
+                        TransportClient.quicConfig(transport),
+                        stream -> Thread.ofVirtual().start(() -> serve(Conn.quic(stream))));
+            }
         }
         System.out.println("transport bench server: tcp :" + port + ", quic reno :" + (port + 1)
-                + ", cubic :" + (port + 2) + ", bbr :" + (port + 3) + ", fp " + identity.fingerprint());
+                + ", cubic :" + (port + 2) + ", bbr :" + (port + 3) + ", bbr-relaxed :" + (port + 4)
+                + ", fp " + identity.fingerprint());
         new CountDownLatch(1).await();
         return 0;
     }

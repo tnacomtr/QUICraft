@@ -21,6 +21,37 @@ val nettyRelocationPrefix = "rs.sudoe.quicraft.shaded"
 val nativePrefix = nettyRelocationPrefix.replace("_", "_1").replace('.', '_') + "_"
 val nativeClassifiers = listOf("linux-x86_64", "linux-aarch_64", "osx-x86_64", "osx-aarch_64", "windows-x86_64")
 
+// Netty's QUIC classes always come from QUICraft's patched build (natives/, docs/protocol.md §11).
+// Natives come from it for the platforms listed here (-Pquicraft.patchedNatives=a,b or =all) and
+// from upstream Netty for the rest, where the patched-only options are reported unavailable.
+val patchedNatives: List<String> = providers.gradleProperty("quicraft.patchedNatives")
+    .getOrElse("linux-x86_64")
+    .split(',').map { it.trim() }.filter { it.isNotEmpty() }
+    .let { if (it == listOf("all")) nativeClassifiers else it }
+require(nativeClassifiers.containsAll(patchedNatives)) { "unknown classifier in quicraft.patchedNatives: $patchedNatives" }
+
+/** Netty's classifier for the build host, e.g. linux-x86_64. */
+val hostClassifier: String = run {
+    val os = System.getProperty("os.name").lowercase()
+    val osPart = when {
+        os.startsWith("linux") -> "linux"
+        os.startsWith("mac") -> "osx"
+        os.startsWith("windows") -> "windows"
+        else -> os.replace(' ', '_')
+    }
+    val archPart = when (val arch = System.getProperty("os.arch").lowercase()) {
+        "amd64", "x86_64" -> "x86_64"
+        "aarch64", "arm64" -> "aarch_64"
+        else -> arch
+    }
+    "$osPart-$archPart"
+}
+
+/** Tests assert the relaxed loss threshold is available exactly when this host runs a patched native. */
+val expectRelaxedLossThreshold = hostClassifier in patchedNatives
+
+val patchedRepo = rootProject.layout.projectDirectory.dir("natives/build/out/repo")
+
 val quicNatives = configurations.create("quicNatives") {
     isCanBeConsumed = false
     isTransitive = false
@@ -28,15 +59,29 @@ val quicNatives = configurations.create("quicNatives") {
 
 dependencies {
     implementation(platform(libs.netty.bom))
-    implementation(libs.netty.quic.classes) {
-        // NIO datagram transport only: quiche is the single native we ship.
-        exclude(group = "io.netty", module = "netty-transport-classes-epoll")
-    }
+    // Its POM lists no epoll classes: NIO datagram transport only, quiche is the single native.
+    implementation(libs.quicraft.netty.quic.classes)
     for (classifier in nativeClassifiers) {
-        quicNatives(variantOf(libs.netty.quic.native) { classifier(classifier) })
+        val native: Provider<MinimalExternalModuleDependency> =
+            if (classifier in patchedNatives) libs.quicraft.netty.quic.native else libs.netty.quic.native
+        quicNatives(variantOf(native) { classifier(classifier) })
     }
     // Plain (unshaded) natives so ordinary unit tests can run QUIC on this machine.
     testRuntimeOnly(files(quicNatives))
+}
+
+// Without the patched build, resolution would fail with a bare "could not find"; say what to run.
+for (name in listOf("compileClasspath", "runtimeClasspath", "testCompileClasspath", "testRuntimeClasspath", "quicNatives")) {
+    configurations.named(name) {
+        incoming.beforeResolve {
+            if (!patchedRepo.dir("rs/sudoe/quicraft/netty").asFile.isDirectory) {
+                throw GradleException(
+                    "QUICraft's patched Netty QUIC build is missing from natives/build/out/repo. " +
+                        "Run natives/build-linux.sh (Docker) first.",
+                )
+            }
+        }
+    }
 }
 
 // Native libraries renamed for the relocated loader, e.g.
@@ -84,6 +129,39 @@ val shadedTestTask = tasks.register<Test>("shadedTest") {
     testClassesDirs = shadedTest.output.classesDirs
     classpath = shadedTest.runtimeClasspath
     useJUnitPlatform()
+    systemProperty("quicraft.test.expectRelaxedLossThreshold", expectRelaxedLossThreshold)
+}
+
+tasks.named<Test>("test") {
+    systemProperty("quicraft.test.expectRelaxedLossThreshold", expectRelaxedLossThreshold)
+}
+
+// The patched classes with upstream Netty's native for this host, which is what platforms without
+// a patched native run. QUIC must still work, with the relaxed loss threshold reported unavailable.
+val upstreamHostNative = configurations.create("upstreamHostNative") {
+    isCanBeConsumed = false
+    isTransitive = false
+}
+if (hostClassifier in nativeClassifiers) {
+    dependencies {
+        upstreamHostNative(variantOf(libs.netty.quic.native) { classifier(hostClassifier) })
+    }
+    val testUpstreamNative = tasks.register<Test>("testUpstreamNative") {
+        group = "verification"
+        description = "Runs the native-feature and loopback tests on upstream Netty's native for this platform."
+        val test = sourceSets.test.get()
+        testClassesDirs = test.output.classesDirs
+        classpath = test.runtimeClasspath.minus(quicNatives) + upstreamHostNative
+        useJUnitPlatform()
+        systemProperty("quicraft.test.expectRelaxedLossThreshold", false)
+        filter {
+            includeTestsMatching("rs.sudoe.quicraft.core.transport.NativeFeaturesTest")
+            includeTestsMatching("rs.sudoe.quicraft.core.transport.QuicLoopbackTest")
+        }
+    }
+    tasks.check {
+        dependsOn(testUpstreamNative)
+    }
 }
 
 val checkShadedNotices = tasks.register<ShadedNoticeCheck>("checkShadedNotices") {
