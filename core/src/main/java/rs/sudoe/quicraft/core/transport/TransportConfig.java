@@ -18,6 +18,7 @@ public final class TransportConfig {
     final long initialMaxStreamData;
     final CongestionControl congestionControl;
     final boolean earlyData;
+    final boolean sessionResumption;
     final boolean relaxedLossThreshold;
 
     private TransportConfig(Builder b) {
@@ -26,6 +27,7 @@ public final class TransportConfig {
         this.initialMaxStreamData = b.initialMaxStreamData;
         this.congestionControl = b.congestionControl;
         this.earlyData = b.earlyData;
+        this.sessionResumption = b.sessionResumption;
         this.relaxedLossThreshold = b.relaxedLossThreshold;
     }
 
@@ -62,6 +64,7 @@ public final class TransportConfig {
         private long initialMaxStreamData = 8L << 20;
         private CongestionControl congestionControl = defaultCongestionControl();
         private boolean earlyData = true;
+        private boolean sessionResumption = true;
         private boolean relaxedLossThreshold = true;
 
         public Builder maxIdleTimeout(long value, TimeUnit unit) {
@@ -86,6 +89,16 @@ public final class TransportConfig {
 
         public Builder earlyData(boolean enabled) {
             this.earlyData = enabled;
+            return this;
+        }
+
+        /**
+         * Client: resume TLS sessions from tickets the same server issued earlier in this
+         * process, skipping the certificate exchange (docs/protocol.md §8). Off gives every
+         * connect a full handshake, e.g. to measure one.
+         */
+        public Builder sessionResumption(boolean enabled) {
+            this.sessionResumption = enabled;
             return this;
         }
 

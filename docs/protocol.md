@@ -123,8 +123,8 @@ then didn't look again until the server's next packet arrived, one RTT later.
 `natives/patches/netty/0002-complete-connect-after-handshake-send.patch` completes the connect
 right after that send. In the transport benchmark at +150 ms RTT, QUIC handshake p50 went from
 303 ms (run `transport-20261009T191726Z`) to 153 ms (run `transport-20261010T010019Z`). This
-compares two runs; TCP connect was 150.5 and 150.4 ms in them. 0-RTT resumption (§8) removes the
-handshake wait on rejoin.
+compares two runs; TCP connect was 150.5 and 150.4 ms in them. Session resumption (§8) takes the
+certificate work off a rejoin but not the round trip.
 
 **H = 250 ms, provisional.** Transport benchmark with the connect fix: QUIC handshake p50/p99
 was 2.7/3.2 ms (clean), 153/155 ms (+150 ms RTT) and 23/24 ms (reorder). The earlier run measured
@@ -187,16 +187,31 @@ idea: derive H from the RTT the server-list ping already measured.
 - Application close error codes: `0x0` normal, `0x1` protocol violation, `0x2` internal error.
 - Multi-stream (Phase 5) needs a separately reviewed encryption design; the proposed one is §12.
 
-### 0-RTT *(user: allowed in v1)*
+### Session resumption and 0-RTT *(user: 0-RTT allowed in v1)*
 
-- The server issues session tickets. A client holding a ticket for the same server and
-  fingerprint MAY send its first flight as 0-RTT: the Minecraft handshake packet plus the packet
-  right after it (Status Request or Login Start).
+- **Resumption.** The server issues TLS 1.3 session tickets. The client keeps them in memory
+  only, per advertised fingerprint and per server (IP, QUIC port), so a ticket is only ever
+  offered to a server advertising the fingerprint it was issued under. A resumed handshake has no
+  certificate exchange: the server proves itself with the ticket's key, which only the server
+  that issued it holds, so it counts as a fingerprint match (§5, §7). A ticket the server
+  refuses (restart, new key, expiry) turns into a full handshake with the certificate, checked as
+  usual; a different server behind the same address fails the fingerprint check as before.
+  Tickets don't survive a client restart.
+- **What resumption saves:** the certificate, its signature and its check, i.e. CPU time on both
+  ends. Not a round trip: the connect still completes after 1 RTT (§5).
+- **0-RTT data: allowed, not sent by v1 clients.** A client holding a ticket MAY send its first
+  flight as 0-RTT: the Minecraft handshake packet plus the packet right after it (Status Request
+  or Login Start).
 - **Replay protection.** 0-RTT data can be replayed by an attacker. The server MUST NOT pass
   early stream data to the game until the QUIC handshake has completed. A replayed first flight
   never completes the handshake, so it never reaches the game. Otherwise a replay could, for
-  example, start a ghost login and kick the real player. The client still saves the round trip,
-  because its data travels with the handshake.
+  example, start a ghost login and kick the real player.
+- **Why v1 clients don't send it.** With that hold, 0-RTT data saves nothing. The server's
+  handshake completes when the client's Finished arrives, 1.5 RTT after the first Initial; that
+  is also when 1-RTT data sent right after the client's own handshake completed (at 1 RTT, §5)
+  arrives. Either way the first answer reaches the client 2 RTT after the start, as over TCP.
+  Saving a round trip would require the server to act on early data before the handshake
+  completes, which reopens the replay case above: a security decision for the user, not made.
 - If the server rejects early data, the client resends it normally after the handshake; nothing
   else changes.
 - Needs a security review before release (Phase 4), as part of the alpha's review.
