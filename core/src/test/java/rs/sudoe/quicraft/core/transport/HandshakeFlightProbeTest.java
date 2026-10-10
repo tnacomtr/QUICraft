@@ -14,21 +14,24 @@ import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 /**
- * Characterizes connect latency through a relay adding 100 ms each way (200 ms RTT). Observed
- * with Netty 4.2.19: the client has finished the TLS handshake after one round trip, but the
- * connect future only completes when the server's next (1-RTT) packet arrives, so connecting
- * takes about 2 RTT, against 1 RTT for TCP connect (docs/protocol.md §5). This test logs the
- * flights and fails only outside 1–2.5 RTT, so a Netty change in either direction gets noticed.
+ * Characterizes connect latency through a relay adding 100 ms each way (200 ms RTT), measured
+ * from the client's first Initial to the connect future. Upstream Netty 4.2.19 completed the
+ * connect only when the server's next (1-RTT) packet arrived, about 2 RTT (~420 ms here).
+ * QUICraft's patched build completes it as soon as the client has sent its Finished, one round
+ * trip after the Initial (natives/patches/netty/0002-complete-connect-after-handshake-send.patch,
+ * docs/protocol.md §5). Logs the flights and fails outside 0.9–1.6 RTT, so a regression to
+ * ~2 RTT (or an implausibly fast connect) gets noticed.
  */
 class HandshakeFlightProbeTest {
     @Test
-    void connectTakesAboutTwoRoundTripsWithNetty4219() throws Exception {
+    void connectTakesAboutOneRoundTrip() throws Exception {
         ServerIdentity id = ServerIdentity.generate();
         ScheduledExecutorService delay = Executors.newScheduledThreadPool(2);
         try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), id, TransportConfig.DEFAULT, s -> {});
                 DatagramSocket relay = new DatagramSocket(0, InetAddress.getLoopbackAddress())) {
             long t0 = System.nanoTime();
             SocketAddress[] client = new SocketAddress[1];
+            java.util.concurrent.atomic.AtomicLong firstInitial = new java.util.concurrent.atomic.AtomicLong();
             Thread pump = new Thread(() -> {
                 byte[] buf = new byte[65536];
                 try {
@@ -39,6 +42,7 @@ class HandshakeFlightProbeTest {
                         boolean fromServer = p.getSocketAddress().equals(server.localAddress());
                         if (!fromServer) {
                             client[0] = p.getSocketAddress();
+                            firstInitial.compareAndSet(0, System.nanoTime());
                         }
                         SocketAddress to = fromServer ? client[0] : server.localAddress();
                         System.out.printf("+%4dms %s %5d bytes first=0x%02x%n", (System.nanoTime() - t0) / 1_000_000,
@@ -57,12 +61,11 @@ class HandshakeFlightProbeTest {
             pump.start();
             CompletableFuture<QuicByteStream> f = QuicClient.connect(
                     (InetSocketAddress) relay.getLocalSocketAddress(), id.fingerprint(), TransportConfig.DEFAULT);
-            long start = System.nanoTime();
             f.get(10, TimeUnit.SECONDS);
-            long millis = (System.nanoTime() - start) / 1_000_000;
-            System.out.printf("connected after %d ms (%.2f RTT)%n", millis, millis / 200.0);
-            org.junit.jupiter.api.Assertions.assertTrue(millis >= 200 && millis <= 500,
-                    "connect took " + millis + " ms at 200 ms RTT");
+            long millis = (System.nanoTime() - firstInitial.get()) / 1_000_000;
+            System.out.printf("connected %d ms after the first Initial (%.2f RTT)%n", millis, millis / 200.0);
+            org.junit.jupiter.api.Assertions.assertTrue(millis >= 180 && millis <= 320,
+                    "connect took " + millis + " ms after the first Initial at 200 ms RTT");
             f.get().close();
             Thread.sleep(500);
         } finally {
