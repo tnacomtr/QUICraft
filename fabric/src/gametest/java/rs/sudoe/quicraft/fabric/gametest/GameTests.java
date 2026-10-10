@@ -61,32 +61,35 @@ final class GameTests {
     }
 
     /**
-     * Waits until the joined world has rendered. The method's home differs between Fabric API
-     * versions (getClientLevel on 26.x, getClientWorld on 1.21.11), hence reflection.
+     * Waits until the joined world has rendered. Where that method lives differs between Fabric
+     * API versions: on the connection (6.x, 26.2+), on getClientLevel()'s context (5.x, 26.1.x) or
+     * on getClientWorld()'s (4.x, 1.21.11). Hence reflection.
      */
     static void waitForChunks(Object connection) {
-        Object level = null;
-        for (String getter : new String[] {"getClientLevel", "getClientWorld"}) {
-            try {
-                java.lang.reflect.Method m = connection.getClass().getMethod(getter);
-                m.setAccessible(true); // implementation classes may be package-private
-                level = m.invoke(connection);
-                break;
-            } catch (NoSuchMethodException e) {
-                // try the next name
-            } catch (ReflectiveOperationException e) {
-                throw new AssertionError(e);
-            }
-        }
-        Object target = level != null ? level : connection;
         try {
-            java.lang.reflect.Method m = target.getClass().getMethod("waitForChunksRender");
-            m.setAccessible(true);
-            m.invoke(target);
+            Object target = connection;
+            if (find(connection, "waitForChunksRender") == null) {
+                java.lang.reflect.Method getter = find(connection, "getClientLevel");
+                if (getter == null) {
+                    getter = find(connection, "getClientWorld");
+                }
+                target = getter.invoke(connection);
+            }
+            find(target, "waitForChunksRender").invoke(target);
         } catch (java.lang.reflect.InvocationTargetException e) {
             throw new AssertionError(e.getCause());
-        } catch (ReflectiveOperationException e) {
+        } catch (ReflectiveOperationException | NullPointerException e) {
             throw new AssertionError(e);
+        }
+    }
+
+    private static java.lang.reflect.Method find(Object target, String name) {
+        try {
+            java.lang.reflect.Method m = target.getClass().getMethod(name);
+            m.setAccessible(true); // implementation classes may be package-private
+            return m;
+        } catch (NoSuchMethodException e) {
+            return null;
         }
     }
 

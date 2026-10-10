@@ -9,7 +9,6 @@ import java.util.Optional;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestDedicatedServerContext;
-import net.fabricmc.fabric.api.client.gametest.v1.context.TestServerConnection;
 import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
@@ -52,7 +51,7 @@ public class FallbackGameTest implements FabricClientGameTest {
         record(port, fake);
         int reportsBefore = server.computeOnServer(s -> ServerQuic.fallbackReportsReceived());
         long start = System.nanoTime();
-        try (TestServerConnection connection = server.connect()) {
+        try (var connection = server.connect()) {
             GameTests.waitForChunks(connection);
             check(!GameTests.connectedOverQuic(context), what + ": joined over TCP");
             context.waitTicks(10);
