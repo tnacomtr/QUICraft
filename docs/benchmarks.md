@@ -262,3 +262,45 @@ lost, retransmits them and backs off, while Linux TCP detects the reordering and
 threshold. The quiche inside Netty 4.2.19 contains an adaptive mode
 (`enable_relaxed_loss_threshold`), but Netty exposes no setter for it and the native exports no
 quiche config symbols. Turning it on needs a Netty change or our own native build.
+
+### Relaxed loss threshold and the connect fix (2026-10-10)
+
+QUICraft's Netty build (`4.2.19.Final-quicraft1`, docs/protocol.md §11) adds quiche's relaxed
+loss threshold and completes a client connect one RTT sooner. Method as above, with a fifth
+transport interleaved, `quic-bbr-relaxed`. The other three QUIC transports set the option off
+explicitly. Short runs (N=5, 1 warm-up), so CIs are wide. Commit `238cd87`, same host.
+
+Run `transport-20261010T010019Z` (reorder, delay; N=5), 0 failed runs:
+
+| Profile | Metric | TCP | QUIC Reno | QUIC CUBIC | QUIC BBR | QUIC BBR relaxed |
+| --- | --- | --- | --- | --- | --- | --- |
+| delay | handshake (ms) | 150.4 | 153.2 (**+2.8 [+2.2, +3.1]**) | 153.2 (**+2.7 [+2.3, +3.4]**) | 153.6 (**+3.2 [+2.5, +3.5]**) | 153.5 (**+3.1 [+2.3, +4.7]**) |
+| delay | login+chunk burst (ms) | 2105.3 | 4067.5 (+1962.2 [-747.7, +2714.4]) | 1358.4 (-746.9 [-1346.3, +1510.8]) | 1556.3 (-549.0 [-1148.4, +54.2]) | 1526.5 (-578.9 [-1178.2, +155.7]) |
+| reorder | handshake (ms) | 20.4 | 23.0 (+2.6 [-6.3, +12.5]) | 23.0 (**+2.6 [+2.3, +12.5]**) | 23.0 (**+2.6 [+2.3, +12.5]**) | 23.3 (**+2.8 [+2.6, +12.8]**) |
+| reorder | login+chunk burst (ms) | 1211.9 | 3658.8 (**+2446.9 [+2032.1, +3495.4]**) | 2416.0 (**+1204.1 [+615.2, +2252.6]**) | 2754.2 (**+1542.3 [+1226.7, +2590.8]**) | 799.1 (-412.8 [-650.0, +635.7]) |
+
+| Profile | Metric | QUIC BBR | QUIC BBR relaxed | Difference [95% CI] |
+| --- | --- | --- | --- | --- |
+| reorder | login+chunk burst (ms) | 2754.2 | 799.1 | **-1955.1 [-2155.2, -1561.4]** |
+| delay | login+chunk burst (ms) | 1556.3 | 1526.5 | -29.8 [-282.0, +151.0] |
+
+Sender counters under reorder (median per run): BBR lost 579 / retrans 575 of 2956 sent; BBR
+relaxed lost 93 / retrans 91 of 2331; Reno 164/160; CUBIC 767/766. TCP: RetransSegs 15,
+TCPSACKReorder 29.
+
+Clean link, run `transport-20261010T010824Z` (N=5): burst TCP 7.1 ms, BBR 12.2, BBR relaxed 9.6
+(relaxed vs BBR −2.6 [−9.5, +6.4]); handshake p50 2.5–3.1 ms for all QUIC variants. No regression.
+(An N=3 run before it, `transport-20261010T010652Z`, showed BBR relaxed at 19.6 ms against 8.9,
+CI [−6.4, +14.8]. Single runs on loopback have sporadic real losses in either mode.)
+
+Reading:
+
+- **Reordering: fixed for BBR.** The relaxed threshold cuts spurious losses ~6x and the 2.2 MiB
+  burst by ~2 s, bringing QUIC BBR level with TCP (−413 ms, CI includes zero) instead of 1.5 s
+  slower. Reno and CUBIC don't get it: quiche 0.30 implements it in its BBR recovery only.
+- **Handshake: ~1 RTT now.** At +150 ms RTT the QUIC handshake p50 is 153 ms, down from 303 ms
+  in run `transport-20261009T191726Z`. That is a cross-run comparison, anchored on TCP connect
+  (150.4 and 150.5 ms). Remaining cost over TCP: ~3 ms.
+- Core's `NativeFeaturesTest` shows the same effect on loopback through a relay that reorders
+  both directions (25% overtake 10 ms): BBR declared 1778–1969 packets lost per 2 MiB without the
+  option and 466–908 with it.

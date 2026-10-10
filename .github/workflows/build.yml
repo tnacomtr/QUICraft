@@ -20,6 +20,8 @@ jobs:
           distribution: temurin
           java-version: 25
       - uses: gradle/actions/setup-gradle@v6
+      # QUICraft's patched Netty QUIC jars (natives/); cached, built in Docker on a miss.
+      - uses: ./.github/actions/netty-quic-linux
       - run: ./gradlew build
       - name: Upload license reports
         if: always()

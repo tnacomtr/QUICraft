@@ -8,12 +8,17 @@ import io.netty.handler.codec.quic.QuicCodecBuilder;
 import io.netty.handler.codec.quic.QuicCongestionControlAlgorithm;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import java.util.concurrent.TimeUnit;
+import rs.sudoe.quicraft.core.QuicSupport;
 
 /** Applies {@link TransportConfig} to Netty's codec builders (docs/protocol.md §9). */
 final class Codecs {
     private Codecs() {}
 
     static <B extends QuicCodecBuilder<B>> B apply(B builder, TransportConfig config, boolean server) {
+        // Only QUICraft's patched native has the binding; elsewhere quiche's default (off) stays.
+        if (QuicSupport.hasRelaxedLossThreshold()) {
+            builder.relaxedLossThreshold(config.relaxedLossThreshold);
+        }
         return builder
                 .maxIdleTimeout(config.maxIdleTimeoutMillis, TimeUnit.MILLISECONDS)
                 .initialMaxData(config.initialMaxData)

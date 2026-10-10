@@ -18,6 +18,7 @@ public final class TransportConfig {
     final long initialMaxStreamData;
     final CongestionControl congestionControl;
     final boolean earlyData;
+    final boolean relaxedLossThreshold;
 
     private TransportConfig(Builder b) {
         this.maxIdleTimeoutMillis = b.maxIdleTimeoutMillis;
@@ -25,6 +26,7 @@ public final class TransportConfig {
         this.initialMaxStreamData = b.initialMaxStreamData;
         this.congestionControl = b.congestionControl;
         this.earlyData = b.earlyData;
+        this.relaxedLossThreshold = b.relaxedLossThreshold;
     }
 
     public static Builder builder() {
@@ -35,12 +37,23 @@ public final class TransportConfig {
         return congestionControl;
     }
 
+    /**
+     * Whether quiche relaxes its loss-detection thresholds after a spurious loss (packet
+     * reordering). Applied only where the loaded native supports it
+     * ({@link rs.sudoe.quicraft.core.QuicSupport#hasRelaxedLossThreshold()}); quiche 0.30 implements
+     * it for BBR only.
+     */
+    public boolean relaxedLossThreshold() {
+        return relaxedLossThreshold;
+    }
+
     public static final class Builder {
         private long maxIdleTimeoutMillis = TimeUnit.SECONDS.toMillis(60);
         private long initialMaxData = 16L << 20;
         private long initialMaxStreamData = 8L << 20;
         private CongestionControl congestionControl = CongestionControl.BBR;
         private boolean earlyData = true;
+        private boolean relaxedLossThreshold = true;
 
         public Builder maxIdleTimeout(long value, TimeUnit unit) {
             this.maxIdleTimeoutMillis = unit.toMillis(value);
@@ -64,6 +77,12 @@ public final class TransportConfig {
 
         public Builder earlyData(boolean enabled) {
             this.earlyData = enabled;
+            return this;
+        }
+
+        /** Sender-side only; the peer never sees it (docs/protocol.md §9). */
+        public Builder relaxedLossThreshold(boolean enabled) {
+            this.relaxedLossThreshold = enabled;
             return this;
         }
 
