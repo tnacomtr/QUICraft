@@ -321,7 +321,9 @@ nothing about small differences.
 - QUIC: the client pings over TCP for the advertisement (outside the timed window, like a
   server-list entry), connects QUIC to the advertised port, then runs MCProtocolLib's session
   over a bridge channel. Every join loaded all 329 chunks, with no lost pings.
-- TCP with the plugin installed matches the TCP baseline. The plugin leaves TCP joins alone.
+- TCP with the plugin installed matches TCP without it, measured back to back in one session
+  (2026-10-10, clean, 5 runs each): join 312.8 vs 310.2 ms, chunk load 426 vs 428 ms, play RTT
+  0.7 vs 0.8 ms. The plugin leaves TCP joins alone.
 - Join time is noisy at N=3 in both transports (warmups at 1.5–1.7 s, one QUIC run at 1559 ms in
   the configuration phase, one TCP run at 510 ms). That's the clean-join quantization documented
   in the baseline, not a transport effect.
@@ -329,3 +331,63 @@ nothing about small differences.
   favicon (16.5 KB PNG) and a MOTD sized around the cap (advertisement member: 136 characters):
   MOTD 10449 → 32767 characters with the advertisement; 10450 → 32632, advertisement left out,
   Velocity's response unchanged; 10585 → 32767 (Velocity's own response at the cap), left out.
+
+### Latency work: QUIC vs TCP (2026-10-10)
+
+The user's bar for Phase 2: QUIC at TCP's latency. Method: `run-baseline.sh` with
+`TRANSPORTS="tcp quic"`, so each profile runs TCP and QUIC back to back in one session; 5
+measured runs each; QUIC − TCP as the difference of medians with a 95% bootstrap CI.
+
+**Where the gap came from (in-process, `quicraft-testkit latency`):** 16-byte ping-pong on
+loopback, 20 ms idle between pings (like game ticks), p50, with each round trip traced point by
+point:
+
+| Path | p50 | Notes |
+| --- | --- | --- |
+| TCP (Netty NIO) | 352–391 µs | reference |
+| QUIC, bridge on core's own QUIC thread | 739 µs | four thread hand-offs per round trip, ~80–90 µs each on idle threads |
+| QUIC hosted on the game's loop (first version) | 487 µs | hand-offs gone; wake-up segments equal TCP's |
+| hosted, every read deferred to a task | 524 µs | quiche then sent an ACK-only packet before each reply: 2 packets per side |
+| hosted, inline up to 32 KiB per pass (current) | 485 µs | 1 packet per side; the rest is quiche's per-packet work on cold caches |
+
+With busy threads (no idle gap) the same paths take 45 µs (TCP) and 48 µs (hosted QUIC):
+QUIC's own cost is ~3 µs when caches are warm, ~110 µs per round trip (four packets) when the
+CPU went idle in between.
+
+**End to end through Velocity** (current code: runs `20261010T034955Z-tcp-quic` for clean and
+loss; `20261010T030746Z-tcp-quic` for delay and reorder, taken before the inline-delivery fix,
+which only affects idle-path latency):
+
+| Profile | Join | Chunk load | Play RTT |
+| --- | --- | --- | --- |
+| clean | −2 ms [−255, +443] | +3 ms [+3, +16] | +0.10 ms [+0.08, +0.19] |
+| loss 2% | −39 ms (noisy) | +21 ms [−237, +45] | +0.14 ms [+0.08, +0.22] |
+| delay +150 ms | −47 ms [−243, +235] | **−291 ms** [−410, −116] | +0.05 ms [−0.09, +0.29] |
+| reorder | +105 ms (noisy) | **+830 ms** [+613, +1168] | +0.05 ms [−0.01, +0.25] |
+| jitter (10 ± 5 ms per direction) | +2 ms | +1268 ms [−247, +2607] | −0.24 ms [−2.62, +0.72] |
+
+Fixed on the way, each found by these runs:
+
+- **UDP receive-buffer overflow** (delay profile, 112–740 datagrams dropped per join; TCP's
+  autotuned buffer absorbs the same burst): 4 MiB socket buffers where the kernel allows
+  (`quicraft.udpBufferBytes`), 128 datagrams read per loop pass, and sliced delivery beyond
+  32 KiB per pass so the loop keeps draining the socket while the game decodes. Drops: 0.
+  Delay-profile chunk load went from +492 ms to −291 ms against TCP.
+- **Close dropped data** (a kick message right before a close could be lost) and the bridge
+  never fired channelInactive on a peer close: now TCP-like (protocol.md §8).
+- **Event loop spin** after closing a connection right after connecting (the race loser):
+  quiche bug, fixed upstream in fc9fe129 and backported (protocol.md §11).
+
+Open:
+
+- **Play RTT +0.10–0.14 ms on idle CPUs** (clean, loss): quiche's per-packet work, four packets
+  per round trip. No profiler on the test machine; closing it means cutting per-packet work in
+  Netty QUIC/quiche.
+- **Chunk load under the reorder and jitter profiles.** Both netem models are harsher than real
+  paths. `reorder` sends 25% of packets with no delay, so the path has a ~0 ms and a 20 ms RTT;
+  BBR sizes its window from the minimum RTT and caps itself far below what the 20 ms packets
+  need. Velocity-side stats: 32–84 spurious losses per join with BBR (relaxed threshold),
+  2400–3600 with CUBIC (chunk load 2.0–2.2 s). `jitter` delays every packet independently, so
+  each burst is shuffled: TCP also degrades (median 1756 ms vs 410 ms clean) and QUIC's sender
+  declared 1200–1860 of ~7000 packets lost. Play RTT is at parity under both.
+
