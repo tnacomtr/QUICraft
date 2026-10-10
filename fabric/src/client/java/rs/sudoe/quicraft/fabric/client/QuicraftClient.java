@@ -20,7 +20,7 @@ public final class QuicraftClient implements ClientModInitializer {
     private volatile Mode mode = Mode.AUTO;
 
     /** Null if initialization failed: every hook then takes the vanilla path. */
-    static @Nullable QuicraftClient get() {
+    public static @Nullable QuicraftClient get() {
         return instance;
     }
 
@@ -38,15 +38,15 @@ public final class QuicraftClient implements ClientModInitializer {
         }
     }
 
-    ClientConnector connector() {
+    public ClientConnector connector() {
         return connector;
     }
 
-    Mode mode() {
+    public Mode mode() {
         return mode;
     }
 
-    void setMode(Mode mode) {
+    public void setMode(Mode mode) {
         this.mode = mode;
         ClientSettings.save(configDir, mode);
     }

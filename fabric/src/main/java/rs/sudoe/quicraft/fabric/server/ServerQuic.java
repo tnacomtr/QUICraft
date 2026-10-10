@@ -52,8 +52,11 @@ public final class ServerQuic {
         this.fallbackLog = new FallbackReport.Log(port);
     }
 
+    private static final java.util.concurrent.atomic.AtomicInteger FALLBACK_REPORTS =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     /** The advertisement to add to status responses, or null when QUIC isn't running. */
-    static @Nullable Advertisement advertisement() {
+    public static @Nullable Advertisement advertisement() {
         ServerQuic s = current;
         return s != null ? s.advertisement : null;
     }
@@ -162,10 +165,16 @@ public final class ServerQuic {
 
     /** Hook: a client reported a fallback to TCP (docs/protocol.md §6). Untrusted; log only. */
     public static void onFallbackReport(byte[] payload) {
+        FALLBACK_REPORTS.incrementAndGet();
         ServerQuic s = current;
         if (s != null) {
             s.fallbackLog.report(payload);
         }
+    }
+
+    /** Tests: fallback reports received since start, well-formed or not. */
+    public static int fallbackReportsReceived() {
+        return FALLBACK_REPORTS.get();
     }
 
     /**

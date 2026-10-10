@@ -7,6 +7,7 @@
 //   minecraftVersion   game version compiled and run against (override: -P<module>.minecraft=…)
 //   minecraftRange     fabric.mod.json "minecraft" dependency
 //   javaRelease        bytecode level (25 for 26.x, 21 for 1.21.11)
+//   fabricApiVersion   Fabric API for the client gametests only (never a runtime dependency)
 import com.github.jk1.license.LicenseReportExtension
 import net.fabricmc.loom.api.LoomGradleExtensionAPI
 
@@ -24,6 +25,7 @@ val minecraftVersion: String = providers.gradleProperty("${project.name}.minecra
     ?: moduleProperty("minecraftVersion")
 val minecraftRange: String = moduleProperty("minecraftRange")
 val javaRelease: Int = moduleProperty("javaRelease").toInt()
+val fabricApiVersion: String = moduleProperty("fabricApiVersion")
 val fabricLoader = "0.19.5"
 
 val shared = rootProject.layout.projectDirectory.dir("fabric/src")
@@ -39,9 +41,38 @@ sourceSets {
         resources.setSrcDirs(listOf(shared.dir("client/resources")))
     }
 }
+// Separate run directories, so a client and a server can run side by side (both gitignored).
+// Loom 1.18 deprecates runDir without a replacement yet.
+@Suppress("DEPRECATION")
+loom.runs.named("client") { runDir("run/client") }
+@Suppress("DEPRECATION")
+loom.runs.named("server") { runDir("run/server") }
 loom.mods.register("quicraft") {
     sourceSet(sourceSets.main.get())
     sourceSet(sourceSets.getByName("client"))
+}
+
+// Client gametests (fabric/src/gametest): a real client and an in-process dedicated server, run
+// headless with runClientGameTest (under xvfb-run on Linux). Fabric API (Apache-2.0) is needed
+// for the test harness only; the mod itself doesn't depend on it.
+extensions.getByType<net.fabricmc.loom.api.fabricapi.FabricApiExtension>().configureTests {
+    createSourceSet = true
+    modId = "quicraft-gametest"
+    enableGameTests = false
+    enableClientGameTests = true
+    eula = true
+}
+// The harness's network synchronizer counts packets sent through Connection.sendPacket against
+// packets received; QUICraft's status query writes raw bytes, which it can't account for. Fabric
+// says to disable it for mods that work at the Netty level; tests wait in ticks instead.
+loom.runs.matching { it.name == "clientGameTest" }.configureEach {
+    property("fabric.client.gametest.disableNetworkSynchronizer", "true")
+}
+sourceSets.named("gametest") {
+    java.setSrcDirs(listOf(shared.dir("gametest/java")))
+    resources.setSrcDirs(listOf(shared.dir("gametest/resources")))
+    compileClasspath += sourceSets.main.get().output + sourceSets.getByName("client").output
+    runtimeClasspath += sourceSets.main.get().output + sourceSets.getByName("client").output
 }
 
 // What the mod jar carries besides its own classes: the shaded core (Netty relocated, natives
@@ -58,6 +89,11 @@ dependencies {
         "modImplementation"("net.fabricmc:fabric-loader:$fabricLoader")
     } else {
         "implementation"("net.fabricmc:fabric-loader:$fabricLoader")
+    }
+    if (remapped) {
+        "modGametestImplementation"("net.fabricmc.fabric-api:fabric-api:$fabricApiVersion")
+    } else {
+        "gametestImplementation"("net.fabricmc.fabric-api:fabric-api:$fabricApiVersion")
     }
     for (dep in listOf(
         project.dependencies.project(mapOf("path" to ":core", "configuration" to "shadowRuntimeElements")),
@@ -80,8 +116,16 @@ val licensePlatform = configurations.create("licensePlatform") {
 dependencies {
     licensePlatform("net.fabricmc:fabric-loader:$fabricLoader")
 }
+// Fabric API (tests only) and its modules.
+val licenseTests = configurations.create("licenseTests") {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
+dependencies {
+    licenseTests("net.fabricmc.fabric-api:fabric-api:$fabricApiVersion")
+}
 extensions.configure<LicenseReportExtension> {
-    configurations = arrayOf(shipped.name, licensePlatform.name)
+    configurations = arrayOf(shipped.name, licensePlatform.name, licenseTests.name)
 }
 
 tasks.withType<JavaCompile>().configureEach {
