@@ -16,6 +16,7 @@ import org.geysermc.mcprotocollib.protocol.MinecraftProtocol;
 import rs.sudoe.quicraft.bridge.GameHost;
 import rs.sudoe.quicraft.bridge.QuicBridgeChannel;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
+import rs.sudoe.quicraft.core.transport.EarlyFlight;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.QuicClient;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
@@ -37,6 +38,15 @@ final class QuicClientSession extends ClientNetworkSession {
     /** Opens the QUIC connection; call {@link #connect(boolean)} once it completes. */
     CompletableFuture<QuicByteStream> openQuic(InetSocketAddress target, Fingerprint fingerprint,
             TransportConfig config) {
+        return openQuic(target, fingerprint, config, null, false);
+    }
+
+    /**
+     * With 0-RTT ({@code early}, null for none), and optionally dropping every datagram from the
+     * server at this socket, as if server-to-client UDP were blocked.
+     */
+    CompletableFuture<QuicByteStream> openQuic(InetSocketAddress target, Fingerprint fingerprint,
+            TransportConfig config, EarlyFlight early, boolean dropFromServer) {
         loop = super.getEventLoopGroup().next();
         ChannelFactory<? extends DatagramChannel> datagrams = TransportHelper.TRANSPORT_TYPE.datagramChannelFactory();
         CompletableFuture<QuicByteStream> result = new CompletableFuture<>();
@@ -47,15 +57,32 @@ final class QuicClientSession extends ClientNetworkSession {
                         return;
                     }
                     DatagramChannel udp = (DatagramChannel) ((io.netty.channel.ChannelFuture) f).channel();
-                    QuicClient.connect(GameHost.loop(loop), GameHost.socket(udp), target, fingerprint, config)
-                            .whenComplete((s, e) -> {
-                                if (e != null) {
-                                    result.completeExceptionally(e);
-                                } else {
-                                    stream = s;
-                                    result.complete(s);
-                                }
-                            });
+                    var socket = GameHost.socket(udp);
+                    if (dropFromServer) {
+                        udp.pipeline().addFirst(new ChannelInboundHandlerAdapter() {
+                            @Override
+                            public void channelRead(io.netty.channel.ChannelHandlerContext ctx, Object msg) {
+                                io.netty.util.ReferenceCountUtil.release(msg);
+                            }
+                        });
+                    }
+                    CompletableFuture<QuicByteStream> attempt =
+                            QuicClient.connect(GameHost.loop(loop), socket, target, fingerprint, config, early);
+                    result.whenComplete((s, e) -> {
+                        if (result.isCancelled()) {
+                            attempt.cancel(false); // abandons the QUIC attempt, as a lost race does
+                        }
+                    });
+                    attempt.whenComplete((s, e) -> {
+                        if (e != null) {
+                            result.completeExceptionally(e);
+                            return;
+                        }
+                        stream = s;
+                        if (!result.complete(s)) {
+                            s.close(); // cancelled meanwhile
+                        }
+                    });
                 });
         return result;
     }

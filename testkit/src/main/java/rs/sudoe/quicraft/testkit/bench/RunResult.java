@@ -12,6 +12,7 @@ package rs.sudoe.quicraft.testkit.bench;
  * @param disconnected the connection closed before the bench ended it
  * @param net kernel counter deltas over the run (UDP drops, TCP retransmits), see NetStats
  * @param quic the client's QUIC connection stats at the end of the run; null over TCP
+ * @param zeroRtt the join sent its first flight as 0-RTT data (transport quic-0rtt)
  */
 public record RunResult(
         int run,
@@ -28,4 +29,5 @@ public record RunResult(
         boolean disconnected,
         String error,
         java.util.Map<String, Long> net,
-        java.util.Map<String, Long> quic) {}
+        java.util.Map<String, Long> quic,
+        boolean zeroRtt) {}

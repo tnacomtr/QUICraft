@@ -38,8 +38,16 @@ KEEP_UP=true testkit/run-baseline.sh                          # leave the server
 
 Environment knobs: `BATCHES`, `RUNS`, `WARMUP`, `PROFILES`, `ONLINE` (`true` uses online-mode login
 and with it Minecraft's encryption), `PLAY_MS`, `TOLERANCE_PCT`, `TOLERANCE_MS`, `TRANSPORTS`
-(`"tcp quic"` runs both back to back per profile), `TARGET` (`velocity` or `fabric`),
-`QUICRAFT_PLUGIN` (`false` leaves the plugin or mod out).
+(`"tcp quic quic-0rtt"` runs them back to back per profile), `TARGET` (`velocity` or `fabric`),
+`QUICRAFT_PLUGIN` (`false` leaves the plugin or mod out), `SCENARIO`.
+
+Transports: `tcp`; `quic`, a full QUIC handshake on every join (session resumption off, as in the
+runs before it existed); `quic-0rtt`, which rejoins as one player (`bench0rtt`) so the first flight
+recorded on one join fits the next, and sends it as 0-RTT data from the second join on (each run
+reports `0rtt=true|false`). Scenarios: `join` (default); `early-fallback`, where each run joins
+over QUIC, then makes a 0-RTT attempt whose server-to-client UDP is dropped at the client's
+socket, abandons it after the head start as a lost race does, and joins over TCP as the same
+player; the run's metrics are that TCP join's (docs/protocol.md §8).
 
 `TARGET=fabric` joins a Fabric 26.1.2 dedicated server with the `fabric-26x` mod directly
 (`docker/fabric/`). Its world is pre-generated at image build with vanilla `/forceload` (same

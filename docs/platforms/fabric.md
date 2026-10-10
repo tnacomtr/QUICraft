@@ -18,6 +18,8 @@ in both, and the gametests run on each version (see Tests).
 | client | `ConnectScreen$1.run` (the connector thread), the `Connection.connect` call (`@WrapOperation`) | the connect path below | vanilla's `Connection.connect` |
 | client | `ServerStatusPinger.pingServer`, the `Connection.connectToServer` result | reads the advertisement off the status response as it passes (byte level, nothing changed) | nothing cached; vanilla ping unaffected |
 | client | `ClientHandshakePacketListenerImpl.handleLoginFinished`, `TAIL` | after a fallback, sends one `quicraft:fallback` report (configuration phase) | no report |
+| client | `ConnectScreen.startConnecting`, `HEAD` | records the join request (0-RTT inputs, TCP retry) | no 0-RTT |
+| client | `ClientHandshakePacketListenerImpl.onDisconnect`, `HEAD` | after a 0-RTT first-flight mismatch, the same join again over TCP instead of the disconnect screen | vanilla disconnect screen |
 | client | `DebugEntryTps.display`, `TAIL` | F3 line `QUICraft: QUIC (auto)` / `TCP (…)` under the server line | no line |
 | client | `JoinMultiplayerScreen.init`, `TAIL` | "QUICraft" button (top right) opening the settings screen | no button |
 
@@ -80,6 +82,15 @@ QUIC session tickets stay in memory for the game session: a rejoin resumes the e
 session and skips the certificate exchange (docs/protocol.md §8). The first join after a restart
 is a full handshake.
 
+**0-RTT rejoins** (docs/protocol.md §8). `ConnectScreen.startConnecting` (`HEAD`) records the join
+request; the join inputs are the resolved address's host name and port (what the handshake
+carries), login or transfer, the profile name and UUID, and the protocol version. A rejoin with the
+same inputs, a session ticket and an early token sends the first flight recorded on the last QUIC
+join as 0-RTT data, and the game's own copy is dropped. If the game's packets differ, the QUIC
+connection is closed and `ClientHandshakePacketListenerImpl.onDisconnect` (`HEAD`, cancellable)
+starts the same join again over TCP instead of showing the disconnect screen (`EarlyJoins`). The
+log line reads `connected to … over QUIC (0-RTT)`.
+
 Files in `config/quicraft/`: `client.properties` (`transport=auto|tcp-only|quic-only`),
 `quic-failures.properties` (the failure cache).
 
@@ -103,6 +114,7 @@ client and an in-process dedicated server with the mod, headless under Xvfb.
 | `FallbackGameTest` | advertisement with a dead UDP port, and one with another server's fingerprint: each joins over TCP, the server receives the fallback report, the failure cache backs off |
 | `TcpOnlyGameTest` | `tcp-only` joins an advertising server over TCP; F3 says so |
 | `QuicOnlyGameTest` | `quic-only` joins over QUIC; with a dead QUIC port it ends on the disconnected screen (no fallback, no hang) |
+| `EarlyDataGameTest` | 0-RTT rejoin (the server acts on the early flight); a first-flight mismatch rejoins over TCP with no error screen, then QUIC records again and 0-RTT resumes; a QUIC attempt abandoned after its 0-RTT data (the server started that login) ends in a TCP join; each 0-RTT stage failing (send, record, token issue, token check) leaves a working join |
 | `JoinTimingGameTest` | opt-in (`-Pquicraft.joinTimings=N`): join timings over TCP, QUIC with a full handshake and QUIC resumed (checked to skip the certificate), see docs/benchmarks.md |
 | `FaultInjectionGameTest` | every hook throwing on client and server (`Hooks.setFaultInjection`): server list ping works, join over TCP, full play session |
 | `AsyncFaultInjectionGameTest` | each stage of the asynchronous connect throwing on its own (status query, QUIC connect, using the winner, installing a TCP winner): join over TCP each time |

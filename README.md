@@ -16,6 +16,10 @@ it runs over plain TCP, exactly like vanilla.
   with QUICraft that sees the advertisement uses QUIC; otherwise it uses TCP.
 - **Falls back silently.** If UDP is blocked, the QUIC handshake fails, or anything else goes
   wrong, the client uses TCP. A QUICraft bug must never stop a player from joining.
+- **Faster rejoins.** Rejoining a server in the same game session sends the first login packets
+  with the QUIC handshake (0-RTT), so the server answers a round trip sooner: about 150 ms less
+  per rejoin at 150 ms of latency ([`docs/benchmarks.md`](docs/benchmarks.md)). The first join
+  after starting the game is a normal one.
 - **Where it helps:** lossy Wi-Fi, mobile links, long-distance connections and network changes.
   On a clean wired connection the difference is close to zero. Benchmarks will be published in
   [`docs/benchmarks.md`](docs/benchmarks.md) as they are measured. No numbers are claimed before

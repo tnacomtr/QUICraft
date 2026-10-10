@@ -42,6 +42,23 @@ each release of the plugin.
   over-cap response and vanilla clients would fail to ping. The Phase 2 gate test (maximum-size
   MOTD plus favicon) covers this.
 
+## 0-RTT logins (docs/protocol.md §8)
+
+- Velocity registers a player in its `LoginEvent` stage, before sending Login Success and long
+  before Login Acknowledged (`AuthSessionHandler`, read in 4.2.0): in offline mode a login started
+  by 0-RTT data holds the name right away. If the client then abandons that QUIC attempt (TCP won
+  the race), its TCP login would be refused with "already connected to this proxy" until the
+  abandoned connection closes, up to the server's 3 s confirmation deadline.
+- So the plugin subscribes to `PreLoginEvent` (public API, highest priority), which fires for every
+  login before Velocity registers anything: it calls core's `closeUnconfirmedEarly(remote
+  address, username)`, which closes unconfirmed early QUIC connections from the same IP with that
+  name in their Login Start (never the login's own connection), and returns an `EventTask` that
+  resumes once they are closed and `proxy.getPlayer(name)` is empty again (at most 1 s, then 2 s
+  overall). Logs one INFO line per closed login. Any failure lets the login continue unchanged.
+- Measured (testkit `SCENARIO=early-fallback`, docs/benchmarks.md): offline and online mode,
+  4 of 4 TCP joins after an abandoned 0-RTT attempt succeeded, with the abandoned login closed
+  each time.
+
 ## Query port
 
 - `ConnectionManager.queryBind(String hostname, int port)` binds the GameSpy4 query listener

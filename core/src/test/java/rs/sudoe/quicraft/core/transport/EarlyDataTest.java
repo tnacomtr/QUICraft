@@ -243,6 +243,30 @@ class EarlyDataTest {
     }
 
     @Test
+    void everyAbandonedAttemptAfterAFullJoinSendsZeroRtt() throws Exception {
+        ServerIdentity identity = ServerIdentity.generate();
+        try (GameServer game = new GameServer(identity); DelayRelay relay = new DelayRelay(game.address(), 5)) {
+            for (int round = 0; round < 4; round++) {
+                Join prime = Join.run(relay, identity, "inputs", FLIGHT);
+                System.out.println("round " + round + ": prime join sent 0-RTT: " + prime.early.sent()
+                        + ", token now: " + EarlyCache.INSTANCE.hasToken(EarlyCache.server(relay.address(),
+                                identity.fingerprint())));
+                prime.closeAfterTicket(relay);
+                relay.dropFromServer(true);
+                EarlyFlight early = new EarlyFlight("inputs");
+                CompletableFuture<QuicByteStream> attempt = QuicClient.connect(relay.address(), identity.fingerprint(),
+                        TransportConfig.DEFAULT, early);
+                Thread.sleep(300);
+                attempt.cancel(false);
+                relay.dropFromServer(false);
+                System.out.println("round " + round + ": abandoned attempt sent 0-RTT: " + early.sent());
+                assertTrue(early.sent(), "round " + round);
+                Thread.sleep(200);
+            }
+        }
+    }
+
+    @Test
     void eachEarlyStageFailingLeavesAWorkingJoin() throws Exception {
         for (String stage : new String[] {Faults.EARLY_SEND, Faults.EARLY_RECORD, Faults.EARLY_TOKEN_ISSUE,
                 Faults.EARLY_TOKEN_REDEEM}) {
