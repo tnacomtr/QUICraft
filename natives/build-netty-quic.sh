@@ -38,6 +38,7 @@ mkdir -p "$2" "$3"
 work="$(cd "$2" && pwd)"
 out="$(cd "$3" && pwd)"
 python="${PYTHON:-python3}"
+sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi; }
 
 case "$(uname -s)" in
     Linux) os=linux ;;
@@ -205,7 +206,7 @@ info="$out/build-info-$classifier.txt"
     echo "boringssl: $BORINGSSL_COMMIT"
     echo "patches applied: $([[ "${SKIP_PATCHES:-0}" == 1 ]] && echo none || echo yes)"
     for p in "$src"/patches/*/*.patch "$src"/quiche-Cargo.lock; do
-        [[ -f "$p" ]] && echo "  $(sha256sum "$p" | cut -d' ' -f1)  ${p#"$src"/}"
+        [[ -f "$p" ]] && echo "  $(sha256 "$p" | cut -d' ' -f1)  ${p#"$src"/}"
     done
     echo "rustc: $(rustc -V)"
     echo "cargo: $(cargo -V)"
@@ -214,7 +215,7 @@ info="$out/build-info-$classifier.txt"
     echo "java: $(java -version 2>&1 | head -1)"
     echo "outputs:"
     (cd "$out/repo" && find . -name '*.jar' -newer "$work/cargo-metadata.json" | sort | while read -r f; do
-        echo "  $(sha256sum "$f" | cut -d' ' -f1)  $f"
+        echo "  $(sha256 "$f" | cut -d' ' -f1)  $f"
     done)
     if [[ "$os" == linux ]]; then
         echo "glibc floor: $(objdump -T "$lib" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"

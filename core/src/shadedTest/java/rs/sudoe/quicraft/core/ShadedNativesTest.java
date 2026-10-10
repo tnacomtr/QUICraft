@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -29,5 +30,17 @@ class ShadedNativesTest {
     @Test
     void quicheNativeLoadsFromTheShadedJar() {
         assertTrue(QuicSupport.isAvailable(), () -> "QUIC unavailable: " + QuicSupport.unavailabilityCause());
+    }
+
+    /**
+     * The patched native registers its extra JNI method under the relocated class names, so the
+     * relaxed loss threshold must work from the shaded jar exactly where Gradle built a patched
+     * native for this platform (core/build.gradle.kts, quicraft.patchedNatives).
+     */
+    @Test
+    void relaxedLossThresholdMatchesTheNativeBuiltForThisPlatform() {
+        String expected = System.getProperty("quicraft.test.expectRelaxedLossThreshold");
+        assertNotNull(expected, "run through Gradle");
+        assertEquals(Boolean.parseBoolean(expected), QuicSupport.hasRelaxedLossThreshold());
     }
 }
