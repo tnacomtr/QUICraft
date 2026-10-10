@@ -8,7 +8,7 @@
 netty = "4.2.19.Final"
 # QUICraft's build of netty-codec-{classes,native}-quic for that Netty with natives/patches/ applied
 # (natives/build-linux.sh). Bump together with QUICRAFT_VERSION in natives/build-netty-quic.sh.
-netty-quic-quicraft = "4.2.19.Final-quicraft2"
+netty-quic-quicraft = "4.2.19.Final-quicraft3"
 # Oldest game/platform Netty per bridge (docs/version-matrix.md); compile-only, never shipped.
 netty-game41 = "4.1.82.Final"
 netty-game42 = "4.2.1.Final"

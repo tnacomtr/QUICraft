@@ -124,8 +124,8 @@ then didn't look again until the server's next packet arrived, one RTT later.
 `natives/patches/netty/0002-complete-connect-after-handshake-send.patch` completes the connect
 right after that send. In the transport benchmark at +150 ms RTT, QUIC handshake p50 went from
 303 ms (run `transport-20261009T191726Z`) to 153 ms (run `transport-20261010T010019Z`). This
-compares two runs; TCP connect was 150.5 and 150.4 ms in them. Session resumption (§8) takes the
-certificate work off a rejoin but not the round trip.
+compares two runs; TCP connect was 150.5 and 150.4 ms in them. On a rejoin, 0-RTT (§8) lets the
+server answer one round trip earlier still.
 
 **H = 250 ms, provisional.** Transport benchmark with the connect fix: QUIC handshake p50/p99
 was 2.7/3.2 ms (clean), 153/155 ms (+150 ms RTT) and 23/24 ms (reorder). The earlier run measured
@@ -175,11 +175,25 @@ idea: derive H from the RTT the server-list ping already measured.
 
 ## 8. Encryption and streams
 
-- **v1 uses one stream.** Right after the handshake, the client opens client-initiated
-  bidirectional stream 0. It carries exactly the TCP byte stream, starting with the Minecraft
-  handshake packet: VarInt-framed packets, then compression and Minecraft's AES/CFB8 encryption
-  once negotiated, all unchanged. The server MUST NOT open streams in v1. Other streams are
-  reserved for later versions.
+- **v1 uses one stream.** The client opens client-initiated bidirectional stream 0, right after
+  the handshake or, with 0-RTT, during it. After one preamble in each direction (below) it
+  carries exactly the TCP byte stream, starting with the Minecraft handshake packet:
+  VarInt-framed packets, then compression and Minecraft's AES/CFB8 encryption once negotiated,
+  all unchanged. The server MUST NOT open streams in v1. Other streams are reserved for later
+  versions.
+- **Preamble.** Each direction of stream 0 starts with exactly one preamble, before any
+  Minecraft byte:
+
+  | Field | Type | Values |
+  | --- | --- | --- |
+  | length | VarInt | length of the rest, 2–64 |
+  | version | byte | `1` |
+  | token length | byte | `0` or `16` |
+  | token | bytes | client → server: an early token this server issued (0-RTT, below), or none. Server → client: a fresh early token for the client's next connection, or none |
+
+  An unknown version, a length outside 2–64, or a token length other than 0 or 16 closes the
+  connection with `0x1`. The server sends its preamble as soon as it passes the stream to the
+  game. Both sides strip the preambles; the game never sees them.
 - End of session: a stream FIN or connection close is treated like a TCP close.
 - **Closing, like TCP.** An endpoint that closes sends what it wrote, then FIN on stream 0, and
   lets the peer close the connection: the peer reads FIN only after all the data before it, so
@@ -188,7 +202,8 @@ idea: derive H from the RTT the server-list ping already measured.
   the connection itself after 10 s. An endpoint that never wrote on the stream (e.g. a QUIC
   attempt that lost the race, §5), or that already received FIN, closes the connection at once.
   Closing the connection immediately instead would discard data still unsent or unacknowledged.
-- Application close error codes: `0x0` normal, `0x1` protocol violation, `0x2` internal error.
+- Application close error codes: `0x0` normal, `0x1` protocol violation, `0x2` internal error,
+  `0x3` early data never confirmed (below).
 - Multi-stream (Phase 5) needs a separately reviewed encryption design; the proposed one is §12.
 
 ### Session resumption and 0-RTT *(user: 0-RTT allowed in v1)*
@@ -203,22 +218,69 @@ idea: derive H from the RTT the server-list ping already measured.
   Tickets don't survive a client restart.
 - **What resumption saves:** the certificate, its signature and its check, i.e. CPU time on both
   ends. Not a round trip: the connect still completes after 1 RTT (§5).
-- **0-RTT data: allowed, not sent by v1 clients.** A client holding a ticket MAY send its first
-  flight as 0-RTT: the Minecraft handshake packet plus the packet right after it (Status Request
-  or Login Start).
-- **Replay protection.** 0-RTT data can be replayed by an attacker. The server MUST NOT pass
-  early stream data to the game until the QUIC handshake has completed. A replayed first flight
-  never completes the handshake, so it never reaches the game. Otherwise a replay could, for
-  example, start a ghost login and kick the real player.
-- **Why v1 clients don't send it.** With that hold, 0-RTT data saves nothing. The server's
-  handshake completes when the client's Finished arrives, 1.5 RTT after the first Initial; that
-  is also when 1-RTT data sent right after the client's own handshake completed (at 1 RTT, §5)
-  arrives. Either way the first answer reaches the client 2 RTT after the start, as over TCP.
-  Saving a round trip would require the server to act on early data before the handshake
-  completes, which reopens the replay case above: a security decision for the user, not made.
-- If the server rejects early data, the client resends it normally after the handshake; nothing
-  else changes.
-- Needs a security review before release (Phase 4), as part of the alpha's review.
+- **0-RTT *(user: server acts on it, guarded by single-use tokens)*.** A rejoin sends the
+  Minecraft handshake and Login Start as 0-RTT data, and the server answers them before the
+  handshake completes: the first reply arrives **1 RTT** after the client's first Initial instead
+  of 2 (measured through a 200 ms RTT relay: 1.02 RTT against 2.03; needs QUICraft's Netty build,
+  netty/0003 in §11). A first join, and the first join after either side restarted, gets nothing
+  from it: there is no ticket, token or recorded flight yet.
+
+**Early tokens (server).**
+
+- A token is 16 random bytes from a CSPRNG. The server issues a fresh one in its preamble on
+  every stream it accepts and keeps it in memory, per listener, with its issue time. Tokens are
+  valid for 24 hours; at most 65 536 are outstanding, the oldest dropped first. A restart drops
+  them all (its ticket keys change too).
+- **Single use.** A token in a client preamble is removed when the server reads it, whether the
+  data was early or not, valid or not.
+- **Early release.** Stream data that arrives before the handshake has completed is passed to the
+  game at once if its preamble carries a token the server holds. Otherwise (no token, unknown,
+  used, expired) it waits until the handshake has completed, as without 0-RTT.
+- **Confirmation.** A connection passed early must complete its handshake within **3 s**. If
+  not, the server closes it with `0x3`, and the game sees an ordinary disconnect.
+- Not bound to the client's address: a rejoin after a network change still gets 0-RTT *(user)*.
+
+**0-RTT (client).**
+
+- The client keeps, in memory only: the latest token per server (IP, QUIC port, fingerprint), and
+  the **recorded first flight** per server and join inputs (host name and port sent in the
+  handshake, intent, profile name and UUID, protocol version): the bytes of the handshake and
+  Login Start the game wrote on its last QUIC join with those inputs.
+- It sends 0-RTT data only when the TLS session allows early data and it holds a token and a
+  recorded flight for this join's inputs: the preamble with the token, then the recorded flight.
+  The token is forgotten once sent. Otherwise its preamble (no token) goes first on stream 0
+  after the handshake, followed by the game's bytes.
+- **Racing is unchanged** (§5): QUIC wins only when its handshake completes. 0-RTT changes when
+  the server acts, not who wins.
+- **Duplicate removal.** On a QUIC win, the game's own first writes on stream 0 are its handshake
+  and Login Start again; the client drops them if they equal the recorded flight byte for byte.
+- **Mismatch.** If they differ (e.g. another mod changed the packets), the server has already
+  acted on the recorded flight. The client closes QUIC, forgets the recorded flight and token for
+  that server, and starts the join again over TCP: the player sees the connect screen once more,
+  no error.
+- **TCP wins after 0-RTT went out.** The server may have acted on the early flight: a login is in
+  progress there that the client has abandoned. The client closes the QUIC connection first and
+  hands the TCP connection to the game one TCP round trip later (the time its connect took,
+  between 20 and 250 ms), so the close reaches the server before the TCP login. Reason: Velocity
+  registers an offline-mode player before Login Acknowledged, and refuses a second login with the
+  same name ("already connected to this proxy") until the first connection closes.
+- If the server rejects the 0-RTT data (ticket refused after a restart), quiche resends it after
+  the handshake once loss detection declares it lost (4.2 RTT to the first reply measured at
+  200 ms RTT, instead of 2); the token then works as for any data after the handshake.
+
+**Replay (security).** 0-RTT data can be replayed by anyone who sees it.
+
+- A copy of an earlier join's flight carries a token that join already used: the server holds it,
+  the handshake never completes (the copier has no keys), and it never reaches the game.
+- A copy of the current flight that arrives before the original is passed early instead of it,
+  once; the original then waits for its handshake and gets in a round trip later. The copy stops
+  where the game first needs the client: at the encryption response in online mode (nothing
+  happens), at Login Acknowledged in offline mode, where the server has already started a login.
+  On Velocity in offline mode that login holds the player's name for up to 3 s, so the real join
+  is refused: an attacker on the path can make one join fail, which dropping packets would do as
+  well. The game sees the copy's source address, unvalidated, for up to 3 s.
+- Needs the security review before release (Phase 4): this changes the earlier rule that early
+  data never reached the game before the handshake completed.
 
 ## 9. Transport parameters
 
@@ -322,15 +384,16 @@ connection-ID routing between sockets (Phase 9).
 ### QUICraft's Netty QUIC build
 
 `core` doesn't use Maven Central's `netty-codec-classes-quic`. It uses QUICraft's build,
-`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft2` from
+`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft3` from
 `natives/`. That is Netty `netty-4.2.19.Final` (64cc10f3), quiche `be47c501` and BoringSSL
-`d03dbc3e`, the same revisions as upstream 4.2.19, plus four patches:
+`d03dbc3e`, the same revisions as upstream 4.2.19, plus five patches:
 
 | Patch | What it does |
 | --- | --- |
 | `quiche/0001-ffi-relaxed-loss-threshold` | C FFI `quiche_config_set_enable_relaxed_loss_threshold`. quiche's C API lacks it, including master as of 2026-10-08. |
 | `netty/0001-relaxed-loss-threshold` | `QuicCodecBuilder.relaxedLossThreshold(boolean)`, its JNI binding, and `Quic.isRelaxedLossThresholdSupported()`, which probes the loaded native. |
 | `netty/0002-complete-connect-after-handshake-send` | Completes a client connect as soon as the handshake does (§5), in a task on the connection's event loop. |
+| `netty/0003-server-reads-accepted-early-data` | A server that accepted 0-RTT reads early stream data before the handshake completes: the connection is active during early data, and after the send that decrypts a buffered 0-RTT packet it processes the readable streams. Java only, so it works with upstream natives too. `SslHandshakeCompletionEvent` still marks the completed handshake. |
 | `quiche/0002-backport-fc9fe129-handshake-close` | Upstream quiche fc9fe129 (2026-09-25), unchanged. Without it, an application close sent after the client's handshake completed but before HANDSHAKE_DONE (the window netty/0002 opens) never goes out, and the send loop spins forever. |
 
 - `natives/build-linux.sh` runs Netty's own Maven build unchanged in Docker, on AlmaLinux 8 with
