@@ -60,6 +60,10 @@ final class QuicClientSession extends ClientNetworkSession {
         return result;
     }
 
+    QuicByteStream stream() {
+        return stream;
+    }
+
     /** The loop QUIC runs on: the bridge channel registers there too, so nothing crosses threads. */
     @Override
     protected EventLoopGroup getEventLoopGroup() {

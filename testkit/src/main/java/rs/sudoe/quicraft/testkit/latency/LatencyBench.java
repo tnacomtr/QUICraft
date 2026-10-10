@@ -178,6 +178,9 @@ public final class LatencyBench {
 
         abstract void send();
 
+        @Override
+        public abstract void close();
+
         /** Called with each chunk the client receives; signals once a whole message is back. */
         void onClientBytes(int n) {
             received += n;

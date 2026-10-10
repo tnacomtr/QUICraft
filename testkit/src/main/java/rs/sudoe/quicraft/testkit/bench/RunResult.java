@@ -10,6 +10,8 @@ package rs.sudoe.quicraft.testkit.bench;
  * @param chunkLoadMs play login until the last chunk before a quiet period
  * @param rttMedianMs median play RTT (ping request sent right after a movement packet, until pong)
  * @param disconnected the connection closed before the bench ended it
+ * @param net kernel counter deltas over the run (UDP drops, TCP retransmits), see NetStats
+ * @param quic the client's QUIC connection stats at the end of the run; null over TCP
  */
 public record RunResult(
         int run,
@@ -24,4 +26,6 @@ public record RunResult(
         int rttSamples,
         int rttLost,
         boolean disconnected,
-        String error) {}
+        String error,
+        java.util.Map<String, Long> net,
+        java.util.Map<String, Long> quic) {}

@@ -14,6 +14,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -74,10 +75,10 @@ public final class BenchClient {
             boolean warmup = i < o.warmup();
             RunResult result = runOnce(o, i, warmup);
             results.add(result);
-            System.out.printf("[%s/%s] run %d%s ok=%s join=%.1fms phases=%s chunks=%d chunkLoad=%.1fms rtt=%.2fms p95=%.2fms lost=%d%s%n",
+            System.out.printf("[%s/%s] run %d%s ok=%s join=%.1fms phases=%s chunks=%d chunkLoad=%.1fms rtt=%.2fms p95=%.2fms lost=%d net=%s quic=%s%s%n",
                     o.profile(), o.transport(), i, warmup ? " (warmup)" : "", result.ok(), result.joinMs(), Arrays.toString(result.phasesMs()), result.chunks(),
                     result.chunkLoadMs(), result.rttMedianMs(), result.rttP95Ms(), result.rttLost(),
-                    result.error() == null ? "" : " error=" + result.error());
+                    result.net(), result.quic(), result.error() == null ? "" : " error=" + result.error());
             // Let the proxy and backend finish the previous player's logout.
             Thread.sleep(1_000);
         }
@@ -126,6 +127,7 @@ public final class BenchClient {
             }
         }
 
+        Map<String, Long> netBefore = NetStats.read();
         long start = System.nanoTime();
         ClientNetworkSession session;
         if (ad != null) {
@@ -180,7 +182,8 @@ public final class BenchClient {
                 millis(bench.configurationNanos - start), joinMs,
             };
             return new RunResult(index, warmup, true, phases, joinMs, chunkLoadMs, bench.chunks.get(),
-                    percentile(rtt, 0.5), percentile(rtt, 0.95), rtt.length, pingsSent - rtt.length, false, null);
+                    percentile(rtt, 0.5), percentile(rtt, 0.95), rtt.length, pingsSent - rtt.length, false, null,
+                    NetStats.delta(netBefore, NetStats.read()), quicStats(session));
         } finally {
             bench.benchClosing = !bench.disconnected;
             if (session.isConnected()) {
@@ -209,10 +212,21 @@ public final class BenchClient {
         return pings;
     }
 
+    private static Map<String, Long> quicStats(ClientNetworkSession session) {
+        if (!(session instanceof QuicClientSession quic) || quic.stream() == null) {
+            return null;
+        }
+        try {
+            return quic.stream().connectionStats().get(2, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private static RunResult failure(int index, boolean warmup, BenchSession bench, String what) {
         String error = bench.disconnected ? what + ": " + bench.disconnectReason : what;
         return new RunResult(index, warmup, false, new double[0], -1, -1, bench.chunks.get(), -1, -1, 0, 0,
-                bench.disconnected, error);
+                bench.disconnected, error, null, null);
     }
 
     static double percentile(double[] sorted, double p) {
