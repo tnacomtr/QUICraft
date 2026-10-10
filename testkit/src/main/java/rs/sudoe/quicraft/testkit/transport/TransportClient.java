@@ -30,9 +30,28 @@ public final class TransportClient {
             double rttMedianMs, double rttP95Ms, int rttSamples, java.util.Map<String, Long> senderStats,
             String error) {}
 
-    static final String[] TRANSPORTS = {"tcp", "quic-reno", "quic-cubic", "quic-bbr"};
+    static final String[] TRANSPORTS = {"tcp", "quic-reno", "quic-cubic", "quic-bbr", "quic-bbr-relaxed"};
 
     private TransportClient() {}
+
+    /** QUIC listener port for a transport: --port + 1..4 in {@link #TRANSPORTS} order. */
+    static int quicPort(int tcpPort, String transport) {
+        return tcpPort + java.util.Arrays.asList(TRANSPORTS).indexOf(transport);
+    }
+
+    /**
+     * Sender-side config for a QUIC transport. The relaxed loss threshold is set explicitly
+     * either way, since core's default turned it on; only quic-bbr-relaxed has it.
+     */
+    static TransportConfig quicConfig(String transport) {
+        boolean relaxed = transport.endsWith("-relaxed");
+        String cc = transport.substring("quic-".length(), relaxed ? transport.length() - "-relaxed".length()
+                : transport.length());
+        return TransportConfig.builder()
+                .congestionControl(TransportConfig.CongestionControl.valueOf(cc.toUpperCase()))
+                .relaxedLossThreshold(relaxed)
+                .build();
+    }
 
     public static int run(Args args) throws Exception {
         String host = args.string("host", "transportserver");
@@ -81,10 +100,8 @@ public final class TransportClient {
                 s.connect(new InetSocketAddress(address, port), 10_000);
                 conn = Conn.tcp(s);
             } else {
-                TransportConfig.CongestionControl cc = TransportConfig.CongestionControl.valueOf(
-                        transport.substring("quic-".length()).toUpperCase());
-                conn = Conn.quic(QuicClient.connect(new InetSocketAddress(address, port + 1 + cc.ordinal()), fp,
-                        TransportConfig.builder().congestionControl(cc).build()).get(10, TimeUnit.SECONDS));
+                conn = Conn.quic(QuicClient.connect(new InetSocketAddress(address, quicPort(port, transport)), fp,
+                        quicConfig(transport)).get(10, TimeUnit.SECONDS));
             }
             double handshakeMs = millis(System.nanoTime() - start);
 
