@@ -31,8 +31,27 @@ public final class QuicBridgeChannel extends AbstractChannel {
     private final Config config = new Config(this);
     private volatile boolean open = true;
     private volatile boolean listening;
-    /** Event loop only: data held back while reading is paused (auto-read off, no read()). */
+    /**
+     * Pipeline delivery happens in slices of about this many bytes, one slice per event loop
+     * pass, so the loop reads its sockets between slices. Without that, a game that decodes a
+     * chunk burst inline would leave the UDP socket unread long enough to overflow it (UDP has no
+     * flow control; TCP's kernel buffer absorbs the same burst).
+     */
+    static final int SLICE_BYTES = 64 * 1024;
+    /** Above this many bytes waiting, the stream is paused, so QUIC flow control stops the peer. */
+    static final long HELD_HIGH = 4L << 20;
+    static final long HELD_LOW = 1L << 20;
+
+    /** Event loop only: data received but not yet delivered to the pipeline. */
     private final java.util.ArrayDeque<ByteBuf> held = new java.util.ArrayDeque<>();
+    /** Event loop only: bytes in {@link #held}. */
+    private long heldBytes;
+    /** Event loop only: the stream is paused because too much is held. */
+    private boolean pausedForHeld;
+    /** Event loop only: a slice task is queued or running. */
+    private boolean delivering;
+    /** Event loop only: the stream closed; close the channel once held data is delivered. */
+    private boolean closeWhenDrained;
     /** Event loop only: a read() is outstanding while auto-read is off. */
     private boolean readRequested;
 
@@ -55,9 +74,14 @@ public final class QuicBridgeChannel extends AbstractChannel {
         return open;
     }
 
+    /**
+     * Open and registered. Deliberately not tied to {@code stream.isOpen()}: the stream closing
+     * reaches this channel as a close, which must fire channelInactive (the game's disconnect
+     * handling) after any data still being delivered.
+     */
     @Override
     public boolean isActive() {
-        return open && isRegistered() && stream.isOpen();
+        return open && isRegistered();
     }
 
     @Override
@@ -94,6 +118,10 @@ public final class QuicBridgeChannel extends AbstractChannel {
         if (!listening) {
             listening = true;
             stream.setListener(new StreamListener());
+            if (!stream.isOpen()) {
+                // Closed before we listened: the listener will never hear of it.
+                eventLoop().execute(() -> unsafe().close(voidPromise()));
+            }
         }
     }
 
@@ -121,14 +149,18 @@ public final class QuicBridgeChannel extends AbstractChannel {
      */
     @Override
     protected void doBeginRead() throws Exception {
+        if (!config.isAutoRead()) {
+            readRequested = true;
+        }
         if (!held.isEmpty()) {
-            deliver(held.poll());
+            scheduleDelivery();
             return;
         }
         if (config.isAutoRead()) {
-            stream.setAutoRead(true);
+            if (!pausedForHeld) {
+                stream.setAutoRead(true);
+            }
         } else {
-            readRequested = true;
             stream.read();
         }
     }
@@ -139,17 +171,69 @@ public final class QuicBridgeChannel extends AbstractChannel {
             data.release();
             return;
         }
-        if (held.isEmpty() && (config.isAutoRead() || readRequested)) {
-            deliver(data);
-        } else {
-            held.add(data);
+        held.add(data);
+        heldBytes += data.readableBytes();
+        if (heldBytes > HELD_HIGH && !pausedForHeld) {
+            pausedForHeld = true;
+            stream.setAutoRead(false);
+        }
+        scheduleDelivery();
+    }
+
+    /** Event loop only. */
+    long heldBytesForTest() {
+        return heldBytes;
+    }
+
+    private boolean canDeliver() {
+        return config.isAutoRead() || readRequested;
+    }
+
+    /** The first slice runs later in this loop pass; see {@link #SLICE_BYTES}. */
+    private void scheduleDelivery() {
+        if (!delivering && !held.isEmpty() && canDeliver()) {
+            delivering = true;
+            eventLoop().execute(this::deliverSlice);
         }
     }
 
-    private void deliver(ByteBuf data) {
-        readRequested = false;
-        pipeline().fireChannelRead(data);
-        pipeline().fireChannelReadComplete();
+    private void deliverSlice() {
+        if (!isOpen()) {
+            delivering = false;
+            releaseHeld();
+            return;
+        }
+        long budget = SLICE_BYTES;
+        boolean any = false;
+        ByteBuf data;
+        while (budget > 0 && canDeliver() && (data = held.poll()) != null) {
+            heldBytes -= data.readableBytes();
+            budget -= data.readableBytes();
+            readRequested = false;
+            any = true;
+            pipeline().fireChannelRead(data);
+        }
+        if (any) {
+            // May call read() (auto-read): doBeginRead sees delivering and leaves the rest to us.
+            pipeline().fireChannelReadComplete();
+        }
+        if (pausedForHeld && heldBytes < HELD_LOW) {
+            pausedForHeld = false;
+            if (config.isAutoRead()) {
+                stream.setAutoRead(true);
+            } else if (readRequested) {
+                stream.read();
+            }
+        }
+        if (!held.isEmpty() && canDeliver() && isOpen()) {
+            // Next pass: the loop reads its sockets first.
+            eventLoop().schedule(this::deliverSlice, 0, java.util.concurrent.TimeUnit.NANOSECONDS);
+            return;
+        }
+        delivering = false;
+        if (held.isEmpty() && closeWhenDrained && isOpen()) {
+            unsafe().close(voidPromise());
+        }
     }
 
     @Override
@@ -158,6 +242,7 @@ public final class QuicBridgeChannel extends AbstractChannel {
     }
 
     private void releaseHeld() {
+        heldBytes = 0;
         ByteBuf b;
         while ((b = held.poll()) != null) {
             b.release();
@@ -238,8 +323,9 @@ public final class QuicBridgeChannel extends AbstractChannel {
         @Override
         public void onWritabilityChanged(boolean writable) {
             if (writable) {
-                // Resume writing what doWrite left in the outbound buffer.
-                run(() -> unsafe().flush());
+                // Resume writing what doWrite left in the outbound buffer. Always a task, even on
+                // this loop: this can fire inside our own flush, where a nested flush is ignored.
+                eventLoop().execute(() -> unsafe().flush());
             }
         }
 
@@ -249,9 +335,19 @@ public final class QuicBridgeChannel extends AbstractChannel {
                 if (cause != null && isOpen()) {
                     pipeline().fireExceptionCaught(cause);
                 }
-                if (isOpen()) {
-                    unsafe().close(voidPromise());
+                if (!isOpen()) {
+                    return;
                 }
+                if (cause == null && !held.isEmpty()) {
+                    // Like TCP: what the peer sent before closing (e.g. a disconnect message)
+                    // reaches the pipeline first, if the game is reading.
+                    closeWhenDrained = true;
+                    if (!delivering && !canDeliver()) {
+                        unsafe().close(voidPromise());
+                    }
+                    return;
+                }
+                unsafe().close(voidPromise());
             });
         }
 
