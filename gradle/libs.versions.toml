@@ -6,6 +6,9 @@
 [versions]
 # 4.2.19.Final: BoringSSL d03dbc3e (2026-05-12, Apache-2.0), quiche be47c501, Java 8 bytecode.
 netty = "4.2.19.Final"
+# QUICraft's build of netty-codec-{classes,native}-quic for that Netty with natives/patches/ applied
+# (natives/build-linux.sh). Bump together with QUICRAFT_VERSION in natives/build-netty-quic.sh.
+netty-quic-quicraft = "4.2.19.Final-quicraft1"
 # Oldest game/platform Netty per bridge (docs/version-matrix.md); compile-only, never shipped.
 netty-game41 = "4.1.82.Final"
 netty-game42 = "4.2.1.Final"
@@ -19,6 +22,8 @@ mcprotocollib = "26.1-1"
 netty-bom = { module = "io.netty:netty-bom", version.ref = "netty" }
 netty-quic-classes = { module = "io.netty:netty-codec-classes-quic" }
 netty-quic-native = { module = "io.netty:netty-codec-native-quic", version.ref = "netty" }
+quicraft-netty-quic-classes = { module = "rs.sudoe.quicraft.netty:netty-codec-classes-quic", version.ref = "netty-quic-quicraft" }
+quicraft-netty-quic-native = { module = "rs.sudoe.quicraft.netty:netty-codec-native-quic", version.ref = "netty-quic-quicraft" }
 netty41-transport = { module = "io.netty:netty-transport", version.ref = "netty-game41" }
 netty42-transport = { module = "io.netty:netty-transport", version.ref = "netty-game42" }
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
