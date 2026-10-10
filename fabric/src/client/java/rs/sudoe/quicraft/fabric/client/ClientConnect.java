@@ -29,6 +29,7 @@ import rs.sudoe.quicraft.bridge.GameHost;
 import rs.sudoe.quicraft.bridge.QuicBridgeChannel;
 import rs.sudoe.quicraft.bridge.status.StatusQuery;
 import rs.sudoe.quicraft.core.connect.ClientConnector;
+import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 import rs.sudoe.quicraft.core.connect.ConnectionRace;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
@@ -58,7 +59,7 @@ public final class ClientConnect {
             QuicraftClient client = QuicraftClient.get();
             if (client != null
                     && client.connector().plan(address, client.mode()) == ClientConnector.Plan.CONNECT) {
-                ours = start(client, address, holder, connection);
+                ours = start(client, address, holder, connection, vanilla);
             }
         } catch (Throwable t) {
             Hooks.failed("connect", t);
@@ -67,12 +68,13 @@ public final class ClientConnect {
     }
 
     private static ChannelFuture start(QuicraftClient client, InetSocketAddress address, EventLoopGroupHolder holder,
-            Connection connection) {
+            Connection connection, Supplier<ChannelFuture> vanilla) {
+        Mode mode = client.mode();
         EventLoop loop = holder.eventLoopGroup().next();
         // The screen only syncs on and cancels this future, never asks for its channel.
         ChannelPromise promise = new DefaultChannelPromise(new EmbeddedChannel(), loop);
         CompletableFuture<ClientConnector.Outcome<Channel>> attempt = client.connector()
-                .connect(address, client.mode(), new Platform(address, holder, loop));
+                .connect(address, mode, new Platform(address, holder, loop));
         promise.addListener(f -> {
             if (f.isCancelled()) {
                 attempt.cancel(false);
@@ -80,14 +82,22 @@ public final class ClientConnect {
         });
         attempt.whenComplete((outcome, error) -> {
             if (error != null) {
-                promise.tryFailure(withMessage(error instanceof CompletionException && error.getCause() != null
-                        ? error.getCause() : error));
+                Throwable cause = error instanceof CompletionException && error.getCause() != null
+                        ? error.getCause() : error;
+                if (cause instanceof ClientConnector.TcpConnectException) {
+                    promise.tryFailure(withMessage(cause.getCause())); // as vanilla would have failed
+                } else {
+                    failed(mode, cause, promise, vanilla);
+                }
                 return;
             }
+            // Until the Connection is attached to a channel, any failure can still go vanilla.
+            boolean[] attached = {false};
             try {
+                Hooks.enter("connect outcome");
                 if (outcome.quic() != null) {
                     QuicraftFabric.LOG.info("QUICraft: connected to {} over QUIC", outcome.quic().remoteAddress());
-                    useQuic(outcome.quic(), loop, connection, promise);
+                    useQuic(outcome.quic(), loop, connection, promise, attached);
                 } else {
                     if (outcome.fallback() != null) {
                         QuicraftFabric.LOG.info("QUICraft: connected to {} over TCP; QUIC failed ({})", address,
@@ -95,18 +105,60 @@ public final class ClientConnect {
                     } else {
                         QuicraftFabric.LOG.info("QUICraft: connected to {} over TCP; no QUIC advertised", address);
                     }
-                    useTcp(outcome, connection, promise);
+                    useTcp(outcome, connection, promise, mode, vanilla);
                 }
             } catch (Throwable t) {
                 close(outcome);
-                promise.tryFailure(withMessage(t));
+                if (attached[0]) {
+                    promise.tryFailure(withMessage(t));
+                } else {
+                    failed(mode, t, promise, vanilla);
+                }
             }
         });
         return promise;
     }
 
-    private static void useQuic(QuicByteStream stream, EventLoop loop, Connection connection, ChannelPromise promise) {
+    /**
+     * QUICraft failed after the screen got its future. In {@code quic-only} mode that's the
+     * player's error; otherwise connect as vanilla would have, and complete the screen's future
+     * with that (CLAUDE.md: a QUICraft bug never stops a TCP join).
+     */
+    private static void failed(Mode mode, Throwable cause, ChannelPromise promise, Supplier<ChannelFuture> vanilla) {
+        if (mode == Mode.QUIC_ONLY) {
+            promise.tryFailure(withMessage(cause));
+            return;
+        }
+        Hooks.failed("async connect", cause);
+        if (promise.isDone()) {
+            return; // cancelled
+        }
+        try {
+            ChannelFuture tcp = vanilla.get();
+            promise.addListener(f -> {
+                if (f.isCancelled()) {
+                    tcp.cancel(true);
+                    tcp.channel().close();
+                }
+            });
+            tcp.addListener(f -> {
+                if (f.isSuccess()) {
+                    if (!promise.trySuccess()) {
+                        tcp.channel().close();
+                    }
+                } else {
+                    promise.tryFailure(withMessage(f.cause()));
+                }
+            });
+        } catch (Throwable t) {
+            promise.tryFailure(withMessage(t));
+        }
+    }
+
+    private static void useQuic(QuicByteStream stream, EventLoop loop, Connection connection, ChannelPromise promise,
+            boolean[] attached) {
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
+        attached[0] = true;
         installVanillaPipeline(channel, connection);
         Transports.quic(connection, stream);
         // Registration makes the bridge active, so the Connection sees channelActive as on TCP.
@@ -121,15 +173,18 @@ public final class ClientConnect {
     }
 
     private static void useTcp(ClientConnector.Outcome<Channel> outcome, Connection connection,
-            ChannelPromise promise) {
+            ChannelPromise promise, Mode mode, Supplier<ChannelFuture> vanilla) {
         Channel channel = outcome.tcp();
         // A task, so it runs after Netty has fired channelActive for the bare channel.
         channel.eventLoop().execute(() -> {
+            boolean attached = false;
             try {
                 if (promise.isDone()) {
                     channel.close(); // cancelled meanwhile
                     return;
                 }
+                Hooks.enter("connect tcp winner");
+                attached = true;
                 installVanillaPipeline(channel, connection);
                 if (channel.isActive()) {
                     ChannelHandlerContext ctx = channel.pipeline().context(connection);
@@ -143,7 +198,11 @@ public final class ClientConnect {
                 }
             } catch (Throwable t) {
                 channel.close();
-                promise.tryFailure(withMessage(t));
+                if (attached) {
+                    promise.tryFailure(withMessage(t));
+                } else {
+                    failed(mode, t, promise, vanilla);
+                }
             }
         });
     }
@@ -194,6 +253,7 @@ public final class ClientConnect {
 
         @Override
         public CompletableFuture<Optional<Advertisement>> queryStatus(InetSocketAddress server) {
+            Hooks.enter("status query"); // a throw here counts as "no advertisement": TCP
             return StatusQuery.query(loop, new ReflectiveChannelFactory<>(holder.channelCls()), server,
                     address.getHostString(), SharedConstants.getCurrentVersion().protocolVersion())
                     .thenApply(Advertisement::extract);
@@ -202,6 +262,7 @@ public final class ClientConnect {
         @Override
         public CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint) {
             try {
+                Hooks.enter("quic connect"); // a throw here is a QUIC failure: TCP wins the race
                 return GameHost.connect(loop, GameHost.datagramChannelsLike(holder.channelCls()), target, fingerprint,
                         TransportConfig.DEFAULT);
             } catch (Throwable t) {

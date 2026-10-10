@@ -58,6 +58,20 @@ public final class ClientConnector {
         ScheduledExecutorService scheduler();
     }
 
+    /**
+     * The connect failed because TCP did (with QUIC failed or not tried as well): the server is
+     * unreachable, as vanilla would have found. {@link #getCause()} is TCP's error. Any other
+     * failure of {@link #connect} in {@code auto} mode is QUICraft's, and the platform should
+     * connect as vanilla instead.
+     */
+    public static final class TcpConnectException extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        TcpConnectException(Throwable cause) {
+            super(String.valueOf(cause.getMessage()), cause);
+        }
+    }
+
     /** Exactly one of {@link #quic()} and {@link #tcp()} is non-null. */
     public static final class Outcome<T> {
         private final QuicByteStream quic;
@@ -133,8 +147,9 @@ public final class ClientConnector {
     }
 
     /**
-     * Connects to {@code server} (its resolved TCP address). Fails like TCP would when neither
-     * transport connects; in {@code quic-only} mode, with QUIC's error. Cancelling the result
+     * Connects to {@code server} (its resolved TCP address). Fails with
+     * {@link TcpConnectException} when TCP fails (QUIC too, if tried); in {@code quic-only} mode,
+     * with QUIC's error. Cancelling the result
      * abandons the attempt and closes whatever connects afterwards.
      */
     public <T> CompletableFuture<Outcome<T>> connect(InetSocketAddress server, ConnectDecision.Mode mode,
@@ -221,7 +236,7 @@ public final class ClientConnector {
         CompletableFuture<T> attempt = tcp.connect();
         attempt.whenComplete((connection, error) -> {
             if (error != null) {
-                result.completeExceptionally(unwrap(error));
+                result.completeExceptionally(new TcpConnectException(unwrap(error)));
             } else if (!result.complete(new Outcome<T>(null, connection, null))) {
                 tcp.close(connection); // cancelled meanwhile
             }
@@ -268,7 +283,7 @@ public final class ClientConnector {
         });
         race.whenComplete((r, error) -> {
             if (error != null) {
-                result.completeExceptionally(unwrap(error));
+                result.completeExceptionally(new TcpConnectException(unwrap(error)));
                 return;
             }
             if (r.quicWon()) {

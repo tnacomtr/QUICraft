@@ -14,20 +14,27 @@ import java.util.concurrent.ConcurrentHashMap;
  * still work with QUICraft broken.
  */
 public final class Hooks {
-    private static volatile boolean faultInjection = Boolean.getBoolean("quicraft.faultInjection");
+    private static volatile java.util.function.Predicate<String> faultInjection =
+            Boolean.getBoolean("quicraft.faultInjection") ? hook -> true : hook -> false;
     private static final Set<String> WARNED = ConcurrentHashMap.newKeySet();
 
     private Hooks() {}
 
     public static void enter(String hook) {
-        if (faultInjection) {
+        if (faultInjection.test(hook)) {
             throw new IllegalStateException("QUICraft fault injection: " + hook);
         }
     }
 
     /** Tests only: make every hook throw from now on (true) or stop (false). */
     public static void setFaultInjection(boolean enabled) {
-        faultInjection = enabled;
+        faultInjection = enabled ? hook -> true : hook -> false;
+    }
+
+    /** Tests only: make just these hooks throw. */
+    public static void setFaultInjection(String... hooks) {
+        Set<String> only = Set.of(hooks);
+        faultInjection = only::contains;
     }
 
     /** Logs a hook's failure once per hook; the caller then takes the vanilla path. */
