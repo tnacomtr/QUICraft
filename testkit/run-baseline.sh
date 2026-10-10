@@ -8,6 +8,9 @@
 #   BATCHES=1 RUNS=3 PROFILES=clean testkit/run-baseline.sh   # smoke test
 #   TRANSPORTS="tcp quic" BATCHES=1 RUNS=5 testkit/run-baseline.sh   # TCP and QUIC interleaved
 #   TARGET=fabric TRANSPORTS="tcp quic" ... testkit/run-baseline.sh  # Fabric server, no proxy
+#   TRANSPORTS="tcp quic quic-0rtt" ...          # quic-0rtt: rejoins as one player, with 0-RTT
+#   SCENARIO=early-fallback TRANSPORTS=tcp ...   # abandoned 0-RTT attempt, then a TCP join
+#                                                # (docs/protocol.md §8)
 #
 # TARGET=velocity (default): bench -> Velocity -> Paper. TARGET=fabric: bench -> Fabric dedicated
 # server. The QUICraft plugin or mod is installed unless QUICRAFT_PLUGIN=false, so a TCP run also
@@ -37,6 +40,7 @@ KEEP_UP="${KEEP_UP:-false}"
 TRANSPORTS="${TRANSPORTS:-${TRANSPORT:-tcp}}"
 QUICRAFT_PLUGIN="${QUICRAFT_PLUGIN:-true}"
 TARGET="${TARGET:-velocity}"
+SCENARIO="${SCENARIO:-join}"
 case "$TARGET" in
     velocity | fabric) ;;
     *) echo "TARGET must be velocity or fabric" >&2; exit 2 ;;
@@ -44,6 +48,7 @@ esac
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 results="$here/results/$stamp-${TARGET}-${TRANSPORTS// /-}"
+[[ "$SCENARIO" != join ]] && results="$results-$SCENARIO"
 mkdir -p "$results"
 
 export VELOCITY_ONLINE_MODE="$ONLINE" FABRIC_ONLINE_MODE="$ONLINE" QUICRAFT_PLUGIN HOST_UID="$(id -u)" HOST_GID="$(id -g)"
@@ -84,7 +89,7 @@ fi
 
 {
     echo "started: $stamp"
-    echo "target=$TARGET batches=$BATCHES runs=$RUNS runs_loss=$RUNS_loss runs_reorder=$RUNS_reorder warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS transports=[$TRANSPORTS] quicraft_plugin=$QUICRAFT_PLUGIN"
+    echo "target=$TARGET batches=$BATCHES runs=$RUNS runs_loss=$RUNS_loss runs_reorder=$RUNS_reorder warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS transports=[$TRANSPORTS] scenario=$SCENARIO quicraft_plugin=$QUICRAFT_PLUGIN"
     echo "git: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo none)$(git -C "$root" diff --quiet 2>/dev/null || echo ' (dirty)')"
     echo "kernel: $(uname -r)"
     echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
@@ -106,7 +111,7 @@ for batch in $(seq 1 "$BATCHES"); do
             echo "== batch $batch/$BATCHES, profile $profile, $transport ($runs runs)"
             "${compose[@]}" run --rm --no-deps -e NETEM_PROFILE="$profile" bench \
                 bench --host "$TARGET" --port 25565 --transport "$transport" --profile "$label" \
-                --runs "$runs" --warmup "$WARMUP" --play-ms "$PLAY_MS" "${online_flag[@]}" \
+                --runs "$runs" --warmup "$WARMUP" --play-ms "$PLAY_MS" --scenario "$SCENARIO" "${online_flag[@]}" \
                 --out "/results/$(basename "$results")/batch$batch/$label.json" || echo "!! bench reported failed runs"
         done
     done

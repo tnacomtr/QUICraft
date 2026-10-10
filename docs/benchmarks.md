@@ -473,10 +473,46 @@ The client now resumes TLS sessions (protocol.md §8). Two measurements, same ho
   The session ticket arrives about 2 RTT after the first Initial, so only a connection that lived
   that long leaves a ticket behind.
 
-0-RTT early data would not save a round trip either while the server holds early data until the
-handshake completes (protocol.md §8, replay protection). The transport benchmark sets
-`sessionResumption(false)`, so its handshake numbers stay full handshakes, comparable with earlier
-runs.
+With the server holding early data until the handshake completed, 0-RTT data would not have saved
+a round trip either. The transport benchmark sets `sessionResumption(false)`, so its handshake
+numbers stay full handshakes, comparable with earlier runs.
+
+### 0-RTT joins (2026-10-10)
+
+The server now acts on a rejoin's 0-RTT handshake and Login Start when they carry an unused
+single-use token (protocol.md §8; needs netty/0003, §11).
+
+- **Core, through a relay at 200 ms RTT** (`EarlyDataTest`): first reply 1.01 RTT after the
+  client's first datagram with 0-RTT, 2.03 RTT without.
+- **Testkit, +150 ms RTT (delay profile), online mode**, `TRANSPORTS="tcp quic quic-0rtt"`, N=10
+  each after 1 warm-up, interleaved by transport, play 2 s. `quic` is a full handshake every
+  join; `quic-0rtt` sent 0-RTT data on 10 of 10 measured joins on both targets. Medians, ms;
+  differences with 95% bootstrap CIs:
+
+  | Target | Metric | TCP | QUIC full | QUIC 0-RTT | 0-RTT − TCP | 0-RTT − QUIC full |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | Velocity → Paper (`20261010T150734Z-velocity-tcp-quic-quic-0rtt`) | first login response (encryption request) | 303.5 | 305.2 | 154.4 | −149.1 [−149.4, −148.4] | −150.8 [−151.4, −150.2] |
+  | | play login (join) | 1435.6 | 1449.5 | 1275.5 | −160.1 [−201.3, −136.3] | −174.0 [−202.1, −145.0] |
+  | | chunk load | 1093.3 | 1014.7 | 966.0 | −127.3 [−246.0, −0.6] | −48.7 [−100.8, +103.5] |
+  | | play RTT | 150.7 | 150.8 | 150.7 | −0.0 [−0.2, +0.1] | −0.1 [−0.2, +0.1] |
+  | Fabric server (`20261010T151553Z-fabric-tcp-quic-quic-0rtt`) | first login response | 303.3 | 305.7 | 154.6 | −148.8 [−149.2, −148.1] | −151.1 [−151.5, −150.4] |
+  | | play login (join) | 1429.7 | 1350.3 | 1198.3 | −231.3 [−272.6, −187.1] | −151.9 [−181.3, −126.3] |
+  | | chunk load | 1010.1 | 1092.1 | 1074.3 | +64.3 [+40.5, +75.6] | −17.8 [−26.2, +9.0] |
+  | | play RTT | 150.5 | 150.7 | 150.6 | +0.0 [−0.0, +0.2] | −0.1 [−0.2, +0.1] |
+
+  0-RTT saves one round trip on the join, as predicted. The Fabric play-login difference against
+  TCP also includes the faster configuration phase over QUIC seen in Phase 3, and its chunk-load
+  difference against TCP (+64 ms) is the one Phase 3 measured (+68 ms), not a 0-RTT effect.
+- **Clean link, Velocity** (same run): no difference between 0-RTT and a full QUIC handshake
+  (first login response 4.2 vs 4.5 ms, join 293.7 vs 294.4 ms; CIs span 0). QUIC's first login
+  response stays ~2 ms behind TCP's (2.2 ms): the handshake's local cost, which a round trip
+  saved doesn't touch at this RTT.
+- **Fallback after 0-RTT** (`SCENARIO=early-fallback`, clean, N=4 each): a 0-RTT attempt whose
+  server-to-client UDP is dropped is abandoned after the head start, then the same player joins
+  over TCP. Velocity offline and online, Fabric offline and online: 16 of 16 TCP joins succeeded.
+  On Velocity the plugin closed the abandoned login each time (it had registered the player, in
+  offline mode); on Fabric the abandoned login timed out by itself ~3 s later without getting in
+  the way.
 
 ### No desync, fault injection, fallback
 

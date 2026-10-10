@@ -29,6 +29,7 @@ import org.geysermc.mcprotocollib.protocol.codec.MinecraftCodec;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundMovePlayerPosPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ping.serverbound.ServerboundPingRequestPacket;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
+import rs.sudoe.quicraft.core.transport.EarlyFlight;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
 import rs.sudoe.quicraft.testkit.Args;
 import rs.sudoe.quicraft.testkit.session.MockSessionService;
@@ -66,17 +67,21 @@ public final class BenchClient {
                 args.string("out", null) == null ? null : Path.of(args.string("out", null)),
                 args.flag("verbose"));
 
-        if (!o.transport().equals("tcp") && !o.transport().equals("quic")) {
-            throw new IllegalArgumentException("--transport must be tcp or quic");
+        if (!List.of("tcp", "quic", "quic-0rtt").contains(o.transport())) {
+            throw new IllegalArgumentException("--transport must be tcp, quic or quic-0rtt");
+        }
+        String scenario = args.string("scenario", "join");
+        if (!List.of("join", "early-fallback").contains(scenario)) {
+            throw new IllegalArgumentException("--scenario must be join or early-fallback");
         }
         List<RunResult> results = new ArrayList<>();
         int total = o.warmup() + o.runs();
         for (int i = 0; i < total; i++) {
             boolean warmup = i < o.warmup();
-            RunResult result = runOnce(o, i, warmup);
+            RunResult result = scenario.equals("join") ? runOnce(o, i, warmup) : earlyFallback(o, i, warmup);
             results.add(result);
-            System.out.printf("[%s/%s] run %d%s ok=%s join=%.1fms phases=%s chunks=%d chunkLoad=%.1fms rtt=%.2fms p95=%.2fms lost=%d net=%s quic=%s%s%n",
-                    o.profile(), o.transport(), i, warmup ? " (warmup)" : "", result.ok(), result.joinMs(), Arrays.toString(result.phasesMs()), result.chunks(),
+            System.out.printf("[%s/%s] run %d%s ok=%s 0rtt=%s join=%.1fms phases=%s chunks=%d chunkLoad=%.1fms rtt=%.2fms p95=%.2fms lost=%d net=%s quic=%s%s%n",
+                    o.profile(), o.transport(), i, warmup ? " (warmup)" : "", result.ok(), result.zeroRtt(), result.joinMs(), Arrays.toString(result.phasesMs()), result.chunks(),
                     result.chunkLoadMs(), result.rttMedianMs(), result.rttP95Ms(), result.rttLost(),
                     result.net(), result.quic(), result.error() == null ? "" : " error=" + result.error());
             // Let the proxy and backend finish the previous player's logout.
@@ -103,17 +108,73 @@ public final class BenchClient {
         return failed == 0 ? 0 : 1;
     }
 
-    private static RunResult runOnce(Options o, int index, boolean warmup) throws InterruptedException {
-        String name = "bench" + index;
+    /**
+     * docs/protocol.md §8, "TCP wins after 0-RTT went out": a 0-RTT attempt whose server-to-client
+     * UDP is dropped (the server gets the early flight and starts that login, the client hears
+     * nothing), abandoned after the head start as when TCP wins, then the same player's TCP join.
+     * The run's metrics are the TCP join's; it must succeed.
+     */
+    private static RunResult earlyFallback(Options o, int index, boolean warmup) throws InterruptedException {
+        RunResult prime = runOnce(o, index, warmup, ZERO_RTT_PLAYER, "quic-0rtt");
+        System.out.printf("[early-fallback] run %d: QUIC join first, ok=%s 0rtt=%s%s%n", index, prime.ok(),
+                prime.zeroRtt(), prime.error() == null ? "" : " error=" + prime.error());
+        if (!prime.ok()) {
+            return prime;
+        }
+        Thread.sleep(1_000);
+        InetSocketAddress address = new InetSocketAddress(o.host(), o.port());
+        Advertisement ad;
+        try {
+            ad = Advertisement.extract(StatusPing.fetch(address, o.host(),
+                    MinecraftCodec.CODEC.getProtocolVersion(), 10_000)).orElse(null);
+        } catch (IOException e) {
+            return failure(index, warmup, new BenchSession(protocol(o, ZERO_RTT_PLAYER), o.viewDistance(),
+                    o.verbose()), "status ping failed: " + e);
+        }
+        EarlyFlight early = new EarlyFlight(joinInputs(o, ZERO_RTT_PLAYER));
+        QuicClientSession abandoned = new QuicClientSession(address, protocol(o, ZERO_RTT_PLAYER));
+        var attempt = abandoned.openQuic(new InetSocketAddress(address.getAddress(), ad.port()), ad.fingerprint(),
+                TransportConfig.DEFAULT, early, true);
+        // The head start, then TCP connects and wins.
+        Thread.sleep(rs.sudoe.quicraft.core.connect.ClientConnector.HEAD_START_MILLIS + 50);
+        attempt.cancel(false);
+        if (!early.sent()) {
+            return failure(index, warmup, new BenchSession(protocol(o, ZERO_RTT_PLAYER), o.viewDistance(),
+                    o.verbose()), "the abandoned attempt sent no 0-RTT data");
+        }
+        Thread.sleep(20); // the connector's grace after TCP wins (one TCP round trip, at least 20 ms)
+        return runOnce(o, index, warmup, ZERO_RTT_PLAYER, "tcp");
+    }
+
+    /** quic-0rtt rejoins as one player, so the first flight recorded on one join fits the next. */
+    static final String ZERO_RTT_PLAYER = "bench0rtt";
+
+    private static MinecraftProtocol protocol(Options o, String name) {
         UUID uuid = UUID.nameUUIDFromBytes(("quicraft-bench:" + name).getBytes(StandardCharsets.UTF_8));
-        MinecraftProtocol protocol = o.online()
+        return o.online()
                 ? new MinecraftProtocol(new GameProfile(uuid, name), "testkit-token")
                 : new MinecraftProtocol(name);
+    }
+
+    /** What the bench's first flight depends on (the mod uses the same inputs, EarlyJoins). */
+    private static String joinInputs(Options o, String name) {
+        return String.join("\n", o.host(), Integer.toString(o.port()), "login", name,
+                Integer.toString(MinecraftCodec.CODEC.getProtocolVersion()));
+    }
+
+    private static RunResult runOnce(Options o, int index, boolean warmup) throws InterruptedException {
+        boolean zeroRtt = o.transport().equals("quic-0rtt");
+        return runOnce(o, index, warmup, zeroRtt ? ZERO_RTT_PLAYER : "bench" + index, o.transport());
+    }
+
+    private static RunResult runOnce(Options o, int index, boolean warmup, String name, String transport)
+            throws InterruptedException {
+        MinecraftProtocol protocol = protocol(o, name);
         BenchSession bench = new BenchSession(protocol, o.viewDistance(), o.verbose());
         // Resolve before the clock starts, so DNS is not part of join time.
         InetSocketAddress address = new InetSocketAddress(o.host(), o.port());
         Advertisement ad = null;
-        if (o.transport().equals("quic")) {
+        if (!transport.equals("tcp")) {
             // As a client with a fresh server-list entry would: the advertisement is in hand
             // before the player clicks Join, so the ping isn't part of join time.
             try {
@@ -130,11 +191,16 @@ public final class BenchClient {
         Map<String, Long> netBefore = NetStats.read();
         long start = System.nanoTime();
         ClientNetworkSession session;
+        EarlyFlight early = null;
         if (ad != null) {
             QuicClientSession quic = new QuicClientSession(address, protocol);
+            // quic: a full handshake every time, as in the runs before resumption existed.
+            TransportConfig config = transport.equals("quic-0rtt") ? TransportConfig.DEFAULT
+                    : TransportConfig.builder().sessionResumption(false).build();
+            early = transport.equals("quic-0rtt") ? new EarlyFlight(joinInputs(o, name)) : null;
             try {
                 quic.openQuic(new InetSocketAddress(address.getAddress(), ad.port()), ad.fingerprint(),
-                        TransportConfig.DEFAULT).get(o.timeoutNanos(), TimeUnit.NANOSECONDS);
+                        config, early, false).get(o.timeoutNanos(), TimeUnit.NANOSECONDS);
             } catch (ExecutionException | TimeoutException e) {
                 return failure(index, warmup, bench, "QUIC connect failed: " + e);
             }
@@ -183,7 +249,7 @@ public final class BenchClient {
             };
             return new RunResult(index, warmup, true, phases, joinMs, chunkLoadMs, bench.chunks.get(),
                     percentile(rtt, 0.5), percentile(rtt, 0.95), rtt.length, pingsSent - rtt.length, false, null,
-                    NetStats.delta(netBefore, NetStats.read()), quicStats(session));
+                    NetStats.delta(netBefore, NetStats.read()), quicStats(session), early != null && early.sent());
         } finally {
             bench.benchClosing = !bench.disconnected;
             if (session.isConnected()) {
@@ -226,7 +292,7 @@ public final class BenchClient {
     private static RunResult failure(int index, boolean warmup, BenchSession bench, String what) {
         String error = bench.disconnected ? what + ": " + bench.disconnectReason : what;
         return new RunResult(index, warmup, false, new double[0], -1, -1, bench.chunks.get(), -1, -1, 0, 0,
-                bench.disconnected, error, null, null);
+                bench.disconnected, error, null, null, false);
     }
 
     static double percentile(double[] sorted, double p) {

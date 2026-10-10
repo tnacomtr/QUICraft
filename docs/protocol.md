@@ -261,9 +261,19 @@ idea: derive H from the RTT the server-list ping already measured.
 - **TCP wins after 0-RTT went out.** The server may have acted on the early flight: a login is in
   progress there that the client has abandoned. The client closes the QUIC connection first and
   hands the TCP connection to the game one TCP round trip later (the time its connect took,
-  between 20 and 250 ms), so the close reaches the server before the TCP login. Reason: Velocity
-  registers an offline-mode player before Login Acknowledged, and refuses a second login with the
-  same name ("already connected to this proxy") until the first connection closes.
+  between 20 and 250 ms), so the close reaches the server before the TCP login. quiche sends that
+  CONNECTION_CLOSE only if the client has received a packet from the server; a client that heard
+  nothing (server-to-client UDP lost or blocked) closes silently, and the abandoned login lasts
+  until the server's 3 s confirmation deadline.
+- **Abandoned logins on the server.** Velocity registers an offline-mode player before Login
+  Acknowledged and refuses a second login with the same name ("already connected to this proxy")
+  until the first connection closes. So a server platform that holds a name during login MUST,
+  when a login arrives, close the unconfirmed early connections from the same IP whose Login
+  Start carries the same name (except the login's own connection), and let the login continue
+  only once they are closed (core: `QuicServer.closeUnconfirmedEarly`; Velocity: on
+  `PreLoginEvent`). Vanilla, Fabric and Paper don't hold a name before the player is in the world
+  and need nothing. Players behind one IP never lose a confirmed connection to this: only
+  connections still unconfirmed are closed, and only for the same name.
 - If the server rejects the 0-RTT data (ticket refused after a restart), quiche resends it after
   the handshake once loss detection declares it lost (4.2 RTT to the first reply measured at
   200 ms RTT, instead of 2); the token then works as for any data after the handshake.

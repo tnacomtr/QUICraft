@@ -107,9 +107,16 @@ public final class QuicraftVelocity {
                 return null;
             }
             String name = event.getUsername();
-            CompletableFuture<Void> done = l.closeUnconfirmedEarly(event.getConnection().getRemoteAddress(), name)
-                    .thenCompose(closed -> closed == 0 ? CompletableFuture.<Void>completedFuture(null)
-                            : whenNameFree(name, System.nanoTime() + TimeUnit.SECONDS.toNanos(1)))
+            InetSocketAddress from = event.getConnection().getRemoteAddress();
+            CompletableFuture<Void> done = l.closeUnconfirmedEarly(from, name)
+                    .thenCompose(closed -> {
+                        if (closed == 0) {
+                            return CompletableFuture.<Void>completedFuture(null);
+                        }
+                        logger.info("QUICraft: closed {}'s abandoned 0-RTT login from {} before their new login",
+                                name, from.getAddress().getHostAddress());
+                        return whenNameFree(name, System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
+                    })
                     .completeOnTimeout(null, 2, TimeUnit.SECONDS)
                     .exceptionally(t -> {
                         logger.debug("QUICraft: closing an abandoned QUIC login failed", t);
