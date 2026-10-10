@@ -66,6 +66,13 @@ tasks.named<ShadowJar>("shadowJar") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
+// Stable name for the testkit's Velocity image (testkit/docker/compose.yaml).
+tasks.register<Sync>("testkitPlugin") {
+    from(tasks.named("shadowJar"))
+    into(layout.buildDirectory.dir("testkit"))
+    rename { "quicraft-velocity.jar" }
+}
+
 tasks.named<Jar>("jar") {
     archiveClassifier = "plain"
 }
