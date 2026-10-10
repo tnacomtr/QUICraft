@@ -38,6 +38,12 @@ public final class QuicBridgeChannel extends AbstractChannel {
      * flow control; TCP's kernel buffer absorbs the same burst).
      */
     static final int SLICE_BYTES = 64 * 1024;
+    /**
+     * Up to this many bytes per event loop pass go to the pipeline right away, inside the read,
+     * so a reply goes out in the same packet as QUIC's ACK (deferring every read cost an extra
+     * ACK-only packet per round trip). Only beyond it, i.e. in a burst, delivery is sliced.
+     */
+    static final int INLINE_BYTES_PER_PASS = 32 * 1024;
     /** Above this many bytes waiting, the stream is paused, so QUIC flow control stops the peer. */
     static final long HELD_HIGH = 4L << 20;
     static final long HELD_LOW = 1L << 20;
@@ -48,8 +54,16 @@ public final class QuicBridgeChannel extends AbstractChannel {
     private long heldBytes;
     /** Event loop only: the stream is paused because too much is held. */
     private boolean pausedForHeld;
-    /** Event loop only: a slice task is queued or running. */
+    /** Event loop only: a slice task is queued or running, or an inline delivery is running. */
     private boolean delivering;
+    /** Event loop only: what may still be delivered inline in this loop pass. */
+    private long inlineBudget = INLINE_BYTES_PER_PASS;
+    /** Event loop only: the task that refills {@link #inlineBudget} after this pass is queued. */
+    private boolean budgetResetQueued;
+    private final Runnable resetInlineBudget = () -> {
+        budgetResetQueued = false;
+        inlineBudget = INLINE_BYTES_PER_PASS;
+    };
     /** Event loop only: the stream closed; close the channel once held data is delivered. */
     private boolean closeWhenDrained;
     /** Event loop only: a read() is outstanding while auto-read is off. */
@@ -177,7 +191,53 @@ public final class QuicBridgeChannel extends AbstractChannel {
             pausedForHeld = true;
             stream.setAutoRead(false);
         }
+        if (!delivering && inlineBudget > 0 && canDeliver() && eventLoop().inEventLoop()) {
+            if (!budgetResetQueued) {
+                budgetResetQueued = true;
+                eventLoop().execute(resetInlineBudget);
+            }
+            delivering = true;
+            inlineBudget -= deliverUpTo(inlineBudget);
+            delivering = false;
+            afterDelivery();
+            if (held.isEmpty()) {
+                return;
+            }
+        }
         scheduleDelivery();
+    }
+
+    /** Delivers held data up to about {@code budget} bytes; returns the bytes delivered. */
+    private long deliverUpTo(long budget) {
+        long delivered = 0;
+        ByteBuf data;
+        while (delivered < budget && canDeliver() && (data = held.poll()) != null) {
+            int n = data.readableBytes();
+            heldBytes -= n;
+            delivered += n;
+            readRequested = false;
+            pipeline().fireChannelRead(data);
+        }
+        if (delivered > 0) {
+            // May call read() (auto-read): doBeginRead sees delivering and leaves the rest to us.
+            pipeline().fireChannelReadComplete();
+        }
+        return delivered;
+    }
+
+    /** Resumes a stream paused for held data, and completes a close that waited for it. */
+    private void afterDelivery() {
+        if (pausedForHeld && heldBytes < HELD_LOW) {
+            pausedForHeld = false;
+            if (config.isAutoRead()) {
+                stream.setAutoRead(true);
+            } else if (readRequested) {
+                stream.read();
+            }
+        }
+        if (held.isEmpty() && closeWhenDrained && isOpen() && !delivering) {
+            unsafe().close(voidPromise());
+        }
     }
 
     /** Event loop only. */
@@ -203,37 +263,15 @@ public final class QuicBridgeChannel extends AbstractChannel {
             releaseHeld();
             return;
         }
-        long budget = SLICE_BYTES;
-        boolean any = false;
-        ByteBuf data;
-        while (budget > 0 && canDeliver() && (data = held.poll()) != null) {
-            heldBytes -= data.readableBytes();
-            budget -= data.readableBytes();
-            readRequested = false;
-            any = true;
-            pipeline().fireChannelRead(data);
-        }
-        if (any) {
-            // May call read() (auto-read): doBeginRead sees delivering and leaves the rest to us.
-            pipeline().fireChannelReadComplete();
-        }
-        if (pausedForHeld && heldBytes < HELD_LOW) {
-            pausedForHeld = false;
-            if (config.isAutoRead()) {
-                stream.setAutoRead(true);
-            } else if (readRequested) {
-                stream.read();
-            }
-        }
+        deliverUpTo(SLICE_BYTES);
         if (!held.isEmpty() && canDeliver() && isOpen()) {
             // Next pass: the loop reads its sockets first.
             eventLoop().schedule(this::deliverSlice, 0, java.util.concurrent.TimeUnit.NANOSECONDS);
+            afterDelivery();
             return;
         }
         delivering = false;
-        if (held.isEmpty() && closeWhenDrained && isOpen()) {
-            unsafe().close(voidPromise());
-        }
+        afterDelivery();
     }
 
     @Override

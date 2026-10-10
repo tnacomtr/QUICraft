@@ -10,6 +10,10 @@ netem_args() {
         delay)   echo "delay 75ms" ;;
         # 25% of packets skip the 10 ms delay and overtake the ones queued before them.
         reorder) echo "delay 10ms reorder 25% 50%" ;;
+        # Reordering as real paths produce it: delay jitter around a real base delay (each
+        # direction 10 ms +- 5 ms, normal), so later packets sometimes overtake earlier ones.
+        # Unlike 'reorder', no packet skips the delay, so the minimum RTT stays realistic.
+        jitter)  echo "delay 10ms 5ms distribution normal" ;;
         *)       return 1 ;;
     esac
 }
