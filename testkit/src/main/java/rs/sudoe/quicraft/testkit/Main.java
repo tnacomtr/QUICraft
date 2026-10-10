@@ -26,6 +26,7 @@ public final class Main {
             case "transport-server" -> TransportServer.run(Args.parse(rest));
             case "transport-client" -> TransportClient.run(Args.parse(rest));
             case "transport-summarize" -> TransportSummarize.run(Args.parse(rest));
+            case "latency" -> rs.sudoe.quicraft.testkit.latency.LatencyBench.run(Args.parse(rest));
             default -> {
                 usage();
                 yield 2;
@@ -42,6 +43,7 @@ public final class Main {
                   summarize    aggregate bench results and check reproducibility
                   transport-server     QUIC (Reno, CUBIC, BBR) and TCP servers with Minecraft-shaped traffic
                   transport-client     compare those transports: handshake, burst and play RTT
-                  transport-summarize  medians and bootstrap CIs of QUIC minus TCP""");
+                  transport-summarize  medians and bootstrap CIs of QUIC minus TCP
+                  latency      in-process loopback ping-pong: TCP vs QUIC vs QUIC through the bridge""");
     }
 }

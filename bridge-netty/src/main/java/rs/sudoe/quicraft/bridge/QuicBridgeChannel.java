@@ -220,7 +220,10 @@ public final class QuicBridgeChannel extends AbstractChannel {
         }
     }
 
-    /** Called on the stream's thread; everything is forwarded to this channel's event loop. */
+    /**
+     * Called on the stream's thread. In the hosted transport that is this channel's own loop and
+     * everything runs right here; otherwise it is forwarded to this channel's event loop.
+     */
     private final class StreamListener implements QuicByteStream.Listener {
         @Override
         public void onData(ByteBuffer data) {
@@ -229,20 +232,20 @@ public final class QuicBridgeChannel extends AbstractChannel {
             }
             ByteBuf copy = alloc().buffer(data.remaining());
             copy.writeBytes(data);
-            eventLoop().execute(() -> onIncoming(copy));
+            run(() -> onIncoming(copy));
         }
 
         @Override
         public void onWritabilityChanged(boolean writable) {
             if (writable) {
                 // Resume writing what doWrite left in the outbound buffer.
-                eventLoop().execute(() -> unsafe().flush());
+                run(() -> unsafe().flush());
             }
         }
 
         @Override
         public void onClosed(Throwable cause) {
-            eventLoop().execute(() -> {
+            run(() -> {
                 if (cause != null && isOpen()) {
                     pipeline().fireExceptionCaught(cause);
                 }
@@ -250,6 +253,15 @@ public final class QuicBridgeChannel extends AbstractChannel {
                     unsafe().close(voidPromise());
                 }
             });
+        }
+
+        private void run(Runnable task) {
+            EventLoop loop = eventLoop();
+            if (loop.inEventLoop()) {
+                task.run();
+            } else {
+                loop.execute(task);
+            }
         }
     }
 

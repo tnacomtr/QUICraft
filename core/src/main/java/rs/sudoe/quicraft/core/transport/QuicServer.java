@@ -48,14 +48,52 @@ public final class QuicServer implements Closeable {
         this.channel = channel;
     }
 
+    /** Binds {@code address} and runs QUIC on core's own thread. */
     public static QuicServer bind(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
+            StreamAcceptor acceptor) throws Exception {
+        io.netty.channel.ChannelHandler codec = codec(identity, config, acceptor);
+        EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
+        try {
+            Channel channel = new Bootstrap().group(group).channel(NioDatagramChannel.class).handler(codec)
+                    .bind(address).sync().channel();
+            return new QuicServer(group, channel);
+        } catch (Exception | Error e) {
+            group.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
+            throw e;
+        }
+    }
+
+    /**
+     * Runs QUIC on the platform's {@code loop} over its bound {@code socket} (hosted transport,
+     * docs/protocol.md §11): accepted streams can go straight into a pipeline on the same loop,
+     * with no thread hop. {@link #close()} closes the socket.
+     */
+    public static QuicServer bind(HostLoop loop, HostDatagramSocket socket, ServerIdentity identity,
+            TransportConfig config, StreamAcceptor acceptor) throws Exception {
+        HostedDatagramChannel channel = new HostedDatagramChannel(socket);
+        try {
+            channel.pipeline().addLast(codec(identity, config, acceptor));
+        } catch (Exception | Error e) {
+            socket.close();
+            throw e;
+        }
+        io.netty.channel.ChannelFuture registered = new HostedEventLoop(loop).register(channel);
+        if (!loop.inEventLoop(Thread.currentThread())) {
+            registered.sync();
+        } else if (registered.isDone() && !registered.isSuccess()) {
+            throw new IllegalStateException("registering the QUIC listener failed", registered.cause());
+        }
+        return new QuicServer(null, channel);
+    }
+
+    private static io.netty.channel.ChannelHandler codec(ServerIdentity identity, TransportConfig config,
             StreamAcceptor acceptor) throws Exception {
         QuicSslContext ssl = QuicSslContextBuilder
                 .forServer(identity.privateKey(), null, identity.certificate())
                 .applicationProtocols(Protocol.ALPN)
                 .earlyData(config.earlyData)
                 .build();
-        io.netty.channel.ChannelHandler codec = Codecs.apply(new QuicServerCodecBuilder(), config, true)
+        return Codecs.apply(new QuicServerCodecBuilder(), config, true)
                 .sslContext(ssl)
                 // Address validation (Retry) under load comes with Phase 4 (docs/protocol.md §9).
                 .tokenHandler(NoRetryTokenHandler.INSTANCE)
@@ -78,15 +116,6 @@ public final class QuicServer implements Closeable {
                     }
                 })
                 .build();
-        EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
-        try {
-            Channel channel = new Bootstrap().group(group).channel(NioDatagramChannel.class).handler(codec)
-                    .bind(address).sync().channel();
-            return new QuicServer(group, channel);
-        } catch (Exception | Error e) {
-            group.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
-            throw e;
-        }
     }
 
     public InetSocketAddress localAddress() {
@@ -95,8 +124,13 @@ public final class QuicServer implements Closeable {
 
     @Override
     public void close() {
-        channel.close().syncUninterruptibly();
-        group.shutdownGracefully(0, 1, java.util.concurrent.TimeUnit.SECONDS).syncUninterruptibly();
+        if (group != null) {
+            channel.close().syncUninterruptibly();
+            group.shutdownGracefully(0, 1, java.util.concurrent.TimeUnit.SECONDS).syncUninterruptibly();
+        } else {
+            // Hosted: the loop is the platform's. Bounded wait, in case it is already gone.
+            channel.close().awaitUninterruptibly(2, java.util.concurrent.TimeUnit.SECONDS);
+        }
     }
 
     /** Per-connection state: holds streams back until the handshake has completed. */
