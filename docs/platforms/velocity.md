@@ -52,4 +52,24 @@ each release of the plugin.
 ## Build
 
 - Compile against `velocity-api` (MIT) and the Velocity proxy jar for internals (GPL-3.0), the
-  proxy jar compile-only, fetched by version and checked by sha256 like the testkit images.
+  proxy jar compile-only, fetched by version and checked by sha256 like the testkit images
+  (`VerifiedDownload`). velocity-api 4.2.0 requires Java 25, so the plugin targets 25.
+- The POMs of `velocity-api` and `velocity-brigadier` declare no license. Both are MIT (Velocity's
+  `api/LICENSE`, PaperMC/velocity-brigadier; checked Oct 2026) and allowlisted by exact version.
+  `aopalliance` (public domain, via Guice) is excluded: not needed to compile.
+- The plugin jar bundles the shaded core (natives, licence and notice files included) and
+  bridge-netty42 as they are. Nothing of Velocity's is bundled.
+
+## Implementation (velocity/)
+
+- `QuicraftVelocity`: on `ProxyInitializeEvent` (which Velocity fires before binding its
+  listeners) reads `config.properties`, checks the native, reads `cm`, binds the QUIC listener
+  and only then wraps the initializer holder. Any failure: one WARN, TCP untouched.
+- `QuicListener`: `QuicBridgeChannel` + `holder.get()` + `DropProxyProtocol` per stream. With
+  Velocity's `haproxy-protocol` on, the initializer adds an `HAProxyMessageDecoder`; QUIC
+  carries no PROXY header (the UDP source is the player), so it is removed on QUIC channels.
+- `AdvertisingInitializer` / `StatusAdvertiser`: as planned above. The advertiser is withdrawn
+  when the listener closes; the wrapper stays in the holder (another plugin may have wrapped it
+  since) but passes everything through.
+- `Settings`: `enabled`, `port` (0 = game port), `alternative-port` (0 = game port + 1, used
+  when `[query]` is on the same UDP port).
