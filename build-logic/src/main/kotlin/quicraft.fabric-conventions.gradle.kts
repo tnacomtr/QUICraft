@@ -4,7 +4,8 @@
 // (fabric/), one module per jar. The module applies Loom first: net.fabricmc.fabric-loom for
 // unobfuscated 26.x, net.fabricmc.fabric-loom-remap (Mojang names in source, Intermediary in the
 // jar) for 1.21.11. Module gradle.properties set:
-//   minecraftVersion   game version compiled and run against (override: -P<module>.minecraft=…)
+//   minecraftVersion   game version compiled and run against (override: -P<module>.minecraft=…
+//                      together with -P<module>.fabricApi=…, to test other versions in the range)
 //   minecraftRange     fabric.mod.json "minecraft" dependency
 //   javaRelease        bytecode level (25 for 26.x, 21 for 1.21.11)
 //   fabricApiVersion   Fabric API for the client gametests only (never a runtime dependency)
@@ -25,7 +26,8 @@ val minecraftVersion: String = providers.gradleProperty("${project.name}.minecra
     ?: moduleProperty("minecraftVersion")
 val minecraftRange: String = moduleProperty("minecraftRange")
 val javaRelease: Int = moduleProperty("javaRelease").toInt()
-val fabricApiVersion: String = moduleProperty("fabricApiVersion")
+val fabricApiVersion: String = providers.gradleProperty("${project.name}.fabricApi").orNull
+    ?: moduleProperty("fabricApiVersion")
 val fabricLoader = "0.19.5"
 
 val shared = rootProject.layout.projectDirectory.dir("fabric/src")
