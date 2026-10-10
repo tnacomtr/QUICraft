@@ -14,13 +14,17 @@ total instead of ~1).
 
 Fix: after each connectionSend(...) that can follow an SSL task (recvComplete() and the three
 event-loop continuations after SSL tasks), a client whose connect promise is still pending and
-whose connection is now established runs processReceived(...) (channelActive, connect promise)
-and sends again, so whatever the listeners wrote goes out at once.
+whose connection is now established queues a task on its event loop that runs
+processReceived(...) (channelActive, connect promise) and sends again. The task runs right after
+the current read or send, so the connect still completes in the same round trip, and connect
+listeners run outside connectionSend. (quicraft1 ran them inside it; a listener that closed the
+connection there, as a client that lost the QUIC/TCP race does, made the send loop spin forever
+and starved every connection on that event loop.)
 
 Applied by natives/build-netty-quic.sh with `git apply`, which ignores this text.
 
 diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java
-index f17547d..2bea387 100644
+index f17547d..0e459f2 100644
 --- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java
 +++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java
 @@ -12,6 +12,9 @@
@@ -41,7 +45,7 @@ index f17547d..2bea387 100644
  
              // We are done with the read loop, flush all pending writes now.
              forceFlushParent();
-@@ -1206,6 +1210,25 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
+@@ -1206,6 +1210,31 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
          } while ((task = conn.sslTask()) != null);
      }
  
@@ -49,51 +53,51 @@ index f17547d..2bea387 100644
 +     * A client's handshake can finish inside {@link #connectionSend(QuicheQuicConnection)}: quiche resumes a
 +     * handshake that paused for a certificate verification task only when it is next driven, and that is the send
 +     * after the task ran. Nothing else checks for an established connection until the peer's next packet arrives,
-+     * which delays the connect by one round trip. Completes the connect now instead.
-+     *
-+     * @return {@code true} if something may have been written and the parent needs a flush.
++     * which delays the connect by one round trip. Completes the connect in a task on this event loop instead: it
++     * runs right after the current read or send, without waiting for the peer, and outside of it, so connect
++     * listeners never run inside connectionSend (one that closes the connection there made the send loop spin).
 +     */
-+    private boolean completeConnectIfEstablished(QuicheQuicConnection conn) {
++    private void completeConnectIfEstablished(QuicheQuicConnection conn) {
 +        if (server || connectPromise == null || conn.isFreed()
 +                || !Quiche.quiche_conn_is_established(conn.address())) {
-+            return false;
++            return;
 +        }
-+        ((QuicChannelUnsafe) unsafe()).processReceived(conn);
-+        // Send what channelActive and the connect listeners produced.
-+        connectionSend(conn);
-+        return true;
++        eventLoop().execute(() -> {
++            if (connectPromise == null || conn.isFreed() || !isOpen()) {
++                return;
++            }
++            ((QuicChannelUnsafe) unsafe()).processReceived(conn);
++            // Send what channelActive and the connect listeners produced.
++            if (!conn.isFreed() && connectionSend(conn) != SendResult.NONE) {
++                forceFlushParent();
++            }
++        });
 +    }
 +
      private Runnable decorateTaskSend(QuicheQuicConnection conn, Runnable task) {
          return () -> {
              try {
-@@ -1214,7 +1237,8 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
-                 // Move back to the EventLoop.
-                 eventLoop().execute(() -> {
-                     // Call connection send to continue handshake if needed.
--                    if (connectionSend(conn) != SendResult.NONE) {
-+                    boolean flush = connectionSend(conn) != SendResult.NONE;
-+                    if (completeConnectIfEstablished(conn) || flush) {
+@@ -1217,6 +1246,7 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
+                     if (connectionSend(conn) != SendResult.NONE) {
                          forceFlushParent();
                      }
++                    completeConnectIfEstablished(conn);
                      freeIfClosed();
-@@ -1488,7 +1512,8 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
-                         @Override
-                         public void run() {
-                             // Call connection send to continue handshake if needed.
--                            if (connectionSend(conn) != SendResult.NONE) {
-+                            boolean flush = connectionSend(conn) != SendResult.NONE;
-+                            if (completeConnectIfEstablished(conn) || flush) {
+                 });
+             }
+@@ -1491,6 +1521,7 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
+                             if (connectionSend(conn) != SendResult.NONE) {
                                  forceFlushParent();
                              }
++                            completeConnectIfEstablished(conn);
                              freeIfClosed();
-@@ -1838,7 +1863,8 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
-                             processReceived(conn);
- 
-                             // Call connection send to continue handshake if needed.
--                            if (connectionSend(conn) != SendResult.NONE) {
-+                            boolean flush = connectionSend(conn) != SendResult.NONE;
-+                            if (completeConnectIfEstablished(conn) || flush) {
+                         }
+                     });
+@@ -1841,6 +1872,7 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
+                             if (connectionSend(conn) != SendResult.NONE) {
                                  forceFlushParent();
                              }
++                            completeConnectIfEstablished(conn);
  
+                             freeIfClosed();
+                         }

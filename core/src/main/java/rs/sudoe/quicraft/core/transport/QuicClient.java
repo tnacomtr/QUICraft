@@ -2,7 +2,6 @@
 package rs.sudoe.quicraft.core.transport;
 
 import io.netty.bootstrap.Bootstrap;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandler;
@@ -118,13 +117,13 @@ public final class QuicClient {
             QuicChannel connection = (QuicChannel) f.getNow();
             connection.closeFuture().addListener(closed -> udp.close());
             if (result.isDone()) {
-                connection.close(true, Protocol.CLOSE_NORMAL, Unpooled.EMPTY_BUFFER);
+                Codecs.closeLater(connection, true, Protocol.CLOSE_NORMAL);
                 return;
             }
             connection.createStream(QuicStreamType.BIDIRECTIONAL, new ChannelInboundHandlerAdapter())
                     .addListener(s -> {
                         if (!s.isSuccess()) {
-                            connection.close(true, Protocol.CLOSE_INTERNAL_ERROR, Unpooled.EMPTY_BUFFER);
+                            Codecs.closeLater(connection, true, Protocol.CLOSE_INTERNAL_ERROR);
                             result.completeExceptionally(s.cause());
                             return;
                         }
