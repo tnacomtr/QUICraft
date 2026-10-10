@@ -35,6 +35,7 @@ import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
 import rs.sudoe.quicraft.fabric.Hooks;
+import rs.sudoe.quicraft.fabric.QuicraftFabric;
 import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
 
 /**
@@ -85,8 +86,15 @@ public final class ClientConnect {
             }
             try {
                 if (outcome.quic() != null) {
+                    QuicraftFabric.LOG.info("QUICraft: connected to {} over QUIC", outcome.quic().remoteAddress());
                     useQuic(outcome.quic(), loop, connection, promise);
                 } else {
+                    if (outcome.fallback() != null) {
+                        QuicraftFabric.LOG.info("QUICraft: connected to {} over TCP; QUIC failed ({})", address,
+                                outcome.fallback().name().toLowerCase(java.util.Locale.ROOT));
+                    } else {
+                        QuicraftFabric.LOG.info("QUICraft: connected to {} over TCP; no QUIC advertised", address);
+                    }
                     useTcp(outcome, connection, promise);
                 }
             } catch (Throwable t) {

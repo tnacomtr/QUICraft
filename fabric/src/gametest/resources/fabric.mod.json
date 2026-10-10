@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "quicraft-gametest",
+  "version": "1",
+  "name": "QUICraft client gametests",
+  "license": "GPL-3.0-or-later",
+  "environment": "client",
+  "entrypoints": {
+    "fabric-client-gametest": [
+      "rs.sudoe.quicraft.fabric.gametest.QuicJoinGameTest",
+      "rs.sudoe.quicraft.fabric.gametest.FallbackGameTest",
+      "rs.sudoe.quicraft.fabric.gametest.TcpOnlyGameTest",
+      "rs.sudoe.quicraft.fabric.gametest.FaultInjectionGameTest"
+    ]
+  },
+  "depends": {
+    "quicraft": "*",
+    "fabric-client-gametest-api-v1": "*"
+  }
+}

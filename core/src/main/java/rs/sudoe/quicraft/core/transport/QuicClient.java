@@ -133,11 +133,9 @@ public final class QuicClient {
                         }
                     });
         });
-        result.whenComplete((stream, error) -> {
-            if (result.isCancelled()) {
-                connecting.cancel(false);
-            }
-        });
+        // A cancel needs nothing more here: closing the socket (above) force-closes the QUIC channel,
+        // which fails the connect. Cancelling Netty's connect future instead makes
+        // QuicChannelBootstrap log an IllegalStateException when it later fails that future.
     }
 
     private static EventLoopGroup group() {

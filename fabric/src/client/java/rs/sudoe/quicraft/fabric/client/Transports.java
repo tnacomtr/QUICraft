@@ -9,7 +9,7 @@ import rs.sudoe.quicraft.core.connect.FallbackReason;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 
 /** Per-connection client state: the transport in use and a pending fallback report. */
-final class Transports {
+public final class Transports {
     private static final Map<Connection, QuicByteStream> QUIC = new WeakHashMap<>();
     private static final Map<Connection, FallbackReason> FALLBACKS = new WeakHashMap<>();
 
@@ -17,6 +17,11 @@ final class Transports {
 
     static synchronized void quic(Connection connection, QuicByteStream stream) {
         QUIC.put(connection, stream);
+    }
+
+    /** Whether {@code connection} runs over QUIC (else TCP, or memory for singleplayer). */
+    public static synchronized boolean isQuic(Connection connection) {
+        return QUIC.containsKey(connection);
     }
 
     static synchronized @Nullable QuicByteStream quic(Connection connection) {
