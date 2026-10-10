@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Loads the quiche native from core's shaded jar on every platform we ship a native for
-# (CLAUDE.md: test natives loading in a CI matrix). Runs only when core, the build logic or
+# (CLAUDE.md: test natives loading in a CI matrix). linux-x86_64 runs QUICraft's patched native;
+# the others run upstream Netty's with the patched classes, so the relaxed loss threshold must be
+# reported unavailable there (core/build.gradle.kts, quicraft.patchedNatives). Runs only when core, the build logic or
 # dependency versions change, or by hand: macOS minutes are expensive on a private repo.
 name: natives
 
@@ -8,6 +10,7 @@ on:
   push:
     paths:
       - "core/**"
+      - "natives/**"
       - "build-logic/**"
       - "gradle/**"
       - "*.gradle.kts"
@@ -18,7 +21,19 @@ permissions:
   contents: read
 
 jobs:
+  # Patched Netty QUIC classes (+ linux-x86_64 native), needed by every leg to compile core.
+  netty-quic:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/netty-quic-linux
+      - uses: actions/upload-artifact@v7
+        with:
+          name: netty-quic-repo
+          path: natives/build/out/repo/
+
   shaded-natives:
+    needs: netty-quic
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +55,10 @@ jobs:
           distribution: temurin
           java-version: 25
       - uses: gradle/actions/setup-gradle@v6
+      - uses: actions/download-artifact@v7
+        with:
+          name: netty-quic-repo
+          path: natives/build/out/repo/
       - run: ./gradlew :core:shadedTest :core:checkShadedNotices
       - name: Upload test report
         if: failure()
