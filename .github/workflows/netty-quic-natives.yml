@@ -1,0 +1,132 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Builds QUICraft's patched Netty QUIC native (natives/) on each platform's own runner, then
+# checks core's shaded jar loads it there with the relaxed loss threshold available
+# (-Pquicraft.patchedNatives=all). Manual only: macOS minutes are expensive and a cold build takes
+# 15-30 min per platform.
+#
+# NOT RUN YET. Linux x86_64 is the only platform built and tested so far (locally, through
+# natives/build-linux.sh). The macOS and Windows toolchain steps follow Netty's own release
+# workflow but are untested; expect to fix them on the first run.
+name: netty-quic-natives
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, native: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, native: linux-aarch_64 }
+    name: build ${{ matrix.native }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/netty-quic-linux
+      - uses: actions/upload-artifact@v7
+        with:
+          name: netty-quic-${{ matrix.native }}
+          path: natives/build/out/
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15-intel, native: osx-x86_64 }
+          - { os: macos-15, native: osx-aarch_64 }
+    name: build ${{ matrix.native }}
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 11
+      - name: Toolchain (pinned Rust, as in natives/Dockerfile)
+        run: |
+          brew install autoconf automake libtool cmake ninja
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+      - run: natives/build-netty-quic.sh natives natives/build/work natives/build/out
+      - uses: actions/upload-artifact@v7
+        with:
+          name: netty-quic-${{ matrix.native }}
+          path: natives/build/out/
+
+  windows:
+    name: build windows-x86_64
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 11
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: microsoft/setup-msbuild@v2
+      - name: Toolchain (pinned Rust, as in natives/Dockerfile)
+        run: |
+          choco install -y nasm ninja
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+      - run: natives/build-netty-quic.sh natives natives/build/work natives/build/out
+        env:
+          PYTHON: python
+      - uses: actions/upload-artifact@v7
+        with:
+          name: netty-quic-windows-x86_64
+          path: natives/build/out/
+
+  verify:
+    needs: [linux, macos, windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, native: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, native: linux-aarch_64 }
+          - { os: macos-15-intel, native: osx-x86_64 }
+          - { os: macos-15, native: osx-aarch_64 }
+          - { os: windows-2025, native: windows-x86_64 }
+    name: verify ${{ matrix.native }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v6
+      # Every platform's repo has the same classes jar coordinates; the linux-x86_64 build's
+      # classes are used (downloaded last, so they win).
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: netty-quic-*
+          path: natives/build/artifacts/
+      - name: Merge the per-platform Maven repos
+        run: |
+          mkdir -p natives/build/out/repo
+          for d in natives/build/artifacts/netty-quic-*/; do
+            [[ "$d" == *linux-x86_64* ]] || cp -R "$d/repo/." natives/build/out/repo/
+          done
+          cp -R natives/build/artifacts/netty-quic-linux-x86_64/repo/. natives/build/out/repo/
+      - run: ./gradlew -Pquicraft.patchedNatives=all :core:test :core:shadedTest :core:checkShadedNotices
+      - uses: actions/upload-artifact@v7
+        if: matrix.native == 'linux-x86_64'
+        with:
+          name: netty-quic-repo-all
+          path: natives/build/out/repo/
