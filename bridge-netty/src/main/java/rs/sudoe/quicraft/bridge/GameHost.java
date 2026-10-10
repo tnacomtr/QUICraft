@@ -1,18 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.bridge;
 
+import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFactory;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.EventLoop;
+import io.netty.channel.ReflectiveChannelFactory;
 import io.netty.channel.socket.DatagramChannel;
 import io.netty.channel.socket.DatagramPacket;
 import io.netty.util.concurrent.ScheduledFuture;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.transport.HostDatagramSocket;
 import rs.sudoe.quicraft.core.transport.HostLoop;
+import rs.sudoe.quicraft.core.transport.QuicByteStream;
+import rs.sudoe.quicraft.core.transport.QuicClient;
+import rs.sudoe.quicraft.core.transport.TransportConfig;
 
 /**
  * The game's (or proxy's) Netty as a host for core's QUIC (hosted transport, docs/protocol.md
@@ -75,6 +89,75 @@ public final class GameHost {
         SocketHandler handler = new SocketHandler(channel);
         channel.pipeline().addLast(handler);
         return handler;
+    }
+
+    /**
+     * The datagram channel type that runs on the same kind of event loop as {@code socketChannel}
+     * (in Netty 4.2 a channel only registers on a loop of its own transport): Epoll, KQueue or
+     * NIO, found by name in the socket channel's package. Throws if there is none.
+     */
+    @SuppressWarnings("unchecked")
+    public static ChannelFactory<? extends DatagramChannel> datagramChannelsLike(Class<? extends Channel> socketChannel)
+            throws ClassNotFoundException {
+        String name = socketChannel.getName();
+        if (!name.endsWith("SocketChannel")) {
+            throw new ClassNotFoundException("no datagram channel for " + name);
+        }
+        String datagram = name.substring(0, name.length() - "SocketChannel".length()) + "DatagramChannel";
+        Class<?> type = Class.forName(datagram, false, socketChannel.getClassLoader());
+        if (!DatagramChannel.class.isAssignableFrom(type)) {
+            throw new ClassNotFoundException(datagram + " is not a DatagramChannel");
+        }
+        return new ReflectiveChannelFactory<>((Class<? extends DatagramChannel>) type);
+    }
+
+    /**
+     * Opens a QUIC connection hosted on {@code loop}: binds a UDP socket of the given type there
+     * (wildcard address of the server's family, any port) and runs {@link QuicClient} over it.
+     * Cancelling the result cancels the attempt and closes the socket, also when it is still
+     * binding; a stream that arrives after the cancel is closed.
+     */
+    public static CompletableFuture<QuicByteStream> connect(EventLoop loop,
+            ChannelFactory<? extends DatagramChannel> datagrams, InetSocketAddress remote, Fingerprint fingerprint,
+            TransportConfig config) {
+        CompletableFuture<QuicByteStream> result = new CompletableFuture<>();
+        InetSocketAddress local;
+        try {
+            local = new InetSocketAddress(InetAddress.getByAddress(
+                    new byte[remote.getAddress() instanceof Inet6Address ? 16 : 4]), 0);
+        } catch (UnknownHostException e) {
+            result.completeExceptionally(e);
+            return result;
+        }
+        ChannelFuture bound = new Bootstrap().group(loop).channelFactory(datagrams)
+                .handler(new ChannelInboundHandlerAdapter()).bind(local);
+        bound.addListener((ChannelFuture f) -> {
+            if (!f.isSuccess()) {
+                f.channel().close();
+                result.completeExceptionally(f.cause());
+                return;
+            }
+            if (result.isDone()) {
+                f.channel().close(); // cancelled while binding
+                return;
+            }
+            CompletableFuture<QuicByteStream> attempt = QuicClient.connect(loop(loop),
+                    socket((DatagramChannel) f.channel()), remote, fingerprint, config);
+            result.whenComplete((s, e) -> {
+                if (result.isCancelled()) {
+                    attempt.cancel(false);
+                }
+            });
+            attempt.whenComplete((stream, error) -> {
+                if (error != null) {
+                    result.completeExceptionally(error instanceof CompletionException && error.getCause() != null
+                            ? error.getCause() : error);
+                } else if (!result.complete(stream)) {
+                    stream.close();
+                }
+            });
+        });
+        return result;
     }
 
     private static final class SocketHandler extends ChannelInboundHandlerAdapter implements HostDatagramSocket {

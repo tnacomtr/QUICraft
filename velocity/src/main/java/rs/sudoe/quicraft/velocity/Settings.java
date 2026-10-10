@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Properties;
+import rs.sudoe.quicraft.core.discovery.QuicPort;
 
 /** {@code plugins/quicraft/config.properties}. Missing or invalid values fall back to defaults. */
 record Settings(boolean enabled, int port, int alternativePort) {
@@ -63,11 +64,6 @@ record Settings(boolean enabled, int port, int alternativePort) {
      * the query listener is on that UDP port; then the alternative port (default game port + 1).
      */
     int quicPort(int gamePort, boolean queryEnabled, int queryPort) {
-        int wanted = port != 0 ? port : gamePort;
-        if (queryEnabled && queryPort == wanted) {
-            int alternative = alternativePort != 0 ? alternativePort : gamePort + 1;
-            return alternative <= 65535 ? alternative : gamePort - 1;
-        }
-        return wanted;
+        return QuicPort.choose(port, alternativePort, gamePort, queryEnabled, queryPort);
     }
 }

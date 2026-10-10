@@ -275,4 +275,51 @@ class HostedTransportTest {
         assertTrue(clientUdp.closeFuture().await(5, TimeUnit.SECONDS));
         silent.close().sync();
     }
+
+    @Test
+    void connectBindsASocketOfTheGivenTypeOnTheLoopAndCarriesBytes() throws Exception {
+        DatagramChannel serverUdp = udp(serverLoop);
+        try (QuicServer server = echoServer(serverUdp, new AtomicReference<>(), new AtomicReference<>())) {
+            QuicByteStream stream = GameHost.connect(clientLoop, GameHost.datagramChannelsLike(
+                    io.netty.channel.socket.nio.NioSocketChannel.class), serverUdp.localAddress(),
+                    identity.fingerprint(), TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
+            assertTrue(clientLoop.submit(stream::inEventLoop).get(5, TimeUnit.SECONDS));
+            QuicBridgeChannelTest.Collector collector = new QuicBridgeChannelTest.Collector();
+            QuicBridgeChannel ch = new QuicBridgeChannel(stream);
+            ch.pipeline().addLast(collector);
+            clientLoop.register(ch).sync();
+            collector.channel = ch;
+            byte[] payload = new byte[10_000];
+            new Random(3).nextBytes(payload);
+            ch.writeAndFlush(Unpooled.wrappedBuffer(payload)).sync();
+            assertArrayEquals(payload, collector.await(payload.length));
+            ch.close().sync();
+        }
+    }
+
+    @Test
+    void datagramChannelsLikeFindsTheSameTransport() throws Exception {
+        assertSame(NioDatagramChannel.class, GameHost.datagramChannelsLike(
+                io.netty.channel.socket.nio.NioSocketChannel.class).newChannel().getClass());
+        assertThrows(ClassNotFoundException.class,
+                () -> GameHost.datagramChannelsLike(io.netty.channel.local.LocalChannel.class));
+    }
+
+    @Test
+    void cancellingAHostedConnectClosesItsSocket() throws Exception {
+        DatagramChannel silent = udp(serverLoop);
+        java.util.List<io.netty.channel.Channel> opened = new java.util.concurrent.CopyOnWriteArrayList<>();
+        io.netty.channel.ChannelFactory<DatagramChannel> recording = () -> {
+            NioDatagramChannel ch = new NioDatagramChannel();
+            opened.add(ch);
+            return ch;
+        };
+        CompletableFuture<QuicByteStream> attempt = GameHost.connect(clientLoop, recording, silent.localAddress(),
+                identity.fingerprint(), TransportConfig.DEFAULT);
+        Thread.sleep(200);
+        assertTrue(attempt.cancel(false));
+        assertTrue(opened.size() == 1);
+        assertTrue(opened.get(0).closeFuture().await(5, TimeUnit.SECONDS), "the socket closes on cancel");
+        silent.close().sync();
+    }
 }
