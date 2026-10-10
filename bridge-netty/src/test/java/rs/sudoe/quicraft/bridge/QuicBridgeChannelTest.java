@@ -113,6 +113,42 @@ class QuicBridgeChannelTest {
         }
     }
 
+    /** Clients that connect through a Bootstrap (vanilla, MCProtocolLib) get the bridge from a factory. */
+    @Test
+    void bootstrapConnectThroughAChannelFactorySucceedsAndFiresActiveOnce() throws Exception {
+        CompletableFuture<Channel> serverChannel = new CompletableFuture<>();
+        try (QuicServer server = echoServer(serverChannel)) {
+            QuicByteStream stream = QuicClient.connect(server.localAddress(), identity.fingerprint(),
+                    TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
+            Collector collector = new Collector();
+            java.util.concurrent.atomic.AtomicInteger active = new java.util.concurrent.atomic.AtomicInteger();
+            Channel ch = new io.netty.bootstrap.Bootstrap()
+                    .group(gameGroup)
+                    .channelFactory(() -> new QuicBridgeChannel(stream))
+                    .option(ChannelOption.TCP_NODELAY, true)
+                    .handler(new io.netty.channel.ChannelInitializer<Channel>() {
+                        @Override
+                        protected void initChannel(Channel c) {
+                            c.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                                @Override
+                                public void channelActive(ChannelHandlerContext ctx) {
+                                    active.incrementAndGet();
+                                    ctx.fireChannelActive();
+                                }
+                            });
+                            c.pipeline().addLast(collector);
+                        }
+                    })
+                    // Nothing listens on port 1: the address is not used.
+                    .connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), 1)).sync().channel();
+            collector.channel = ch;
+            ch.writeAndFlush(Unpooled.wrappedBuffer(new byte[] {4, 2})).sync();
+            assertArrayEquals(new byte[] {4, 2}, collector.await(2));
+            assertEquals(1, active.get());
+            ch.close().sync();
+        }
+    }
+
     @Test
     void tcpOptionsAreAcceptedWithoutThrowing() throws Exception {
         CompletableFuture<Channel> serverChannel = new CompletableFuture<>();
