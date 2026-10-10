@@ -11,6 +11,7 @@ rm -f /srv/plugins/quicraft-velocity.jar
 if [ "${QUICRAFT_PLUGIN:-true}" = true ]; then
     cp /srv/quicraft/quicraft-velocity.jar /srv/plugins/
 fi
-exec java -Xms1G -Xmx1G \
+# shellcheck disable=SC2086 # JAVA_OPTS is a list of flags
+exec java -Xms1G -Xmx1G ${JAVA_OPTS:-} \
     -Dmojang.sessionserver="${MOCK_SESSION_URL:-http://mocksession:8080}/session/minecraft/hasJoined" \
     -jar /srv/velocity.jar

@@ -31,6 +31,8 @@ services:
       VELOCITY_ONLINE_MODE: ${VELOCITY_ONLINE_MODE:-true}
       # false: plain Velocity, for a baseline without the plugin installed.
       QUICRAFT_PLUGIN: ${QUICRAFT_PLUGIN:-true}
+      # Extra JVM flags for Velocity and the bench client, e.g. -Dquicraft.udpBufferBytes=0.
+      JAVA_OPTS: ${QUICRAFT_JAVA_OPTS:-}
     networks: [front, back]
     depends_on: [paper, mocksession]
     stop_grace_period: 30s
@@ -42,6 +44,7 @@ services:
     cap_add: [NET_ADMIN]
     environment:
       NETEM_PROFILE: ${NETEM_PROFILE:-clean}
+      JAVA_OPTS: ${QUICRAFT_JAVA_OPTS:-}
       HOST_UID: ${HOST_UID:-0}
       HOST_GID: ${HOST_GID:-0}
     volumes:
