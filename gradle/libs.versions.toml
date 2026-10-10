@@ -14,6 +14,8 @@ slf4j = "2.0.17"
 gson = "2.11.0"
 # Testkit only. One MCProtocolLib release per tested protocol; see docs/version-matrix.md.
 mcprotocollib = "26.1-1"
+# Velocity API (MIT). The proxy jar (GPL-3.0) is pinned by sha256 in velocity/build.gradle.kts.
+velocity = "4.2.0"
 
 [libraries]
 netty-bom = { module = "io.netty:netty-bom", version.ref = "netty" }
@@ -27,3 +29,4 @@ junit-launcher = { module = "org.junit.platform:junit-platform-launcher" }
 gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
 slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
 mcprotocollib = { module = "org.geysermc.mcprotocollib:protocol", version.ref = "mcprotocollib" }
+velocity-api = { module = "com.velocitypowered:velocity-api", version.ref = "velocity" }

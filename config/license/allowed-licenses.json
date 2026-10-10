@@ -5,6 +5,8 @@
     { "moduleLicense": "BSD 2-Clause \"Simplified\" License" },
     { "moduleLicense": "GNU LESSER GENERAL PUBLIC LICENSE, Version 2.1" },
     { "moduleLicense": "GNU GENERAL PUBLIC LICENSE, Version 3" },
-    { "moduleLicense": "Eclipse Public License - v 2.0", "moduleName": "org\\.junit.*" }
+    { "moduleLicense": "Eclipse Public License - v 2.0", "moduleName": "org\\.junit.*" },
+    { "moduleName": "com\\.velocitypowered:velocity-api", "moduleVersion": "4\\.2\\.0" },
+    { "moduleName": "com\\.velocitypowered:velocity-brigadier", "moduleVersion": "1\\.0\\.0-SNAPSHOT" }
   ]
 }
