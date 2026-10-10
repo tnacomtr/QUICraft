@@ -39,6 +39,26 @@ dependencies {
     testImplementation(files(velocityProxy))
 }
 
+// @Plugin(version = ...) needs a compile-time constant.
+val generateBuildInfo = tasks.register("generateBuildInfo") {
+    val out = layout.buildDirectory.dir("generated/sources/buildinfo")
+    val version = project.version.toString()
+    inputs.property("version", version)
+    outputs.dir(out)
+    doLast {
+        val file = out.get().file("rs/sudoe/quicraft/velocity/BuildInfo.java").asFile
+        file.parentFile.mkdirs()
+        file.writeText(
+            "// SPDX-License-Identifier: GPL-3.0-or-later\n" +
+                "package rs.sudoe.quicraft.velocity;\n\n" +
+                "final class BuildInfo {\n" +
+                "    static final String VERSION = \"$version\";\n\n" +
+                "    private BuildInfo() {\n    }\n}\n",
+        )
+    }
+}
+sourceSets.main { java.srcDir(generateBuildInfo) }
+
 tasks.named<ShadowJar>("shadowJar") {
     archiveClassifier = ""
     // Both bundled jars carry the project licence; the rest (Netty, quiche, BoringSSL notices)

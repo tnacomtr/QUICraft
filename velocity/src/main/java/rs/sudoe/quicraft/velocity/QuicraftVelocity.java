@@ -27,7 +27,7 @@ import rs.sudoe.quicraft.core.transport.TransportConfig;
  * QUICraft for Velocity (docs/platforms/velocity.md). Every step fails safe: whatever goes
  * wrong, the plugin logs once and leaves Velocity's TCP listener and ping exactly as they were.
  */
-@Plugin(id = "quicraft", name = "QUICraft", description = "QUIC transport for Minecraft, with TCP fallback")
+@Plugin(id = "quicraft", name = "QUICraft", version = BuildInfo.VERSION, description = "QUIC transport for Minecraft, with TCP fallback")
 public final class QuicraftVelocity {
     private final ProxyServer proxy;
     private final Logger logger;

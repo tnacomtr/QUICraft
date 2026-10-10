@@ -71,5 +71,12 @@ each release of the plugin.
 - `AdvertisingInitializer` / `StatusAdvertiser`: as planned above. The advertiser is withdrawn
   when the listener closes; the wrapper stays in the holder (another plugin may have wrapped it
   since) but passes everything through.
+- Velocity logs one WARN at startup, "The server channel initializer has been replaced by
+  rs.sudoe.quicraft.velocity.QuicraftVelocity.start": `ServerChannelInitializerHolder.set` is
+  deprecated as internal and logs its caller. Expected; the README tells server owners.
+- Smoke test against the real Velocity 4.2.0-30 jar (2026-10-10, loopback): TCP ping carries the
+  advertisement; a status ping over QUIC runs through Velocity's own pipeline on its native
+  worker loop and returns the same JSON; the identity persists across restarts; with the UDP
+  port taken, the plugin logs one WARN and Velocity runs TCP-only.
 - `Settings`: `enabled`, `port` (0 = game port), `alternative-port` (0 = game port + 1, used
   when `[query]` is on the same UDP port).
