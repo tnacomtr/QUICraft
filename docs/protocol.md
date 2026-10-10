@@ -100,7 +100,8 @@ Spectrum and similar) relay the ping, advertisement included, but drop UDP. The 
 1. The client starts the QUIC handshake.
 2. If the handshake hasn't completed after the **head start H**, the client also opens TCP. The
    first transport to complete wins. For QUIC, "complete" means the handshake is done *and* the
-   certificate fingerprint matched (§7). For TCP, it means the connection is established.
+   certificate fingerprint matched (§7), or the session was resumed from a ticket issued under
+   that fingerprint (§8). For TCP, it means the connection is established.
 3. A QUIC failure before that point (handshake error, ALPN mismatch, fingerprint mismatch, ICMP
    unreachable, any exception) starts TCP immediately, without waiting for H.
 4. The Minecraft handshake goes **only** over the winner. The loser is closed at once: QUIC with
@@ -160,6 +161,9 @@ idea: derive H from the RTT the server-list ping already measured.
   them. Deleting them rotates the fingerprint.
 - The client checks the server's leaf certificate only against the advertised `fp`. It does not
   check names, dates or chains. Mismatch → QUIC fails → TCP (§5).
+- A resumed session (§8) presents no certificate. It is trusted because its ticket came from an
+  earlier full handshake whose certificate matched the same `fp`, and only the server holding
+  that ticket's key can complete it.
 - No trust prompt before Phase 9. Minecraft's own encryption still protects the session, and an
   attacker who can strip the advertisement can force silent TCP anyway, so a warning would add
   scary UI without real protection.
@@ -391,6 +395,9 @@ The Minecraft login and the hash sent to Mojang's session server stay exactly as
 ### Pinning
 
 - A binding check that passes authenticates the server's QUIC certificate through Mojang's login.
+  On a resumed connection (§8) no certificate is presented: the check then authenticates the
+  session resumed from a ticket of an earlier full handshake, and pins what that handshake
+  presented. The exporter is still unique per connection.
   The client then **pins** that fingerprint for the server, so the fingerprint is
   authenticated without any TCP-first join: the first join can be over QUIC directly.
 - On a later join, a different advertised fingerprint is not trusted silently. Behaviour (TCP
@@ -428,3 +435,6 @@ the first contact. Off by default.
 - Whether Netty's QUIC TLS engine exposes BoringSSL's exporter (`SSL_export_keying_material`).
   If not, it's a small patch in the custom Netty build.
 - Exact key derivation, message format, the switch-off boundary, and pin storage and rotation.
+- Security review: resumption × channel binding (what a pin means when the binding check runs on
+  a resumed connection; the client must remember which fingerprint each ticket was issued under,
+  as it does today through one TLS context per fingerprint).
