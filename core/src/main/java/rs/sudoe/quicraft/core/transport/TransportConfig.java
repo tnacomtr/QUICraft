@@ -47,11 +47,20 @@ public final class TransportConfig {
         return relaxedLossThreshold;
     }
 
+    /** BBR; system property {@code quicraft.congestionControl} (RENO, CUBIC, BBR) for experiments. */
+    private static CongestionControl defaultCongestionControl() {
+        try {
+            return CongestionControl.valueOf(System.getProperty("quicraft.congestionControl", "BBR").trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return CongestionControl.BBR;
+        }
+    }
+
     public static final class Builder {
         private long maxIdleTimeoutMillis = TimeUnit.SECONDS.toMillis(60);
         private long initialMaxData = 16L << 20;
         private long initialMaxStreamData = 8L << 20;
-        private CongestionControl congestionControl = CongestionControl.BBR;
+        private CongestionControl congestionControl = defaultCongestionControl();
         private boolean earlyData = true;
         private boolean relaxedLossThreshold = true;
 

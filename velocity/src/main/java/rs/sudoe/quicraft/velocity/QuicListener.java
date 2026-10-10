@@ -65,12 +65,35 @@ final class QuicListener implements AutoCloseable {
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
         channel.pipeline().addLast(initializer.get());
         channel.pipeline().addLast(new DropProxyProtocol());
+        if (LOG_STATS) {
+            channel.pipeline().addLast(new StatsOnClose(stream, logger));
+        }
         loop.register(channel).addListener(f -> {
             if (!f.isSuccess()) {
                 logger.debug("QUICraft: registering a QUIC connection failed", f.cause());
                 stream.close();
             }
         });
+    }
+
+    /** Diagnostics: log each QUIC connection's stats when the player's channel closes. */
+    static final boolean LOG_STATS = Boolean.getBoolean("quicraft.logStats");
+
+    private static final class StatsOnClose extends ChannelInboundHandlerAdapter {
+        private final QuicByteStream stream;
+        private final Logger logger;
+
+        StatsOnClose(QuicByteStream stream, Logger logger) {
+            this.stream = stream;
+            this.logger = logger;
+        }
+
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) {
+            stream.connectionStats().whenComplete((stats, error) -> logger.info("QUICraft stats {}: {}",
+                    ctx.channel().remoteAddress(), error == null ? stats : error.toString()));
+            ctx.fireChannelInactive();
+        }
     }
 
     /**
