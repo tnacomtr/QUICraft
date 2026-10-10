@@ -4,8 +4,9 @@ QUIC transport for Minecraft: Java Edition. QUICraft is a client mod plus server
 plugins. When both sides have it, the game connection runs over QUIC (UDP). In every other case
 it runs over plain TCP, exactly like vanilla.
 
-> **Status: early development (Phase 1, core transport).** Nothing is released yet and nothing in
-> this repository can be installed in a game yet. See [Roadmap](#roadmap).
+> **Status: early development (Phase 2, Velocity plugin).** Nothing is released yet. The Velocity
+> plugin builds and runs, but there is no client mod yet, so no player can use QUIC. See
+> [Roadmap](#roadmap).
 
 ## What it does, and what it doesn't
 
@@ -43,6 +44,13 @@ Not available yet. When it is:
   through a TCP-only frontend (TCPShield, playit.gg, Cloudflare Spectrum and similar), QUIC can't
   reach you and clients use TCP automatically.
 
+  Velocity details (Velocity 4.2, Java 25): drop the jar into `plugins/`. On first start it
+  writes `plugins/quicraft/config.properties` and a self-signed certificate
+  (`quic-key.pem`, `quic-cert.pem`; keep them, since clients remember the fingerprint). If
+  `[query]` is enabled on the game port, QUIC moves to the game port + 1 (configurable). Velocity
+  logs one expected WARN, "The server channel initializer has been replaced by
+  rs.sudoe.quicraft.velocity...": that is how the plugin adds the advertisement to the ping.
+
 ## Supported versions (planned)
 
 - Minecraft **26.x** (every release) and **1.21–1.21.11**: Fabric first, then NeoForge.
@@ -56,8 +64,8 @@ Exact version ranges per module: [`docs/version-matrix.md`](docs/version-matrix.
 | Phase | Scope | Status |
 | --- | --- | --- |
 | 0 | Build, license checks, CI, Docker testkit, TCP baseline | done ([baseline](docs/benchmarks.md)) |
-| 1 | `core`: QUIC client/listener, discovery, racing, fallback, fingerprint check | in progress |
-| 2 | Velocity plugin (single stream) | |
+| 1 | `core`: QUIC client/listener, discovery, racing, fallback, fingerprint check | done (loopback gate) |
+| 2 | Velocity plugin (single stream) | in progress |
 | 3 | Fabric client + dedicated server for 26.x and 1.21.11 | |
 | 4 | Public alpha | |
 | 5 | Multi-stream on 26.x | |
