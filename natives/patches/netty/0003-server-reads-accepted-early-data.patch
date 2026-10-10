@@ -1,0 +1,118 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+(This header only. The diff below changes a Netty file, which stays under Netty's Apache-2.0
+licence and carries a "Modified by the QUICraft project" note.)
+
+QUICraft patch for Netty netty-4.2.19.Final (commit 64cc10f38ea5f5bd7eae48507817c66680d0afdc),
+on top of 0001 and 0002: a server that accepted 0-RTT reads early stream data before the
+handshake completes.
+
+Two things kept a server from seeing 0-RTT stream data before the client's Finished arrived,
+one round trip after the data itself (measured through a 200 ms RTT relay: first reply 2.03 RTT
+after the client's Initial, against 1.11 RTT once both are fixed):
+
+1. A server QuicChannel became active, and so started reading streams (autoRead), only once
+   quiche reported the connection established. handlePendingChannelActive now also activates it
+   while quiche reports accepted early data (quiche_conn_is_in_early_data).
+2. The client's 0-RTT packet usually arrives right behind its Initial, before the server's
+   handshake has installed the 0-RTT key: Netty runs the server's TLS work as an SSL task after
+   quiche_conn_recv. quiche buffers the packet and decrypts it in its next send(), which follows
+   that task. Nothing looked for readable streams after that send until the client's next packet
+   arrived. After each connectionSend(...) that can follow an SSL task (the same four places as
+   0002), a server in early data now queues a task on its event loop that runs
+   processReceived(...) (channelActive, readable streams) and sends again.
+
+SslHandshakeCompletionEvent still fires only when the handshake has completed, so an application
+can tell early data from confirmed data. QUICraft acts on early data only with a single-use token
+(docs/protocol.md §8). Servers that don't enable early data are unaffected: quiche never reports
+early data for them.
+
+Applied by natives/build-netty-quic.sh with `git apply`, which ignores this text.
+
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java
+@@ -14,7 +14,8 @@
+  * under the License.
+  *
+  * Modified by the QUICraft project:
+- * completes a client connect as soon as connectionSend(...) finishes the handshake.
++ * completes a client connect as soon as connectionSend(...) finishes the handshake;
++ * a server that accepted 0-RTT reads early stream data before the handshake completes.
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -1172,6 +1173,7 @@
+             // See https://docs.rs/quiche/0.6.0/quiche/struct.Connection.html#method.send
+             connectionSend(conn);
+             completeConnectIfEstablished(conn);
++            readEarlyDataIfAccepted(conn);
+ 
+             // We are done with the read loop, flush all pending writes now.
+             forceFlushParent();
+@@ -1235,6 +1237,32 @@
+         });
+     }
+ 
++    /**
++     * A server that accepted 0-RTT can read early stream data before the handshake completes, but its channel
++     * becomes active, and so starts reading streams, only once the handshake is established. And when the client's
++     * 0-RTT packet arrives right behind its Initial, it often comes in before the server's handshake task has
++     * installed the 0-RTT key: quiche buffers it and decrypts it in its next send() after that task, where nothing
++     * looks for readable streams until the client's next packet, one round trip later. After each such send, a
++     * server that is in early data processes what it received in a task on this event loop: channelActive (see
++     * handlePendingChannelActive) and the readable streams. Whether to act on early data before the handshake
++     * completes is up to the application; SslHandshakeCompletionEvent still fires only when it has completed.
++     */
++    private void readEarlyDataIfAccepted(QuicheQuicConnection conn) {
++        if (!server || conn.isFreed() || !Quiche.quiche_conn_is_in_early_data(conn.address())) {
++            return;
++        }
++        eventLoop().execute(() -> {
++            if (conn.isFreed() || !isOpen()) {
++                return;
++            }
++            ((QuicChannelUnsafe) unsafe()).processReceived(conn);
++            // Send what channelActive and the stream handlers produced.
++            if (!conn.isFreed() && connectionSend(conn) != SendResult.NONE) {
++                forceFlushParent();
++            }
++        });
++    }
++
+     private Runnable decorateTaskSend(QuicheQuicConnection conn, Runnable task) {
+         return () -> {
+             try {
+@@ -1247,6 +1275,7 @@
+                         forceFlushParent();
+                     }
+                     completeConnectIfEstablished(conn);
++                    readEarlyDataIfAccepted(conn);
+                     freeIfClosed();
+                 });
+             }
+@@ -1522,6 +1551,7 @@
+                                 forceFlushParent();
+                             }
+                             completeConnectIfEstablished(conn);
++                            readEarlyDataIfAccepted(conn);
+                             freeIfClosed();
+                         }
+                     });
+@@ -1873,6 +1903,7 @@
+                                 forceFlushParent();
+                             }
+                             completeConnectIfEstablished(conn);
++                            readEarlyDataIfAccepted(conn);
+ 
+                             freeIfClosed();
+                         }
+@@ -2004,7 +2035,9 @@
+                 return true;
+             }
+             if (server) {
+-                if (state == ChannelState.OPEN && Quiche.quiche_conn_is_established(conn.address())) {
++                // Also active while in accepted 0-RTT, so early stream data can be read (QUICraft).
++                if (state == ChannelState.OPEN && (Quiche.quiche_conn_is_established(conn.address())
++                        || Quiche.quiche_conn_is_in_early_data(conn.address()))) {
+                     // We didn't notify before about channelActive... Update state and fire the event.
+                     state = ChannelState.ACTIVE;
+ 
