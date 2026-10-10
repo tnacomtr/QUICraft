@@ -391,3 +391,69 @@ Open:
   each burst is shuffled: TCP also degrades (median 1756 ms vs 410 ms clean) and QUIC's sender
   declared 1200–1860 of ~7000 packets lost. Play RTT is at parity under both.
 
+
+## Phase 3: Fabric client and dedicated server (2026-10-10)
+
+### Fabric dedicated server, bench client (testkit)
+
+`TARGET=fabric`: bench client → Fabric 26.1.2 dedicated server with the `fabric-26x` mod, no
+proxy (`testkit/docker/fabric/`). Online mode against the mock session server, so Minecraft's
+AES/CFB8 runs (inside QUIC, for QUIC joins). Same seed, view distance 8 (329 chunks), creative,
+peaceful; world pre-generated at image build. TCP and QUIC back to back per profile, one batch,
+10 measured joins each (20 under loss) after 2 warm-ups. QUIC − TCP is the difference of medians
+with a 95% bootstrap CI. Run `20261010T094648Z-fabric-tcp-quic` (commit 09e96b8 plus the
+testkit's Fabric image, committed with this section).
+
+| Profile | Metric | TCP | QUIC | QUIC − TCP [95% CI] |
+| --- | --- | --- | --- | --- |
+| clean | join | 344 ms | 202 ms | −142 ms [−162, −102] |
+| clean | chunk load | 379 ms | 390 ms | +10 ms [−37, +54] |
+| clean | play RTT | 0.37 ms | 0.51 ms | +0.14 ms [+0.08, +0.21] |
+| loss 2% | join | 346 ms | 217 ms | −129 ms [−247, −83] |
+| loss 2% | chunk load | 400 ms | 445 ms | +45 ms [+4, +94] |
+| loss 2% | play RTT | 0.35 ms | 0.47 ms | +0.11 ms [+0.07, +0.15] |
+| delay +150 ms | join | 1330 ms | 1350 ms | +20 ms [−11, +37] |
+| delay +150 ms | chunk load | 1011 ms | 1079 ms | +68 ms [−84, +75] |
+| delay +150 ms | play RTT | 150.40 ms | 150.51 ms | +0.11 ms [−0.02, +0.19] |
+
+Every join succeeded (80 of 80), no disconnects, no UDP receive-buffer drops. Under loss QUIC's
+sender counted a median of 44 lost packets per join, TCP retransmitted a median of 5 segments.
+
+- **Join:** QUIC is faster on the clean and loss profiles because the configuration phase is:
+  about 150 ms over QUIC against 304 ms over TCP (phase timestamps in the run files). Through
+  Velocity (Phase 2) the joins were level, since the proxy-to-backend hop is TCP for both. The
+  cause inside the configuration phase wasn't investigated further.
+- **TCP is unaffected by the mod**, back to back on the same image, clean, 10 joins each (runs
+  `20261010T100910Z-fabric-tcp` with, `20261010T101214Z-fabric-tcp` without): with the mod join 323 ms, chunk load 363 ms, RTT 0.37 ms, configuration
+  phase 304 ms; without it 324 ms, 365 ms, 0.37 ms, 304 ms.
+- **Play RTT:** the same +0.1 ms per round trip as through Velocity (quiche's per-packet work,
+  Phase 2 notes).
+- **Chunk load under loss:** +45 ms (CI just above 0). Not looked into yet.
+
+### Real client (gametests, loopback)
+
+`JoinTimingGameTest` (`-Pquicraft.joinTimings=10`): the real Fabric client joins an in-process
+dedicated server 10 times over TCP (`tcp-only`) and 10 times over QUIC (`auto`), alternating, after
+one warm-up round. Timestamps are taken on the client's Netty thread as the play login packet and
+each chunk arrive (117 chunks). The gametest harness runs the server's ticks in lockstep with
+the client's, so server-side steps land on 50 ms tick boundaries and the times come in 50 ms
+steps.
+
+| Version | Connect → play login (median) | Connect → last chunk (median) |
+| --- | --- | --- |
+| 1.21.11 | TCP 198.2 ms, QUIC 198.0 ms | TCP 744.2 ms, QUIC 744.5 ms |
+| 26.1.2 | TCP 154.1 ms, QUIC 203.9 ms | TCP 700.4 ms, QUIC 750.4 ms |
+
+On 26.1.2 QUIC lands one server tick later in 9 of 10 runs. QUIC's handshake costs about 3 ms
+more than a TCP connect on loopback (TLS; transport benchmark p50 2.7 ms), which is enough to miss
+a tick boundary with this lockstep scheduling. On 1.21.11 the same few milliseconds don't cross
+one. Client-side 0-RTT (§8, not implemented yet) would remove the handshake on rejoin.
+
+### No desync, fault injection, fallback
+
+The client gametests (docs/platforms/fabric.md) pass on 26.1, 26.1.1, 26.1.2, 26.2, 26.3 and
+1.21.11: the scripted play session (block bursts, entities, client and server movement, inventory,
+weather, a far teleport into freshly generated chunks) compares client and server state at every
+step over QUIC and, with every hook throwing, over TCP; dead UDP port and fingerprint mismatch fall
+back to TCP (join to rendered world 1.75–1.85 s and 1.25–1.35 s, against about 0.7 s normally;
+both include the world load).

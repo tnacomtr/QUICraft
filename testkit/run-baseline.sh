@@ -7,9 +7,11 @@
 #   testkit/run-baseline.sh                       # full baseline (see docs/benchmarks.md)
 #   BATCHES=1 RUNS=3 PROFILES=clean testkit/run-baseline.sh   # smoke test
 #   TRANSPORTS="tcp quic" BATCHES=1 RUNS=5 testkit/run-baseline.sh   # TCP and QUIC interleaved
+#   TARGET=fabric TRANSPORTS="tcp quic" ... testkit/run-baseline.sh  # Fabric server, no proxy
 #
-# The QUICraft Velocity plugin is installed unless QUICRAFT_PLUGIN=false, so a TCP run also
-# checks that the plugin leaves TCP joins alone.
+# TARGET=velocity (default): bench -> Velocity -> Paper. TARGET=fabric: bench -> Fabric dedicated
+# server. The QUICraft plugin or mod is installed unless QUICRAFT_PLUGIN=false, so a TCP run also
+# checks that it leaves TCP joins alone.
 #
 # Results land in testkit/results/<UTC timestamp>/batch<k>/<profile>.json plus summary.md.
 set -euo pipefail
@@ -34,13 +36,19 @@ KEEP_UP="${KEEP_UP:-false}"
 # results are labelled <profile>-<transport>.
 TRANSPORTS="${TRANSPORTS:-${TRANSPORT:-tcp}}"
 QUICRAFT_PLUGIN="${QUICRAFT_PLUGIN:-true}"
+TARGET="${TARGET:-velocity}"
+case "$TARGET" in
+    velocity | fabric) ;;
+    *) echo "TARGET must be velocity or fabric" >&2; exit 2 ;;
+esac
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-results="$here/results/$stamp-${TRANSPORTS// /-}"
+results="$here/results/$stamp-${TARGET}-${TRANSPORTS// /-}"
 mkdir -p "$results"
 
-export VELOCITY_ONLINE_MODE="$ONLINE" QUICRAFT_PLUGIN HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+export VELOCITY_ONLINE_MODE="$ONLINE" FABRIC_ONLINE_MODE="$ONLINE" QUICRAFT_PLUGIN HOST_UID="$(id -u)" HOST_GID="$(id -g)"
 compose=(docker compose -f "$here/docker/compose.yaml")
+[[ "$TARGET" == fabric ]] && compose+=(--profile fabric)
 
 wait_for_log() { # service, pattern, timeout seconds
     local deadline=$((SECONDS + $3))
@@ -63,15 +71,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$root/gradlew" -p "$root" -q :testkit:installDist :velocity:testkitPlugin
+"$root/gradlew" -p "$root" -q :testkit:installDist :velocity:testkitPlugin :fabric-26x:testkitMod
 "${compose[@]}" build --quiet
-"${compose[@]}" up -d mocksession paper velocity
-wait_for_log paper 'Done (' 600
-wait_for_log velocity 'Done (' 120
+if [[ "$TARGET" == fabric ]]; then
+    "${compose[@]}" up -d mocksession fabric
+    wait_for_log fabric 'Done (' 600
+else
+    "${compose[@]}" up -d mocksession paper velocity
+    wait_for_log paper 'Done (' 600
+    wait_for_log velocity 'Done (' 120
+fi
 
 {
     echo "started: $stamp"
-    echo "batches=$BATCHES runs=$RUNS runs_loss=$RUNS_loss runs_reorder=$RUNS_reorder warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS transports=[$TRANSPORTS] quicraft_plugin=$QUICRAFT_PLUGIN"
+    echo "target=$TARGET batches=$BATCHES runs=$RUNS runs_loss=$RUNS_loss runs_reorder=$RUNS_reorder warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS transports=[$TRANSPORTS] quicraft_plugin=$QUICRAFT_PLUGIN"
     echo "git: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo none)$(git -C "$root" diff --quiet 2>/dev/null || echo ' (dirty)')"
     echo "kernel: $(uname -r)"
     echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
@@ -92,7 +105,7 @@ for batch in $(seq 1 "$BATCHES"); do
             [[ "$TRANSPORTS" == *" "* ]] && label="$profile-$transport"
             echo "== batch $batch/$BATCHES, profile $profile, $transport ($runs runs)"
             "${compose[@]}" run --rm --no-deps -e NETEM_PROFILE="$profile" bench \
-                bench --host velocity --port 25565 --transport "$transport" --profile "$label" \
+                bench --host "$TARGET" --port 25565 --transport "$transport" --profile "$label" \
                 --runs "$runs" --warmup "$WARMUP" --play-ms "$PLAY_MS" "${online_flag[@]}" \
                 --out "/results/$(basename "$results")/batch$batch/$label.json" || echo "!! bench reported failed runs"
         done

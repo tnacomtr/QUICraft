@@ -1,0 +1,15 @@
+{
+  "quicraft.settings.button": "QUICraft",
+  "quicraft.settings.title": "QUICraft",
+  "quicraft.settings.transport": "Connect over",
+  "quicraft.settings.transport.auto": "Auto",
+  "quicraft.settings.transport.auto.tooltip": "QUIC when the server offers it, TCP otherwise. If QUIC doesn't work, you join over TCP without noticing.",
+  "quicraft.settings.transport.tcp-only": "TCP only",
+  "quicraft.settings.transport.tcp-only.tooltip": "Always TCP, exactly like the game without QUICraft.",
+  "quicraft.settings.transport.quic-only": "QUIC only (debug)",
+  "quicraft.settings.transport.quic-only.tooltip": "QUIC without falling back to TCP. Joining fails with QUIC's error if QUIC doesn't work. For testing servers.",
+  "quicraft.settings.forget_failures": "Forget QUIC failures",
+  "quicraft.settings.forget_failures.tooltip": "Servers where QUIC failed are skipped for a while (up to an hour). Use this after fixing a firewall to try QUIC again right away.",
+  "quicraft.settings.native.available": "QUIC is available on this computer.",
+  "quicraft.settings.native.unavailable": "QUIC is not available on this computer (no QUIC library for this system). You always connect over TCP."
+}

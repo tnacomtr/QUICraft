@@ -3,14 +3,15 @@
 Docker harness for measuring and testing QUICraft against real server software.
 
 ```
-bench client ──(front, netem)──▶ Velocity ──(back)──▶ Paper
-      └──────────────────────▶ mock session server ◀──┘
+bench client ──(front, netem)──▶ Velocity ──(back)──▶ Paper           TARGET=velocity (default)
+bench client ──(front, netem)──▶ Fabric dedicated server + mod         TARGET=fabric
+      └──────────────────────▶ mock session server
 ```
 
 | Piece | What it is |
 | --- | --- |
 | `src/` | `quicraft-testkit`: headless bench client (MCProtocolLib), mock Mojang session server, results summarizer |
-| `docker/` | Images and `compose.yaml` for Velocity, Paper and the bench client |
+| `docker/` | Images and `compose.yaml` for Velocity, Paper, the Fabric server and the bench client |
 | `netem/profiles.sh` | `clean`, `loss`, `delay`, `reorder` link profiles |
 | `run-baseline.sh` | Builds everything, runs batches × profiles × joins, checks reproducibility |
 
@@ -36,7 +37,14 @@ KEEP_UP=true testkit/run-baseline.sh                          # leave the server
 ```
 
 Environment knobs: `BATCHES`, `RUNS`, `WARMUP`, `PROFILES`, `ONLINE` (`true` uses online-mode login
-and with it Minecraft's encryption), `PLAY_MS`, `TOLERANCE_PCT`, `TOLERANCE_MS`.
+and with it Minecraft's encryption), `PLAY_MS`, `TOLERANCE_PCT`, `TOLERANCE_MS`, `TRANSPORTS`
+(`"tcp quic"` runs both back to back per profile), `TARGET` (`velocity` or `fabric`),
+`QUICRAFT_PLUGIN` (`false` leaves the plugin or mod out).
+
+`TARGET=fabric` joins a Fabric 26.1.2 dedicated server with the `fabric-26x` mod directly
+(`docker/fabric/`). Its world is pre-generated at image build with vanilla `/forceload` (same
+seed as Paper, 48×48 chunks around spawn); Paper's world can't be reused because Paper stores the
+world-gen settings differently.
 
 Results go to `testkit/results/<UTC timestamp>/`: one JSON file per batch and profile, plus
 `environment.txt` and `summary.md`. Method and metric definitions are in

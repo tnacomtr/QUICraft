@@ -26,7 +26,7 @@ public class FaultInjectionGameTest implements FabricClientGameTest {
             try (var connection = server.connect()) {
                 GameTests.waitForChunks(connection);
                 check(!GameTests.connectedOverQuic(context), "joined over TCP");
-                PlaySession.run(context, server);
+                PlaySession.run(context, server, connection);
             }
         } finally {
             Hooks.setFaultInjection(false);

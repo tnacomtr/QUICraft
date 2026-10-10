@@ -80,8 +80,8 @@ public final class ClientConnect {
         });
         attempt.whenComplete((outcome, error) -> {
             if (error != null) {
-                promise.tryFailure(error instanceof CompletionException && error.getCause() != null
-                        ? error.getCause() : error);
+                promise.tryFailure(withMessage(error instanceof CompletionException && error.getCause() != null
+                        ? error.getCause() : error));
                 return;
             }
             try {
@@ -99,7 +99,7 @@ public final class ClientConnect {
                 }
             } catch (Throwable t) {
                 close(outcome);
-                promise.tryFailure(t);
+                promise.tryFailure(withMessage(t));
             }
         });
         return promise;
@@ -113,7 +113,7 @@ public final class ClientConnect {
         loop.register(channel).addListener(f -> {
             if (!f.isSuccess()) {
                 stream.close();
-                promise.tryFailure(f.cause());
+                promise.tryFailure(withMessage(f.cause()));
             } else if (!promise.trySuccess()) {
                 channel.close(); // cancelled meanwhile
             }
@@ -143,7 +143,7 @@ public final class ClientConnect {
                 }
             } catch (Throwable t) {
                 channel.close();
-                promise.tryFailure(t);
+                promise.tryFailure(withMessage(t));
             }
         });
     }
@@ -159,6 +159,17 @@ public final class ClientConnect {
         Connection.configureSerialization(pipeline, PacketFlow.CLIENTBOUND, false,
                 ((ConnectionAccessor) connection).quicraft$bandwidthDebugMonitor());
         connection.configurePacketHandler(pipeline);
+    }
+
+    /**
+     * The connect screen shows {@code cause.getMessage()} and calls {@code replaceAll} on it, so a
+     * failure without a message would throw there and leave the screen hanging.
+     */
+    static Throwable withMessage(Throwable cause) {
+        if (cause.getMessage() != null) {
+            return cause;
+        }
+        return new java.io.IOException(cause.getClass().getSimpleName(), cause);
     }
 
     private static void close(ClientConnector.Outcome<Channel> outcome) {

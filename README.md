@@ -4,9 +4,9 @@ QUIC transport for Minecraft: Java Edition. QUICraft is a client mod plus server
 plugins. When both sides have it, the game connection runs over QUIC (UDP). In every other case
 it runs over plain TCP, exactly like vanilla.
 
-> **Status: early development (Phase 2, Velocity plugin).** Nothing is released yet. The Velocity
-> plugin builds and runs, but there is no client mod yet, so no player can use QUIC. See
-> [Roadmap](#roadmap).
+> **Status: early development (Phase 3, Fabric).** Nothing is released yet. The Velocity plugin
+> and the Fabric client and server mod for 26.x and 1.21.11 build, run and pass their tests; a
+> public alpha comes after Phase 4 (rate limits, Retry tokens). See [Roadmap](#roadmap).
 
 ## What it does, and what it doesn't
 
@@ -21,24 +21,27 @@ it runs over plain TCP, exactly like vanilla.
   [`docs/benchmarks.md`](docs/benchmarks.md) as they are measured. No numbers are claimed before
   that.
 
-## How fallback works (planned)
+## How fallback works
 
 1. The server adds a `quicraft:quic` object to its status response with the QUIC port, protocol
-   version and certificate fingerprint. Vanilla clients ignore it.
-2. The client starts a QUIC handshake. If it hasn't finished after a short head start, the client
+   version and certificate fingerprint. Vanilla clients ignore it. The client reads it from the
+   server list ping, or asks for the status itself when you connect directly.
+2. The client starts a QUIC handshake. If it hasn't finished after a 250 ms head start, the client
    opens TCP in parallel and keeps whichever connects first. A failed handshake starts TCP at once.
-3. Failures are remembered per server with exponential backoff, so a server whose UDP port is
-   unreachable costs at most one short head start now and then.
+3. Failures are remembered per server with exponential backoff (1 minute, doubling, up to 1 hour),
+   so a server whose UDP port is unreachable costs at most one short head start now and then. The
+   client also tells the server, which logs a hint about its UDP port.
 
-The exact protocol will be specified in [`docs/protocol.md`](docs/protocol.md) before it is
-implemented.
+The protocol is specified in [`docs/protocol.md`](docs/protocol.md).
 
 ## Installing
 
-Not available yet. When it is:
+Not released yet. When it is:
 
-- **Players:** install the client mod for your loader and game version. Nothing to configure;
-  a settings screen offers `auto` (default), `tcp-only` and `quic-only` (debugging).
+- **Players:** install the client mod for your loader and game version. Nothing to configure.
+  The multiplayer screen has a **QUICraft** button (top right) with the transport setting:
+  `Auto` (default), `TCP only` and `QUIC only` (debugging), and a button to forget remembered
+  QUIC failures. F3 shows `QUICraft: QUIC` or `TCP` under the server line.
 - **Server owners:** install the Velocity plugin (or the server mod) and **allow UDP on the same
   port number as your TCP game port** (default 25565/udp) in your firewall. If players connect
   through a TCP-only frontend (TCPShield, playit.gg, Cloudflare Spectrum and similar), QUIC can't
@@ -51,11 +54,18 @@ Not available yet. When it is:
   logs one expected WARN, "The server channel initializer has been replaced by
   rs.sudoe.quicraft.velocity...": that is how the plugin adds the advertisement to the ping.
 
-## Supported versions (planned)
+  Fabric dedicated server details: the same mod jar as the client (`quicraft-fabric-26x` for
+  26.1–26.3, `quicraft-fabric-1.21.11` for 1.21.11) goes into `mods/`; Fabric API is not needed.
+  On first start it writes `config/quicraft/server.properties` and the certificate
+  (`config/quicraft/quic-key.pem`, `quic-cert.pem`). With `enable-query` on the game port, QUIC
+  moves to the game port + 1 (configurable).
 
-- Minecraft **26.x** (every release) and **1.21–1.21.11**: Fabric first, then NeoForge.
-- **Velocity** proxy: server side for every client version Velocity accepts.
-- Later: Paper (servers without a proxy), 1.20.1 (Forge/Fabric), 1.8.9 (Forge).
+## Supported versions
+
+- **Fabric**, client and dedicated server: Minecraft **26.1–26.3** and **1.21.11** (tested on each).
+- **Velocity** 4.2 proxy: server side for every client version Velocity accepts.
+- Planned: 1.21–1.21.10 (Fabric), NeoForge, Paper (servers without a proxy), 1.20.1
+  (Forge/Fabric), 1.8.9 (Forge).
 
 Exact version ranges per module: [`docs/version-matrix.md`](docs/version-matrix.md).
 
@@ -65,8 +75,8 @@ Exact version ranges per module: [`docs/version-matrix.md`](docs/version-matrix.
 | --- | --- | --- |
 | 0 | Build, license checks, CI, Docker testkit, TCP baseline | done ([baseline](docs/benchmarks.md)) |
 | 1 | `core`: QUIC client/listener, discovery, racing, fallback, fingerprint check | done (loopback gate) |
-| 2 | Velocity plugin (single stream) | in progress |
-| 3 | Fabric client + dedicated server for 26.x and 1.21.11 | |
+| 2 | Velocity plugin (single stream) | done ([gate](docs/benchmarks.md)) |
+| 3 | Fabric client + dedicated server for 26.x and 1.21.11 | in progress |
 | 4 | Public alpha | |
 | 5 | Multi-stream on 26.x | |
 | 6–9 | More versions and loaders, Velocity multi-stream, Paper, hardening | |
@@ -86,6 +96,9 @@ patches: quiche's relaxed loss threshold exposed, and a client connect that comp
 trip sooner. The build script runs Netty's own Maven build in Docker. Its output stays in
 `natives/build/` and is never committed. Linux x86_64 uses the patched native. The other platforms
 use upstream Netty's native for now, where the relaxed loss threshold is unavailable.
+
+Fabric client gametests (a real client and server, headless) need Xvfb:
+`xvfb-run -a ./gradlew :fabric-26x:runClientGameTest :fabric-1.21.11:runClientGameTest`.
 
 The Docker testkit (needs Docker and the `sch_netem` and `ifb` kernel modules on the host) is
 described in [`testkit/README.md`](testkit/README.md).

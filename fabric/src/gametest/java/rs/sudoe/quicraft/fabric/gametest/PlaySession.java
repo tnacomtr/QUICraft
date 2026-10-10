@@ -15,12 +15,13 @@ import net.minecraft.world.phys.Vec3;
 /**
  * A scripted play session that fails on any desync between server and client: world edits in a
  * burst, entities appearing and disappearing, player movement in both directions (client
- * input and server teleports). Each step compares the client's view with the server's.
+ * input and server teleports), inventory changes, weather, and a far teleport that streams in
+ * freshly generated chunks. Each step compares the client's view with the server's.
  */
 final class PlaySession {
     private PlaySession() {}
 
-    static void run(ClientGameTestContext context, TestDedicatedServerContext server) {
+    static void run(ClientGameTestContext context, TestDedicatedServerContext server, Object connection) {
         BlockPos base = context.computeOnClient(c -> c.player.blockPosition());
 
         // 1. A burst of block changes, in a known order, must arrive complete and in order.
@@ -71,6 +72,46 @@ final class PlaySession {
         Vec3 there = context.computeOnClient(c -> c.player.position());
         check(Math.abs(there.x - (x + 20.5)) < 1 && Math.abs(there.z - (z + 20.5)) < 1,
                 "client not at the teleport target: " + there);
+
+        // 5. Inventory changes made by the server.
+        server.runCommand("give @a minecraft:diamond 37");
+        server.runCommand("give @a minecraft:oak_log 64");
+        server.runCommand("give @a minecraft:torch 5");
+        server.runCommand("clear @a minecraft:oak_log 10");
+        context.waitTicks(20);
+        compareInventories(context, server);
+
+        // 6. Weather.
+        server.runCommand("weather rain");
+        context.waitTicks(40);
+        check(context.computeOnClient(c -> c.level.isRaining()), "client sees the rain");
+        server.runCommand("weather clear");
+        context.waitTicks(40);
+        check(!context.computeOnClient(c -> c.level.isRaining()), "client sees the rain stop");
+
+        // 7. Far away: chunks generated and streamed while connected.
+        int fx = x + 2000;
+        int fz = z - 1500;
+        server.runCommand("tp @a " + fx + " " + (y + 1) + " " + fz);
+        context.waitTicks(20);
+        GameTests.waitForChunks(connection);
+        comparePositions(context, server, "after a far teleport");
+        server.runCommand("fill " + (fx - 3) + " " + y + " " + (fz + 2) + " " + (fx + 3) + " " + (y + 2) + " "
+                + (fz + 4) + " minecraft:bricks");
+        context.waitTicks(20);
+        compareBlocks(context, server, new BlockPos(fx - 8, y - 3, fz - 8), new BlockPos(fx + 8, y + 3, fz + 8));
+    }
+
+    private static void compareInventories(ClientGameTestContext context, TestDedicatedServerContext server) {
+        int size = context.computeOnClient(c -> c.player.getInventory().getContainerSize());
+        for (int slot = 0; slot < size; slot++) {
+            int s = slot;
+            net.minecraft.world.item.ItemStack onClient = context.computeOnClient(c -> c.player.getInventory().getItem(s).copy());
+            net.minecraft.world.item.ItemStack onServer = server.computeOnServer(
+                    m -> m.getPlayerList().getPlayers().get(0).getInventory().getItem(s).copy());
+            check(net.minecraft.world.item.ItemStack.matches(onClient, onServer),
+                    "slot " + slot + ": client " + onClient + ", server " + onServer);
+        }
     }
 
     private static void compareBlocks(ClientGameTestContext context, TestDedicatedServerContext server, BlockPos from,
