@@ -111,8 +111,8 @@ jobs:
           distribution: temurin
           java-version: 25
       - uses: gradle/actions/setup-gradle@v6
-      # Every platform's repo has the same classes jar coordinates; the linux-x86_64 build's
-      # classes are used (downloaded last, so they win).
+      # Every platform's repo has the same classes jar coordinates. The loop below skips
+      # linux-x86_64, whose repo is copied explicitly last, so its classes jar wins.
       - uses: actions/download-artifact@v7
         with:
           pattern: netty-quic-*

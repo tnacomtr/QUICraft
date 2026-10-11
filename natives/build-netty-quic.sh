@@ -188,7 +188,7 @@ pom netty-codec-native-quic "Netty/Codec/Native/Quic" "" \
 # --- Checks on the native.
 check="$work/check-$classifier"
 rm -rf "$check" && mkdir -p "$check"
-(cd "$check" && unzip -q "$native_jar")
+"$python" -m zipfile -e "$native_jar" "$check"
 manifest="$check/META-INF/MANIFEST.MF"
 grep -q "Quiche-Revision: $QUICHE_COMMIT" "$manifest"
 grep -q "BoringSSL-Revision: $BORINGSSL_COMMIT" "$manifest"
