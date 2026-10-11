@@ -232,8 +232,11 @@ class EarlyDataTest {
             try (GameServer game = new GameServer(identity, address)) {
                 Join second = Join.run(relay, identity, "inputs", FLIGHT);
                 assertTrue(second.early.sent());
-                System.out.printf("rejected 0-RTT: first reply %.2f RTT after the first datagram%n",
-                        second.replyRtt(relay));
+                double replyRtt = second.replyRtt(relay);
+                System.out.printf("rejected 0-RTT: first reply %.2f RTT after the first datagram%n", replyRtt);
+                // Abandoned after the grace period and retried: about 3.25 RTT, not the ~4.2 of
+                // waiting for quiche's loss detection (docs/protocol.md §8).
+                assertTrue(replyRtt < 3.5, "a rejected 0-RTT must not wait for loss detection, was " + replyRtt);
                 second.stream.write(ByteBuffer.wrap(AFTER));
                 second.stream.flush();
                 assertArrayEquals(concat(FLIGHT, AFTER), second.collector.await(FLIGHT.length + AFTER.length, 5,
@@ -241,6 +244,48 @@ class EarlyDataTest {
                 assertArrayEquals(concat(FLIGHT, AFTER), game.received(0, FLIGHT.length + AFTER.length));
                 second.stream.close();
             }
+        }
+    }
+
+    /**
+     * The server accepts the 0-RTT flight, but its preamble never reaches the client. The client
+     * abandons that connection with 0x4 after the grace period and sends the flight again on a new
+     * connection: the game sees the join once, from the new connection only. The preamble is lost
+     * deterministically by the relay: it drops the server's 1-RTT datagrams (where the preamble
+     * is) until the client's retry starts, so the handshake itself still completes.
+     */
+    @Test
+    void aLostPreambleAbandonsTheZeroRttConnectionAndReconnects() throws Exception {
+        ServerIdentity identity = ServerIdentity.generate();
+        try (GameServer game = new GameServer(identity); DelayRelay relay = new DelayRelay(game.address(), 100)) {
+            Join.run(relay, identity, "inputs", FLIGHT).closeAfterTicket(relay);
+            relay.dropOneRttFromServerUntilNewConnection(true);
+            EarlyFlight early = new EarlyFlight("inputs");
+            QuicByteStream stream = QuicClient.connect(relay.address(), identity.fingerprint(),
+                    TransportConfig.DEFAULT, early).get(5, TimeUnit.SECONDS);
+            assertTrue(early.sent(), "the first connection must have sent its flight as 0-RTT data");
+
+            // The server acted on the 0-RTT flight on the first connection; the client abandoned it.
+            GameServer.Accepted abandoned = game.awaitAccepted(1, 2, TimeUnit.SECONDS);
+            assertArrayEquals(FLIGHT, game.received(1, FLIGHT.length));
+            assertTrue(abandoned.closed.await(5, TimeUnit.SECONDS), "the server must drop the abandoned login");
+            assertEquals(1, game.server.earlyAbandoned(), "the server counts the 0x4 close");
+
+            // The retry is the stream the game gets: the flight arrives once, and the game's echo
+            // comes back from the new connection only.
+            Loopback.Collector collector = new Loopback.Collector();
+            stream.setListener(collector);
+            stream.setAutoRead(true);
+            stream.write(ByteBuffer.wrap(concat(FLIGHT, AFTER)));
+            stream.flush();
+            assertArrayEquals(concat(FLIGHT, AFTER), collector.await(FLIGHT.length + AFTER.length, 5,
+                    TimeUnit.SECONDS));
+            Thread.sleep(200);
+            assertArrayEquals(concat(FLIGHT, AFTER), collector.await(0, 1, TimeUnit.MILLISECONDS),
+                    "nothing from the abandoned connection may reach the game");
+            assertEquals(3, game.accepted.size(), "the join, the abandoned connection and the retry");
+            assertArrayEquals(concat(FLIGHT, AFTER), game.received(2, FLIGHT.length + AFTER.length));
+            stream.close();
         }
     }
 

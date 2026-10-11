@@ -36,6 +36,9 @@ final class DelayRelay implements AutoCloseable {
     private volatile boolean copyFirst;
     private volatile boolean dropFromServer;
     private volatile boolean dropFromClient;
+    private volatile boolean dropOneRtt;
+    /** The source connection ID of the first Initial seen while dropping; a new one means a new connection. */
+    private volatile String firstSourceId;
 
     DelayRelay(InetSocketAddress server, long oneWayMillis) throws IOException {
         this.server = server;
@@ -85,6 +88,17 @@ final class DelayRelay implements AutoCloseable {
         dropFromClient = on;
     }
 
+    /**
+     * Drops the server's 1-RTT datagrams (short header: the early preamble, stream data, ACKs)
+     * while on, and turns itself off when the client's Initial packets come from a new connection
+     * (a different source connection ID). The handshake packets pass, so the first connection
+     * completes its handshake without ever getting the server's preamble.
+     */
+    void dropOneRttFromServerUntilNewConnection(boolean on) {
+        firstSourceId = null;
+        dropOneRtt = on;
+    }
+
     /** Sends the captured client datagrams to the server again, from another socket. */
     void replay() throws IOException {
         List<byte[]> copy;
@@ -105,13 +119,21 @@ final class DelayRelay implements AutoCloseable {
                 byte[] data = Arrays.copyOf(p.getData(), p.getLength());
                 boolean fromServer = p.getSocketAddress().equals(server);
                 if (fromServer) {
-                    if (!dropFromServer && client != null) {
+                    if (!dropFromServer && !(dropOneRtt && isShortHeader(data)) && client != null) {
                         send(data, client);
                     }
                     continue;
                 }
                 client = p.getSocketAddress();
                 firstClientDatagram.compareAndSet(0, System.nanoTime());
+                if (dropOneRtt && isInitial(data)) {
+                    String source = sourceConnectionId(data);
+                    if (firstSourceId == null) {
+                        firstSourceId = source;
+                    } else if (!firstSourceId.equals(source)) {
+                        dropOneRtt = false;
+                    }
+                }
                 if (capture) {
                     synchronized (captured) {
                         captured.add(data);
@@ -126,6 +148,30 @@ final class DelayRelay implements AutoCloseable {
         } catch (IOException ignored) {
             // closed
         }
+    }
+
+    /** RFC 9000 §17.2: a long header has the top bit set; a short header (1-RTT) does not. */
+    private static boolean isShortHeader(byte[] data) {
+        return data.length > 0 && (data[0] & 0x80) == 0;
+    }
+
+    /** A long header of type Initial (RFC 9000 §17.2.2). */
+    private static boolean isInitial(byte[] data) {
+        return data.length > 0 && (data[0] & 0xF0) == 0xC0;
+    }
+
+    /** The source connection ID of a long header (RFC 9000 §17.2): constant within a connection. */
+    private static String sourceConnectionId(byte[] data) {
+        int p = 5; // first byte and the 4-byte version
+        if (p >= data.length) {
+            return "";
+        }
+        p += 1 + (data[p] & 0xFF); // destination connection ID
+        if (p >= data.length) {
+            return "";
+        }
+        int length = data[p] & 0xFF;
+        return Arrays.toString(Arrays.copyOfRange(data, p + 1, Math.min(data.length, p + 1 + length)));
     }
 
     private void send(byte[] data, SocketAddress to) {

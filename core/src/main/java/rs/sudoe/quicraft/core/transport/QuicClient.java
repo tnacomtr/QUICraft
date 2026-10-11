@@ -25,8 +25,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.net.ssl.SSLEngine;
@@ -40,6 +40,9 @@ import rs.sudoe.quicraft.core.tls.FingerprintTrustManager.FingerprintMismatchExc
 public final class QuicClient {
     private static final Logger LOG = Logger.getLogger("QUICraft");
     static final int CONNECT_TIMEOUT_MILLIS = 10_000;
+    /** Bounds of the grace period for a late server preamble after 0-RTT (docs/protocol.md §8). */
+    private static final long MIN_GRACE_NANOS = TimeUnit.MILLISECONDS.toNanos(5);
+    private static final long MAX_GRACE_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     private static volatile EventLoopGroup group;
 
     private QuicClient() {}
@@ -101,15 +104,14 @@ public final class QuicClient {
             Fingerprint fingerprint, TransportConfig config, EarlyFlight early) {
         CompletableFuture<QuicByteStream> result = new CompletableFuture<>();
         try {
-            Tls tls = tls(fingerprint, config);
+            Dial dial = new Dial(fingerprint, config, tls(fingerprint, config));
             String peerHost = remote.getAddress().getHostAddress();
             int peerPort = remote.getPort();
-            AtomicReference<SSLEngine> engine = new AtomicReference<>();
             ChannelHandler codec = Codecs.apply(new QuicClientCodecBuilder(), config, false)
                     // Host and port key the context's session cache.
                     .sslEngineProvider(q -> {
-                        QuicSslEngine e = tls.context.newEngine(q.alloc(), peerHost, peerPort);
-                        engine.set(e);
+                        QuicSslEngine e = dial.tls.get().context.newEngine(q.alloc(), peerHost, peerPort);
+                        dial.engine.set(e);
                         return e;
                     })
                     .build();
@@ -120,8 +122,8 @@ public final class QuicClient {
                     return;
                 }
                 Attempt attempt = new Attempt(opened.channel(), remote, EarlyCache.server(remote, fingerprint),
-                        config.earlyData && config.sessionResumption ? early : null, result);
-                attempt.start(() -> tls.trust.mismatch(engine.get()));
+                        config.earlyData && config.sessionResumption ? early : null, result, dial);
+                attempt.start();
             });
         } catch (Throwable t) {
             result.completeExceptionally(t);
@@ -143,6 +145,27 @@ public final class QuicClient {
                     .applicationProtocols(Protocol.ALPN)
                     .earlyData(earlyData)
                     .build();
+        }
+    }
+
+    /**
+     * The TLS context the next handshake of one attempt uses, and the engine of the last one. A
+     * retry after an abandoned 0-RTT connection swaps in a fresh context (see {@link #freshTls}).
+     */
+    private static final class Dial {
+        final Fingerprint fingerprint;
+        final TransportConfig config;
+        final AtomicReference<Tls> tls;
+        final AtomicReference<SSLEngine> engine = new AtomicReference<>();
+
+        Dial(Fingerprint fingerprint, TransportConfig config, Tls tls) {
+            this.fingerprint = fingerprint;
+            this.config = config;
+            this.tls = new AtomicReference<>(tls);
+        }
+
+        FingerprintMismatchException mismatch() {
+            return tls.get().trust.mismatch(engine.get());
         }
     }
 
@@ -177,6 +200,24 @@ public final class QuicClient {
     }
 
     /**
+     * A new context for {@code fingerprint}, replacing the cached one: it holds no session
+     * ticket, so the next handshake is a full one. It is cached, so the ticket that handshake
+     * returns is kept. Replacing drops the tickets of every server with this fingerprint, not only
+     * the one that was abandoned (the JDK-style session cache is not per host here).
+     */
+    private static Tls freshTls(Fingerprint fingerprint, TransportConfig config) {
+        if (!config.sessionResumption) {
+            return new Tls(fingerprint, config.earlyData);
+        }
+        List<Object> key = Arrays.<Object>asList(fingerprint, config.earlyData);
+        Tls tls = new Tls(fingerprint, config.earlyData);
+        synchronized (CONTEXTS) {
+            CONTEXTS.put(key, tls);
+        }
+        return tls;
+    }
+
+    /**
      * Drops every session ticket, early token and recorded first flight: the next connect to each
      * server is a full handshake without 0-RTT.
      */
@@ -202,20 +243,28 @@ public final class QuicClient {
         private final List<Object> server;
         private final EarlyFlight early;
         private final CompletableFuture<QuicByteStream> result;
+        private final Dial dial;
         private final AtomicReference<QuicChannel> quic = new AtomicReference<>();
         /** Set when 0-RTT data is on its way; completes with its stream, or null if that failed. */
         private volatile CompletableFuture<ClientStream> earlyStream;
+        /** Set when the connection that sent 0-RTT data is abandoned (docs/protocol.md §8). */
+        private volatile QuicChannel abandoned;
+        /** Set for the one retry after an abandoned connection: a full handshake, no 0-RTT. */
+        private volatile boolean retrying;
+        /** Nanos at which the first connect started; the handshake time is measured from it. */
+        private volatile long connectStart;
 
         Attempt(Channel udp, InetSocketAddress remote, List<Object> server, EarlyFlight early,
-                CompletableFuture<QuicByteStream> result) {
+                CompletableFuture<QuicByteStream> result, Dial dial) {
             this.udp = udp;
             this.remote = remote;
             this.server = server;
             this.early = early;
             this.result = result;
+            this.dial = dial;
         }
 
-        void start(Supplier<FingerprintMismatchException> mismatch) {
+        void start() {
             result.whenComplete((stream, error) -> {
                 if (result.isCancelled() || error != null) {
                     abandon();
@@ -224,6 +273,11 @@ public final class QuicClient {
             if (result.isDone()) {
                 return; // cancelled while the socket opened
             }
+            connectStart = System.nanoTime();
+            connect();
+        }
+
+        private void connect() {
             Future<QuicChannel> connecting = QuicChannel.newBootstrap(udp)
                     // Upper bound for a silent server; racing normally decides much sooner.
                     .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MILLIS)
@@ -247,7 +301,7 @@ public final class QuicClient {
             connecting.addListener(f -> {
                 if (!f.isSuccess()) {
                     Throwable cause = f.cause();
-                    FingerprintMismatchException wrongCertificate = mismatch.get();
+                    FingerprintMismatchException wrongCertificate = dial.mismatch();
                     if (wrongCertificate != null) {
                         wrongCertificate.addSuppressed(cause);
                         cause = wrongCertificate;
@@ -255,8 +309,14 @@ public final class QuicClient {
                     result.completeExceptionally(cause);
                     return;
                 }
+                long handshake = System.nanoTime() - connectStart;
                 QuicChannel connection = (QuicChannel) f.getNow();
-                connection.closeFuture().addListener(closed -> udp.close());
+                // The abandoned connection shares the socket with the retry: it must not close it.
+                connection.closeFuture().addListener(closed -> {
+                    if (connection != abandoned) {
+                        udp.close();
+                    }
+                });
                 if (result.isDone()) {
                     Codecs.closeLater(connection, true, Protocol.CLOSE_NORMAL);
                     return;
@@ -268,12 +328,58 @@ public final class QuicClient {
                     sent.whenComplete((stream, error) -> connection.eventLoop().execute(() -> {
                         if (stream == null) {
                             openStream(connection);
-                        } else if (!result.complete(stream)) {
-                            stream.close(); // cancelled meanwhile
+                        } else {
+                            awaitPreamble(connection, stream, handshake);
                         }
                     }));
                 }
             });
+        }
+
+        /**
+         * The handshake completed with 0-RTT data out. If the server's preamble is still missing
+         * after a grace period, the 0-RTT was rejected (or lost): the connection is abandoned and
+         * the attempt retried, without the game seeing it (docs/protocol.md §8, "Rejected 0-RTT").
+         * On the connection's event loop.
+         */
+        private void awaitPreamble(QuicChannel connection, ClientStream stream, long handshakeNanos) {
+            if (stream.preambleRead() || !connection.isOpen()) {
+                deliver(stream);
+                return;
+            }
+            long grace = Math.max(MIN_GRACE_NANOS, Math.min(MAX_GRACE_NANOS, handshakeNanos / 4));
+            connection.eventLoop().schedule(() -> {
+                if (stream.preambleRead() || !connection.isOpen() || result.isDone()) {
+                    deliver(stream);
+                } else {
+                    abandonEarly(connection);
+                }
+            }, grace, TimeUnit.NANOSECONDS);
+        }
+
+        private void deliver(ClientStream stream) {
+            if (!result.complete(stream)) {
+                stream.close(); // cancelled meanwhile
+            }
+        }
+
+        /**
+         * Closes the connection that sent 0-RTT data with {@code 0x4} and connects again over the
+         * same socket: a full handshake with a context that holds no session for this server.
+         * Its failure is the attempt's failure. Only one retry.
+         */
+        private void abandonEarly(QuicChannel connection) {
+            try {
+                abandoned = connection;
+                retrying = true;
+                earlyStream = null;
+                dial.tls.set(freshTls(dial.fingerprint, dial.config));
+                Codecs.closeLater(connection, true, Protocol.CLOSE_EARLY_ABANDONED);
+                connect();
+            } catch (Throwable t) {
+                // Fails the attempt as usual: the race falls back to TCP (docs/protocol.md §5).
+                result.completeExceptionally(t);
+            }
         }
 
         /**
@@ -282,7 +388,7 @@ public final class QuicClient {
          * (docs/protocol.md §8). Any failure leaves the attempt as it would be without 0-RTT.
          */
         private void sendEarly(QuicChannel connection) {
-            if (early == null || result.isDone() || earlyStream != null) {
+            if (early == null || retrying || result.isDone() || earlyStream != null) {
                 return;
             }
             byte[] flight;

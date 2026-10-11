@@ -9,6 +9,7 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.quic.QuicChannel;
+import io.netty.handler.codec.quic.QuicConnectionCloseEvent;
 import io.netty.handler.codec.quic.QuicServerCodecBuilder;
 import io.netty.handler.codec.quic.QuicSslContext;
 import io.netty.handler.codec.quic.QuicSslContextBuilder;
@@ -68,6 +69,11 @@ public final class QuicServer implements Closeable {
     /** Streams passed to the game on 0-RTT data so far, for diagnostics and tests. */
     public long earlyReleases() {
         return unconfirmed.released.get();
+    }
+
+    /** Connections the client closed with {@code 0x4} (early data abandoned) so far, for diagnostics and tests. */
+    public long earlyAbandoned() {
+        return unconfirmed.abandoned.get();
     }
 
     /** Binds {@code address} and runs QUIC on core's own thread. */
@@ -224,6 +230,12 @@ public final class QuicServer implements Closeable {
 
         @Override
         public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+            if (evt instanceof QuicConnectionCloseEvent) {
+                QuicConnectionCloseEvent close = (QuicConnectionCloseEvent) evt;
+                if (close.isApplicationClose() && close.error() == Protocol.CLOSE_EARLY_ABANDONED) {
+                    unconfirmed.abandoned.incrementAndGet();
+                }
+            }
             if (evt instanceof SslHandshakeCompletionEvent) {
                 SslHandshakeCompletionEvent done = (SslHandshakeCompletionEvent) evt;
                 if (done.isSuccess()) {
@@ -301,6 +313,7 @@ public final class QuicServer implements Closeable {
 
         private final java.util.Map<QuicChannel, Entry> entries = new java.util.concurrent.ConcurrentHashMap<>();
         final java.util.concurrent.atomic.AtomicLong released = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong abandoned = new java.util.concurrent.atomic.AtomicLong();
 
         Entry add(QuicChannel connection, InetSocketAddress address) {
             released.incrementAndGet();
