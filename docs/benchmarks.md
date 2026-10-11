@@ -621,6 +621,23 @@ on CPUs that idled in between (clock and caches), which TCP does in the kernel. 
 measures the same today as at Phase 2's commit (550–556 µs), and Netty build quicraft2 the same
 as quicraft3; Phase 2's 485 µs was this machine on a faster day.
 
+**It doesn't accumulate.** The cost is per packet and finished before the thread sleeps;
+nothing carries over to the next packet. Measured 2026-10-11:
+
+- In-process, 5 minutes at 20 ms spacing (15,000 round trips, 10 blocks): hosted QUIC p50 552 µs
+  in the first block (JIT warm-up), then 434–461 µs for blocks 2–10, flat; TCP 358 µs, then
+  296–327 µs. The gap stays at ~140 µs from start to end.
+- In the game, a 5-minute play session per transport through the Fabric server (run
+  `20261011T133541Z-fabric-tcp-quic`, 1,200 pings each, none lost, no disconnect): QUIC median
+  0.605 ms, p95 0.84 ms; TCP 0.349 ms, p95 0.46 ms. QUIC's median is no higher than in the
+  10-second sessions (0.63–0.70 ms).
+
+It could only build up if packets arrived faster than a loop can handle them, so they queue: a
+capacity question for many players on one loop (proxy CPU per player, Phase 9), not one that
+time or session length brings on.
+
+Accepted by the user (2026-10-11) on that condition, with Phase 3.
+
 What would close it, all outside this change:
 - **Busy-polling** the event loop briefly before it sleeps: keeps the CPU awake, at a CPU cost
   on every server and client. It can only reach the warm floor, +35 µs, not zero.

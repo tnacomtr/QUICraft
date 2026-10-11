@@ -122,6 +122,14 @@ public final class LatencyBench {
             }) {
                 rtt = measure(echo, warmup, count, gapNanos);
             }
+            int blocks = args.integer("blocks", 0);
+            // --blocks N: p50/p99 per consecutive block of round trips, to see drift over a session.
+            for (int b = 0; b < blocks; b++) {
+                double[] block = Arrays.copyOfRange(rtt, b * count / blocks, (b + 1) * count / blocks);
+                Arrays.sort(block);
+                System.out.printf("   %-7s block %2d/%d  p50=%.1fus p99=%.1fus%n", mode, b + 1, blocks,
+                        pct(block, 0.5), pct(block, 0.99));
+            }
             Arrays.sort(rtt);
             System.out.printf("%-7s n=%d gap=%dus  p50=%.1fus p90=%.1fus p99=%.1fus min=%.1fus%n", mode, count,
                     TimeUnit.NANOSECONDS.toMicros(gapNanos), pct(rtt, 0.5), pct(rtt, 0.9), pct(rtt, 0.99), rtt[0]);
