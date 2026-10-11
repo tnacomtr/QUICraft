@@ -38,13 +38,6 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     private boolean finWhenWritten;
     /** Something was written: a close must not drop it. */
     private volatile boolean wroteAny;
-    /** Event loop only: bytes written in this loop pass, not yet handed to Netty. */
-    private ByteBuf pending;
-    /** Event loop only: the hand-off of {@link #pending} is queued. */
-    private boolean handOffQueued;
-    /** Event loop only: data is being delivered to the listener (Netty's read is in progress). */
-    private boolean delivering;
-    private final Runnable queuedHandOff = this::runQueuedHandOff;
     private volatile Listener listener;
 
     NettyQuicByteStream(QuicStreamChannel channel) {
@@ -72,72 +65,14 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
         this.listener = listener;
     }
 
-    /**
-     * Writes are collected per event-loop pass and handed to Netty as one buffer at the end of the
-     * pass, flushed or not (Netty's QUIC stream has no flush of its own: it sends on every write).
-     * Netty passes each write to quiche and asks it for packets right away, so Minecraft's one
-     * write per game packet left as one small QUIC packet each whenever the congestion window
-     * allowed: a tick's burst of chunk data went out in 415-byte packets on average, against
-     * TCP's 1366 (docs/benchmarks.md). One write per pass lets quiche fill its packets.
-     *
-     * <p>A write made while data is being delivered (a reply written straight from onData) goes
-     * to Netty at once instead: during its read Netty sends nothing until the read completes,
-     * so it already batches, and the reply then leaves in the same packet as the ACK. Deferred
-     * past the read, quiche would send an ACK-only packet first (docs/benchmarks.md, Phase 2).
-     */
     @Override
     public void write(ByteBuffer data) {
         int length = data.remaining();
-        if (length == 0) {
-            return;
-        }
+        ByteBuf copy = channel.alloc().buffer(length);
+        copy.writeBytes(data.duplicate());
         inFlight.addAndGet(length);
         wroteAny = true;
-        if (channel.eventLoop().inEventLoop()) {
-            append(data.duplicate());
-        } else {
-            ByteBuf copy = channel.alloc().buffer(length);
-            copy.writeBytes(data.duplicate());
-            channel.eventLoop().execute(() -> {
-                try {
-                    append(copy.nioBuffer());
-                } finally {
-                    copy.release();
-                }
-            });
-        }
-    }
-
-    /** Event loop only. */
-    private void append(ByteBuffer data) {
-        if (pending == null) {
-            pending = channel.alloc().directBuffer(Math.max(data.remaining(), 2048));
-        }
-        pending.writeBytes(data);
-        if (delivering) {
-            handOff();
-            return;
-        }
-        if (!handOffQueued) {
-            handOffQueued = true;
-            channel.eventLoop().execute(queuedHandOff);
-        }
-    }
-
-    private void runQueuedHandOff() {
-        handOffQueued = false;
-        handOff();
-    }
-
-    /** Event loop only: gives Netty what was written since the last hand-off, as one write. */
-    private void handOff() {
-        ByteBuf buf = pending;
-        if (buf == null) {
-            return;
-        }
-        pending = null;
-        int length = buf.readableBytes();
-        channel.write(buf).addListener(f -> {
+        channel.write(copy).addListener(f -> {
             long left = inFlight.addAndGet(-length);
             if (!f.isSuccess()) {
                 channel.pipeline().fireExceptionCaught(f.cause());
@@ -150,12 +85,12 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
                 notifyWritable();
             }
         });
-        channel.flush();
     }
 
-    /** Writes already go out at the end of the event-loop pass they were made in. */
     @Override
-    public void flush() {}
+    public void flush() {
+        channel.flush();
+    }
 
     @Override
     public boolean isWritable() {
@@ -229,7 +164,6 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
             return;
         }
         finWhenWritten = true;
-        handOff();
         channel.flush();
         channel.eventLoop().schedule(this::closeConnection, LINGER_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
         if (inFlight.get() == 0) {
@@ -296,12 +230,7 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
         try {
             Listener l = listener;
             if (l != null && buf.isReadable()) {
-                delivering = true;
-                try {
-                    l.onData(buf.nioBuffer());
-                } finally {
-                    delivering = false;
-                }
+                l.onData(buf.nioBuffer());
             }
         } finally {
             buf.release();
@@ -331,10 +260,6 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-        if (pending != null) {
-            pending.release();
-            pending = null;
-        }
         notifyClosed(null);
         ctx.fireChannelInactive();
     }
