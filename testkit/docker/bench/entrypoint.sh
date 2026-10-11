@@ -20,14 +20,28 @@ if [ -n "$args" ]; then
     tc filter add dev "$dev" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev ifb0
     # shellcheck disable=SC2086
     tc qdisc add dev ifb0 root netem $args limit 10000
+    # netem drops whole packets, and with segmentation offload a TCP packet here can be 64 KB
+    # of segments: TCP would see a fraction of the configured loss. One segment per packet, as
+    # on a wire. (run-baseline.sh does the same on the server's side.)
+    ip link set dev "$dev" gso_max_segs 1
     echo "netem '$profile' on $dev (both directions): $args"
 fi
 
 uid="${HOST_UID:-0}"
 gid="${HOST_GID:-0}"
+status=0
 if [ "$uid" != 0 ]; then
     export HOME=/tmp
-    exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --inh-caps=-all \
-        /opt/testkit/bin/quicraft-testkit "$@"
+    setpriv --reuid="$uid" --regid="$gid" --clear-groups --inh-caps=-all \
+        /opt/testkit/bin/quicraft-testkit "$@" || status=$?
+else
+    /opt/testkit/bin/quicraft-testkit "$@" || status=$?
 fi
-exec /opt/testkit/bin/quicraft-testkit "$@"
+if [ -n "$args" ]; then
+    # What netem actually handled: packets per direction, drops, bytes (docs/benchmarks.md).
+    echo "netem stats, client to server ($dev):"
+    tc -s qdisc show dev "$dev" | sed -n '/netem/,/backlog/p'
+    echo "netem stats, server to client (ifb0):"
+    tc -s qdisc show dev ifb0 | sed -n '/netem/,/backlog/p'
+fi
+exit "$status"

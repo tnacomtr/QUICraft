@@ -95,6 +95,18 @@ fi
     echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
 } > "$results/environment.txt"
 
+# With a netem profile, the server sends one segment per packet like the bench does
+# (bench/entrypoint.sh): netem drops whole packets, and segmentation offload would hand it
+# 64 KB TCP packets, so TCP would see a fraction of the loss QUIC sees. Clean keeps the
+# defaults, as real NICs offload. Runs before 2026-10-11 had offloads on everywhere.
+set_segments() { # profile
+    local segs=65535
+    [[ "$1" != clean ]] && segs=1
+    docker run --rm --net "container:$("${compose[@]}" ps -q "$TARGET")" --cap-add NET_ADMIN \
+        --entrypoint sh quicraft-testkit-bench -c \
+        "for d in \$(ls /sys/class/net); do [ \"\$d\" = lo ] || ip link set dev \"\$d\" gso_max_segs $segs; done"
+}
+
 online_flag=()
 [[ "$ONLINE" == true ]] && online_flag=(--online)
 
@@ -108,6 +120,7 @@ for batch in $(seq 1 "$BATCHES"); do
         for transport in $TRANSPORTS; do
             label="$profile"
             [[ "$TRANSPORTS" == *" "* ]] && label="$profile-$transport"
+            set_segments "$profile"
             echo "== batch $batch/$BATCHES, profile $profile, $transport ($runs runs)"
             "${compose[@]}" run --rm --no-deps -e NETEM_PROFILE="$profile" bench \
                 bench --host "$TARGET" --port 25565 --transport "$transport" --profile "$label" \
