@@ -519,6 +519,14 @@ single-use token (protocol.md §8; needs netty/0003, §11).
   without 0-RTT. That is about +320 ms at 150 ms RTT, once, on the first rejoin after the server
   restarted. Fix (not done): make quiche treat in-flight 0-RTT packets as lost as soon as the
   server rejects them.
+- **0-RTT data that arrives before the Initial** (found 2026-10-11 through a flaky
+  `EarlyDataTest`): the server has no connection for it yet, the stream only reaches it after
+  the handshake (seen in the server's preamble timing), and the join takes
+  the same ~4 RTT path as a rejected 0-RTT. The test relay sent datagrams due at the same
+  instant from two threads, so the 0-RTT packet sometimes overtook the Initial (2 failures in
+  about 25 runs of the class; 0 in 14 with one thread). Real networks reorder that pair only
+  rarely, and a lost 0-RTT packet ends the same way. The quiche fix above would shorten this
+  case too.
 - **Fallback after 0-RTT** (`SCENARIO=early-fallback`, clean, N=4 each): a 0-RTT attempt whose
   server-to-client UDP is dropped is abandoned after the head start, then the same player joins
   over TCP. Velocity offline and online, Fabric offline and online: 16 of 16 TCP joins succeeded.

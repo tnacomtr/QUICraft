@@ -23,6 +23,14 @@ jobs:
       # QUICraft's patched Netty QUIC jars (natives/); cached, built in Docker on a miss.
       - uses: ./.github/actions/netty-quic-linux
       - run: ./gradlew build
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: |
+            */build/test-results/
+            */build/reports/tests/
       - name: Upload license reports
         if: always()
         uses: actions/upload-artifact@v7

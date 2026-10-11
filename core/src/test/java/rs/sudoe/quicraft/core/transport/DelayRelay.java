@@ -26,7 +26,9 @@ final class DelayRelay implements AutoCloseable {
     private final long oneWayMillis;
     private final DatagramSocket socket;
     private final DatagramSocket copier;
-    private final ScheduledExecutorService delay = Executors.newScheduledThreadPool(2);
+    // One thread: datagrams due at the same instant leave in the order they came (like netem
+    // without a reorder rule). Two threads could swap an Initial and its 0-RTT packet.
+    private final ScheduledExecutorService delay = Executors.newSingleThreadScheduledExecutor();
     private final AtomicLong firstClientDatagram = new AtomicLong();
     private final List<byte[]> captured = new ArrayList<>();
     private volatile SocketAddress client;
