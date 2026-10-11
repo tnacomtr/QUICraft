@@ -13,7 +13,6 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -63,7 +62,11 @@ public final class MockSessionServer {
                 body = JsonParser.parseReader(reader).getAsJsonObject();
             }
             String serverId = body.get("serverId").getAsString();
-            String id = UUID.fromString(body.get("selectedProfile").getAsString()).toString().replace("-", "");
+            // Undashed (authlib, Mojang's format) or dashed; hasJoined answers undashed, like Mojang.
+            String id = body.get("selectedProfile").getAsString().replace("-", "").toLowerCase(java.util.Locale.ROOT);
+            if (!id.matches("[0-9a-f]{32}")) {
+                throw new IllegalArgumentException("selectedProfile is not a UUID: " + id);
+            }
             // The real client (authlib) sends no name; MCProtocolLib's does. Store under "" then.
             String name = body.has("name") && !body.get("name").isJsonNull() ? body.get("name").getAsString() : "";
             joins.put(key(name, serverId), new Joined(id));
