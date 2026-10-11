@@ -528,8 +528,10 @@ single-use token (protocol.md §8; needs netty/0003, §11).
   relay at 200 ms RTT): the data is resent only once quiche's loss detection declares it lost,
   so the first reply comes 4.18 RTT after the first datagram, against 2.03 RTT for a join
   without 0-RTT. That is about +320 ms at 150 ms RTT, once, on the first rejoin after the server
-  restarted. Fix (not done): make quiche treat in-flight 0-RTT packets as lost as soon as the
-  server rejects them.
+  restarted. Since 2026-10-11 the client abandons such a connection with `0x4` and reconnects
+  without 0-RTT (docs/protocol.md §8, "Rejected 0-RTT"): 3.30 RTT in the same test (four runs,
+  3.29-3.30). A quiche patch that treats in-flight 0-RTT packets as lost on the reject would be
+  faster still; not done.
 - **0-RTT data that arrives before the Initial** (found 2026-10-11 through a flaky
   `EarlyDataTest`): the server has no connection for it yet, the stream only reaches it after
   the handshake (seen in the server's preamble timing), and the join takes
@@ -595,6 +597,21 @@ with coalescing (run `20261011T114704Z-fabric-tcp-quic`, N=10): +71 ms [+49, +79
 Netty's defaults, 1350-byte UDP payloads and quiche's 10-packet initial window, so ~11% less data
 per packet than TCP's 1448-byte segments; that explains perhaps 20 ms. The rest is not explained
 yet. Not one of the three gaps this section set out to close, but a regression all the same.
+
+It follows the congestion control. Fabric server, delay profile, N=10 per arm, run back to back
+on 44d4d93 (each server's `-Dquicraft.congestionControl` checked in its java command line);
+QUIC minus TCP, difference of medians with a 95% bootstrap interval:
+
+| Congestion control | Run | Join | Chunk load | Join + chunk load |
+| --- | --- | --- | --- | --- |
+| CUBIC | `20261011T152852Z-fabric-tcp-quic` | -42 [-92, -28] | +367 [+284, +374] | +307 [+219, +338] |
+| BBR (default) | `20261011T153642Z-fabric-tcp-quic` | -33 [-71, -8] | +67 [+21, +73] | +19 [-37, +48] |
+
+So the gap is the sender's ramp-up, not the harness or the bridge: CUBIC from quiche's
+10-packet initial window is five times worse than BBR. With BBR, connect to last chunk is level
+with TCP (QUIC's faster join pays for most of the slower chunk load); the chunk-load phase alone
+is still ~0.45 RTT behind. Next lever: the initial window (`initialCongestionWindowPackets`,
+docs/protocol.md §9), not measured yet.
 
 ### Play RTT on a clean link: not closed
 
