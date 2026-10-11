@@ -14,6 +14,8 @@ permissions:
 jobs:
   gametest:
     runs-on: ubuntu-latest
+    # A client that can't open a window hangs instead of exiting (26.3 on the runner, Oct 2026).
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +36,9 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
       # QUICraft's patched Netty QUIC jars (natives/); cached, built in Docker on a miss.
       - uses: ./.github/actions/netty-quic-linux
-      - run: sudo apt-get update && sudo apt-get install -y xvfb libgl1-mesa-dri
+      - run: sudo apt-get update && sudo apt-get install -y xvfb libgl1-mesa-dri mesa-vulkan-drivers
+      # 26.3's renderer finds no usable GLX visual under Xvfb; Mesa's software Vulkan
+      # driver (lavapipe) gives it a backend.
       - name: Client gametests
         env:
           MODULE: ${{ matrix.module }}
