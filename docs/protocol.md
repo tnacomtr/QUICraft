@@ -287,8 +287,9 @@ idea: derive H from the RTT the server-list ping already measured.
   nothing. If none has arrived by then, the 0-RTT is treated as rejected: the client closes
   that connection with `0x4` (early data abandoned), without passing it to the game, and opens a
   new connection to the same address in the same attempt. The new connection is a full
-  handshake with no 0-RTT and no session ticket for that server, and the Minecraft first flight
-  is sent normally after it. Only one such retry per attempt. If the retry fails, the attempt
+  handshake with no 0-RTT and no session ticket for that server (the client may drop the tickets
+  of other servers with the same certificate too), and the Minecraft first flight is sent
+  normally after it. Only one such retry per attempt. If the retry fails, the attempt
   fails as usual: racing (§5) and the failure cache (§6) apply.
 - A server treats `0x4` like any other close: the connection ends, and a login started from
   that stream is dropped, so the game sees a disconnect. A server may count `0x4` closes. Netty

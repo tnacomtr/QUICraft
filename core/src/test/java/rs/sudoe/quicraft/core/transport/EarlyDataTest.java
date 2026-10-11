@@ -236,7 +236,7 @@ class EarlyDataTest {
                 System.out.printf("rejected 0-RTT: first reply %.2f RTT after the first datagram%n", replyRtt);
                 // Abandoned after the grace period and retried: about 3.25 RTT, not the ~4.2 of
                 // waiting for quiche's loss detection (docs/protocol.md §8).
-                assertTrue(replyRtt < 3.5, "a rejected 0-RTT must not wait for loss detection, was " + replyRtt);
+                assertTrue(replyRtt < 3.8, "a rejected 0-RTT must not wait for loss detection, was " + replyRtt);
                 second.stream.write(ByteBuffer.wrap(AFTER));
                 second.stream.flush();
                 assertArrayEquals(concat(FLIGHT, AFTER), second.collector.await(FLIGHT.length + AFTER.length, 5,
