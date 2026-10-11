@@ -80,6 +80,14 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
     providers.gradleProperty("quicraft.externalServer").orNull?.let {
         property("quicraft.gametest.externalServer", it)
     }
+    // Opt-in: online-mode login against the testkit's mock session server. The real client reads
+    // its session/services/profiles hosts only when all three are set:
+    // -Pquicraft.minecraftApi=http://127.0.0.1:8080
+    providers.gradleProperty("quicraft.minecraftApi").orNull?.let {
+        property("minecraft.api.session.host", it)
+        property("minecraft.api.services.host", it)
+        property("minecraft.api.profiles.host", it)
+    }
 }
 sourceSets.named("gametest") {
     java.setSrcDirs(listOf(shared.dir("gametest/java")))

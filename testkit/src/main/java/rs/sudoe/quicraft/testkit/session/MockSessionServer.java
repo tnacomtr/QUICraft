@@ -13,6 +13,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -62,8 +63,9 @@ public final class MockSessionServer {
                 body = JsonParser.parseReader(reader).getAsJsonObject();
             }
             String serverId = body.get("serverId").getAsString();
-            String id = body.get("selectedProfile").getAsString();
-            String name = body.get("name").getAsString();
+            String id = UUID.fromString(body.get("selectedProfile").getAsString()).toString().replace("-", "");
+            // The real client (authlib) sends no name; MCProtocolLib's does. Store under "" then.
+            String name = body.has("name") && !body.get("name").isJsonNull() ? body.get("name").getAsString() : "";
             joins.put(key(name, serverId), new Joined(id, name));
             exchange.sendResponseHeaders(204, -1);
         }
@@ -72,7 +74,13 @@ public final class MockSessionServer {
     private void hasJoined(HttpExchange exchange) throws IOException {
         try (exchange) {
             Map<String, String> query = query(exchange.getRequestURI().getRawQuery());
-            Joined joined = joins.remove(key(query.get("username"), query.get("serverId")));
+            String username = query.get("username");
+            String serverId = query.get("serverId");
+            Joined joined = joins.remove(key(username, serverId));
+            if (joined == null) {
+                // The real client registers with no name, so fall back to the name-less key.
+                joined = joins.remove(key("", serverId));
+            }
             if (joined == null) {
                 // Same as Mojang: 204 means "not joined" and the server rejects the login.
                 exchange.sendResponseHeaders(204, -1);
@@ -80,7 +88,7 @@ public final class MockSessionServer {
             }
             JsonObject profile = new JsonObject();
             profile.addProperty("id", joined.id());
-            profile.addProperty("name", joined.name());
+            profile.addProperty("name", username);
             profile.add("properties", new JsonArray());
             byte[] bytes = profile.toString().getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json");

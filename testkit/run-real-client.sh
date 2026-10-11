@@ -5,15 +5,19 @@
 # Paper: a first join over QUIC, then a rejoin with 0-RTT. Velocity logs each QUIC connection's
 # stats with its early-release count (-Dquicraft.logStats); the rejoin must raise it by one.
 #
-#   testkit/run-real-client.sh            # offline mode (the gametest client has no Mojang account)
+# Online mode: the client logs in through the testkit's mock session server, which the overlay
+# publishes on 127.0.0.1:8080 (the client has no Mojang account). Set VELOCITY_ONLINE_MODE=false
+# to run offline instead.
 #
-# Needs a display or xvfb-run, docker, and port 25565 free on 127.0.0.1 (TCP and UDP).
+#   testkit/run-real-client.sh            # online mode through the mock session server
+#
+# Needs a display or xvfb-run, docker, and ports 25565 (TCP and UDP) and 8080 free on 127.0.0.1.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 compose=(docker compose -f "$here/docker/compose.yaml" -f "$here/docker/compose.real-client.yaml")
-export VELOCITY_ONLINE_MODE=false QUICRAFT_PLUGIN=true QUICRAFT_JAVA_OPTS="-Dquicraft.logStats=true"
+export VELOCITY_ONLINE_MODE="${VELOCITY_ONLINE_MODE:-true}" QUICRAFT_PLUGIN=true QUICRAFT_JAVA_OPTS="-Dquicraft.logStats=true"
 
 log="${REAL_CLIENT_LOG:-$here/results/real-client-velocity.log}"
 cleanup() {
@@ -38,7 +42,7 @@ done
 xvfb=()
 [[ -z "${DISPLAY:-}" ]] && xvfb=(xvfb-run -a -s "-screen 0 1280x720x24")
 ALSOFT_DRIVERS=null "${xvfb[@]}" "$root/gradlew" -p "$root" :fabric-26x:runClientGameTest \
-    -Pquicraft.externalServer=127.0.0.1:25565 --console=plain
+    -Pquicraft.externalServer=127.0.0.1:25565 -Pquicraft.minecraftApi=http://127.0.0.1:8080 --console=plain
 
 echo "== Velocity's QUIC connections (earlyReleases counts logins passed on 0-RTT data):"
 stats="$("${compose[@]}" logs --no-color velocity | grep -F 'QUICraft stats' || true)"
