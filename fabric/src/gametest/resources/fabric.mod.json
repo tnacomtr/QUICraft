@@ -15,7 +15,8 @@
       "rs.sudoe.quicraft.fabric.gametest.QuicOnlyGameTest",
       "rs.sudoe.quicraft.fabric.gametest.FaultInjectionGameTest",
       "rs.sudoe.quicraft.fabric.gametest.AsyncFaultInjectionGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.JoinTimingGameTest"
+      "rs.sudoe.quicraft.fabric.gametest.JoinTimingGameTest",
+      "rs.sudoe.quicraft.fabric.gametest.ExternalServerGameTest"
     ]
   },
   "mixins": ["quicraft-gametest.mixins.json"],

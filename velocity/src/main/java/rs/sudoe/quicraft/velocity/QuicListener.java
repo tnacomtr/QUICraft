@@ -43,17 +43,24 @@ final class QuicListener implements AutoCloseable {
     static QuicListener bind(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
             Supplier<ChannelInitializer<Channel>> initializer, EventLoopGroup workers,
             ChannelFactory<? extends DatagramChannel> datagrams, Logger logger) throws Exception {
+        // For the stats line: the server's early-release count, once it exists.
+        java.util.concurrent.atomic.AtomicReference<QuicServer> bound = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.function.LongSupplier early = () -> bound.get() == null ? -1 : bound.get().earlyReleases();
         if (datagrams == null) {
-            return new QuicListener(QuicServer.bind(address, identity, config,
-                    stream -> accept(stream, initializer, workers, logger)));
+            QuicServer server = QuicServer.bind(address, identity, config,
+                    stream -> accept(stream, initializer, workers, logger, early));
+            bound.set(server);
+            return new QuicListener(server);
         }
         EventLoop loop = workers.next();
         DatagramChannel socket = (DatagramChannel) new Bootstrap().group(loop).channelFactory(datagrams)
                 .handler(new ChannelInboundHandlerAdapter())
                 .bind(address).sync().channel();
         try {
-            return new QuicListener(QuicServer.bind(GameHost.loop(loop), GameHost.socket(socket), identity, config,
-                    stream -> accept(stream, initializer, loop, logger)));
+            QuicServer server = QuicServer.bind(GameHost.loop(loop), GameHost.socket(socket), identity, config,
+                    stream -> accept(stream, initializer, loop, logger, early));
+            bound.set(server);
+            return new QuicListener(server);
         } catch (Exception | Error e) {
             socket.close();
             throw e;
@@ -66,12 +73,12 @@ final class QuicListener implements AutoCloseable {
     }
 
     private static void accept(QuicByteStream stream, Supplier<ChannelInitializer<Channel>> initializer,
-            EventLoopGroup loop, Logger logger) {
+            EventLoopGroup loop, Logger logger, java.util.function.LongSupplier earlyReleases) {
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
         channel.pipeline().addLast(initializer.get());
         channel.pipeline().addLast(new DropProxyProtocol());
         if (LOG_STATS) {
-            channel.pipeline().addLast(new StatsOnClose(stream, logger));
+            channel.pipeline().addLast(new StatsOnClose(stream, logger, earlyReleases));
         }
         loop.register(channel).addListener(f -> {
             if (!f.isSuccess()) {
@@ -81,22 +88,28 @@ final class QuicListener implements AutoCloseable {
         });
     }
 
-    /** Diagnostics: log each QUIC connection's stats when the player's channel closes. */
+    /**
+     * Diagnostics: log each QUIC connection's stats when the player's channel closes, with the
+     * listener's count of logins passed on 0-RTT data so far.
+     */
     static final boolean LOG_STATS = Boolean.getBoolean("quicraft.logStats");
 
     private static final class StatsOnClose extends ChannelInboundHandlerAdapter {
         private final QuicByteStream stream;
         private final Logger logger;
+        private final java.util.function.LongSupplier earlyReleases;
 
-        StatsOnClose(QuicByteStream stream, Logger logger) {
+        StatsOnClose(QuicByteStream stream, Logger logger, java.util.function.LongSupplier earlyReleases) {
             this.stream = stream;
             this.logger = logger;
+            this.earlyReleases = earlyReleases;
         }
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            stream.connectionStats().whenComplete((stats, error) -> logger.info("QUICraft stats {}: {}",
-                    ctx.channel().remoteAddress(), error == null ? stats : error.toString()));
+            stream.connectionStats().whenComplete((stats, error) -> logger.info("QUICraft stats {}: {} earlyReleases={}",
+                    ctx.channel().remoteAddress(), error == null ? stats : error.toString(),
+                    earlyReleases.getAsLong()));
             ctx.fireChannelInactive();
         }
     }

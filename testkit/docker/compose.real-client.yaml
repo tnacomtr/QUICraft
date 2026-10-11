@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Overlay for testkit/run-real-client.sh: Velocity reachable from this machine, TCP and UDP on
+# the same port number (the advertisement carries Velocity's own port), loopback only.
+services:
+  velocity:
+    ports:
+      - "127.0.0.1:25565:25565/tcp"
+      - "127.0.0.1:25565:25565/udp"

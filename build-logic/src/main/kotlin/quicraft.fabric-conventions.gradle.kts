@@ -75,6 +75,11 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
     providers.gradleProperty("quicraft.joinTimings").orNull?.let {
         property("quicraft.gametest.joinTimings", it)
     }
+    // Opt-in: the real client against an outside server (ExternalServerGameTest), e.g. the
+    // testkit's Velocity through testkit/run-real-client.sh: -Pquicraft.externalServer=host:port
+    providers.gradleProperty("quicraft.externalServer").orNull?.let {
+        property("quicraft.gametest.externalServer", it)
+    }
 }
 sourceSets.named("gametest") {
     java.setSrcDirs(listOf(shared.dir("gametest/java")))
