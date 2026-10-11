@@ -1,6 +1,6 @@
 # Fabric integration notes (Phase 3)
 
-Client and dedicated server for the 26.x + 1.21.11 hook group. One source tree (`fabric/`), two
+Client and dedicated server for the 26.x + 1.21.11 hook group. One shared source tree (`fabric/`, plus one small class per module), two
 jars: `fabric-26x` (26.1–26.3, unobfuscated, Java 25) and `fabric-1.21.11` (Mojang names in
 source, remapped to Intermediary by Loom, Java 21). Read from the decompiled game (Loom
 `genSources`, kept local, never committed) for 1.21.11 and 26.1.2. Every hook below was checked

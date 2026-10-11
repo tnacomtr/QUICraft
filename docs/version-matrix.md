@@ -16,11 +16,11 @@ module and every new release.
 | `fabric-26x` | 26.1, 26.1.1, 26.1.2, 26.2, 26.3 | Fabric Loader ≥ 0.19.5 | 25 | Phase 3 |
 | `fabric-1.21.11` | 1.21.11 | Fabric Loader ≥ 0.19.5 | 21 | Phase 3 |
 
-The 26.x + 1.21.11 Fabric hook group shares one source tree (`fabric/`) and builds separate jars:
+The 26.x + 1.21.11 Fabric hook group shares one source tree (`fabric/`; each module adds only `Screens`, below) and builds separate jars:
 1.21.11 is obfuscated (Mojang names in source, Intermediary in the jar, Loom
 `fabric-loom-remap`, Java 21) and 26.1+ is not (Loom `fabric-loom`, Java 25). Checked against the
 decompiled 1.21.11 and 26.1.2 (Oct 2026): every hook target and the client pipeline the mod
-rebuilds are the same in both, so no split beyond the two jars (details:
+rebuilds are the same in both, so no hook split beyond the two jars (details:
 docs/platforms/fabric.md). `fabric-26x` is built against 26.1.2; its classes compiled against
 26.1, 26.1.1, 26.2 and 26.3 are byte-identical, and the client gametests pass on each (re-checked
 2026-10-11). 26.2 moved the current screen from `Minecraft` to `Minecraft.gui`; each module's own
