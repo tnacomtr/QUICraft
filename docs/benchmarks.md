@@ -613,7 +613,7 @@ with TCP (QUIC's faster join pays for most of the slower chunk load); the chunk-
 is still ~0.45 RTT behind. Next lever: the initial window (`initialCongestionWindowPackets`,
 docs/protocol.md §9), not measured yet.
 
-### Initial window experiment (branch exp/initial-cwnd, not merged)
+### Initial window experiment (2026-10-11)
 
 QUIC minus TCP, difference of medians with a 95% bootstrap interval, Fabric server, BBR, N=10 per
 arm, run back to back on c04d641 (each server's `-Dquicraft.initialCwndPackets` checked in its java
@@ -631,11 +631,13 @@ The setting was verified in each arm's java command line. The 10-packet arm ran 
 `-Dquicraft.congestionControl=BBR` only. The 32-packet arm's added `-Dquicraft.initialCwndPackets=32`,
 and the 64-packet arm's added `-Dquicraft.initialCwndPackets=64`.
 
-At +150 ms the chunk-load gap shrinks as the window grows, from +179.5 ms (10 packets, intervals
-overlap) to +85.9 ms (32, no overlap) to -95.5 ms (64, no overlap), so a larger initial window
-closes it and at 64 packets QUIC leads TCP. On the clean link the difference moves from +31.4 to
--23.0 ms, both intervals overlapping, so these runs do not show a clean-link regression but cannot
-resolve one.
+Reading (reviewed after the run): the 10-packet arm is noisy. Its QUIC chunk loads split into
+two groups (1073-1088 and 1225-1372 ms), and the earlier BBR run on the same code
+(`20261011T153642Z`, above) gave +67 [+21, +73]. So 32 packets (+86) shows no gain over 10.
+64 packets is the clear change: all ten QUIC chunk loads 916-1004 ms against TCP's 1004-1159,
+and connect to last chunk -189 ms. The clean link shows no regression at 32 (intervals overlap).
+64 packets was measured at +150 ms only; clean and loss are not measured yet, so the default
+stays quiche's 10 until they are (a docs/protocol.md §9 decision).
 
 ### Play RTT on a clean link: not closed
 
