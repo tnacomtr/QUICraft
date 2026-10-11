@@ -32,7 +32,7 @@ import rs.sudoe.quicraft.testkit.Args;
  * (Velocity appends the query string itself).
  */
 public final class MockSessionServer {
-    private record Joined(String id, String name) {}
+    private record Joined(String id) {}
 
     private final Map<String, Joined> joins = new ConcurrentHashMap<>();
 
@@ -66,7 +66,7 @@ public final class MockSessionServer {
             String id = UUID.fromString(body.get("selectedProfile").getAsString()).toString().replace("-", "");
             // The real client (authlib) sends no name; MCProtocolLib's does. Store under "" then.
             String name = body.has("name") && !body.get("name").isJsonNull() ? body.get("name").getAsString() : "";
-            joins.put(key(name, serverId), new Joined(id, name));
+            joins.put(key(name, serverId), new Joined(id));
             exchange.sendResponseHeaders(204, -1);
         }
     }
