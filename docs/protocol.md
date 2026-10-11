@@ -22,14 +22,14 @@ and "MAY" are used as in RFC 2119.
 The server adds one top-level member to its status (server-list ping) JSON:
 
 ```json
-"quicraft:quic": { "v": 1, "port": 25565, "alpn": "quicraft/1", "fp": "sha256:<64 hex>" }
+"quicraft:quic": { "v": 1, "port": 25565, "alpn": "quicraft/2", "fp": "sha256:<64 hex>" }
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `v` | integer | Protocol version. This document is `1`. |
 | `port` | integer 1–65535 | UDP port of the QUIC listener (§2). |
-| `alpn` | string | ALPN the server accepts. v1: `quicraft/1`. |
+| `alpn` | string | ALPN the server accepts, naming the stream format. This document: `quicraft/2`. |
 | `fp` | string | `sha256:` followed by the lowercase hex SHA-256 of the DER encoding of the server's leaf certificate (§7). |
 
 Client rules:
@@ -308,7 +308,7 @@ flow control and stream counts, meaning nothing could be sent.
 | Parameter | v1 value | Reason |
 | --- | --- | --- |
 | Version | QUIC v1 (RFC 9000) | |
-| ALPN | `quicraft/1` | |
+| ALPN | `quicraft/2` | Names the stream format of §8, preambles included. `quicraft/1` was the unreleased format without preambles (Phase 3 builds); renamed *(user, 2026-10-11)* so mismatched builds fall back to TCP instead of joining over QUIC and being closed. |
 | `max_idle_timeout` | 60 s | Longer than Minecraft's 30 s keepalive timeout, so QUIC never times out a session the game still considers alive. |
 | `initial_max_data` | 16 MiB | Covers a full chunk burst at login without stalling on flow control. **Provisional**, to tune in the benchmark. |
 | `initial_max_stream_data_bidi_local` / `_remote` | 8 MiB | Same, per stream. **Provisional**. |

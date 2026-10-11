@@ -54,7 +54,7 @@ public final class Advertisement {
         return version;
     }
 
-    /** The member's value, e.g. {@code {"v":1,"port":25565,"alpn":"quicraft/1","fp":"sha256:…"}}. */
+    /** The member's value, e.g. {@code {"v":1,"port":25565,"alpn":"quicraft/2","fp":"sha256:…"}}. */
     public String toJson() {
         return "{\"v\":" + version + ",\"port\":" + port + ",\"alpn\":" + Json.quote(alpn)
                 + ",\"fp\":" + Json.quote(fingerprint.toString()) + "}";

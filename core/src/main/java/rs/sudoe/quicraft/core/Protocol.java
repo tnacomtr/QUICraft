@@ -5,7 +5,11 @@ package rs.sudoe.quicraft.core;
 public final class Protocol {
     /** Protocol version, the advertisement's {@code v}. */
     public static final int VERSION = 1;
-    public static final String ALPN = "quicraft/1";
+    /**
+     * The QUIC ALPN, naming the stream format (docs/protocol.md §1, §8). {@code quicraft/1} was
+     * the unreleased format without stream preambles; builds that disagree fall back to TCP.
+     */
+    public static final String ALPN = "quicraft/2";
     /** Top-level member name in the status JSON. */
     public static final String ADVERTISEMENT_KEY = "quicraft:quic";
     /** Plugin channel for the client's fallback report. */

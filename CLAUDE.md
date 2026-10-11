@@ -92,7 +92,7 @@ Write the full spec in `docs/protocol.md` before implementing it, and keep it ve
 
 1. **Advertisement.** The server adds a namespaced top-level object to its status (server-list ping) JSON response, e.g.
    ```json
-   "quicraft:quic": { "v": 1, "port": 25565, "alpn": "quicraft/1", "fp": "sha256:<cert fingerprint>" }
+   "quicraft:quic": { "v": 1, "port": 25565, "alpn": "quicraft/2", "fp": "sha256:<cert fingerprint>" }
    ```
    - Vanilla clients ignore unknown fields.
    - The status response has a string-length cap (believed to be 32767; confirm in each version's source). If adding the object would push the response over the cap, leave it out, or vanilla clients would fail to ping.

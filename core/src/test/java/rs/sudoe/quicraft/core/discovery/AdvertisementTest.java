@@ -42,7 +42,7 @@ class AdvertisementTest {
 
     @Test
     void memberHasTheDocumentedShape() {
-        assertEquals("{\"v\":1,\"port\":25577,\"alpn\":\"quicraft/1\",\"fp\":\"" + fp + "\"}",
+        assertEquals("{\"v\":1,\"port\":25577,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}",
                 Advertisement.v1(25577, fp).toJson());
     }
 
@@ -74,16 +74,16 @@ class AdvertisementTest {
 
     @Test
     void ignoresUnknownFieldsButRejectsAnythingInvalid() {
-        String good = "{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/1\",\"fp\":\"" + fp + "\"";
+        String good = "{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"";
         assertTrue(extract(good + ",\"future\":{\"x\":[1,2]}}").isPresent());
-        assertFalse(extract("{\"v\":2,\"port\":25565,\"alpn\":\"quicraft/1\",\"fp\":\"" + fp + "\"}").isPresent());
-        assertFalse(extract("{\"v\":\"1\",\"port\":25565,\"alpn\":\"quicraft/1\",\"fp\":\"" + fp + "\"}").isPresent());
-        assertFalse(extract("{\"v\":1,\"port\":0,\"alpn\":\"quicraft/1\",\"fp\":\"" + fp + "\"}").isPresent());
-        assertFalse(extract("{\"v\":1,\"port\":65536,\"alpn\":\"quicraft/1\",\"fp\":\"" + fp + "\"}").isPresent());
-        assertFalse(extract("{\"v\":1,\"port\":25565.5,\"alpn\":\"quicraft/1\",\"fp\":\"" + fp + "\"}").isPresent());
-        assertFalse(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}").isPresent());
-        assertFalse(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/1\",\"fp\":\"sha256:xyz\"}").isPresent());
-        assertFalse(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/1\"}").isPresent());
+        assertFalse(extract("{\"v\":2,\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}").isPresent());
+        assertFalse(extract("{\"v\":\"1\",\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}").isPresent());
+        assertFalse(extract("{\"v\":1,\"port\":0,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}").isPresent());
+        assertFalse(extract("{\"v\":1,\"port\":65536,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}").isPresent());
+        assertFalse(extract("{\"v\":1,\"port\":25565.5,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}").isPresent());
+        assertFalse(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/1\",\"fp\":\"" + fp + "\"}").isPresent());  // unreleased pre-preamble format
+        assertFalse(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"sha256:xyz\"}").isPresent());
+        assertFalse(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/2\"}").isPresent());
         assertFalse(extract("[]").isPresent());
         assertFalse(Advertisement.extract(VANILLA).isPresent());
         assertFalse(Advertisement.extract("not json").isPresent());
