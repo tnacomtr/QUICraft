@@ -613,6 +613,30 @@ with TCP (QUIC's faster join pays for most of the slower chunk load); the chunk-
 is still ~0.45 RTT behind. Next lever: the initial window (`initialCongestionWindowPackets`,
 docs/protocol.md §9), not measured yet.
 
+### Initial window experiment (branch exp/initial-cwnd, not merged)
+
+QUIC minus TCP, difference of medians with a 95% bootstrap interval, Fabric server, BBR, N=10 per
+arm, run back to back on c04d641 (each server's `-Dquicraft.initialCwndPackets` checked in its java
+command line):
+
+| Initial window | Run | Profile | Join | Chunk load | Join + chunk load | Play RTT |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10 packets (quiche default) | `20261011T181541Z-fabric-tcp-quic` | clean | -135.2 [-159.1, -88.1] | +31.4 [-45.4, +202.5] | -74.0 [-155.0, +55.4] | +0.2 [+0.1, +0.4] |
+| 10 packets (quiche default) | `20261011T181541Z-fabric-tcp-quic` | delay | -15.0 [-31.9, +17.7] | +179.5 [-22.7, +275.9] | +148.6 [-20.8, +277.7] | +0.2 [+0.1, +0.4] |
+| 32 packets | `20261011T183004Z-fabric-tcp-quic` | clean | -140.0 [-173.1, -85.4] | -23.0 [-59.9, +41.6] | -135.2 [-213.9, -72.9] | +0.2 [+0.1, +0.2] |
+| 32 packets | `20261011T183004Z-fabric-tcp-quic` | delay | -111.1 [-130.6, -62.1] | +85.9 [+65.4, +119.9] | +6.9 [-36.7, +28.2] | +0.2 [+0.1, +0.2] |
+| 64 packets | `20261011T184452Z-fabric-tcp-quic` | delay | -91.3 [-149.2, -63.5] | -95.5 [-166.0, -76.2] | -188.8 [-283.9, -148.0] | +0.2 [+0.2, +0.3] |
+
+The setting was verified in each arm's java command line. The 10-packet arm ran with
+`-Dquicraft.congestionControl=BBR` only. The 32-packet arm's added `-Dquicraft.initialCwndPackets=32`,
+and the 64-packet arm's added `-Dquicraft.initialCwndPackets=64`.
+
+At +150 ms the chunk-load gap shrinks as the window grows, from +179.5 ms (10 packets, intervals
+overlap) to +85.9 ms (32, no overlap) to -95.5 ms (64, no overlap), so a larger initial window
+closes it and at 64 packets QUIC leads TCP. On the clean link the difference moves from +31.4 to
+-23.0 ms, both intervals overlapping, so these runs do not show a clean-link regression but cannot
+resolve one.
+
 ### Play RTT on a clean link: not closed
 
 End to end, current code, Fabric, clean, N=10 (run `20261011T122358Z-fabric-tcp-quic`): TCP
