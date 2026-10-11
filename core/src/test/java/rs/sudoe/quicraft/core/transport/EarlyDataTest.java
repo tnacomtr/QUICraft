@@ -200,6 +200,23 @@ class EarlyDataTest {
         }
     }
 
+    /** The connection dies before the server's preamble arrives: the game must still see it close. */
+    @Test
+    void aConnectionLostBeforeTheServersPreambleStillClosesForTheGame() throws Exception {
+        ServerIdentity identity = ServerIdentity.generate();
+        TransportConfig shortIdle = TransportConfig.builder().maxIdleTimeout(500, TimeUnit.MILLISECONDS).build();
+        try (GameServer game = new GameServer(identity); DelayRelay relay = new DelayRelay(game.address(), 50)) {
+            QuicByteStream stream = QuicClient.connect(relay.address(), identity.fingerprint(), shortIdle)
+                    .get(5, TimeUnit.SECONDS);
+            // The server's preamble is a round trip behind the client's connect: it never arrives.
+            relay.dropFromServer(true);
+            Loopback.Collector collector = new Loopback.Collector();
+            stream.setListener(collector);
+            stream.setAutoRead(true);
+            assertTrue(collector.closed.await(5, TimeUnit.SECONDS), "the idle timeout must reach the game");
+        }
+    }
+
     @Test
     void zeroRttRejectedByARestartedServerStillArrivesOnce() throws Exception {
         ServerIdentity identity = ServerIdentity.generate();
@@ -233,18 +250,17 @@ class EarlyDataTest {
         ServerIdentity identity = ServerIdentity.generate();
         try (GameServer game = new GameServer(identity); DelayRelay relay = new DelayRelay(game.address(), 100)) {
             Join.run(relay, identity, "inputs", FLIGHT).closeAfterTicket(relay);
+            relay.dropFromServer(true); // the client never hears from the server
             EarlyFlight early = new EarlyFlight("inputs");
             CompletableFuture<QuicByteStream> attempt = QuicClient.connect(relay.address(), identity.fingerprint(),
                     TransportConfig.DEFAULT, early);
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (!early.sent() && System.nanoTime() < deadline) {
-                Thread.sleep(1);
-            }
+            // The server acts on the 0-RTT flight; cancelling only after that keeps the test
+            // independent of when the client's packets leave its socket.
+            GameServer.Accepted accepted = game.awaitAccepted(1, 2, TimeUnit.SECONDS);
             assertTrue(early.sent());
             // TCP won before the client heard from the server: quiche closes without a
             // CONNECTION_CLOSE, so the server's deadline has to end the login it started.
             attempt.cancel(false);
-            GameServer.Accepted accepted = game.awaitAccepted(1, 2, TimeUnit.SECONDS);
             assertTrue(accepted.closed.await(2, TimeUnit.SECONDS), "the deadline must close it");
         }
     }

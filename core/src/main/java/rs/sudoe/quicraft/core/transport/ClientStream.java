@@ -69,6 +69,18 @@ public final class ClientStream extends PreambleStream {
         }
     }
 
+    /**
+     * Without 0-RTT data the gate waits only for the server's preamble, and nothing is kept
+     * before it: if the connection ends first, the game must still see the close. (With 0-RTT
+     * data the game's own first flight opens the gate, as usual.)
+     */
+    @Override
+    void onClosedBeforeGate(Throwable cause) {
+        if (sentEarly == null) {
+            openGate();
+        }
+    }
+
     @Override
     public void write(ByteBuffer data) {
         boolean open = false;
