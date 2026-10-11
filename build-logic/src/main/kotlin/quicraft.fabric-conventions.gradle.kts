@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Fabric hook group for 26.x + 1.21.11 (docs/version-matrix.md): one shared source tree
-// (fabric/), one module per jar. The module applies Loom first: net.fabricmc.fabric-loom for
+// (fabric/), one module per jar, plus a small per-module source dir (src/client/java) for the
+// calls that differ between them. The module applies Loom first: net.fabricmc.fabric-loom for
 // unobfuscated 26.x, net.fabricmc.fabric-loom-remap (Mojang names in source, Intermediary in the
 // jar) for 1.21.11. Module gradle.properties set:
 //   minecraftVersion   game version compiled and run against (override: -P<module>.minecraft=…
@@ -39,7 +40,8 @@ sourceSets {
         resources.setSrcDirs(listOf(shared.dir("main/resources")))
     }
     named("client") {
-        java.setSrcDirs(listOf(shared.dir("client/java")))
+        // Plus the module's own src/client/java: the few classes whose calls differ per jar.
+        java.setSrcDirs(listOf(shared.dir("client/java"), layout.projectDirectory.dir("src/client/java")))
         resources.setSrcDirs(listOf(shared.dir("client/resources")))
     }
 }

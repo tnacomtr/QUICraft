@@ -22,7 +22,9 @@ The 26.x + 1.21.11 Fabric hook group shares one source tree (`fabric/`) and buil
 decompiled 1.21.11 and 26.1.2 (Oct 2026): every hook target and the client pipeline the mod
 rebuilds are the same in both, so no split beyond the two jars (details:
 docs/platforms/fabric.md). `fabric-26x` is built against 26.1.2; its classes compiled against
-26.1, 26.1.1, 26.2 and 26.3 are byte-identical, and the client gametests pass on each.
+26.1, 26.1.1, 26.2 and 26.3 are byte-identical, and the client gametests pass on each (re-checked
+2026-10-11). 26.2 moved the current screen from `Minecraft` to `Minecraft.gui`; each module's own
+`src/client/java/.../Screens.java` covers that (docs/platforms/fabric.md).
 
 Fabric API is not a dependency of the mod. The gametests use it (test-only):
 

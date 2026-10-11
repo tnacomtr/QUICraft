@@ -18,6 +18,7 @@ import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.client.QuicraftClient;
+import rs.sudoe.quicraft.fabric.client.Screens;
 
 /**
  * quic-only (debugging): joins over QUIC when QUIC works, and when it doesn't, ends on the
@@ -47,7 +48,7 @@ public class QuicOnlyGameTest implements FabricClientGameTest {
                     ServerAddress.parseString(address), new ServerData("quic-only", address, ServerData.Type.OTHER),
                     false, null));
             // QUIC's own connect timeout is 10 s; the screen must come back after it.
-            context.waitFor(c -> c.screen instanceof DisconnectedScreen, 20 * 20);
+            context.waitFor(c -> Screens.current(c) instanceof DisconnectedScreen, 20 * 20);
             check(!GameTests.connectedOverQuic(context), "no connection");
             context.setScreen(TitleScreen::new);
         } finally {

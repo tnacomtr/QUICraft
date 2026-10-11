@@ -83,7 +83,7 @@ public final class EarlyJoins {
                 request.address());
         // The TCP address, not the connection's: over QUIC that is the UDP port, which may differ.
         tcpOnce = currentTcp;
-        minecraft.setScreen(request.parent()); // startConnecting refuses while a ConnectScreen shows
+        Screens.set(minecraft, request.parent()); // startConnecting refuses while a ConnectScreen shows
         ConnectScreen.startConnecting(request.parent(), minecraft, request.address(), request.data(),
                 request.quickPlay(), request.transferState());
         return true;

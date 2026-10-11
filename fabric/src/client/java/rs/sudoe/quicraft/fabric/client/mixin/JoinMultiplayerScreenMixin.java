@@ -11,6 +11,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.client.QuicraftSettingsScreen;
+import rs.sudoe.quicraft.fabric.client.Screens;
 
 /** A small "QUICraft" button in the multiplayer screen's top right corner opens the settings. */
 @Mixin(JoinMultiplayerScreen.class)
@@ -25,7 +26,7 @@ abstract class JoinMultiplayerScreenMixin extends Screen {
             Hooks.enter("settings button");
             Screen self = this;
             addRenderableWidget(Button.builder(Component.translatable("quicraft.settings.button"),
-                    button -> minecraft.setScreen(new QuicraftSettingsScreen(self)))
+                    button -> Screens.set(minecraft, new QuicraftSettingsScreen(self)))
                     .bounds(width - 86, 6, 80, 20).build());
         } catch (Throwable t) {
             Hooks.failed("settings button", t);

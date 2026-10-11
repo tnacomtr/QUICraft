@@ -528,7 +528,7 @@ single-use token (protocol.md §8; needs netty/0003, §11).
 
 ### No desync, fault injection, fallback
 
-The client gametests (docs/platforms/fabric.md) pass on 26.1, 26.1.1, 26.1.2, 26.2, 26.3 and
+The client gametests (docs/platforms/fabric.md; last run on all six 2026-10-11) pass on 26.1, 26.1.1, 26.1.2, 26.2, 26.3 and
 1.21.11: the scripted play session (block bursts, entities, client and server movement, inventory,
 weather, a far teleport into freshly generated chunks) compares client and server state at every
 step over QUIC and, with every hook throwing, over TCP; dead UDP port and fingerprint mismatch fall

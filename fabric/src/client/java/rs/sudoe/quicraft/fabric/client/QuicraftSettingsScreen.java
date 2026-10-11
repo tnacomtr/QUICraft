@@ -75,6 +75,6 @@ public final class QuicraftSettingsScreen extends Screen {
 
     @Override
     public void onClose() {
-        minecraft.setScreen(parent);
+        Screens.set(minecraft, parent);
     }
 }

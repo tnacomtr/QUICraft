@@ -6,6 +6,12 @@ source, remapped to Intermediary by Loom, Java 21). Read from the decompiled gam
 `genSources`, kept local, never committed) for 1.21.11 and 26.1.2. Every hook below was checked
 in both, and the gametests run on each version (see Tests).
 
+Calls that differ between the jars live in each module's own `src/client/java`, next to the
+shared tree. So far that is only `Screens`: 26.2 moved the current screen from `Minecraft`
+(`setScreen`, `screen`) to `Minecraft.gui` (`Gui.setScreen`, `Gui.screen()`). The `fabric-26x`
+copy resolves whichever exists at runtime by name (26.x is unobfuscated, so the names hold); the
+`fabric-1.21.11` copy calls `Minecraft` directly and is remapped by Loom.
+
 ## What runs where
 
 | Side | Hook (class, method) | What QUICraft does there | On failure |
@@ -125,9 +131,13 @@ xvfb-run -a ./gradlew :fabric-26x:runClientGameTest :fabric-1.21.11:runClientGam
 xvfb-run -a ./gradlew :fabric-26x:runClientGameTest -Pfabric-26x.minecraft=26.3 -Pfabric-26x.fabricApi=0.162.0+26.3
 ```
 
-Results (2026-10-10): all pass on 26.1, 26.1.1, 26.1.2, 26.2, 26.3 and 1.21.11. The mod classes
-compiled against each 26.x version are byte-identical, so the single jar built against 26.1.2 is
-the one tested on every 26.x release.
+Results (2026-10-11, commit after 5026691): all pass on 26.1, 26.1.1, 26.1.2, 26.2, 26.3 and
+1.21.11, each with five 0-RTT joins and the TCP retry after a first-flight mismatch. The mod
+classes compiled against each 26.x version are byte-identical (31 classes), so the single jar
+built against 26.1.2 is the one tested on every 26.x release. Between the settings screen
+(4a27c12) and this fix the client didn't compile against 26.2 and 26.3, and the 26.1.2 jar would
+have failed there with `NoSuchMethodError` wherever it switched screens (settings button, 0-RTT
+TCP retry); CI's `fabric-gametest` matrix caught it.
 
 Harness notes:
 
