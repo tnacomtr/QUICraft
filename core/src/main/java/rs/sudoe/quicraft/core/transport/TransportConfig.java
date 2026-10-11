@@ -17,6 +17,7 @@ public final class TransportConfig {
     final long initialMaxData;
     final long initialMaxStreamData;
     final CongestionControl congestionControl;
+    final int initialCongestionWindowPackets;
     final boolean earlyData;
     final boolean sessionResumption;
     final boolean relaxedLossThreshold;
@@ -26,6 +27,7 @@ public final class TransportConfig {
         this.initialMaxData = b.initialMaxData;
         this.initialMaxStreamData = b.initialMaxStreamData;
         this.congestionControl = b.congestionControl;
+        this.initialCongestionWindowPackets = b.initialCongestionWindowPackets;
         this.earlyData = b.earlyData;
         this.sessionResumption = b.sessionResumption;
         this.relaxedLossThreshold = b.relaxedLossThreshold;
@@ -37,6 +39,11 @@ public final class TransportConfig {
 
     public CongestionControl congestionControl() {
         return congestionControl;
+    }
+
+    /** 0 = quiche's default (10 packets). System property {@code quicraft.initialCwndPackets}, for experiments. */
+    public int initialCongestionWindowPackets() {
+        return initialCongestionWindowPackets;
     }
 
     /**
@@ -58,11 +65,25 @@ public final class TransportConfig {
         }
     }
 
+    /**
+     * 0 = quiche's default (10 packets). System property
+     * {@code quicraft.initialCwndPackets}, for experiments.
+     */
+    private static int defaultInitialCwndPackets() {
+        try {
+            int packets = Integer.parseInt(System.getProperty("quicraft.initialCwndPackets", "0").trim());
+            return packets >= 1 && packets <= 1000 ? packets : 0;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
     public static final class Builder {
         private long maxIdleTimeoutMillis = TimeUnit.SECONDS.toMillis(60);
         private long initialMaxData = 16L << 20;
         private long initialMaxStreamData = 8L << 20;
         private CongestionControl congestionControl = defaultCongestionControl();
+        private int initialCongestionWindowPackets = defaultInitialCwndPackets();
         private boolean earlyData = true;
         private boolean sessionResumption = true;
         private boolean relaxedLossThreshold = true;
@@ -84,6 +105,11 @@ public final class TransportConfig {
 
         public Builder congestionControl(CongestionControl algorithm) {
             this.congestionControl = algorithm;
+            return this;
+        }
+
+        public Builder initialCongestionWindowPackets(int packets) {
+            this.initialCongestionWindowPackets = packets;
             return this;
         }
 

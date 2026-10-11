@@ -77,6 +77,25 @@ class QuicLoopbackTest {
     }
 
     @Test
+    void echoesBytesWithACustomInitialCongestionWindow() throws Exception {
+        CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
+        try (QuicServer server = Loopback.echoServer(identity, accepted)) {
+            TransportConfig config = TransportConfig.builder().initialCongestionWindowPackets(32).build();
+            QuicByteStream stream = QuicClient.connect(server.localAddress(), identity.fingerprint(),
+                    config).get(5, TimeUnit.SECONDS);
+            Loopback.Collector collector = new Loopback.Collector();
+            stream.setListener(collector);
+            stream.setAutoRead(true);
+
+            byte[] hello = "hello with a bigger initial window".getBytes(StandardCharsets.UTF_8);
+            stream.write(ByteBuffer.wrap(hello));
+            stream.flush();
+            assertArrayEquals(hello, collector.await(hello.length, 5, TimeUnit.SECONDS));
+            stream.close();
+        }
+    }
+
+    @Test
     void movesFourMebibytesEachWayWithoutStalling() throws Exception {
         CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
         try (QuicServer server = Loopback.echoServer(identity, accepted)) {

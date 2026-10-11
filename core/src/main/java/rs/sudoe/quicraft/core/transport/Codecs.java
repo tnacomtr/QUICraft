@@ -19,7 +19,7 @@ final class Codecs {
         if (QuicSupport.hasRelaxedLossThreshold()) {
             builder.relaxedLossThreshold(config.relaxedLossThreshold);
         }
-        return builder
+        B configured = builder
                 .maxIdleTimeout(config.maxIdleTimeoutMillis, TimeUnit.MILLISECONDS)
                 .initialMaxData(config.initialMaxData)
                 .initialMaxStreamDataBidirectionalLocal(config.initialMaxStreamData)
@@ -30,6 +30,10 @@ final class Codecs {
                 .initialMaxStreamsUnidirectional(0)
                 .activeMigration(false)
                 .congestionControlAlgorithm(algorithm(config.congestionControl));
+        if (config.initialCongestionWindowPackets() > 0) {
+            configured.initialCongestionWindowPackets(config.initialCongestionWindowPackets());
+        }
+        return configured;
     }
 
     private static QuicCongestionControlAlgorithm algorithm(TransportConfig.CongestionControl cc) {
