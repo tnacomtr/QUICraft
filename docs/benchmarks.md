@@ -39,6 +39,17 @@ Defined in `testkit/netem/profiles.sh`; every value is per direction.
 | delayloss | `delay 75ms loss 2%` | both: loss recovery that has a real round trip to wait for |
 | reorder | `delay 10ms reorder 25% 50%` | 25% of packets (50% correlated) skip the 10 ms delay and overtake earlier ones |
 
+**Segmentation offload (changed 2026-10-11).** netem drops whole packets. Until 2026-10-11 the
+containers kept segmentation offload on, so the server's TCP handed netem packets of many
+segments and TCP saw a fraction of the configured loss: in one TCP and one QUIC join under
+`loss`, netem dropped 10 of TCP's ~500 offloaded server-to-client packets (3,264 segments, about
+0.3% of segments) and 263 of QUIC's 12,892 datagrams (2.0%). Since then, every profile except
+`clean` caps segmentation at one segment per packet on both ends, and TCP loses 2.1% (69 of
+3,287). **Every loss and delayloss row dated before 2026-10-11 (Phase 0 baseline, Phase 1, 2 and
+3) was taken with offloads on**, so its TCP side had ~0.3% effective loss; the Phase 0 loss
+reference values are from that harness too. Delay and reorder rows are affected less (no drops),
+clean not at all. See "Phase 3 gaps" below.
+
 ### Metrics
 
 Each join ("run") records:
@@ -411,7 +422,7 @@ testkit's Fabric image, committed with this section).
 | clean | chunk load | 379 ms | 390 ms | +10 ms [−37, +54] |
 | clean | play RTT | 0.37 ms | 0.51 ms | +0.14 ms [+0.08, +0.21] |
 | loss 2% | join | 346 ms | 217 ms | −129 ms [−247, −83] |
-| loss 2% | chunk load | 400 ms | 445 ms | +45 ms [+4, +94] |
+| loss 2% | chunk load | 400 ms | 445 ms | +45 ms [+4, +94] (offloads on: TCP saw ~0.3% loss; closed below) |
 | loss 2% | play RTT | 0.35 ms | 0.47 ms | +0.11 ms [+0.07, +0.15] |
 | delay +150 ms | join | 1330 ms | 1350 ms | +20 ms [−11, +37] |
 | delay +150 ms | chunk load | 1011 ms | 1079 ms | +68 ms [−84, +75] |
@@ -542,3 +553,92 @@ weather, a far teleport into freshly generated chunks) compares client and serve
 step over QUIC and, with every hook throwing, over TCP; dead UDP port and fingerprint mismatch fall
 back to TCP (join to rendered world 1.75–1.85 s and 1.25–1.35 s, against about 0.7 s normally;
 both include the world load).
+
+## Phase 3 gaps (2026-10-11)
+
+The three gaps left at the Phase 3 report: chunk load under loss, play RTT on a clean link, and
+0-RTT with the real client through Velocity.
+
+### Chunk load under loss: closed (it was the harness)
+
+netem's own counters (now printed after every bench run) showed that **the harness undercounted
+TCP's losses**: with segmentation offload on, TCP saw ~0.3% loss under the 2% profile, QUIC 2%
+(see "netem profiles" above). Fixed in the harness (commit 7ef8a94). With TCP facing the same
+loss, QUIC is not slower.
+
+Fabric target, online mode, TCP and QUIC back to back, offloads capped, current code (commit
+b152f2b, run `20261011T125228Z-fabric-tcp-quic`), N=20 each, 0 disconnects, 0 failed runs:
+
+| Profile | Metric | TCP | QUIC | QUIC − TCP [95% CI] |
+| --- | --- | --- | --- | --- |
+| loss 2% | join | 355 ms | 237 ms | −118 ms [−156, −82] |
+| loss 2% | chunk load | 597 ms | 434 ms | **−164 ms [−247, +20]** |
+| loss 2% | play RTT | 0.40 ms | 0.56 ms | +0.16 ms [+0.12, +0.19] |
+
+Chunk load is bimodal under loss (TCP's median was 419–597 ms across today's runs), so read the
+CI, not the median gap: QUIC is not slower.
+
+**Tried and reverted: coalescing stream writes.** Netty's QUIC stream asks quiche for packets on
+every write, and Minecraft writes once per game packet, so chunk bursts leave in small packets:
+415 bytes on average against TCP's 1366 (12,892 server-to-client datagrams for two joins under
+`loss`). Handing writes to Netty once per event-loop pass (commit 40670fb) brought that to about
+1,110 bytes (4,054 datagrams; through Velocity 2,284 packets for 2.1 MB instead of 34,645 for
+3.5 MB). But on a clean link it leaned the wrong way, N=10 per run, Fabric: play RTT +0.28 and
++0.29 ms against TCP with every write deferred, +0.21 ms with the first write per pass sent at
+once (current code in the same conditions: +0.20 ms), and clean chunk load +24, +57 and +49 ms
+(current code: −20 ms). Under loss it measured +10 ms [−67, +55] pooled over 40 joins, no better
+than the current code. Reverted (b152f2b); worth another look for proxy CPU per player (Phase 9),
+where a third of the packets matters more than here.
+
+**Open: chunk load at +150 ms RTT is ~70 ms slower over QUIC.** Phase 3 (current code): +68 ms;
+with coalescing (run `20261011T114704Z-fabric-tcp-quic`, N=10): +71 ms [+49, +79]. QUIC runs on
+Netty's defaults, 1350-byte UDP payloads and quiche's 10-packet initial window, so ~11% less data
+per packet than TCP's 1448-byte segments; that explains perhaps 20 ms. The rest is not explained
+yet. Not one of the three gaps this section set out to close, but a regression all the same.
+
+### Play RTT on a clean link: not closed
+
+End to end, current code, Fabric, clean, N=10 (run `20261011T122358Z-fabric-tcp-quic`): TCP
+0.43 ms, QUIC 0.63 ms, **+0.20 ms [+0.11, +0.25]** (Phase 3: +0.14 ms; this machine measured
+slower all day, see below). Under loss: +0.16 ms [+0.12, +0.19].
+
+In-process (`quicraft-testkit latency`, 16-byte ping-pong on loopback, hosted QUIC against Netty
+NIO TCP), p50 by the idle time between pings:
+
+| Gap between pings | TCP | Hosted QUIC | QUIC − TCP |
+| --- | --- | --- | --- |
+| 0 (busy threads) | 52 µs | 87 µs | +35 µs |
+| 0.5 ms | 97 µs | 139 µs | +42 µs |
+| 2 ms | 202 µs | 311 µs | +109 µs |
+| 20 ms (game ticks) | 392 µs | 553 µs | +161 µs |
+| 50 ms | 406 µs | 585 µs | +179 µs |
+
+Per-hop trace at 20 ms (p50): client write → UDP send 69 µs, server UDP read → stream 54 µs,
+server reply → UDP send 38 µs, client UDP read → stream 32 µs: about 190 µs of QUIC processing
+per round trip, all of it synchronous on one thread. A CPU profile (async-profiler, local tool
+only) puts QUIC's user-space CPU per round trip at a few µs warm: the cost is that work running
+on CPUs that idled in between (clock and caches), which TCP does in the kernel. The same code
+measures the same today as at Phase 2's commit (550–556 µs), and Netty build quicraft2 the same
+as quicraft3; Phase 2's 485 µs was this machine on a faster day.
+
+What would close it, all outside this change:
+- **Busy-polling** the event loop briefly before it sleeps: keeps the CPU awake, at a CPU cost
+  on every server and client. It can only reach the warm floor, +35 µs, not zero.
+- **Fewer instructions per packet** in Netty QUIC / quiche. A quiche change only reaches
+  linux-x86_64 (every other platform runs upstream natives), so it can't close a client-side gap.
+- **Accept it**: ~0.1–0.3 ms per round trip, against Minecraft's 50 ms tick and a ping display in
+  whole milliseconds.
+
+### 0-RTT through Velocity with the real client: closed (offline mode)
+
+`testkit/run-real-client.sh` (commit b152f2b): the real 26.1.2 Fabric client against the testkit's
+Velocity → Paper, offline mode. First join over QUIC, in the world after 1744 ms; disconnect as
+the pause menu does; rejoin over QUIC with 0-RTT, in the world after 551 ms; 5 s in the world each
+time, no disconnect. Velocity's `earlyReleases` went from 0 to 1, so it acted on the 0-RTT data.
+Online mode isn't covered with the real client: its authlib finds the session server through a
+discovery URL the testkit's mock doesn't serve. (The headless client covers online-mode 0-RTT
+through Velocity, 10 of 10, earlier in this file.)
+
+The first attempt failed with "You are already connected to this proxy!": the test disconnected
+with `Minecraft.disconnect`, which leaves the network connection open (the pause menu closes it
+first through `disconnectFromWorld`). A bug in the test, not in QUICraft.

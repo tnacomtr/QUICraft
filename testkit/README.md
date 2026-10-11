@@ -68,7 +68,27 @@ docker compose -f testkit/docker/compose.yaml run --rm -e NETEM_PROFILE=loss ben
 `--verbose` prints the first arrival of every packet type with its protocol state, which helps
 when a join stalls.
 
+### Real client through Velocity
+
+```sh
+testkit/run-real-client.sh
+```
+
+Starts Velocity → Paper (offline mode) with Velocity's port published on `127.0.0.1:25565`, TCP and
+UDP, then runs the Fabric client gametests with `ExternalServerGameTest` pointed at it. The real
+26.1.2 client joins over QUIC, stays in the world for 5 s, disconnects as the pause menu does, and
+rejoins, which must use 0-RTT. Velocity runs with `-Dquicraft.logStats=true`; the script checks
+that its early-release count goes from 0 to 1 over the two connections and saves Velocity's log
+under `results/`. Needs a display or `xvfb-run`, and port 25565 free. Offline mode only: the
+client's authlib finds its session server through a discovery URL the mock doesn't serve.
+
 ## Notes
+
+- netem's counters: every bench run ends by printing the packets, bytes and drops netem handled
+  in each direction. With a netem profile active, both ends send one segment per packet
+  (`gso_max_segs 1`): netem drops whole packets, and with segmentation offload a TCP packet could
+  hold dozens of segments, so TCP saw a fraction of the configured loss (0.3% instead of 2%
+  before 2026-10-11; docs/benchmarks.md). `clean` keeps the offloads, as real NICs do.
 
 - Server jars are downloaded at image build time and checked against pinned sha256 sums (see the
   Dockerfiles). Paperclip downloads and patches the Mojang server jar during the build. Nothing

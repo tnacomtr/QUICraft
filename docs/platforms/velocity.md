@@ -97,5 +97,10 @@ each release of the plugin.
   port taken, the plugin logs one WARN and Velocity runs TCP-only.
 - Phase 2 gate (2026-10-10): QUIC and TCP joins through the plugin in the Docker testkit, and the
   status-length cap against the real jar; numbers in docs/benchmarks.md.
+- Diagnostics: `-Dquicraft.logStats=true` logs each QUIC connection's stats when the player's
+  channel closes, with the listener's count of logins passed on 0-RTT data so far
+  (`earlyReleases=`). `testkit/run-real-client.sh` uses it to check that a real client's 0-RTT
+  rejoin was acted on (2026-10-11: real 26.1.2 Fabric client, offline mode, first join over QUIC
+  in the world after 1744 ms, 0-RTT rejoin after 551 ms, count 0 then 1).
 - `Settings`: `enabled`, `port` (0 = game port), `alternative-port` (0 = game port + 1, used
   when `[query]` is on the same UDP port).
