@@ -59,13 +59,20 @@ public final class QuicServer implements Closeable {
     private final Channel channel;
     private final Unconfirmed unconfirmed;
     private final java.util.concurrent.atomic.AtomicLong retries;
+    private final ConnectionAdmission admission;
 
     private QuicServer(EventLoopGroup group, Channel channel, Unconfirmed unconfirmed,
-            java.util.concurrent.atomic.AtomicLong retries) {
+            java.util.concurrent.atomic.AtomicLong retries, ConnectionAdmission admission) {
         this.group = group;
         this.channel = channel;
         this.unconfirmed = unconfirmed;
         this.retries = retries;
+        this.admission = admission;
+    }
+
+    /** Connections holding an open-connection lease whose handshake hasn't completed, for tests. */
+    int pendingHandshakes() {
+        return admission.pendingLeases();
     }
 
     /** Retry packets sent so far, for diagnostics and tests. */
@@ -100,7 +107,8 @@ public final class QuicServer implements Closeable {
             StreamAcceptor acceptor) throws Exception {
         Unconfirmed unconfirmed = new Unconfirmed();
         java.util.concurrent.atomic.AtomicLong retries = new java.util.concurrent.atomic.AtomicLong();
-        io.netty.channel.ChannelHandler codec = codec(identity, config, acceptor, unconfirmed, retries);
+        ConnectionAdmission admission = admission(config);
+        io.netty.channel.ChannelHandler codec = codec(identity, config, acceptor, unconfirmed, retries, admission);
         IngressGuard guard = IngressGuard.forConfig(config);
         EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
         try {
@@ -112,7 +120,7 @@ public final class QuicServer implements Closeable {
                         }
                     })
                     .bind(address).sync().channel();
-            return new QuicServer(group, channel, unconfirmed, retries);
+            return new QuicServer(group, channel, unconfirmed, retries, admission);
         } catch (Exception | Error e) {
             group.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
             throw e;
@@ -129,9 +137,10 @@ public final class QuicServer implements Closeable {
         HostedDatagramChannel channel = new HostedDatagramChannel(socket);
         Unconfirmed unconfirmed = new Unconfirmed();
         java.util.concurrent.atomic.AtomicLong retries = new java.util.concurrent.atomic.AtomicLong();
+        ConnectionAdmission admission = admission(config);
         try {
             channel.pipeline().addLast(IngressGuard.forConfig(config),
-                    codec(identity, config, acceptor, unconfirmed, retries));
+                    codec(identity, config, acceptor, unconfirmed, retries, admission));
         } catch (Exception | Error e) {
             socket.close();
             throw e;
@@ -142,7 +151,14 @@ public final class QuicServer implements Closeable {
         } else if (registered.isDone() && !registered.isSuccess()) {
             throw new IllegalStateException("registering the QUIC listener failed", registered.cause());
         }
-        return new QuicServer(null, channel, unconfirmed, retries);
+        return new QuicServer(null, channel, unconfirmed, retries, admission);
+    }
+
+    /** One per bind, like the Retry key inside the token handler: attempts and open-connection leases. */
+    private static ConnectionAdmission admission(TransportConfig config) {
+        return new ConnectionAdmission(
+                config.globalAttemptsPerSecond, config.perIpAttemptsPerSecond, config.maxOpen,
+                config.maxOpenPerIp, config.retryThresholdPerSecond, config.maxTrackedIps);
     }
 
     /** Deadline for a connection passed early to complete its handshake. Tests shorten it. */
@@ -155,13 +171,9 @@ public final class QuicServer implements Closeable {
     static volatile long handshakeMillis = 10_000;
 
     private static io.netty.channel.ChannelHandler codec(ServerIdentity identity, TransportConfig config,
-            StreamAcceptor acceptor, Unconfirmed unconfirmed, java.util.concurrent.atomic.AtomicLong retries)
-            throws Exception {
+            StreamAcceptor acceptor, Unconfirmed unconfirmed, java.util.concurrent.atomic.AtomicLong retries,
+            ConnectionAdmission admission) throws Exception {
         EarlyTokens tokens = new EarlyTokens();
-        // One per bind, like the Retry key inside the token handler.
-        ConnectionAdmission admission = new ConnectionAdmission(
-                config.globalAttemptsPerSecond, config.perIpAttemptsPerSecond, config.maxOpen,
-                config.maxOpenPerIp, config.retryThresholdPerSecond, config.maxTrackedIps);
         // Attempts with a valid token get their own budget; its open caps are unused.
         ConnectionAdmission validated = new ConnectionAdmission(
                 config.globalAttemptsPerSecond, config.perIpAttemptsPerSecond, 1, 1,
@@ -170,6 +182,11 @@ public final class QuicServer implements Closeable {
             LOG.warning("QUIC admission: maxTrackedIps (" + config.maxTrackedIps + ") is below maxOpen + "
                     + "globalAttemptsPerSecond (" + config.maxOpen + " + " + config.globalAttemptsPerSecond
                     + "); new addresses may be refused while the tracked ones fill it");
+        }
+        if (config.maxTrackedIps < config.ingressInitialsPerSecond) {
+            LOG.warning("QUIC admission: maxTrackedIps (" + config.maxTrackedIps + ") is below "
+                    + "ingressInitialsPerSecond (" + config.ingressInitialsPerSecond + "), and the ingress guard "
+                    + "shares that tracking limit; Initials from new addresses may be dropped while it is full");
         }
         QuicSslContext ssl = QuicSslContextBuilder
                 .forServer(identity.privateKey(), null, identity.certificate())
@@ -262,13 +279,20 @@ public final class QuicServer implements Closeable {
         @Override
         public void handlerAdded(ChannelHandlerContext ctx) {
             QuicChannel connection = (QuicChannel) ctx.channel();
-            deadline = ctx.executor().schedule(() -> {
-                if (!handshakeDone) {
-                    // Transport NO_ERROR: a real but slow client sees a failed handshake and falls
-                    // back to TCP.
-                    Codecs.closeLater(connection, false, 0x0);
-                }
-            }, handshakeMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+            try {
+                rs.sudoe.quicraft.core.Faults.check(rs.sudoe.quicraft.core.Faults.HANDSHAKE_DEADLINE);
+                deadline = ctx.executor().schedule(() -> {
+                    if (!handshakeDone) {
+                        // Transport NO_ERROR: a real but slow client sees a failed handshake and
+                        // falls back to TCP.
+                        Codecs.closeLater(connection, false, 0x0);
+                    }
+                }, handshakeMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (Throwable t) {
+                // E.g. RejectedExecutionException from a hosted loop shutting down. The handler
+                // stays, so the lease is still confirmed and released.
+                LOG.log(Level.FINE, "scheduling the QUIC handshake deadline failed; this connection has none", t);
+            }
         }
 
         @Override

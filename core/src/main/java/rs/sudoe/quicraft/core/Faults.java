@@ -21,6 +21,8 @@ public final class Faults {
     public static final String EARLY_TOKEN_REDEEM = "early token redeem";
     /** The QUIC attempt fails right after its 0-RTT data went out: TCP wins with a login started. */
     public static final String EARLY_ABANDON = "early abandon";
+    /** Scheduling a server connection's handshake deadline fails (docs/protocol.md §9). */
+    public static final String HANDSHAKE_DEADLINE = "handshake deadline";
 
     private static volatile Set<String> stages = Collections.emptySet();
 

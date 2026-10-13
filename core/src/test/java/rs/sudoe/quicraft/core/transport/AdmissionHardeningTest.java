@@ -23,8 +23,29 @@ class AdmissionHardeningTest {
         return new InetSocketAddress(InetAddress.getByName("192.0.2." + lastOctet), 40000);
     }
 
-    private static ByteBuf dcid() {
-        return Unpooled.wrappedBuffer(new byte[] {1, 2, 3, 4, 5, 6, 7, 8});
+    /** Every buffer a test allocates, released in {@link #releaseAll()}. */
+    private final java.util.List<ByteBuf> buffers = new java.util.ArrayList<>();
+
+    private ByteBuf buf() {
+        ByteBuf b = Unpooled.buffer();
+        buffers.add(b);
+        return b;
+    }
+
+    private ByteBuf dcid() {
+        ByteBuf b = Unpooled.wrappedBuffer(new byte[] {1, 2, 3, 4, 5, 6, 7, 8});
+        buffers.add(b);
+        return b;
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void releaseAll() {
+        for (ByteBuf b : buffers) {
+            if (b.refCnt() > 0) {
+                b.release();
+            }
+        }
+        buffers.clear();
     }
 
     private static ConnectionAdmission admission(int global, int perIp, int maxOpen) {
@@ -37,13 +58,13 @@ class AdmissionHardeningTest {
         AdmissionTokenHandler handler = new AdmissionTokenHandler(admission(2, 2, 10), admission(2, 2, 1),
                 TransportConfig.RetryMode.NEVER, retries);
         // Two token-less attempts from other IPs use up the token-less global budget...
-        assertFalse(handler.writeToken(Unpooled.buffer(), dcid(), client(1)));
-        assertFalse(handler.writeToken(Unpooled.buffer(), dcid(), client(2)));
+        assertFalse(handler.writeToken(buf(), dcid(), client(1)));
+        assertFalse(handler.writeToken(buf(), dcid(), client(2)));
         // ...so the next one is refused with a Retry, whose token the client brings back.
-        ByteBuf token = Unpooled.buffer();
+        ByteBuf token = buf();
         assertTrue(handler.writeToken(token, dcid(), client(9)), "an attempt over the limit gets a Retry");
         for (int i = 10; i < 50; i++) {
-            assertTrue(handler.writeToken(Unpooled.buffer(), dcid(), client(i)), "the token-less flood gets Retries");
+            assertTrue(handler.writeToken(buf(), dcid(), client(i)), "the token-less flood gets Retries");
         }
         assertTrue(handler.validateToken(token, client(9)) > 0,
                 "a valid token spends the separate validated budget, which the flood didn't touch");
@@ -55,17 +76,32 @@ class AdmissionHardeningTest {
         ConnectionAdmission admission = admission(100, 100, 4);
         AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, admission(100, 100, 1),
                 TransportConfig.RetryMode.ADAPTIVE, new AtomicLong());
-        assertFalse(handler.writeToken(Unpooled.buffer(), dcid(), client(1)), "no Retry at low load");
+        assertFalse(handler.writeToken(buf(), dcid(), client(1)), "no Retry at low load");
         assertEquals(0, admission.pendingLeases(), "the open-slot probe leaves pending unchanged");
 
         ConnectionAdmission.Lease pending = admission.tryAcquire(client(1).getAddress());
-        assertTrue(handler.writeToken(Unpooled.buffer(), dcid(), client(2)), "1 of 4 pending forces Retry");
+        assertTrue(handler.writeToken(buf(), dcid(), client(2)), "1 of 4 pending forces Retry");
         assertEquals(1, admission.pendingLeases(), "the probe left pending unchanged");
 
         pending.confirm();
-        assertFalse(handler.writeToken(Unpooled.buffer(), dcid(), client(3)), "confirmed: no Retry");
+        assertFalse(handler.writeToken(buf(), dcid(), client(3)), "confirmed: no Retry");
         pending.close();
         assertEquals(0, admission.pendingLeases());
+    }
+
+    @Test
+    void neverStillForcesRetryOnAHandshakeBacklog() throws Exception {
+        ConnectionAdmission admission = admission(100, 100, 4);
+        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, admission(100, 100, 1),
+                TransportConfig.RetryMode.NEVER, new AtomicLong());
+        assertFalse(handler.writeToken(buf(), dcid(), client(1)), "NEVER: no Retry for an admitted attempt");
+
+        ConnectionAdmission.Lease pending = admission.tryAcquire(client(1).getAddress());
+        assertTrue(handler.writeToken(buf(), dcid(), client(2)),
+                "a handshake backlog is refusal-class: Retry even in NEVER");
+        pending.confirm();
+        assertFalse(handler.writeToken(buf(), dcid(), client(3)), "backlog gone: no Retry again");
+        pending.close();
     }
 
     /** A datagram of {@code size} bytes starting with a long-header Initial (QUIC v1). */
