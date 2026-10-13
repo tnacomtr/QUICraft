@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -25,13 +26,18 @@ import org.junit.jupiter.api.Test;
  * only the package-private API with a fixed or injected clock; no pipeline is involved.
  *
  * <p>Non-expiry behavior uses {@link #FROZEN} so no window can roll over mid-test. Only the
- * window-expiry tests advance an injected {@link AtomicLong} clock.
+ * window-expiry tests advance an injected {@link AtomicLong} clock. Every test-owned lease is
+ * registered through {@link #owned(ConnectionAdmission.Lease)} so it is closed even when an
+ * assertion fails; production {@code close()} is idempotent.
  */
 class ConnectionAdmissionTest {
     private static final long WINDOW = 1_000_000_000L;
 
     /** A clock frozen in time so attempt budgets never roll over during a test. */
     private static final LongSupplier FROZEN = () -> 0L;
+
+    private final ConcurrentLinkedQueue<ConnectionAdmission.Lease> ownedLeases =
+            new ConcurrentLinkedQueue<>();
 
     private static InetAddress addr(int lastOctet) {
         try {
@@ -46,6 +52,22 @@ class ConnectionAdmissionTest {
             return InetAddress.getByName("198.51.100." + lastOctet);
         } catch (UnknownHostException e) {
             throw new AssertionError(e);
+        }
+    }
+
+    /** Registers a test-owned lease for {@link #closeOwnedLeases()} and returns it unchanged. */
+    private ConnectionAdmission.Lease owned(ConnectionAdmission.Lease lease) {
+        if (lease != null) {
+            ownedLeases.add(lease);
+        }
+        return lease;
+    }
+
+    @AfterEach
+    void closeOwnedLeases() {
+        ConnectionAdmission.Lease lease;
+        while ((lease = ownedLeases.poll()) != null) {
+            lease.close();
         }
     }
 
@@ -119,11 +141,11 @@ class ConnectionAdmissionTest {
         ConnectionAdmission a = new ConnectionAdmission(1, 1, 1, 1, 1, 2, FROZEN);
         assertTrue(a.allowAttempt(addr(1)), "first IP consumes the only global attempt and tracks");
         assertFalse(a.allowAttempt(addr(2)), "second IP is globally denied");
-        ConnectionAdmission.Lease c = a.tryAcquire(addr(3));
+        ConnectionAdmission.Lease c = owned(a.tryAcquire(addr(3)));
         assertNotNull(c, "a globally denied IP must not consume the second tracking slot");
         c.close();
         c.close();
-        assertNotNull(a.tryAcquire(addr(3)), "repeated close calls stay safe");
+        assertNotNull(owned(a.tryAcquire(addr(3))), "repeated close calls stay safe");
     }
 
     @Test
@@ -154,7 +176,7 @@ class ConnectionAdmissionTest {
     @Test
     void tryAcquireSpendsNoAttempt() {
         ConnectionAdmission a = new ConnectionAdmission(1, 1, 1, 1, 1, 10, FROZEN);
-        ConnectionAdmission.Lease lease = a.tryAcquire(addr(1));
+        ConnectionAdmission.Lease lease = owned(a.tryAcquire(addr(1)));
         assertNotNull(lease);
         assertFalse(a.requiresRetry(), "tryAcquire must not spend an attempt");
         assertTrue(a.allowAttempt(addr(1)), "the attempt budget is still available");
@@ -165,12 +187,12 @@ class ConnectionAdmissionTest {
     @Test
     void openLeaseCapsAreExactGloballyAndPerIp() {
         ConnectionAdmission a = new ConnectionAdmission(10, 10, 2, 1, 10, 10, FROZEN);
-        ConnectionAdmission.Lease first = a.tryAcquire(addr(1));
+        ConnectionAdmission.Lease first = owned(a.tryAcquire(addr(1)));
         assertNotNull(first);
-        assertNull(a.tryAcquire(addr(1)), "per-IP open cap of one");
-        ConnectionAdmission.Lease second = a.tryAcquire(addr(2));
+        assertNull(owned(a.tryAcquire(addr(1))), "per-IP open cap of one");
+        ConnectionAdmission.Lease second = owned(a.tryAcquire(addr(2)));
         assertNotNull(second);
-        assertNull(a.tryAcquire(addr(3)), "global open cap of two");
+        assertNull(owned(a.tryAcquire(addr(3))), "global open cap of two");
         first.close();
         second.close();
     }
@@ -178,15 +200,15 @@ class ConnectionAdmissionTest {
     @Test
     void closeIsIdempotentAndFreesCapacityExactlyOnce() {
         ConnectionAdmission a = new ConnectionAdmission(10, 10, 1, 1, 10, 10, FROZEN);
-        ConnectionAdmission.Lease lease = a.tryAcquire(addr(1));
+        ConnectionAdmission.Lease lease = owned(a.tryAcquire(addr(1)));
         assertNotNull(lease);
-        assertNull(a.tryAcquire(addr(2)), "global cap of one is full");
+        assertNull(owned(a.tryAcquire(addr(2))), "global cap of one is full");
         lease.close();
         lease.close();
         lease.close();
-        ConnectionAdmission.Lease next = a.tryAcquire(addr(2));
+        ConnectionAdmission.Lease next = owned(a.tryAcquire(addr(2)));
         assertNotNull(next, "capacity freed exactly once");
-        assertNull(a.tryAcquire(addr(3)), "a double close must not free capacity twice");
+        assertNull(owned(a.tryAcquire(addr(3))), "a double close must not free capacity twice");
         next.close();
     }
 
@@ -196,12 +218,12 @@ class ConnectionAdmissionTest {
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(2)));
-        ConnectionAdmission.Lease lease = a.tryAcquire(addr(2));
+        ConnectionAdmission.Lease lease = owned(a.tryAcquire(addr(2)));
         assertNotNull(lease);
         assertFalse(a.allowAttempt(addr(3)), "a third IP exceeds the tracking capacity");
         assertFalse(a.allowAttempt(addr(1)), "the tracked per-IP attempts are preserved");
-        assertNull(a.tryAcquire(addr(2)), "the tracked open lease is preserved");
-        assertNull(a.tryAcquire(addr(4)), "tracking capacity also bounds new leases");
+        assertNull(owned(a.tryAcquire(addr(2))), "the tracked open lease is preserved");
+        assertNull(owned(a.tryAcquire(addr(4))), "tracking capacity also bounds new leases");
         lease.close();
     }
 
@@ -210,11 +232,11 @@ class ConnectionAdmissionTest {
         AtomicLong now = new AtomicLong(0);
         ConnectionAdmission a = new ConnectionAdmission(100, 5, 5, 1, 100, 2, now::get);
         assertTrue(a.allowAttempt(addr(1)), "idle attempt-only entry");
-        ConnectionAdmission.Lease lease = a.tryAcquire(addr(2));
+        ConnectionAdmission.Lease lease = owned(a.tryAcquire(addr(2)));
         assertNotNull(lease);
         now.set(WINDOW);
         assertTrue(a.allowAttempt(addr(3)), "the idle entry was pruned, freeing a tracking slot");
-        assertNull(a.tryAcquire(addr(2)), "the entry holding an open lease is retained");
+        assertNull(owned(a.tryAcquire(addr(2))), "the entry holding an open lease is retained");
         lease.close();
     }
 
@@ -222,7 +244,7 @@ class ConnectionAdmissionTest {
     void closeAtNewWindowPrunesFormerlySpentIdleEntry() {
         AtomicLong now = new AtomicLong(0);
         ConnectionAdmission a = new ConnectionAdmission(100, 5, 1, 1, 100, 1, now::get);
-        ConnectionAdmission.Lease lease = a.tryAcquire(addr(1));
+        ConnectionAdmission.Lease lease = owned(a.tryAcquire(addr(1)));
         assertNotNull(lease);
         assertTrue(a.allowAttempt(addr(1)));
         now.set(WINDOW);
@@ -332,7 +354,7 @@ class ConnectionAdmissionTest {
                 pool.execute(() -> {
                     ConnectionAdmission.Lease lease = null;
                     try {
-                        lease = a.tryAcquire(ip);
+                        lease = owned(a.tryAcquire(ip));
                         leases[index] = lease;
                         ready.countDown();
                         proceed.await();
@@ -363,7 +385,7 @@ class ConnectionAdmissionTest {
             proceed.countDown();
             assertTrue(done.await(10, TimeUnit.SECONDS), "workers closed their leases");
             assertTrue(failures.isEmpty(), () -> "unexpected worker failures: " + failures);
-            ConnectionAdmission.Lease after = a.tryAcquire(other(1));
+            ConnectionAdmission.Lease after = owned(a.tryAcquire(other(1)));
             assertNotNull(after, "closing all leases restores capacity");
             after.close();
         } finally {
