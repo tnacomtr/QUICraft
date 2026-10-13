@@ -113,33 +113,55 @@ Records come from Wave 0 types.
   - `stagingCoverage(List<VerifiedDocument<Revocations>> per distinct origin, UpdaterState)` requires 2 of 3 distinct origins returning matching current bytes (`docs/updater.md:651-654,663-667`).
   - `acceptManifest(...) -> StateDelta` persists `seqByKid`, clock contribution and own-platform withdrawn entries (`docs/updater.md:982-983`).
 
-### Wave 3: fetch, acceptance, staging, transaction, recovery (frozen at Wave 2.5)
+### Wave 3 to 5: frozen at Wave 2.5 (superior critique `superior-upd-2.5`, all 12 findings accepted)
 
-- `ReleaseHost(String key, URI origin)`, keys `modrinth`, `github`, `sudoe`; origins distinct and injected (`docs/updater.md:798`).
-- `SourceFetcher { FetchedBytes fetch(URI uri, long maxBytes) throws FetchException; }`; HTTPS only, connect and read timeouts, abort past the cap.
-- `RedirectPolicy` (injected per `ReleaseHost`): `allows(URI from, URI to) -> boolean`, HTTPS only, hop limit 3, default `DENY_ALL`. Blocker 5 sets the real per-host allowlist (GitHub and Modrinth asset downloads redirect to CDNs); this plan ships only `DENY_ALL` and test policies.
-- `HttpSourceFetcher` using `java.net.http.HttpClient.Builder.followRedirects(NEVER)` and following redirects itself through `RedirectPolicy`, re-applying the size cap and timeouts per hop.
-- `MetadataCollector.collect(List<ReleaseHost>, SourceFetcher) -> HostCollection`: revocations from all hosts first, then manifests, per-host outcomes kept (`docs/updater.md:640-644`).
-- `Acceptance.evaluate(HostCollection, Snapshot, Instant systemNow) -> AcceptanceResult` pure, no I/O, using Wave 2 policy.
-- `ArtifactVerifier.verify(Path stagedJar, VerifiedDocument<ReleaseManifest> manifest, ReleaseEntry entry, UpdateVersion runningVersion, UpdateVersion onDiskVersion, Snapshot snapshot)`: size, SHA-512, platform, entry version above `max(running, on-disk)`, and the staged jar's own trust file and version metadata without loading it as code (`docs/updater.md:882-886,890`): same revocation key, same key-set fingerprint at the same epoch, or `KeySetChangeAuthorization` passes.
-- `UpdaterTransaction`: download, verify, stage, revalidate, back up, journal, atomic move, health handoff, cancel token, lock order `txn` then `state` (`docs/updater.md:873-916`). Final locked authorization re-runs `KeySetChangeAuthorization` and the staged trust-file checks. Live jar and staging on different file stores: refuse before any write and print manual-install instructions (`docs/updater.md:1066`, approved); never fall back to copy.
-- `HealthSignal` (injected): `awaitHealthy(Duration) -> boolean`. Placeholder default per the blocker-9 non-goal.
-- `StartupRecovery.run(...)` never throws (`docs/updater.md:922-952`), manual-restore detection at step 4.
-- `UpdaterJournal` codec, cap 8192, phases `prepared`, `swapped`, `boot-pending`, `recovery-required` (`docs/updater.md:817-848`).
-- `LiveJarDiscovery` interface per platform (`docs/updater.md:1030-1056`), so the library stays loader-free.
+Shared (unit 3.0, first): all in package `rs.sudoe.quicraft.updater`, immutable, byte arrays copied in and out.
+- `CancelToken { boolean isCancelled(); }`; `MutableCancelToken implements CancelToken` (`cancel()`).
+- `ReleaseHost(String key, URI origin)`: key in `modrinth`/`github`/`sudoe`; origin HTTPS, normalized (lowercase host, default port removed, no path/query/userinfo). `ReleaseHosts.of(List<ReleaseHost>)` rejects duplicate keys and duplicate normalized origins (finding 3).
+- `ReleaseEndpoints { URI revocations(ReleaseHost); URI revocationsSignature(ReleaseHost); URI manifest(ReleaseHost); URI manifestSignature(ReleaseHost); URI artifact(ReleaseHost, ReleaseEntry); }` injected; real paths are blocker 5.
+- `RedirectPolicy { boolean allows(ReleaseHost host, URI from, URI to); static RedirectPolicy denyAll(); }`, HTTPS on every hop, max 3 hops; a redirect keeps the original host identity and never adds a coverage vote.
+- `FetchRequest(ReleaseHost host, URI uri, long maxBytes, Duration connectTimeout, Duration idleReadTimeout, Duration overallDeadline, RedirectPolicy redirects)`; the overall deadline never resets across hops (finding 4).
+- `FetchOutcome { OK, TRANSPORT_ERROR, TIMEOUT, OVERSIZE, HTTP_STATUS, REDIRECT_REFUSED, CANCELLED }`; `FetchException(FetchOutcome)`; `FetchedBytes(byte[] bytes)`.
+- `SourceFetcher { FetchedBytes fetch(FetchRequest, CancelToken) throws FetchException; long download(FetchRequest, WritableByteChannel destination, CancelToken) throws FetchException; }`. `download` checks cancel between chunks and fails OVERSIZE on byte `maxBytes + 1` without writing it; the caller owns the destination.
+- `DocumentPair(byte[] documentBytes, byte[] signatureBytes)`; `HostEvidence(ReleaseHost host, FetchOutcome outcome, DocumentPair pair /* null unless OK */)`; `HostCollection(List<HostEvidence> responses)`.
+- `RuntimeIdentity(String platform, String target, UpdateVersion runningVersion, Trust runningTrust, String liveSha512AtInit)` built once at init from preloaded resources.
+- `ArtifactIdentity(String platform, UpdateVersion version, long size, String sha512)`.
+- `ManifestEvidence(byte[] exactManifestBytes, byte[] exactSignatureBytes)`: retained so step 6 re-authenticates locally under a fresh snapshot (finding 7).
+- `InstallCapability { VERIFIED_STAGING_ONLY, ATOMIC_REPLACEMENT }`, injected. Windows always VERIFIED_STAGING_ONLY; Linux/macOS ATOMIC_REPLACEMENT only when the platform adapter's evidence gate says so (blocker 10), never from OS detection alone, and never when directory fsync is unsupported (finding 11, 12).
+- `InitBarrier { boolean readyForStaging(); }`.
+- `HealthSignal { CompletionStage<Boolean> awaitHealthy(Duration timeout); }` (finding 10).
+- Locks (unit 2.1 extension): `StateStore.withLockedSnapshot(LockedStateOperation<T>)` holds `state.lock` across a callback on a freshly read snapshot; `TransactionLock.tryAcquire(Path) -> TxnLease`, thread-owned, shared by transaction and recovery; order txn then state, enforced.
+
+3.1 transport: `HttpSourceFetcher implements SourceFetcher` on `java.net.http.HttpClient` with `followRedirects(NEVER)` and manual redirects through `RedirectPolicy`; status 200 only; caps per hop; overall deadline. Tests use a fake server only where a local TLS fixture is authorized; otherwise fake `SourceFetcher`s drive everything else.
+
+3.2 collection: `MetadataCollector.collectRevocations(ReleaseHosts, ReleaseEndpoints, SourceFetcher, CancelToken) -> HostCollection` and `collectManifests(...)`; all hosts, fixed caps (document cap per schema, `.sig` 4096).
+
+3.3 acceptance (pure): `Acceptance.evaluateRevocations(HostCollection, Snapshot, Trust running, Instant systemNow) -> RevocationAcceptance(StateDelta delta, Map<String, VerifiedDocument<Revocations>> currentByHost, List<String> diagnostics)`; `Acceptance.evaluateManifests(HostCollection, Snapshot, RuntimeIdentity, UpdateVersion onDiskVersion, CheckMode mode, Instant systemNow) -> ManifestAcceptance(StateDelta delta, Optional<AcceptedCandidate> candidate, boolean stateFull, List<String> diagnostics)`, `CheckMode { REPORT, STAGE }`; `AcceptedCandidate(VerifiedDocument<ReleaseManifest> manifest, ManifestEvidence evidence, ReleaseEntry entry, List<ReleaseHost> artifactSources)`. Exact platform AND target match; version > max(running, on-disk); not blocked/withdrawn; STAGE also needs fresh revocations and 2-of-3 coverage. Orchestration runs each evaluation INSIDE `StateStore.commit` on the freshly read snapshot (revocations first, then manifests), never applies a delta computed before locking, and does no network under `state.lock` (finding 2).
+
+3.4 artifact verification: `ArtifactVerifier.verify(Path stagedJar, AcceptedCandidate c, RuntimeIdentity id, UpdateVersion onDiskVersion, Snapshot current) -> StagedArtifact(Path path, ArtifactIdentity identity, Trust stagedTrust, String stagedKeySetFingerprint)`: size, SHA-512, bounded ZIP reads of exactly one `META-INF/quicraft/updater-trust.json` and one version-metadata entry (duplicates rejected), metadata agrees with the entry, never loads classes. `ArtifactVerifier.validateStagedTrust(Trust staged, Snapshot current)`: schema, exactly one revocation key EQUAL to persisted, no revoked pub, epoch not lower, equal epoch requires equal fingerprint; a different backup key is always rejected. `KeySetChangeAuthorization` is an additional requirement, never a waiver (finding 8).
+
+3.5 staging and journal: `JournalRecord` (full schema docs/updater.md 817-848), `JournalCodec.encode/decode` (cap 8192, exact keys); `UpdateDirectory(Path updateDir)` with fixed `staging/<txid>.part|.jar`, `backup/<txid>.jar`, `journal.json`, `readJournal()`, `writeJournal(JournalRecord)` (atomic, fsync), `deleteJournal()`, NOFOLLOW/owner/0700 rules; fault-injection seam `DurabilityOps` (force, move, dir-fsync, journal write) so every boundary can fail in tests (finding 9). `Revalidation.compare(ArtifactIdentity staged, ReleaseEntry revalidated) -> RevalidationDecision { MATCH, RESTART_REQUIRED, REJECT }` (finding 6).
+
+3.6 transaction: `UpdateAdmission.admit(AdmissionContext(boolean initComplete, boolean journalPresent, String liveSha512AtInit, String currentLiveSha512, boolean stateFull), RuntimeIdentity, Snapshot) -> AdmissionDecision`; `UpdaterTransaction.execute(UpdateRequest, CancelToken) -> TransactionResult` implementing 12.10 steps 1-6 (step 4 full re-pipeline incl. coverage, at most one restart with a new txid under the same lease; step 6 inside `withLockedSnapshot`: rebuild TrustSnapshot from running trust + fresh revoked state, re-authenticate `ManifestEvidence`, release authorization, freshness, floor, fresh revocations, entry binding, not blocked/withdrawn, `validateStagedTrust`, `KeySetChangeAuthorization.check`, re-hash, ATOMIC_MOVE, dir fsync, journal `swapped`); `cancelActive() -> CancelReply { REQUESTED, NO_ACTIVE_TRANSACTION, INSTALLED_RESTART_PENDING }`, atomic with entry into step 6; cancel never takes txn.lock. Cross-store check happens before any staging write. `VERIFIED_STAGING_ONLY` stops after step 3/5 checks with the jar staged. After a move may have happened, failures keep recovery evidence (finding 5, 9).
+
+3.7 recovery: `StartupRecovery.run(RecoveryContext) -> RecoveryResult(RecoveryStatus status, Optional<RecoveryTicket> ticket, List<String> messages)`, `RecoveryStatus { IDLE, HEALTH_PENDING, RECOVERY_REQUIRED, DISABLED }`, never throws; ordered cases 1-7 of docs/updater.md 922-952 (discovery failure disables and touches nothing; invalid journal keeps every file; manual restore before phase dispatch; boot-pending attempt 1 written durably, attempt 2 allowed, then recovery-required). `completeHealth(RecoveryTicket, HealthSignal, Duration) -> CompletionStage<HealthCompletion>`: runs after init, re-acquires the txn lease, checks the journal still belongs to the ticket, deletes it and only EARLIER transactions' backups; timeout/failure keeps journal and backup (finding 10).
+
+`LiveJarDiscovery { LiveJar discover() throws IOException, UpdateRejectedException; }`, `LiveJar(Path realPath, Path realScanDirectory, long size, String sha512, UpdateVersion onDiskVersion)`; implementations per platform (Wave 4) validate the original path for symlinks before resolving, scan-parent membership, unique id.
+
+`ResetResult resetStateAndRefetch(...)` (Wave 3.6 owner): reset-state with an invalid revoked.json refetches and re-merges; staging stays disabled unless that succeeds; never authorizes an empty revocation state.
 
 ### Wave 4: platform adapters
 
-- `velocity/`: `UpdaterAdapter` registers commands and the notify permission `quicraft.admin.update.notify`, loads config, discovers the live jar via `PluginContainer.getDescription().getSource()`, preloads own-jar resources at init (`docs/updater.md:1012-1016`), schedules the hourly check-only task, stops on shutdown.
-- `fabric/`: dedicated-only `UpdaterAdapter` using `FabricLoader.getInstance().getModContainer("quicraft").getOrigin()`, `getConfigDir()`, Fabric command registration, OP level 3 gate (`docs/updater.md:67,1043-1055`). No activation on the client.
-- Commands, both platforms, exactly the spec table (`docs/updater.md:55-63`): `/quicraft update check`, `check -s`, `/quicraft update` (download, verify, stage), `cancel`, and `reset-state` (console only, rejected from players even with `quicraft.admin.update`). Permission `quicraft.admin.update` on Velocity, OP level 3 on Fabric.
-- Config keys and first-start disclosure (`docs/updater.md:179-196`). Missing trust file or origin disables the updater with a WARN; TCP is untouched.
-- Live-jar discovery tested on every supported Velocity and Fabric build (blocker 16).
+- Starts by wiring `implementation(project(":updater"))` (the spike branch `agent/phase4-upd-spike`), so adapters build against it; Wave 5 only verifies packaging (finding 11).
+- `velocity/`: commands `/quicraft update check|check -s|cancel|reset-state` and `/quicraft update` (spec table 55-63), permission `quicraft.admin.update` (+ `.notify`); config; `LiveJarDiscovery` via `PluginContainer.getDescription().getSource()`; preload trust file, version metadata and every own-jar resource (incl. native extraction/loading and service lookups) at init; off-thread checks and commands; hourly check-only task; shutdown cancels; post-swap checks use the cached `RuntimeIdentity`.
+- `fabric/`: dedicated-only, same commands with OP level 3, `FabricLoader` origin discovery, config dir `config/quicraft/`, no activation on clients.
+- Missing trust file or origins disables the updater with a WARN; TCP untouched. `InstallCapability` defaults to `VERIFIED_STAGING_ONLY` until the blocker-10 gate passes.
+- Discovery tested on every supported Velocity and Fabric build (blocker 16). JDK 21 / macOS evidence via a CI job on the github mirror: prepared in this plan, pushed/run only after asking the user (finding 12).
 
 ### Wave 5: packaging and integration
 
-- Add `implementation(project(":updater"))` in the three platform build files; shade for Velocity, `include` for Fabric. Extend the shaded-notice check to the updater jar.
-- Testkit integration: a mock release server serving a precomputed signed manifest and jar, a server that stages and restarts, then still accepts TCP and QUIC joins (`docs/updater.md:247-248`).
+- Verify the shaded/nested updater in all three jars, shaded-notice check extended to the updater.
+- Testkit: a mock release server with precomputed throwaway-key-signed documents and jar; a server stages, (where capability allows) swaps, restarts, and still accepts TCP and QUIC joins.
 
 ## Waves and executors
 
@@ -171,16 +193,13 @@ Order: 0T (Wave 0 types, default-coder, small) merges first; then 1.1; then 1.2,
 
 Freeze Wave 3 to 5 signatures, the fetch and transaction contracts, and the crash/recovery test matrix. Independent superior critique of the frozen interfaces before Wave 3 assignment. Update the plan, then brief.
 
-### Wave 3 (split so each piece is fault-injectable; after Wave 2.5)
+### Wave 3 (after Wave 2 merges; order per superior critique)
 
-- 3.1 fetch transport (`SourceFetcher`, `HttpSourceFetcher`): timeouts, size caps, no redirects, TLS only.
-- 3.2 candidate and evidence collection (`MetadataCollector`, `HostCollection`).
-- 3.3 pure acceptance (`Acceptance`).
-- 3.4 artifact verification (`ArtifactVerifier`).
-- 3.5 durable staging and journal (`Journal`, staging writes, fsync).
-- 3.6 swap execution (backup, revalidate under `state.lock`, atomic move, cancel).
-- 3.7 startup recovery (`StartupRecovery`).
-Each unit gets fault-injection tests: truncated download, oversized bytes, redirect denied by default and allowed only by a test policy, redirect to HTTP refused, hop limit, torn pair, corrupted journal, wrong platform, changed live jar, manual restore, cancel at each step, key-set change without backup signature refused at final locked authorization, cross-file-store refusal before any write.
+1. 3.0 shared records/interfaces above (small, first).
+2. In parallel: 3.1 transport, 3.3 pure acceptance, 3.4 artifact verification, 3.5 staging/journal/durability seam.
+3. 3.2 collection (against the frozen fetch interface; may start with 3.1).
+4. 3.6 transaction and 3.7 recovery in parallel after 3.5.
+Each unit gets fault-injection tests: truncated download, oversized bytes, redirect denied by default and allowed only by a test policy, redirect to HTTP refused, hop limit, overall deadline, torn pair, corrupted journal, wrong platform/target, changed live jar, manual restore, cancel at each step and racing step-6 entry, key-set change without backup signature refused at final locked authorization, revocation merged between step 5 and step 6 stopping the swap, clock advanced past expiry before step 6, cross-file-store refusal before any staging write, failure at every durability boundary.
 
 ### Wave 3.5: crash/recovery matrix gate (before adapters)
 
@@ -188,7 +207,7 @@ Test every journal boundary, a crash between the two state-file writes, stale tr
 
 ### Wave 4: adapters
 
-Velocity and Fabric adapters as above, own branches, adapter-specific tests plus the required swap-then-read loader test (`docs/updater.md:1018-1019`). Linux runs locally. JDK 21 and macOS run on a GitHub Actions job on the `github` mirror (`macos-latest`, Temurin 21 and 25), added in this wave; pushing to the mirror follows the standing push permission, but the job's result is the gate, not a local claim.
+Velocity and Fabric adapters as above, own branches, adapter-specific tests plus the required swap-then-read loader test (`docs/updater.md:1018-1019`). Linux runs locally. JDK 21 and macOS run on a GitHub Actions job on the `github` mirror (`macos-latest`, Temurin 21 and 25), prepared in this wave; push and run only after asking the user; the job's result is the gate, not a local claim.
 
 ### Wave 5: packaging and integration
 
@@ -209,7 +228,7 @@ Two layers, no owner keys:
 ## Risks
 
 - Crypto and authorization mistakes: lane separation, default-coder plus mandatory security review, no network or swap in Wave 1 and 2.
-- Local state rollback or corruption silently weakening protections: invariants 4 and 5, generation-consistent commits, and the Wave 2.1 tests.
+- Local state rollback or corruption silently weakening protections: invariants 4 and 5, revoked-first monotone merges, and the Wave 2.1 tests.
 - Two-file crash window: idempotent monotone merges (invariant 4) plus the Wave 3.5 crash matrix.
 - Loader resource mixing after swap on Velocity: the Wave 0.5 spike plus the init preload barrier and the swap-then-read test.
 - Redirect and health placeholders mistaken for final policy: both injected, defaults deny/provisional, release gate open (non-goals).
@@ -239,7 +258,7 @@ Per unit: fresh verifier (`:updater:check build --rerun-tasks --no-build-cache`)
 Advisor `ses_ec901f029fferSuXasStZoUdgO`, one question, no tools. Recommendation: keep Waves 1 and 2 separate with security review; use one logical state store for both files. Incorporated:
 
 1. Wave 0 now freezes invariants, durable commit points, lock ordering and a crash/recovery matrix, not only signatures.
-2. Persistence moved to an explicit generation-consistent pair commit; a two-file transaction is defined, not assumed from two renames.
+2. Persistence moved to an explicit generation-consistent pair commit; a two-file transaction is defined, not assumed from two renames. (Superseded 2026-10-13 review: independent files, revoked first, monotone merges; invariant 4.)
 3. Corruption recovery versus malicious local rollback separated as invariant 5, with refusal to lower floors or drop revocations.
 4. Added Wave 0.5 packaging and bootstrap feasibility spike before Wave 1.
 5. Wave 1.1 split into key validation and fingerprint (1.1) and exact-byte verification and signer evidence (1.2).
