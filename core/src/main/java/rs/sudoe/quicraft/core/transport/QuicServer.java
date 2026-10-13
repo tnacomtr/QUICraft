@@ -148,6 +148,12 @@ public final class QuicServer implements Closeable {
     /** Deadline for a connection passed early to complete its handshake. Tests shorten it. */
     static volatile long confirmMillis = 10_000;
 
+    /**
+     * Deadline for every connection to complete its handshake, so spoofed or abandoned handshakes
+     * can't hold open-connection slots. Separate from {@link #confirmMillis}. Tests shorten it.
+     */
+    static volatile long handshakeMillis = 10_000;
+
     private static io.netty.channel.ChannelHandler codec(ServerIdentity identity, TransportConfig config,
             StreamAcceptor acceptor, Unconfirmed unconfirmed, java.util.concurrent.atomic.AtomicLong retries)
             throws Exception {
@@ -156,6 +162,15 @@ public final class QuicServer implements Closeable {
         ConnectionAdmission admission = new ConnectionAdmission(
                 config.globalAttemptsPerSecond, config.perIpAttemptsPerSecond, config.maxOpen,
                 config.maxOpenPerIp, config.retryThresholdPerSecond, config.maxTrackedIps);
+        // Attempts with a valid token get their own budget; its open caps are unused.
+        ConnectionAdmission validated = new ConnectionAdmission(
+                config.globalAttemptsPerSecond, config.perIpAttemptsPerSecond, 1, 1,
+                config.retryThresholdPerSecond, config.maxTrackedIps);
+        if ((long) config.maxTrackedIps < (long) config.maxOpen + config.globalAttemptsPerSecond) {
+            LOG.warning("QUIC admission: maxTrackedIps (" + config.maxTrackedIps + ") is below maxOpen + "
+                    + "globalAttemptsPerSecond (" + config.maxOpen + " + " + config.globalAttemptsPerSecond
+                    + "); new addresses may be refused while the tracked ones fill it");
+        }
         QuicSslContext ssl = QuicSslContextBuilder
                 .forServer(identity.privateKey(), null, identity.certificate())
                 .applicationProtocols(Protocol.ALPN)
@@ -164,14 +179,16 @@ public final class QuicServer implements Closeable {
         return Codecs.apply(new QuicServerCodecBuilder(), config, true)
                 .sslContext(ssl)
                 // Attempt limits and address validation (Retry), docs/protocol.md §9.
-                .tokenHandler(new AdmissionTokenHandler(admission, config.retryMode, retries))
+                .tokenHandler(new AdmissionTokenHandler(admission, validated, config.retryMode, retries))
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
-                        if (!lease(connection, admission)) {
+                        Admitted admitted = Admitted.admit(connection, admission);
+                        if (admitted == null) {
                             return;
                         }
-                        connection.pipeline().addLast(new Connection(acceptor, tokens, config.earlyData, unconfirmed));
+                        connection.pipeline().addLast(admitted,
+                                new Connection(acceptor, tokens, config.earlyData, unconfirmed));
                     }
                 })
                 .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
@@ -193,37 +210,90 @@ public final class QuicServer implements Closeable {
     }
 
     /**
-     * Takes an open-connection lease for {@code connection}, released when it closes. Over a limit
-     * (not expected: the token handler checked first), closes it with CONNECTION_REFUSED and returns
-     * false. Runs inside the codec's read (the channel
-     * is registered there), where the remote address is already set; fails open.
+     * Per connection, first in its pipeline: holds its open-connection lease, confirms it when the
+     * handshake completes and releases it on close, and closes a connection whose handshake hasn't
+     * completed within {@link #handshakeMillis}.
      */
-    private static boolean lease(QuicChannel connection, ConnectionAdmission admission) {
-        ConnectionAdmission.Lease lease;
-        try {
-            java.net.SocketAddress remote = connection.remoteSocketAddress();
-            if (!(remote instanceof InetSocketAddress) || ((InetSocketAddress) remote).getAddress() == null) {
-                return true;
+    private static final class Admitted extends ChannelInboundHandlerAdapter {
+        /** Null when admission failed open. */
+        private final ConnectionAdmission.Lease lease;
+        private boolean handshakeDone;
+        private java.util.concurrent.ScheduledFuture<?> deadline;
+
+        private Admitted(ConnectionAdmission.Lease lease) {
+            this.lease = lease;
+        }
+
+        /**
+         * Takes an open-connection lease, released when the connection closes. Over a limit (not
+         * expected: the token handler checked first), closes it with CONNECTION_REFUSED and
+         * returns null. Runs inside the codec's read (the channel is registered there), where the
+         * remote address is already set; fails open.
+         */
+        static Admitted admit(QuicChannel connection, ConnectionAdmission admission) {
+            ConnectionAdmission.Lease lease = null;
+            try {
+                java.net.SocketAddress remote = connection.remoteSocketAddress();
+                if (remote instanceof InetSocketAddress && ((InetSocketAddress) remote).getAddress() != null) {
+                    lease = admission.tryAcquire(((InetSocketAddress) remote).getAddress());
+                    if (lease == null) {
+                        // Last resort: AdmissionTokenHandler checked the same limits on this thread
+                        // just before the connection was created, so this should not happen. It
+                        // can't fall back cleanly: Netty sends the queued handshake flight before the
+                        // close (QuicheQuicChannel.java:615-616 in Netty 4.2.19, "send all that is
+                        // queued before we close"), so the client completes its handshake and then
+                        // sees the close, which reaches the game.
+                        LOG.log(Level.FINE, "QUIC connection over the open-connection limits after admission; "
+                                + "refusing it");
+                        connection.attr(REFUSED).set(Boolean.TRUE);
+                        Codecs.closeLater(connection, false, CONNECTION_REFUSED);
+                        return null;
+                    }
+                }
+            } catch (Throwable t) {
+                LOG.log(Level.FINE, "QUIC open-connection check failed; admitting the connection", t);
             }
-            lease = admission.tryAcquire(((InetSocketAddress) remote).getAddress());
-        } catch (Throwable t) {
-            LOG.log(Level.FINE, "QUIC open-connection check failed; admitting the connection", t);
-            return true;
+            Admitted admitted = new Admitted(lease);
+            // The Lease keeps its own key; the channel's address is cleared when it is freed.
+            connection.closeFuture().addListener(f -> admitted.closed());
+            return admitted;
         }
-        if (lease == null) {
-            // Last resort: AdmissionTokenHandler checked the same limits on this thread just before
-            // the connection was created, so this should not happen. It can't fall back cleanly:
-            // Netty sends the queued handshake flight before the close (QuicheQuicChannel.java:615-616
-            // in Netty 4.2.19, "send all that is queued before we close"), so the client completes
-            // its handshake and then sees the close, which reaches the game.
-            LOG.log(Level.FINE, "QUIC connection over the open-connection limits after admission; refusing it");
-            connection.attr(REFUSED).set(Boolean.TRUE);
-            Codecs.closeLater(connection, false, CONNECTION_REFUSED);
-            return false;
+
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) {
+            QuicChannel connection = (QuicChannel) ctx.channel();
+            deadline = ctx.executor().schedule(() -> {
+                if (!handshakeDone) {
+                    // Transport NO_ERROR: a real but slow client sees a failed handshake and falls
+                    // back to TCP.
+                    Codecs.closeLater(connection, false, 0x0);
+                }
+            }, handshakeMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
-        // The Lease keeps its own address; the channel's is cleared when it is freed.
-        connection.closeFuture().addListener(f -> lease.close());
-        return true;
+
+        @Override
+        public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+            if (evt instanceof SslHandshakeCompletionEvent && ((SslHandshakeCompletionEvent) evt).isSuccess()
+                    && !handshakeDone) {
+                handshakeDone = true;
+                if (deadline != null) {
+                    deadline.cancel(false);
+                }
+                if (lease != null) {
+                    lease.confirm();
+                }
+            }
+            ctx.fireUserEventTriggered(evt);
+        }
+
+        private void closed() {
+            if (deadline != null) {
+                deadline.cancel(false);
+            }
+            if (lease != null) {
+                lease.close();
+            }
+        }
     }
 
     public InetSocketAddress localAddress() {

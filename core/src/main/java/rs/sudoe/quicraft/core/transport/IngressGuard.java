@@ -11,13 +11,16 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Packet-flood guard in front of the listener's QUIC codec (docs/protocol.md §9). Counts each
- * long-header Initial against its own datagram-level {@link ConnectionAdmission} and drops the ones
- * over budget. Every other datagram, and any datagram it fails to classify, goes to the codec
+ * Packet-flood guard in front of the listener's QUIC codec (docs/protocol.md §9). Drops a datagram
+ * that starts with a long-header Initial but is shorter than 1200 bytes (RFC 9000 §14.1), so no
+ * reply, Retry included, answers a small datagram. Counts every other such Initial against its own
+ * datagram-level {@link ConnectionAdmission} and drops the ones over budget. Every other datagram, and any datagram it fails to classify, goes to the codec
  * unchanged. One instance per listener; runs on the listener's event loop.
  */
 final class IngressGuard extends ChannelInboundHandlerAdapter {
     private static final Logger LOG = Logger.getLogger("QUICraft");
+    /** RFC 9000 §14.1: the smallest datagram a client may carry an Initial in. */
+    static final int MIN_INITIAL_DATAGRAM = 1200;
 
     private final ConnectionAdmission ingress;
     private final int localConnectionIdLength;
@@ -58,7 +61,7 @@ final class IngressGuard extends ChannelInboundHandlerAdapter {
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
         boolean drop = false;
         try {
-            drop = msg instanceof DatagramPacket && overBudget((DatagramPacket) msg);
+            drop = msg instanceof DatagramPacket && shouldDrop((DatagramPacket) msg);
         } catch (Throwable t) {
             LOG.log(Level.FINE, "QUIC ingress guard failed; passing the datagram on", t);
         }
@@ -69,7 +72,7 @@ final class IngressGuard extends ChannelInboundHandlerAdapter {
         }
     }
 
-    private boolean overBudget(DatagramPacket packet) {
+    private boolean shouldDrop(DatagramPacket packet) {
         InetSocketAddress sender = packet.sender();
         if (parser == null || sender == null || sender.getAddress() == null) {
             return false;
@@ -81,6 +84,10 @@ final class IngressGuard extends ChannelInboundHandlerAdapter {
         } catch (Exception notQuic) {
             return false;
         }
-        return initial && !ingress.allowAttempt(sender.getAddress());
+        if (!initial) {
+            return false;
+        }
+        // Too short: dropped before the budget, so it spends none.
+        return packet.content().readableBytes() < MIN_INITIAL_DATAGRAM || !ingress.allowAttempt(sender.getAddress());
     }
 }

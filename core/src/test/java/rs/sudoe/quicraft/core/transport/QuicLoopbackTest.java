@@ -140,6 +140,51 @@ class QuicLoopbackTest {
     }
 
     @Test
+    void aHandshakeThatNeverCompletesIsClosedAndReleasesItsSlot() throws Exception {
+        TransportConfig onePerIp = TransportConfig.builder().maxOpenPerIp(1).build();
+        CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
+        QuicServer.handshakeMillis = 2_000;
+        try (QuicServer server = Loopback.echoServer(Loopback.anyLocal(), identity, onePerIp, accepted);
+                DelayRelay relay = new DelayRelay(server.localAddress(), 0)) {
+            // A half-open handshake: the server's flight never reaches the client, and once the
+            // server has the connection nothing more comes from the client, not even its close.
+            relay.dropFromServer(true);
+            long created = System.nanoTime();
+            CompletableFuture<QuicByteStream> halfOpen = QuicClient.connect(relay.address(), identity.fingerprint(),
+                    TransportConfig.DEFAULT);
+            Thread.sleep(200);
+            relay.dropFromClient(true);
+            halfOpen.cancel(true);
+
+            CompletableFuture<QuicByteStream> blocked = QuicClient.connect(server.localAddress(),
+                    identity.fingerprint(), TransportConfig.DEFAULT);
+            assertThrows(java.util.concurrent.TimeoutException.class, () -> blocked.get(1, TimeUnit.SECONDS),
+                    "the half-open handshake holds the only slot");
+            blocked.cancel(true);
+
+            QuicByteStream next = null;
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (next == null && System.nanoTime() < deadline) {
+                CompletableFuture<QuicByteStream> attempt = QuicClient.connect(server.localAddress(),
+                        identity.fingerprint(), TransportConfig.DEFAULT);
+                try {
+                    next = attempt.get(3, TimeUnit.SECONDS); // longer than the client's first PTO
+                } catch (ExecutionException | java.util.concurrent.TimeoutException stillHeld) {
+                    attempt.cancel(true);
+                }
+            }
+            long freedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - created);
+            System.out.printf("slot free again %d ms after the half-open connection started (deadline %d ms)%n",
+                    freedMillis, QuicServer.handshakeMillis);
+            assertTrue(next != null && freedMillis < QuicServer.handshakeMillis + 2_000,
+                    "the handshake deadline closes the half-open connection and frees its slot, took " + freedMillis);
+            next.close();
+        } finally {
+            QuicServer.handshakeMillis = 10_000;
+        }
+    }
+
+    @Test
     void echoesBytesWithACustomInitialCongestionWindow() throws Exception {
         CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
         try (QuicServer server = Loopback.echoServer(identity, accepted)) {

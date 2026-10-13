@@ -12,9 +12,16 @@ import java.util.logging.Logger;
  *
  * <p>A token-less Initial spends one attempt. If that is over a limit, or the open-connection
  * limits are full, the client gets a Retry (stateless and smaller than its Initial) instead of a
- * connection; otherwise Retry follows the {@link TransportConfig.RetryMode}. A valid token spends
- * another attempt, and if that is over a limit, or the open-connection limits are full, the Initial
- * is dropped without an answer. A refused client so falls back to TCP after its head start.
+ * connection; otherwise Retry follows the {@link TransportConfig.RetryMode}. {@code ADAPTIVE}
+ * also sends Retry while a quarter of the open-connection limit is waiting for its handshake. A
+ * valid token spends an attempt from a separate budget, so a flood of token-less Initials can't
+ * starve clients that proved their address; if that is over a limit, or the open-connection limits
+ * are full, the Initial is dropped without an answer. A refused client so falls back to TCP after
+ * its head start.
+ *
+ * <p>A valid token can be replayed with a new destination connection id until it expires, and
+ * each replay may start a connection. That is accepted: only the address the token was issued
+ * to can complete such a handshake, and every replay spends that address's per-IP budgets.
  *
  * <p>The open-connection limits are checked here, before a connection exists, because a connection
  * closed after Netty has created it still sends its handshake flight first: the client would see a
@@ -30,15 +37,21 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
     private static final Logger LOG = Logger.getLogger("QUICraft");
 
     private final ConnectionAdmission admission;
+    private final ConnectionAdmission validated;
     private final TransportConfig.RetryMode mode;
     private final HmacRetryTokenHandler hmac;
     private final java.util.concurrent.atomic.AtomicLong retries;
     private boolean forceRetry;
 
-    /** {@code retries} counts the Retry packets asked for. */
-    AdmissionTokenHandler(ConnectionAdmission admission, TransportConfig.RetryMode mode,
-            java.util.concurrent.atomic.AtomicLong retries) {
+    /**
+     * {@code admission} holds the token-less attempt budget and the open-connection leases;
+     * {@code validated} only the attempt budget for valid tokens. {@code retries} counts the Retry
+     * packets asked for.
+     */
+    AdmissionTokenHandler(ConnectionAdmission admission, ConnectionAdmission validated,
+            TransportConfig.RetryMode mode, java.util.concurrent.atomic.AtomicLong retries) {
         this.admission = admission;
+        this.validated = validated;
         this.mode = mode;
         this.retries = retries;
         this.hmac = new HmacRetryTokenHandler(() -> forceRetry);
@@ -51,7 +64,8 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
             if (address != null && address.getAddress() != null) {
                 if (!admission.allowAttempt(address.getAddress()) || !openSlotFree(address)) {
                     retry = true;
-                } else if (mode == TransportConfig.RetryMode.ADAPTIVE && admission.requiresRetry()) {
+                } else if (mode == TransportConfig.RetryMode.ADAPTIVE
+                        && (admission.requiresRetry() || admission.handshakesBacklogged())) {
                     retry = true;
                 }
             }
@@ -77,7 +91,7 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
             return offset;
         }
         try {
-            if (!admission.allowAttempt(address.getAddress()) || !openSlotFree(address)) {
+            if (!validated.allowAttempt(address.getAddress()) || !openSlotFree(address)) {
                 return -1;
             }
         } catch (Throwable t) {
