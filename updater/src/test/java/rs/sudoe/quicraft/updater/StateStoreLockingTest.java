@@ -43,7 +43,7 @@ class StateStoreLockingTest {
         new StateStore(dir).initialiseIfAbsent(new StateDelta(
                 new UpdaterState(1, HEX_A, HEX_B, new CurrentRevocations(0, "", null, null, 0),
                         Map.of(), List.of(), "", List.of(), Map.of()),
-                RevokedState.empty()));
+                RevokedState.empty()), true);
         return dir;
     }
 
