@@ -28,11 +28,13 @@ public final class DocumentParser {
     private static final String TYPE_SIGNATURES = "quicraft.sig";
     private static final String TYPE_RELEASE = "quicraft.release";
     private static final String TYPE_REVOCATIONS = "quicraft.revocations";
+    private static final String TYPE_BUILD = "quicraft.build";
 
     private static final int TRUST_MAX_BYTES = 8192;
     private static final int SIGNATURES_MAX_BYTES = 4096;
     private static final int RELEASE_MAX_BYTES = 65536;
     private static final int REVOCATIONS_MAX_BYTES = 65536;
+    private static final int BUILD_MAX_BYTES = 1024;
     private static final int MAX_STRING_CHARS = 256;
 
     private static final long MAX_SEQ = 9007199254740991L;
@@ -249,6 +251,21 @@ public final class DocumentParser {
 
         return new UpdateDocuments.Revocations(
                 seq, issued, expires, minManifestSeq, revokedKeys, blockedArtifacts);
+    }
+
+    /**
+     * Parses the build metadata resource ({@code META-INF/quicraft/build.json}). This is internal to
+     * the project's own jars: the exact key set is {@code type}, {@code v}, {@code platform} and
+     * {@code version}.
+     *
+     * @throws UpdateRejectedException on any structural violation
+     */
+    public static BuildInfo parseBuild(byte[] bytes) throws UpdateRejectedException {
+        Map<String, Object> root = parseRoot(bytes, BUILD_MAX_BYTES);
+        requireHeader(root, TYPE_BUILD, "platform", "version");
+        String platform = platformValue(root.get("platform"));
+        UpdateVersion version = versionValue(root.get("version"));
+        return new BuildInfo(platform, version);
     }
 
     private static UpdateDocuments.ReleaseEntry releaseValue(Object raw)
