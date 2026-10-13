@@ -33,9 +33,20 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
  * once; such a connection must then complete its handshake within {@link #confirmMillis} or is
  * closed. A replayed first flight carries a used token, waits for a handshake that never
  * completes, and never reaches the game (docs/protocol.md §8).
+ *
+ * <p>Each bind limits connection attempts and open connections, per IP and overall, and validates
+ * client addresses with Retry under load or for an attempt over its limit (docs/protocol.md §9):
+ * an {@link IngressGuard} drops floods of Initial packets before the codec, an
+ * {@link AdmissionTokenHandler} answers attempts over their limit with at most a Retry, and a
+ * connection over the open-connection limits is closed at once with CONNECTION_REFUSED.
  */
 public final class QuicServer implements Closeable {
     private static final Logger LOG = Logger.getLogger("QUICraft");
+    /** RFC 9000 §20.1: transport error CONNECTION_REFUSED. */
+    private static final int CONNECTION_REFUSED = 0x2;
+    /** Marks a connection refused by the open-connection limits; its streams are ignored. */
+    private static final io.netty.util.AttributeKey<Boolean> REFUSED =
+            io.netty.util.AttributeKey.valueOf(QuicServer.class, "refused");
     /** RFC 9001 §4.8: CRYPTO_ERROR 0x100 + TLS alert handshake_failure (40). */
     private static final int CRYPTO_ERROR_HANDSHAKE_FAILURE = 0x100 + 40;
 
@@ -81,9 +92,16 @@ public final class QuicServer implements Closeable {
             StreamAcceptor acceptor) throws Exception {
         Unconfirmed unconfirmed = new Unconfirmed();
         io.netty.channel.ChannelHandler codec = codec(identity, config, acceptor, unconfirmed);
+        IngressGuard guard = IngressGuard.forConfig(config);
         EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
         try {
-            Channel channel = new Bootstrap().group(group).channel(NioDatagramChannel.class).handler(codec)
+            Channel channel = new Bootstrap().group(group).channel(NioDatagramChannel.class)
+                    .handler(new ChannelInitializer<Channel>() {
+                        @Override
+                        protected void initChannel(Channel ch) {
+                            ch.pipeline().addLast(guard, codec);
+                        }
+                    })
                     .bind(address).sync().channel();
             return new QuicServer(group, channel, unconfirmed);
         } catch (Exception | Error e) {
@@ -102,7 +120,7 @@ public final class QuicServer implements Closeable {
         HostedDatagramChannel channel = new HostedDatagramChannel(socket);
         Unconfirmed unconfirmed = new Unconfirmed();
         try {
-            channel.pipeline().addLast(codec(identity, config, acceptor, unconfirmed));
+            channel.pipeline().addLast(IngressGuard.forConfig(config), codec(identity, config, acceptor, unconfirmed));
         } catch (Exception | Error e) {
             socket.close();
             throw e;
@@ -122,6 +140,10 @@ public final class QuicServer implements Closeable {
     private static io.netty.channel.ChannelHandler codec(ServerIdentity identity, TransportConfig config,
             StreamAcceptor acceptor, Unconfirmed unconfirmed) throws Exception {
         EarlyTokens tokens = new EarlyTokens();
+        // One per bind, like the Retry key inside the token handler.
+        ConnectionAdmission admission = new ConnectionAdmission(
+                config.globalAttemptsPerSecond, config.perIpAttemptsPerSecond, config.maxOpen,
+                config.maxOpenPerIp, config.retryThresholdPerSecond, config.maxTrackedIps);
         QuicSslContext ssl = QuicSslContextBuilder
                 .forServer(identity.privateKey(), null, identity.certificate())
                 .applicationProtocols(Protocol.ALPN)
@@ -129,17 +151,23 @@ public final class QuicServer implements Closeable {
                 .build();
         return Codecs.apply(new QuicServerCodecBuilder(), config, true)
                 .sslContext(ssl)
-                // Address validation (Retry) under load comes with Phase 4 (docs/protocol.md §9).
-                .tokenHandler(NoRetryTokenHandler.INSTANCE)
+                // Attempt limits and address validation (Retry), docs/protocol.md §9.
+                .tokenHandler(new AdmissionTokenHandler(admission, config.retryMode))
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
+                        if (!lease(connection, admission)) {
+                            return;
+                        }
                         connection.pipeline().addLast(new Connection(acceptor, tokens, config.earlyData, unconfirmed));
                     }
                 })
                 .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
                     @Override
                     protected void initChannel(QuicStreamChannel stream) {
+                        if (stream.parent().hasAttr(REFUSED)) {
+                            return; // closing with CONNECTION_REFUSED already
+                        }
                         Connection connection = stream.parent().pipeline().get(Connection.class);
                         if (connection == null || stream.type() != QuicStreamType.BIDIRECTIONAL
                                 || stream.isLocalCreated()) {
@@ -150,6 +178,33 @@ public final class QuicServer implements Closeable {
                     }
                 })
                 .build();
+    }
+
+    /**
+     * Takes an open-connection lease for {@code connection}, released when it closes. Over a limit,
+     * closes it with CONNECTION_REFUSED and returns false. Runs inside the codec's read (the channel
+     * is registered there), where the remote address is already set; fails open.
+     */
+    private static boolean lease(QuicChannel connection, ConnectionAdmission admission) {
+        ConnectionAdmission.Lease lease;
+        try {
+            java.net.SocketAddress remote = connection.remoteSocketAddress();
+            if (!(remote instanceof InetSocketAddress) || ((InetSocketAddress) remote).getAddress() == null) {
+                return true;
+            }
+            lease = admission.tryAcquire(((InetSocketAddress) remote).getAddress());
+        } catch (Throwable t) {
+            LOG.log(Level.FINE, "QUIC open-connection check failed; admitting the connection", t);
+            return true;
+        }
+        if (lease == null) {
+            connection.attr(REFUSED).set(Boolean.TRUE);
+            Codecs.closeLater(connection, false, CONNECTION_REFUSED);
+            return false;
+        }
+        // The Lease keeps its own address; the channel's is cleared when it is freed.
+        connection.closeFuture().addListener(f -> lease.close());
+        return true;
     }
 
     public InetSocketAddress localAddress() {
