@@ -25,6 +25,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -64,6 +67,7 @@ class StartupRecoveryTest {
     static final class FaultOps implements DurabilityOps {
         boolean failForce;
         boolean failSync;
+        Error seamError;
 
         @Override
         public void force(FileChannel ch) throws IOException {
@@ -80,6 +84,9 @@ class StartupRecoveryTest {
 
         @Override
         public boolean syncDirectory(Path dir) throws IOException {
+            if (seamError != null) {
+                throw seamError;
+            }
             if (failSync) {
                 throw new IOException("injected sync failure");
             }
@@ -409,6 +416,7 @@ class StartupRecoveryTest {
         assertFalse(Files.exists(staging(TXID, ".jar")));
         assertFalse(Files.exists(journalPath()));
         assertTrue(Files.exists(backup(TXID)));
+        assertMessageContains(result, "not installed");
     }
 
     @Test
@@ -604,9 +612,12 @@ class StartupRecoveryTest {
 
     // ---- completeHealth -----------------------------------------------------------------------
 
+    /** Runs the recording step on the completing thread. */
+    private static final Executor DIRECT = Runnable::run;
+
     private CompletionStage<HealthCompletion> completeWith(RecoveryTicket ticket, FakeSignal signal,
             Duration timeout) {
-        return StartupRecovery.completeHealth(ctx(V2), ticket, signal, timeout);
+        return StartupRecovery.completeHealth(ctx(V2), ticket, signal, timeout, DIRECT);
     }
 
     private void setUpBootPending(String txid, String backupTxid) throws Exception {
@@ -734,22 +745,6 @@ class StartupRecoveryTest {
     }
 
     @Test
-    void lockBusyWhenVerdictArrivesCompletesExceptionallyAndKeepsFiles() throws Exception {
-        setUpBootPending(TXID, TXID_OLD);
-        FakeSignal signal = new FakeSignal();
-        CompletionStage<HealthCompletion> stage = completeWith(new RecoveryTicket(TXID), signal,
-                Duration.ofSeconds(5));
-
-        holdingTxnLock(() -> signal.future.complete(true));
-
-        ExecutionException failure = assertThrows(ExecutionException.class,
-                () -> stage.toCompletableFuture().get());
-        assertTrue(failure.getCause() instanceof UpdateRejectedException, "cause " + failure.getCause());
-        assertTrue(Files.exists(journalPath()));
-        assertTrue(Files.exists(backup(TXID_OLD)));
-    }
-
-    @Test
     void unexpectedFailureCompletesWithFixedRejection() throws Exception {
         setUpBootPending(TXID, TXID_OLD);
         FakeSignal signal = new FakeSignal();
@@ -761,8 +756,7 @@ class StartupRecoveryTest {
         ExecutionException failure = assertThrows(ExecutionException.class,
                 () -> stage.toCompletableFuture().get());
         assertTrue(failure.getCause() instanceof UpdateRejectedException);
-        assertEquals("health result could not be recorded; keeping the journal and backup",
-                failure.getCause().getMessage());
+        assertEquals(StartupRecovery.MSG_HEALTH_UNCONFIRMED, failure.getCause().getMessage());
     }
 
     @Test
@@ -803,5 +797,106 @@ class StartupRecoveryTest {
         assertThrows(IllegalArgumentException.class, () -> new RecoveryTicket("ABC"));
         assertThrows(IllegalArgumentException.class, () -> new RecoveryTicket(TXID.toUpperCase()));
         assertEquals(TXID, new RecoveryTicket(TXID).txid());
+    }
+
+    private static HealthCompletion awaitHealth(CompletionStage<HealthCompletion> stage) throws Exception {
+        return stage.toCompletableFuture().get(10, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void busyLockThenFreeSucceedsOnRetry() throws Exception {
+        setUpBootPending(TXID, TXID_OLD);
+        FakeSignal signal = new FakeSignal();
+        CompletionStage<HealthCompletion> stage = completeWith(new RecoveryTicket(TXID), signal,
+                Duration.ofSeconds(5));
+
+        // The first attempt sees the lock busy and schedules a retry; the lock is free again before it runs.
+        holdingTxnLock(() -> signal.future.complete(true));
+
+        assertEquals(HealthCompletion.HEALTHY, awaitHealth(stage));
+        assertFalse(Files.exists(journalPath()));
+        assertFalse(Files.exists(backup(TXID_OLD)));
+    }
+
+    @Test
+    void busyLockForEveryAttemptCompletesExceptionallyAndKeepsBootPending() throws Exception {
+        setUpBootPending(TXID, TXID_OLD);
+        FakeSignal signal = new FakeSignal();
+        CompletionStage<HealthCompletion> stage = completeWith(new RecoveryTicket(TXID), signal,
+                Duration.ofSeconds(5));
+        byte[] before = journalBytes();
+
+        holdingTxnLock(() -> {
+            signal.future.complete(true);
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> stage.toCompletableFuture().get(10, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof UpdateRejectedException, "cause " + failure.getCause());
+        });
+
+        assertArrayEquals(before, journalBytes());
+        assertEquals(JournalPhase.BOOT_PENDING, readJournal().phase());
+        assertTrue(Files.exists(backup(TXID_OLD)));
+    }
+
+    @Test
+    void recordingRunsOnTheSuppliedExecutor() throws Exception {
+        setUpBootPending(TXID, TXID_OLD);
+        ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "health-worker");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            FakeSignal signal = new FakeSignal();
+            CompletionStage<HealthCompletion> stage = StartupRecovery.completeHealth(ctx(V2),
+                    new RecoveryTicket(TXID), signal, Duration.ofSeconds(5), worker);
+            signal.future.complete(true);
+            assertEquals(HealthCompletion.HEALTHY, awaitHealth(stage));
+        } finally {
+            worker.shutdownNow();
+        }
+    }
+
+    @Test
+    void nonVirtualMachineErrorInRecordingStillCompletesTheStage() throws Exception {
+        setUpBootPending(TXID, TXID_OLD);
+        ops.seamError = new AssertionError("injected seam failure");
+        FakeSignal signal = new FakeSignal();
+        CompletionStage<HealthCompletion> stage = completeWith(new RecoveryTicket(TXID), signal,
+                Duration.ofSeconds(5));
+
+        signal.future.complete(true);
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> stage.toCompletableFuture().get(5, TimeUnit.SECONDS));
+        assertTrue(failure.getCause() instanceof UpdateRejectedException);
+        assertEquals(StartupRecovery.MSG_HEALTH_UNCONFIRMED, failure.getCause().getMessage());
+    }
+
+    @Test
+    void virtualMachineErrorInRecordingCompletesTheStageBeforeRethrowing() throws Exception {
+        setUpBootPending(TXID, TXID_OLD);
+        ops.seamError = new OutOfMemoryError("injected seam failure");
+        ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "health-worker-vm");
+            t.setDaemon(true);
+            t.setUncaughtExceptionHandler((thread, e) -> {
+                // The rethrown error is expected here; the stage is what the test checks.
+            });
+            return t;
+        });
+        try {
+            FakeSignal signal = new FakeSignal();
+            CompletionStage<HealthCompletion> stage = StartupRecovery.completeHealth(ctx(V2),
+                    new RecoveryTicket(TXID), signal, Duration.ofSeconds(5), worker);
+
+            signal.future.complete(true);
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> stage.toCompletableFuture().get(5, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof UpdateRejectedException);
+        } finally {
+            worker.shutdownNow();
+        }
     }
 }
