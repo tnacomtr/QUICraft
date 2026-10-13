@@ -20,3 +20,6 @@ natives/build/
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# Isolated OpenCode agent worktrees
+.worktrees/
