@@ -88,7 +88,7 @@ Do not implement wire formats, trust/key rotation, or jar application from the d
 
 Adaptive Retry/listener admission integration, platform configuration, server-owner DDoS/release documentation, updater specification and implementation remain follow-up waves. Test-writing units use `cheap-tester` with precise behavior specifications and isolated mutation checks. Verification and peer review are mandatory; network, cryptographic, and filesystem changes also require a fresh security reviewer.
 
-The user permits parallel coding agents and regular testers, but only one llama.cpp cheap-tester may be active at once. The Retry test agent owns that slot until it reports stopped or done.
+The user permits parallel coding agents and regular testers, but only one llama.cpp cheap-tester may be active at once. The original Retry test agent has finished; that slot is currently free. Its submitted test file was audited and corrected by a regular tester in a fresh worktree.
 
 ### Parallel preparation units
 
@@ -134,7 +134,57 @@ Commands and numeric gate criteria pending readiness audit. A verifier must inde
 | ses_ecbe1425efferbZ3XYGOIJ8SPN | explorer | Admission hook facts | read-only | L0 | done |
 | ses_ecbe04feaffeN64v3fY3yjIXHt | security-reviewer | Updater design | read-only | L0 | done |
 | ses_ecbde37e3ffeIPbEMbc3hhb3Ou | advisor | Retry-token design critique | tool-less | L0 | done |
-| ses_ecbd80d84ffeYLBalvShEbDxEZ | default-coder | Retry-token primitive | agent/phase4-retry-token | L2 | done, awaiting gates |
-| ses_ecbd3f1e3ffevdUL7OI2kTdbt2 | cheap-tester | Retry-token tests | agent/phase4-retry-tests | L1 | backgrounded, unfinished |
+| ses_ecbd80d84ffeYLBalvShEbDxEZ | default-coder | Retry-token primitive | agent/phase4-retry-token | L2 | done, integrated through reviewed branch |
+| ses_ecbd3f1e3ffevdUL7OI2kTdbt2 | cheap-tester | Original Retry tests | agent/phase4-retry-tests | L1 | stopped after report; branch/worktree retained quarantined |
+| ses_ecbc71d47ffe2XKJ3QXe1bOKzT | default-coder | Admission primitive | agent/phase4-admission | L1 | done, integrated through reviewed branch |
+| ses_ecbc71d0bffeE40WFEHgwkvHRX | default-coder | Updater/release/security docs | agent/phase4-updater-docs | L1 | stopped; docs gated and merged |
+| ses_ecbc1335fffe27A09jUusyU5sl | default-tester | Admission tests and review fixes | agent/phase4-admission-tests | L2 | done, final 43ffccd gated and merged |
+| ses_ecbbb6ff2ffeSEigYjFbBQfyNu | verifier | Admission verification 1 | read-only admission-tests worktree | L0 | done, FAIL: evidence access only |
+| ses_ecbb1949cffe4xUPYJTRbrvI7V | verifier | Admission verification 2 | read-only admission-tests worktree | L0 | done, FAIL: scope/plan access and cached execution |
+| ses_ecbaaf47cffeEKJ5JZQ3PzwsNO | verifier | Admission verification 3 | read-only admission-tests worktree | L0 | done, PASS on pre-review tests |
+| ses_ecba74c58ffeGBsr5Q7UdQVDXO | peer-reviewer | Admission review 1 | read-only admission-tests worktree | L0 | done, clock/cleanup findings fixed in 62567fc |
+| ses_ecbb9fa7effe9uYYT4kkashXDO | verifier | Documentation verification 1 | read-only updater-docs worktree | L0 | done, PASS |
+| ses_ecbb3df27ffec1uz0LWr7etnKr | peer-reviewer | Documentation review 1 | read-only updater-docs worktree | L0 | done, three findings fixed |
+| ses_ecbaead7affeOHA5r96LMLc1mh | verifier | Corrected documentation verification | read-only updater-docs worktree | L0 | done, PASS |
+| ses_ecbaaf401ffeETkezFFFocfoEW | peer-reviewer | Corrected documentation review | read-only updater-docs worktree | L0 | done, approve; cross-reference nit fixed |
+| ses_ecba7fecfffeUi4VSn5KIneD9t | security-reviewer | Documentation safety review | read-only updater-docs worktree | L0 | done, clean for preparation only |
+| ses_ecb9c4abfffe1bUR1Dig5M4lH4 | default-tester | Audited Retry tests and renewed patched-dependency proof | agent/phase4-retry-reviewed | L2 | done, final 64e1ab9 gated and merged |
+| ses_ecb8d3885ffeZ3y7L8d7ZV41fM | verifier | Retry implementation and audited tests | read-only retry-reviewed worktree | L0 | done, pre-review PASS |
+| ses_ecb8d37fdffeHuzeN7jg70011I | verifier | Corrected admission tests | read-only admission-tests worktree | L0 | done, inline lease finding fixed |
+| ses_ecb8b281affe1mP8rbAU5vK5xu | explorer | Official loader live-swap behavior | read-only | L0 | done; runtime proof still required |
+| ses_ecb8620c9ffeK1CRYdbF7pi3Pt | peer-reviewer | Retry coverage review | read-only | L0 | done, genuine wrap/index findings fixed |
+| ses_ecb6fa9c9ffe9l1RJj7cyKPg6b | verifier | Final Retry verification | read-only retry-reviewed worktree | L0 | done, PASS 52 tests and core check/build |
+| ses_ecb6fa9c8ffeyxvqhcynJM7igg | verifier | Final admission verification | read-only admission-tests worktree | L0 | done, PASS 21 tests and core check/build |
+| ses_ecb699fd2ffe4bIm9164njhn29 | peer-reviewer | Final Retry review | read-only | L0 | done, approve |
+| ses_ecb699f9effeyR3uKGaiwTVBMl | peer-reviewer | Final admission review | read-only | L0 | done, approve |
+| ses_ecb662a43ffeHu3IaBb47Okl45 | security-reviewer | Actual primitive code security | read-only | L0 | done, clean within unwired primitive scope |
+| ses_ecb5fdd6affe3nJditgYISkQVJ | verifier | First code merge fast check | root integration branch | L0 | done, PASS 52 fresh tests |
 
 The advisor supported listener-local random keys plus short expiry over minute rotation for this first unit. The local Netty API requires the original DCID to be a suffix: the authenticated tag therefore precedes it, and validation returns offset 41, not 9. All design advice remains subject to actual implementation review.
+
+### Current branch disposition
+
+- Integration branch: `feat/phase4-alpha`; planning/roadmap commits `64711f5`, `2abfbec`. No push or publication.
+- Retry implementation: commit `9bb1f06`, integrated through the reviewed Retry branch; its original worktree is retained.
+- Admission implementation/tests: final commit `43ffccd` (ancestors `a453b12`, `cd789c0`, `62567fc`), merged after final verifier PASS, peer approval and fresh code security review. 21 cases passed, with five isolated mutants renewed against exact final tests. All acquired test leases now receive assertion-failure cleanup.
+- Documentation: commit `5ec479f` on `agent/phase4-updater-docs` was merged after verifier PASS, peer approval and clean preparation-only security review. The copied original draft remains untracked read-only input and was not staged.
+- Original cheap-test output: commit `6cdf7a8`, branch `agent/phase4-retry-tests`, worktree `.worktrees/phase4-retry-tests`, retained quarantined. It created unapproved `mutation-isolated/` artifacts and omitted sufficient proof provenance. The agent is stopped. Do not merge or delete this branch/worktree; no root user work or production source changes were observed.
+- Audited Retry output: final commit `64e1ab9` (ancestor `d9711f2`) on `agent/phase4-retry-reviewed`, merged after verifier PASS, peer approval and fresh code security review. No original cheap commit was merged. 52 cases now prove genuine signed-clock wrap, real nonzero buffer indices and immediate ownership assertions as well as inherited API behavior. Ten mutants were killed against exact patched dependencies and unchanged final tests.
+- The root user's untracked `.claude/`, `AGENTS.md`, and `docs/.plans/` remain untouched. No worktree cleanup is authorized or planned while gates/writers are outstanding.
+
+### Current milestone and remaining work
+
+- This session prepares Phase 4; it does not complete the public-alpha gate. The listener still uses `NoRetryTokenHandler`; neither primitive enforces runtime protections yet.
+- Final unit gate totals: 73 new tests, 15 killed behavior mutants, peer approvals and a clean security review limited to the primitives.
+- Documentation is merged; README and companion status wording now distinguish implemented primitives from inactive protections and the unimplemented updater.
+- Final integrated whole-project build and review remain to be run before reporting this preparation slice complete.
+- Next implementation wave: adaptive Retry/admission pipeline integration and platform configuration, then actual native/TCP/fault-injection tests. Updater schemas, revocation coverage, signing tooling and loader-generation proof remain open release blockers.
+- Loader exploration pinned Fabric Loader 0.19.5 but could only inspect an unpinned Velocity development branch. No guarantee of live-swap safety was found. Test the exact sha256-pinned Velocity 4.2.0-30 build and each supported Fabric/JDK combination with lazy classes/resources, nested jars and native paths before implementing the requested swap.
+
+### Admission integration facts for the next wave
+
+- Netty's public `QuicHeaderParser` can classify the first datagram header before codec allocation; the codec itself only creates channels for unknown-DCID Initial packets (`QuicheQuicServerCodec.java:114-119`). Prefer this parser over a hand-written version/type guess.
+- `QuicheQuicCodec.java:175-203` parses the first packet and releases each received datagram. A preceding admission handler must forward accepted messages without releasing them and release rejected messages exactly once.
+- The parser uses zero-based absolute offsets (`QuicHeaderParser.java:75-79`), so any new admission handler must parse a slice and preserve the incoming buffer's indices and byte order assumptions.
+- Both ordinary and hosted listener binds need identical admission placement before the QUIC codec. Child connection reservations must cover pending and established channels and release on the close future, including failed initialization/TLS/shutdown.
+- No integration defaults or pipeline contracts are finalized yet. In particular, distinguish conservative Initial-datagram budgets (including retries/retransmits) from unique logical connection counts; do not silently throttle established 1-RTT traffic or disable low-load 0-RTT.

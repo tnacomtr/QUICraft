@@ -44,7 +44,8 @@ handler, are Phase 4 release blockers. As of this document:
 
 - The listener still uses `NoRetryTokenHandler` (`core/.../transport/QuicServer.java:133`).
   Retry is not enforced.
-- `ConnectionAdmission` is a contract, not wired into the listener.
+- `ConnectionAdmission` is implemented and unit-tested, but not wired into the listener. It does
+  not yet enforce runtime limits.
 - No platform setting for these limits exists yet. No setting name is documented here.
 
 When they ship, limits are a **mitigation**. They reduce the cost of abusive connection attempts for

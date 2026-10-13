@@ -4,9 +4,9 @@ QUIC transport for Minecraft: Java Edition. QUICraft is a client mod plus server
 plugins. When both sides have it, the game connection runs over QUIC (UDP). In every other case
 it runs over plain TCP, exactly like vanilla.
 
-> **Status: early development (Phase 3 done, Phase 4 next).** Nothing is released yet. The Velocity plugin
+> **Status: early development (Phase 3 done, Phase 4 in progress).** Nothing is released yet. The Velocity plugin
 > and the Fabric client and server mod for 26.x and 1.21.11 build, run and pass their tests; a
-> public alpha comes after Phase 4 (rate limits, Retry tokens). See [Roadmap](#roadmap).
+> public alpha requires Phase 4's active rate limits, Retry tokens, and server-updater gates. See [Roadmap](#roadmap).
 
 ## What it does, and what it doesn't
 
@@ -64,6 +64,13 @@ Not released yet. When it is:
   (`config/quicraft/quic-key.pem`, `quic-cert.pem`). With `enable-query` on the game port, QUIC
   moves to the game port + 1 (configurable).
 
+Alpha preparation guidance: [UDP firewall and DDoS caveats](docs/server-security.md) and
+[release checklist](docs/release.md). The [server updater](docs/updater.md) is planned, not
+implemented: its default will be hourly checks against Modrinth (primary), GitHub, and
+`git.sudoe.rs`, disclosing the server's IP and potentially version/platform information to those
+hosts. Owners will be able to turn checks off; downloads require an explicit command. No updater
+check or download runs in current builds.
+
 ## Supported versions
 
 - **Fabric**, client and dedicated server: Minecraft **26.1–26.3** and **1.21.11** (tested on each).
@@ -81,7 +88,7 @@ Exact version ranges per module: [`docs/version-matrix.md`](docs/version-matrix.
 | 1 | `core`: QUIC client/listener, discovery, racing, fallback, fingerprint check | done (loopback gate) |
 | 2 | Velocity plugin (single stream) | done ([gate](docs/benchmarks.md)) |
 | 3 | Fabric client + dedicated server for 26.x and 1.21.11 | done ([gate and gaps](docs/benchmarks.md)) |
-| 4 | Public alpha | |
+| 4 | Public alpha: Retry, admission limits, server-owner docs, signed server updater | in progress; not release-ready |
 | 5 | Multi-stream on 26.x | |
 | 6–9 | More versions and loaders, Velocity multi-stream, Paper, hardening | |
 
