@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -22,9 +23,15 @@ import org.junit.jupiter.api.Test;
 /**
  * Behavior of the bounded admission state (docs/protocol.md Retry and limits). These tests drive
  * only the package-private API with a fixed or injected clock; no pipeline is involved.
+ *
+ * <p>Non-expiry behavior uses {@link #FROZEN} so no window can roll over mid-test. Only the
+ * window-expiry tests advance an injected {@link AtomicLong} clock.
  */
 class ConnectionAdmissionTest {
     private static final long WINDOW = 1_000_000_000L;
+
+    /** A clock frozen in time so attempt budgets never roll over during a test. */
+    private static final LongSupplier FROZEN = () -> 0L;
 
     private static InetAddress addr(int lastOctet) {
         try {
@@ -63,7 +70,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void allowsExactlyPerIpAttemptsThenDenies() {
-        ConnectionAdmission a = new ConnectionAdmission(10, 3, 5, 5, 10, 10);
+        ConnectionAdmission a = new ConnectionAdmission(10, 3, 5, 5, 10, 10, FROZEN);
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(1)));
@@ -72,7 +79,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void allowsExactlyGlobalAttemptsAcrossDistinctIps() {
-        ConnectionAdmission a = new ConnectionAdmission(3, 5, 5, 5, 3, 10);
+        ConnectionAdmission a = new ConnectionAdmission(3, 5, 5, 5, 3, 10, FROZEN);
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(2)));
         assertTrue(a.allowAttempt(addr(3)));
@@ -81,7 +88,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void distinctIpsHaveIndependentPerIpBudgets() {
-        ConnectionAdmission a = new ConnectionAdmission(100, 2, 5, 5, 100, 10);
+        ConnectionAdmission a = new ConnectionAdmission(100, 2, 5, 5, 100, 10, FROZEN);
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(1)));
         assertFalse(a.allowAttempt(addr(1)));
@@ -92,7 +99,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void perIpRefusalConsumesGlobalAttempt() {
-        ConnectionAdmission a = new ConnectionAdmission(2, 1, 5, 5, 2, 10);
+        ConnectionAdmission a = new ConnectionAdmission(2, 1, 5, 5, 2, 10, FROZEN);
         assertTrue(a.allowAttempt(addr(1)));
         assertFalse(a.allowAttempt(addr(1)), "per-IP limit denies");
         assertTrue(a.requiresRetry(), "the per-IP refusal consumed the second global attempt");
@@ -100,7 +107,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void trackingRefusalConsumesGlobalAttempt() {
-        ConnectionAdmission a = new ConnectionAdmission(5, 5, 5, 5, 3, 2);
+        ConnectionAdmission a = new ConnectionAdmission(5, 5, 5, 5, 3, 2, FROZEN);
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(2)));
         assertFalse(a.allowAttempt(addr(3)), "tracking capacity denies a third IP");
@@ -109,7 +116,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void globalRefusalAllocatesNoTrackingSlot() {
-        ConnectionAdmission a = new ConnectionAdmission(1, 1, 1, 1, 1, 2);
+        ConnectionAdmission a = new ConnectionAdmission(1, 1, 1, 1, 1, 2, FROZEN);
         assertTrue(a.allowAttempt(addr(1)), "first IP consumes the only global attempt and tracks");
         assertFalse(a.allowAttempt(addr(2)), "second IP is globally denied");
         ConnectionAdmission.Lease c = a.tryAcquire(addr(3));
@@ -146,7 +153,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void tryAcquireSpendsNoAttempt() {
-        ConnectionAdmission a = new ConnectionAdmission(1, 1, 1, 1, 1, 10);
+        ConnectionAdmission a = new ConnectionAdmission(1, 1, 1, 1, 1, 10, FROZEN);
         ConnectionAdmission.Lease lease = a.tryAcquire(addr(1));
         assertNotNull(lease);
         assertFalse(a.requiresRetry(), "tryAcquire must not spend an attempt");
@@ -157,7 +164,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void openLeaseCapsAreExactGloballyAndPerIp() {
-        ConnectionAdmission a = new ConnectionAdmission(10, 10, 2, 1, 10, 10);
+        ConnectionAdmission a = new ConnectionAdmission(10, 10, 2, 1, 10, 10, FROZEN);
         ConnectionAdmission.Lease first = a.tryAcquire(addr(1));
         assertNotNull(first);
         assertNull(a.tryAcquire(addr(1)), "per-IP open cap of one");
@@ -170,7 +177,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void closeIsIdempotentAndFreesCapacityExactlyOnce() {
-        ConnectionAdmission a = new ConnectionAdmission(10, 10, 1, 1, 10, 10);
+        ConnectionAdmission a = new ConnectionAdmission(10, 10, 1, 1, 10, 10, FROZEN);
         ConnectionAdmission.Lease lease = a.tryAcquire(addr(1));
         assertNotNull(lease);
         assertNull(a.tryAcquire(addr(2)), "global cap of one is full");
@@ -185,7 +192,7 @@ class ConnectionAdmissionTest {
 
     @Test
     void trackingCapacityRefusesNewIpWithoutEvictingAttemptsOrLeases() {
-        ConnectionAdmission a = new ConnectionAdmission(100, 2, 5, 1, 100, 2);
+        ConnectionAdmission a = new ConnectionAdmission(100, 2, 5, 1, 100, 2, FROZEN);
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(2)));
@@ -274,73 +281,94 @@ class ConnectionAdmissionTest {
     @Test
     void concurrentAttemptsNeverOveradmit() throws Exception {
         final int threads = 16;
-        final ConnectionAdmission a = new ConnectionAdmission(4, 100, 100, 100, 4, 100);
+        final ConnectionAdmission a = new ConnectionAdmission(4, 100, 100, 100, 4, 100, FROZEN);
         final CountDownLatch start = new CountDownLatch(1);
         final CountDownLatch done = new CountDownLatch(threads);
         final AtomicInteger allowed = new AtomicInteger();
+        final ConcurrentLinkedQueue<Throwable> failures = new ConcurrentLinkedQueue<>();
         ExecutorService pool = Executors.newFixedThreadPool(threads);
-        for (int i = 0; i < threads; i++) {
-            final InetAddress ip = addr(i + 1);
-            pool.execute(() -> {
-                try {
-                    start.await();
-                    if (a.allowAttempt(ip)) {
-                        allowed.incrementAndGet();
+        try {
+            for (int i = 0; i < threads; i++) {
+                final InetAddress ip = addr(i + 1);
+                pool.execute(() -> {
+                    try {
+                        start.await();
+                        if (a.allowAttempt(ip)) {
+                            allowed.incrementAndGet();
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (Throwable t) {
+                        failures.add(t);
+                    } finally {
+                        done.countDown();
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } finally {
-                    done.countDown();
-                }
-            });
+                });
+            }
+            start.countDown();
+            assertTrue(done.await(10, TimeUnit.SECONDS), "workers finished");
+            assertTrue(failures.isEmpty(), () -> "unexpected worker failures: " + failures);
+            assertEquals(4, allowed.get(), "exactly the global attempt budget is admitted");
+        } finally {
+            start.countDown();
+            pool.shutdownNow();
         }
-        start.countDown();
-        assertTrue(done.await(10, TimeUnit.SECONDS), "workers finished");
-        pool.shutdownNow();
-        assertEquals(4, allowed.get(), "exactly the global attempt budget is admitted");
     }
 
     @Test
     void concurrentLeasesNeverOveradmitAndAreHeldUntilObserved() throws Exception {
         final int threads = 12;
-        final ConnectionAdmission a = new ConnectionAdmission(100, 100, 3, 100, 100, 100);
+        final ConnectionAdmission a = new ConnectionAdmission(100, 100, 3, 100, 100, 100, FROZEN);
         final ConnectionAdmission.Lease[] leases = new ConnectionAdmission.Lease[threads];
         final CountDownLatch ready = new CountDownLatch(threads);
         final CountDownLatch proceed = new CountDownLatch(1);
         final CountDownLatch done = new CountDownLatch(threads);
+        final ConcurrentLinkedQueue<Throwable> failures = new ConcurrentLinkedQueue<>();
         ExecutorService pool = Executors.newFixedThreadPool(threads);
-        for (int i = 0; i < threads; i++) {
-            final int index = i;
-            final InetAddress ip = addr(i + 1);
-            pool.execute(() -> {
-                ConnectionAdmission.Lease lease = a.tryAcquire(ip);
-                leases[index] = lease;
-                ready.countDown();
-                try {
-                    proceed.await();
-                    if (lease != null) {
-                        lease.close();
+        try {
+            for (int i = 0; i < threads; i++) {
+                final int index = i;
+                final InetAddress ip = addr(i + 1);
+                pool.execute(() -> {
+                    ConnectionAdmission.Lease lease = null;
+                    try {
+                        lease = a.tryAcquire(ip);
+                        leases[index] = lease;
+                        ready.countDown();
+                        proceed.await();
+                        if (lease != null) {
+                            lease.close();
+                            lease = null;
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (Throwable t) {
+                        failures.add(t);
+                    } finally {
+                        if (lease != null) {
+                            lease.close();
+                        }
+                        done.countDown();
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } finally {
-                    done.countDown();
-                }
-            });
-        }
-        assertTrue(ready.await(10, TimeUnit.SECONDS), "all reservation results observed");
-        int granted = 0;
-        for (ConnectionAdmission.Lease lease : leases) {
-            if (lease != null) {
-                granted++;
+                });
             }
+            assertTrue(ready.await(10, TimeUnit.SECONDS), "all reservation results observed");
+            int granted = 0;
+            for (ConnectionAdmission.Lease lease : leases) {
+                if (lease != null) {
+                    granted++;
+                }
+            }
+            assertEquals(3, granted, "exactly the global open cap is granted while leases are held");
+            proceed.countDown();
+            assertTrue(done.await(10, TimeUnit.SECONDS), "workers closed their leases");
+            assertTrue(failures.isEmpty(), () -> "unexpected worker failures: " + failures);
+            ConnectionAdmission.Lease after = a.tryAcquire(other(1));
+            assertNotNull(after, "closing all leases restores capacity");
+            after.close();
+        } finally {
+            proceed.countDown();
+            pool.shutdownNow();
         }
-        assertEquals(3, granted, "exactly the global open cap is granted while leases are held");
-        proceed.countDown();
-        assertTrue(done.await(10, TimeUnit.SECONDS), "workers closed their leases");
-        pool.shutdownNow();
-        ConnectionAdmission.Lease after = a.tryAcquire(other(1));
-        assertNotNull(after, "closing all leases restores capacity");
-        after.close();
     }
 }
