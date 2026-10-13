@@ -32,6 +32,13 @@ import rs.sudoe.quicraft.updater.UpdateDocuments.Withdrawal;
  * <p>Signer evidence is bound to the trust snapshot of the current run ({@code currentTrust}).
  * A {@link VerifiedDocument} verified under any other {@link TrustSnapshot} is ignored, and role,
  * revocation and key checks use {@code currentTrust}, never the document's own snapshot.
+ *
+ * <p>Withdrawal attribution (residual limit). A withdrawn entry is recorded once per sha512 (the
+ * entry is unique by sha512), so a withdrawal cannot be recorded under every trusted signing kid.
+ * It is attributed to the lowest sorted trusted signing kid of the accepted manifest. If that kid
+ * is later revoked, the withdrawal is pruned together with its floor, as docs/updater.md 12.4
+ * specifies, even if another signer of the same manifest remains trusted. This is a known,
+ * accepted limit of the rule, not a fix; a test pins this behaviour.
  */
 public final class SequencePolicy {
 
@@ -56,14 +63,16 @@ public final class SequencePolicy {
      * REPLAY_SAME} is the same document fetched again, {@code STALE} is older than the floor or an
      * unbacked floor value, {@code EQUIVOCATION} is the same seq with different bytes, and
      * {@code UNTRUSTED} means no signer is a current, unrevoked release key or the document was
-     * verified under another trust snapshot.
+     * verified under another trust snapshot. {@code INVALID_TIMES} means the times fail the M6
+     * checks (structural lifetime, future tolerance, expiry); it is decided before any floor logic.
      */
     public enum ManifestDecision {
         ACCEPT,
         REPLAY_SAME,
         STALE,
         EQUIVOCATION,
-        UNTRUSTED
+        UNTRUSTED,
+        INVALID_TIMES
     }
 
     /** The result of {@link #acceptManifest}. {@code stateFull} is true when a cap was exceeded. */
@@ -73,13 +82,20 @@ public final class SequencePolicy {
         }
     }
 
-    /** The result of {@link #selectCurrent}: the delta and the WARN messages it produced. */
-    public record SelectionResult(StateDelta delta, List<String> warnings) {
+    /**
+     * The result of {@link #selectCurrent}: the delta and the WARN messages it produced.
+     * {@code stateFull} is true when a document was skipped because merging it would exceed the
+     * revocations caps; such a document is not merged and cannot become current.
+     */
+    public record SelectionResult(StateDelta delta, List<String> warnings, boolean stateFull) {
         public SelectionResult {
             Objects.requireNonNull(delta, "delta");
             warnings = List.copyOf(warnings);
         }
     }
+
+    /** Fixed WARN text for a revocations document skipped because the state caps would be exceeded. */
+    static final String REVOCATIONS_STATE_FULL_WARNING = "revocations state full; document not merged";
 
     /**
      * The manifest sequence floor (12.4): the maximum of the trust floor, the current revocation
@@ -105,20 +121,32 @@ public final class SequencePolicy {
      * UNTRUSTED}. Only signers that are current release keys and not revoked count. A {@code seq}
      * equal to the floor is accepted only when a persisted non-revoked kid holds the identical
      * SHA-256 for that seq (the same document fetched again); any other persisted hash for that seq
-     * is equivocation.
+     * is equivocation. Before any floor logic, the times must pass M6 at {@code systemNow} and
+     * {@code effectiveNow} (see {@link #timesAdmissible}); otherwise the result is {@code
+     * INVALID_TIMES} and no floor is read or changed.
      */
     public static ManifestDecision manifestDecision(
-            VerifiedDocument<ReleaseManifest> m, Snapshot snap, Trust trust, TrustSnapshot currentTrust) {
+            VerifiedDocument<ReleaseManifest> m,
+            Snapshot snap,
+            Trust trust,
+            TrustSnapshot currentTrust,
+            Instant systemNow,
+            Instant effectiveNow) {
         Objects.requireNonNull(m, "m");
         Objects.requireNonNull(snap, "snap");
         Objects.requireNonNull(trust, "trust");
         Objects.requireNonNull(currentTrust, "currentTrust");
+        Objects.requireNonNull(systemNow, "systemNow");
+        Objects.requireNonNull(effectiveNow, "effectiveNow");
         if (!m.snapshot().equals(currentTrust)) {
             return ManifestDecision.UNTRUSTED;
         }
         Set<String> trustedKids = trustedReleaseKids(m, snap, currentTrust);
         if (trustedKids.isEmpty()) {
             return ManifestDecision.UNTRUSTED;
+        }
+        if (!timesAdmissible(m.document(), systemNow, effectiveNow)) {
+            return ManifestDecision.INVALID_TIMES;
         }
         long seq = m.document().seq();
         long floor = manifestFloor(snap, trust);
@@ -160,6 +188,9 @@ public final class SequencePolicy {
         if (!admissible(snap, currentTrust, doc)) {
             return unchanged(snap);
         }
+        if (!fitsRevokedCaps(mergeRevoked(snap.revoked(), doc.document()))) {
+            return unchanged(snap);
+        }
         Snapshot merged = applyRestrictions(snap, doc.document());
         return new StateDelta(merged.state(), merged.revoked());
     }
@@ -193,13 +224,22 @@ public final class SequencePolicy {
         }
 
         Snapshot folded = snap;
+        boolean stateFull = false;
+        List<VerifiedDocument<Revocations>> merged = new ArrayList<>();
         for (VerifiedDocument<Revocations> doc : candidates) {
+            if (!fitsRevokedCaps(mergeRevoked(folded.revoked(), doc.document()))) {
+                // Never evicts: the document is skipped whole, so it cannot become current either.
+                stateFull = true;
+                warnings.add(REVOCATIONS_STATE_FULL_WARNING);
+                continue;
+            }
             folded = applyRestrictions(folded, doc.document());
+            merged.add(doc);
         }
 
         CurrentRevocations persisted = snap.state().revocations();
         List<VerifiedDocument<Revocations>> eligible = new ArrayList<>();
-        for (VerifiedDocument<Revocations> doc : candidates) {
+        for (VerifiedDocument<Revocations> doc : merged) {
             if (!FreshnessPolicy.futureIssued(doc.document().issued(), systemNow)) {
                 eligible.add(doc);
             }
@@ -221,7 +261,7 @@ public final class SequencePolicy {
         }
 
         if (pool.isEmpty()) {
-            return new SelectionResult(new StateDelta(folded.state(), folded.revoked()), warnings);
+            return new SelectionResult(new StateDelta(folded.state(), folded.revoked()), warnings, stateFull);
         }
         long highest = Long.MIN_VALUE;
         for (VerifiedDocument<Revocations> doc : pool) {
@@ -251,7 +291,7 @@ public final class SequencePolicy {
                     old.minManifestSeq());
             folded = new Snapshot(withRevocations(state, next), folded.revoked());
         }
-        return new SelectionResult(new StateDelta(folded.state(), folded.revoked()), warnings);
+        return new SelectionResult(new StateDelta(folded.state(), folded.revoked()), warnings, stateFull);
     }
 
     /**
@@ -322,14 +362,17 @@ public final class SequencePolicy {
             Trust trust,
             TrustSnapshot currentTrust,
             String compiledPlatform,
-            UpdateVersion maxRunningOrOnDisk) {
+            UpdateVersion maxRunningOrOnDisk,
+            Instant systemNow,
+            Instant effectiveNow) {
         Objects.requireNonNull(snap, "snap");
         Objects.requireNonNull(m, "m");
         Objects.requireNonNull(trust, "trust");
         Objects.requireNonNull(currentTrust, "currentTrust");
         Objects.requireNonNull(compiledPlatform, "compiledPlatform");
         Objects.requireNonNull(maxRunningOrOnDisk, "maxRunningOrOnDisk");
-        ManifestDecision decision = manifestDecision(m, snap, trust, currentTrust);
+        ManifestDecision decision =
+                manifestDecision(m, snap, trust, currentTrust, systemNow, effectiveNow);
         if (decision != ManifestDecision.ACCEPT && decision != ManifestDecision.REPLAY_SAME) {
             return new AcceptResult(unchanged(snap), false);
         }
@@ -403,9 +446,8 @@ public final class SequencePolicy {
                 r.issued(), r.expires(), FreshnessPolicy.REVOCATIONS_MAX_LIFETIME);
     }
 
-    /** Applies the restriction merge of one document and prunes, returning the new snapshot. */
-    private static Snapshot applyRestrictions(Snapshot snap, Revocations doc) {
-        RevokedState revoked = snap.revoked();
+    /** The union of the persisted revoked state and one document's restrictions, before pruning. */
+    private static RevokedState mergeRevoked(RevokedState revoked, Revocations doc) {
         List<UpdateDocuments.RevokedKey> keys = new ArrayList<>();
         Set<String> pubs = new HashSet<>();
         for (UpdateDocuments.RevokedKey key : revoked.revokedKeys()) {
@@ -424,7 +466,34 @@ public final class SequencePolicy {
                 blocked.add(sha512);
             }
         }
-        RevokedState mergedRevoked = new RevokedState(keys, blocked);
+        return new RevokedState(keys, blocked);
+    }
+
+    /**
+     * True when the merged revoked state fits the {@code revoked.json} codec: at most 64 revoked
+     * keys, at most 1024 blocked artifacts and the byte cap. The codec's own check is reused so the
+     * limits cannot drift apart.
+     */
+    private static boolean fitsRevokedCaps(RevokedState merged) {
+        try {
+            RevokedCodec.encode(merged);
+            return true;
+        } catch (IllegalStateException e) {
+            return false;
+        }
+    }
+
+    /** M6 times (R6 structure, future tolerance and expiry at the effective clock). */
+    private static boolean timesAdmissible(ReleaseManifest doc, Instant systemNow, Instant effectiveNow) {
+        return FreshnessPolicy.structuralTimesValid(
+                        doc.issued(), doc.expires(), FreshnessPolicy.MANIFEST_MAX_LIFETIME)
+                && !FreshnessPolicy.futureIssued(doc.issued(), systemNow)
+                && FreshnessPolicy.unexpired(doc.expires(), effectiveNow);
+    }
+
+    /** Applies the restriction merge of one document and prunes, returning the new snapshot. */
+    private static Snapshot applyRestrictions(Snapshot snap, Revocations doc) {
+        RevokedState mergedRevoked = mergeRevoked(snap.revoked(), doc);
 
         UpdaterState state = snap.state();
         CurrentRevocations old = state.revocations();

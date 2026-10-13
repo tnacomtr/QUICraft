@@ -160,13 +160,15 @@ public final class Acceptance {
                 continue;
             }
             ManifestDecision decision =
-                    SequencePolicy.manifestDecision(vm.verified(), folded, running, currentTrust);
+                    SequencePolicy.manifestDecision(vm.verified(), folded, running, currentTrust,
+                            systemNow, effectiveNow);
             if (decision != ManifestDecision.ACCEPT && decision != ManifestDecision.REPLAY_SAME) {
                 diagnostics.add(vm.key() + ": " + rejectionText(decision));
                 continue;
             }
             AcceptResult accepted = SequencePolicy.acceptManifest(
-                    folded, vm.verified(), running, currentTrust, id.platform(), floorVersion);
+                    folded, vm.verified(), running, currentTrust, id.platform(), floorVersion,
+                    systemNow, effectiveNow);
             if (accepted.stateFull()) {
                 stateFull = true;
                 diagnostics.add(STATE_FULL_DIAGNOSTIC);
