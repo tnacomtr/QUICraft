@@ -11,6 +11,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
+import java.net.URI;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -282,7 +283,8 @@ class ArtifactVerifierTest {
         VerifiedDocument<UpdateDocuments.ReleaseManifest> doc = new VerifiedDocument<>(
                 manifest, bytes("{}"), new VerifiedSigners(List.of()),
                 TrustSnapshot.of(parseTrust(trustJson(1, standardKeys())), Set.of()));
-        return new AcceptedCandidate(doc, new ManifestEvidence(bytes("{}"), bytes("{}")), entry, List.of());
+        return new AcceptedCandidate(doc, new ManifestEvidence(bytes("{}"), bytes("{}")), entry,
+                List.of(new ReleaseHost("modrinth", URI.create("https://modrinth.example"))));
     }
 
     private static RuntimeIdentity runtime(String running) throws Exception {
