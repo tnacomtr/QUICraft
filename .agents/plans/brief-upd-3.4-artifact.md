@@ -1,0 +1,25 @@
+# Brief upd-3.4: artifact verification and staged-trust validation
+
+GOAL: plan `.agents/plans/2026-10-13-updater-runtime.md` section "Wave 3 to 5: frozen", item 3.4, and spec docs/updater.md 12.2 "Validating a staged jar's trust file" (lines ~408-415), 12.10 step 5.
+SCOPE: new files in `updater/src/main/java/rs/sudoe/quicraft/updater/` and its test dir; plus a new parser method in `DocumentParser.java` for build metadata (below).
+BRANCH/WORKTREE: `agent/phase4-upd-artifact` in `/home/tna/QUICraft/.worktrees/phase4-upd-artifact` (contains 3.0 types, StateRecords, keys, signers, TrustTransition, SequencePolicy). `./gradlew`/`git` from there only.
+READ FIRST: plan section; `DocumentParser.java` (parseTrust and helpers), `UpdateDocuments.java`, `KeySetFingerprint.java`, `StateRecords.java`, `ArtifactIdentity.java`, `RuntimeIdentity.java`, `TrustTransition.java` (classify), `KeySetChangeAuthorization.java`.
+
+NEW BUILD METADATA FORMAT (orchestrator decision, internal to our own jars): resource `META-INF/quicraft/build.json`, exactly `{"type":"quicraft.build","v":1,"platform":"<velocity|fabric-26x|fabric-1.21.11>","version":"<UpdateVersion string>"}`, cap 1024 bytes, strict like other documents. Add `record BuildInfo(String platform, UpdateVersion version)` to UpdateDocuments? NO - no existing-record edits: create `BuildInfo.java` record, and add `public static BuildInfo parseBuild(byte[] bytes) throws UpdateRejectedException` to DocumentParser using its existing helpers (requireHeader/requireExactKeys/platformValue/versionValue).
+
+API:
+1. `StagedArtifact(Path path, ArtifactIdentity identity, UpdateDocuments.Trust stagedTrust, String stagedKeySetFingerprint)` record.
+2. `ArtifactVerifier.verify(Path stagedJar, AcceptedCandidate c, RuntimeIdentity id, UpdateVersion onDiskVersion, StateRecords.Snapshot current) throws IOException, UpdateRejectedException -> StagedArtifact`:
+   - Open with NOFOLLOW_LINKS; must be a regular file; size == entry.size; SHA-512 of the bytes == entry.sha512 (stream, do not load the whole file).
+   - entry.platform == id.platform; entry.targets contains id.target; entry.version > max(id.runningVersion, onDiskVersion).
+   - ZIP read with `java.util.zip.ZipFile` (no class loading): exactly one entry named `META-INF/quicraft/updater-trust.json` and exactly one `META-INF/quicraft/build.json` (iterate all entries to detect duplicates; ZipFile may hide duplicates, so also scan with ZipInputStream and count names); each entry uncompressed size cap (trust 65536, build 1024), read at most cap+1 bytes. Parse trust (DocumentParser.parseTrust) and build (parseBuild); build.platform == entry.platform and build.version equals entry.version.
+   - validateStagedTrust(stagedTrust, current); compute stagedKeySetFingerprint = KeySetFingerprint.of(stagedTrust.keys()).
+   - Return StagedArtifact. Never load or define classes.
+   (AcceptedCandidate: if unit 3.3 has not created it yet, create `AcceptedCandidate(VerifiedDocument<UpdateDocuments.ReleaseManifest> manifest, ManifestEvidence evidence, UpdateDocuments.ReleaseEntry entry, List<ReleaseHost> artifactSources)` exactly as in the plan, in its own file; the orchestrator resolves the duplicate at merge.)
+3. `ArtifactVerifier.validateStagedTrust(UpdateDocuments.Trust staged, StateRecords.Snapshot current) throws UpdateRejectedException`: exactly one REVOCATION key and its pub equals current.state().revocationKey(); no staged pub in current.revoked().revokedPubs(); staged.epoch >= current.state().epoch(); if equal epoch, KeySetFingerprint.of(staged.keys()) equals current.state().keySetFingerprint(). Fixed messages. A different backup key is always rejected (no co-signature waiver).
+TESTS: build small ZIPs in @TempDir with java.util.zip.ZipOutputStream (opaque payload entry + metadata); trust JSON from SignedFixtures / DocumentParserTest style with RFC 8032 test pubs only. Cases: happy path; size mismatch; sha512 mismatch; symlinked jar refused; wrong platform; target missing; version not greater than max(running, on-disk) (both sides); missing trust entry; duplicate trust entry (write two entries with the same name via ZipOutputStream if it allows, else via raw bytes — if impossible, document and test duplicate build.json the same way); oversized metadata entry; build.json platform/version mismatch; validateStagedTrust: different revocation key rejected, revoked pub rejected, lower epoch rejected, equal epoch different fingerprint rejected, higher epoch same revocation key accepted; parseBuild strictness (unknown key, wrong type, bad version).
+Run `./gradlew :updater:test :updater:check --rerun-tasks --no-build-cache`; green. Commit, trailer (own model):
+   Co-Authored-By: <your model> <noreply@anthropic.com>
+   Claude-Session: https://claude.ai/code/session_01CbMd2TPdZhSiL4ecdkFEH9
+CONSTRAINTS: JDK only. Throwaway RFC 8032 keys only. Never use the built-in advisor() tool. Nothing outside the worktree.
+REPORT: RESULT, CHANGED, test counts from XML, deviations, CONCERNS, BRANCH + COMMITS.

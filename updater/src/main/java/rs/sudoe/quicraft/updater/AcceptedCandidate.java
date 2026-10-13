@@ -3,18 +3,16 @@ package rs.sudoe.quicraft.updater;
 
 import java.util.List;
 import java.util.Objects;
-import rs.sudoe.quicraft.updater.UpdateDocuments.ReleaseEntry;
-import rs.sudoe.quicraft.updater.UpdateDocuments.ReleaseManifest;
 
 /**
- * The update that a manifest check selected: the winning verified manifest, its exact evidence
- * bytes, the selected release entry, and the configured hosts that served byte-identical manifests
- * (candidate artifact sources, in configured order, never empty).
+ * A release entry that policy has accepted for staging (docs/updater.md 12.2 and 12.10). It carries
+ * the verified manifest and its evidence, the chosen entry and the hosts the artifact may be fetched
+ * from. The list is copied defensively and must not be empty.
  */
 public record AcceptedCandidate(
-        VerifiedDocument<ReleaseManifest> manifest,
+        VerifiedDocument<UpdateDocuments.ReleaseManifest> manifest,
         ManifestEvidence evidence,
-        ReleaseEntry entry,
+        UpdateDocuments.ReleaseEntry entry,
         List<ReleaseHost> artifactSources) {
 
     public AcceptedCandidate {
