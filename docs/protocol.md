@@ -336,7 +336,15 @@ flow control and stream counts, meaning nothing could be sent.
 | Datagrams (RFC 9221) | off | Not used before a later version. |
 | Congestion control | BBR, **provisional** | Phase 1 transport benchmark (docs/benchmarks.md): the only variant faster than TCP at +150 ms RTT (−509 ms on a 2.2 MiB burst). Reno, CUBIC and plain BBR trail TCP badly under heavy reordering; BBR with the relaxed loss threshold (next row) doesn't. Sender-side only, so changing it needs no protocol version. |
 | Relaxed loss threshold (quiche `enable_relaxed_loss_threshold`) | on, where the native supports it | Reordering makes quiche declare late packets lost and retransmit them. With this on, the first spurious loss disables the packet threshold, and each further one doubles the time-threshold overhead, up to 2× RTT. Transport benchmark, reorder profile (run `transport-20261010T010019Z`, N=5): 2.2 MiB burst 799 ms with it, 2754 ms without (−1955 ms [−2155, −1561]); TCP took 1212 ms. Lost packets per run were 93 against 579. No significant difference on a clean link or at +150 ms RTT. quiche 0.30 implements it only for BBR (gcongestion), so it does nothing under Reno or CUBIC. Sender-side only: no transport parameter, no protocol version. Needs QUICraft's patched native (§11). With an upstream native it is unavailable, and core logs one INFO line. |
-| Address validation (Retry) | when handshake rate exceeds a threshold | A real token handler is required before the public alpha (Phase 4). `InsecureQuicTokenHandler` is never used. |
+| Address validation (Retry) | when the listener's connection attempts in the current second reach a threshold (default 50), and for every attempt over a limit | Retry tokens are HMAC-authenticated, bound to the client's IP and port, and expire after 30 s. `InsecureQuicTokenHandler` is never used. |
+
+Retry and limits. Each listener limits connection attempts (per second, overall and per IP) and
+open connections (overall and per IP), and drops floods of Initial packets before the QUIC codec.
+An attempt over any of these limits gets at most a Retry, which is smaller than the client's
+Initial, and then silence, so the client falls back to TCP after its head start (§5). A join that
+goes through Retry may spend up to 3 attempts: one for each token-less Initial datagram of the
+client's first flight (often two), plus one when the token comes back. A Retry also discards 0-RTT
+data sent before it, so such a rejoin completes as a 1-RTT join.
 
 Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
 
