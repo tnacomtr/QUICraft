@@ -184,6 +184,70 @@ class QuicLoopbackTest {
         }
     }
 
+    /** Writes {@code text} and waits for the echo, {@code before} bytes having come back already. */
+    private static void echo(QuicByteStream stream, Loopback.Collector collector, int before, String text)
+            throws Exception {
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        stream.write(ByteBuffer.wrap(bytes));
+        stream.flush();
+        byte[] all = collector.await(before + bytes.length, 5, TimeUnit.SECONDS);
+        assertArrayEquals(bytes, java.util.Arrays.copyOfRange(all, before, all.length));
+    }
+
+    @Test
+    void aCompletedHandshakeOutlivesTheHandshakeDeadline() throws Exception {
+        CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
+        QuicServer.handshakeMillis = 300;
+        try (QuicServer server = Loopback.echoServer(identity, accepted)) {
+            QuicByteStream stream = QuicClient.connect(server.localAddress(), identity.fingerprint(),
+                    TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
+            Loopback.Collector collector = new Loopback.Collector();
+            stream.setListener(collector);
+            stream.setAutoRead(true);
+            echo(stream, collector, 0, "before the deadline");
+            Thread.sleep(800);
+            echo(stream, collector, "before the deadline".length(), "after the deadline");
+            assertEquals(1, collector.closed.getCount(), "the connection is still open");
+            assertEquals(0, server.pendingHandshakes(), "its lease was confirmed");
+            stream.close();
+        } finally {
+            QuicServer.handshakeMillis = 10_000;
+        }
+    }
+
+    @Test
+    void aFailedHandshakeDeadlineStillConfirmsAndReleasesTheLease() throws Exception {
+        TransportConfig onePerIp = TransportConfig.builder().maxOpenPerIp(1).build();
+        CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
+        rs.sudoe.quicraft.core.Faults.set(rs.sudoe.quicraft.core.Faults.HANDSHAKE_DEADLINE);
+        try (QuicServer server = Loopback.echoServer(Loopback.anyLocal(), identity, onePerIp, accepted)) {
+            QuicByteStream first = QuicClient.connect(server.localAddress(), identity.fingerprint(),
+                    TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
+            Loopback.Collector collector = new Loopback.Collector();
+            first.setListener(collector);
+            first.setAutoRead(true);
+            echo(first, collector, 0, "no deadline, still admitted");
+            assertEquals(0, server.pendingHandshakes(), "the handshake still confirms the lease");
+            first.close();
+
+            QuicByteStream next = null;
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (next == null && System.nanoTime() < deadline) {
+                CompletableFuture<QuicByteStream> attempt = QuicClient.connect(server.localAddress(),
+                        identity.fingerprint(), TransportConfig.DEFAULT);
+                try {
+                    next = attempt.get(3, TimeUnit.SECONDS); // longer than the client's first PTO
+                } catch (ExecutionException | java.util.concurrent.TimeoutException stillHeld) {
+                    attempt.cancel(true);
+                }
+            }
+            assertTrue(next != null, "closing still releases the lease");
+            next.close();
+        } finally {
+            rs.sudoe.quicraft.core.Faults.set();
+        }
+    }
+
     @Test
     void echoesBytesWithACustomInitialCongestionWindow() throws Exception {
         CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
