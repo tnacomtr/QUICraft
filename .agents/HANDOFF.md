@@ -2,26 +2,22 @@
 
 GOAL: Continue Phase 4 public-alpha preparation on `feat/phase4-alpha`. This is a handoff, not approval to release.
 
-READ FIRST: `CLAUDE.md`, this file, `.agents/plans/2026-10-13-phase4-alpha.md`, `.agents/memory/decisions.md`.
+READ FIRST: `CLAUDE.md`, this file, `.agents/plans/2026-10-13-phase4-alpha.md` (Progress, "Wave 2"), `.agents/memory/decisions.md`.
 
-## STATE
-- Retry-token primitive and bounded admission-state primitive are merged, independently verified, peer-reviewed, and security-reviewed. They are foundations only, not connected to the live listener.
-- Evidence: 52 Retry tests plus 10 killed behavioral mutants; 21 admission tests plus 5 killed mutants. Both units passed fresh `:core:check :core:build` in their worktrees. Root merge check freshly passed the 52 Retry tests.
-- The server still uses `NoRetryTokenHandler`; admission limits do not currently protect runtime traffic. Phase 4 is not complete.
-- Updater/release/security docs are merged. The updater is not implemented. The original user-authored `docs/.plans/updater-plan.md` is untracked input and must remain untouched and unstaged.
-- Approved updater direction: server-only for Velocity and Fabric dedicated servers; Modrinth primary plus GitHub and `git.sudoe.rs`; hourly checks-only default with disclosure; explicit command for download; owner-managed offline signing keys; requested Unix atomic live replacement remains conditional on loader safety and crash-recovery proof.
-- Loader-source research found no live-swap guarantee. Fabric Loader 0.19.5 was inspected; Velocity source was not pinned to the exact sha256-pinned build. Keep live replacement blocked pending exact-loader runtime tests.
-- A root full build previously failed because SPDX scanning traversed retained `.worktrees/`. Fix commit `5429948` excludes `.worktrees/**`; regression-test branch `agent/phase4-spdx-tests` at `973b8b8` has three real Gradle TestKit tests and red/green proof, but is NOT merged. Verifier and peer passed; security review could not run because usage limit was reached.
-- Root tracked working changes include plan/README/CLAUDE/docs wording. Root untracked `.claude/`, `AGENTS.md`, and `docs/.plans/` are user work: do not inspect broadly, edit, stage, or delete. The handoff itself is task-owned and untracked.
-- No pushes, publishing, deployments, private-key generation, or updater hosting setup were authorized. The original cheap Retry-test branch/worktree is quarantined; do not merge or delete it.
+## STATE (2026-10-13, end of wave 2)
+- Full root build `./gradlew build --rerun-tasks --no-build-cache` on 8df6c07+: BUILD SUCCESSFUL, 77 tasks; tests core 196, shadedTest 4, testUpstreamNative 19, velocity 16, bridge-netty41 23, bridge-netty42 23, build-logic 5, 0 failures.
+- Listener protections are WIRED and merged (945ed86, 8df6c07): `IngressGuard` before the QUIC codec in both binds, `AdmissionTokenHandler` (HMAC Retry, token-less and validated attempt budgets, per-IP first, IPv6 per /64), open-connection leases with a 10 s handshake deadline. Settings: `quicraft.admission.*` (docs/server-security.md section 3, protocol.md §9). Verifier PASS, Sol approve, Opus security review clean for every round.
+- Owner docs updated (e24cddc). docs/release.md ticks the Retry-handler and limits items; the UDP/DDoS docs review item is still open.
+- Updater: `docs/updater.md` §12 is a reviewed PROPOSAL (feef4c2), with security and peer review done over 4 rounds. Implementation stays BLOCKED until the user decides the §12 USER DECISION items and signs off the live-swap semantics (restart-required; Velocity reads no own-jar resources after a swap). Don't silently replace the requested atomic live swap.
+- Nothing is pushed. `feat/phase4-alpha` is local only; main = 22b4e80 on both remotes.
+- Quarantined, do not merge or delete: `agent/phase4-retry-tests` (6cdf7a8, `.worktrees/phase4-retry-tests`).
+- Never stage `.claude/`, root `AGENTS.md`, `docs/.plans/`, `agent_skills/`, `agent_config.yaml`.
 
 ## NEXT
-1. Resume with the pending security review of the SPDX/build-logic change on `.worktrees/phase4-spdx-tests` (`973b8b8`). Do not merge until that review is clean; do not launch a second local/cheap tester.
-2. Merge the reviewed test branch into `feat/phase4-alpha`, then run a fresh full root `./gradlew build --rerun-tasks --no-build-cache` serially. Confirm both Retry/admission XML counts, license/SPDX/shaded-notice/native tasks, and all platform build tasks. Keep temporary worktrees; the fix should exclude them, not delete them.
-3. Review the integrated diff and markdown links; update plan/status evidence. Commit only task-owned tracked changes and `.agents/HANDOFF.md`. Never stage `.claude/`, root `AGENTS.md`, or `docs/.plans/`.
-4. Next implementation wave: wire Retry and bounded admission into both ordinary and hosted server listeners, choose reviewed platform settings/defaults, and add lifecycle, packet ownership, native QUIC, concurrency, and TCP-fallback tests. Preserve TCP behavior and low-load 0-RTT. See plan sections “Admission integration facts” and “Current milestone”.
-5. Before alpha, also finish owner UDP/firewall guidance and gates. Updater implementation remains a separate blocked unit until manifest/signature/revocation freshness, endpoint/redirect policy, confined serialized staging/journal/recovery, dedicated-server authorization, Windows helper, signing workflow, and exact loader-generation safety are resolved and reviewed.
+1. Present the updater decisions and the live-swap implication to the user; record the answers in `.agents/memory/decisions.md`.
+2. Platform/fault-injection gates with the new listener code: Fabric gametests (26.x and 1.21.11), Velocity tests, testkit join/ping over QUIC with default admission settings, and the fault-injection TCP-join test.
+3. Release checklist (docs/release.md), the UDP/DDoS docs review item, Phase 3 prerequisites.
+4. Updater implementation only after step 1 and its remaining blockers (signing tool, endpoint/redirect policy, Windows helper, loader tests on JDK 21 and macOS).
+5. Still waiting on the user: default initial cwnd of 64 packets (protocol.md §9).
 
-CONSTRAINTS: No alpha-complete claim until listener protections, platform/fault-injection gates, Phase 3 prerequisites, release checks, and updater release blockers are actually satisfied. Do not push, publish, deploy, create keys, or silently replace requested atomic live swap with manual-only behavior.
-
-REPORT: State exact commit/build/test evidence, what remains inactive, and any blockers. Keep Phase 4 preparation distinct from a release-ready public alpha.
+CONSTRAINTS: No alpha-complete claim until listener protections (done), platform/fault-injection gates, Phase 3 prerequisites, release checks and updater release blockers are all satisfied. Do not push, publish, deploy, create keys, or open PRs.

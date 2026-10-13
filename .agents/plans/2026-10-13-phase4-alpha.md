@@ -211,3 +211,28 @@ resources from its own jar after the swap (or preload them) and must require a r
 new version counts. In-place overwrite is unsafe on both loaders. Not yet tested: JDK 21 (none installed;
 1.21.11 ran on JDK 25), and macOS. Logs: scratchpad `liveswap-velocity/`, `liveswap-fabric/`
 (the first Fabric run inlined a constant and is invalid; the `*-fixed.log` files are the valid ones).
+
+### Wave 2 (2026-10-13, orchestrator: Claude Opus 5.5)
+
+| Handle | Agent (model) | Unit | Branch | Status |
+| --- | --- | --- | --- | --- |
+| a3a427c7 | superior (opus) | 2.1 / 2.1b / 2.1c listener Retry + admission wiring and hardening | agent/phase4-listener-admission | merged 945ed86, branch deleted |
+| ses_ec9aa6f8 | default-tester (deepseek) | 2.7 admission unit matrix (3 rounds) | agent/phase4-admission-matrix | merged 8df6c07, branch deleted |
+| a3ab5e12 | superior (opus) | 2.5 updater spec §12 (4 rounds) | agent/phase4-updater-spec | merged feef4c2, branch deleted |
+| adcba98d | default-coder (haiku) | owner docs for merged admission | agent/phase4-owner-docs-2 | merged e24cddc, branch deleted |
+| a7bc598f / ad09fa0c | security-reviewer (opus) | updater spec x4, admission 2.1b/2.1c | read-only | done, clean (no medium+ open) |
+| opencode sessions | verifier (deepseek), peer-reviewer (gpt-6.1-sol) | every unit above | read-only | PASS / approve on final commits |
+
+Listener result: `QuicServer` wires `IngressGuard` (pre-codec Initial budget, drops Initials under
+1200 bytes) and `AdmissionTokenHandler` (HMAC Retry; token-less and validated budgets; per-IP first;
+IPv6 per /64) into both binds, plus leases with a 10 s handshake deadline. Retry modes
+adaptive/always/never; refusals and a handshake backlog (pending*4 >= maxOpen) force Retry in every
+mode. 0-RTT stays at low load. `:core:test` 168 + matrix; verifier, Sol and Opus security all
+clean. The one remaining security note (Faults javadoc) was fixed in d2f6590.
+
+Updater spec: `docs/updater.md` §12 is a reviewed PROPOSAL. Implementation stays blocked on the user
+decisions listed in §12 (manifest expiry/refresh, revocation lifetime, 2-of-3 quorum, reset-state
+command, cross-filesystem behaviour, backup-key co-signature for key-set changes, rollback command)
+and the remaining blockers. Live swap: the evidence above means a swap takes effect only at restart,
+and Velocity must read no own-jar resources after a swap; this needs the user's sign-off, because
+the request was an atomic live swap.
