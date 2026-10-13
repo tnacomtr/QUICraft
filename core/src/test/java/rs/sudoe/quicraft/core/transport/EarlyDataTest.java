@@ -382,6 +382,8 @@ class EarlyDataTest {
             System.out.printf("rejoin after Retry: 0-RTT sent=%s, server early releases=%d, Retry packets=%d%n",
                     second.early.sent(), game.server.earlyReleases(), game.server.retriesSent());
             assertTrue(game.server.retriesSent() >= 2, "every new connection gets a Retry");
+            assertTrue(second.early.sent(), "the rejoin sends its flight as 0-RTT data");
+            assertEquals(0, game.server.earlyReleases(), "the Retry discards that 0-RTT data: no early release");
             assertArrayEquals(FLIGHT, game.received(1, FLIGHT.length), "the game gets the flight exactly once");
             second.stream.close();
         }
