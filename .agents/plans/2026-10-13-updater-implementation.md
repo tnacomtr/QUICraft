@@ -97,4 +97,6 @@ All are stopped/done; all worktrees retained, none authorized for cleanup.
 | `ses_ec9639f77ffeahtN2pbVOh1yKN` | cwnd default / `agent/phase4-cwnd-default` | done, merged |
 | `ses_ec9612e57ffeEZ343UoaLOJvxS` | cheap tests / `agent/phase4-cwnd-tests` | STOP confirmed, quarantined, never merge |
 
-Root integrated build and final documentation review are pending; no runtime-updater or alpha-complete claim.
+Root integrated gate passed at `0c4fd8e`: independent verifier `ses_ec916abdeffeJGJWNrtxD8CmSM`, fresh `./gradlew build --rerun-tasks --no-build-cache`,84executed tasks;229updater,209core,20upstream(1expectedskip),4shaded,16velocity,23eachbridge,5build-logic =528passed/1expectedskip. SPDX, all license checks, shaded notices and platform jars passed; classmajor52core/65updater. Evidence `/tmp/opencode/phase4-integrated-build.log`. No fresh game-client/JDK21/macOS/native-platform gate claimed.
+
+Final integration/doc peer `ses_ec912d8b7ffeqPNtpie2o0V2k6` approved; stale proposal labels in the blocker list corrected as a documentation-only nit. All agents are stopped/done; first slice is verified and reviewed. The overall implementation plan stays in progress: authentication, persistent policy, I/O/transactions, platform commands/lifecycle and remaining release gates are unimplemented. No runtime-updater or alpha-complete claim.

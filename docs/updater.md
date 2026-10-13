@@ -246,7 +246,7 @@ These are requirements for the design. None is proven by implementation.
 - Fail-safe: an exception inside a check never reaches the server.
 - Integration (testkit): Velocity updates from a mock release server signed with test keys,
   restarts, and still accepts TCP and QUIC joins.
-- PROPOSED (section 12): a staged jar whose trust file names a revocation key other than the persisted
+- Approved requirements (section 12): a staged jar whose trust file names a revocation key other than the persisted
   one is rejected before the swap, even when validly signed (12.2, N1); a staged jar with the same
   epoch and a different key-set fingerprint is rejected (12.2, N2); a hand-installed jar with a higher
   epoch and a new revocation key resets that key's floors (transition 6); a revalidated entry that
@@ -263,27 +263,29 @@ These are requirements for the design. None is proven by implementation.
 
 ## 10. Unresolved release blockers
 
-1. Manifest, `release.json.sig`, key-set, and `revocations.json` wire formats. (Proposed: 12.2, 12.3.)
-2. Signed-byte, bounded-parse, duplicate-field, and sequence/expiry encodings. (Proposed: 12.3, 12.4.)
-3. Freshness thresholds and clock policy. (Proposed: 12.5.)
-4. Revocation coverage rule when a source fails (fallback must not weaken fresh coverage). (Proposed:
-   12.6.)
+1. Runtime integration and release freeze of the approved manifest, signature, trust and revocation
+   schemas (12.2, 12.3). Disconnected structural parsers are implemented and tested, not authentication.
+2. Signed-byte authentication and sequence/expiry enforcement under the approved encodings (12.3,
+   12.4). Bounded parsing and duplicate-field rejection are implemented as primitives only.
+3. Implementation and tests of the approved freshness thresholds and clock policy (12.5).
+4. Implementation and tests of the approved failed-source coverage rule: fallback never weakens
+   fresh coverage (12.6).
 5. Exact endpoints, CDN redirects, and the role of `git.sudoe.rs` in source priority.
-6. Release sequencing and withdrawal. (Proposed: 12.7.)
+6. Prove the specified release sequencing and withdrawal workflow (12.7).
 7. Dedicated-server gating mechanism (section 7).
 8. Permission integration for Fabric and Velocity, and command registration.
 9. Platform health criteria and mechanism (backup retention until they pass is unconditional).
 10. Loader-generation safety for live `ATOMIC_MOVE` replacement on Linux and macOS, with crash-recovery
     evidence. Release is blocked until it exists. (Evidence so far and rules: 12.13; gaps remain.)
 11. Windows post-exit helper design and verification.
-12. Lock file locations, journal format, and recovery procedure. (Proposed: 12.8 to 12.11.)
+12. Implement and prove the approved locks, journal and recovery design (12.8 to 12.11).
 13. Disclosure text in the README and on project pages (required before release).
 14. Hosting-rule re-checks (section 11).
 15. Signing tool, key generation, and the offline key process (see `release.md`).
-16. Loader-specific installed-jar discovery, and backup and staging locations outside loader-scanned
-    directories (section 5, "Installed jar discovery and placement"). (Proposed: 12.14.)
-17. Revocation metadata encodings, clock policy, and required coverage (section 4). (Proposed: 12.3,
-    12.5, 12.6.)
+16. Implement and prove loader-specific installed-jar discovery and confined backup/staging placement
+    outside loader scan roots (approved specification: 12.14).
+17. Implement and prove revocation authentication, clock policy and required coverage using the
+    approved metadata encodings (12.3, 12.5, 12.6).
 
 ## 11. Hosting rules (re-check required)
 
