@@ -178,7 +178,9 @@ public final class SequencePolicy {
      * not be revoked), and have structurally valid times (R6). Otherwise the delta is unchanged.
      * There is no expiry, {@code seq} or {@code issued} condition beyond R6. Adds the revoked keys
      * and blocked artifacts to the permanent union, maxes {@code minManifestSeq}, and prunes
-     * entries of revoked kids.
+     * entries of revoked kids. A document whose merge would exceed the {@code revoked.json} caps is
+     * also left unmerged here, with no signal; callers that need the state-full flag use
+     * {@link #selectCurrent}.
      */
     public static StateDelta mergeRestrictions(
             Snapshot snap, TrustSnapshot currentTrust, VerifiedDocument<Revocations> doc) {
@@ -472,7 +474,8 @@ public final class SequencePolicy {
     /**
      * True when the merged revoked state fits the {@code revoked.json} codec: at most 64 revoked
      * keys, at most 1024 blocked artifacts and the byte cap. The codec's own check is reused so the
-     * limits cannot drift apart.
+     * limits cannot drift apart. The check runs on the union before revoked kids are pruned, so it is
+     * conservative: a document that would only fit after pruning is still skipped.
      */
     private static boolean fitsRevokedCaps(RevokedState merged) {
         try {
