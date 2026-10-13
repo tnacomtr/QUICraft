@@ -7,7 +7,7 @@ import java.util.Objects;
 /**
  * A release entry that policy has accepted for staging (docs/updater.md 12.2 and 12.10). It carries
  * the verified manifest and its evidence, the chosen entry and the hosts the artifact may be fetched
- * from. The list is copied defensively.
+ * from. The list is copied defensively and must not be empty.
  */
 public record AcceptedCandidate(
         VerifiedDocument<UpdateDocuments.ReleaseManifest> manifest,
@@ -20,5 +20,8 @@ public record AcceptedCandidate(
         Objects.requireNonNull(evidence, "evidence");
         Objects.requireNonNull(entry, "entry");
         artifactSources = List.copyOf(artifactSources);
+        if (artifactSources.isEmpty()) {
+            throw new IllegalArgumentException("artifactSources must not be empty");
+        }
     }
 }
