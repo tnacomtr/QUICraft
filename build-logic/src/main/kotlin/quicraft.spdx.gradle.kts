@@ -24,6 +24,9 @@ val checkSpdxHeaders = tasks.register<SpdxHeaderCheck>("checkSpdxHeaders") {
                 // Agent worktrees: other checkouts of this repo, checked in their own builds.
                 ".claude/**",
                 ".worktrees/**",
+                // Local agent tooling (user-owned skill packs and model config), not project source.
+                "agent_skills/**",
+                "agent_config.yaml",
             )
         },
     )
