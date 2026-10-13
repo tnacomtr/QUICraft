@@ -1,0 +1,16 @@
+# Brief upd-2H: Wave 2 security hardening (1 medium, 4 low)
+
+GOAL: fix the Wave 2 security review findings, with tests. Starts after unit 3.3 (Acceptance) is merged; update Acceptance's calls if signatures change.
+SCOPE: `SequencePolicy.java`, `StateStore.java`, `Acceptance.java` (call sites only), their tests.
+BRANCH/WORKTREE: `agent/phase4-upd-harden2` in `/home/tna/QUICraft/.worktrees/phase4-upd-harden2`. `./gradlew`/`git` from there only, relative paths.
+
+1. [medium] M6 inside policy (SequencePolicy.manifestDecision ~:110 and acceptManifest ~:319): add parameters `Instant systemNow, Instant effectiveNow` to both. Before any floor logic return a new decision `INVALID_TIMES` (add to ManifestDecision) unless FreshnessPolicy.structuralTimesValid(issued, expires, MANIFEST_MAX_LIFETIME) && !futureIssued(issued, systemNow) && unexpired(expires, effectiveNow). acceptManifest returns the unchanged delta for INVALID_TIMES. Update Acceptance to pass its systemNow/effectiveNow (it may keep its own M6 check). Tests: year-9999 issued, expired, 45d+1s lifetime -> INVALID_TIMES and seqByKid/clock floor unchanged.
+2. [low] StateStore atomicWrite (~:550-563): before writing, decode `content` with the same validator used for reads (validCurrent) and throw IOException("refusing to write an invalid state file") if it fails. Test via a package-private seam that injects a bad encoding.
+3. [low] revoked.json caps during merges (SequencePolicy applyRestrictions/selectCurrent ~:407-438): if merging a document would exceed RevokedCodec caps (64 revoked keys, 1024 blocked artifacts), skip that document (no restriction merge, cannot become current) and report it: add `boolean stateFull` to SelectionResult and a fixed warning "revocations state full; document not merged"; mergeRestrictions returns unchanged. Acceptance propagates stateFull into its diagnostics. Never evicts anything. Tests at the boundary (64 ok, 65 skipped; 1024/1025).
+4. [low] Withdrawn entries and co-signers (~:354): record the withdrawal under EVERY trusted signing kid is impossible (unique by sha512), so change pruning: a withdrawn entry is dropped only if its kid is revoked AND the entry's sha512 is not withdrawn by any manifest currently being accepted; document the residual limit in the class javadoc ("a withdrawal is attributed to the lowest sorted trusted signing kid; if that kid is later revoked the withdrawal is pruned with its floor, per 12.4"). If that change is not clean, implement only the javadoc and a test that pins the current behaviour; report which.
+5. [low] StateStore.initialiseIfAbsent reseed (~:153-165): add a parameter `boolean firstRunAllowed`; reseeding a missing state.json when revoked.json exists happens only when true. Document: platforms pass true only when no QUICraft update directory existed before this start (they determine this before creating it). Update tests.
+Run `./gradlew :updater:test :updater:check --rerun-tasks --no-build-cache`; green. Small commits, own-model trailer:
+   Co-Authored-By: <your model> <noreply@anthropic.com>
+   Claude-Session: https://claude.ai/code/session_01CbMd2TPdZhSiL4ecdkFEH9
+CONSTRAINTS: JDK only. Never use the built-in advisor() tool. Nothing outside the worktree.
+REPORT: RESULT, CHANGED, test counts from XML, deviations, CONCERNS, BRANCH + COMMITS.
