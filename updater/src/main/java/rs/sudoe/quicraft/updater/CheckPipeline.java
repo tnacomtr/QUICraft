@@ -73,7 +73,9 @@ final class CheckPipeline {
         ManifestAcceptance manifest = manifests.get();
         List<String> diagnostics = new ArrayList<>(revocations.get().diagnostics());
         diagnostics.addAll(manifest.diagnostics());
-        boolean fresh = revocationsFresh(finalSnapshot, identity.runningTrust(), clock.instant());
+        boolean fresh = revocationsFresh(finalSnapshot, identity.runningTrust(), clock.instant())
+                && manifest.candidate().map(c -> finalSnapshot.state().revocations().seq()
+                        >= c.manifest().document().minRevocationsSeq()).orElse(true);
         return new CheckResult(mode, manifest.candidate(), manifest.stateFull(), fresh, diagnostics);
     }
 
@@ -115,8 +117,10 @@ final class CheckPipeline {
     }
 
     /**
-     * Fresh revocation state after the run (12.6 item 3), without the manifest term: the current
-     * document is not the seed, is unexpired at the effective time and meets the trust floor.
+     * Fresh revocation state after the run (12.6 item 3) without the manifest term: the current
+     * document is not the seed, is unexpired at the effective time and meets the trust floor. The caller
+     * adds {@code minRevocationsSeq} when a candidate exists. Staging itself is gated by
+     * {@link Acceptance}, which applies the full test; this flag only reports.
      */
     private static boolean revocationsFresh(Snapshot snap, UpdateDocuments.Trust trust, Instant systemNow)
             throws UpdateRejectedException {
