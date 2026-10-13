@@ -552,8 +552,10 @@ over keys that are not revoked.
   2. *Current-document acceptance.* A document becomes the current one if `seq > persisted seq`, or
      `seq ==` with identical SHA-256. Equal `seq` with different bytes is equivocation (WARN once).
      **Seed case** (fresh install, reset, or transition 6; both reviews): while the persisted
-     `revocations.sha256` is the empty string, the first validly signed document with
-     `seq >= persisted seq` becomes current; its SHA-256, `issued` and `expires` are filled in, its
+     `revocations.sha256` is the empty string, the highest-`seq` validly signed document among this
+     run's responses with `seq >= persisted seq` becomes current (so the result does not depend on host
+     order). An expired document may become current this way; it is never fresh, but it ends the seed
+     case; its SHA-256, `issued` and `expires` are filled in, its
      restrictions are merged as in 1, and `minManifestSeq` is merged by max, so no floor is lowered.
      Without this a fresh install would see `seq == floor` with a hash that cannot match the empty one
      and never reach fresh revocation state.
