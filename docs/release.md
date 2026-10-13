@@ -47,15 +47,15 @@ and `docs/server-security.md`.
 
 ## 4. Server-side protections (must exist before alpha)
 
-Release blockers from `CLAUDE.md` (Phase 4) and the plan. Runtime protections are not active yet:
+Release blockers from `CLAUDE.md` (Phase 4) and the plan. Runtime protections are wired into both
+listener binds (pending review on branch `agent/phase4-listener-admission`):
 
-- [ ] A real Retry token handler. The listener still uses `NoRetryTokenHandler`
-      (`core/.../transport/QuicServer.java:133`). `HmacRetryTokenHandler` is implemented and unit-tested,
-      but not wired into the listener.
+- [ ] A real Retry token handler. `HmacRetryTokenHandler` is wired into both listener binds (pending
+      review on branch `agent/phase4-listener-admission`).
       `InsecureQuicTokenHandler` from Netty's examples must never ship.
 - [ ] Per-IP and global limits on connection attempts and open connections. `ConnectionAdmission` is
-      an implemented, unit-tested state primitive. Its integration (adaptive Retry policy,
-      lifecycle, platform settings) is a follow-up.
+      wired into both listener binds (pending review on branch `agent/phase4-listener-admission`);
+      the settings are documented in [`server-security.md`](server-security.md) section 3.
 - [ ] Server-owner UDP firewall and DDoS documentation reviewed against
       [`server-security.md`](server-security.md).
 

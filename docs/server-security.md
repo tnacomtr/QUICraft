@@ -1,7 +1,9 @@
 # Server security and firewall guidance (draft)
 
-**Status: draft for server owners, not yet reviewed for release.** Limits described as planned are not
-active. Do not rely on any limit here until the Phase 4 gates in `docs/release.md` section 4 pass.
+**Status: draft for server owners, not yet reviewed for release.** The connection limits and Retry in
+section 3 are wired into both listener binds, pending review on branch
+`agent/phase4-listener-admission`. Do not rely on any limit here until the Phase 4 gates in
+`docs/release.md` section 4 pass.
 
 ## 1. Ports
 
@@ -22,8 +24,11 @@ active. Do not rely on any limit here until the Phase 4 gates in `docs/release.m
 General firewall practice, shown as examples only. These have not been tested on any platform in this
 preparation unit.
 
-- Allow UDP on the QUIC port (or the alternative port, if the query collision applies). Keep the TCP
-  game port open. Do not close TCP to make QUIC work: TCP is the compatibility path.
+- Allow UDP on the QUIC port. That is the same number as the TCP game port (default `25565/udp`), or
+  the game port + 1 when the query collision moves QUIC to the alternative port. Keep the TCP game
+  port open. Do not close TCP to make QUIC work: TCP is the compatibility path.
+- Add the rule for **both IPv4 and IPv6** if the server is reachable over both; most firewalls keep
+  the two rule sets separate (see IPv6 below).
 - Example with `ufw` (adjust the port): `ufw allow 25565/udp`. Equivalent `nftables` or `iptables` rules
   accept UDP to the chosen port.
 - If a TCP-only frontend (for example TCPShield, playit.gg, or Cloudflare Spectrum) sits in front of
@@ -37,19 +42,49 @@ preparation unit.
   or how clients choose a family. Do not assume IPv6 QUIC works until the Phase 4 test matrix covers it.
 - The TCP IPv6 path is unchanged and must keep working.
 
-## 3. Limits (planned, not active)
+## 3. Connection limits and Retry
 
-Per-IP and global limits on connection attempts and open connections, and a production Retry token
-handler, are Phase 4 release blockers. As of this document:
+The listener enforces per-IP and global limits on QUIC connection attempts and open connections,
+plus an address-validation Retry. Every setting is a JVM system property, read once at listener
+start, for example `-Dquicraft.admission.maxOpenPerIp=64`. They are wired into both listener binds,
+pending review on branch `agent/phase4-listener-admission`.
 
-- The listener still uses `NoRetryTokenHandler` (`core/.../transport/QuicServer.java:133`).
-  Retry is not enforced.
-- `ConnectionAdmission` is implemented and unit-tested, but not wired into the listener. It does
-  not yet enforce runtime limits.
-- No platform setting for these limits exists yet. No setting name is documented here.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `quicraft.admission.retry` | `adaptive` | Retry policy: `adaptive`, `always` or `never` (below). |
+| `quicraft.admission.globalAttemptsPerSecond` | 200 | New connection attempts per second, all IPs. |
+| `quicraft.admission.perIpAttemptsPerSecond` | 20 | New connection attempts per second, per IP. |
+| `quicraft.admission.retryThresholdPerSecond` | 50 | All-IP attempt rate at which `adaptive` starts Retry. |
+| `quicraft.admission.maxOpen` | 2048 | Open QUIC connections (pending plus established), all IPs. |
+| `quicraft.admission.maxOpenPerIp` | 32 | Open QUIC connections (pending plus established), per IP. |
+| `quicraft.admission.maxTrackedIps` | 8192 | IPs tracked at once for the per-IP counters. |
+| `quicraft.admission.ingressInitialsPerSecond` | 4000 | Initial datagrams per second, all IPs (packet guard). |
+| `quicraft.admission.ingressInitialsPerIpPerSecond` | 200 | Initial datagrams per second, per IP (packet guard). |
 
-When they ship, limits are a **mitigation**. They reduce the cost of abusive connection attempts for
-honest players. They are **not** DDoS prevention.
+- **`retry=adaptive` (default).** The server sends a QUIC Retry (address validation, which costs the
+  client one extra round trip and its 0-RTT early data) only once connection attempts in the current
+  second reach `retryThresholdPerSecond`, or when an attempt is over a limit. `retryThresholdPerSecond`
+  is clamped to `globalAttemptsPerSecond`.
+- **`retry=always`.** Every new connection gets a Retry. Use this under attack: the server validates
+  the client's address before spending connection state on it.
+- **`retry=never`.** No load-based Retry. Attempts over a limit still get a Retry and are then
+  dropped.
+- **Ingress guard.** `ingressInitialsPerSecond` and `ingressInitialsPerIpPerSecond` drop excess QUIC
+  Initial datagrams before any QUIC processing. This is a cheap packet-level guard; other packets
+  (established connections) are never counted.
+- **Many players behind one IP** (shared NAT: schools, LAN parties, carrier NAT): raise
+  `maxOpenPerIp` and `perIpAttemptsPerSecond` so one address does not starve the others. Raise
+  `maxOpen` too if the whole server, not one IP, is the limit.
+- **Invalid or out-of-range values** fall back to the default with one WARNING in the log.
+- A refused connection (over any attempt or open-connection limit) gets at most a Retry and is then
+  silently dropped, before any QUIC connection exists. A QUICraft client falls back to TCP after its
+  short head start (`docs/protocol.md` section 5). **TCP joins are never limited by these settings.**
+- **Retry tokens:** HMAC-SHA256, bound to the client IP and port, 30 s lifetime. The key is random
+  per listener start, so a restart invalidates outstanding tokens (harmless: the client retries or
+  falls back to TCP).
+
+These limits are a **mitigation**, not DDoS protection. They reduce the cost of abusive connection
+attempts for honest players. They are **not** DDoS prevention (section 4).
 
 ## 4. DDoS and spoofed traffic
 
@@ -92,6 +127,7 @@ These must hold for every configuration (`CLAUDE.md`):
 
 ## 8. Not claimed
 
-- No specific rate, port, or connection number is recommended until the limits are tested.
+- The section 3 settings are wired pending review (branch `agent/phase4-listener-admission`) and are
+  not active in any release. Their defaults have not been load-tested in this project.
 - IPv6 QUIC behavior has not been tested by this project (see section 2).
 - Hosting-rule compliance is not verified here (see `docs/updater.md` section 11).
