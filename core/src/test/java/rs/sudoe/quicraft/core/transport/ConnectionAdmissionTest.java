@@ -120,20 +120,106 @@ class ConnectionAdmissionTest {
     }
 
     @Test
-    void perIpRefusalConsumesGlobalAttempt() {
+    void perIpRefusalConsumesNoGlobalAttempt() {
         ConnectionAdmission a = new ConnectionAdmission(2, 1, 5, 5, 2, 10, FROZEN);
         assertTrue(a.allowAttempt(addr(1)));
         assertFalse(a.allowAttempt(addr(1)), "per-IP limit denies");
-        assertTrue(a.requiresRetry(), "the per-IP refusal consumed the second global attempt");
+        assertFalse(a.requiresRetry(), "the per-IP refusal consumed no global attempt");
+        assertTrue(a.allowAttempt(addr(2)), "the second global attempt is still there");
+        assertTrue(a.requiresRetry());
     }
 
     @Test
-    void trackingRefusalConsumesGlobalAttempt() {
+    void trackingRefusalConsumesNoGlobalAttempt() {
         ConnectionAdmission a = new ConnectionAdmission(5, 5, 5, 5, 3, 2, FROZEN);
         assertTrue(a.allowAttempt(addr(1)));
         assertTrue(a.allowAttempt(addr(2)));
         assertFalse(a.allowAttempt(addr(3)), "tracking capacity denies a third IP");
-        assertTrue(a.requiresRetry(), "the tracking refusal consumed a global attempt");
+        assertFalse(a.requiresRetry(), "the tracking refusal consumed no global attempt");
+        assertTrue(a.allowAttempt(addr(1)));
+        assertTrue(a.requiresRetry());
+    }
+
+    @Test
+    void oneIpOverItsLimitLeavesTheGlobalBudgetForOthers() {
+        ConnectionAdmission a = new ConnectionAdmission(3, 1, 5, 5, 3, 10, FROZEN);
+        assertTrue(a.allowAttempt(addr(1)));
+        for (int i = 0; i < 1000; i++) {
+            assertFalse(a.allowAttempt(addr(1)), "per-IP limit denies the flood");
+        }
+        assertTrue(a.allowAttempt(addr(2)), "another IP still gets in");
+        assertTrue(a.allowAttempt(addr(3)));
+        assertFalse(a.allowAttempt(addr(4)), "only the real global budget of three is spent");
+    }
+
+    private static InetAddress v6(String literal) {
+        try {
+            return InetAddress.getByName(literal);
+        } catch (UnknownHostException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    @Test
+    void ipv6AddressesInOneSlash64ShareTheirAttemptLimit() {
+        ConnectionAdmission a = new ConnectionAdmission(10, 1, 5, 5, 10, 10, FROZEN);
+        assertTrue(a.allowAttempt(v6("2001:db8:1:2::1")));
+        assertFalse(a.allowAttempt(v6("2001:db8:1:2:ffff:ffff:ffff:fffe")), "same /64, same budget");
+        assertTrue(a.allowAttempt(v6("2001:db8:1:3::1")), "another /64 has its own budget");
+    }
+
+    @Test
+    void ipv6AddressesInOneSlash64ShareTheirOpenCapAndReleaseTheSameKey() {
+        ConnectionAdmission a = new ConnectionAdmission(10, 10, 5, 1, 10, 10, FROZEN);
+        ConnectionAdmission.Lease first = owned(a.tryAcquire(v6("2001:db8:1:2::1")));
+        assertNotNull(first);
+        assertNull(owned(a.tryAcquire(v6("2001:db8:1:2::2"))), "same /64, one open connection");
+        assertNotNull(owned(a.tryAcquire(v6("2001:db8:1:3::1"))), "another /64 has its own cap");
+        first.close();
+        assertNotNull(owned(a.tryAcquire(v6("2001:db8:1:2::2"))), "the lease released its /64 key");
+    }
+
+    @Test
+    void limitKeyKeepsIpv4AndFoldsIpv4MappedAndMasksIpv6() throws Exception {
+        assertEquals(addr(7), ConnectionAdmission.limitKey(addr(7)));
+        byte[] mapped = new byte[16];
+        mapped[10] = (byte) 0xFF;
+        mapped[11] = (byte) 0xFF;
+        System.arraycopy(addr(7).getAddress(), 0, mapped, 12, 4);
+        // getByAddress already folds mapped addresses; build an Inet6Address explicitly.
+        InetAddress mapped6 = java.net.Inet6Address.getByAddress(null, mapped, -1);
+        assertEquals(addr(7), ConnectionAdmission.limitKey(mapped6), "IPv4-mapped counts as IPv4");
+        assertEquals(v6("2001:db8:1:2::"), ConnectionAdmission.limitKey(v6("2001:db8:1:2:3:4:5:6")));
+        assertEquals(v6("fe80::"), ConnectionAdmission.limitKey(v6("fe80::1%1")), "scope dropped");
+
+        ConnectionAdmission a = new ConnectionAdmission(10, 1, 5, 5, 10, 10, FROZEN);
+        assertTrue(a.allowAttempt(addr(7)));
+        assertFalse(a.allowAttempt(mapped6), "the mapped form shares the IPv4 budget");
+    }
+
+    @Test
+    void pendingCountsUnconfirmedLeasesExactlyOnce() {
+        ConnectionAdmission a = new ConnectionAdmission(10, 10, 4, 4, 10, 10, FROZEN);
+        ConnectionAdmission.Lease probe = a.tryAcquire(addr(1));
+        probe.close();
+        assertEquals(0, a.pendingLeases(), "an acquire-and-close probe leaves pending unchanged");
+        assertFalse(a.handshakesBacklogged());
+
+        ConnectionAdmission.Lease lease = owned(a.tryAcquire(addr(1)));
+        assertEquals(1, a.pendingLeases());
+        assertTrue(a.handshakesBacklogged(), "one pending of four open is 25%");
+        lease.confirm();
+        lease.confirm();
+        assertEquals(0, a.pendingLeases(), "confirm decrements once");
+        assertFalse(a.handshakesBacklogged());
+        lease.close();
+        lease.close();
+        assertEquals(0, a.pendingLeases(), "closing a confirmed lease leaves pending alone");
+
+        ConnectionAdmission.Lease abandoned = owned(a.tryAcquire(addr(2)));
+        abandoned.close();
+        abandoned.confirm();
+        assertEquals(0, a.pendingLeases(), "close decrements an unconfirmed lease once; confirm after close is a no-op");
     }
 
     @Test

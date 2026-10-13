@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.transport;
 
+import java.net.Inet6Address;
 import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
@@ -13,9 +15,13 @@ import java.util.function.LongSupplier;
  *
  * <p>One listener-wide fixed one-second monotonic window governs attempts. Global and per-IP
  * attempt budgets reset together when the window rolls over. Open leases count pending and
- * established connections alike and are capped globally and per IP. Tracked IP entries are bounded
- * by {@code maxTrackedIps}; entries that hold open leases or current-window attempts are never
+ * established connections alike and are capped globally and per IP; leases whose handshake hasn't
+ * been confirmed are also counted as pending. Tracked IP entries are bounded by
+ * {@code maxTrackedIps}; entries that hold open leases or current-window attempts are never
  * evicted to admit another address.
+ *
+ * <p>"Per IP" means per {@linkplain #limitKey limit key}: an IPv4 address (IPv4-mapped IPv6
+ * included), or an IPv6 /64.
  *
  * <p>Not thread-safe except through its own synchronized methods; all state is guarded by this
  * instance.
@@ -35,6 +41,7 @@ final class ConnectionAdmission {
     private long windowStart;
     private int globalAttempts;
     private int open;
+    private int pending;
 
     ConnectionAdmission(
             int globalAttemptsPerSecond,
@@ -82,26 +89,25 @@ final class ConnectionAdmission {
     }
 
     /**
-     * Spends one attempt for {@code address} if the global and per-IP budgets allow it. A refusal
-     * by per-IP or tracking limits still consumes one global attempt when global budget remains.
+     * Spends one attempt for {@code address} if the per-IP and global budgets allow it. Per-IP and
+     * tracking limits are checked first; a refused attempt consumes nothing, so one address over
+     * its limit can't drain the global budget.
      */
     synchronized boolean allowAttempt(InetAddress address) {
-        Objects.requireNonNull(address, "address");
+        InetAddress key = limitKey(Objects.requireNonNull(address, "address"));
         advance();
+        IpState state = ips.get(key);
+        if (state == null ? ips.size() >= maxTrackedIps : state.attempts >= perIpAttemptsPerSecond) {
+            return false;
+        }
         if (globalAttempts >= globalAttemptsPerSecond) {
             return false;
         }
-        globalAttempts++;
-        IpState state = ips.get(address);
         if (state == null) {
-            if (ips.size() >= maxTrackedIps) {
-                return false;
-            }
             state = new IpState();
-            ips.put(address, state);
-        } else if (state.attempts >= perIpAttemptsPerSecond) {
-            return false;
+            ips.put(key, state);
         }
+        globalAttempts++;
         state.attempts++;
         return true;
     }
@@ -111,24 +117,66 @@ final class ConnectionAdmission {
      * spend an attempt.
      */
     synchronized Lease tryAcquire(InetAddress address) {
-        Objects.requireNonNull(address, "address");
+        InetAddress key = limitKey(Objects.requireNonNull(address, "address"));
         advance();
         if (open >= maxOpen) {
             return null;
         }
-        IpState state = ips.get(address);
+        IpState state = ips.get(key);
         if (state == null) {
             if (ips.size() >= maxTrackedIps) {
                 return null;
             }
             state = new IpState();
-            ips.put(address, state);
+            ips.put(key, state);
         } else if (state.open >= maxOpenPerIp) {
             return null;
         }
         open++;
+        pending++;
         state.open++;
-        return new Lease(this, address, state);
+        return new Lease(this, key, state);
+    }
+
+    /** True while unconfirmed (pending-handshake) leases are at or above 25% of {@code maxOpen}. */
+    synchronized boolean handshakesBacklogged() {
+        return (long) pending * 4 >= maxOpen;
+    }
+
+    /** Leases not yet {@linkplain Lease#confirm() confirmed} or closed, for tests. */
+    synchronized int pendingLeases() {
+        return pending;
+    }
+
+    /**
+     * The key every per-IP limit counts under: an IPv4 address as is, an IPv4-mapped IPv6 address
+     * as its IPv4 address, and any other IPv6 address as its /64 prefix (scope dropped).
+     */
+    static InetAddress limitKey(InetAddress address) {
+        if (!(address instanceof Inet6Address)) {
+            return address;
+        }
+        byte[] raw = address.getAddress();
+        try {
+            if (isIpv4Mapped(raw)) {
+                return InetAddress.getByAddress(new byte[] {raw[12], raw[13], raw[14], raw[15]});
+            }
+            for (int i = 8; i < 16; i++) {
+                raw[i] = 0;
+            }
+            return InetAddress.getByAddress(raw);
+        } catch (UnknownHostException impossible) {
+            throw new IllegalStateException(impossible);
+        }
+    }
+
+    private static boolean isIpv4Mapped(byte[] raw) {
+        for (int i = 0; i < 10; i++) {
+            if (raw[i] != 0) {
+                return false;
+            }
+        }
+        return raw[10] == (byte) 0xFF && raw[11] == (byte) 0xFF;
     }
 
     /** True once consumed global attempts in the current window reach the Retry threshold. */
@@ -170,17 +218,32 @@ final class ConnectionAdmission {
         int open;
     }
 
-    /** An open-connection reservation. {@link #close()} is idempotent. */
+    /**
+     * An open-connection reservation, pending until {@link #confirm()}. {@link #confirm()} and
+     * {@link #close()} are idempotent; each changes the pending count at most once in total.
+     */
     static final class Lease implements AutoCloseable {
         private final ConnectionAdmission owner;
         private final InetAddress address;
         private final IpState state;
         private boolean closed;
+        private boolean confirmed;
 
         private Lease(ConnectionAdmission owner, InetAddress address, IpState state) {
             this.owner = owner;
             this.address = address;
             this.state = state;
+        }
+
+        /** The connection's handshake completed: it no longer counts as pending. */
+        void confirm() {
+            synchronized (owner) {
+                if (closed || confirmed) {
+                    return;
+                }
+                confirmed = true;
+                owner.pending--;
+            }
         }
 
         @Override
@@ -190,6 +253,9 @@ final class ConnectionAdmission {
                     return;
                 }
                 closed = true;
+                if (!confirmed) {
+                    owner.pending--;
+                }
                 owner.advance();
                 owner.open--;
                 state.open--;

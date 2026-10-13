@@ -336,7 +336,39 @@ flow control and stream counts, meaning nothing could be sent.
 | Datagrams (RFC 9221) | off | Not used before a later version. |
 | Congestion control | BBR, **provisional** | Phase 1 transport benchmark (docs/benchmarks.md): the only variant faster than TCP at +150 ms RTT (−509 ms on a 2.2 MiB burst). Reno, CUBIC and plain BBR trail TCP badly under heavy reordering; BBR with the relaxed loss threshold (next row) doesn't. Sender-side only, so changing it needs no protocol version. |
 | Relaxed loss threshold (quiche `enable_relaxed_loss_threshold`) | on, where the native supports it | Reordering makes quiche declare late packets lost and retransmit them. With this on, the first spurious loss disables the packet threshold, and each further one doubles the time-threshold overhead, up to 2× RTT. Transport benchmark, reorder profile (run `transport-20261010T010019Z`, N=5): 2.2 MiB burst 799 ms with it, 2754 ms without (−1955 ms [−2155, −1561]); TCP took 1212 ms. Lost packets per run were 93 against 579. No significant difference on a clean link or at +150 ms RTT. quiche 0.30 implements it only for BBR (gcongestion), so it does nothing under Reno or CUBIC. Sender-side only: no transport parameter, no protocol version. Needs QUICraft's patched native (§11). With an upstream native it is unavailable, and core logs one INFO line. |
-| Address validation (Retry) | when handshake rate exceeds a threshold | A real token handler is required before the public alpha (Phase 4). `InsecureQuicTokenHandler` is never used. |
+| Address validation (Retry) | always for refusals: an attempt over a limit, full open-connection limits, or a handshake backlog. For admitted attempts it depends on the mode (`quicraft.admission.retry`): `adaptive` (default) once the listener's attempts in the current second reach a threshold (default 50), `always` for every one, `never` for none | Retry tokens are HMAC-authenticated, bound to the client's IP and port, and expire after 30 s. `InsecureQuicTokenHandler` is never used. |
+
+Retry and limits. Each listener limits connection attempts (per second, overall and per IP) and
+open connections (overall and per IP), and drops floods of Initial packets before the QUIC codec.
+
+- "Per IP" means per IPv4 address (IPv4-mapped IPv6 included) or per IPv6 /64. So the hosts of
+  one /64 share their budgets, while a holder of a /48 gets 65536 separate keys; aggregating
+  larger prefixes is left out on purpose, as it would penalise the many unrelated users behind
+  shared prefixes.
+- A datagram carrying an Initial that is shorter than 1200 bytes (RFC 9000 §14.1) is dropped
+  unanswered, so a Retry (at most 124 bytes with QUICraft's tokens) only ever answers a datagram
+  of at least 1200 bytes.
+- Ingress flood protection counts every Initial datagram per IP and overall (defaults 200 and
+  4000 per second), whether or not it carries a token, and drops those over budget before any
+  other check.
+- An Initial that passes ingress spends a connection attempt. A token-less one spends the
+  attempt budget; one that brings back a valid Retry token spends a separate validated budget
+  with the same limits, which a flood of token-less Initials can't use up. Validated Initials
+  still count against the shared ingress budget.
+- These are refusals, in every Retry mode: an attempt over its limit, an attempt while the
+  open-connection limits are full, and every token-less attempt while a quarter of the
+  open-connection limit is still in its handshake (a backlog, e.g. of spoofed half-open
+  handshakes). A token-less Initial is then answered with a Retry and nothing more. A
+  token-bearing Initial over its validated limit, or arriving while the open-connection limits
+  are full, is dropped unanswered; a backlog alone doesn't refuse it, as its address is proven.
+  The client falls back to TCP after its head start
+  (§5). The modes differ only for admitted attempts: `never` sends them no Retry, `adaptive`
+  sends Retry once the attempt rate reaches the threshold, and `always` sends it every time.
+- A connection whose handshake hasn't completed 10 s after it was created is closed (transport
+  error NO_ERROR); a real client that slow falls back to TCP.
+- A join that goes through Retry may spend up to 3 attempts: one for each token-less Initial
+  datagram of the client's first flight (often two), plus one when the token comes back. A Retry
+  also discards 0-RTT data sent before it, so such a rejoin completes as a 1-RTT join.
 
 Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
 
