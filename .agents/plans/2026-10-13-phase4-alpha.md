@@ -188,3 +188,26 @@ The advisor supported listener-local random keys plus short expiry over minute r
 - The parser uses zero-based absolute offsets (`QuicHeaderParser.java:75-79`), so any new admission handler must parse a slice and preserve the incoming buffer's indices and byte order assumptions.
 - Both ordinary and hosted listener binds need identical admission placement before the QUIC codec. Child connection reservations must cover pending and established channels and release on the close future, including failed initialization/TLS/shutdown.
 - No integration defaults or pipeline contracts are finalized yet. In particular, distinguish conservative Initial-datagram budgets (including retries/retransmits) from unique logical connection counts; do not silently throttle established 1-RTT traffic or disable low-load 0-RTT.
+
+### Live-swap evidence (2026-10-13, updater blocker 10)
+
+Experiment only (scratch dirs, no repo code): a test plugin/mod with a lazily loaded class `Lazy`
+(non-constant `V`), a resource `version.txt`, and, in v2 only, a new class `Lazy2` plus a 2 MB pad.
+v1 runs, the jar is replaced, then the lazy reads run. 3 trials per mode, then a restart.
+
+| Loader | Replace mode | Lazy (first load after swap) | Resource | v2-only class | Shutdown |
+| --- | --- | --- | --- | --- | --- |
+| Velocity 4.2.0-30, JDK 25.0.4.1 | atomic rename | v1 (old) | **v2 (new)** | not found | clean |
+| Velocity 4.2.0-30 | in-place overwrite | NoClassDefFoundError | v2 | not found | clean |
+| Fabric Loader 0.19.5, MC 26.1.2, JDK 25.0.4.1 | atomic rename | v1 (old) | v1 (old) | not found | clean |
+| Fabric Loader 0.19.5 | in-place overwrite | v2 (mixed) | ZipException | not found | clean |
+| Fabric Loader 0.19.5, MC 1.21.11, JDK 25 | atomic rename (x3) / in-place (x1) | v1 / v2 | v1 / ZipException | not found | clean |
+| all three | restart after swap | v2 | v2 | found | clean |
+
+Reading: an atomic rename never crashed either loader, and a restart picks up the new jar cleanly.
+Fabric keeps a consistent old view until restart. Velocity mixes versions: classes come from the
+old jar, resources from the new one. A live-swapped Velocity plugin must therefore read no
+resources from its own jar after the swap (or preload them) and must require a restart before the
+new version counts. In-place overwrite is unsafe on both loaders. Not yet tested: JDK 21 (none installed;
+1.21.11 ran on JDK 25), and macOS. Logs: scratchpad `liveswap-velocity/`, `liveswap-fabric/`
+(the first Fabric run inlined a constant and is invalid; the `*-fixed.log` files are the valid ones).
