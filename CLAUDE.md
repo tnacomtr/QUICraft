@@ -52,6 +52,10 @@ Dependency status (each license file checked Oct 2026; re-check on every version
 | MCProtocolLib transitive deps (testkit only) | Apache-2.0 / MIT, checked Oct 2026 for 26.1-1. Its `net.raphimc:MinecraftAuth` (LGPL-3.0) is excluded; the testkit never logs in with a Microsoft account | OK |
 | Chunky 1.5.3 (testkit Paper image build only) | GPL-3.0-only | OK: runs once to pre-generate the testkit world and is deleted from the image; never linked or shipped |
 | JUnit 5 (tests only) | EPL-2.0 | OK for tests only, approved by the user (Oct 2026). Never in a shipped jar; the allowlist accepts EPL-2.0 only for `org.junit*` |
+| fabric-installer 1.1.2 (testkit only: launches the Fabric test server) | Apache-2.0 | OK; testkit only, never shipped |
+| Rust build-time crates of the native: bindgen 0.72.1, libloading 0.8.9, unicode-ident 1.0.26 | BSD-3-Clause; ISC; (MIT OR Apache-2.0) AND Unicode-3.0 | OK; used only while compiling the native, not linked into it (absent from `natives/build/out/licenses/INVENTORY.txt`) |
+| libstdc++ / libgcc (statically linked into the Linux native) | GPL-3.0-or-later WITH GCC-exception-3.1 | OK; the GCC Runtime Library Exception covers static linking |
+| glibc (≥ 2.28, used from the host system at runtime) | LGPL-2.1-or-later | OK; not shipped |
 
 Rules:
 

@@ -639,6 +639,30 @@ and connect to last chunk -189 ms. The clean link shows no regression at 32 (int
 64 packets was measured at +150 ms only; clean and loss are not measured yet, so the default
 stays quiche's 10 until they are (a docs/protocol.md §9 decision).
 
+Clean link and 2% loss (follow-up, 2026-10-11):
+
+| Initial window | Run | Profile | Join | Chunk load | Join + chunk load | Play RTT |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10 packets (quiche default) | `20261011T190719Z-fabric-tcp-quic` | clean | -158.0 [-187.5, -109.1] | +55.0 [-35.9, +121.0] | -80.5 [-213.3, +19.6] | +0.2 [+0.1, +0.3] |
+| 10 packets (quiche default) | `20261011T190719Z-fabric-tcp-quic` | loss | -69.1 [-136.8, -7.7] | -82.2 [-202.8, -22.1] | -189.7 [-297.2, -47.2] | +0.2 [+0.1, +0.2] |
+| 64 packets | `20261011T192603Z-fabric-tcp-quic` | clean | -145.7 [-171.2, -102.0] | +1.2 [-62.6, +39.2] | -149.7 [-200.7, -101.4] | +0.1 [+0.0, +0.2] |
+| 64 packets | `20261011T192603Z-fabric-tcp-quic` | loss | -107.6 [-164.6, -16.7] | -82.7 [-167.7, -39.2] | -202.0 [-300.4, -113.7] | +0.2 [+0.2, +0.2] |
+
+Verification (same method as above): the 10-packet arm's server ran with
+`-Dquicraft.congestionControl=BBR` only; the 64-packet arm's added
+`-Dquicraft.initialCwndPackets=64`. Both appear in the respective java command lines.
+
+At 64 packets the clean-link chunk-load difference is +1.2 [-62.6, +39.2] against the 10-packet
+arm's +55.0 [-35.9, +121.0]; the QUIC medians themselves are flat (411.6 vs 402.1 ms), the
+TCP-only chunk median moved +44.3 ms between the two sessions, and the intervals overlap zero, so
+no clean-link regression of ~100 ms or larger was detected at 64 packets, but equivalence is not
+established and the narrowing of the QUIC-TCP gap from +55 to +1.2 should not be read as a QUIC
+gain. Under 2% loss the two arms are indistinguishable at the median (-82.7 [-167.7, -39.2] at 64
+against -82.2 [-202.8, -22.1] at 10, an arm-to-arm difference of -0.5 ms with a CI of about
++/-110 ms); the loss chunk loads are bimodal with overlapping tails (four 10-packet runs at
+574-768 ms, one 64-packet run at 1035.5 ms that the same session's TCP arm echoes at 915.5 ms),
+and flat 2% loss with deep queues cannot exercise a queue overflow from the larger initial burst.
+
 ### Play RTT on a clean link: not closed
 
 End to end, current code, Fabric, clean, N=10 (run `20261011T122358Z-fabric-tcp-quic`): TCP
