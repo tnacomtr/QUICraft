@@ -77,6 +77,69 @@ class QuicLoopbackTest {
     }
 
     @Test
+    void echoesBytesWhenEveryConnectionGetsARetry() throws Exception {
+        TransportConfig always = TransportConfig.builder().retryMode(TransportConfig.RetryMode.ALWAYS).build();
+        CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
+        try (QuicServer server = Loopback.echoServer(Loopback.anyLocal(), identity, always, accepted)) {
+            QuicByteStream stream = QuicClient.connect(server.localAddress(), identity.fingerprint(),
+                    TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
+            Loopback.Collector collector = new Loopback.Collector();
+            stream.setListener(collector);
+            stream.setAutoRead(true);
+            byte[] hello = "hello after a retry".getBytes(StandardCharsets.UTF_8);
+            stream.write(ByteBuffer.wrap(hello));
+            stream.flush();
+            assertArrayEquals(hello, collector.await(hello.length, 5, TimeUnit.SECONDS));
+            assertTrue(server.retriesSent() >= 1, "the connection went through a Retry");
+            stream.close();
+        }
+    }
+
+    @Test
+    void aConnectionOverThePerIpLimitGetsNoConnectionAndTheSlotFreesOnClose() throws Exception {
+        TransportConfig onePerIp = TransportConfig.builder().maxOpenPerIp(1).build();
+        CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
+        try (QuicServer server = Loopback.echoServer(Loopback.anyLocal(), identity, onePerIp, accepted)) {
+            QuicByteStream first = QuicClient.connect(server.localAddress(), identity.fingerprint(),
+                    TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
+            accepted.get(5, TimeUnit.SECONDS);
+            long retriesBefore = server.retriesSent();
+
+            // Over the limit: a Retry at most, then silence. No handshake completes, so the client
+            // can't mistake the attempt for a won race; it falls back to TCP after its head start.
+            long start = System.nanoTime();
+            CompletableFuture<QuicByteStream> second = QuicClient.connect(server.localAddress(),
+                    identity.fingerprint(), TransportConfig.DEFAULT);
+            assertThrows(java.util.concurrent.TimeoutException.class, () -> second.get(2, TimeUnit.SECONDS));
+            System.out.printf("over the limit: no connection after %d ms, Retry packets %d%n",
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), server.retriesSent() - retriesBefore);
+            assertTrue(server.retriesSent() > retriesBefore, "the refused attempt is answered with a Retry");
+            second.cancel(true);
+
+            first.close();
+            long closed = System.nanoTime();
+            long deadline = closed + TimeUnit.SECONDS.toNanos(10);
+            QuicByteStream third = null;
+            while (third == null && System.nanoTime() < deadline) {
+                CompletableFuture<QuicByteStream> attempt = QuicClient.connect(server.localAddress(),
+                        identity.fingerprint(), TransportConfig.DEFAULT);
+                try {
+                    // Longer than the client's first PTO (~1 s): a retransmitted Initial can still
+                    // be admitted, and a cancelled half-open attempt would hold the slot.
+                    third = attempt.get(3, TimeUnit.SECONDS);
+                } catch (ExecutionException | java.util.concurrent.TimeoutException stillHeld) {
+                    attempt.cancel(true); // else a late success would hold the slot
+                    Thread.sleep(50);
+                }
+            }
+            assertTrue(third != null, "the lease must be released when the first connection closes");
+            System.out.printf("a new connection succeeded %d ms after the first closed%n",
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closed));
+            third.close();
+        }
+    }
+
+    @Test
     void echoesBytesWithACustomInitialCongestionWindow() throws Exception {
         CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
         try (QuicServer server = Loopback.echoServer(identity, accepted)) {

@@ -371,6 +371,35 @@ class EarlyDataTest {
         }
     }
 
+    @Test
+    void aRejoinWithRetryOnEveryConnectionStillSucceeds() throws Exception {
+        ServerIdentity identity = ServerIdentity.generate();
+        TransportConfig always = TransportConfig.builder().retryMode(TransportConfig.RetryMode.ALWAYS).build();
+        try (GameServer game = new GameServer(identity, Loopback.anyLocal(), always);
+                DelayRelay relay = new DelayRelay(game.address(), 50)) {
+            Join.run(relay, identity, "inputs", FLIGHT).closeAfterTicket(relay);
+            Join second = Join.run(relay, identity, "inputs", FLIGHT);
+            System.out.printf("rejoin after Retry: 0-RTT sent=%s, server early releases=%d, Retry packets=%d%n",
+                    second.early.sent(), game.server.earlyReleases(), game.server.retriesSent());
+            assertTrue(game.server.retriesSent() >= 2, "every new connection gets a Retry");
+            assertArrayEquals(FLIGHT, game.received(1, FLIGHT.length), "the game gets the flight exactly once");
+            second.stream.close();
+        }
+    }
+
+    @Test
+    void theDefaultConfigAcceptsZeroRttWithoutRetry() throws Exception {
+        ServerIdentity identity = ServerIdentity.generate();
+        try (GameServer game = new GameServer(identity); DelayRelay relay = new DelayRelay(game.address(), 50)) {
+            Join.run(relay, identity, "inputs", FLIGHT).closeAfterTicket(relay);
+            Join second = Join.run(relay, identity, "inputs", FLIGHT);
+            assertTrue(second.early.sent(), "the rejoin sends 0-RTT data");
+            assertTrue(game.server.earlyReleases() > 0, "the server passes the resumed stream on early");
+            assertEquals(0, game.server.retriesSent(), "no Retry at low load");
+            second.stream.close();
+        }
+    }
+
     static byte[] concat(byte[] a, byte[] b) {
         byte[] out = new byte[a.length + b.length];
         System.arraycopy(a, 0, out, 0, a.length);
@@ -449,7 +478,11 @@ class EarlyDataTest {
         }
 
         GameServer(ServerIdentity identity, InetSocketAddress address) throws Exception {
-            server = QuicServer.bind(address, identity, TransportConfig.DEFAULT, stream -> {
+            this(identity, address, TransportConfig.DEFAULT);
+        }
+
+        GameServer(ServerIdentity identity, InetSocketAddress address, TransportConfig config) throws Exception {
+            server = QuicServer.bind(address, identity, config, stream -> {
                 Accepted a = new Accepted(stream);
                 accepted.add(a);
                 synchronized (accepted) {

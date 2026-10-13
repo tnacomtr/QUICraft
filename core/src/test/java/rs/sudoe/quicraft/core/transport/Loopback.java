@@ -24,7 +24,12 @@ final class Loopback {
 
     static QuicServer echoServer(InetSocketAddress address, ServerIdentity identity,
             CompletableFuture<QuicByteStream> accepted) throws Exception {
-        return QuicServer.bind(address, identity, TransportConfig.DEFAULT, stream -> {
+        return echoServer(address, identity, TransportConfig.DEFAULT, accepted);
+    }
+
+    static QuicServer echoServer(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
+            CompletableFuture<QuicByteStream> accepted) throws Exception {
+        return QuicServer.bind(address, identity, config, stream -> {
             accepted.complete(stream);
             stream.setListener(new QuicByteStream.Listener() {
                 @Override
