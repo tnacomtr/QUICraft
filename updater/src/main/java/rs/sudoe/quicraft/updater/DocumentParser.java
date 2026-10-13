@@ -64,7 +64,7 @@ public final class DocumentParser {
     private static final Pattern TAG = Pattern.compile("v[0-9A-Za-z.-]{1,40}");
     private static final Pattern TIMESTAMP_SHAPE =
             Pattern.compile("[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z");
-    private static final DateTimeFormatter TIMESTAMP_FORMAT =
+    static final DateTimeFormatter TIMESTAMP_FORMAT =
             DateTimeFormatter.ofPattern("uuuu-MM-dd'T'HH:mm:ss'Z'")
                     .withResolverStyle(ResolverStyle.STRICT);
 
@@ -319,7 +319,7 @@ public final class DocumentParser {
     }
 
     /** Requires the exact key set, including {@code type} and {@code v}, and checks both values. */
-    private static void requireHeader(Map<String, Object> root, String type, String... fields)
+    static void requireHeader(Map<String, Object> root, String type, String... fields)
             throws UpdateRejectedException {
         Set<String> expected = new HashSet<>();
         expected.add("type");
@@ -336,13 +336,13 @@ public final class DocumentParser {
         }
     }
 
-    private static void requireExactKeys(Map<String, Object> object, String... fields)
+    static void requireExactKeys(Map<String, Object> object, String... fields)
             throws UpdateRejectedException {
         requireExactKeys(object, Set.of(fields));
     }
 
     /** Rejects unknown keys, missing keys and any null value at this level. */
-    private static void requireExactKeys(Map<String, Object> object, Set<String> expected)
+    static void requireExactKeys(Map<String, Object> object, Set<String> expected)
             throws UpdateRejectedException {
         if (!object.keySet().equals(expected)) {
             throw invalid();
@@ -354,7 +354,7 @@ public final class DocumentParser {
         }
     }
 
-    private static Map<String, Object> objectValue(Object raw) throws UpdateRejectedException {
+    static Map<String, Object> objectValue(Object raw) throws UpdateRejectedException {
         if (!(raw instanceof Map<?, ?> map)) {
             throw invalid();
         }
@@ -363,7 +363,7 @@ public final class DocumentParser {
         return object;
     }
 
-    private static List<?> listValue(Object raw, int min, int max)
+    static List<?> listValue(Object raw, int min, int max)
             throws UpdateRejectedException {
         if (!(raw instanceof List<?> list) || list.size() < min || list.size() > max) {
             throw invalid();
@@ -371,7 +371,7 @@ public final class DocumentParser {
         return list;
     }
 
-    private static String stringValue(Object raw) throws UpdateRejectedException {
+    static String stringValue(Object raw) throws UpdateRejectedException {
         if (!(raw instanceof String text)) {
             throw invalid();
         }
@@ -379,14 +379,14 @@ public final class DocumentParser {
     }
 
     /** Strict lowercase hex of exactly {@code byteLength} bytes. */
-    private static String hexValue(Object raw, int byteLength) throws UpdateRejectedException {
+    static String hexValue(Object raw, int byteLength) throws UpdateRejectedException {
         String text = stringValue(raw);
         Hex.decode(text, byteLength);
         return text;
     }
 
     /** An integer JSON value in {@code min..max}. Booleans and nulls never qualify. */
-    private static long uintValue(Object raw, long min, long max)
+    static long uintValue(Object raw, long min, long max)
             throws UpdateRejectedException {
         if (!(raw instanceof Long value) || value < min || value > max) {
             throw invalid();
@@ -398,7 +398,7 @@ public final class DocumentParser {
      * A calendar-valid UTC timestamp in exactly {@code YYYY-MM-DDTHH:MM:SSZ} form. Leap seconds
      * and {@code 24:00} are rejected, not normalised.
      */
-    private static Instant timestampValue(Object raw) throws UpdateRejectedException {
+    static Instant timestampValue(Object raw) throws UpdateRejectedException {
         String text = stringValue(raw);
         if (text.length() != 20 || !TIMESTAMP_SHAPE.matcher(text).matches()) {
             throw invalid();
@@ -410,7 +410,7 @@ public final class DocumentParser {
         }
     }
 
-    private static UpdateRejectedException invalid() {
+    static UpdateRejectedException invalid() {
         return new UpdateRejectedException(INVALID);
     }
 }
