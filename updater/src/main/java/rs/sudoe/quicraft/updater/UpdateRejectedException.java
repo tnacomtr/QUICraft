@@ -2,7 +2,7 @@
 package rs.sudoe.quicraft.updater;
 
 /** A fail-closed rejection of untrusted updater metadata. */
-public final class UpdateRejectedException extends Exception {
+public class UpdateRejectedException extends Exception {
     public UpdateRejectedException(String message) {
         super(message);
     }
