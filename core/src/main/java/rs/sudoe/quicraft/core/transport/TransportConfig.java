@@ -12,15 +12,17 @@ public final class TransportConfig {
     public enum CongestionControl { RENO, CUBIC, BBR }
 
     /**
-     * When the listener sends a QUIC Retry (address validation, docs/protocol.md §9). In every
-     * mode an attempt over its limit is answered with a Retry and nothing more.
+     * When the listener sends a QUIC Retry to an admitted attempt (address validation,
+     * docs/protocol.md §9). In every mode, an attempt over a limit, an attempt while the
+     * open-connection limits are full, and every attempt while a quarter of the open-connection
+     * limit is still in its handshake get a Retry and nothing more.
      */
     public enum RetryMode {
-        /** Retry once the listener's attempts in the current second reach the Retry threshold. */
+        /** Also Retry once the listener's attempts in the current second reach the Retry threshold. */
         ADAPTIVE,
         /** Retry every new connection: for tests and for owners under attack. */
         ALWAYS,
-        /** Retry only attempts over their limit. */
+        /** No Retry for admitted attempts; refusals and a handshake backlog still get one. */
         NEVER
     }
 

@@ -10,11 +10,12 @@ import java.util.logging.Logger;
 /**
  * Connection-attempt limits on top of {@link HmacRetryTokenHandler} (docs/protocol.md §9).
  *
- * <p>A token-less Initial spends one attempt. If that is over a limit, or the open-connection
- * limits are full, the client gets a Retry (stateless and smaller than its Initial) instead of a
- * connection; otherwise Retry follows the {@link TransportConfig.RetryMode}. {@code ADAPTIVE}
- * also sends Retry while a quarter of the open-connection limit is waiting for its handshake. A
- * valid token spends an attempt from a separate budget, so a flood of token-less Initials can't
+ * <p>A token-less Initial spends one attempt. In every {@link TransportConfig.RetryMode} the
+ * client gets a Retry (stateless and smaller than its Initial) instead of a connection when that
+ * attempt is over a limit, when the open-connection limits are full, or while a quarter of the
+ * open-connection limit is still in its handshake (a backlog, e.g. spoofed half-open handshakes).
+ * Otherwise Retry follows the mode: {@code ALWAYS} always, {@code ADAPTIVE} once the attempt rate
+ * reaches the Retry threshold, {@code NEVER} not at all. A valid token spends an attempt from a separate budget, so a flood of token-less Initials can't
  * starve clients that proved their address; if that is over a limit, or the open-connection limits
  * are full, the Initial is dropped without an answer. A refused client so falls back to TCP after
  * its head start.
@@ -62,10 +63,11 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
         boolean retry = mode == TransportConfig.RetryMode.ALWAYS;
         try {
             if (address != null && address.getAddress() != null) {
-                if (!admission.allowAttempt(address.getAddress()) || !openSlotFree(address)) {
+                // Refusal-class conditions: a Retry in every mode.
+                if (!admission.allowAttempt(address.getAddress()) || !openSlotFree(address)
+                        || admission.handshakesBacklogged()) {
                     retry = true;
-                } else if (mode == TransportConfig.RetryMode.ADAPTIVE
-                        && (admission.requiresRetry() || admission.handshakesBacklogged())) {
+                } else if (mode == TransportConfig.RetryMode.ADAPTIVE && admission.requiresRetry()) {
                     retry = true;
                 }
             }
