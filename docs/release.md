@@ -50,7 +50,8 @@ and `docs/server-security.md`.
 Release blockers from `CLAUDE.md` (Phase 4) and the plan. Runtime protections are wired into both
 listener binds, merged on `feat/phase4-alpha` after verifier, peer and security review:
 
-- [x] A real Retry token handler. `HmacRetryTokenHandler` is wired into both listener binds, merged
+- [x] A real Retry token handler. `HmacRetryTokenHandler` (through `AdmissionTokenHandler`) is wired
+      into both listener binds, merged
       on `feat/phase4-alpha` after verifier, peer and security review.
       `InsecureQuicTokenHandler` from Netty's examples must never ship.
 - [x] Per-IP and global limits on connection attempts and open connections. `ConnectionAdmission` is
