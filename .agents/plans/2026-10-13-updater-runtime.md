@@ -252,7 +252,9 @@ Per unit: fresh verifier (`:updater:check build --rerun-tasks --no-build-cache`)
 - Later merges: Wave 2.1 state (57c1580), 2.2 sequence (2c330ae), Wave 1 hardening from the Wave 1 security review (e5ea9b3), 3.0 shared (57e5699). 499 updater tests green before 3.0; Wave 1 security review: no critical/high/medium, 3 lows fixed.
 - ChatGPT usage limit hit 2026-10-13: Sonnet stands in for peer-reviewer and superior (user decision).
 - Decisions by orchestrator (report to user): build metadata resource `META-INF/quicraft/build.json` {type quicraft.build, v 1, platform, version}; release hosts are LDH DNS names or exactly `localhost`; throwaway TLS fixture `updater/src/test/resources/tls/test-localhost.p12` for transport tests; Windows DurabilityOps fails closed on directory fsync (3.6 must allow VERIFIED_STAGING_ONLY staging there or document it).
-- Running: 3.1 transport, 3.3 acceptance, 3.4 artifact (default-coder); 3.5 journal gates; Wave 2 security review.
+- Wave 3 merges: 3.5 journal (b0834fa), 3.4 artifact (f5dd45d), 3.1 transport (bc07bc3), 3.2 collection (208d00e), 3.3 acceptance (6bffac3), 3.7 recovery (c2dd937; health stage always completes, injected worker executor, 3 lock attempts 1 s apart). Updater suite after 3.7: 747 tests, 0 failures. Wave 2 security review: 1 medium + 4 lows -> unit 2H.
+- Docs (6a5943b): build.json, journal without `.prev`, release host names added to docs/updater.md.
+- Running: 2H Wave 2 hardening, 3.6a pipeline (default-coder). Next: 3.6b transaction (after 3.6a), Wave 3 security review, 3.5 crash matrix gate, Wave 4.
 - Test keys: RFC 8032 TEST 1-3 seeds only, test sources only (throwaway, per user). Owner keys replace them after implementation; user to be told.
 - Grounding explorers: `ses_ec90bf527ffewKBKlh3oIN8CLf` (platform wiring), `ses_ec90bf445fferbnM9Eq2V7R7S5` (state/verification gaps). Both done, read-only.
 

@@ -847,6 +847,10 @@ process or generation.
 
 Size cap 8192 bytes. Unknown fields rejected.
 
+Unlike the state files, `journal.json` has no `.prev`. It is written with the same `.tmp`, `force`,
+`ATOMIC_MOVE`, directory-fsync procedure. A journal that fails to parse is never replaced by an older
+copy: startup recovery (12.11) treats it as `recovery-required` and keeps every update file.
+
 ### 12.9 Locking, admission and cancel (blocker 12)
 
 - **Two locks**, each an in-process `ReentrantLock` plus the OS file lock (`FileChannel.tryLock`):
@@ -988,6 +992,20 @@ Manifests, per host, after every revocation response is processed:
 Staging repeats R1 to M8 at step 4 of 12.10, and step 6 re-authorises from persisted state under
 `state.lock`.
 
+#### Build metadata (`META-INF/quicraft/build.json`, normative)
+
+Each of the project's own jars carries its platform and version, so a staged jar can be matched
+against its release entry without loading any class:
+
+```json
+{ "type": "quicraft.build", "v": 1, "platform": "fabric-26x", "version": "0.4.0" }
+```
+
+- Size cap 1024 bytes; strict parsing as in 12.3; unknown fields rejected.
+- `platform` must equal both the release entry's `platform` and the compiled-in platform;
+  `version` must equal the entry's `version` (12.3 grammar, compared as versions).
+- A staged jar without the entry, or with more than one, is rejected. The entry is read as data only.
+
 ### 12.13 Live-swap evidence and rules (basis for blocker 10)
 
 Evidence (experiment, 2026-10-13, scratch only, recorded in the Phase 4 plan,
@@ -1071,6 +1089,10 @@ Both:
 ### 12.15 Dependencies on blockers not resolved here
 
 - Blocker 5: URLs per host, redirect policy, which host serves which file.
+  Settled so far: each host origin is `https://` with no path, query or fragment. Its host part is
+  a plain LDH DNS name (two or more labels of 1..63 letters, digits or hyphens, no leading or trailing
+  hyphen, no IP literals, no trailing dot) or exactly `localhost` (tests only). Redirects are denied
+  unless an injected policy allows them.
 - Blocker 9: health criteria that end `health-check-pending`.
 - Blocker 10: open gaps listed in 12.13.
 - Blocker 11: Windows steps 5 to 7.
