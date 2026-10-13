@@ -75,7 +75,7 @@ class TransactionLockTest {
     void stateLockHeldThenTxnIsRefused() throws Exception {
         Path dir = dir();
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(seed());
+        store.initialiseIfAbsent(seed(), true);
         IllegalStateException e = assertThrows(IllegalStateException.class,
                 () -> store.withLockedSnapshot((snapshot) -> TransactionLock.tryAcquire(dir)));
         assertEquals("txn lock must be taken before the state lock", e.getMessage());
@@ -87,7 +87,7 @@ class TransactionLockTest {
     void txnThenStateLockIsAllowed() throws Exception {
         Path dir = dir();
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(seed());
+        store.initialiseIfAbsent(seed(), true);
         TransactionLock.TxnLease lease = TransactionLock.tryAcquire(dir);
         try {
             StateRecords.Snapshot seen = store.withLockedSnapshot(snapshot -> snapshot);
