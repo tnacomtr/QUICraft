@@ -229,7 +229,9 @@ Per unit: fresh verifier (`:updater:check build --rerun-tasks --no-build-cache`)
 
 - Review fixes applied 2026-10-13: backup co-sign check, Wave 0 types unit, spec-aligned state store, injected redirect policy, `reset-state` and cross-store refusal assigned, health placeholder, `UpdateVersion` args, macOS/JDK21 CI route, in-process lock guard.
 - Wave 0 (this plan): approved, advisor critique incorporated, open decisions resolved (fixtures approved, origins injected, Windows deferred). Awaiting the user's go-ahead to start Wave 0.5.
-- No implementation unit assigned. No editing agent running.
+- 2026-10-13 execution (orchestrator). Merged on feat/phase4-alpha after verifier PASS + peer approve: Wave 0 types (1a2df88), 1.1 keys (e2ad90e), 1.4 freshness (2b76dee), 1.3 trust (a196461), 1.2 signers (643cfad). Merged updater suite: 387 tests, 0 failures. Wave 0.5 spike PASS, kept unmerged on `agent/phase4-upd-spike` (4a87986, note `.agents/plans/spike-upd-0.5.md`) for Wave 5.
+- Running: 2.1 state (default-coder), 2.2 sequence (default-coder), Wave 1 security review (security-reviewer), Wave 2.5 critique (superior, opencode).
+- Test keys: RFC 8032 TEST 1-3 seeds only, test sources only (throwaway, per user). Owner keys replace them after implementation; user to be told.
 - Grounding explorers: `ses_ec90bf527ffewKBKlh3oIN8CLf` (platform wiring), `ses_ec90bf445fferbnM9Eq2V7R7S5` (state/verification gaps). Both done, read-only.
 
 ## Advisor review
