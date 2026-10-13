@@ -30,9 +30,9 @@ public final class DocumentParser {
     private static final String TYPE_REVOCATIONS = "quicraft.revocations";
 
     private static final int TRUST_MAX_BYTES = 8192;
-    private static final int SIGNATURES_MAX_BYTES = 4096;
-    private static final int RELEASE_MAX_BYTES = 65536;
-    private static final int REVOCATIONS_MAX_BYTES = 65536;
+    static final int SIGNATURES_MAX_BYTES = 4096;
+    static final int RELEASE_MAX_BYTES = 65536;
+    static final int REVOCATIONS_MAX_BYTES = 65536;
     private static final int MAX_STRING_CHARS = 256;
 
     private static final long MAX_SEQ = 9007199254740991L;

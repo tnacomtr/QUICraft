@@ -17,16 +17,13 @@ import java.util.function.Function;
  * seen, or a fetch reports {@link FetchOutcome#CANCELLED}, every host not yet fetched is marked
  * {@link FetchOutcome#CANCELLED}. Fetches are never retried.
  *
+ * <p>Each host is isolated: a {@link RuntimeException} raised while fetching that host (including an
+ * {@link IllegalArgumentException} from an endpoint URI that does not match its host) is recorded as
+ * {@link FetchOutcome#TRANSPORT_ERROR} for that host alone, and collection continues.
+ *
  * <p>Nothing is parsed here and no URI is logged.
  */
 final class MetadataCollector {
-
-    /** Cap for the revocations document; equal to the parser's REVOCATIONS_MAX_BYTES. */
-    static final long REVOCATIONS_MAX_BYTES = 65_536L;
-    /** Cap for the release manifest; equal to the parser's RELEASE_MAX_BYTES. */
-    static final long MANIFEST_MAX_BYTES = 65_536L;
-    /** Cap for any detached {@code .sig}; equal to the parser's SIGNATURES_MAX_BYTES. */
-    static final long SIGNATURE_MAX_BYTES = 4_096L;
 
     private final SourceFetcher fetcher;
     private final ReleaseEndpoints endpoints;
@@ -56,7 +53,7 @@ final class MetadataCollector {
      * @return one evidence entry per configured host, in configured order
      */
     HostCollection collectRevocations(ReleaseHosts hosts, CancelToken cancel) {
-        return collect(hosts, cancel, REVOCATIONS_MAX_BYTES,
+        return collect(hosts, cancel, DocumentParser.REVOCATIONS_MAX_BYTES,
                 endpoints::revocations, endpoints::revocationsSignature);
     }
 
@@ -68,7 +65,7 @@ final class MetadataCollector {
      * @return one evidence entry per configured host, in configured order
      */
     HostCollection collectManifests(ReleaseHosts hosts, CancelToken cancel) {
-        return collect(hosts, cancel, MANIFEST_MAX_BYTES,
+        return collect(hosts, cancel, DocumentParser.RELEASE_MAX_BYTES,
                 endpoints::manifest, endpoints::manifestSignature);
     }
 
@@ -85,14 +82,28 @@ final class MetadataCollector {
                 stopped = true;
                 continue;
             }
-            HostEvidence result = fetchPair(host, cancel, documentMaxBytes,
-                    documentUri.apply(host), signatureUri.apply(host));
+            HostEvidence result = fetchHost(host, cancel, documentMaxBytes, documentUri, signatureUri);
             evidence.add(result);
             if (result.outcome() == FetchOutcome.CANCELLED) {
                 stopped = true;
             }
         }
         return new HostCollection(evidence);
+    }
+
+    /**
+     * Fetches one host's document and signature. Any {@link RuntimeException} raised while doing so
+     * (an endpoint URI that does not match its host, a misbehaving fetcher) is contained to this host
+     * and recorded as {@link FetchOutcome#TRANSPORT_ERROR}, so the remaining hosts are still fetched.
+     */
+    private HostEvidence fetchHost(ReleaseHost host, CancelToken cancel, long documentMaxBytes,
+            Function<ReleaseHost, URI> documentUri, Function<ReleaseHost, URI> signatureUri) {
+        try {
+            return fetchPair(host, cancel, documentMaxBytes,
+                    documentUri.apply(host), signatureUri.apply(host));
+        } catch (RuntimeException e) {
+            return new HostEvidence(host, FetchOutcome.TRANSPORT_ERROR, null);
+        }
     }
 
     private HostEvidence fetchPair(ReleaseHost host, CancelToken cancel, long documentMaxBytes,
@@ -105,7 +116,7 @@ final class MetadataCollector {
         }
         FetchedBytes signature;
         try {
-            signature = fetcher.fetch(request(host, signatureUri, SIGNATURE_MAX_BYTES), cancel);
+            signature = fetcher.fetch(request(host, signatureUri, DocumentParser.SIGNATURES_MAX_BYTES), cancel);
         } catch (FetchException e) {
             return new HostEvidence(host, e.outcome(), null);
         }

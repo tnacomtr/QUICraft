@@ -258,30 +258,95 @@ class MetadataCollectorTest {
     }
 
     @Test
-    void revocationsUseDocumentCapOf65536AndSignatureCapOf4096() {
+    void revocationRequestsCarryParserRevocationAndSignatureCaps() {
         ScriptedFetcher fetcher = allHostsOkFetcher();
         collector(fetcher).collectRevocations(HOSTS, new MutableCancelToken());
 
-        assertEquals(65_536L, MetadataCollector.REVOCATIONS_MAX_BYTES);
+        assertEquals(6, fetcher.requests.size());
         for (int i = 0; i < fetcher.requests.size(); i++) {
-            FetchRequest request = fetcher.requests.get(i);
-            long expected = i % 2 == 0 ? 65_536L : 4_096L;
-            assertEquals(expected, request.maxBytes(), "request " + i);
+            long expected = i % 2 == 0
+                    ? DocumentParser.REVOCATIONS_MAX_BYTES
+                    : DocumentParser.SIGNATURES_MAX_BYTES;
+            assertEquals(expected, fetcher.requests.get(i).maxBytes(), "request " + i);
         }
     }
 
     @Test
-    void manifestsUseDocumentCapOf65536AndSignatureCapOf4096() {
+    void manifestRequestsCarryParserReleaseAndSignatureCaps() {
         ScriptedFetcher fetcher = allHostsOkFetcher();
         collector(fetcher).collectManifests(HOSTS, new MutableCancelToken());
 
-        assertEquals(65_536L, MetadataCollector.MANIFEST_MAX_BYTES);
-        assertEquals(4_096L, MetadataCollector.SIGNATURE_MAX_BYTES);
+        assertEquals(6, fetcher.requests.size());
         for (int i = 0; i < fetcher.requests.size(); i++) {
-            FetchRequest request = fetcher.requests.get(i);
-            long expected = i % 2 == 0 ? 65_536L : 4_096L;
-            assertEquals(expected, request.maxBytes(), "request " + i);
+            long expected = i % 2 == 0
+                    ? DocumentParser.RELEASE_MAX_BYTES
+                    : DocumentParser.SIGNATURES_MAX_BYTES;
+            assertEquals(expected, fetcher.requests.get(i).maxBytes(), "request " + i);
         }
+    }
+
+    @Test
+    void endpointUriNotMatchingItsHostFailsOnlyThatHost() {
+        ScriptedFetcher fetcher = allHostsOkFetcher();
+        ReleaseEndpoints mismatched = new ReleaseEndpoints() {
+            @Override
+            public URI revocations(ReleaseHost host) {
+                if (host.key().equals("github")) {
+                    return URI.create("https://elsewhere.example/revocations.json");
+                }
+                return ENDPOINTS.revocations(host);
+            }
+
+            @Override
+            public URI revocationsSignature(ReleaseHost host) {
+                return ENDPOINTS.revocationsSignature(host);
+            }
+
+            @Override
+            public URI manifest(ReleaseHost host) {
+                return ENDPOINTS.manifest(host);
+            }
+
+            @Override
+            public URI manifestSignature(ReleaseHost host) {
+                return ENDPOINTS.manifestSignature(host);
+            }
+
+            @Override
+            public URI artifact(ReleaseHost host, UpdateDocuments.ReleaseEntry entry) {
+                return ENDPOINTS.artifact(host, entry);
+            }
+        };
+
+        HostCollection collection = new MetadataCollector(fetcher, mismatched, Map.of(),
+                FetchTimeouts.defaults()).collectRevocations(HOSTS, new MutableCancelToken());
+
+        HostEvidence github = evidenceFor(collection, GITHUB);
+        assertEquals(FetchOutcome.TRANSPORT_ERROR, github.outcome());
+        assertNull(github.pair());
+        assertEquals(FetchOutcome.OK, evidenceFor(collection, MODRINTH).outcome());
+        assertEquals(FetchOutcome.OK, evidenceFor(collection, SUDOE).outcome());
+        assertEquals(3, collection.responses().size());
+    }
+
+    @Test
+    void runtimeExceptionFromFetcherFailsOnlyThatHost() {
+        ScriptedFetcher fetcher = allHostsOkFetcher();
+        URI githubDocument = ENDPOINTS.manifest(GITHUB);
+        fetcher.onFetch = uri -> {
+            if (uri.equals(githubDocument)) {
+                throw new IllegalStateException("fetcher bug");
+            }
+        };
+
+        HostCollection collection = collector(fetcher)
+                .collectManifests(HOSTS, new MutableCancelToken());
+
+        HostEvidence github = evidenceFor(collection, GITHUB);
+        assertEquals(FetchOutcome.TRANSPORT_ERROR, github.outcome());
+        assertNull(github.pair());
+        assertEquals(FetchOutcome.OK, evidenceFor(collection, MODRINTH).outcome());
+        assertEquals(FetchOutcome.OK, evidenceFor(collection, SUDOE).outcome());
     }
 
     @Test
