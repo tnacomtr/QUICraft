@@ -25,8 +25,8 @@ General firewall practice, shown as examples only. These have not been tested on
 preparation unit.
 
 - Allow UDP on the QUIC port. That is the same number as the TCP game port (default `25565/udp`), or
-  the game port + 1 when the query collision moves QUIC to the alternative port. Keep the TCP game
-  port open. Do not close TCP to make QUIC work: TCP is the compatibility path.
+  the configured alternative port when the query collision moves QUIC (default: game port + 1). Keep
+  the TCP game port open. Do not close TCP to make QUIC work: TCP is the compatibility path.
 - Add the rule for **both IPv4 and IPv6** if the server is reachable over both; most firewalls keep
   the two rule sets separate (see IPv6 below).
 - Example with `ufw` (adjust the port): `ufw allow 25565/udp`. Equivalent `nftables` or `iptables` rules
@@ -53,7 +53,7 @@ pending review on branch `agent/phase4-listener-admission`.
 | --- | --- | --- |
 | `quicraft.admission.retry` | `adaptive` | Retry policy: `adaptive`, `always` or `never` (below). |
 | `quicraft.admission.globalAttemptsPerSecond` | 200 | New connection attempts per second, all IPs. |
-| `quicraft.admission.perIpAttemptsPerSecond` | 20 | New connection attempts per second, per IP. |
+| `quicraft.admission.perIpAttemptsPerSecond` | 20 | New connection attempts per second, per IP (see the attempt budget below). |
 | `quicraft.admission.retryThresholdPerSecond` | 50 | All-IP attempt rate at which `adaptive` starts Retry. |
 | `quicraft.admission.maxOpen` | 2048 | Open QUIC connections (pending plus established), all IPs. |
 | `quicraft.admission.maxOpenPerIp` | 32 | Open QUIC connections (pending plus established), per IP. |
@@ -72,6 +72,8 @@ pending review on branch `agent/phase4-listener-admission`.
 - **Ingress guard.** `ingressInitialsPerSecond` and `ingressInitialsPerIpPerSecond` drop excess QUIC
   Initial datagrams before any QUIC processing. This is a cheap packet-level guard; other packets
   (established connections) are never counted.
+- **Attempt budget.** One join under Retry can spend up to 3 connection attempts. So the default
+  `perIpAttemptsPerSecond=20` allows roughly 6-10 joins per second per IP while Retry is active.
 - **Many players behind one IP** (shared NAT: schools, LAN parties, carrier NAT): raise
   `maxOpenPerIp` and `perIpAttemptsPerSecond` so one address does not starve the others. Raise
   `maxOpen` too if the whole server, not one IP, is the limit.
