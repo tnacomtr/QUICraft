@@ -59,8 +59,30 @@ class StateStoreTest {
     }
 
     private Path updateDir() throws IOException {
-        return Files.createDirectories(Path.of(tmp.toString(), "upd"));
+        return privateDir(Path.of(tmp.toString(), "upd"));
     }
+
+    /** Writes a file with owner-only permissions on POSIX, as the store itself would. */
+    static void writePrivate(Path p, byte[] bytes) throws IOException {
+        Files.write(p, bytes);
+        if (java.nio.file.FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+            Files.setPosixFilePermissions(p, PosixFilePermissions.fromString("rw-------"));
+        }
+    }
+
+    static Path privateDirFor(Path p) throws IOException {
+        return privateDir(p);
+    }
+
+    /** Creates a directory the way the store does: owner-only on POSIX (umask-independent). */
+    static Path privateDir(Path p) throws IOException {
+        Files.createDirectories(p);
+        if (java.nio.file.FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+            Files.setPosixFilePermissions(p, PosixFilePermissions.fromString("rwx------"));
+        }
+        return p;
+    }
+
 
     /** Adds one kid to seqByKid and bumps the revocations seq. */
     private static UpdaterState withKid(UpdaterState s, String kid, long seq) {
@@ -206,7 +228,7 @@ class StateStoreTest {
         store.initialiseIfAbsent(seedDelta());
         store.commit(before -> addKid(before, KID_1, 1));
         Files.write(dir.resolve("revoked.json"), "x".getBytes(StandardCharsets.UTF_8));
-        Files.write(dir.resolve("revoked.json.prev"), "y".getBytes(StandardCharsets.UTF_8));
+        writePrivate(dir.resolve("revoked.json.prev"), "y".getBytes(StandardCharsets.UTF_8));
 
         StateUnavailableException e = assertThrows(StateUnavailableException.class,
                 () -> new StateStore(dir).load());
@@ -219,7 +241,7 @@ class StateStoreTest {
         new StateStore(dir).initialiseIfAbsent(seedDelta());
         Files.delete(dir.resolve("state.json"));
         StateUnavailableException e = assertThrows(StateUnavailableException.class,
-                () -> new StateStore(dir).initialiseIfAbsent(seedDelta()));
+                () -> new StateStore(dir).load());
         assertTrue(e.revokedValid());
     }
 
@@ -404,5 +426,92 @@ class StateStoreTest {
         UpdaterState s = seedState(4);
         UpdateDocuments.Trust trust = new UpdateDocuments.Trust(1, T1, 4, 0, List.of());
         assertTrue(s == StateStore.clampToTrust(s, trust));
+    }
+
+    @Test
+    void initialisationCrashAfterRevokedWriteConvergesByReseeding() throws Exception {
+        Path dir = updateDir();
+        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        Files.delete(dir.resolve("state.json"));
+        StateStore store = new StateStore(dir);
+        Snapshot s = store.initialiseIfAbsent(seedDelta());
+        assertEquals(seedDelta().newState(), s.state());
+        assertTrue(store.warnings().contains(
+                "state.json missing after interrupted initialisation; reseeded"),
+                store.warnings().toString());
+        assertEquals(Optional.of(s), new StateStore(dir).load());
+    }
+
+    @Test
+    void initialiseWithCorruptRevokedAndMissingStateStaysUnavailable() throws Exception {
+        Path dir = updateDir();
+        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        Files.delete(dir.resolve("state.json"));
+        Files.write(dir.resolve("revoked.json"), "x".getBytes(StandardCharsets.UTF_8));
+        StateUnavailableException e = assertThrows(StateUnavailableException.class,
+                () -> new StateStore(dir).initialiseIfAbsent(seedDelta()));
+        assertFalse(e.revokedValid());
+    }
+
+    @Test
+    void directoryFsyncIsSupportedOnLinuxTempDir() throws Exception {
+        assertTrue(StateStore.directoryFsyncSupported(updateDir()));
+    }
+
+    @Test
+    void failingDirectoryForcePropagatesToCaller() throws Exception {
+        Path dir = updateDir();
+        StateStore failing = new StateStore(dir, () -> { }, ch -> {
+            throw new IOException("fsync failed");
+        });
+        IOException e = assertThrows(IOException.class,
+                () -> failing.initialiseIfAbsent(seedDelta()));
+        assertEquals("fsync failed", e.getMessage());
+    }
+
+    @Test
+    void groupOrOtherBitsOnDirectoryAreRefused() throws Exception {
+        assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        Path dir = updateDir();
+        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxr-xr-x"));
+        UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
+                () -> new StateStore(dir).load());
+        assertEquals("update directory permissions too open", e.getMessage());
+    }
+
+    @Test
+    void groupOrOtherBitsOnStateFileAreRefused() throws Exception {
+        assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        Path dir = updateDir();
+        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        Files.setPosixFilePermissions(dir.resolve("state.json"),
+                PosixFilePermissions.fromString("rw-r--r--"));
+        UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
+                () -> new StateStore(dir).load());
+        assertEquals("update directory permissions too open", e.getMessage());
+    }
+
+    @Test
+    void oversizedStateFileIsTreatedAsInvalid() throws Exception {
+        Path dir = updateDir();
+        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        Files.write(dir.resolve("state.json"), new byte[300_000]);
+        StateUnavailableException e = assertThrows(StateUnavailableException.class,
+                () -> new StateStore(dir).load());
+        assertTrue(e.revokedValid());
+    }
+
+    @Test
+    void staleProbeFilesAreSweptButFreshOnesKept() throws Exception {
+        Path dir = updateDir();
+        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        Path stale = Files.createFile(dir.resolve(".owner-stale.probe"));
+        Files.setLastModifiedTime(stale,
+                java.nio.file.attribute.FileTime.from(Instant.now().minusSeconds(600)));
+        Path fresh = Files.createFile(dir.resolve(".owner-fresh.probe"));
+        new StateStore(dir).load();
+        assertFalse(Files.exists(stale));
+        assertTrue(Files.exists(fresh));
     }
 }

@@ -29,7 +29,7 @@ class TransactionLockTest {
     private static final String HEX_B = "b".repeat(64);
 
     private Path dir() throws Exception {
-        return Files.createDirectories(tmp.resolve("upd"));
+        return StateStoreTest.privateDirFor(tmp.resolve("upd"));
     }
 
     private static StateDelta seed() {
@@ -55,6 +55,7 @@ class TransactionLockTest {
     @Test
     void lockHeldByAnotherProcessIsRefused() throws Exception {
         Path dir = dir();
+        StateStoreTest.writePrivate(dir.resolve(StateStore.TXN_LOCK), new byte[0]);
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         Process child = new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"),
                 LockHolderMain.class.getName(), dir.toString(), StateStore.TXN_LOCK)

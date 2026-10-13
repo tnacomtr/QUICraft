@@ -39,7 +39,7 @@ class StateStoreLockingTest {
     private static final String KID_2 = "fedcba9876543210";
 
     private Path dir() throws Exception {
-        Path dir = Files.createDirectories(tmp.resolve("upd"));
+        Path dir = StateStoreTest.privateDirFor(tmp.resolve("upd"));
         new StateStore(dir).initialiseIfAbsent(new StateDelta(
                 new UpdaterState(1, HEX_A, HEX_B, new CurrentRevocations(0, "", null, null, 0),
                         Map.of(), List.of(), "", List.of(), Map.of()),
