@@ -65,7 +65,7 @@ final class StateReset {
         List<String> messages = new ArrayList<>();
         messages.add("state.json rebuilt from the trust seeds; revoked.json kept");
         messages.addAll(refetch.diagnostics());
-        return new ResetResult(true, refetch.freshRevocations(), messages);
+        return new ResetResult(true, refetch.freshRevocations() && !refetch.stateFull(), messages);
     }
 
     private enum Probe {

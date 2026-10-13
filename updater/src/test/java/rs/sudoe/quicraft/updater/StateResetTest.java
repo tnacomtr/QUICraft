@@ -35,7 +35,7 @@ class StateResetTest {
 
     private StateStore store(Path dir, StateDelta initial) throws Exception {
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(initial);
+        store.initialiseIfAbsent(initial, true);
         return store;
     }
 

@@ -28,7 +28,7 @@ class CheckPipelineTest {
             throws Exception {
         Path dir = PipelineFixtures.privateDir(tmp.resolve("upd"));
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(new StateDelta(state, revoked));
+        store.initialiseIfAbsent(new StateDelta(state, revoked), true);
         return store;
     }
 
@@ -56,6 +56,38 @@ class CheckPipelineTest {
         assertTrue(result.candidate().isPresent(), result.diagnostics().toString());
         assertTrue(result.freshRevocations());
         assertFalse(result.stateFull());
+    }
+
+    @Test
+    void revocationsOverTheCapOfferNoCandidateAndReportStateFull() throws Exception {
+        StateStore store = initialisedStore();
+        // A document holds at most 16 keys and revoked.json at most 64, so the cap is reached across
+        // runs: four documents fill it, then a fifth adding one more key is skipped whole.
+        for (int run = 0; run < 4; run++) {
+            ScriptedFetcher fill = new ScriptedFetcher();
+            fill.answerEveryHost(PipelineFixtures.revocations(revokedKeys(run * 16, 16)), PipelineFixtures.manifest());
+            CheckResult before = pipeline(store, fill).run(CheckMode.REPORT, onDisk(), new MutableCancelToken());
+            assertFalse(before.stateFull(), before.diagnostics().toString());
+        }
+        assertEquals(64, store.load().orElseThrow().revoked().revokedPubs().size());
+
+        ScriptedFetcher second = new ScriptedFetcher();
+        second.answerEveryHost(PipelineFixtures.revocations(revokedKeys(100, 1)), PipelineFixtures.manifest());
+        for (CheckMode mode : CheckMode.values()) {
+            CheckResult result = pipeline(store, second).run(mode, onDisk(), new MutableCancelToken());
+            assertFalse(result.candidate().isPresent(), mode + ": restrictions were not applied");
+            assertTrue(result.stateFull(), mode + " " + result.diagnostics());
+        }
+        assertEquals(64, store.load().orElseThrow().revoked().revokedPubs().size(), "nothing evicted or merged");
+    }
+
+    private static String[] revokedKeys(int from, int count) throws Exception {
+        String[] keys = new String[count];
+        for (int i = 0; i < count; i++) {
+            String pub = Hex.sha256(("over-cap-" + (from + i)).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            keys[i] = PipelineFixtures.revokedKey(Hex.kid(pub), pub);
+        }
+        return keys;
     }
 
     @Test

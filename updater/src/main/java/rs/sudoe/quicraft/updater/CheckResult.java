@@ -10,7 +10,7 @@ import java.util.Optional;
  *
  * @param mode the check mode that was run
  * @param candidate the candidate chosen inside the manifest commit, if any
- * @param stateFull true when a state cap stopped manifest acceptance
+ * @param stateFull true when a state cap stopped manifest acceptance or skipped a revocations document; no candidate is offered then
  * @param freshRevocations true when the persisted revocations are fresh after this run
  * @param diagnostics fixed diagnostic strings (host keys only)
  */

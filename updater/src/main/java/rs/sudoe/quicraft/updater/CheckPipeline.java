@@ -76,7 +76,10 @@ final class CheckPipeline {
         boolean fresh = revocationsFresh(finalSnapshot, identity.runningTrust(), clock.instant())
                 && manifest.candidate().map(c -> finalSnapshot.state().revocations().seq()
                         >= c.manifest().document().minRevocationsSeq()).orElse(true);
-        return new CheckResult(mode, manifest.candidate(), manifest.stateFull(), fresh, diagnostics);
+        // A skipped revocations document leaves restrictions unapplied: never offer a candidate then.
+        boolean stateFull = manifest.stateFull() || revocations.get().stateFull();
+        return new CheckResult(mode, stateFull ? Optional.empty() : manifest.candidate(), stateFull, fresh,
+                diagnostics);
     }
 
     private void commitRevocations(HostCollection responses, AtomicReference<RevocationAcceptance> out)
