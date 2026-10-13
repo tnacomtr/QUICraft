@@ -4,12 +4,14 @@ package rs.sudoe.quicraft.updater;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.WritableByteChannel;
 import java.time.Duration;
 import java.util.Objects;
@@ -35,6 +37,11 @@ import javax.net.ssl.SSLContext;
  * call. The idle timeout bounds each body read: a watchdog closes the body stream when a read has
  * been blocked for longer than the idle timeout or past the overall deadline, and the read then fails
  * as {@link FetchOutcome#TIMEOUT}.
+ *
+ * <p>The idle timeout bounds only the reads of the response body. A caller-owned destination that
+ * blocks inside {@code write} is not bounded by it; the caller must bound its own destination. An
+ * interrupt of the calling thread, during a read, a write or between steps, fails
+ * {@link FetchOutcome#CANCELLED} and leaves the interrupt flag set.
  */
 public final class HttpSourceFetcher implements SourceFetcher {
 
@@ -129,8 +136,21 @@ public final class HttpSourceFetcher implements SourceFetcher {
             throw new FetchException(FetchOutcome.TRANSPORT_ERROR);
         } finally {
             if (ownsClients && client != null) {
-                client.close();
+                closeOwnedClient(client);
             }
+        }
+    }
+
+    /**
+     * Stops an owned client without letting cleanup replace the outcome of the fetch. Abandoned
+     * operations are shut down first so {@code close} does not wait for them.
+     */
+    private static void closeOwnedClient(HttpClient client) {
+        try {
+            client.shutdownNow();
+            client.close();
+        } catch (RuntimeException cleanupFailure) {
+            // Cleanup runs after the fetch outcome is decided; a failure here must not replace it.
         }
     }
 
@@ -269,6 +289,11 @@ public final class HttpSourceFetcher implements SourceFetcher {
     }
 
     private static FetchException mapIo(IOException e, IdleWatchdog watchdog) {
+        if (Thread.currentThread().isInterrupted() || e instanceof InterruptedIOException
+                || e instanceof ClosedByInterruptException) {
+            Thread.currentThread().interrupt();
+            return new FetchException(FetchOutcome.CANCELLED);
+        }
         if (watchdog.fired() || e instanceof HttpTimeoutException) {
             return new FetchException(FetchOutcome.TIMEOUT);
         }
@@ -276,11 +301,16 @@ public final class HttpSourceFetcher implements SourceFetcher {
     }
 
     private static OptionalLong declaredLength(HttpResponse<?> response) throws FetchException {
+        OptionalLong declared;
         try {
-            return response.headers().firstValueAsLong("content-length");
+            declared = response.headers().firstValueAsLong("content-length");
         } catch (NumberFormatException e) {
             throw new FetchException(FetchOutcome.TRANSPORT_ERROR);
         }
+        if (declared.isPresent() && declared.getAsLong() < 0) {
+            throw new FetchException(FetchOutcome.TRANSPORT_ERROR);
+        }
+        return declared;
     }
 
     private static URI redirectTarget(URI current, String location) throws FetchException {
@@ -291,6 +321,7 @@ public final class HttpSourceFetcher implements SourceFetcher {
             throw new FetchException(FetchOutcome.REDIRECT_REFUSED);
         }
         if (!target.isAbsolute() || target.isOpaque() || target.getRawAuthority() == null
+                || target.getHost() == null || target.getRawAuthority().endsWith(":")
                 || target.getRawAuthority().indexOf('@') >= 0 || target.getRawFragment() != null
                 || !"https".equalsIgnoreCase(target.getScheme())) {
             throw new FetchException(FetchOutcome.REDIRECT_REFUSED);
@@ -303,7 +334,7 @@ public final class HttpSourceFetcher implements SourceFetcher {
     }
 
     private static void checkCancel(CancelToken cancel) throws FetchException {
-        if (cancel.isCancelled()) {
+        if (cancel.isCancelled() || Thread.currentThread().isInterrupted()) {
             throw new FetchException(FetchOutcome.CANCELLED);
         }
     }

@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.updater;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -19,8 +20,6 @@ import java.net.http.HttpClient;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.security.KeyStore;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -29,7 +28,9 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
@@ -387,6 +388,183 @@ final class HttpSourceFetcherTest {
 
         FetchException failure = assertThrows(FetchException.class,
                 () -> fetcher().fetch(request, new MutableCancelToken()));
+
+        assertEquals(FetchOutcome.TRANSPORT_ERROR, failure.outcome());
+    }
+
+    // ---- interrupts, abandoned operations and cleanup -------------------------------------
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void interruptDuringAStalledBodyIsCancelledAndKeepsTheFlag() throws Exception {
+        route("/interrupt", exchange -> {
+            exchange.sendResponseHeaders(200, 0);
+            OutputStream out = exchange.getResponseBody();
+            out.write(bytes("x"));
+            out.flush();
+            awaitRelease();
+        });
+        AtomicReference<FetchOutcome> outcome = new AtomicReference<>();
+        AtomicBoolean flagAfter = new AtomicBoolean();
+        Thread caller = new Thread(() -> {
+            try {
+                fetcher().fetch(request("/interrupt", 1024, LONG, LONG, RedirectPolicy.denyAll()),
+                        new MutableCancelToken());
+            } catch (FetchException e) {
+                outcome.set(e.outcome());
+            }
+            flagAfter.set(Thread.currentThread().isInterrupted());
+        });
+        caller.start();
+        Thread.sleep(500);
+        caller.interrupt();
+        caller.join(TimeUnit.SECONDS.toMillis(10));
+
+        assertFalse(caller.isAlive(), "fetch did not return after interrupt");
+        assertEquals(FetchOutcome.CANCELLED, outcome.get());
+        assertTrue(flagAfter.get(), "interrupt flag was not restored");
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void fetchAbandonedByDeadlineInTheBodyReturnsPromptly() throws Exception {
+        route("/abandon-body", exchange -> {
+            exchange.sendResponseHeaders(200, 0);
+            OutputStream out = exchange.getResponseBody();
+            out.write(bytes("x"));
+            out.flush();
+            awaitRelease();
+        });
+
+        long started = System.nanoTime();
+        FetchException failure = assertThrows(FetchException.class, () -> fetcher().fetch(
+                request("/abandon-body", 1024, LONG, Duration.ofSeconds(1), RedirectPolicy.denyAll()),
+                new MutableCancelToken()));
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertEquals(FetchOutcome.TIMEOUT, failure.outcome());
+        assertTrue(elapsedMillis < 3_000, "returned after " + elapsedMillis + " ms");
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void fetchAbandonedByDeadlineBeforeHeadersReturnsPromptly() throws Exception {
+        route("/abandon-headers", exchange -> awaitRelease());
+
+        long started = System.nanoTime();
+        FetchException failure = assertThrows(FetchException.class, () -> fetcher().fetch(
+                request("/abandon-headers", 1024, LONG, Duration.ofSeconds(1), RedirectPolicy.denyAll()),
+                new MutableCancelToken()));
+        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertEquals(FetchOutcome.TIMEOUT, failure.outcome());
+        assertTrue(elapsedMillis < 3_000, "returned after " + elapsedMillis + " ms");
+    }
+
+    // ---- redirect target rules and policy inputs -----------------------------------------
+
+    @Test
+    void redirectWithUserinfoIsRefusedBeforeThePolicyIsAsked() throws Exception {
+        route("/userinfo", exchange -> redirect(exchange, "https://user@localhost:" + port() + "/x"));
+        List<URI> asked = new ArrayList<>();
+
+        FetchException failure = assertThrows(FetchException.class, () -> fetcher().fetch(
+                request("/userinfo", 1024, LONG, LONG, (host, from, to) -> {
+                    asked.add(to);
+                    return true;
+                }), new MutableCancelToken()));
+
+        assertEquals(FetchOutcome.REDIRECT_REFUSED, failure.outcome());
+        assertTrue(asked.isEmpty());
+    }
+
+    @Test
+    void redirectWithFragmentIsRefusedBeforeThePolicyIsAsked() throws Exception {
+        route("/fragment", exchange -> redirect(exchange, "/x#frag"));
+        List<URI> asked = new ArrayList<>();
+
+        FetchException failure = assertThrows(FetchException.class, () -> fetcher().fetch(
+                request("/fragment", 1024, LONG, LONG, (host, from, to) -> {
+                    asked.add(to);
+                    return true;
+                }), new MutableCancelToken()));
+
+        assertEquals(FetchOutcome.REDIRECT_REFUSED, failure.outcome());
+        assertTrue(asked.isEmpty());
+    }
+
+    @Test
+    void uppercaseHttpsRedirectTargetIsAccepted() throws Exception {
+        route("/upper", exchange -> redirect(exchange, "HTTPS://localhost:" + port() + "/target"));
+        route("/target", exchange -> respond(exchange, 200, bytes("upper")));
+
+        FetchedBytes body = fetcher().fetch(request("/upper", 1024, LONG, LONG, (host, from, to) -> true),
+                new MutableCancelToken());
+
+        assertArrayEquals(bytes("upper"), body.bytes());
+    }
+
+    @Test
+    void crossHostRedirectGivesThePolicyTheOriginalHostAndTheNewTarget() throws Exception {
+        route("/cross", exchange -> redirect(exchange, "https://127.0.0.1:" + port() + "/target"));
+        route("/target", exchange -> respond(exchange, 200, bytes("elsewhere")));
+        List<ReleaseHost> hosts = new ArrayList<>();
+        List<URI> targets = new ArrayList<>();
+        ReleaseHost original = new ReleaseHost("sudoe", URI.create("https://localhost:" + port()));
+
+        FetchException failure = assertThrows(FetchException.class, () -> fetcher().fetch(
+                request("/cross", 1024, LONG, LONG, (host, from, to) -> {
+                    hosts.add(host);
+                    targets.add(to);
+                    return true;
+                }), new MutableCancelToken()));
+
+        assertEquals(1, hosts.size());
+        assertEquals(original, hosts.get(0));
+        assertEquals("127.0.0.1", targets.get(0).getHost());
+        // The fixture certificate names localhost only, so the hostname check refuses the hop.
+        assertEquals(FetchOutcome.TRANSPORT_ERROR, failure.outcome());
+    }
+
+    @Test
+    void throwingPolicyIsATransportError() throws Exception {
+        route("/throwing", exchange -> redirect(exchange, "/target"));
+        route("/target", exchange -> respond(exchange, 200, bytes("never")));
+
+        FetchException failure = assertThrows(FetchException.class, () -> fetcher().fetch(
+                request("/throwing", 1024, LONG, LONG, (host, from, to) -> {
+                    throw new IllegalStateException("policy bug");
+                }), new MutableCancelToken()));
+
+        assertEquals(FetchOutcome.TRANSPORT_ERROR, failure.outcome());
+    }
+
+    // ---- Content-Length shape ------------------------------------------------------------
+
+    @Test
+    void negativeContentLengthIsATransportError() throws Exception {
+        route("/neg", exchange -> {
+            exchange.getResponseHeaders().set("Content-Length", "-5");
+            exchange.sendResponseHeaders(200, 0);
+            exchange.getResponseBody().close();
+        });
+
+        FetchException failure = assertThrows(FetchException.class, () -> fetcher().fetch(
+                request("/neg", 1024, LONG, LONG, RedirectPolicy.denyAll()), new MutableCancelToken()));
+
+        assertEquals(FetchOutcome.TRANSPORT_ERROR, failure.outcome());
+    }
+
+    @Test
+    void malformedContentLengthIsATransportError() throws Exception {
+        route("/bad", exchange -> {
+            exchange.getResponseHeaders().set("Content-Length", "abc");
+            exchange.sendResponseHeaders(200, 0);
+            exchange.getResponseBody().close();
+        });
+
+        FetchException failure = assertThrows(FetchException.class, () -> fetcher().fetch(
+                request("/bad", 1024, LONG, LONG, RedirectPolicy.denyAll()), new MutableCancelToken()));
 
         assertEquals(FetchOutcome.TRANSPORT_ERROR, failure.outcome());
     }
