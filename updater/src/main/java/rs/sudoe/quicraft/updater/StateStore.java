@@ -4,11 +4,11 @@ package rs.sudoe.quicraft.updater;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
 import java.nio.channels.SeekableByteChannel;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -18,9 +18,12 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.nio.file.attribute.UserPrincipal;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -63,6 +66,15 @@ public final class StateStore {
 
     private final Path dir;
     private final Runnable afterRevokedWrite;
+    private final DirectoryForce directoryForce;
+    private static final ConcurrentHashMap<Path, Boolean> FSYNC_SUPPORT = new ConcurrentHashMap<>();
+    private static final int MAX_FILE_BYTES = RevokedCodec.MAX_BYTES + 1;
+    private static final long PROBE_STALE_SECONDS = 60;
+
+    /** Forces a directory channel to disk. The seam lets tests inject an fsync failure. */
+    interface DirectoryForce {
+        void force(FileChannel directory) throws IOException;
+    }
     private volatile List<String> lastWarnings = List.of();
 
     /** Opens the store for {@code updateDir}. Nothing is read or written until an operation runs. */
@@ -72,8 +84,35 @@ public final class StateStore {
 
     /** Test seam: {@code afterRevokedWrite} runs after revoked.json is replaced, before state.json. */
     StateStore(Path updateDir, Runnable afterRevokedWrite) {
+        this(updateDir, afterRevokedWrite, directory -> directory.force(true));
+    }
+
+    /** Test seam with an injectable directory fsync. */
+    StateStore(Path updateDir, Runnable afterRevokedWrite, DirectoryForce directoryForce) {
         this.dir = Objects.requireNonNull(updateDir, "updateDir").toAbsolutePath().normalize();
         this.afterRevokedWrite = Objects.requireNonNull(afterRevokedWrite, "afterRevokedWrite");
+        this.directoryForce = Objects.requireNonNull(directoryForce, "directoryForce");
+    }
+
+    /**
+     * Whether this platform can open and fsync the directory. Probed once per canonical directory
+     * and cached. Never throws: any failure means "not supported".
+     */
+    static boolean directoryFsyncSupported(Path dir) {
+        Path key;
+        try {
+            key = dir.toRealPath();
+        } catch (IOException e) {
+            return false;
+        }
+        return FSYNC_SUPPORT.computeIfAbsent(key, k -> {
+            try (FileChannel ch = FileChannel.open(k, StandardOpenOption.READ)) {
+                ch.force(true);
+                return true;
+            } catch (IOException e) {
+                return false;
+            }
+        });
     }
 
     /** Fixed-message warnings raised by the last operation on this store (never file content). */
@@ -105,9 +144,24 @@ public final class StateStore {
         Objects.requireNonNull(initial, "initial");
         return withLocks(warnings -> {
             if (!anyFileExists()) {
-                atomicWrite(REVOKED, RevokedCodec.encode(initial.newRevoked()), StateStore::validRevoked);
-                atomicWrite(STATE, StateCodec.encode(initial.newState()), StateStore::validState);
+                atomicWrite(REVOKED, RevokedCodec.encode(initial.newRevoked()),
+                        StateStore::validRevoked, warnings);
+                atomicWrite(STATE, StateCodec.encode(initial.newState()),
+                        StateStore::validState, warnings);
                 return new StateRecords.Snapshot(initial.newState(), initial.newRevoked());
+            }
+            if (!Files.exists(dir.resolve(STATE), LinkOption.NOFOLLOW_LINKS)
+                    && !Files.exists(dir.resolve(STATE + PREV), LinkOption.NOFOLLOW_LINKS)) {
+                // Interrupted first run: revoked.json was written, state.json never was. Only this
+                // case reseeds; a later deletion still goes through load() and stays unavailable.
+                Loaded<StateRecords.RevokedState> revoked =
+                        readFile(REVOKED, RevokedCodec::decode, new ArrayList<>());
+                if (revoked.value() != null) {
+                    warnings.add("state.json missing after interrupted initialisation; reseeded");
+                    atomicWrite(STATE, StateCodec.encode(initial.newState()),
+                            StateStore::validState, warnings);
+                    return new StateRecords.Snapshot(initial.newState(), revoked.value());
+                }
             }
             return readSnapshot(warnings).snapshot();
         });
@@ -160,11 +214,11 @@ public final class StateStore {
             boolean writeState = !current.stateMainValid()
                     || !next.state().equals(current.snapshot().state());
             if (writeRevoked) {
-                atomicWrite(REVOKED, revokedBytes, StateStore::validRevoked);
+                atomicWrite(REVOKED, revokedBytes, StateStore::validRevoked, warnings);
                 afterRevokedWrite.run();
             }
             if (writeState) {
-                atomicWrite(STATE, stateBytes, StateStore::validState);
+                atomicWrite(STATE, stateBytes, StateStore::validState, warnings);
             }
             return next;
         });
@@ -185,7 +239,7 @@ public final class StateStore {
                 throw new UpdateRejectedException("revoked.json invalid; refetch required");
             }
             byte[] bytes = StateCodec.encode(rebuilt);
-            atomicWrite(STATE, bytes, StateStore::validState);
+            atomicWrite(STATE, bytes, StateStore::validState, warnings);
             return new StateRecords.Snapshot(rebuilt, revoked.value());
         });
     }
@@ -238,6 +292,7 @@ public final class StateStore {
         }
         prepareDirectory(dir);
         ReentrantLock guard = GUARDS.computeIfAbsent(dir.toRealPath(), k -> new ReentrantLock());
+        // The in-process guard may wait for another thread in this JVM. Only the OS lock never waits.
         guard.lock();
         IN_STATE_LOCK.set(true);
         try {
@@ -263,7 +318,7 @@ public final class StateStore {
                 }
             }
         } finally {
-            IN_STATE_LOCK.set(false);
+            IN_STATE_LOCK.remove();
             guard.unlock();
         }
     }
@@ -308,6 +363,16 @@ public final class StateStore {
                 throw new UpdateRejectedException("state file is a symbolic link");
             }
         }
+        if (posixSupported()) {
+            requireTightPermissions(dir);
+            for (String name : managedNames()) {
+                Path p = dir.resolve(name);
+                if (Files.exists(p, LinkOption.NOFOLLOW_LINKS)) {
+                    requireTightPermissions(p);
+                }
+            }
+        }
+        sweepStaleProbes(dir);
         Path probe = Files.createTempFile(dir, ".owner-", ".probe", fileAttributes());
         try {
             UserPrincipal self = Files.getOwner(probe, LinkOption.NOFOLLOW_LINKS);
@@ -320,6 +385,36 @@ public final class StateStore {
             }
         } finally {
             Files.deleteIfExists(probe);
+        }
+    }
+
+    private static boolean posixSupported() {
+        return FileSystems.getDefault().supportedFileAttributeViews().contains("posix");
+    }
+
+    /** Refuses any group or other permission bit on a POSIX file system. */
+    private static void requireTightPermissions(Path p) throws IOException, UpdateRejectedException {
+        for (PosixFilePermission perm : Files.getPosixFilePermissions(p, LinkOption.NOFOLLOW_LINKS)) {
+            if (perm.name().startsWith("GROUP_") || perm.name().startsWith("OTHERS_")) {
+                throw new UpdateRejectedException("update directory permissions too open");
+            }
+        }
+    }
+
+    /**
+     * Deletes probe files left behind by a crashed process. Files younger than a minute are kept, so
+     * a concurrent process's probe is never removed underneath it.
+     */
+    private static void sweepStaleProbes(Path dir) throws IOException {
+        Instant cutoff = Instant.now().minusSeconds(PROBE_STALE_SECONDS);
+        try (DirectoryStream<Path> probes = Files.newDirectoryStream(dir, ".owner-*.probe")) {
+            for (Path probe : probes) {
+                if (Files.isRegularFile(probe, LinkOption.NOFOLLOW_LINKS)
+                        && Files.getLastModifiedTime(probe, LinkOption.NOFOLLOW_LINKS)
+                                .toInstant().isBefore(cutoff)) {
+                    Files.deleteIfExists(probe);
+                }
+            }
         }
     }
 
@@ -427,9 +522,13 @@ public final class StateStore {
         if (Files.isSymbolicLink(p)) {
             throw new IOException("state file is a symbolic link");
         }
-        try (SeekableByteChannel ch = Files.newByteChannel(p, LinkOption.NOFOLLOW_LINKS);
-                InputStream in = Channels.newInputStream(ch)) {
-            return in.readAllBytes();
+        try (SeekableByteChannel ch = Files.newByteChannel(p, LinkOption.NOFOLLOW_LINKS)) {
+            // One byte past the largest cap: a longer file is then rejected by the decoder.
+            ByteBuffer buf = ByteBuffer.allocate(MAX_FILE_BYTES);
+            while (buf.hasRemaining() && ch.read(buf) >= 0) {
+                // keep reading until the cap or end of file
+            }
+            return Arrays.copyOf(buf.array(), buf.position());
         } catch (NoSuchFileException e) {
             return null;
         }
@@ -448,8 +547,8 @@ public final class StateStore {
      * {@code name.prev} only when the current file is itself valid, move the temp over the target,
      * then fsync the directory.
      */
-    private void atomicWrite(String name, byte[] content, Predicate<byte[]> validCurrent)
-            throws IOException {
+    private void atomicWrite(String name, byte[] content, Predicate<byte[]> validCurrent,
+            List<String> warnings) throws IOException {
         Path target = dir.resolve(name);
         Path tmp = dir.resolve(name + TMP);
         writeSynced(tmp, content);
@@ -460,7 +559,7 @@ public final class StateStore {
             Files.move(prevTmp, dir.resolve(name + PREV), StandardCopyOption.ATOMIC_MOVE);
         }
         Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
-        syncDirectory();
+        syncDirectory(warnings);
     }
 
     private void writeSynced(Path path, byte[] content) throws IOException {
@@ -476,12 +575,21 @@ public final class StateStore {
         }
     }
 
-    private void syncDirectory() throws IOException {
-        try (FileChannel ch = FileChannel.open(dir, StandardOpenOption.READ)) {
-            ch.force(true);
+    /**
+     * Fsyncs the directory after a rename. Only a failure to OPEN the directory is tolerated (some
+     * platforms, such as Windows, cannot open one), and is recorded as a warning. A failing force()
+     * is rethrown, so the caller sees the write as failed.
+     */
+    private void syncDirectory(List<String> warnings) throws IOException {
+        FileChannel ch;
+        try {
+            ch = FileChannel.open(dir, StandardOpenOption.READ);
         } catch (IOException e) {
-            // Some platforms refuse to open or fsync a directory (Windows). The file itself was
-            // already forced, so a missing directory fsync only weakens the rename's durability.
+            warnings.add("directory fsync unsupported");
+            return;
+        }
+        try (FileChannel directory = ch) {
+            directoryForce.force(directory);
         }
     }
 }
