@@ -568,20 +568,41 @@ class HmacRetryTokenHandlerTest {
 
     @Test
     void longWrapRemainsValidForShortElapsed() {
-        long ts = Long.MAX_VALUE - 100L;
-        HmacRetryTokenHandler h = handler(TEST_KEY, () -> ts, () -> true);
+        long issueTs = Long.MAX_VALUE - 100L;
+        HmacRetryTokenHandler writeH = handler(TEST_KEY, () -> issueTs, () -> true);
         byte[] dcid = new byte[]{1};
         InetSocketAddress addr = ipv4(1, 1, 1, 1);
 
         ByteBuf out = owned(Unpooled.buffer());
-        h.writeToken(out, owned(Unpooled.wrappedBuffer(dcid)), addr);
+        writeH.writeToken(out, owned(Unpooled.wrappedBuffer(dcid)), addr);
         byte[] tokenBytes = new byte[out.readableBytes()];
         out.getBytes(out.readerIndex(), tokenBytes);
         out.release();
 
-        // Clock advanced a small amount — wrap subtraction yields small positive age
+        // Same key, clock wrapped past Long.MAX_VALUE: wrapped elapsed is 201 ns and stays valid.
+        HmacRetryTokenHandler wrappedH = handler(TEST_KEY, () -> Long.MIN_VALUE + 100L, () -> true);
         ByteBuf tokenBuf = owned(Unpooled.wrappedBuffer(tokenBytes));
-        assertEquals(PREFIX_LENGTH, h.validateToken(tokenBuf, ipv4(1, 1, 1, 1)));
+        assertEquals(PREFIX_LENGTH, wrappedH.validateToken(tokenBuf, addr));
+        tokenBuf.release();
+    }
+
+    @Test
+    void longWrapExactTtlIsInvalid() {
+        long issueTs = Long.MAX_VALUE - 100L;
+        HmacRetryTokenHandler writeH = handler(TEST_KEY, () -> issueTs, () -> true);
+        byte[] dcid = new byte[]{1};
+        InetSocketAddress addr = ipv4(1, 1, 1, 1);
+
+        ByteBuf out = owned(Unpooled.buffer());
+        writeH.writeToken(out, owned(Unpooled.wrappedBuffer(dcid)), addr);
+        byte[] tokenBytes = new byte[out.readableBytes()];
+        out.getBytes(out.readerIndex(), tokenBytes);
+        out.release();
+
+        // Same key, clock wrapped exactly one TTL after issue: wrapped age == TTL must be rejected.
+        HmacRetryTokenHandler expiredH = handler(TEST_KEY, () -> issueTs + 30_000_000_000L, () -> true);
+        ByteBuf tokenBuf = owned(Unpooled.wrappedBuffer(tokenBytes));
+        assertEquals(-1, expiredH.validateToken(tokenBuf, addr));
         tokenBuf.release();
     }
 
@@ -783,35 +804,176 @@ class HmacRetryTokenHandlerTest {
     // ── 15. Nonzero reader/writer indices, sliced and little-endian views ──
 
     @Test
-    void nonzeroReaderAndWriterIndicesPreserved() {
-        long ts = 600L;
+    void writeTokenAppendsAtNonzeroWriterIndexAndPreservesInputs() throws Exception {
+        long ts = 4_242_424_242L;
         HmacRetryTokenHandler h = handler(TEST_KEY, () -> ts, () -> true);
-        byte[] dcid = new byte[]{(byte) 0xAB};
-        InetSocketAddress addr = ipv4(10, 20, 30, 40);
+        InetSocketAddress addr = ipv4(198, 51, 100, 9);
+
+        // DCID payload sits at a nonzero readerIndex inside a head/tail holder.
+        byte[] dcidPayload = new byte[]{0x11, 0x22, 0x33};
+        ByteBuf dcidHolder = owned(Unpooled.buffer(dcidPayload.length + 4));
+        dcidHolder.writeByte(0xAA);
+        dcidHolder.writeBytes(dcidPayload);
+        dcidHolder.writeByte(0xBB);
+        dcidHolder.setIndex(1, 1 + dcidPayload.length);
+        int dcidReaderBefore = dcidHolder.readerIndex();
+        int dcidWriterBefore = dcidHolder.writerIndex();
+        int dcidRefBefore = dcidHolder.refCnt();
+
+        // Output is prefilled and both indices are nonzero before the append.
+        ByteBuf out = owned(Unpooled.buffer(64));
+        out.writeBytes(new byte[]{0x01, 0x02, 0x03, 0x04, 0x05, 0x06});
+        out.setIndex(2, 6);
+        int outReaderBefore = out.readerIndex();
+        int outWriterBefore = out.writerIndex();
+        int outRefBefore = out.refCnt();
+
+        assertTrue(h.writeToken(out, dcidHolder, addr));
+
+        // Only the writer advanced, by exactly one token length.
+        assertEquals(outReaderBefore, out.readerIndex(), "writeToken must not move output readerIndex");
+        assertEquals(outWriterBefore + PREFIX_LENGTH + dcidPayload.length, out.writerIndex(),
+                "writeToken must advance output writerIndex by the exact token length");
+        assertEquals(outRefBefore, out.refCnt(), "writeToken must not change output refCnt");
+
+        byte[] after = new byte[out.writerIndex()];
+        out.getBytes(0, after);
+        assertArrayEquals(new byte[]{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}, Arrays.copyOf(after, 6),
+                "prefilled output bytes must be preserved");
+        byte[] appended = Arrays.copyOfRange(after, outWriterBefore, after.length);
+        assertEquals(PREFIX_LENGTH + dcidPayload.length, appended.length);
+        assertEquals(VERSION, appended[0]);
+        assertArrayEquals(encodeBigEndian(ts), Arrays.copyOfRange(appended, 1, 9));
+        assertArrayEquals(dcidPayload, Arrays.copyOfRange(appended, PREFIX_LENGTH, appended.length),
+                "appended DCID must be the payload read at the DCID readerIndex");
+        byte[] expectedTag = computeTag(TEST_KEY, addr.getAddress().getAddress(), addr.getPort(),
+                Arrays.copyOfRange(appended, 1, 9), dcidPayload);
+        assertArrayEquals(expectedTag, Arrays.copyOfRange(appended, 9, PREFIX_LENGTH),
+                "appended HMAC must match the independent oracle over the DCID payload");
+
+        // Inputs untouched.
+        assertEquals(dcidReaderBefore, dcidHolder.readerIndex(), "writeToken must not move DCID readerIndex");
+        assertEquals(dcidWriterBefore, dcidHolder.writerIndex(), "writeToken must not move DCID writerIndex");
+        assertEquals(dcidRefBefore, dcidHolder.refCnt(), "writeToken must not retain or release the input DCID");
+    }
+
+    @Test
+    void validateTokenReadsAtNonzeroReaderIndexWithoutMutation() {
+        long ts = 5_555_555_555L;
+        HmacRetryTokenHandler writeH = handler(TEST_KEY, () -> ts, () -> true);
+        // Validation must authenticate regardless of the Retry policy, so validate with policy off.
+        HmacRetryTokenHandler validateH = handler(TEST_KEY, () -> ts, () -> false);
+        byte[] dcid = new byte[]{0x0D, 0x0E};
+        InetSocketAddress addr = ipv4(198, 51, 100, 10);
 
         ByteBuf out = owned(Unpooled.buffer());
-        int readerBeforeWrite = out.readerIndex();
-        int writerBeforeWrite = out.writerIndex();
-
-        h.writeToken(out, owned(Unpooled.wrappedBuffer(dcid)), addr);
-
-        // writeToken should not change reader index; writer advances by token size
-        assertEquals(readerBeforeWrite, out.readerIndex(), "writeToken must not advance reader index");
-        assertEquals(writerBeforeWrite + PREFIX_LENGTH + dcid.length, out.writerIndex(),
-                "writeToken must advance writer by exact token size");
-
-        // Now validate with a fresh buffer
+        assertTrue(writeH.writeToken(out, owned(Unpooled.wrappedBuffer(dcid)), addr));
         byte[] tokenBytes = new byte[out.readableBytes()];
         out.getBytes(out.readerIndex(), tokenBytes);
-        out.release();
 
-        ByteBuf tokenBuf = owned(Unpooled.wrappedBuffer(tokenBytes));
-        int readerBeforeValidate = tokenBuf.readerIndex();
+        // Token sits at a nonzero readerIndex inside a head/tail holder.
+        ByteBuf holder = owned(Unpooled.buffer(tokenBytes.length + 4));
+        holder.writeByte(0xCC);
+        holder.writeBytes(tokenBytes);
+        holder.writeByte(0xDD);
+        holder.setIndex(1, 1 + tokenBytes.length);
 
-        assertEquals(PREFIX_LENGTH, h.validateToken(tokenBuf, addr));
-        assertEquals(readerBeforeValidate, tokenBuf.readerIndex(),
-                "validateToken must not advance reader index");
-        tokenBuf.release();
+        int readerBefore = holder.readerIndex();
+        int writerBefore = holder.writerIndex();
+        int refBefore = holder.refCnt();
+        byte[] bytesBefore = new byte[holder.writerIndex()];
+        holder.getBytes(0, bytesBefore);
+
+        assertEquals(PREFIX_LENGTH, validateH.validateToken(holder, addr));
+        assertEquals(readerBefore, holder.readerIndex(), "valid validation must not move readerIndex");
+        assertEquals(writerBefore, holder.writerIndex(), "valid validation must not move writerIndex");
+        assertEquals(refBefore, holder.refCnt(), "valid validation must not change refCnt");
+        byte[] bytesAfterValid = new byte[holder.writerIndex()];
+        holder.getBytes(0, bytesAfterValid);
+        assertArrayEquals(bytesBefore, bytesAfterValid, "valid validation must not modify token bytes");
+
+        // Tamper one tag byte inside the holder and validate again.
+        int tagIndex = holder.readerIndex() + 9;
+        holder.setByte(tagIndex, holder.getByte(tagIndex) ^ 0xFF);
+        int readerBefore2 = holder.readerIndex();
+        int writerBefore2 = holder.writerIndex();
+        int refBefore2 = holder.refCnt();
+
+        assertEquals(-1, validateH.validateToken(holder, addr));
+        assertEquals(readerBefore2, holder.readerIndex(), "rejected validation must not move readerIndex");
+        assertEquals(writerBefore2, holder.writerIndex(), "rejected validation must not move writerIndex");
+        assertEquals(refBefore2, holder.refCnt(), "rejected validation must not change refCnt");
+    }
+
+    @Test
+    void policyDisabledWritePreservesIndicesBytesAndRefCnts() {
+        HmacRetryTokenHandler h = handler(TEST_KEY, () -> 777L, () -> false);
+        InetSocketAddress addr = ipv4(198, 51, 100, 11);
+
+        byte[] dcidPayload = new byte[]{0x51, 0x52};
+        ByteBuf dcidHolder = owned(Unpooled.buffer(dcidPayload.length + 4));
+        dcidHolder.writeByte(0x01);
+        dcidHolder.writeBytes(dcidPayload);
+        dcidHolder.writeByte(0x02);
+        dcidHolder.setIndex(1, 1 + dcidPayload.length);
+        int dcidReader = dcidHolder.readerIndex();
+        int dcidWriter = dcidHolder.writerIndex();
+        int dcidRef = dcidHolder.refCnt();
+
+        ByteBuf out = owned(Unpooled.buffer(32));
+        out.writeBytes(new byte[]{0x10, 0x20, 0x30, 0x40});
+        out.setIndex(1, 4);
+        byte[] outBytesBefore = new byte[out.writerIndex()];
+        out.getBytes(0, outBytesBefore);
+        int outReader = out.readerIndex();
+        int outWriter = out.writerIndex();
+        int outRef = out.refCnt();
+
+        assertFalse(h.writeToken(out, dcidHolder, addr));
+
+        assertEquals(outReader, out.readerIndex(), "policy-off write must not move output readerIndex");
+        assertEquals(outWriter, out.writerIndex(), "policy-off write must not move output writerIndex");
+        assertEquals(outRef, out.refCnt(), "policy-off write must not change output refCnt");
+        assertEquals(dcidReader, dcidHolder.readerIndex(), "policy-off write must not move DCID readerIndex");
+        assertEquals(dcidWriter, dcidHolder.writerIndex(), "policy-off write must not move DCID writerIndex");
+        assertEquals(dcidRef, dcidHolder.refCnt(), "policy-off write must not change DCID refCnt");
+        byte[] outBytesAfter = new byte[out.writerIndex()];
+        out.getBytes(0, outBytesAfter);
+        assertArrayEquals(outBytesBefore, outBytesAfter, "policy-off write must not modify output bytes");
+    }
+
+    @Test
+    void rejectedWritePreservesIndicesBytesAndRefCnts() {
+        HmacRetryTokenHandler h = handler(TEST_KEY, () -> 888L, () -> true);
+        InetSocketAddress addr = ipv4(198, 51, 100, 12);
+
+        ByteBuf dcidTooLong = owned(Unpooled.buffer(24));
+        dcidTooLong.writeBytes(new byte[22]);
+        dcidTooLong.setIndex(1, 22); // 21 readable bytes, one over the 20-byte maximum
+        int dcidReader = dcidTooLong.readerIndex();
+        int dcidWriter = dcidTooLong.writerIndex();
+        int dcidRef = dcidTooLong.refCnt();
+
+        ByteBuf out = owned(Unpooled.buffer(32));
+        out.writeBytes(new byte[]{0x0A, 0x0B, 0x0C});
+        out.setIndex(1, 3);
+        byte[] outBytesBefore = new byte[out.writerIndex()];
+        out.getBytes(0, outBytesBefore);
+        int outReader = out.readerIndex();
+        int outWriter = out.writerIndex();
+        int outRef = out.refCnt();
+
+        assertThrows(IllegalArgumentException.class, () -> h.writeToken(out, dcidTooLong, addr));
+
+        assertEquals(outReader, out.readerIndex(), "rejected write must not move output readerIndex");
+        assertEquals(outWriter, out.writerIndex(), "rejected write must not move output writerIndex");
+        assertEquals(outRef, out.refCnt(), "rejected write must not change output refCnt");
+        assertEquals(dcidReader, dcidTooLong.readerIndex(), "rejected write must not move DCID readerIndex");
+        assertEquals(dcidWriter, dcidTooLong.writerIndex(), "rejected write must not move DCID writerIndex");
+        assertEquals(dcidRef, dcidTooLong.refCnt(), "rejected write must not change DCID refCnt");
+        byte[] outBytesAfter = new byte[out.writerIndex()];
+        out.getBytes(0, outBytesAfter);
+        assertArrayEquals(outBytesBefore, outBytesAfter, "rejected write must not modify output bytes");
     }
 
     @Test
