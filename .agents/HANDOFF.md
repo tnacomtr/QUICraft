@@ -1,23 +1,53 @@
-# Claude Code handoff: Phase 4
+# Handoff: Phase 4 (2026-10-13)
 
-GOAL: Continue Phase 4 public-alpha preparation on `feat/phase4-alpha`. This is a handoff, not approval to release.
+Branch `feat/phase4-alpha` @ 0ae5fe6, local only. `main` = 22b4e80 on both remotes. Nothing pushed.
+Read first: `CLAUDE.md`, `.agents/plans/2026-10-13-phase4-alpha.md` ("Wave 2"), `.agents/memory/decisions.md`.
 
-READ FIRST: `CLAUDE.md`, this file, `.agents/plans/2026-10-13-phase4-alpha.md` (Progress, "Wave 2"), `.agents/memory/decisions.md`.
+## Done (verified)
+- **Listener protections merged.**
+  - `IngressGuard`: drops Initials under 1200 bytes and enforces the Initial budget.
+  - `AdmissionTokenHandler`: HMAC Retry, separate token-less and validated budgets, per-IP checks first, IPv6 per /64.
+  - Open-connection leases with a 10 s handshake deadline.
+  - Settings `quicraft.admission.*` (protocol.md §9, docs/server-security.md §3).
+  - Gates: verifier PASS, Sol approve, Opus security clean.
+- **Full clean build:** 77 tasks, 0 failures. Tests: core 196, shadedTest 4, testUpstreamNative 19, velocity 16, bridges 23+23, build-logic 5.
+- **Platform gates on the new code:**
+  - Fabric gametests (26.x and 1.21.11) PASS: QUIC, 0-RTT, fallback, fault injection with a TCP join.
+  - `run-real-client.sh` PASS: real client over QUIC, 0-RTT rejoin, earlyReleases 0→1. Run it as `MOCKSESSION_PORT=18080 xvfb-run -a testkit/run-real-client.sh` (searxng holds 8080).
+- **Updater spec:** `docs/updater.md` §12 is a **proposal**, reviewed over 4 security + peer rounds. The live-swap evidence is in the plan.
 
-## STATE (2026-10-13, end of wave 2)
-- Full root build `./gradlew build --rerun-tasks --no-build-cache` on 8df6c07+: BUILD SUCCESSFUL, 77 tasks; tests core 196, shadedTest 4, testUpstreamNative 19, velocity 16, bridge-netty41 23, bridge-netty42 23, build-logic 5, 0 failures.
-- Listener protections are WIRED and merged (945ed86, 8df6c07): `IngressGuard` before the QUIC codec in both binds, `AdmissionTokenHandler` (HMAC Retry, token-less and validated attempt budgets, per-IP first, IPv6 per /64), open-connection leases with a 10 s handshake deadline. Settings: `quicraft.admission.*` (docs/server-security.md section 3, protocol.md §9). Verifier PASS, Sol approve, Opus security review clean for every round.
-- Owner docs updated (e24cddc). docs/release.md ticks the Retry-handler and limits items; the UDP/DDoS docs review item is still open.
-- Updater: `docs/updater.md` §12 is a reviewed PROPOSAL (feef4c2), with security and peer review done over 4 rounds. Implementation stays BLOCKED until the user decides the §12 USER DECISION items and signs off the live-swap semantics (restart-required; Velocity reads no own-jar resources after a swap). Don't silently replace the requested atomic live swap.
-- Nothing is pushed. `feat/phase4-alpha` is local only; main = 22b4e80 on both remotes.
-- Quarantined, do not merge or delete: `agent/phase4-retry-tests` (6cdf7a8, `.worktrees/phase4-retry-tests`).
-- Never stage `.claude/`, root `AGENTS.md`, `docs/.plans/`, `agent_skills/`, `agent_config.yaml`.
+## Blocked on the user (ask, don't decide)
+1. **Seven updater decisions in §12.** Recommendations in brackets:
+   - Manifest expiry/re-sign [30 d / 14 d].
+   - Revocation lifetime [365 d; the backup key signs yearly].
+   - Staging quorum [2 of 3 hosts].
+   - `reset-state` command [add, console only].
+   - Update dir on another filesystem [fail with manual instructions].
+   - Backup-key co-signature on jars that change the key set [yes; needs a format change].
+   - `rollback` command [undecided; manual restore is the baseline].
+2. **Live-swap semantics.** The atomic rename is safe, but the new version only runs after a restart, and on Velocity the plugin must read no own-jar resources after the swap. The user asked for an "atomic live swap": get sign-off and don't silently downgrade it.
+3. **Initial cwnd default.** Make 64 packets the default (protocol.md §9), keeping `-Dquicraft.initialCwndPackets` as the override. Recommended: yes.
 
-## NEXT
-1. Present the updater decisions and the live-swap implication to the user; record the answers in `.agents/memory/decisions.md`.
-2. DONE 2026-10-13 with the new listener code: `:fabric-26x:runClientGameTest` and `:fabric-1.21.11:runClientGameTest` PASS (QUIC join, 0-RTT, fallback, fault injection with TCP join), `:velocity:test` 16/16, `testkit/run-real-client.sh` (MOCKSESSION_PORT=18080, since searxng holds 8080) PASS: real 26.1.2 client over QUIC, rejoin over 0-RTT, earlyReleases 0 -> 1. Logs in `.agents/opencode-runs/gates-*`.
-3. Release checklist (docs/release.md), the UDP/DDoS docs review item, Phase 3 prerequisites.
-4. Updater implementation only after step 1 and its remaining blockers (signing tool, endpoint/redirect policy, Windows helper, loader tests on JDK 21 and macOS).
-5. Still waiting on the user: default initial cwnd of 64 packets (protocol.md §9).
+## Next (after the answers)
+- Implement the updater (Velocity and Fabric dedicated servers). Its remaining blockers:
+  - signing tool (key-set fingerprint bytes, seq-floor checks)
+  - URL/redirect policy
+  - Windows post-exit helper
+  - loader tests on JDK 21 and macOS
+- Release checklist (`docs/release.md`): the UDP/DDoS owner-docs review is still unticked. Phase 3 prerequisites.
+- No alpha-complete claim until all of the above is done. Releases, pushes and Modrinth uploads each need the user's go-ahead. Never open PRs.
 
-CONSTRAINTS: No alpha-complete claim until listener protections (done), platform/fault-injection gates, Phase 3 prerequisites, release checks and updater release blockers are all satisfied. Do not push, publish, deploy, create keys, or open PRs.
+## Housekeeping
+- **Quarantined, don't merge or delete:** `agent/phase4-retry-tests` (`.worktrees/phase4-retry-tests`).
+- **Old worktrees, retained until the user OKs cleanup:** phase4-admission, -admission-tests, -retry-reviewed, -retry-token, -spdx-tests, -updater-docs. Their work is merged.
+- **Never stage:** `.claude/`, `AGENTS.md`, `docs/.plans/`, `agent_skills/`, `agent_config.yaml`.
+- **Agents:**
+  - Briefs start with `.agents/plans/contract-L0.txt`.
+  - Advisor: Astra via opencode, never the built-in advisor().
+  - At most 6 parallel units.
+  - `opencode run` has no `--dir`; `cd` into the worktree first.
+- **Older open items:**
+  - Forgejo CI (runner labels, Docker/DinD, ARM64, actions mirror)
+  - online-mode real-client run
+  - the netty-quic-natives workflow has never run
+  - the relay's `--work` mode hangs
