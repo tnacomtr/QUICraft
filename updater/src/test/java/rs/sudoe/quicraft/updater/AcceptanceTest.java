@@ -220,11 +220,41 @@ class AcceptanceTest {
     }
 
     @Test
-    void verifiedPairClearsTornSince() throws Exception {
+    void verifiedRevocationsAloneDoNotClearTornSince() throws Exception {
         UpdaterState torn = state(SEED, Map.of(), List.of(), Map.of("modrinth", NOW.minusSeconds(3600)));
         Snapshot snap = new Snapshot(torn, RevokedState.empty());
         RevocationAcceptance r = revs(hosts(ok(MOD, revocations(), K2)), ALL, snap, NOW);
-        assertFalse(r.delta().newState().tornSince().containsKey("modrinth"));
+        assertEquals(NOW.minusSeconds(3600), r.delta().newState().tornSince().get("modrinth"),
+                "a torn manifest pair must keep its host torn even when the revocations verify");
+    }
+
+    @Test
+    void torn_manifestAcrossRunsWarnsThenBothVerifiedClears() throws Exception {
+        byte[] rev = revocations();
+        byte[] man = release(42, standardEntry(A512), "");
+        Snapshot persisted = after(revs(hosts(ok(MOD, rev, K2), ok(GH, rev, K2), ok(SU, rev, K2)),
+                ALL, seedSnapshot(), NOW).delta());
+
+        ManifestAcceptance run1 = mans(hosts(ok(MOD, rev, K2)), hosts(torn(MOD, man, K1)), ALL,
+                persisted, identity(), CheckMode.REPORT, NOW);
+        assertEquals(NOW, run1.delta().newState().tornSince().get("modrinth"));
+        Snapshot afterRun1 = after(run1.delta());
+
+        Instant later = NOW.plusSeconds(25 * 3600);
+        RevocationAcceptance revLater = revs(hosts(ok(MOD, rev, K2)), ALL, afterRun1, later);
+        assertEquals(NOW, revLater.delta().newState().tornSince().get("modrinth"),
+                "a verified revocations pair must not clear a manifest-torn host");
+        ManifestAcceptance run2 = mans(hosts(ok(MOD, rev, K2)), hosts(torn(MOD, man, K1)), ALL,
+                after(revLater.delta()), identity(), CheckMode.REPORT, later);
+        assertTrue(run2.diagnostics().contains("modrinth: torn for more than 24 h"),
+                run2.diagnostics().toString());
+        assertEquals(NOW, run2.delta().newState().tornSince().get("modrinth"), "first torn time is kept");
+
+        Instant clean = NOW.plusSeconds(26 * 3600);
+        ManifestAcceptance run3 = mans(hosts(ok(MOD, rev, K2)), hosts(ok(MOD, man, K1)), ALL,
+                after(run2.delta()), identity(), CheckMode.REPORT, clean);
+        assertFalse(run3.delta().newState().tornSince().containsKey("modrinth"),
+                "both pairs verified in this run must clear the host");
     }
 
     @Test
