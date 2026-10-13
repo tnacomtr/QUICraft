@@ -93,6 +93,7 @@ public final class ArtifactVerifier {
             trustBytes = readCapped(zip, TRUST_ENTRY, TRUST_MAX_BYTES);
             buildBytes = readCapped(zip, BUILD_ENTRY, BUILD_MAX_BYTES);
         }
+        requireUnchanged(stagedJar, before);
 
         UpdateDocuments.Trust trust = DocumentParser.parseTrust(trustBytes);
         BuildInfo build = DocumentParser.parseBuild(buildBytes);
@@ -178,11 +179,16 @@ public final class ArtifactVerifier {
         return attributes;
     }
 
-    /** Re-reads the path without following links and requires it to still name the same file. */
-    private static void requireUnchanged(Path path, BasicFileAttributes before)
+    /**
+     * Re-reads the path without following links and requires it to still name the same file with the
+     * same size and modification time. Package-private so the mtime check can be tested directly.
+     */
+    static void requireUnchanged(Path path, BasicFileAttributes before)
             throws IOException, UpdateRejectedException {
         BasicFileAttributes now = regularFileAttributes(path);
-        if (!Objects.equals(before.fileKey(), now.fileKey()) || before.size() != now.size()) {
+        if (!Objects.equals(before.fileKey(), now.fileKey())
+                || before.size() != now.size()
+                || !Objects.equals(before.lastModifiedTime(), now.lastModifiedTime())) {
             throw reject("artifact changed during verification");
         }
     }

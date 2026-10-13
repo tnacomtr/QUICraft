@@ -188,6 +188,32 @@ class ArtifactVerifierTest {
         assertRejected(() -> verify(staged, c, RUNNING, ON_DISK));
     }
 
+    // ---- file identity between hashing and ZIP reads ----
+
+    @Test
+    void sameSizeRewriteWithNewModificationTimeIsRejected() throws Exception {
+        byte[] jar = standardJar(trustJson(1, standardKeys()), buildJson(PLATFORM, VERSION));
+        Path staged = stage("toctou.jar", jar);
+        java.nio.file.attribute.BasicFileAttributes before = Files.readAttributes(
+                staged, java.nio.file.attribute.BasicFileAttributes.class);
+        // Same inode and same size; only the modification time moves.
+        Files.write(staged, jar);
+        Files.setLastModifiedTime(staged,
+                java.nio.file.attribute.FileTime.from(before.lastModifiedTime().toInstant().plusSeconds(3600)));
+        UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
+                () -> ArtifactVerifier.requireUnchanged(staged, before));
+        assertEquals("artifact changed during verification", e.getMessage());
+    }
+
+    @Test
+    void unchangedFileIsAcceptedByRequireUnchanged() throws Exception {
+        byte[] jar = standardJar(trustJson(1, standardKeys()), buildJson(PLATFORM, VERSION));
+        Path staged = stage("stable.jar", jar);
+        java.nio.file.attribute.BasicFileAttributes before = Files.readAttributes(
+                staged, java.nio.file.attribute.BasicFileAttributes.class);
+        assertDoesNotThrow(() -> ArtifactVerifier.requireUnchanged(staged, before));
+    }
+
     // ---- key-set change authorization (docs/updater.md 12.2, key-set change rule) ----
 
     @Test
