@@ -340,11 +340,17 @@ flow control and stream counts, meaning nothing could be sent.
 
 Retry and limits. Each listener limits connection attempts (per second, overall and per IP) and
 open connections (overall and per IP), and drops floods of Initial packets before the QUIC codec.
-An attempt over any of these limits gets at most a Retry, which is smaller than the client's
-Initial, and then silence, so the client falls back to TCP after its head start (§5). A join that
-goes through Retry may spend up to 3 attempts: one for each token-less Initial datagram of the
-client's first flight (often two), plus one when the token comes back. A Retry also discards 0-RTT
-data sent before it, so such a rejoin completes as a 1-RTT join.
+"Per IP" means per IPv4 address or per IPv6 /64. A datagram carrying an Initial that is shorter
+than 1200 bytes (RFC 9000 §14.1) is dropped unanswered, so a Retry (at most 124 bytes with
+QUICraft's tokens) only ever answers a datagram of at least 1200 bytes. An attempt over any limit gets at most a Retry
+and then silence, so the client falls back to TCP after its head start (§5). Attempts that bring
+back a valid Retry token have a budget of their own, which a flood of token-less Initials can't
+use up. Retry is also sent while a quarter of the open-connection limit is still in its
+handshake, and a connection whose handshake hasn't completed 10 s after it was created is closed
+(transport error NO_ERROR); a real client that slow falls back to TCP. A join that goes through
+Retry may spend up to 3 attempts: one for each token-less Initial datagram of the client's first
+flight (often two), plus one when the token comes back. A Retry also discards 0-RTT data sent
+before it, so such a rejoin completes as a 1-RTT join.
 
 Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
 
