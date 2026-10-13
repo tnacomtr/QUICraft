@@ -5,3 +5,7 @@
 plugins {
     id("quicraft.spdx")
 }
+
+tasks.named("check") {
+    dependsOn(gradle.includedBuild("build-logic").task(":test"))
+}
