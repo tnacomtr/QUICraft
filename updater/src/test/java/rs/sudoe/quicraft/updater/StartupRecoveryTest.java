@@ -12,11 +12,13 @@ import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.FileSystems;
+import java.nio.file.InvalidPathException;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.time.Instant;
@@ -201,6 +203,10 @@ class StartupRecoveryTest {
 
     private Path backup(String txid) {
         return updateDir.resolve("backup").resolve(txid + ".jar");
+    }
+
+    private static String sha512Of(String text) throws Exception {
+        return Hex.encode(MessageDigest.getInstance("SHA-512").digest(text.getBytes(StandardCharsets.UTF_8)));
     }
 
     private Path journalPath() {
@@ -411,6 +417,93 @@ class StartupRecoveryTest {
         assertMessageContains(result, "restored by hand");
     }
 
+    // ---- manual-restore message: offered only when the backup matches the journal ----
+
+    @Test
+    void recoveryRequiredOffersRestoreWhenBackupMatchesJournal() throws Exception {
+        String oldReal = sha512Of("old");
+        put(staging(TXID, ".jar"), "staged");
+        put(backup(TXID), "old");
+        writeJournal(journal(TXID, JournalPhase.RECOVERY_REQUIRED, liveJar.toString(), oldReal, V2, NEW, 0));
+        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+
+        RecoveryResult result = StartupRecovery.run(ctx(V1));
+
+        assertEquals(RecoveryStatus.RECOVERY_REQUIRED, result.status());
+        assertAllKept(TXID);
+        assertMessageContains(result, "copy " + backup(TXID));
+        assertMessageContains(result, "Expected backup SHA-512: " + oldReal);
+        assertFalse(result.messages().stream().anyMatch(m -> m.contains(StartupRecovery.MSG_BACKUP_MISMATCH)));
+    }
+
+    @Test
+    void recoveryRequiredRefusesRestoreWhenBackupDiffersFromJournal() throws Exception {
+        String oldReal = sha512Of("old");
+        put(staging(TXID, ".jar"), "staged");
+        put(backup(TXID), "xyz"); // same size as the journaled live jar, different bytes
+        writeJournal(journal(TXID, JournalPhase.RECOVERY_REQUIRED, liveJar.toString(), oldReal, V2, NEW, 0));
+        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+
+        RecoveryResult result = StartupRecovery.run(ctx(V1));
+
+        assertEquals(RecoveryStatus.RECOVERY_REQUIRED, result.status());
+        assertAllKept(TXID);
+        assertMessageContains(result, StartupRecovery.MSG_BACKUP_MISMATCH);
+        assertMessageContains(result, "Expected backup SHA-512: " + oldReal);
+        assertFalse(result.messages().stream().anyMatch(m -> m.contains("copy ")));
+    }
+
+    @Test
+    void recoveryRequiredRefusesRestoreWhenBackupIsMissing() throws Exception {
+        String oldReal = sha512Of("old");
+        put(staging(TXID, ".jar"), "staged");
+        writeJournal(journal(TXID, JournalPhase.RECOVERY_REQUIRED, liveJar.toString(), oldReal, V2, NEW, 0));
+        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+
+        RecoveryResult result = StartupRecovery.run(ctx(V1));
+
+        assertEquals(RecoveryStatus.RECOVERY_REQUIRED, result.status());
+        assertTrue(Files.exists(staging(TXID, ".jar")));
+        assertTrue(Files.exists(journalPath()));
+        assertFalse(Files.exists(backup(TXID)));
+        assertMessageContains(result, StartupRecovery.MSG_BACKUP_MISMATCH);
+        assertFalse(result.messages().stream().anyMatch(m -> m.contains("copy ")));
+    }
+
+    // ---- unexpected staging names: printable and capped ----
+
+    @Test
+    void unexpectedStagingNameWithControlCharactersIsSanitized() throws Exception {
+        try {
+            put(updateDir.resolve("staging").resolve("evil\nline\rend\u0001.txt"), "x");
+        } catch (IOException | InvalidPathException e) {
+            assumeTrue(false, "filesystem refuses control characters in file names");
+        }
+
+        RecoveryResult result = StartupRecovery.run(ctx(V1));
+
+        assertTrue(result.messages().contains(StartupRecovery.MSG_UNEXPECTED_STAGING + "evil?line?end?.txt"),
+                () -> "messages " + result.messages());
+        assertTrue(result.messages().stream().noneMatch(m -> m.contains("\n") || m.contains("\r")));
+    }
+
+    @Test
+    void unexpectedStagingNameIsCappedAtSixtyFourCharacters() throws Exception {
+        put(updateDir.resolve("staging").resolve("x".repeat(100) + ".bin"), "x");
+
+        RecoveryResult result = StartupRecovery.run(ctx(V1));
+
+        assertTrue(result.messages().contains(StartupRecovery.MSG_UNEXPECTED_STAGING + "x".repeat(64)),
+                () -> "messages " + result.messages());
+    }
+
+    @Test
+    void printableNameReplacesEveryNonPrintableCharacter() {
+        assertEquals("a?b?c?d", StartupRecovery.printableName("a\nb\rc\u007fd"));
+        assertEquals("~ !", StartupRecovery.printableName("~ !"));
+        assertEquals(StartupRecovery.MAX_LOGGED_NAME_CHARS, StartupRecovery.printableName("q".repeat(300)).length());
+    }
+
     // ---- step 5: prepared ---------------------------------------------------------------------
 
     @Test
@@ -550,8 +643,12 @@ class StartupRecoveryTest {
 
     @Test
     void journalAlreadyRecoveryRequiredKeepsEverythingWithManualSteps() throws Exception {
-        // Live is the new jar, so the manual-restore check (step 4) does not apply.
-        setUpTransaction(journal(JournalPhase.RECOVERY_REQUIRED, V2, NEW, 0));
+        // Live is the new jar, so the manual-restore check (step 4) does not apply. The backup holds
+        // "old", so the journal records its real SHA-512; the restore is only offered when it matches.
+        String oldReal = sha512Of("old");
+        put(staging(TXID, ".jar"), "staged");
+        put(backup(TXID), "old");
+        writeJournal(journal(TXID, JournalPhase.RECOVERY_REQUIRED, liveJar.toString(), oldReal, V2, NEW, 0));
         discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
         byte[] before = journalBytes();
 
