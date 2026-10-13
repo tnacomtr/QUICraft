@@ -97,6 +97,9 @@ public final class DocumentParser {
             Map<String, Object> key = objectValue(rawKey);
             requireExactKeys(key, "kid", "pub", "roles");
             String pub = hexValue(key.get("pub"), PUBLIC_KEY_BYTES);
+            if (!Ed25519Points.isCanonicalPrimeOrderCandidate(Hex.decode(pub, PUBLIC_KEY_BYTES))) {
+                throw invalid();
+            }
             String kid = stringValue(key.get("kid"));
             if (!kid.equals(Hex.kid(pub))) {
                 throw invalid();
