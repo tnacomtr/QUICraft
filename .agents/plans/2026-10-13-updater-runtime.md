@@ -249,7 +249,10 @@ Per unit: fresh verifier (`:updater:check build --rerun-tasks --no-build-cache`)
 - Review fixes applied 2026-10-13: backup co-sign check, Wave 0 types unit, spec-aligned state store, injected redirect policy, `reset-state` and cross-store refusal assigned, health placeholder, `UpdateVersion` args, macOS/JDK21 CI route, in-process lock guard.
 - Wave 0 (this plan): approved, advisor critique incorporated, open decisions resolved (fixtures approved, origins injected, Windows deferred). Awaiting the user's go-ahead to start Wave 0.5.
 - 2026-10-13 execution (orchestrator). Merged on feat/phase4-alpha after verifier PASS + peer approve: Wave 0 types (1a2df88), 1.1 keys (e2ad90e), 1.4 freshness (2b76dee), 1.3 trust (a196461), 1.2 signers (643cfad). Merged updater suite: 387 tests, 0 failures. Wave 0.5 spike PASS, kept unmerged on `agent/phase4-upd-spike` (4a87986, note `.agents/plans/spike-upd-0.5.md`) for Wave 5.
-- Running: 2.1 state (default-coder), 2.2 sequence (default-coder), Wave 1 security review (security-reviewer), Wave 2.5 critique (superior, opencode).
+- Later merges: Wave 2.1 state (57c1580), 2.2 sequence (2c330ae), Wave 1 hardening from the Wave 1 security review (e5ea9b3), 3.0 shared (57e5699). 499 updater tests green before 3.0; Wave 1 security review: no critical/high/medium, 3 lows fixed.
+- ChatGPT usage limit hit 2026-10-13: Sonnet stands in for peer-reviewer and superior (user decision).
+- Decisions by orchestrator (report to user): build metadata resource `META-INF/quicraft/build.json` {type quicraft.build, v 1, platform, version}; release hosts are LDH DNS names or exactly `localhost`; throwaway TLS fixture `updater/src/test/resources/tls/test-localhost.p12` for transport tests; Windows DurabilityOps fails closed on directory fsync (3.6 must allow VERIFIED_STAGING_ONLY staging there or document it).
+- Running: 3.1 transport, 3.3 acceptance, 3.4 artifact (default-coder); 3.5 journal gates; Wave 2 security review.
 - Test keys: RFC 8032 TEST 1-3 seeds only, test sources only (throwaway, per user). Owner keys replace them after implementation; user to be told.
 - Grounding explorers: `ses_ec90bf527ffewKBKlh3oIN8CLf` (platform wiring), `ses_ec90bf445fferbnM9Eq2V7R7S5` (state/verification gaps). Both done, read-only.
 
