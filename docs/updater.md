@@ -1093,6 +1093,11 @@ Both:
   a plain LDH DNS name (two or more labels of 1..63 letters, digits or hyphens, no leading or trailing
   hyphen, no IP literals, no trailing dot) or exactly `localhost` (tests only). Redirects are denied
   unless an injected policy allows them.
+  A real redirect policy (security review) allows only a fixed CDN allowlist per host, never an IP
+  literal and never another configured host's origin, so one origin cannot count as two hosts in the
+  2-of-3 coverage rule. Response header size is bounded only by the JDK HTTP client
+  (`jdk.http.maxHeaderSize`); the minimum supported JDK update must have that limit, checked
+  before release.
 - Blocker 9: health criteria that end `health-check-pending`.
 - Blocker 10: open gaps listed in 12.13.
 - Blocker 11: Windows steps 5 to 7.
