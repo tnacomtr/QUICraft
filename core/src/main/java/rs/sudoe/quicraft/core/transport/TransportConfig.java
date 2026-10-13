@@ -99,7 +99,12 @@ public final class TransportConfig {
         return congestionControl;
     }
 
-    /** 0 = quiche's default (10 packets). System property {@code quicraft.initialCwndPackets}, for experiments. */
+    /**
+     * Initial congestion window in packets, 64 by default. System property
+     * {@code quicraft.initialCwndPackets} overrides it: an explicit {@code 0} selects quiche's
+     * native default (10 packets), {@code 1..1000} the value, for experiments. An invalid value
+     * (malformed text or out of range) falls back to 64.
+     */
     public int initialCongestionWindowPackets() {
         return initialCongestionWindowPackets;
     }
@@ -203,16 +208,27 @@ public final class TransportConfig {
     }
 
     /**
-     * 0 = quiche's default (10 packets). System property
-     * {@code quicraft.initialCwndPackets}, for experiments.
+     * 64 packets by default. System property {@code quicraft.initialCwndPackets} overrides it:
+     * an explicit {@code 0} selects quiche's native default (10 packets), {@code 1..1000} the
+     * value, for experiments. A malformed or out-of-range value falls back to 64.
      */
     private static int defaultInitialCwndPackets() {
-        try {
-            int packets = Integer.parseInt(System.getProperty("quicraft.initialCwndPackets", "0").trim());
-            return packets >= 1 && packets <= 1000 ? packets : 0;
-        } catch (NumberFormatException e) {
-            return 0;
+        String value = System.getProperty("quicraft.initialCwndPackets");
+        if (value == null) {
+            return 64;
         }
+        try {
+            int packets = Integer.parseInt(value.trim());
+            if (packets == 0) {
+                return 0;
+            }
+            if (packets >= 1 && packets <= 1000) {
+                return packets;
+            }
+        } catch (NumberFormatException ignored) {
+            // falls through to the default
+        }
+        return 64;
     }
 
     public static final class Builder {
