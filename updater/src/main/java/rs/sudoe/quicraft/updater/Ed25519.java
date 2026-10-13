@@ -41,6 +41,9 @@ public final class Ed25519 {
             }
             byte[] pub = Hex.decode(pubHex, PUBLIC_KEY_BYTES);
             byte[] sig = Hex.decode(sigHex, SIGNATURE_BYTES);
+            if (!Ed25519Points.isCanonicalPrimeOrderCandidate(pub)) {
+                return false;
+            }
             if (!hasCanonicalS(sig)) {
                 return false;
             }

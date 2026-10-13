@@ -124,6 +124,13 @@ public final class TrustTransition {
             throws UpdateRejectedException {
         Objects.requireNonNull(d, "decision");
         Objects.requireNonNull(trust, "trust");
+        // A caller-built decision is never trusted: it must be exactly what classify computes for
+        // this trust file against the state it is applied to.
+        TrustDecision expected = classify(
+                current == null ? null : current.state().persistedTrust(), trust);
+        if (!expected.equals(d)) {
+            throw new IllegalArgumentException("decision does not match trust and state");
+        }
         if ((d.transition() == Transition.INITIALISE) != (current == null)) {
             throw new IllegalArgumentException("current state must be null only for INITIALISE");
         }
