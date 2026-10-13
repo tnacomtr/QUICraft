@@ -73,7 +73,7 @@ public final class Acceptance {
 
         UpdaterState selected = selection.delta().newState();
         Map<String, Instant> torn = updateTorn(
-                selected.tornSince(), view.torn(), view.byKey().keySet(), systemNow, diagnostics);
+                selected.tornSince(), view.torn(), Set.of(), systemNow, diagnostics);
         StateDelta delta = new StateDelta(withTornSince(selected, torn), selection.delta().newRevoked());
         return new RevocationAcceptance(delta, diagnostics);
     }
@@ -186,10 +186,13 @@ public final class Acceptance {
                     running, currentTrust, revocations, mode, effectiveNow, diagnostics);
         }
 
+        Set<String> tornNow = new TreeSet<>(manifestTorn);
+        tornNow.addAll(revocations.torn());
         Set<String> cleared = new TreeSet<>(manifestVerified);
-        cleared.removeAll(revocations.torn());
+        cleared.retainAll(revocations.byKey().keySet());
+        cleared.removeAll(tornNow);
         Map<String, Instant> torn = updateTorn(
-                folded.state().tornSince(), manifestTorn, cleared, systemNow, diagnostics);
+                folded.state().tornSince(), tornNow, cleared, systemNow, diagnostics);
         StateDelta delta = new StateDelta(withTornSince(folded.state(), torn), folded.revoked());
         return new ManifestAcceptance(delta, candidate, stateFull, diagnostics);
     }
@@ -243,8 +246,10 @@ public final class Acceptance {
     }
 
     /**
-     * Applies the torn rules of 12.6 item 7. Hosts in {@code torn} keep the first time they were
-     * seen torn and get a diagnostic after 24 hours. Hosts in {@code cleared} lose their entry.
+     * Applies the torn rules of 12.6 item 7, which are host-level: a host is torn when any of its
+     * pairs is torn. Hosts in {@code torn} keep the first time they were seen torn and get a
+     * diagnostic after 24 hours. Hosts in {@code cleared} lose their entry. Callers clear a host only
+     * when all of its pairs verified in this run.
      */
     private static Map<String, Instant> updateTorn(
             Map<String, Instant> existing,
