@@ -390,4 +390,140 @@ class SharedTypesTest {
         HealthSignal signal = timeout -> java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE);
         assertTrue(signal.awaitHealthy(Duration.ofSeconds(1)).toCompletableFuture().get());
     }
+
+    // ---- ReleaseHost LDH rules (ADJUST) ----
+
+    @Test
+    void releaseHostRejectsTrailingDotAndEmptyLabels() {
+        assertThrows(IllegalArgumentException.class, () -> host("github", "https://example.com."));
+        assertThrows(IllegalArgumentException.class, () -> host("github", "https://a.com.."));
+        assertThrows(IllegalArgumentException.class, () -> host("github", "https://a..com"));
+    }
+
+    @Test
+    void releaseHostRejectsIpLiteralsAndZoneIds() {
+        String[] bad = {
+            "https://[::1]", "https://[0:0:0:0:0:0:0:1]", "https://[::ffff:1.2.3.4]",
+            "https://[::1%25eth0]", "https://1.2.3.4", "https://127.0.0.1", "https://127.0.0.1:8443",
+        };
+        for (String origin : bad) {
+            assertThrows(IllegalArgumentException.class, () -> host("github", origin), origin);
+        }
+    }
+
+    @Test
+    void releaseHostRejectsUnderscoreHyphenAndLabelRules() {
+        assertThrows(IllegalArgumentException.class, () -> host("github", "https://a_b.com"));
+        assertThrows(IllegalArgumentException.class, () -> host("github", "https://-a.com"));
+        assertThrows(IllegalArgumentException.class, () -> host("github", "https://a-.com"));
+        assertThrows(IllegalArgumentException.class, () -> host("github", "https://" + "x".repeat(64) + ".com"));
+        String longName = ("x".repeat(63) + ".").repeat(3) + "x".repeat(63);
+        assertThrows(IllegalArgumentException.class, () -> host("github", "https://" + longName));
+    }
+
+    @Test
+    void releaseHostAcceptsLdhNamesWithMixedLastLabel() {
+        assertEquals("https://a.1a.com", host("github", "https://a.1a.com").origin().toString());
+    }
+
+    @Test
+    void releaseHostNormalizesCaseAndPortSpellings() {
+        assertEquals("https://example.com", host("sudoe", "https://EXAMPLE.com:443").origin().toString());
+        assertEquals("https://example.com", host("sudoe", "https://example.com:0443").origin().toString());
+    }
+
+    @Test
+    void releaseHostAcceptsLocalhostOnlyAsSingleLabel() {
+        assertEquals("https://localhost:8443", host("sudoe", "https://localhost:8443").origin().toString());
+        assertEquals("https://localhost", host("sudoe", "https://localhost:443").origin().toString());
+        assertEquals("https://localhost", host("sudoe", "https://LOCALHOST").origin().toString());
+        assertThrows(IllegalArgumentException.class, () -> host("sudoe", "https://localhostx"));
+        assertThrows(IllegalArgumentException.class, () -> host("sudoe", "https://localhost."));
+    }
+
+    // ---- ReleaseHosts.contains / of (ADJUST) ----
+
+    @Test
+    void releaseHostsContainsRequiresKeyAndOrigin() {
+        ReleaseHosts hosts = ReleaseHosts.of(List.of(host("github", "https://a.example")));
+        assertTrue(hosts.contains(host("github", "https://a.example")));
+        assertFalse(hosts.contains(host("github", "https://b.example")));
+        assertFalse(hosts.contains(host("sudoe", "https://a.example")));
+    }
+
+    @Test
+    void releaseHostsOfFollowsConstructorRules() {
+        assertEquals(1, ReleaseHosts.of(List.of(host("github", "https://a.example"))).hosts().size());
+        assertThrows(IllegalArgumentException.class, () -> ReleaseHosts.of(List.of()));
+    }
+
+    // ---- HostCollection origin uniqueness (ADJUST) ----
+
+    @Test
+    void hostCollectionRejectsDuplicateOriginUnderDifferentKeys() {
+        HostEvidence a = new HostEvidence(host("github", "https://a.example"), FetchOutcome.TRANSPORT_ERROR, null);
+        HostEvidence b = new HostEvidence(host("sudoe", "https://a.example"), FetchOutcome.CANCELLED, null);
+        assertThrows(IllegalArgumentException.class, () -> new HostCollection(List.of(a, b)));
+    }
+
+    // ---- FetchRequest URI binding and ceilings (ADJUST) ----
+
+    @Test
+    void fetchRequestRejectsUriOfAnotherHostOrPort() {
+        Duration d = Duration.ofSeconds(1);
+        assertThrows(IllegalArgumentException.class, () -> request("https://b.example/x", 10L, d, d, d));
+        assertThrows(IllegalArgumentException.class, () -> request("https://a.example:8443/x", 10L, d, d, d));
+        assertThrows(IllegalArgumentException.class, () -> request("https://sub.a.example/x", 10L, d, d, d));
+    }
+
+    @Test
+    void fetchRequestAcceptsUriEqualAfterNormalization() {
+        Duration d = Duration.ofSeconds(1);
+        assertEquals("https://A.example:443/x", request("https://A.example:443/x", 10L, d, d, d).uri().toString());
+    }
+
+    @Test
+    void fetchRequestRejectsUserinfoAndFragment() {
+        Duration d = Duration.ofSeconds(1);
+        assertThrows(IllegalArgumentException.class, () -> request("https://u@a.example/x", 10L, d, d, d));
+        assertThrows(IllegalArgumentException.class, () -> request("https://a.example/x#frag", 10L, d, d, d));
+        assertThrows(IllegalArgumentException.class, () -> request("https://a.example/x#", 10L, d, d, d));
+    }
+
+    @Test
+    void fetchRequestEnforcesTimeoutCeilings() {
+        Duration d = Duration.ofSeconds(1);
+        assertEquals(FetchRequest.MAX_CONNECT,
+                request("https://a.example/x", 10L, FetchRequest.MAX_CONNECT, d, d).connectTimeout());
+        assertThrows(IllegalArgumentException.class, () -> request("https://a.example/x", 10L,
+                FetchRequest.MAX_CONNECT.plusMillis(1), d, d));
+        assertThrows(IllegalArgumentException.class, () -> request("https://a.example/x", 10L, d,
+                FetchRequest.MAX_IDLE.plusMillis(1), d));
+        assertEquals(FetchRequest.MAX_DEADLINE,
+                request("https://a.example/x", 10L, d, d, FetchRequest.MAX_DEADLINE).overallDeadline());
+        assertThrows(IllegalArgumentException.class, () -> request("https://a.example/x", 10L, d, d,
+                FetchRequest.MAX_DEADLINE.plusMillis(1)));
+    }
+
+    @Test
+    void fetchRequestByteCeilingsAndConstants() {
+        Duration d = Duration.ofSeconds(1);
+        assertEquals(1L << 31, FetchRequest.MAX_BYTES);
+        assertEquals(64L << 20, FetchRequest.MAX_FETCH_BYTES);
+        assertEquals(FetchRequest.MAX_BYTES, request("https://a.example/x", FetchRequest.MAX_BYTES, d, d, d).maxBytes());
+        // A request above MAX_FETCH_BYTES is still a valid request; fetch() refuses it with OVERSIZE.
+        assertEquals(FetchRequest.MAX_FETCH_BYTES + 1,
+                request("https://a.example/x", FetchRequest.MAX_FETCH_BYTES + 1, d, d, d).maxBytes());
+    }
+
+    // ---- FetchException httpStatus (ADJUST) ----
+
+    @Test
+    void fetchExceptionCarriesOptionalHttpStatus() {
+        assertEquals(-1, new FetchException(FetchOutcome.TRANSPORT_ERROR).httpStatus());
+        assertEquals(503, new FetchException(FetchOutcome.HTTP_STATUS, 503).httpStatus());
+        assertThrows(IllegalArgumentException.class, () -> new FetchException(FetchOutcome.HTTP_STATUS, 99));
+        assertThrows(IllegalArgumentException.class, () -> new FetchException(FetchOutcome.HTTP_STATUS, 600));
+        assertThrows(IllegalArgumentException.class, () -> new FetchException(FetchOutcome.OK, 200));
+    }
 }

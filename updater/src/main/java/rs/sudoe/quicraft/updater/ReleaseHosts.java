@@ -33,6 +33,16 @@ public record ReleaseHosts(List<ReleaseHost> hosts) {
     }
 
     /**
+     * Builds the set from a list. Same rules as the record constructor.
+     *
+     * @param hosts the configured hosts; copied
+     * @return the release hosts
+     */
+    public static ReleaseHosts of(List<ReleaseHost> hosts) {
+        return new ReleaseHosts(hosts);
+    }
+
+    /**
      * Finds the configured host with the given key.
      *
      * @param key the host key; must not be null
@@ -46,5 +56,23 @@ public record ReleaseHosts(List<ReleaseHost> hosts) {
             }
         }
         return Optional.empty();
+    }
+
+    /**
+     * Reports whether this exact host (key and normalized origin) is configured. Acceptance uses this
+     * to bind evidence to configuration; a redirect target is never a configured host.
+     *
+     * @param host the host to look up; must not be null
+     * @return {@code true} when a configured entry has the same key and origin
+     */
+    public boolean contains(ReleaseHost host) {
+        Objects.requireNonNull(host, "host");
+        for (ReleaseHost configured : hosts) {
+            if (configured.key().equals(host.key())
+                    && configured.origin().toString().equals(host.origin().toString())) {
+                return true;
+            }
+        }
+        return false;
     }
 }

@@ -6,6 +6,9 @@ import java.util.Objects;
 /**
  * The result of fetching one document from one host. The pair is present exactly when the outcome
  * is {@link FetchOutcome#OK}.
+ *
+ * <p>One outcome covers both the document and its signature fetch. A failed {@code .sig} makes the
+ * whole evidence a failure, with no pair.
  */
 public record HostEvidence(ReleaseHost host, FetchOutcome outcome, DocumentPair pair) {
 
