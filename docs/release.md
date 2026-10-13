@@ -48,14 +48,15 @@ and `docs/server-security.md`.
 ## 4. Server-side protections (must exist before alpha)
 
 Release blockers from `CLAUDE.md` (Phase 4) and the plan. Runtime protections are wired into both
-listener binds (pending review on branch `agent/phase4-listener-admission`):
+listener binds, merged on `feat/phase4-alpha` after verifier, peer and security review:
 
-- [ ] A real Retry token handler. `HmacRetryTokenHandler` is wired into both listener binds (pending
-      review on branch `agent/phase4-listener-admission`).
+- [x] A real Retry token handler. `HmacRetryTokenHandler` (through `AdmissionTokenHandler`) is wired
+      into both listener binds, merged
+      on `feat/phase4-alpha` after verifier, peer and security review.
       `InsecureQuicTokenHandler` from Netty's examples must never ship.
-- [ ] Per-IP and global limits on connection attempts and open connections. `ConnectionAdmission` is
-      wired into both listener binds (pending review on branch `agent/phase4-listener-admission`);
-      the settings are documented in [`server-security.md`](server-security.md) section 3.
+- [x] Per-IP and global limits on connection attempts and open connections. `ConnectionAdmission` is
+      wired into both listener binds, merged on `feat/phase4-alpha` after verifier, peer and security
+      review; the settings are documented in [`server-security.md`](server-security.md) section 3.
 - [ ] Server-owner UDP firewall and DDoS documentation reviewed against
       [`server-security.md`](server-security.md).
 

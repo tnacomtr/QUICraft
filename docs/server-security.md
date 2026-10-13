@@ -1,8 +1,8 @@
 # Server security and firewall guidance (draft)
 
 **Status: draft for server owners, not yet reviewed for release.** The connection limits and Retry in
-section 3 are wired into both listener binds, pending review on branch
-`agent/phase4-listener-admission`. Do not rely on any limit here until the Phase 4 gates in
+section 3 are wired into both listener binds and merged on `feat/phase4-alpha` after verifier, peer
+and security review. Do not rely on any limit here until the Phase 4 gates in
 `docs/release.md` section 4 pass.
 
 ## 1. Ports
@@ -46,8 +46,7 @@ preparation unit.
 
 The listener enforces per-IP and global limits on QUIC connection attempts and open connections,
 plus an address-validation Retry. Every setting is a JVM system property, read once at listener
-start, for example `-Dquicraft.admission.maxOpenPerIp=64`. They are wired into both listener binds,
-pending review on branch `agent/phase4-listener-admission`.
+start, for example `-Dquicraft.admission.maxOpenPerIp=64`. They are wired into both listener binds.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -61,14 +60,21 @@ pending review on branch `agent/phase4-listener-admission`.
 | `quicraft.admission.ingressInitialsPerSecond` | 4000 | Initial datagrams per second, all IPs (packet guard). |
 | `quicraft.admission.ingressInitialsPerIpPerSecond` | 200 | Initial datagrams per second, per IP (packet guard). |
 
-- **`retry=adaptive` (default).** The server sends a QUIC Retry (address validation, which costs the
-  client one extra round trip and its 0-RTT early data) only once connection attempts in the current
-  second reach `retryThresholdPerSecond`, or when an attempt is over a limit. `retryThresholdPerSecond`
-  is clamped to `globalAttemptsPerSecond`.
+- **`retry=adaptive` (default).** For admitted attempts, the server sends a QUIC Retry (address
+  validation, which costs the client one extra round trip and its 0-RTT early data) only once
+  connection attempts in the current second reach `retryThresholdPerSecond`. `adaptive` also forces
+  Retry while a handshake backlog exists (see the next bullet). `retryThresholdPerSecond` is clamped
+  to `globalAttemptsPerSecond`.
 - **`retry=always`.** Every new connection gets a Retry. Use this under attack: the server validates
   the client's address before spending connection state on it.
-- **`retry=never`.** No load-based Retry. Attempts over a limit still get a Retry and are then
-  dropped.
+- **`retry=never`.** No Retry for admitted attempts. Refusals and a handshake backlog still get a
+  Retry, as in every mode (next bullet).
+- **Refusals and backlog (every mode).** A refused attempt gets a Retry and is then dropped. An
+  attempt is refused when it is over an attempt limit or the open-connection limits are full. A
+  token-less attempt is also refused while unconfirmed handshakes reach 25% or more of `maxOpen`
+  (a backlog, for example of spoofed half-open handshakes). A token-bearing attempt over its
+  validated limit, or one that arrives while the open-connection limits are full, is dropped without
+  a Retry. A token-bearing attempt is not refused by a backlog, because its address is already proven.
 - **Ingress guard.** `ingressInitialsPerSecond` and `ingressInitialsPerIpPerSecond` drop excess QUIC
   Initial datagrams before any QUIC processing. This is a cheap packet-level guard; other packets
   (established connections) are never counted.
@@ -84,6 +90,24 @@ pending review on branch `agent/phase4-listener-admission`.
 - **Retry tokens:** HMAC-SHA256, bound to the client IP and port, 30 s lifetime. The key is random
   per listener start, so a restart invalidates outstanding tokens (harmless: the client retries or
   falls back to TCP).
+- **Per-IP key.** An IPv4 address (IPv4-mapped IPv6 counts as IPv4) or an IPv6 /64. Hosts in one /64
+  share their budgets, while a holder of a /48 gets 65536 separate keys. Larger prefixes are not
+  aggregated on purpose: that would penalise unrelated users behind shared prefixes.
+- **Handshake deadline.** A QUIC connection whose handshake is not complete 10 s after it was created
+  is closed. A real client on a very slow link then falls back to TCP. The 10 s is fixed; there is no
+  system property for it.
+- **Short Initials.** An Initial datagram shorter than 1200 bytes is dropped without an answer
+  (RFC 9000 §14.1). Real clients always pad to 1200, so this only affects malformed or attack traffic.
+- **Validated budget.** An attempt that brings back a valid Retry token has its own budget, with the
+  same limits. A flood of token-less Initials cannot use it up, so clients that already proved their
+  address keep joining. Validated Initials still count against the ingress guard.
+- **Startup WARNINGs.** The listener logs one WARNING per condition at bind time:
+  - `maxTrackedIps` is below `maxOpen + globalAttemptsPerSecond`. New addresses may be refused while
+    the tracked ones fill the table.
+  - `maxTrackedIps` is below `ingressInitialsPerSecond`. The ingress guard shares that table, so
+    Initials from new addresses may be dropped while it is full.
+  Raising `maxTrackedIps` to at least `maxOpen + globalAttemptsPerSecond` and to at least
+  `ingressInitialsPerSecond` clears both.
 
 These limits are a **mitigation**, not DDoS protection. They reduce the cost of abusive connection
 attempts for honest players. They are **not** DDoS prevention (section 4).
@@ -129,7 +153,7 @@ These must hold for every configuration (`CLAUDE.md`):
 
 ## 8. Not claimed
 
-- The section 3 settings are wired pending review (branch `agent/phase4-listener-admission`) and are
-  not active in any release. Their defaults have not been load-tested in this project.
+- The section 3 settings are merged on `feat/phase4-alpha` but are not active in any release. Their
+  defaults have not been load-tested in this project.
 - IPv6 QUIC behavior has not been tested by this project (see section 2).
 - Hosting-rule compliance is not verified here (see `docs/updater.md` section 11).
