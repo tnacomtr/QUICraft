@@ -36,6 +36,8 @@ class TrustTransitionTest {
     private static final String OTHER_REVOKED = "2".repeat(64);
     private static final String STALE_FINGERPRINT = "a".repeat(64);
 
+    private static final long MAX_SAFE_INTEGER = 9007199254740991L;
+
     private static final Instant T0 = Instant.parse("2026-10-01T00:00:00Z");
     private static final Instant T1 = Instant.parse("2026-10-08T00:00:00Z");
 
@@ -278,6 +280,51 @@ class TrustTransitionTest {
                         new UpdateDocuments.RevokedKey(Hex.kid(OLD_REVOKED), OLD_REVOKED),
                         new UpdateDocuments.RevokedKey(Hex.kid(PUB_2), PUB_2)),
                 revoked.revokedKeys());
+    }
+
+    /** A snapshot whose revocation floors are at 2^53-1, as a leaked backup key could set them. */
+    private static Snapshot highFloorSnapshot() throws Exception {
+        long max = MAX_SAFE_INTEGER;
+        Snapshot base = snapshot();
+        UpdaterState s = base.state();
+        UpdaterState high = new UpdaterState(
+                s.epoch(),
+                s.keySetFingerprint(),
+                s.revocationKey(),
+                new CurrentRevocations(max, "c".repeat(64), T0, T1, max),
+                s.seqByKid(),
+                s.withdrawn(),
+                s.lastAnnounced(),
+                s.warnedBad(),
+                s.tornSince());
+        return new Snapshot(high, base.revoked());
+    }
+
+    @Test
+    void replacementResetsMaxFloorsFromLeakedBackupKey() throws Exception {
+        Snapshot current = highFloorSnapshot();
+        UpdateDocuments.Trust trust = trust(3, PUB_3);
+        TrustDecision d = TrustTransition.classify(
+                new PersistedTrust(2, STALE_FINGERPRINT, PUB_2), trust);
+
+        StateDelta delta = TrustTransition.apply(d, trust, current);
+        // The old revocation key's 2^53-1 floors are dropped; the seed comes from the trust file.
+        assertEquals(
+                new CurrentRevocations(3, "", null, null, 9),
+                delta.newState().revocations());
+    }
+
+    @Test
+    void rotationKeepsMaxFloorsUnchanged() throws Exception {
+        Snapshot current = highFloorSnapshot();
+        UpdateDocuments.Trust trust = trust(3, PUB_2);
+        TrustDecision d = TrustTransition.classify(
+                new PersistedTrust(2, STALE_FINGERPRINT, PUB_2), trust);
+
+        StateDelta delta = TrustTransition.apply(d, trust, current);
+        assertEquals(
+                new CurrentRevocations(MAX_SAFE_INTEGER, "c".repeat(64), T0, T1, MAX_SAFE_INTEGER),
+                delta.newState().revocations());
     }
 
     @Test
