@@ -102,6 +102,7 @@ public final class ArtifactVerifier {
         validateStagedTrust(trust, current);
 
         String fingerprint = KeySetFingerprint.of(trust.keys());
+        requireKeySetChangeAuthorized(c, fingerprint, id, current);
         ArtifactIdentity identity = new ArtifactIdentity(
                 entry.platform(), entry.version(), entry.size(), entry.sha512());
         return new StagedArtifact(stagedJar, identity, trust, fingerprint);
@@ -149,6 +150,21 @@ public final class ArtifactVerifier {
         if (staged.epoch() == state.epoch()
                 && !KeySetFingerprint.of(staged.keys()).equals(state.keySetFingerprint())) {
             throw reject("staged key set differs from persisted key set at the same epoch");
+        }
+    }
+
+    /**
+     * Requires the staged key-set change to be authorized by the verified manifest and the persisted
+     * backup key (docs/updater.md 12.2, key-set change rule). This is an extra requirement on top of
+     * {@link #validateStagedTrust}, never a waiver.
+     */
+    private static void requireKeySetChangeAuthorized(
+            AcceptedCandidate c, String fingerprint, RuntimeIdentity id, StateRecords.Snapshot current)
+            throws UpdateRejectedException {
+        TrustSnapshot snapshot = TrustSnapshot.of(id.runningTrust(), current.revoked().revokedPubs());
+        if (!KeySetChangeAuthorization.check(
+                c.manifest(), fingerprint, current.state().persistedTrust(), snapshot)) {
+            throw reject("staged key-set change is not authorized by the backup key");
         }
     }
 

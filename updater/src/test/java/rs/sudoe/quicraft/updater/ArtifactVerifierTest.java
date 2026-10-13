@@ -188,6 +188,46 @@ class ArtifactVerifierTest {
         assertRejected(() -> verify(staged, c, RUNNING, ON_DISK));
     }
 
+    // ---- key-set change authorization (docs/updater.md 12.2, key-set change rule) ----
+
+    @Test
+    void changedKeySetSignedOnlyByReleaseKeyIsRejected() throws Exception {
+        byte[] jar = standardJar(trustJson(2, backupOnlyKeys()), buildJson(PLATFORM, VERSION));
+        Path staged = stage("keyset-release.jar", jar);
+        AcceptedCandidate c = candidateSigned(jar, releaseSigners());
+        UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
+                () -> verify(staged, c, RUNNING, ON_DISK));
+        assertEquals("staged key-set change is not authorized by the backup key", e.getMessage());
+    }
+
+    @Test
+    void changedKeySetCoSignedByPersistedBackupKeyIsAccepted() throws Exception {
+        byte[] jar = standardJar(trustJson(2, backupOnlyKeys()), buildJson(PLATFORM, VERSION));
+        Path staged = stage("keyset-backup.jar", jar);
+        AcceptedCandidate c = candidateSigned(jar, backupCoSigners());
+        assertDoesNotThrow(() -> verify(staged, c, RUNNING, ON_DISK));
+    }
+
+    @Test
+    void unchangedKeySetSignedOnlyByReleaseKeyIsAccepted() throws Exception {
+        byte[] jar = standardJar(trustJson(1, standardKeys()), buildJson(PLATFORM, VERSION));
+        Path staged = stage("keyset-same.jar", jar);
+        AcceptedCandidate c = candidateSigned(jar, releaseSigners());
+        assertDoesNotThrow(() -> verify(staged, c, RUNNING, ON_DISK));
+    }
+
+    @Test
+    void changedKeySetWithRevokedBackupKeyIsRejected() throws Exception {
+        // The persisted backup key is revoked, so the staged trust (which must name it) is refused
+        // by validateStagedTrust before the co-signature rule is reached.
+        Set<String> revoked = Set.of(TestKeys.PUB_2);
+        byte[] jar = standardJar(trustJson(2, backupOnlyKeys()), buildJson(PLATFORM, VERSION));
+        Path staged = stage("keyset-revoked.jar", jar);
+        AcceptedCandidate c = candidate(PLATFORM, VERSION, List.of(TARGET), jar.length, sha512Hex(jar),
+                backupCoSigners(), runningSnapshot(revoked));
+        assertRejected(() -> verifyWith(staged, c, state(1, fingerprint(standardKeys()), TestKeys.PUB_2, revoked)));
+    }
+
     // ---- validateStagedTrust ----
 
     @Test
@@ -274,6 +314,13 @@ class ArtifactVerifierTest {
 
     private static AcceptedCandidate candidate(
             String platform, String version, List<String> targets, long size, String sha512) throws Exception {
+        return candidate(platform, version, targets, size, sha512,
+                new VerifiedSigners(List.of()), runningSnapshot(Set.of()));
+    }
+
+    private static AcceptedCandidate candidate(
+            String platform, String version, List<String> targets, long size, String sha512,
+            VerifiedSigners signers, TrustSnapshot snapshot) throws Exception {
         UpdateDocuments.ReleaseEntry entry = new UpdateDocuments.ReleaseEntry(
                 platform, UpdateVersion.parse(version), targets, "quicraft-" + platform + "-" + version + ".jar",
                 size, sha512, "v" + version);
@@ -281,10 +328,44 @@ class ArtifactVerifierTest {
                 42, Instant.parse(SignedFixtures.TS1), Instant.parse(SignedFixtures.TS2), 0,
                 List.of(entry), List.of());
         VerifiedDocument<UpdateDocuments.ReleaseManifest> doc = new VerifiedDocument<>(
-                manifest, bytes("{}"), new VerifiedSigners(List.of()),
-                TrustSnapshot.of(parseTrust(trustJson(1, standardKeys())), Set.of()));
+                manifest, bytes("{}"), signers, snapshot);
         return new AcceptedCandidate(doc, new ManifestEvidence(bytes("{}"), bytes("{}")), entry,
                 List.of(new ReleaseHost("modrinth", URI.create("https://modrinth.example"))));
+    }
+
+    /** A candidate for {@code jar} whose manifest was verified under the running trust, with {@code signers}. */
+    private static AcceptedCandidate candidateSigned(byte[] jar, VerifiedSigners signers) throws Exception {
+        return candidate(PLATFORM, VERSION, List.of(TARGET), jar.length, sha512Hex(jar),
+                signers, runningSnapshot(Set.of()));
+    }
+
+    /** The snapshot of the running trust (standard keys, epoch 1) with the given revoked public keys. */
+    private static TrustSnapshot runningSnapshot(Set<String> revoked) throws Exception {
+        return TrustSnapshot.of(parseTrust(trustJson(1, standardKeys())), revoked);
+    }
+
+    /** Manifest signed only by the release key (TEST 1). */
+    private static VerifiedSigners releaseSigners() {
+        return new VerifiedSigners(List.of(
+                new VerifiedSigner(TestKeys.KID_1, TestKeys.PUB_1, Set.of(KeyRole.RELEASE))));
+    }
+
+    /** Manifest signed by the release key and by the persisted backup key (TEST 2, both roles). */
+    private static VerifiedSigners backupCoSigners() {
+        return new VerifiedSigners(List.of(
+                new VerifiedSigner(TestKeys.KID_1, TestKeys.PUB_1, Set.of(KeyRole.RELEASE)),
+                new VerifiedSigner(TestKeys.KID_2, TestKeys.PUB_2,
+                        Set.of(KeyRole.RELEASE, KeyRole.REVOCATION))));
+    }
+
+    /** A staged key set that differs from the standard one: only the backup key remains. */
+    private static String backupOnlyKeys() {
+        return keyJson(TestKeys.KID_2, TestKeys.PUB_2, "[\"release\",\"revocation\"]");
+    }
+
+    private static void verifyWith(Path staged, AcceptedCandidate c, StateRecords.Snapshot current)
+            throws Exception {
+        ArtifactVerifier.verify(staged, c, runtime(RUNNING), UpdateVersion.parse(ON_DISK), current);
     }
 
     private static RuntimeIdentity runtime(String running) throws Exception {
