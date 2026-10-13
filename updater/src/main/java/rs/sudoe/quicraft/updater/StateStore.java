@@ -51,6 +51,7 @@ public final class StateStore {
     static final String REVOKED = "revoked.json";
     static final String LOCK = "state.lock";
     static final String TXN_LOCK = "txn.lock";
+    static final String STATE_FILES_MISSING = "updater state files are missing; not rebuilt silently";
     private static final String PREV = ".prev";
     private static final String TMP = ".tmp";
     private static final String OWNER_MISMATCH = "update directory not owned by the server user";
@@ -136,8 +137,10 @@ public final class StateStore {
     }
 
     /**
-     * Writes the initial files when neither exists; otherwise returns the loaded state unchanged.
-     * {@code revoked.json} is written first.
+     * Writes the initial files when neither exists and {@code firstRunAllowed} is true; otherwise
+     * returns the loaded state unchanged. {@code revoked.json} is written first. With no files and
+     * {@code firstRunAllowed} false, throws {@link StateUnavailableException} (updater disabled): the
+     * owner then removes the whole update directory, which makes the next start a first run.
      *
      * <p>A missing {@code state.json} with a present {@code revoked.json} is reseeded only when
      * {@code firstRunAllowed} is true. Platforms pass true only when no QUICraft update directory
@@ -150,6 +153,10 @@ public final class StateStore {
         Objects.requireNonNull(initial, "initial");
         return withLocks(warnings -> {
             if (!anyFileExists()) {
+                if (!firstRunAllowed) {
+                    // Both files vanished after the directory was in use: never rebuild them silently.
+                    throw new StateUnavailableException(false, STATE_FILES_MISSING);
+                }
                 atomicWrite(REVOKED, RevokedCodec.encode(initial.newRevoked()),
                         StateStore::validRevoked, warnings);
                 atomicWrite(STATE, StateCodec.encode(initial.newState()),

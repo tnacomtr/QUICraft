@@ -457,6 +457,17 @@ class StateStoreTest {
     }
 
     @Test
+    void emptyDirectoryIsNotInitialisedWhenFirstRunNotAllowed() throws Exception {
+        Path dir = updateDir();
+        StateStore store = new StateStore(dir);
+        StateUnavailableException e = assertThrows(StateUnavailableException.class,
+                () -> store.initialiseIfAbsent(seedDelta(), false));
+        assertFalse(e.revokedValid());
+        assertFalse(Files.exists(dir.resolve("state.json")));
+        assertFalse(Files.exists(dir.resolve("revoked.json")));
+    }
+
+    @Test
     void atomicWriteRefusesContentThatFailsTheReadValidator() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
