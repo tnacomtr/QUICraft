@@ -55,9 +55,9 @@ code units (`String.length()`) and at most `ByteBufUtil.utf8MaxBytes(32767)` enc
 writer checks too, so an oversized response fails on the sending side as well. Checked in Paper
 26.1.2's server jar, and in the decompiled 1.21.11 and 26.1.2 game (client and server use the same
 codec). Velocity's own serializer has no check (docs/platforms/velocity.md); the advertisement
-stays under the cap there through `Advertisement.insertInto`. Still to check: 26.2 and 26.3
-(their status codec wasn't read; the Fabric mod's classes are identical across 26.x, and the
-gametests ping successfully).
+stays under the cap there through `Advertisement.insertInto`. 26.2 and 26.3 use the same cap:
+their `ClientboundStatusResponsePacket` passes 32767 to `ByteBufCodecs.lenientJson` (checked in
+the bytecode, 2026-10-11).
 
 ## 2. Port
 
