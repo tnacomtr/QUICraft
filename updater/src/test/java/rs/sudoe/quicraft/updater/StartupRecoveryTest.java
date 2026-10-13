@@ -68,6 +68,7 @@ class StartupRecoveryTest {
         boolean failForce;
         boolean failSync;
         Error seamError;
+        volatile String syncThread;
 
         @Override
         public void force(FileChannel ch) throws IOException {
@@ -84,6 +85,7 @@ class StartupRecoveryTest {
 
         @Override
         public boolean syncDirectory(Path dir) throws IOException {
+            syncThread = Thread.currentThread().getName();
             if (seamError != null) {
                 throw seamError;
             }
@@ -171,6 +173,11 @@ class StartupRecoveryTest {
         } finally {
             lease.close();
         }
+    }
+
+    /** Fails unless {@code txn.lock} is free again, both in-process and at the OS level. */
+    private void assertTxnLockFree() throws Exception {
+        TransactionLock.tryAcquire(updateDir).close();
     }
 
     @FunctionalInterface
@@ -757,6 +764,7 @@ class StartupRecoveryTest {
                 () -> stage.toCompletableFuture().get());
         assertTrue(failure.getCause() instanceof UpdateRejectedException);
         assertEquals(StartupRecovery.MSG_HEALTH_UNCONFIRMED, failure.getCause().getMessage());
+        assertTxnLockFree();
     }
 
     @Test
@@ -769,6 +777,7 @@ class StartupRecoveryTest {
 
         assertEquals(HealthCompletion.FAILED, stage.toCompletableFuture().get());
         assertTrue(Files.exists(journalPath()));
+        assertTxnLockFree();
     }
 
     @Test
@@ -875,6 +884,7 @@ class StartupRecoveryTest {
                     new RecoveryTicket(TXID), signal, Duration.ofSeconds(5), worker);
             signal.future.complete(true);
             assertEquals(HealthCompletion.HEALTHY, awaitHealth(stage));
+            assertEquals("health-worker", ops.syncThread);
         } finally {
             worker.shutdownNow();
         }
@@ -918,6 +928,7 @@ class StartupRecoveryTest {
             ExecutionException failure = assertThrows(ExecutionException.class,
                     () -> stage.toCompletableFuture().get(5, TimeUnit.SECONDS));
             assertTrue(failure.getCause() instanceof UpdateRejectedException);
+            assertTxnLockFree();
         } finally {
             worker.shutdownNow();
         }

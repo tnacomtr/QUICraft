@@ -276,7 +276,8 @@ final class StartupRecovery {
      * <p><b>Thread model.</b> The recording step takes a file lock and does file I/O, so it runs on
      * {@code executor}. The caller must pass a platform worker executor, never the server's main thread.
      * A retry is scheduled on the same executor after {@link #HEALTH_LOCK_RETRY_DELAY}; the JDK delay thread
-     * only schedules and never blocks.
+     * only schedules and never blocks. An executor that accepts a task and then silently drops it (for example a
+     * shutdown that discards queued work) cannot be detected, and leaves the stage incomplete.
      *
      * <p><b>Busy lock.</b> {@code txn.lock} is tried up to {@link #HEALTH_LOCK_ATTEMPTS} times, one second
      * apart. If every attempt fails, the stage completes exceptionally with the lock's
@@ -322,8 +323,8 @@ final class StartupRecovery {
             HealthCompletion verdict = verdictOf(healthy, error);
             try {
                 executor.execute(() -> attemptHealth(ctx, ticket, verdict, executor, out, 1));
-            } catch (RuntimeException e) {
-                out.completeExceptionally(new UpdateRejectedException(MSG_HEALTH_UNCONFIRMED));
+            } catch (RuntimeException | Error e) {
+                failUnconfirmed(out, e);
             }
         });
         return out;
@@ -342,8 +343,8 @@ final class StartupRecovery {
                     Executor guarded = task -> {
                         try {
                             executor.execute(task);
-                        } catch (RuntimeException e) {
-                            out.completeExceptionally(new UpdateRejectedException(MSG_HEALTH_UNCONFIRMED));
+                        } catch (RuntimeException | Error e) {
+                            failUnconfirmed(out, e);
                         }
                     };
                     CompletableFuture.delayedExecutor(HEALTH_LOCK_RETRY_DELAY.toNanos(), TimeUnit.NANOSECONDS,
@@ -357,10 +358,15 @@ final class StartupRecovery {
         } catch (UpdateRejectedException e) {
             out.completeExceptionally(e);
         } catch (Throwable t) {
-            out.completeExceptionally(new UpdateRejectedException(MSG_HEALTH_UNCONFIRMED));
-            if (t instanceof VirtualMachineError) {
-                throw (VirtualMachineError) t;
-            }
+            failUnconfirmed(out, t);
+        }
+    }
+
+    /** Completes {@code out} as unconfirmed, then rethrows {@code t} only if it is a VirtualMachineError. */
+    private static void failUnconfirmed(CompletableFuture<HealthCompletion> out, Throwable t) {
+        out.completeExceptionally(new UpdateRejectedException(MSG_HEALTH_UNCONFIRMED));
+        if (t instanceof VirtualMachineError) {
+            throw (VirtualMachineError) t;
         }
     }
 
