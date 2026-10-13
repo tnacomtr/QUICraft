@@ -37,8 +37,8 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
  * <p>Each bind limits connection attempts and open connections, per IP and overall, and validates
  * client addresses with Retry under load or for an attempt over its limit (docs/protocol.md §9):
  * an {@link IngressGuard} drops floods of Initial packets before the codec, an
- * {@link AdmissionTokenHandler} answers attempts over their limit with at most a Retry, and a
- * connection over the open-connection limits is closed at once with CONNECTION_REFUSED.
+ * {@link AdmissionTokenHandler} answers attempts over a limit, including the open-connection
+ * limits, with at most a Retry, and each connection holds an open-connection lease until it closes.
  */
 public final class QuicServer implements Closeable {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -58,11 +58,19 @@ public final class QuicServer implements Closeable {
     private final EventLoopGroup group;
     private final Channel channel;
     private final Unconfirmed unconfirmed;
+    private final java.util.concurrent.atomic.AtomicLong retries;
 
-    private QuicServer(EventLoopGroup group, Channel channel, Unconfirmed unconfirmed) {
+    private QuicServer(EventLoopGroup group, Channel channel, Unconfirmed unconfirmed,
+            java.util.concurrent.atomic.AtomicLong retries) {
         this.group = group;
         this.channel = channel;
         this.unconfirmed = unconfirmed;
+        this.retries = retries;
+    }
+
+    /** Retry packets sent so far, for diagnostics and tests. */
+    long retriesSent() {
+        return retries.get();
     }
 
     /**
@@ -91,7 +99,8 @@ public final class QuicServer implements Closeable {
     public static QuicServer bind(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
             StreamAcceptor acceptor) throws Exception {
         Unconfirmed unconfirmed = new Unconfirmed();
-        io.netty.channel.ChannelHandler codec = codec(identity, config, acceptor, unconfirmed);
+        java.util.concurrent.atomic.AtomicLong retries = new java.util.concurrent.atomic.AtomicLong();
+        io.netty.channel.ChannelHandler codec = codec(identity, config, acceptor, unconfirmed, retries);
         IngressGuard guard = IngressGuard.forConfig(config);
         EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
         try {
@@ -103,7 +112,7 @@ public final class QuicServer implements Closeable {
                         }
                     })
                     .bind(address).sync().channel();
-            return new QuicServer(group, channel, unconfirmed);
+            return new QuicServer(group, channel, unconfirmed, retries);
         } catch (Exception | Error e) {
             group.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
             throw e;
@@ -119,8 +128,10 @@ public final class QuicServer implements Closeable {
             TransportConfig config, StreamAcceptor acceptor) throws Exception {
         HostedDatagramChannel channel = new HostedDatagramChannel(socket);
         Unconfirmed unconfirmed = new Unconfirmed();
+        java.util.concurrent.atomic.AtomicLong retries = new java.util.concurrent.atomic.AtomicLong();
         try {
-            channel.pipeline().addLast(IngressGuard.forConfig(config), codec(identity, config, acceptor, unconfirmed));
+            channel.pipeline().addLast(IngressGuard.forConfig(config),
+                    codec(identity, config, acceptor, unconfirmed, retries));
         } catch (Exception | Error e) {
             socket.close();
             throw e;
@@ -131,14 +142,15 @@ public final class QuicServer implements Closeable {
         } else if (registered.isDone() && !registered.isSuccess()) {
             throw new IllegalStateException("registering the QUIC listener failed", registered.cause());
         }
-        return new QuicServer(null, channel, unconfirmed);
+        return new QuicServer(null, channel, unconfirmed, retries);
     }
 
     /** Deadline for a connection passed early to complete its handshake. Tests shorten it. */
     static volatile long confirmMillis = 10_000;
 
     private static io.netty.channel.ChannelHandler codec(ServerIdentity identity, TransportConfig config,
-            StreamAcceptor acceptor, Unconfirmed unconfirmed) throws Exception {
+            StreamAcceptor acceptor, Unconfirmed unconfirmed, java.util.concurrent.atomic.AtomicLong retries)
+            throws Exception {
         EarlyTokens tokens = new EarlyTokens();
         // One per bind, like the Retry key inside the token handler.
         ConnectionAdmission admission = new ConnectionAdmission(
@@ -152,7 +164,7 @@ public final class QuicServer implements Closeable {
         return Codecs.apply(new QuicServerCodecBuilder(), config, true)
                 .sslContext(ssl)
                 // Attempt limits and address validation (Retry), docs/protocol.md §9.
-                .tokenHandler(new AdmissionTokenHandler(admission, config.retryMode))
+                .tokenHandler(new AdmissionTokenHandler(admission, config.retryMode, retries))
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
@@ -181,8 +193,9 @@ public final class QuicServer implements Closeable {
     }
 
     /**
-     * Takes an open-connection lease for {@code connection}, released when it closes. Over a limit,
-     * closes it with CONNECTION_REFUSED and returns false. Runs inside the codec's read (the channel
+     * Takes an open-connection lease for {@code connection}, released when it closes. Over a limit
+     * (not expected: the token handler checked first), closes it with CONNECTION_REFUSED and returns
+     * false. Runs inside the codec's read (the channel
      * is registered there), where the remote address is already set; fails open.
      */
     private static boolean lease(QuicChannel connection, ConnectionAdmission admission) {
@@ -198,6 +211,12 @@ public final class QuicServer implements Closeable {
             return true;
         }
         if (lease == null) {
+            // Last resort: AdmissionTokenHandler checked the same limits on this thread just before
+            // the connection was created, so this should not happen. It can't fall back cleanly:
+            // Netty sends the queued handshake flight before the close (QuicheQuicChannel.java:615-616
+            // in Netty 4.2.19, "send all that is queued before we close"), so the client completes
+            // its handshake and then sees the close, which reaches the game.
+            LOG.log(Level.FINE, "QUIC connection over the open-connection limits after admission; refusing it");
             connection.attr(REFUSED).set(Boolean.TRUE);
             Codecs.closeLater(connection, false, CONNECTION_REFUSED);
             return false;
