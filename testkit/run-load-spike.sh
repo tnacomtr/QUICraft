@@ -11,8 +11,9 @@
 #
 # Env: COUNT, RAMP_RATE, HOLD_SEC, LOAD_BIND, SOURCE_BASE, IDLE_MIN, MAX_RSS_MB, MAX_FAIL_PCT,
 # SESSION_RESUMPTION (1 to allow), LAUNCHER (installed testkit launcher), NO_SCOPE (1 skips
-# systemd-run even when present). Each JVM runs under systemd-run --user --scope with
-# MemoryMax=16G when systemd-run exists; otherwise plain java.
+# systemd-run even when present), MEM_MAX (per-JVM systemd MemoryMax, default 16G), JVM_OPTS.
+# Each JVM runs under systemd-run --user --scope with MemoryMax when systemd-run exists; otherwise
+# plain java.
 #
 # RSS sampling and cleanup use the JVM's own printed PID line: under systemd-run --scope $! is
 # systemd-run, not the JVM, and the launcher execs java only in the plain case.
@@ -30,7 +31,7 @@ IDLE_MIN="${IDLE_MIN:-10}"
 MAX_RSS_MB="${MAX_RSS_MB:-12288}"
 MAX_FAIL_PCT="${MAX_FAIL_PCT:-5}"
 LAUNCHER="${LAUNCHER:-$root/testkit/build/install/quicraft-testkit/bin/quicraft-testkit}"
-JVM_OPTS="-Xmx8g -XX:MaxDirectMemorySize=8g"
+JVM_OPTS="${JVM_OPTS:--Xmx8g -XX:MaxDirectMemorySize=8g}"
 MIN_AVAIL_KB=$((8 * 1024 * 1024))
 SAMPLE_SEC=5
 
@@ -53,7 +54,7 @@ launch() {
     local log="$1"
     shift
     if [[ -z "${NO_SCOPE:-}" ]] && command -v systemd-run >/dev/null 2>&1; then
-        JAVA_OPTS="$JVM_OPTS" systemd-run --user --scope --collect -p MemoryMax=16G -p MemorySwapMax=0 \
+        JAVA_OPTS="$JVM_OPTS" systemd-run --user --scope --collect -p MemoryMax="${MEM_MAX:-16G}" -p MemorySwapMax=0 \
             -- nice -n 5 "$LAUNCHER" "$@" > "$log" 2>&1 &
     else
         JAVA_OPTS="$JVM_OPTS" nice -n 5 "$LAUNCHER" "$@" > "$log" 2>&1 &
