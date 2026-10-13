@@ -236,7 +236,8 @@ These are requirements for the design. None is proven by implementation.
   epoch and a new revocation key resets that key's floors (transition 6); a revalidated entry that
   differs from the staged bytes discards the staging (12.10 step 4); a revocation merged by a check
   while a transaction waits blocks the swap (12.10 step 6); after a swap, no code path reads the new
-  jar (12.13).
+  jar (12.13); fresh install, then a check against the currently published revocations document,
+  reaches fresh revocation state (12.4 seed case).
 
 ## 9. Owner responsibilities
 
@@ -294,6 +295,11 @@ recommendation is given.
 - Mix-and-match: a valid signature or hash for one artifact, platform or document type applied to
   another.
 - Key compromise: a leaked primary key, recovered with the backup key (section 4).
+- Accepted limit (security review): transition 5 (12.2) lets any jar signed by a `release`-role key
+  add release keys at a higher epoch. A leaked primary could therefore ship a jar that adds a key of
+  its own, which survives revoking the leaked primary. This is within the limit below: a server that
+  installs a malicious jar already runs attacker code. See the USER DECISION in 12.2 for the
+  stricter option.
 - Clock skew on the server, in either direction.
 - Not answered (unchanged from section 4): first install, signer machine compromise. A server that
   already installed a jar signed by a leaked key runs attacker code, which can disable the updater.
@@ -369,6 +375,12 @@ PROPOSED: keep the two-key design. No separate root/release/timestamp split.
      there is none.
   Transition 6 happens **only through a hand install**: the updater never stages a jar that would
   cause it (staged-jar validation below). Transition 5 may come from an updater-installed jar.
+- **USER DECISION (key-set changes in updater-installed jars):** option: require a signature by the
+  `revocation`-role (backup) key, in addition to the release signature, on any manifest entry whose
+  jar changes the key-set fingerprint. Recommended: yes. Key-set changes are rare (rotation and
+  recovery), the backup key is involved in recovery anyway, and it closes the accepted limit in 12.1.
+  Not specified here; if chosen, it needs a format change (for example a per-entry flag and a second
+  signature) and its own review. Alternative: keep the accepted limit.
   Reason for 6: without it a leaked backup key could set `seq` and `minManifestSeq` to 2^53-1 and block
   every later update permanently, even after a manual install (security review). The transition is
   safe because it only comes from a jar that is already running: a jar with code execution needs no
@@ -539,6 +551,12 @@ over keys that are not revoked.
      the revocation key can sign it.
   2. *Current-document acceptance.* A document becomes the current one if `seq > persisted seq`, or
      `seq ==` with identical SHA-256. Equal `seq` with different bytes is equivocation (WARN once).
+     **Seed case** (fresh install, reset, or transition 6; both reviews): while the persisted
+     `revocations.sha256` is the empty string, the first validly signed document with
+     `seq >= persisted seq` becomes current; its SHA-256, `issued` and `expires` are filled in, its
+     restrictions are merged as in 1, and `minManifestSeq` is merged by max, so no floor is lowered.
+     Without this a fresh install would see `seq == floor` with a hash that cannot match the empty one
+     and never reach fresh revocation state.
      Freshness (12.6) is judged only on the current document and only if it is unexpired. A stale or
      expired document is never fresh.
 - **Withdrawn entries** are persisted with the `kid` that signed the manifest, and only for the
@@ -704,7 +722,7 @@ the first check result is used:
 - `revoked.json`: `revokedKeys` empty, `blockedArtifacts` empty.
 - `state.json`: `epoch`, `keySetFingerprint` and `revocationKey` from the running trust file;
   `revocations` = `{ "seq": <trust.revocationsSeqFloor>, "sha256": "", "issued": "", "expires": "",
-  "minManifestSeq": <trust.manifestSeqFloor> }`; `seqByKid` empty; `withdrawn` empty; `lastAnnounced`
+  "minManifestSeq": <trust.manifestSeqFloor> }` (the empty `sha256` marks the seed case of 12.4); `seqByKid` empty; `withdrawn` empty; `lastAnnounced`
   empty string; `warnedBad` empty; `tornSince` empty.
 - The clock floor is not stored. It is computed (12.5) from the trust file's `built`, the
   `revocations.issued` and the `issued` values in `seqByKid` of non-revoked kids.
@@ -750,7 +768,7 @@ Size cap 262144 bytes (1024 hashes at about 140 bytes each, plus keys, fit with 
 | `epoch` | integer 1..2^31-1 | yes | 12.2 |
 | `keySetFingerprint` | 64 hex | yes | 12.2 |
 | `revocationKey` | 64 hex | yes | `pub` of the current revocation key |
-| `revocations` | object | yes | `seq` integer, `sha256` 64 hex or empty string before the first document, `issued`/`expires` timestamps or empty, `minManifestSeq` integer |
+| `revocations` | object | yes | `seq` integer, `sha256` 64 hex, or the empty string until the first document is accepted (seed case, 12.4), `issued`/`expires` timestamps or empty, `minManifestSeq` integer |
 | `seqByKid` | object, key = kid | yes | 0..32 entries; each `seq` integer, `sha256` 64 hex, `issued` timestamp |
 | `withdrawn` | array | yes | 0..256; own platform only; unique by `sha512` |
 | `lastAnnounced` | version string or empty | yes | own platform only |
@@ -855,8 +873,12 @@ gated on blocker 10 on every platform.
    between the last authorisation and the move) and hold it through this step. Under it: re-read
    `state.json` and `revoked.json` from disk and re-authorise from that persisted state alone (no
    network): the signer of the authorising manifest is not revoked, the staged `sha512` is not blocked
-   or withdrawn, the manifest `seq` is still at or above the floor, the revocation state is still fresh.
-   Then re-hash `staging/<txid>.jar` (security review); `ATOMIC_MOVE` it over the live path (same file
+   or withdrawn, the manifest `seq` is still at or above the floor, the revocation state is still fresh,
+   and the staged jar's trust file (held in memory since step 5) passes the 12.2 staged-jar validation
+   again against this freshly read state (peer review: a revocation merged after step 5 that hits a key
+   in the staged trust file must stop the swap). If any of these fails: release `state.lock`, delete
+   `staging/<txid>.*` and the journal under `txn.lock`, keep the backup, and end the command with the
+   reason (security review); the live jar is unchanged. Otherwise re-hash `staging/<txid>.jar` (security review); `ATOMIC_MOVE` it over the live path (same file
    store required; on `AtomicMoveNotSupportedException` the transaction ends before any change, journal
    removed); fsync the live jar's directory; set `phase=swapped`. Release `state.lock`, then
    `txn.lock`. A scheduled check that wants `state.lock` meanwhile waits for this step (in-process) or
