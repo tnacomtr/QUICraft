@@ -35,6 +35,7 @@ dependencies {
     compileOnly(files(velocityProxy))
     implementation(project(path = ":core", configuration = "shadowRuntimeElements"))
     implementation(project(":bridge-netty42"))
+    implementation(project(":updater"))
     // The proxy jar carries Velocity's API, Netty and the rest, as at runtime.
     testImplementation(files(velocityProxy))
 }
