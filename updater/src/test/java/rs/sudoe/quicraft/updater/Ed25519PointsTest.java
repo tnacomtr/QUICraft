@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigInteger;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /** Small-order and canonical-encoding rejection for trusted Ed25519 public keys. */
@@ -93,6 +94,40 @@ class Ed25519PointsTest {
         assertTrue(Ed25519Points.decodes(bytes(RFC_PUB_1)));
         assertTrue(Ed25519Points.decodes(bytes(RFC_PUB_2)));
         assertTrue(Ed25519Points.decodes(bytes(RFC_PUB_3)));
+    }
+
+    /** Flips the sign bit (bit 255) of a 64-hex-digit encoding. */
+    private static byte[] withSignFlipped(String hex) throws UpdateRejectedException {
+        byte[] b = bytes(hex);
+        b[31] ^= (byte) 0x80;
+        return b;
+    }
+
+    @Test
+    void libsodiumOrderEightBlocklistIsRejected() throws Exception {
+        String order8A = "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05";
+        String order8B = "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a";
+        for (String hex : List.of(order8A, order8B)) {
+            byte[] enc = bytes(hex);
+            assertTrue(Ed25519Points.decodes(enc), hex + " should decode, so it is rejected by order");
+            assertFalse(Ed25519Points.isCanonicalPrimeOrderCandidate(enc), hex);
+            byte[] flipped = withSignFlipped(hex);
+            assertTrue(Ed25519Points.decodes(flipped), hex + " with sign flipped should decode");
+            assertFalse(Ed25519Points.isCanonicalPrimeOrderCandidate(flipped), hex + " with sign flipped");
+        }
+    }
+
+    @Test
+    void nonCanonicalYPlusOneIsRejected() throws Exception {
+        assertFalse(Ed25519Points.isCanonicalPrimeOrderCandidate(bytes("ee" + "ff".repeat(30) + "7f")));
+    }
+
+    @Test
+    void zeroYWithSignBitIsRejected() throws Exception {
+        // y = 0 decodes to x = sqrt(-1) (order 4); the sign bit does not rescue it.
+        byte[] enc = bytes("00".repeat(31) + "80");
+        assertTrue(Ed25519Points.decodes(enc));
+        assertFalse(Ed25519Points.isCanonicalPrimeOrderCandidate(enc));
     }
 
     @Test

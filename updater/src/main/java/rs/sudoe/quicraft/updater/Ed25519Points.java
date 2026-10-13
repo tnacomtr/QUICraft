@@ -7,7 +7,8 @@ import java.math.BigInteger;
  * Edwards25519 point checks for trusted public keys (RFC 8032 encoding, edwards25519 curve).
  *
  * <p>A trusted key must be a canonical encoding of a point on the curve that is not of small
- * order. Small-order keys (identity, order 2, order 4, order 8) make some signatures verify under
+ * order. Mixed-torsion points (a prime-order point plus a small-order point) are accepted by design;
+ * only small-order and non-canonical encodings are rejected. Small-order keys (identity, order 2, order 4, order 8) make some signatures verify under
  * many messages, so they are rejected before any signature check.
  */
 final class Ed25519Points {
