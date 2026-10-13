@@ -2,16 +2,22 @@
 package rs.sudoe.quicraft.updater;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import rs.sudoe.quicraft.updater.StateRecords.CurrentRevocations;
@@ -95,5 +101,28 @@ class TransactionLockTest {
         } finally {
             lease.close();
         }
+    }
+
+    @Test
+    void guardIsFreedAndChannelClosedWhenOsLockReleaseFails() throws Exception {
+        Path file = tmp.resolve("release-fails.lock");
+        Files.write(file, new byte[1]);
+        FileChannel channel = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        FileLock failing = new FileLock(channel, 0, 1, false) {
+            @Override
+            public void release() throws IOException {
+                throw new IOException("release failed");
+            }
+
+            @Override
+            public boolean isValid() {
+                return true;
+            }
+        };
+        Semaphore guard = new Semaphore(0);
+        TransactionLock.Lease lease = new TransactionLock.Lease(channel, failing, guard);
+        assertThrows(IOException.class, lease::close);
+        assertFalse(channel.isOpen());
+        assertEquals(1, guard.availablePermits());
     }
 }
