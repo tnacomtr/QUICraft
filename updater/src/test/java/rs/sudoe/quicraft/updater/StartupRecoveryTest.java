@@ -839,6 +839,29 @@ class StartupRecoveryTest {
     }
 
     @Test
+    void executorRejectingTheRetryStillCompletesTheStage() throws Exception {
+        setUpBootPending(TXID, TXID_OLD);
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.Executor firstOnly = task -> {
+            if (calls.getAndIncrement() > 0) {
+                throw new java.util.concurrent.RejectedExecutionException("shut down");
+            }
+            task.run();
+        };
+        FakeSignal signal = new FakeSignal();
+        CompletionStage<HealthCompletion> stage = StartupRecovery.completeHealth(ctx(V2),
+                new RecoveryTicket(TXID), signal, Duration.ofSeconds(5), firstOnly);
+
+        holdingTxnLock(() -> {
+            signal.future.complete(true);
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> stage.toCompletableFuture().get(10, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof UpdateRejectedException, "cause " + failure.getCause());
+        });
+        assertEquals(JournalPhase.BOOT_PENDING, readJournal().phase());
+    }
+
+    @Test
     void recordingRunsOnTheSuppliedExecutor() throws Exception {
         setUpBootPending(TXID, TXID_OLD);
         ExecutorService worker = Executors.newSingleThreadExecutor(r -> {

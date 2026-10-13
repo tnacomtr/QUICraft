@@ -338,8 +338,16 @@ final class StartupRecovery {
                 lease = TransactionLock.tryAcquire(ctx.updateDir());
             } catch (UpdateRejectedException busy) {
                 if (attempt < HEALTH_LOCK_ATTEMPTS) {
+                    // A rejection on the delay thread would otherwise be lost and leave the stage incomplete.
+                    Executor guarded = task -> {
+                        try {
+                            executor.execute(task);
+                        } catch (RuntimeException e) {
+                            out.completeExceptionally(new UpdateRejectedException(MSG_HEALTH_UNCONFIRMED));
+                        }
+                    };
                     CompletableFuture.delayedExecutor(HEALTH_LOCK_RETRY_DELAY.toNanos(), TimeUnit.NANOSECONDS,
-                            executor).execute(() -> attemptHealth(ctx, ticket, verdict, executor, out, attempt + 1));
+                            guarded).execute(() -> attemptHealth(ctx, ticket, verdict, executor, out, attempt + 1));
                 } else {
                     out.completeExceptionally(busy);
                 }
