@@ -1,9 +1,10 @@
 # Server updater (specification)
 
-**Status: in-progress specification. Not implemented. Not approved for release.** Nothing here is a
-frozen wire format or a shipped feature. Release is blocked until the blockers in section 10 are
-resolved. Section 12 is a PROPOSAL for blockers 1, 2, 3, 4, 6, 12, 16 and 17, plus the evidence
-basis for blocker 10, pending user sign-off.
+**Status: approved implementation direction, not approved for release.** No runtime updater is
+implemented. The first implementation wave adds disconnected verification primitives. Nothing is
+a published wire format or a shipped feature. Release is blocked until the remaining blockers in
+section 10 are resolved. The user approved section 12's recommendations on 2026-10-13, including
+the restart-required live-swap semantics and manual restore instead of a rollback command.
 
 Local input, not a link: the user's draft is `docs/.plans/updater-plan.md` (untracked, local only,
 not committed). This document is self-contained. Where it differs from the draft, the difference is
@@ -20,7 +21,8 @@ recorded here. The Phase 4 plan that sets this contract is
   (`fabric-26x/gradle.properties`). Fabric 1.21.11 uses `javaRelease=21`
   (`fabric-1.21.11/gradle.properties`). The draft's "Java 17+" is superseded by these targets. It
   is not a blocker.
-- The updater lives in the platform modules, not in `core`.
+- Shared updater logic lives in a separate Java 21 `updater` module, with thin platform adapters,
+  not in the Java 8 `core`. Adding this module does not yet wire or ship the updater.
 
 ## 2. Approved user choices (preserved)
 
@@ -32,6 +34,17 @@ recorded here. The Phase 4 plan that sets this contract is
 | Bad-signature output | One console WARN per distinct bad manifest by default (`update.log-bad-signatures`). |
 | Live replacement | Atomic `ATOMIC_MOVE` replacement of the live jar on Linux and macOS stays in the design. Release is blocked until loader-generation safety and crash-recovery evidence exist (section 10). |
 | Process scope | Velocity and Fabric dedicated servers only. |
+| Manifest publication | 30-day expiry, re-sign at least every 14 days; structural cap 45 days. |
+| Revocation publication | 365-day expiry; yearly backup-key signing and immediate signing on revocation; structural cap 400 days. |
+| Staging coverage | Fresh revocations with matching current bytes from at least 2 of 3 hosts. |
+| State reset | Console-only `reset-state`, preserving valid permanent revocations. |
+| Different filesystems | Fail before replacement, with manual install instructions. |
+| Key-set changes | Backup-key authentication required in addition to release authorization (12.2). |
+| Rollback | Manual restore baseline; no rollback command in v1. |
+
+Atomic live replacement means replacement of the on-disk jar while the process runs, not hot
+activation: the new version takes effect only after restart. Own-jar resources must be preloaded.
+JDK 21, macOS and crash-recovery proof remain release gates.
 
 If atomic replacement is unavailable on a platform, the updater fails safe: the installed bytes and
 the backup are kept. Showing manual install or recovery instructions is allowed. A silently
@@ -47,6 +60,7 @@ Console, or a player with `quicraft.admin.update`:
 | `/quicraft update check -s` | Same check, silent mode (section 5). |
 | `/quicraft update` | Downloads, verifies, and stages the new jar. |
 | `/quicraft update cancel` | Cancels a download or a staged update (section 5). |
+| `/quicraft update reset-state` | Console only: rebuilds resettable state while preserving valid permanent revocations (12.8). |
 
 - Nothing is downloaded or installed automatically. A scheduled check only reports.
 - Velocity has no OPs. Its notify permission is `quicraft.admin.update.notify` (draft).
@@ -277,14 +291,14 @@ These are requirements for the design. None is proven by implementation.
   the first Hangar upload.
 - Rules change without versioning. Re-check before the first release that ships the updater.
 
-## 12. Proposal (pending user sign-off)
+## 12. Approved implementation specification
 
-**Status: PROPOSED.** Nothing in this section is approved, frozen, or implemented. It proposes
-answers to section 10 blockers 1, 2, 3, 4, 6, 12, 16 and 17, and records the evidence for blocker 10,
-so they can be reviewed. Revised after a security review and a peer review. Blockers 5, 7-11 and
-13-15 stay open; where this section depends on one, it says so. Every choice gives a one-line
-reason and the rejected alternative. Items marked **USER DECISION** need the user's answer; the
-recommendation is given.
+**Status: approved for implementation, not release.** The user approved the recommendations on
+2026-10-13 after four review rounds, and separately confirmed manual restore and restart-required
+activation after an atomic on-disk swap. This answers the design choices for section 10 blockers
+1, 2, 3, 4, 6, 12, 16 and 17, and records the evidence for blocker 10. Implementation and its tests
+remain required. Blockers 5, 7-11 and 13-15 stay open where not otherwise resolved. The backup
+authentication extension below needs its own implementation security review before release.
 
 ### 12.1 Threat model this proposal answers
 
@@ -295,11 +309,9 @@ recommendation is given.
 - Mix-and-match: a valid signature or hash for one artifact, platform or document type applied to
   another.
 - Key compromise: a leaked primary key, recovered with the backup key (section 4).
-- Accepted limit (security review): transition 5 (12.2) lets any jar signed by a `release`-role key
-  add release keys at a higher epoch. A leaked primary could therefore ship a jar that adds a key of
-  its own, which survives revoking the leaked primary. This is within the limit below: a server that
-  installs a malicious jar already runs attacker code. See the USER DECISION in 12.2 for the
-  stricter option.
+- Backup authentication is required for transition 5 key-set changes (12.2). A leaked primary alone
+  cannot authorize the updater to install a jar adding a persistent release key. This does not
+  protect a server that already installed malicious code or whose backup key is compromised.
 - Clock skew on the server, in either direction.
 - Not answered (unchanged from section 4): first install, signer machine compromise. A server that
   already installed a jar signed by a leaked key runs attacker code, which can disable the updater.
@@ -375,12 +387,15 @@ PROPOSED: keep the two-key design. No separate root/release/timestamp split.
      there is none.
   Transition 6 happens **only through a hand install**: the updater never stages a jar that would
   cause it (staged-jar validation below). Transition 5 may come from an updater-installed jar.
-- **USER DECISION (key-set changes in updater-installed jars):** option: require a signature by the
-  `revocation`-role (backup) key, in addition to the release signature, on any manifest entry whose
-  jar changes the key-set fingerprint. Recommended: yes. Key-set changes are rare (rotation and
-  recovery), the backup key is involved in recovery anyway, and it closes the accepted limit in 12.1.
-  Not specified here; if chosen, it needs a format change (for example a per-entry flag and a second
-  signature) and its own review. Alternative: keep the accepted limit.
+- **APPROVED (key-set changes in updater-installed jars):** require authentication by the current,
+  non-revoked `revocation`-role (backup) key as well as normal release authorization whenever the
+  staged jar's computed key-set fingerprint differs from persisted state. Use the existing detached
+  envelope's `signatures` array: both signatures cover the same exact manifest bytes, which bind
+  the selected jar's SHA-512. No manifest flag can waive this rule. A backup-signed emergency release
+  can satisfy both roles with the same valid signature. Retain all actually verified signers and
+  recheck this requirement at revalidation and final locked authorization before replacement.
+  Co-signing never waives the prohibition on updater-driven replacement of the revocation key.
+  This is an unreleased v1 authorization extension; it needs independent implementation review.
   Reason for 6: without it a leaked backup key could set `seq` and `minManifestSeq` to 2^53-1 and block
   every later update permanently, even after a manual install (security review). The transition is
   safe because it only comes from a jar that is already running: a jar with code execution needs no
@@ -553,8 +568,9 @@ over keys that are not revoked.
      `seq ==` with identical SHA-256. Equal `seq` with different bytes is equivocation (WARN once).
      **Seed case** (fresh install, reset, or transition 6; both reviews): while the persisted
      `revocations.sha256` is the empty string, the highest-`seq` validly signed document among this
-     run's responses with `seq >= persisted seq` becomes current (so the result does not depend on host
-     order). An expired document may become current this way; it is never fresh, but it ends the seed
+     run's responses with `seq >= persisted seq` and `issued <= systemNow + 24 h` becomes current
+     (so the result does not depend on host order). An expired document may become current this way;
+     it is never fresh, but it ends the seed
      case; its SHA-256, `issued` and `expires` are filled in, its
      restrictions are merged as in 1, and `minManifestSeq` is merged by max, so no floor is lowered.
      Without this a fresh install would see `seq == floor` with a hash that cannot match the empty one
@@ -605,10 +621,10 @@ PROPOSED numbers:
   current revocations document (by `seq` and SHA-256) and give that document a multi-year lifetime.
   It touches the backup key less, but a leaked primary could then keep an old revocations document
   alive for years; the 365-day expiry is a deadline that only the backup key can extend.
-- **USER DECISION (manifest refresh):** recommended 30-day expiry and a 14-day re-sign with the
+- **APPROVED (manifest refresh):** 30-day expiry and a 14-day re-sign with the
   primary key. The freeze window equals the expiry. Alternatives: 14 days (more signing), 90 days
   (longer freeze).
-- **USER DECISION (revocation lifetime and backup-key use):** recommended 365 days, so the backup key
+- **APPROVED (revocation lifetime and backup-key use):** 365 days, so the backup key
   signs once a year. Shorter lifetimes mean more backup-key ceremonies. Longer ones mean a longer window
   in which a withheld revocation goes unnoticed. Rejected: no expiry (contradicts section 4's freshness
   rule).
@@ -640,7 +656,7 @@ PROPOSED:
 
 - Reason: an attacker controlling one host cannot hide a revocation. Rejected: 1-of-3 (one host
   withholds) and 3-of-3 (any outage blocks updates).
-- **USER DECISION (staging quorum):** recommended 2 of 3. Effect: an owner whose network blocks two
+- **APPROVED (staging quorum):** 2 of 3. Effect: an owner whose network blocks two
   hosts cannot stage updates through the updater and installs by hand.
 - Limit, stated plainly: the quorum is not proof of freshness. Two hosts replaying the same unexpired
   older document still pass; the bound is the revocation lifetime (12.5). Dependency: blocker 5 (where
@@ -710,7 +726,7 @@ Paths are relative to the per-platform updater directory `<updateDir>` (12.14).
   report it, and the owner runs a reset (below). If `revoked.json` and its `.prev` are both invalid:
   the updater disables itself until a reset, which then re-merges every revocations document it can
   fetch. Neither file is ever reset silently.
-- **USER DECISION (state reset command):** recommended: `/quicraft update reset-state` (console only)
+- **APPROVED (state reset command):** `/quicraft update reset-state` (console only)
   rebuilds `state.json` from the running trust file's seeds, keeps a valid `revoked.json`, and refetches.
   Old floors are lost, so manifests between the jar's `manifestSeqFloor` and the lost floor become
   acceptable again; the downgrade rule still blocks older versions. Alternative: documented manual
@@ -947,9 +963,11 @@ Revocations, per host (all hosts before any manifest):
 - R5. Parse strictly; `type` is `quicraft.revocations`, `v` is 1.
 - R6. Structural times: `issued < expires`, lifetime ≤ 400 days. Failing: reject as malformed.
 - R7. Restriction merge (12.4) under `state.lock`. No expiry or `seq` condition here.
-- R8. Current-document acceptance (12.4) and freshness: `issued <= systemNow + 24 h`,
-  `expires > effectiveNow`. A document failing R8 has still been merged at R7, but is not current and
-  not fresh.
+- R8. Current-document acceptance follows the sequence/seed rules (12.4) and requires
+  `issued <= systemNow + 24 h`. Expired documents may become current; freshness is a separate test
+  requiring `expires > effectiveNow`. A future-issued document still adds restrictions at R7,
+  but cannot become current or contribute a clock floor. Stale or expired current metadata never
+  provides fresh staging coverage.
 
 Manifests, per host, after every revocation response is processed:
 
@@ -983,7 +1001,7 @@ run; 3 trials per mode, then a restart.
 | Fabric Loader 0.19.5, MC 1.21.11, JDK 25 | atomic rename / in-place | old / new | old / `ZipException` | not found | clean |
 | all three | restart after swap | new | new | found | clean |
 
-Rules derived from it (PROPOSED):
+Rules derived from it (user-approved semantics, implementation safety still gated):
 
 - In-place overwrite is never used (unsafe on both loaders). Only `ATOMIC_MOVE` (12.10 step 6).
 - **The new jar takes effect only at restart.** The running version stays the old one, and the
@@ -1042,7 +1060,7 @@ Both:
 - Same file store: `ATOMIC_MOVE` needs `<updateDir>` and the scan directory on one file store
   (container setups often mount `mods/` separately). If they differ, the transaction ends before step
   5 with manual install instructions (section 2 allows this).
-- **USER DECISION (separate file stores):** recommended: keep the "fail with instructions" rule above.
+- **APPROVED (separate file stores):** keep the "fail with instructions" rule above.
   Alternative: put a temporary `.quicraft-<txid>.swap` copy (no `.jar` suffix, hidden; neither loader
   loads it, per the filters above) in the scan directory just before the move. That conflicts with
   section 5's rule that staging lives outside loader-scanned directories, so I did not choose it.
