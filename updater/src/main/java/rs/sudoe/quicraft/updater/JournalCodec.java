@@ -93,7 +93,7 @@ final class JournalCodec {
         try {
             return new JournalLive(
                     DocumentParser.stringValue(o.get("path")),
-                    DocumentParser.uintValue(o.get("size"), 0, Long.MAX_VALUE),
+                    DocumentParser.uintValue(o.get("size"), 0, JournalLive.MAX_SIZE),
                     DocumentParser.hexValue(o.get("sha512"), 64),
                     UpdateVersion.parse(DocumentParser.stringValue(o.get("version"))));
         } catch (IllegalArgumentException e) {
@@ -106,7 +106,7 @@ final class JournalCodec {
         DocumentParser.requireExactKeys(o, "size", "sha512", "version");
         try {
             return new JournalStaged(
-                    DocumentParser.uintValue(o.get("size"), 0, Long.MAX_VALUE),
+                    DocumentParser.uintValue(o.get("size"), 0, JournalLive.MAX_SIZE),
                     DocumentParser.hexValue(o.get("sha512"), 64),
                     UpdateVersion.parse(DocumentParser.stringValue(o.get("version"))));
         } catch (IllegalArgumentException e) {

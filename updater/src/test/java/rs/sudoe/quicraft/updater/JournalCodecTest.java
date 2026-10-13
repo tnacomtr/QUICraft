@@ -152,4 +152,19 @@ class JournalCodecTest {
     private static void assertRejected(byte[] bytes) {
         assertThrows(UpdateRejectedException.class, () -> JournalCodec.decode(bytes));
     }
+
+    @Test
+    void sizesAreCappedAtTwoToTheFiftyThreeMinusOne() throws Exception {
+        long max = 9007199254740991L;
+        assertEquals(max, new JournalStaged(max, HEX_C, UpdateVersion.parse("0.4.0")).size());
+        assertThrows(IllegalArgumentException.class,
+                () -> new JournalStaged(max + 1, HEX_C, UpdateVersion.parse("0.4.0")));
+        assertThrows(IllegalArgumentException.class,
+                () -> new JournalLive("/a/b.jar", max + 1, HEX_A, UpdateVersion.parse("0.3.1")));
+        String c = json(sample());
+        assertRejected(mutate(c, "\"size\":4100000", "\"size\":9007199254740992"));
+        assertRejected(mutate(c, "\"size\":4194304", "\"size\":9007199254740992"));
+        assertEquals(max, JournalCodec.decode(mutate(c, "\"size\":4194304", "\"size\":9007199254740991"))
+                .staged().size());
+    }
 }

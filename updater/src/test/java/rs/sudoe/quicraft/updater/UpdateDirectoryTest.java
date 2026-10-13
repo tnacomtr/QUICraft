@@ -14,10 +14,12 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.DirectoryNotEmptyException;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemException;
+import java.nio.file.FileSystems;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.nio.file.FileAlreadyExistsException;
-import java.nio.file.FileSystems;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -41,6 +43,7 @@ class UpdateDirectoryTest {
         final List<String> events = new ArrayList<>();
         boolean failMove;
         boolean failSync;
+        boolean syncSupported = true;
 
         @Override
         public void force(FileChannel ch) throws IOException {
@@ -58,12 +61,17 @@ class UpdateDirectoryTest {
         }
 
         @Override
-        public void syncDirectory(Path dir) throws IOException {
+        public boolean syncDirectory(Path dir) throws IOException {
             events.add("sync");
             if (failSync) {
                 throw new IOException("injected sync failure");
             }
-            DurabilityOps.system().syncDirectory(dir);
+            return syncSupported && DurabilityOps.system().syncDirectory(dir);
+        }
+
+        @Override
+        public boolean directorySyncSupported(Path dir) {
+            return syncSupported;
         }
     }
 
@@ -282,5 +290,150 @@ class UpdateDirectoryTest {
     void missingLiveJarIsAnIoError() throws Exception {
         UpdateDirectory d = open(DurabilityOps.system());
         assertThrows(NoSuchFileException.class, () -> d.copyBackup(TXID, tmp.resolve("absent.jar")));
+    }
+
+    @Test
+    void unsupportedDirectorySyncRecordsTheWarningAndContinues() throws Exception {
+        FakeOps ops = new FakeOps();
+        ops.syncSupported = false;
+        UpdateDirectory d = open(ops);
+        assertFalse(d.directorySyncSupported());
+        try (FileChannel ch = d.createPart(TXID)) {
+            ch.write(ByteBuffer.wrap(new byte[] {5}));
+            d.commitPart(TXID, ch);
+        }
+        assertEquals(List.of(UpdateDirectory.DIRECTORY_SYNC_WARNING), d.warnings());
+        assertArrayEquals(new byte[] {5}, Files.readAllBytes(d.stagingJar(TXID)));
+    }
+
+    @Test
+    void systemSyncToleratesOnlyAFailureToOpenTheDirectory() throws Exception {
+        assertFalse(DurabilityOps.system().syncDirectory(tmp.resolve("absent")));
+        assertTrue(DurabilityOps.system().syncDirectory(tmp));
+        assertTrue(DurabilityOps.system().directorySyncSupported(tmp));
+        assertFalse(DurabilityOps.system().directorySyncSupported(tmp.resolve("absent")));
+    }
+
+    @Test
+    void backupTxidsAndUnexpectedBackupEntriesAreReported() throws Exception {
+        UpdateDirectory d = open(DurabilityOps.system());
+        Files.write(d.backupJar(TXID2), new byte[] {1});
+        Files.write(d.backupJar(TXID), new byte[] {2});
+        Files.write(tmp.resolve("upd/backup/notes.txt"), new byte[] {3});
+        assertEquals(List.of(TXID, TXID2), d.backupTxids());
+        List<String> unexpected = new ArrayList<>();
+        for (Path p : d.unexpectedBackupEntries()) {
+            unexpected.add(p.getFileName().toString());
+        }
+        assertEquals(List.of("notes.txt"), unexpected);
+    }
+
+    @Test
+    void deleteBackupRemovesTheFileSyncsAndIgnoresMissing() throws Exception {
+        FakeOps ops = new FakeOps();
+        UpdateDirectory d = open(ops);
+        Files.write(d.backupJar(TXID), new byte[] {1});
+        ops.events.clear();
+        d.deleteBackup(TXID);
+        assertFalse(Files.exists(d.backupJar(TXID)));
+        assertEquals(List.of("sync"), ops.events);
+        d.deleteBackup(TXID);
+        assertEquals(List.of("sync"), ops.events, "a missing backup is a no-op");
+    }
+
+    @Test
+    void deleteBackupRefusesASymlinkAndLeavesItsTarget() throws Exception {
+        assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        UpdateDirectory d = open(DurabilityOps.system());
+        Path victim = tmp.resolve("victim.bin");
+        Files.write(victim, new byte[] {7});
+        Files.createSymbolicLink(d.backupJar(TXID), victim);
+        assertThrows(IOException.class, () -> d.deleteBackup(TXID));
+        assertArrayEquals(new byte[] {7}, Files.readAllBytes(victim));
+        assertTrue(Files.isSymbolicLink(d.backupJar(TXID)));
+    }
+
+    @Test
+    void deleteBackupRejectsAnInvalidTxid() throws Exception {
+        UpdateDirectory d = open(DurabilityOps.system());
+        assertThrows(IllegalArgumentException.class, () -> d.deleteBackup("../escape"));
+    }
+
+    @Test
+    void deleteJournalTmpRemovesAStaleTmpAndSyncsOnlyWhenItRemovedSomething() throws Exception {
+        FakeOps ops = new FakeOps();
+        UpdateDirectory d = open(ops);
+        ops.events.clear();
+        d.deleteJournalTmp();
+        assertEquals(List.of(), ops.events, "nothing to delete, no sync");
+        Files.write(tmp.resolve("upd/journal.json.tmp"), new byte[] {1});
+        d.deleteJournalTmp();
+        assertFalse(Files.exists(tmp.resolve("upd/journal.json.tmp")));
+        assertEquals(List.of("sync"), ops.events);
+    }
+
+    @Test
+    void writeJournalCleanupFailureNeverMasksTheOriginalException() throws Exception {
+        UpdateDirectory d = open(DurabilityOps.system());
+        // A non-empty directory named like the temporary file: opening it fails first, and removing
+        // it fails second. The second failure must be attached, not thrown instead.
+        Path tmpAsDir = tmp.resolve("upd/journal.json.tmp");
+        Files.createDirectory(tmpAsDir);
+        Files.write(tmpAsDir.resolve("child"), new byte[] {1});
+        IOException thrown = assertThrows(IOException.class,
+                () -> d.writeJournal(journal(TXID, JournalPhase.PREPARED)));
+        assertFalse(thrown instanceof DirectoryNotEmptyException, "original failure must surface");
+        assertTrue(thrown instanceof FileSystemException);
+        assertEquals(1, thrown.getSuppressed().length);
+        assertTrue(thrown.getSuppressed()[0] instanceof DirectoryNotEmptyException);
+    }
+
+    @Test
+    void moveOverLiveReplacesTheLiveJarAndSyncsItsDirectory() throws Exception {
+        FakeOps ops = new FakeOps();
+        UpdateDirectory d = open(ops);
+        Path mods = Files.createDirectory(tmp.resolve("mods"));
+        Path live = mods.resolve("quicraft.jar");
+        Files.write(live, new byte[] {1, 1});
+        Files.write(d.stagingJar(TXID), new byte[] {2, 2, 2});
+        ops.events.clear();
+        d.moveOverLive(TXID, live);
+        assertArrayEquals(new byte[] {2, 2, 2}, Files.readAllBytes(live));
+        assertFalse(Files.exists(d.stagingJar(TXID)));
+        assertEquals(List.of("move", "sync"), ops.events);
+        assertEquals(List.of(), d.warnings());
+    }
+
+    @Test
+    void moveOverLiveRequiresAnAbsolutePath() throws Exception {
+        UpdateDirectory d = open(DurabilityOps.system());
+        assertThrows(IllegalArgumentException.class, () -> d.moveOverLive(TXID, Path.of("quicraft.jar")));
+    }
+
+    @Test
+    void syncFailureAfterMoveOverLiveMeansTheMoveMayHaveHappened() throws Exception {
+        FakeOps ops = new FakeOps();
+        UpdateDirectory d = open(ops);
+        Path live = Files.createDirectory(tmp.resolve("mods")).resolve("quicraft.jar");
+        Files.write(live, new byte[] {1});
+        Files.write(d.stagingJar(TXID), new byte[] {9});
+        ops.failSync = true;
+        assertThrows(IOException.class, () -> d.moveOverLive(TXID, live));
+        // The documented contract: the rename already happened, so the caller must re-check the file.
+        assertArrayEquals(new byte[] {9}, Files.readAllBytes(live));
+    }
+
+    @Test
+    void sha512OfRefusesLinksAndNonRegularFiles() throws Exception {
+        assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        UpdateDirectory d = open(DurabilityOps.system());
+        Path file = tmp.resolve("data.bin");
+        Files.write(file, new byte[] {3});
+        Path link = tmp.resolve("link.bin");
+        Files.createSymbolicLink(link, file);
+        assertThrows(IOException.class, () -> UpdateDirectory.sha512Of(link));
+        assertThrows(IOException.class, () -> UpdateDirectory.sha512Of(tmp));
+        assertEquals(sha512(new byte[] {3}), UpdateDirectory.sha512Of(file));
+        assertTrue(d.backupTxids().isEmpty());
     }
 }

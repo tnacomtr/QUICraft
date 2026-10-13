@@ -9,6 +9,8 @@ import java.util.Objects;
 public record JournalLive(String path, long size, String sha512, UpdateVersion version) {
 
     static final int MAX_PATH_CHARS = 4096;
+    /** Largest integer a JSON reader can hold exactly (2^53 - 1), like the other integers in the updater. */
+    static final long MAX_SIZE = 9007199254740991L;
 
     public JournalLive {
         Objects.requireNonNull(path, "path");
@@ -23,7 +25,7 @@ public record JournalLive(String path, long size, String sha512, UpdateVersion v
         } catch (InvalidPathException e) {
             throw new IllegalArgumentException("invalid path", e);
         }
-        if (size < 0) {
+        if (size < 0 || size > MAX_SIZE) {
             throw new IllegalArgumentException("invalid size");
         }
         SharedChecks.requireLowerHex(sha512, 128, "sha512");

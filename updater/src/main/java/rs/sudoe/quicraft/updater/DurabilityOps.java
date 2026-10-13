@@ -11,7 +11,11 @@ import java.nio.file.StandardOpenOption;
 /**
  * The durability and rename primitives behind every update file write (docs/updater.md 12.8, 12.10).
  * Production code uses {@link #system()}; tests inject failing or recording implementations to
- * exercise each boundary. A failure always propagates; callers decide what it means.
+ * exercise each boundary.
+ *
+ * <p>A failure of {@link #force} or of an atomic move always propagates. For {@link #syncDirectory}
+ * only a failure to <em>open</em> the directory is tolerated (reported as {@code false}); a failing
+ * force on an opened directory propagates.
  */
 public interface DurabilityOps {
 
@@ -21,10 +25,28 @@ public interface DurabilityOps {
     /** Renames {@code from} over {@code to} atomically, or fails. Never falls back to a copy. */
     void atomicMove(Path from, Path to) throws IOException;
 
-    /** Flushes a directory so that the names created or renamed in it are durable. */
-    void syncDirectory(Path dir) throws IOException;
+    /**
+     * Flushes a directory so that the names created or renamed in it are durable.
+     *
+     * @return {@code true} when the directory was synced; {@code false} when it cannot be opened for
+     *     sync on this platform (for example Windows). Any other failure is thrown.
+     */
+    boolean syncDirectory(Path dir) throws IOException;
 
-    /** The real implementation. {@link #syncDirectory} throws when the directory cannot be synced. */
+    /**
+     * Whether {@link #syncDirectory} can open {@code dir} for sync. The default probes by opening the
+     * directory; tests may stub it.
+     */
+    default boolean directorySyncSupported(Path dir) {
+        try {
+            FileChannel.open(dir, StandardOpenOption.READ).close();
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** The real implementation. */
     static DurabilityOps system() {
         return SystemOps.INSTANCE;
     }
@@ -47,10 +69,18 @@ public interface DurabilityOps {
         }
 
         @Override
-        public void syncDirectory(Path dir) throws IOException {
-            try (FileChannel ch = FileChannel.open(dir, StandardOpenOption.READ)) {
-                ch.force(true);
+        public boolean syncDirectory(Path dir) throws IOException {
+            FileChannel ch;
+            try {
+                ch = FileChannel.open(dir, StandardOpenOption.READ);
+            } catch (IOException unsupported) {
+                // Only the open is tolerated: some platforms refuse to open a directory at all.
+                return false;
             }
+            try (FileChannel directory = ch) {
+                directory.force(true);
+            }
+            return true;
         }
     }
 }

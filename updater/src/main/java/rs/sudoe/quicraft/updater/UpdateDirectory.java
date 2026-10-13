@@ -32,9 +32,27 @@ import java.util.regex.Pattern;
  *
  * <p>Every name is built from a validated 32-hex txid. Every open uses {@code NOFOLLOW_LINKS}. Every
  * durable step goes through the injected {@link DurabilityOps}, so tests can fail any boundary.
- * Methods never swallow a durability failure.
+ *
+ * <p><b>Directory sync.</b> A directory that cannot be opened for sync (for example on Windows) is
+ * recorded as the warning {@value #DIRECTORY_SYNC_WARNING} and the step continues; a failing
+ * {@code force} always propagates. {@link #directorySyncSupported()} tells the caller whether atomic
+ * replacement is possible; the caller must refuse it when this is false.
+ *
+ * <p><b>Failure after a rename.</b> When {@code syncDirectory} throws after a successful rename
+ * ({@link #commitPart}, {@link #writeJournal}, {@link #moveOverLive}), the rename may already have
+ * happened. The caller must re-read the on-disk state (for example {@link #readJournal}) before it
+ * acts, and must not assume the rename failed.
+ *
+ * <p><b>Cleanup order.</b> When a transaction ends, delete the staging files first
+ * ({@link #deleteStaging}), then {@code journal.json} ({@link #deleteJournal}). A crash between the two
+ * leaves a journal that recovery can match to a known txid, rather than staging files that no journal
+ * refers to. The backup of the transaction recorded in the current journal must never be deleted
+ * ({@link #deleteBackup}); only backups of earlier transactions may be.
  */
 public final class UpdateDirectory {
+
+    /** Warning recorded when the directory cannot be opened for sync. Fixed text, shared with StateStore. */
+    public static final String DIRECTORY_SYNC_WARNING = "directory fsync unsupported";
 
     static final String STAGING = "staging";
     static final String BACKUP = "backup";
@@ -46,6 +64,7 @@ public final class UpdateDirectory {
     private static final int COPY_BUFFER = 65536;
     private static final Pattern TXID = Pattern.compile("[0-9a-f]{32}");
     private static final Pattern STAGING_NAME = Pattern.compile("([0-9a-f]{32})\\.(part|jar)");
+    private static final Pattern BACKUP_NAME = Pattern.compile("([0-9a-f]{32})\\.jar");
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final Path dir;
@@ -53,6 +72,7 @@ public final class UpdateDirectory {
     private final Path backup;
     private final DurabilityOps ops;
     private final UserPrincipal owner;
+    private final List<String> warnings = new ArrayList<>();
 
     /**
      * Prepares the directory tree: refuses links and foreign owners (via {@link StateStore}), then
@@ -95,6 +115,16 @@ public final class UpdateDirectory {
         return dir.resolve(JOURNAL);
     }
 
+    /** True when this platform can sync directories, so atomic replacement may be offered. */
+    public boolean directorySyncSupported() {
+        return ops.directorySyncSupported(dir);
+    }
+
+    /** Warnings recorded so far by this instance (a copy). Currently only {@link #DIRECTORY_SYNC_WARNING}. */
+    public List<String> warnings() {
+        return List.copyOf(warnings);
+    }
+
     /** Creates {@code staging/<txid>.part} with {@code CREATE_NEW}, {@code NOFOLLOW_LINKS}, {@code 0600}. */
     public FileChannel createPart(String txid) throws IOException {
         return FileChannel.open(stagingPart(txid),
@@ -106,19 +136,41 @@ public final class UpdateDirectory {
     /**
      * Makes a finished part durable and moves it to its jar name: force and close the channel,
      * atomically rename {@code .part} to {@code .jar}, then sync {@code staging/}.
+     *
+     * <p>If the directory sync throws after the rename, the jar is at its final name but the
+     * rename's durability is unconfirmed; see the class note on failure after a rename.
      */
     public void commitPart(String txid, FileChannel ch) throws IOException {
         try (FileChannel c = ch) {
             ops.force(c);
         }
         ops.atomicMove(stagingPart(txid), stagingJar(txid));
-        ops.syncDirectory(staging);
+        syncDir(staging);
+    }
+
+    /**
+     * Atomically moves the verified staged jar of {@code txid} over the live jar at {@code livePath},
+     * then syncs the live jar's directory.
+     *
+     * <p>If the directory sync throws, the move may already have happened. The caller must check the
+     * live jar's hash before deciding anything (see the class note on failure after a rename).
+     *
+     * @throws IllegalArgumentException if {@code livePath} is not absolute or has no parent
+     */
+    public void moveOverLive(String txid, Path livePath) throws IOException {
+        Objects.requireNonNull(livePath, "livePath");
+        if (!livePath.isAbsolute() || livePath.getParent() == null) {
+            throw new IllegalArgumentException("live path must be absolute");
+        }
+        ops.atomicMove(stagingJar(txid), livePath);
+        syncDir(livePath.getParent());
     }
 
     /**
      * Copies the live jar to {@code backup/<txid>.jar} ({@code CREATE_NEW}, {@code NOFOLLOW_LINKS}),
      * forces it, syncs {@code backup/}, re-hashes the copy and returns its SHA-512 (lowercase hex).
-     * The caller compares that value with the live jar's hash. A failed copy is deleted.
+     * The caller compares that value with the live jar's hash. A failed copy is deleted; a backup
+     * that already exists is never touched.
      */
     public String copyBackup(String txid, Path liveJar) throws IOException {
         Objects.requireNonNull(liveJar, "liveJar");
@@ -149,7 +201,7 @@ public final class UpdateDirectory {
                 Files.deleteIfExists(target);
             }
         }
-        ops.syncDirectory(backup);
+        syncDir(backup);
         return sha512Of(target);
     }
 
@@ -178,6 +230,11 @@ public final class UpdateDirectory {
      * Writes {@code journal.json} atomically: write {@code journal.json.tmp}, force, rename over the
      * target, sync the directory. A failure before the rename leaves the previous journal intact.
      * No {@code .prev} copy is kept for the journal.
+     *
+     * <p>If the directory sync throws after the rename, the new journal may already be in place. The
+     * caller must re-read it with {@link #readJournal} before acting. A failure while removing the
+     * temporary file after an earlier failure is attached as suppressed and never replaces the original
+     * exception.
      */
     public void writeJournal(JournalRecord record) throws IOException {
         byte[] bytes = JournalCodec.encode(record);
@@ -195,10 +252,24 @@ public final class UpdateDirectory {
             }
             ops.atomicMove(tmp, journal());
         } catch (IOException | RuntimeException e) {
-            Files.deleteIfExists(tmp);
+            try {
+                Files.deleteIfExists(tmp);
+            } catch (IOException cleanup) {
+                e.addSuppressed(cleanup);
+            }
             throw e;
         }
-        ops.syncDirectory(dir);
+        syncDir(dir);
+    }
+
+    /**
+     * Deletes a stale {@code journal.json.tmp} left by a crash during {@link #writeJournal}. Syncs the
+     * directory only when a file was removed. Never touches {@code journal.json} itself.
+     */
+    public void deleteJournalTmp() throws IOException {
+        if (Files.deleteIfExists(dir.resolve(JOURNAL + TMP))) {
+            syncDir(dir);
+        }
     }
 
     /**
@@ -221,36 +292,88 @@ public final class UpdateDirectory {
         }
     }
 
-    /** Deletes {@code journal.json} if present and syncs the directory. */
+    /**
+     * Deletes {@code journal.json} if present and syncs the directory. Call only after
+     * {@link #deleteStaging} for the same transaction (see the class note on cleanup order).
+     */
     public void deleteJournal() throws IOException {
-        Files.deleteIfExists(journal());
-        ops.syncDirectory(dir);
+        if (Files.deleteIfExists(journal())) {
+            syncDir(dir);
+        }
     }
 
-    /** Deletes the part and jar of one transaction. Missing files are ignored. */
+    /**
+     * Deletes the part and jar of one transaction. Missing files are ignored. Call this before
+     * {@link #deleteJournal} (see the class note on cleanup order).
+     */
     public void deleteStaging(String txid) throws IOException {
         Files.deleteIfExists(stagingPart(txid));
         Files.deleteIfExists(stagingJar(txid));
     }
 
-    /** Txids that have at least one entry named {@code <txid>.part} or {@code <txid>.jar} in {@code staging/}. */
+    /**
+     * Deletes {@code backup/<txid>.jar}. A missing backup is ignored. A symbolic link or any other
+     * non-regular entry is refused with {@link IOException} and left in place. Syncs {@code backup/}
+     * after a deletion.
+     *
+     * <p><b>Callers must never delete the backup of the txid recorded in the current journal.</b> That
+     * backup is the rollback copy of the running generation; only backups of earlier transactions may
+     * be deleted.
+     */
+    public void deleteBackup(String txid) throws IOException {
+        Path p = backupJar(txid);
+        if (!Files.exists(p, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        if (!Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("backup is not a regular file");
+        }
+        Files.delete(p);
+        syncDir(backup);
+    }
+
+    /** Txids that have a regular file named {@code <txid>.part} or {@code <txid>.jar} in {@code staging/}. */
     public List<String> stagingTxids() throws IOException {
         TreeSet<String> out = new TreeSet<>();
-        for (Path p : listStaging()) {
+        for (Path p : listDirectory(staging)) {
             Matcher m = STAGING_NAME.matcher(p.getFileName().toString());
-            if (m.matches() && !Files.isSymbolicLink(p)) {
+            if (m.matches() && Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) {
                 out.add(m.group(1));
             }
         }
         return List.copyOf(out);
     }
 
-    /** Entries in {@code staging/} whose names do not match the fixed patterns, or that are links. */
+    /** Entries in {@code staging/} whose names do not match the fixed patterns, or that are not regular files. */
     public List<Path> unexpectedStagingEntries() throws IOException {
         List<Path> out = new ArrayList<>();
-        for (Path p : listStaging()) {
+        for (Path p : listDirectory(staging)) {
             Matcher m = STAGING_NAME.matcher(p.getFileName().toString());
-            if (!m.matches() || Files.isSymbolicLink(p)) {
+            if (!m.matches() || !Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) {
+                out.add(p);
+            }
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    /** Txids that have a regular file named {@code <txid>.jar} in {@code backup/}. */
+    public List<String> backupTxids() throws IOException {
+        TreeSet<String> out = new TreeSet<>();
+        for (Path p : listDirectory(backup)) {
+            Matcher m = BACKUP_NAME.matcher(p.getFileName().toString());
+            if (m.matches() && Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) {
+                out.add(m.group(1));
+            }
+        }
+        return List.copyOf(out);
+    }
+
+    /** Entries in {@code backup/} whose names do not match {@code <txid>.jar}, or that are not regular files. */
+    public List<Path> unexpectedBackupEntries() throws IOException {
+        List<Path> out = new ArrayList<>();
+        for (Path p : listDirectory(backup)) {
+            Matcher m = BACKUP_NAME.matcher(p.getFileName().toString());
+            if (!m.matches() || !Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) {
                 out.add(p);
             }
         }
@@ -262,11 +385,40 @@ public final class UpdateDirectory {
         return Files.getFileStore(liveJar).equals(Files.getFileStore(staging));
     }
 
+    /**
+     * SHA-512 of a regular file, opened with {@code NOFOLLOW_LINKS}, as lowercase hex.
+     *
+     * @throws IOException if the path is a link or any other non-regular file
+     */
+    static String sha512Of(Path file) throws IOException {
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IOException("not a regular file");
+        }
+        MessageDigest md = sha512();
+        try (FileChannel ch = FileChannel.open(file,
+                Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS))) {
+            ByteBuffer buf = ByteBuffer.allocate(COPY_BUFFER);
+            while (ch.read(buf) >= 0) {
+                buf.flip();
+                md.update(buf);
+                buf.clear();
+            }
+        }
+        return Hex.encode(md.digest());
+    }
+
     // ---- helpers -------------------------------------------------------------------------------
 
-    private List<Path> listStaging() throws IOException {
+    /** Syncs a directory through the seam; records the fixed warning when the directory cannot be opened. */
+    private void syncDir(Path d) throws IOException {
+        if (!ops.syncDirectory(d) && !warnings.contains(DIRECTORY_SYNC_WARNING)) {
+            warnings.add(DIRECTORY_SYNC_WARNING);
+        }
+    }
+
+    private static List<Path> listDirectory(Path base) throws IOException {
         List<Path> out = new ArrayList<>();
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(staging)) {
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(base)) {
             for (Path p : stream) {
                 out.add(p);
             }
@@ -307,21 +459,6 @@ public final class UpdateDirectory {
         buf.flip();
         buf.get(out);
         return out;
-    }
-
-    /** SHA-512 of a file, opened with {@code NOFOLLOW_LINKS}, as lowercase hex. */
-    private static String sha512Of(Path file) throws IOException {
-        MessageDigest md = sha512();
-        try (FileChannel ch = FileChannel.open(file,
-                Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS))) {
-            ByteBuffer buf = ByteBuffer.allocate(COPY_BUFFER);
-            while (ch.read(buf) >= 0) {
-                buf.flip();
-                md.update(buf);
-                buf.clear();
-            }
-        }
-        return Hex.encode(md.digest());
     }
 
     private static MessageDigest sha512() {
