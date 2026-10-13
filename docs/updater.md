@@ -230,6 +230,13 @@ These are requirements for the design. None is proven by implementation.
 - Fail-safe: an exception inside a check never reaches the server.
 - Integration (testkit): Velocity updates from a mock release server signed with test keys,
   restarts, and still accepts TCP and QUIC joins.
+- PROPOSED (section 12): a staged jar whose trust file names a revocation key other than the persisted
+  one is rejected before the swap, even when validly signed (12.2, N1); a staged jar with the same
+  epoch and a different key-set fingerprint is rejected (12.2, N2); a hand-installed jar with a higher
+  epoch and a new revocation key resets that key's floors (transition 6); a revalidated entry that
+  differs from the staged bytes discards the staging (12.10 step 4); a revocation merged by a check
+  while a transaction waits blocks the swap (12.10 step 6); after a swap, no code path reads the new
+  jar (12.13).
 
 ## 9. Owner responsibilities
 
@@ -336,29 +343,44 @@ PROPOSED: keep the two-key design. No separate root/release/timestamp split.
 - **Read once.** The running jar's trust file, its own version metadata and every other resource the
   updater reads from its own jar are read once at plugin or mod init into memory, and never again in
   that process (12.13 explains why).
+- **Key-set fingerprint** (peer review: makes the same-epoch check implementable). Sort `keys` by
+  `pub` (lowercase hex, ascending). For each key, append the 32 raw public-key bytes and one role byte
+  (bit 0 = `release`, bit 1 = `revocation`). The fingerprint is the lowercase hex SHA-256 of that byte
+  string. It is persisted as `keySetFingerprint` (12.8).
 - **Trust-epoch transitions** (only ever from the running jar's trust file, never from network data).
-  The persisted state records `epoch` and the revocation key's `pub` (12.8):
+  The persisted state records `epoch`, `keySetFingerprint` and the revocation key's `pub` (12.8).
+  Exactly one case applies:
   1. No persisted state: initialise from the trust file (12.8, "Initialisation").
-  2. Same epoch, same revocation key: normal operation.
-  3. Same epoch, different key set: the trust file is invalid; updater disabled, WARN.
+  2. Same epoch, same `keySetFingerprint`: normal operation.
+  3. Same epoch, different `keySetFingerprint`: the trust file is invalid; updater disabled, WARN.
   4. Lower epoch (an older jar installed by hand): checks report only; staging disabled; WARN once per
      start. Persisted revocations still apply to its keys.
-  5. Higher epoch, same revocation key (routine rotation, or primary recovery): store the new epoch;
-     every floor and union is kept.
+  5. Higher epoch, same revocation key (routine rotation, or primary recovery): store the new epoch
+     and fingerprint; every floor and union is kept.
   6. Higher epoch, **different** revocation key (recovery after a backup-key compromise or loss): store
-     the new epoch and key; drop the revocation `seq`, `sha256`, `minManifestSeq` and clock
-     contribution recorded for the old revocation key; seed them from the trust file's
+     the new epoch, fingerprint and key; drop the revocation `seq`, `sha256`, `minManifestSeq` and
+     clock contribution recorded for the old revocation key; seed them from the trust file's
      `revocationsSeqFloor` and `manifestSeqFloor`; add the old revocation `pub` to `revokedKeys`. Keep
      `revokedKeys` and `blockedArtifacts` (permanent union) and the per-`kid` manifest floors of keys
-     that are not revoked.
+     that are not revoked. From here on `revocations.seq` and `revocationsSeqFloor` count documents
+     signed by the **new** revocation key only; its counter may start again at 1 (security review N3).
+     The signing tool (blocker 15) must check that a trust file's `revocationsSeqFloor` equals the
+     `seq` of the newest revocations document signed by that trust file's revocation key, or 0 if
+     there is none.
+  Transition 6 happens **only through a hand install**: the updater never stages a jar that would
+  cause it (staged-jar validation below). Transition 5 may come from an updater-installed jar.
   Reason for 6: without it a leaked backup key could set `seq` and `minManifestSeq` to 2^53-1 and block
   every later update permanently, even after a manual install (security review). The transition is
   safe because it only comes from a jar that is already running: a jar with code execution needs no
   trust-file trick. The replacement keys of a recovery must be freshly generated, so a leaked backup
   key cannot have revoked them in advance. Rejected: epoch as information only (no recovery path).
 - **Validating a staged jar's trust file** (before the swap, 12.10 step 5): it parses under the same
-  rules; exactly one `revocation` key; no `pub` in the persisted `revokedKeys`; `epoch` not lower than
-  the running epoch. Otherwise the staged jar is rejected (security review).
+  rules; exactly one `revocation` key, and its `pub` **equals the persisted `revocationKey`** (security
+  review N1: a key change is transition 6, hand install only, matching the roles rule above); no `pub`
+  in the persisted `revokedKeys`; `epoch` not lower than the persisted epoch; and if `epoch` equals the
+  persisted epoch, its fingerprint equals the persisted `keySetFingerprint` (security review N2:
+  otherwise the jar would disable its own updater at restart through transition 3). Otherwise the
+  staged jar is rejected and its staging files are deleted.
 
 - JDK use: wrap the raw key in the fixed X.509 prefix `302a300506032b6570032100` and load it with
   `KeyFactory.getInstance("Ed25519")` and `X509EncodedKeySpec`; verify with
@@ -387,7 +409,8 @@ PROPOSED:
 - **Parser:** a small strict JSON reader in the updater code, not Gson. Reason: Gson silently keeps
   the last duplicate key and differs between platform versions. Rejected: Gson or Jackson (behaviour
   varies, Jackson is a new dependency). Rules: strict UTF-8 (malformed sequences and a BOM are
-  rejected); max nesting depth 4; max string length 256 chars; max array length as per field; object
+  rejected); max nesting depth 4; max string length 256 chars, except where a field's table states a larger limit (only the journal's
+  `live.path`, ≤ 4096 chars); max array length as per field; object
   keys unique (duplicate = reject); unknown keys rejected; missing required keys rejected; no
   trailing data after the top-level value except ASCII whitespace.
 - **Size caps (bytes, enforced while reading, before hashing):** `release.json` 65536;
@@ -675,8 +698,16 @@ Paths are relative to the per-platform updater directory `<updateDir>` (12.14).
 
 #### Initialisation
 
-With no state files: `epoch`, revocation key and seeds from the running trust file; empty unions;
-`seqByKid` empty; `clockFloor` from `built`. Write both files before the first check result is used.
+With no state files, every field starts as follows (peer review), and both files are written before
+the first check result is used:
+
+- `revoked.json`: `revokedKeys` empty, `blockedArtifacts` empty.
+- `state.json`: `epoch`, `keySetFingerprint` and `revocationKey` from the running trust file;
+  `revocations` = `{ "seq": <trust.revocationsSeqFloor>, "sha256": "", "issued": "", "expires": "",
+  "minManifestSeq": <trust.manifestSeqFloor> }`; `seqByKid` empty; `withdrawn` empty; `lastAnnounced`
+  empty string; `warnedBad` empty; `tornSince` empty.
+- The clock floor is not stored. It is computed (12.5) from the trust file's `built`, the
+  `revocations.issued` and the `issued` values in `seqByKid` of non-revoked kids.
 
 #### `revoked.json` (normative)
 
@@ -703,11 +734,11 @@ Size cap 262144 bytes (1024 hashes at about 140 bytes each, plus keys, fit with 
   "type": "quicraft.updater-state",
   "v": 1,
   "epoch": 1,
+  "keySetFingerprint": "<64 hex>",
   "revocationKey": "<64 hex>",
   "revocations": { "seq": 3, "sha256": "<64 hex>", "issued": "2026-11-01T12:00:00Z", "expires": "2027-11-01T12:00:00Z", "minManifestSeq": 0 },
-  "keys": { "0123456789abcdef": { "seq": 42, "sha256": "<64 hex>", "issued": "2026-11-01T12:00:00Z" } },
+  "seqByKid": { "0123456789abcdef": { "seq": 42, "sha256": "<64 hex>", "issued": "2026-11-01T12:00:00Z" } },
   "withdrawn": [ { "sha512": "<128 hex>", "version": "0.4.1", "kid": "0123456789abcdef" } ],
-  "liveSha512AtInit": "<128 hex>",
   "lastAnnounced": "0.4.0",
   "warnedBad": [ "<64 hex>" ],
   "tornSince": { "modrinth": "2026-11-01T12:00:00Z" }
@@ -717,26 +748,30 @@ Size cap 262144 bytes (1024 hashes at about 140 bytes each, plus keys, fit with 
 | Field | Type | Required | Cardinality / rule |
 | --- | --- | --- | --- |
 | `epoch` | integer 1..2^31-1 | yes | 12.2 |
+| `keySetFingerprint` | 64 hex | yes | 12.2 |
 | `revocationKey` | 64 hex | yes | `pub` of the current revocation key |
 | `revocations` | object | yes | `seq` integer, `sha256` 64 hex or empty string before the first document, `issued`/`expires` timestamps or empty, `minManifestSeq` integer |
-| `keys` | object, key = kid | yes | 0..32 entries; each `seq` integer, `sha256` 64 hex, `issued` timestamp |
+| `seqByKid` | object, key = kid | yes | 0..32 entries; each `seq` integer, `sha256` 64 hex, `issued` timestamp |
 | `withdrawn` | array | yes | 0..256; own platform only; unique by `sha512` |
-| `liveSha512AtInit` | 128 hex | yes | hash of the live jar when this process started (on-disk change detection) |
 | `lastAnnounced` | version string or empty | yes | own platform only |
 | `warnedBad` | array of 64 hex | yes | 0..32, oldest dropped first (it only limits log lines) |
 | `tornSince` | object, key in `modrinth`, `github`, `sudoe` | yes | first time a host was seen torn |
 
 Size cap 131072 bytes.
 
+`liveSha512AtInit` is **not** persisted (peer review). It is held in memory only, computed on every
+process init from the verified live bytes (12.11 step 1), and never carried over from a predecessor
+process or generation.
+
 #### Growth policy (security and peer review)
 
 - Pruning that never loses a protection: withdrawn entries whose version is not greater than
-  `max(running, on-disk)`, withdrawn entries and `keys` entries of revoked kids, and the old revocation
+  `max(running, on-disk)`, withdrawn entries and `seqByKid` entries of revoked kids, and the old revocation
   key's floors on transition 6 (12.2). `warnedBad` is a bounded log-suppression list, not a protection.
 - After pruning, if merging a document would exceed a cardinality limit, the document is **not merged**
   and not accepted, the state is unchanged, staging is disabled while that persists, and a WARN is
   logged once per day ("updater state full"). Nothing already persisted is evicted. Only a leaked
-  release key (withdrawn, `keys`) or the revocation key (`revoked.json`) can cause this, and revocation
+  release key (withdrawn, `seqByKid`) or the revocation key (`revoked.json`) can cause this, and revocation
   or an epoch transition clears the first case.
 
 #### `journal.json` (normative)
@@ -784,8 +819,8 @@ Size cap 8192 bytes. Unknown fields rejected.
   - Lock order is always `txn` then `state`. A busy OS lock held by another process means "another
     server uses this directory": refuse with a message, never wait.
 - **Admission (security and peer review).** `/quicraft update` is refused when any of these is true:
-  a `journal.json` exists in any phase; the live jar's hash differs from `liveSha512AtInit` (the jar
-  changed on disk since start); the trust epoch is lower than the persisted one; the state is full; or
+  a `journal.json` exists in any phase; the live jar's hash differs from the in-memory `liveSha512AtInit` of
+  this process (the jar changed on disk since start); the trust epoch is lower than the persisted one; the state is full; or
   QUICraft's init has not finished (12.13). A swapped-but-not-restarted update therefore blocks a
   second one until restart and health pass.
 - **Cancel (peer review).** `/quicraft update cancel` never takes `txn.lock`. It sets the cancel token
@@ -808,15 +843,25 @@ gated on blocker 10 on every platform.
    `staging/<txid>.jar`; fsync `staging/` (peer review: the bytes and the name are durable before
    anything depends on them).
 4. Revalidate manifest, keys, revocations, freshness, version against `max(running, on-disk)`,
-   withdrawn and blocked sets.
+   withdrawn and blocked sets (12.12). The revalidated entry's `platform`, `version`, `size` and
+   `sha512` must equal those of the staged bytes (peer review). If they differ (for example a newer
+   manifest now names another build), delete `staging/<txid>.*` and restart the transaction from step 1
+   under a new `txid`, at most once per command; a second mismatch ends the command with a message.
 5. `backup-ready`: validate the staged jar's own trust file and version metadata (12.2) without
    loading it as code; copy the live jar to `backup/<txid>.jar`, `force(true)`, fsync `backup/`,
    check its SHA-512; write the journal with `phase=prepared` (atomic). Log the exact manual rollback
    command.
-6. `installed-pending-restart`: re-hash `staging/<txid>.jar` immediately before the move (security
-   review); `ATOMIC_MOVE` it over the live path (same file store required; on
-   `AtomicMoveNotSupportedException` the transaction ends before any change, journal removed); fsync
-   the live jar's directory; set `phase=swapped`. Release `txn.lock`. From here on the process reads
+6. `installed-pending-restart`: take `state.lock` (peer review: no check may merge a revocation
+   between the last authorisation and the move) and hold it through this step. Under it: re-read
+   `state.json` and `revoked.json` from disk and re-authorise from that persisted state alone (no
+   network): the signer of the authorising manifest is not revoked, the staged `sha512` is not blocked
+   or withdrawn, the manifest `seq` is still at or above the floor, the revocation state is still fresh.
+   Then re-hash `staging/<txid>.jar` (security review); `ATOMIC_MOVE` it over the live path (same file
+   store required; on `AtomicMoveNotSupportedException` the transaction ends before any change, journal
+   removed); fsync the live jar's directory; set `phase=swapped`. Release `state.lock`, then
+   `txn.lock`. A scheduled check that wants `state.lock` meanwhile waits for this step (in-process) or
+   skips its write until the next check (other process); the step does no network I/O, so the wait is
+   short. From here on the process reads
    no own-jar resource (12.13).
 7. After restart, in the new generation: startup recovery (12.11) sets `phase=boot-pending` and
    increments `bootAttempts` before anything else -> `health-check-pending`. When the health criteria
@@ -858,9 +903,13 @@ Limit: if the new generation fails before the updater's init runs (for example t
 jar), no project code can recover it. That is why the manual rollback command is logged at step 5 of
 12.10, before the swap.
 
-**USER DECISION (rollback command):** recommended: add `/quicraft update rollback` for
-`recovery-required` (copy the backup to staging, then the same steps 5 and 6 under a new `txid`).
-Alternative: manual restore only. The command adds a second live swap and depends on blocker 10.
+**Baseline: restoration is manual only** (peer review). The owner stops the server, copies
+`backup/<txid>.jar` over the live jar, and starts it; step 4 recognises the restore.
+
+> **Pending user decision, not specified:** a `/quicraft update rollback` command. It would be a
+> second live swap and would need its own admission rules, staged-jar validation and crash-recovery
+> transitions (and blocker 10's evidence) before it could be specified. Those are deliberately not
+> designed here.
 
 ### 12.12 Verification algorithm
 
@@ -891,7 +940,8 @@ Manifests, per host, after every revocation response is processed:
   with an exact target match; version greater than `max(running, on-disk)`; hash not blocked or
   withdrawn; coverage (12.6).
 
-Staging repeats R1 to M8 at step 4 of 12.10.
+Staging repeats R1 to M8 at step 4 of 12.10, and step 6 re-authorises from persisted state under
+`state.lock`.
 
 ### 12.13 Live-swap evidence and rules (basis for blocker 10)
 
