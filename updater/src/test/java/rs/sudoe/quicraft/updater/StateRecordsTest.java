@@ -380,6 +380,97 @@ class StateRecordsTest {
                 () -> r.revokedPubs().add(PUB));
     }
 
+    // ---- Null hex components are NullPointerException ----
+
+    @Test
+    void persistedTrustRejectsNullHexFieldsWithNpe() {
+        assertThrows(NullPointerException.class, () -> new PersistedTrust(1, null, PUB));
+        assertThrows(NullPointerException.class, () -> new PersistedTrust(1, SHA256, null));
+    }
+
+    @Test
+    void kidSeqRejectsNullSha256WithNpe() {
+        assertThrows(NullPointerException.class, () -> new KidSeq(1, null, T0));
+    }
+
+    @Test
+    void withdrawnEntryRejectsNullHexFieldsWithNpe() throws UpdateRejectedException {
+        UpdateVersion v = UpdateVersion.parse("0.4.1");
+        assertThrows(NullPointerException.class, () -> new WithdrawnEntry(null, v, KID));
+        assertThrows(NullPointerException.class, () -> new WithdrawnEntry(SHA512, v, null));
+    }
+
+    @Test
+    void currentRevocationsRejectsNullSha256WithNpe() {
+        assertThrows(NullPointerException.class, () -> new CurrentRevocations(0, null, null, null, 0));
+    }
+
+    @Test
+    void updaterStateRejectsNullHexFieldsWithNpe() throws UpdateRejectedException {
+        UpdaterState base = validState();
+        assertThrows(NullPointerException.class, () -> new UpdaterState(1, null, PUB,
+                base.revocations(), Map.of(), List.of(), "", List.of(), Map.of()));
+        assertThrows(NullPointerException.class, () -> new UpdaterState(1, SHA256, null,
+                base.revocations(), Map.of(), List.of(), "", List.of(), Map.of()));
+        Map<String, KidSeq> nullKey = new HashMap<>();
+        nullKey.put(null, new KidSeq(1, SHA256, T0));
+        assertThrows(NullPointerException.class, () -> new UpdaterState(1, SHA256, PUB,
+                base.revocations(), nullKey, List.of(), "", List.of(), Map.of()));
+    }
+
+    @Test
+    void revokedStateRejectsNullRevokedKeyHexWithNpe() {
+        assertThrows(NullPointerException.class, () -> new RevokedState(
+                List.of(new UpdateDocuments.RevokedKey(KID, null)), List.of()));
+        assertThrows(NullPointerException.class, () -> new RevokedState(
+                List.of(new UpdateDocuments.RevokedKey(null, PUB_B)), List.of()));
+    }
+
+    // ---- Defensive copies after construction ----
+
+    @Test
+    void updaterStateSeqByKidIsCopiedFromMutableInput() throws UpdateRejectedException {
+        Map<String, KidSeq> seq = new HashMap<>();
+        seq.put(KID, new KidSeq(1, SHA256, T0));
+        UpdaterState base = validState();
+        UpdaterState s = new UpdaterState(1, SHA256, PUB, base.revocations(), seq, List.of(),
+                "", List.of(), Map.of());
+        seq.put(KID_B, new KidSeq(2, SHA256_B, T1));
+        seq.remove(KID);
+        assertEquals(Set.of(KID), s.seqByKid().keySet());
+        assertEquals(1, s.seqByKid().get(KID).seq());
+        assertThrows(UnsupportedOperationException.class,
+                () -> s.seqByKid().put(KID_B, new KidSeq(1, SHA256, T0)));
+    }
+
+    @Test
+    void updaterStateWithdrawnIsCopiedFromMutableInput() throws UpdateRejectedException {
+        UpdateVersion v = UpdateVersion.parse("0.4.1");
+        List<WithdrawnEntry> withdrawn = new ArrayList<>(List.of(new WithdrawnEntry(SHA512, v, KID)));
+        UpdaterState base = validState();
+        UpdaterState s = new UpdaterState(1, SHA256, PUB, base.revocations(), Map.of(), withdrawn,
+                "", List.of(), Map.of());
+        withdrawn.add(new WithdrawnEntry(SHA512_B, v, KID_B));
+        withdrawn.clear();
+        assertEquals(1, s.withdrawn().size());
+        assertEquals(SHA512, s.withdrawn().get(0).sha512());
+        assertThrows(UnsupportedOperationException.class,
+                () -> s.withdrawn().add(new WithdrawnEntry(SHA512_B, v, KID)));
+    }
+
+    @Test
+    void revokedStateRevokedKeysAreCopiedFromMutableInput() {
+        List<UpdateDocuments.RevokedKey> keys = new ArrayList<>(
+                List.of(new UpdateDocuments.RevokedKey(KID, PUB_B)));
+        RevokedState r = new RevokedState(keys, List.of());
+        keys.add(new UpdateDocuments.RevokedKey(KID_B, PUB));
+        keys.clear();
+        assertEquals(List.of(new UpdateDocuments.RevokedKey(KID, PUB_B)), r.revokedKeys());
+        assertEquals(Set.of(PUB_B), r.revokedPubs());
+        assertThrows(UnsupportedOperationException.class,
+                () -> r.revokedKeys().add(new UpdateDocuments.RevokedKey(KID_B, PUB)));
+    }
+
     // ---- Snapshot and StateDelta ----
 
     @Test

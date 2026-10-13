@@ -229,7 +229,8 @@ public final class StateRecords {
 
     /** Throws unless {@code s} is exactly {@code chars} characters of lowercase hex. */
     private static void requireHex(String s, int chars, String field) {
-        if (s == null || s.length() != chars) {
+        Objects.requireNonNull(s, field);
+        if (s.length() != chars) {
             throw new IllegalArgumentException("invalid " + field);
         }
         for (int i = 0; i < s.length(); i++) {
