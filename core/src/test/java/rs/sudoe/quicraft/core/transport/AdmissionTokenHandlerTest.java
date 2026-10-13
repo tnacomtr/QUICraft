@@ -19,28 +19,45 @@ import org.junit.jupiter.api.Test;
 
 /**
  * Admission limits layered on the Retry token handler ({@link AdmissionTokenHandler},
- * docs/protocol.md §9). {@link #writeToken} and {@link #validateToken} are driven directly, with an
- * injected frozen clock so no window can roll over mid-test.
+ * docs/protocol.md §9). {@link #writeToken} and {@link #validateToken} are driven directly, with a
+ * deterministic HMAC key and a frozen clock so neither the window nor the token lifetime can roll
+ * over mid-test.
  *
  * <p>Token-less attempts spend from the {@code admission} budget; a valid token spends from the
  * separate {@code validated} budget and probes the open slot on {@code admission}. Those two
  * budgets are given different limits here so a swap would be visible.
  */
 class AdmissionTokenHandlerTest {
-    /** A clock frozen in time so attempt budgets never roll over during a test. */
+    /** A clock frozen in time so no window and no token lifetime can roll over during a test. */
     private static final LongSupplier FROZEN = () -> 0L;
+
+    /** A deterministic 32-byte HMAC key, so tokens validate without a random source. */
+    private static final byte[] KEY = new byte[32];
+
+    static {
+        for (int i = 0; i < KEY.length; i++) {
+            KEY[i] = (byte) i;
+        }
+    }
 
     private static final int DCID_LENGTH = 8;
     private static final int PREFIX_LENGTH = 41;
 
     private static final InetSocketAddress ADDRESS_1 = new InetSocketAddress("192.0.2.1", 5000);
     private static final InetSocketAddress ADDRESS_2 = new InetSocketAddress("192.0.2.2", 5000);
+    private static final InetSocketAddress ADDRESS_3 = new InetSocketAddress("192.0.2.3", 5000);
 
     private final List<ByteBuf> ownedBuffers = new ArrayList<>();
 
     private static ConnectionAdmission admission(int global, int perIp, int maxOpen, int maxOpenPerIp,
             int retryThreshold) {
         return new ConnectionAdmission(global, perIp, maxOpen, maxOpenPerIp, retryThreshold, 100, FROZEN);
+    }
+
+    /** A handler with the deterministic key and frozen clock. */
+    private static AdmissionTokenHandler handler(ConnectionAdmission admission, ConnectionAdmission validated,
+            TransportConfig.RetryMode mode, AtomicLong retries) {
+        return new AdmissionTokenHandler(admission, validated, mode, retries, KEY, FROZEN);
     }
 
     private ByteBuf owned(ByteBuf buffer) {
@@ -79,7 +96,7 @@ class AdmissionTokenHandlerTest {
     void adaptiveBelowThresholdWritesNoTokenAndCountsNoRetry() {
         AtomicLong retries = new AtomicLong();
         ConnectionAdmission admission = admission(1000, 100, 100, 100, 50);
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, admission(1000, 100, 100, 100, 50),
+        AdmissionTokenHandler handler = handler(admission, admission(1000, 100, 100, 100, 50),
                 TransportConfig.RetryMode.ADAPTIVE, retries);
 
         ByteBuf out = out();
@@ -97,7 +114,7 @@ class AdmissionTokenHandlerTest {
     void adaptiveAtThresholdWritesTokenAndCountsRetry() {
         AtomicLong retries = new AtomicLong();
         ConnectionAdmission admission = admission(1000, 100, 100, 100, 1);
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, admission(1000, 100, 100, 100, 1),
+        AdmissionTokenHandler handler = handler(admission, admission(1000, 100, 100, 100, 1),
                 TransportConfig.RetryMode.ADAPTIVE, retries);
 
         ByteBuf out = out();
@@ -113,7 +130,7 @@ class AdmissionTokenHandlerTest {
     void alwaysRetriesOnTheFirstAttempt() {
         AtomicLong retries = new AtomicLong();
         ConnectionAdmission admission = admission(1000, 100, 100, 100, 1000);
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, admission(1000, 100, 100, 100, 1000),
+        AdmissionTokenHandler handler = handler(admission, admission(1000, 100, 100, 100, 1000),
                 TransportConfig.RetryMode.ALWAYS, retries);
 
         assertTrue(handler.writeToken(out(), dcid(), ADDRESS_1), "ALWAYS retries the first attempt");
@@ -124,7 +141,7 @@ class AdmissionTokenHandlerTest {
     void neverWritesNoTokenWithinLimitsButForcesRetryOverThePerIpLimit() {
         AtomicLong retries = new AtomicLong();
         ConnectionAdmission admission = admission(1000, 1, 100, 100, 1000);
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, admission(1000, 1, 100, 100, 1000),
+        AdmissionTokenHandler handler = handler(admission, admission(1000, 1, 100, 100, 1000),
                 TransportConfig.RetryMode.NEVER, retries);
 
         ByteBuf first = out();
@@ -139,6 +156,26 @@ class AdmissionTokenHandlerTest {
         assertFalse(handler.writeToken(out(), dcid(), ADDRESS_2), "another IP keeps its own attempt budget");
     }
 
+    @Test
+    void neverForcesRetryWhileHandshakesAreBacklogged() {
+        AtomicLong retries = new AtomicLong();
+        ConnectionAdmission admission = admission(1000, 100, 4, 4, 1000);
+        AdmissionTokenHandler handler = handler(admission, admission(1000, 100, 4, 4, 1000),
+                TransportConfig.RetryMode.NEVER, retries);
+
+        ConnectionAdmission.Lease pending = admission.tryAcquire(ADDRESS_1.getAddress());
+        assertNotNull(pending);
+        assertEquals(1, admission.pendingLeases());
+
+        assertTrue(handler.writeToken(out(), dcid(), ADDRESS_2),
+                "one pending of four open is a backlog: NEVER must still send a Retry");
+
+        pending.confirm();
+        assertEquals(0, admission.pendingLeases());
+        assertFalse(handler.writeToken(out(), dcid(), ADDRESS_3), "confirmed: NEVER writes no token again");
+        pending.close();
+    }
+
     // ── 11. full open slot ───────────────────────────────────────────────
 
     @Test
@@ -149,8 +186,7 @@ class AdmissionTokenHandlerTest {
             ConnectionAdmission.Lease held = admission.tryAcquire(ADDRESS_1.getAddress());
             assertNotNull(held, "the test holds the single open lease");
 
-            AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, admission(1000, 100, 4, 1, 1000),
-                    mode, retries);
+            AdmissionTokenHandler handler = handler(admission, admission(1000, 100, 4, 1, 1000), mode, retries);
             assertTrue(handler.writeToken(out(), dcid(), ADDRESS_1),
                     mode + " must force a Retry while the open slot is full");
 
@@ -166,8 +202,7 @@ class AdmissionTokenHandlerTest {
         ConnectionAdmission.Lease held = admission.tryAcquire(ADDRESS_1.getAddress());
         assertNotNull(held);
 
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, validated,
-                TransportConfig.RetryMode.ALWAYS, retries);
+        AdmissionTokenHandler handler = handler(admission, validated, TransportConfig.RetryMode.ALWAYS, retries);
         ByteBuf heldToken = token(handler, ADDRESS_1);
         assertEquals(-1, handler.validateToken(heldToken, ADDRESS_1),
                 "a valid token is dropped while the open slot is full");
@@ -186,7 +221,7 @@ class AdmissionTokenHandlerTest {
     void validateAcceptsAValidTokenWithinLimits() {
         AtomicLong retries = new AtomicLong();
         ConnectionAdmission admission = admission(1000, 100, 100, 100, 1000);
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, admission(1000, 10, 100, 100, 1000),
+        AdmissionTokenHandler handler = handler(admission, admission(1000, 10, 100, 100, 1000),
                 TransportConfig.RetryMode.ALWAYS, retries);
 
         ByteBuf token = token(handler, ADDRESS_1);
@@ -198,8 +233,7 @@ class AdmissionTokenHandlerTest {
         AtomicLong retries = new AtomicLong();
         ConnectionAdmission admission = admission(1000, 100, 100, 100, 1000);
         ConnectionAdmission validated = admission(1000, 1, 100, 100, 1000);
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, validated,
-                TransportConfig.RetryMode.ALWAYS, retries);
+        AdmissionTokenHandler handler = handler(admission, validated, TransportConfig.RetryMode.ALWAYS, retries);
 
         ByteBuf token = token(handler, ADDRESS_1);
         byte[] bytes = new byte[token.readableBytes()];
@@ -219,8 +253,7 @@ class AdmissionTokenHandlerTest {
         AtomicLong retries = new AtomicLong();
         ConnectionAdmission admission = admission(1000, 100, 100, 100, 1000);
         ConnectionAdmission validated = admission(1000, 1, 100, 100, 1000);
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, validated,
-                TransportConfig.RetryMode.ALWAYS, retries);
+        AdmissionTokenHandler handler = handler(admission, validated, TransportConfig.RetryMode.ALWAYS, retries);
 
         ByteBuf token = token(handler, ADDRESS_1);
         assertEquals(PREFIX_LENGTH, handler.validateToken(token, ADDRESS_1), "a valid token within limits is accepted");
@@ -229,13 +262,30 @@ class AdmissionTokenHandlerTest {
         assertEquals(0, admission.pendingLeases(), "a rejected token took no lease");
     }
 
+    @Test
+    void validTokenRefusedOnceTheValidatedGlobalBudgetIsSpentFromOtherIps() {
+        AtomicLong retries = new AtomicLong();
+        ConnectionAdmission admission = admission(1000, 100, 100, 100, 1000);
+        ConnectionAdmission validated = admission(2, 100, 100, 100, 2);
+        AdmissionTokenHandler handler = handler(admission, validated, TransportConfig.RetryMode.ALWAYS, retries);
+
+        ByteBuf token1 = token(handler, ADDRESS_1);
+        ByteBuf token2 = token(handler, ADDRESS_2);
+        ByteBuf token3 = token(handler, ADDRESS_3);
+
+        assertEquals(PREFIX_LENGTH, handler.validateToken(token1, ADDRESS_1), "first valid token spends one");
+        assertEquals(PREFIX_LENGTH, handler.validateToken(token2, ADDRESS_2), "second valid token spends the last");
+        assertEquals(-1, handler.validateToken(token3, ADDRESS_3),
+                "the validated global budget is exhausted, so the third IP is refused");
+    }
+
     // ── 13. the open-slot probe leaves nothing behind ────────────────────
 
     @Test
     void openSlotProbeLeavesNoLeaseBehind() {
         AtomicLong retries = new AtomicLong();
         ConnectionAdmission admission = admission(1000, 500, 10, 3, 1000);
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, admission(1000, 500, 10, 3, 1000),
+        AdmissionTokenHandler handler = handler(admission, admission(1000, 500, 10, 3, 1000),
                 TransportConfig.RetryMode.NEVER, retries);
 
         for (int i = 0; i < 100; i++) {
@@ -258,7 +308,7 @@ class AdmissionTokenHandlerTest {
 
     @Test
     void maxTokenLengthIs61() {
-        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission(1000, 100, 100, 100, 1000),
+        AdmissionTokenHandler handler = handler(admission(1000, 100, 100, 100, 1000),
                 admission(1000, 100, 100, 100, 1000), TransportConfig.RetryMode.NEVER, new AtomicLong());
         assertEquals(61, handler.maxTokenLength());
     }

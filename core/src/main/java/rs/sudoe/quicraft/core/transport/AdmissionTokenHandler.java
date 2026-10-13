@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.transport;
 import io.netty.buffer.ByteBuf;
 import io.netty.handler.codec.quic.QuicTokenHandler;
 import java.net.InetSocketAddress;
+import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -51,11 +52,23 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
      */
     AdmissionTokenHandler(ConnectionAdmission admission, ConnectionAdmission validated,
             TransportConfig.RetryMode mode, java.util.concurrent.atomic.AtomicLong retries) {
+        this(admission, validated, mode, retries, null, null);
+    }
+
+    /**
+     * Test constructor: an explicit HMAC key and clock make token issue and validation
+     * deterministic. A null {@code key} or {@code clock} keeps the production delegate.
+     */
+    AdmissionTokenHandler(ConnectionAdmission admission, ConnectionAdmission validated,
+            TransportConfig.RetryMode mode, java.util.concurrent.atomic.AtomicLong retries,
+            byte[] key, LongSupplier clock) {
         this.admission = admission;
         this.validated = validated;
         this.mode = mode;
         this.retries = retries;
-        this.hmac = new HmacRetryTokenHandler(() -> forceRetry);
+        this.hmac = key == null || clock == null
+                ? new HmacRetryTokenHandler(() -> forceRetry)
+                : new HmacRetryTokenHandler(key, clock, () -> forceRetry);
     }
 
     @Override

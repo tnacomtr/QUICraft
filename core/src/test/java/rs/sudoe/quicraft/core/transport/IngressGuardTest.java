@@ -3,7 +3,6 @@ package rs.sudoe.quicraft.core.transport;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -16,6 +15,7 @@ import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -23,12 +23,15 @@ import org.junit.jupiter.api.Test;
  * Datagram-level flood guard behavior ({@link IngressGuard}, docs/protocol.md §9). Only long-header
  * Initial packets are counted against the guard's own {@link ConnectionAdmission}; everything else
  * is forwarded unchanged and never counted. Driven through an {@link EmbeddedChannel} with real
- * QUIC header bytes; non-expiry tests use fresh admissions with the system clock and the single
+ * QUIC header bytes. Every admission that is not testing rollover uses a frozen clock; only the
  * window test advances an injected {@link AtomicLong}.
  */
 class IngressGuardTest {
     /** One QUIC admission window, in nanoseconds. */
     private static final long WINDOW = 1_000_000_000L;
+
+    /** A clock frozen in time so attempt budgets never roll over during a test. */
+    private static final LongSupplier FROZEN = () -> 0L;
 
     /** QUIC requires datagrams carrying an Initial to be at least 1200 bytes. */
     private static final int MIN_INITIAL_SIZE = 1200;
@@ -42,6 +45,11 @@ class IngressGuardTest {
 
     private static InetSocketAddress resolved(String host, int port) {
         return new InetSocketAddress(host, port);
+    }
+
+    private static ConnectionAdmission admission(int global, int perIp, int maxOpen, int maxOpenPerIp,
+            int retryThreshold, int maxTrackedIps) {
+        return new ConnectionAdmission(global, perIp, maxOpen, maxOpenPerIp, retryThreshold, maxTrackedIps, FROZEN);
     }
 
     private EmbeddedChannel channel(ConnectionAdmission admission) {
@@ -135,7 +143,7 @@ class IngressGuardTest {
 
     @Test
     void initialWithinBudgetIsForwardedUnchanged() {
-        EmbeddedChannel channel = channel(new ConnectionAdmission(1000, 2, 1, 1, 1000, 100));
+        EmbeddedChannel channel = channel(admission(1000, 2, 1, 1, 1000, 100));
         ByteBuf content = initialPacket();
         int readerIndex = content.readerIndex();
         int writerIndex = content.writerIndex();
@@ -154,10 +162,10 @@ class IngressGuardTest {
 
     @Test
     void thirdInitialFromTheSameIpIsDroppedAndReleasedExactlyOnce() {
-        EmbeddedChannel channel = channel(new ConnectionAdmission(1000, 2, 1, 1, 1000, 100));
+        EmbeddedChannel channel = channel(admission(1000, 2, 1, 1, 1000, 100));
 
-        assertNotNull(send(channel, initialPacket(), SENDER_1), "first Initial admitted");
-        assertNotNull(send(channel, initialPacket(), SENDER_1), "second Initial admitted");
+        assertTrue(forwarded(channel, initialPacket(), SENDER_1), "first Initial admitted");
+        assertTrue(forwarded(channel, initialPacket(), SENDER_1), "second Initial admitted");
 
         ByteBuf content = initialPacket();
         assertNull(send(channel, content, SENDER_1), "third Initial over the per-IP budget is dropped");
@@ -170,7 +178,7 @@ class IngressGuardTest {
 
     @Test
     void thirdInitialOverTheGlobalBudgetIsDropped() {
-        EmbeddedChannel channel = channel(new ConnectionAdmission(2, 1000, 1, 1, 2, 100));
+        EmbeddedChannel channel = channel(admission(2, 1000, 1, 1, 2, 100));
 
         assertTrue(forwarded(channel, initialPacket(), SENDER_1), "first global attempt");
         assertTrue(forwarded(channel, initialPacket(), SENDER_2), "second global attempt");
@@ -183,26 +191,28 @@ class IngressGuardTest {
     // ── 4. only Initials are counted ─────────────────────────────────────
 
     @Test
-    void nonInitialDatagramsPassAndAreNeverCountedWhenTheBudgetIsExhausted() {
-        EmbeddedChannel channel = channel(new ConnectionAdmission(1000, 2, 1, 1, 1000, 100));
-
-        assertTrue(forwarded(channel, initialPacket(), SENDER_1), "first Initial");
-        assertTrue(forwarded(channel, initialPacket(), SENDER_1), "second Initial");
-        assertFalse(forwarded(channel, initialPacket(), SENDER_1), "the per-IP budget is now exhausted");
+    void nonInitialDatagramsPassAndAreNeverCounted() {
+        EmbeddedChannel channel = channel(admission(1000, 2, 1, 1, 1000, 100));
 
         for (int i = 0; i < 100; i++) {
             assertTrue(forwarded(channel, shortHeaderPacket(), SENDER_1),
-                    "short-header packet " + i + " must pass even when the budget is exhausted");
+                    "short-header packet " + i + " must pass");
         }
         assertTrue(forwarded(channel, handshakePacket(), SENDER_1), "Handshake must pass");
         assertTrue(forwarded(channel, garbage(), SENDER_1), "unparseable garbage must pass");
+
+        // None of the non-Initials was counted, so the whole per-IP Initial allowance is still there.
+        assertTrue(forwarded(channel, initialPacket(), SENDER_1), "first Initial after the non-Initial flood");
+        assertTrue(forwarded(channel, initialPacket(), SENDER_1), "second Initial after the non-Initial flood");
+        assertFalse(forwarded(channel, initialPacket(), SENDER_1),
+                "only now is the per-IP budget exhausted, proving non-Initials were never counted");
     }
 
     // ── 5. non-datagram messages ─────────────────────────────────────────
 
     @Test
     void nonDatagramMessagesAreForwarded() {
-        EmbeddedChannel channel = channel(new ConnectionAdmission(1, 1, 1, 1, 1, 10));
+        EmbeddedChannel channel = channel(admission(1, 1, 1, 1, 1, 10));
         String message = "not a datagram";
         channel.writeInbound(message);
         assertSame(message, channel.readInbound(), "a non-DatagramPacket message is passed through");
@@ -227,7 +237,7 @@ class IngressGuardTest {
 
     @Test
     void unresolvedSenderFailsOpenAndIsForwarded() {
-        EmbeddedChannel channel = channel(new ConnectionAdmission(1, 1, 1, 1, 1, 10));
+        EmbeddedChannel channel = channel(admission(1, 1, 1, 1, 1, 10));
         InetSocketAddress unresolved = InetSocketAddress.createUnresolved("example.invalid", 5000);
 
         DatagramPacket packet = new DatagramPacket(initialPacket(), RECIPIENT, unresolved);
