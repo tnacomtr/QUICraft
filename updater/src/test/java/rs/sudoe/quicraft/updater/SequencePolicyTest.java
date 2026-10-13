@@ -30,7 +30,8 @@ import rs.sudoe.quicraft.updater.UpdateDocuments.Revocations;
  *
  * <p>Documents are signed only with the throwaway RFC 8032 TEST 1, TEST 2 and TEST 3 seeds and
  * verified through {@link AuthenticatedDocuments}, so every {@link VerifiedDocument} is real
- * evidence.
+ * evidence. A few tests build a {@link VerifiedDocument} directly to model evidence whose claimed
+ * signer roles disagree with the current trust.
  */
 class SequencePolicyTest {
 
@@ -104,9 +105,9 @@ class SequencePolicyTest {
                 TestKeys.KID_2, new KidSeq(42, Hex.sha256(docA), ISSUED));
         Snapshot s = new Snapshot(state(SEED, seqByKid, List.of()), RevokedState.empty());
         assertEquals(ManifestDecision.REPLAY_SAME,
-                SequencePolicy.manifestDecision(release(trust3(), docA, K2), s, TRUST));
+                SequencePolicy.manifestDecision(release(trust3(), docA, K2), s, TRUST, trust3()));
         assertEquals(ManifestDecision.EQUIVOCATION,
-                SequencePolicy.manifestDecision(release(trust3(), docB, K2), s, TRUST));
+                SequencePolicy.manifestDecision(release(trust3(), docB, K2), s, TRUST, trust3()));
     }
 
     @Test
@@ -115,7 +116,7 @@ class SequencePolicyTest {
         Map<String, KidSeq> seqByKid = Map.of(TestKeys.KID_2, new KidSeq(42, Hex.sha256(doc), ISSUED));
         Snapshot s = new Snapshot(state(SEED, seqByKid, List.of()), RevokedState.empty());
         AcceptResult result = SequencePolicy.acceptManifest(
-                s, release(trust3(), doc, K2), TRUST, "fabric-26x", version("0.4.0"));
+                s, release(trust3(), doc, K2), TRUST, trust3(), "fabric-26x", version("0.4.0"));
         assertFalse(result.stateFull());
         assertEquals(42L, result.delta().newState().seqByKid().get(TestKeys.KID_2).seq());
         assertEquals(Hex.sha256(doc), result.delta().newState().seqByKid().get(TestKeys.KID_2).sha256());
@@ -126,8 +127,38 @@ class SequencePolicyTest {
         RevokedState revoked = new RevokedState(
                 List.of(new UpdateDocuments.RevokedKey(TestKeys.KID_2, TestKeys.PUB_2)), List.of());
         Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), revoked);
+        assertEquals(ManifestDecision.UNTRUSTED, SequencePolicy.manifestDecision(
+                release(trust3(), releaseBytes(5, "a", ""), K2), s, TRUST, trust3()));
+    }
+
+    @Test
+    void manifestVerifiedBeforeRotationIsUntrustedAfterIt() throws Exception {
+        VerifiedDocument<ReleaseManifest> m = release(trust3(), releaseBytes(5, "a", ""), K2);
+        Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
+        TrustSnapshot rotated = new TrustSnapshot(2, FP, Set.of(),
+                Map.of(TEST3_KID, TEST3_PUB),
+                Map.of(TEST3_PUB, Set.of(KeyRole.RELEASE, KeyRole.REVOCATION)));
+        assertEquals(ManifestDecision.ACCEPT, SequencePolicy.manifestDecision(m, s, TRUST, trust3()));
+        assertEquals(ManifestDecision.UNTRUSTED, SequencePolicy.manifestDecision(m, s, TRUST, rotated));
+        AcceptResult result = SequencePolicy.acceptManifest(
+                s, m, TRUST, rotated, "fabric-26x", version("0.4.0"));
+        assertFalse(result.stateFull());
+        assertEquals(s.state(), result.delta().newState());
+    }
+
+    @Test
+    void signerRoleRemovedInCurrentTrustIsNotCounted() throws Exception {
+        VerifiedDocument<ReleaseManifest> m = release(trust3(), releaseBytes(5, "a", ""), K2);
+        // Evidence that still claims RELEASE for PUB_2, under a current trust where it lost it.
+        TrustSnapshot roleRemoved = new TrustSnapshot(1, FP, Set.of(),
+                Map.of(TestKeys.KID_1, TestKeys.PUB_1, TestKeys.KID_2, TestKeys.PUB_2),
+                Map.of(TestKeys.PUB_1, Set.of(KeyRole.RELEASE),
+                        TestKeys.PUB_2, Set.of(KeyRole.REVOCATION)));
+        VerifiedDocument<ReleaseManifest> forged = new VerifiedDocument<>(
+                m.document(), m.exactBytes(), m.signers(), roleRemoved);
+        Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
         assertEquals(ManifestDecision.UNTRUSTED,
-                SequencePolicy.manifestDecision(release(trust3(), releaseBytes(5, "a", ""), K2), s, TRUST));
+                SequencePolicy.manifestDecision(forged, s, TRUST, roleRemoved));
     }
 
     @Test
@@ -136,7 +167,7 @@ class SequencePolicyTest {
         Snapshot s = new Snapshot(state(rev, Map.of(), List.of()), RevokedState.empty());
         VerifiedDocument<Revocations> old = revocations(trust3(), revocationBytes(2,
                 "2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z", 4, REVOKED_TEST3, blocked(9)), K2);
-        StateDelta delta = SequencePolicy.mergeRestrictions(s, old);
+        StateDelta delta = SequencePolicy.mergeRestrictions(s, trust3(), old);
         assertTrue(delta.newRevoked().revokedPubs().contains(TEST3_PUB));
         assertTrue(delta.newRevoked().blockedArtifacts().contains(h(9)));
         assertEquals(4L, delta.newState().revocations().minManifestSeq());
@@ -153,15 +184,41 @@ class SequencePolicyTest {
 
         VerifiedDocument<Revocations> byOldKey = revocations(rotated, revocationBytes(7, ISSUED_TEXT,
                 EXPIRES_TEXT, 8, REVOKED_TEST3, blocked(3)), K1);
-        StateDelta ignored = SequencePolicy.mergeRestrictions(s, byOldKey);
+        StateDelta ignored = SequencePolicy.mergeRestrictions(s, rotated, byOldKey);
         assertEquals(st, ignored.newState());
         assertTrue(ignored.newRevoked().revokedKeys().isEmpty());
 
         VerifiedDocument<Revocations> byBoth = revocations(rotated, revocationBytes(7, ISSUED_TEXT,
                 EXPIRES_TEXT, 8, REVOKED_TEST3, blocked(3)), K1, K2);
-        StateDelta merged = SequencePolicy.mergeRestrictions(s, byBoth);
+        StateDelta merged = SequencePolicy.mergeRestrictions(s, rotated, byBoth);
         assertTrue(merged.newRevoked().revokedPubs().contains(TEST3_PUB));
         assertEquals(8L, merged.newState().revocations().minManifestSeq());
+    }
+
+    @Test
+    void structurallyInvalidRevocationsDocumentMergesNothing() throws Exception {
+        Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
+        Instant issued = Instant.parse("2026-01-01T00:00:00Z");
+        Instant limit = issued.plus(FreshnessPolicy.REVOCATIONS_MAX_LIFETIME);
+
+        VerifiedDocument<Revocations> reversed = direct(trust3(), 3, ISSUED, EXPIRES, List.of(
+                new UpdateDocuments.RevokedKey(TEST3_KID, TEST3_PUB)), List.of(h(4)));
+        assertEquals(SEED, SequencePolicy.mergeRestrictions(s, trust3(), reversed)
+                .newState().revocations());
+        assertEquals(s.state(), SequencePolicy.mergeRestrictions(s, trust3(), reversed).newState());
+        assertTrue(SequencePolicy.mergeRestrictions(s, trust3(), reversed)
+                .newRevoked().revokedKeys().isEmpty());
+
+        VerifiedDocument<Revocations> tooLong = direct(trust3(), 3, limit.plusSeconds(1), issued,
+                List.of(new UpdateDocuments.RevokedKey(TEST3_KID, TEST3_PUB)), List.of(h(4)));
+        assertEquals(s.state(), SequencePolicy.mergeRestrictions(s, trust3(), tooLong).newState());
+        assertTrue(SequencePolicy.mergeRestrictions(s, trust3(), tooLong)
+                .newRevoked().revokedKeys().isEmpty());
+
+        VerifiedDocument<Revocations> exactly400 = direct(trust3(), 3, limit, issued,
+                List.of(new UpdateDocuments.RevokedKey(TEST3_KID, TEST3_PUB)), List.of(h(4)));
+        assertTrue(SequencePolicy.mergeRestrictions(s, trust3(), exactly400)
+                .newRevoked().revokedPubs().contains(TEST3_PUB));
     }
 
     @Test
@@ -172,7 +229,7 @@ class SequencePolicyTest {
                 ISSUED_TEXT, EXPIRES_TEXT, 0, "", blocked(4)), K2);
         Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
         for (List<VerifiedDocument<Revocations>> order : List.of(List.of(d4, d2), List.of(d2, d4))) {
-            SelectionResult result = SequencePolicy.selectCurrent(s, order, NOW);
+            SelectionResult result = SequencePolicy.selectCurrent(s, trust3(), order, NOW);
             assertEquals(4L, result.delta().newState().revocations().seq());
             assertEquals(Hex.sha256(d4.exactBytes()), result.delta().newState().revocations().sha256());
             assertTrue(result.warnings().isEmpty());
@@ -184,7 +241,7 @@ class SequencePolicyTest {
         VerifiedDocument<Revocations> expired = revocations(trust3(), revocationBytes(3,
                 "2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z", 0, "", blocked(3)), K2);
         Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
-        SelectionResult result = SequencePolicy.selectCurrent(s, List.of(expired), NOW);
+        SelectionResult result = SequencePolicy.selectCurrent(s, trust3(), List.of(expired), NOW);
         CurrentRevocations cur = result.delta().newState().revocations();
         assertEquals(3L, cur.seq());
         assertEquals(Hex.sha256(expired.exactBytes()), cur.sha256());
@@ -199,7 +256,7 @@ class SequencePolicyTest {
         VerifiedDocument<Revocations> two = revocations(trust3(), revocationBytes(4,
                 ISSUED_TEXT, EXPIRES_TEXT, 0, "", blocked(2)), K2);
         Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
-        SelectionResult result = SequencePolicy.selectCurrent(s, List.of(one, two), NOW);
+        SelectionResult result = SequencePolicy.selectCurrent(s, trust3(), List.of(one, two), NOW);
         assertEquals(SEED, result.delta().newState().revocations());
         assertFalse(result.warnings().isEmpty());
     }
@@ -210,17 +267,16 @@ class SequencePolicyTest {
                 ISSUED_TEXT, EXPIRES_TEXT, 0, "", blocked(1)), K2);
         CurrentRevocations rev = new CurrentRevocations(3, Hex.sha256(persistedDoc.exactBytes()),
                 ISSUED, EXPIRES, 0);
-        UpdaterState st = state(rev, Map.of(), List.of());
-        Snapshot s = new Snapshot(st, RevokedState.empty());
+        Snapshot s = new Snapshot(state(rev, Map.of(), List.of()), RevokedState.empty());
         VerifiedDocument<Revocations> older = revocations(trust3(), revocationBytes(2,
                 ISSUED_TEXT, EXPIRES_TEXT, 0, "", blocked(2)), K2);
-        SelectionResult result = SequencePolicy.selectCurrent(s, List.of(older), NOW);
+        SelectionResult result = SequencePolicy.selectCurrent(s, trust3(), List.of(older), NOW);
         assertEquals(rev, result.delta().newState().revocations());
         assertTrue(result.warnings().isEmpty());
 
         VerifiedDocument<Revocations> sameSeqOther = revocations(trust3(), revocationBytes(3,
                 ISSUED_TEXT, EXPIRES_TEXT, 0, "", blocked(5)), K2);
-        SelectionResult conflict = SequencePolicy.selectCurrent(s, List.of(sameSeqOther), NOW);
+        SelectionResult conflict = SequencePolicy.selectCurrent(s, trust3(), List.of(sameSeqOther), NOW);
         assertEquals(rev, conflict.delta().newState().revocations());
         assertFalse(conflict.warnings().isEmpty());
     }
@@ -230,10 +286,38 @@ class SequencePolicyTest {
         VerifiedDocument<Revocations> future = revocations(trust3(), revocationBytes(6,
                 "2026-12-20T00:00:00Z", "2027-12-20T00:00:00Z", 0, REVOKED_TEST3, blocked(3)), K2);
         Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
-        SelectionResult result = SequencePolicy.selectCurrent(s, List.of(future), NOW);
+        SelectionResult result = SequencePolicy.selectCurrent(s, trust3(), List.of(future), NOW);
         assertEquals(SEED, result.delta().newState().revocations());
         assertTrue(result.delta().newRevoked().revokedPubs().contains(TEST3_PUB));
         assertTrue(result.delta().newRevoked().blockedArtifacts().contains(h(3)));
+    }
+
+    @Test
+    void documentFromAnotherTrustSnapshotIsIgnoredEverywhere() throws Exception {
+        TrustSnapshot current = trust3();
+        TrustSnapshot other = otherSnapshot();
+        byte[] d1Bytes = revocationBytes(3, ISSUED_TEXT, EXPIRES_TEXT, 0, "", blocked(1));
+        VerifiedDocument<Revocations> d1 = revocations(current, d1Bytes, K2);
+        VerifiedDocument<Revocations> d1Other = revocations(other, d1Bytes, K2);
+        VerifiedDocument<Revocations> d2Other = revocations(other, revocationBytes(9, ISSUED_TEXT,
+                EXPIRES_TEXT, 0, "", blocked(9)), K2);
+        Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
+
+        SelectionResult selected = SequencePolicy.selectCurrent(s, current, List.of(d2Other, d1), NOW);
+        assertEquals(3L, selected.delta().newState().revocations().seq());
+        assertEquals(Hex.sha256(d1Bytes), selected.delta().newState().revocations().sha256());
+        assertFalse(selected.delta().newRevoked().blockedArtifacts().contains(h(9)));
+        assertTrue(selected.delta().newRevoked().blockedArtifacts().contains(h(1)));
+        assertFalse(selected.warnings().isEmpty());
+
+        assertEquals(s.state(), SequencePolicy.mergeRestrictions(s, current, d2Other).newState());
+
+        CurrentRevocations persisted = new CurrentRevocations(3, Hex.sha256(d1Bytes), ISSUED, EXPIRES, 0);
+        Snapshot withD1 = new Snapshot(state(persisted, Map.of(), List.of()), RevokedState.empty());
+        assertFalse(SequencePolicy.stagingCoverage(withD1, current,
+                Map.of("modrinth", d1, "github", d1Other)));
+        assertTrue(SequencePolicy.stagingCoverage(withD1, current,
+                Map.of("modrinth", d1, "github", d1, "sudoe", d1Other)));
     }
 
     @Test
@@ -264,17 +348,20 @@ class SequencePolicyTest {
         Snapshot s = new Snapshot(state(new CurrentRevocations(3, Hex.sha256(dBytes), ISSUED,
                 EXPIRES, 0), Map.of(), List.of()), RevokedState.empty());
 
-        assertTrue(SequencePolicy.stagingCoverage(s, Map.of("modrinth", d, "github", d, "sudoe", e)));
-        assertFalse(SequencePolicy.stagingCoverage(s, Map.of("modrinth", d, "github", e, "sudoe", f)));
-        assertFalse(SequencePolicy.stagingCoverage(s, Map.of("modrinth", d, "gitlab", d, "sudoe", e)));
+        assertTrue(SequencePolicy.stagingCoverage(s, trust3(),
+                Map.of("modrinth", d, "github", d, "sudoe", e)));
+        assertFalse(SequencePolicy.stagingCoverage(s, trust3(),
+                Map.of("modrinth", d, "github", e, "sudoe", f)));
+        assertFalse(SequencePolicy.stagingCoverage(s, trust3(),
+                Map.of("modrinth", d, "gitlab", d, "sudoe", e)));
 
         Snapshot stale = new Snapshot(state(new CurrentRevocations(3, Hex.sha256(
                 revocationBytes(3, ISSUED_TEXT, EXPIRES_TEXT, 0, "", blocked(7))), ISSUED, EXPIRES, 0),
                 Map.of(), List.of()), RevokedState.empty());
-        assertFalse(SequencePolicy.stagingCoverage(stale, Map.of("modrinth", d, "github", d)));
+        assertFalse(SequencePolicy.stagingCoverage(stale, trust3(), Map.of("modrinth", d, "github", d)));
 
         Snapshot seed = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
-        assertFalse(SequencePolicy.stagingCoverage(seed, Map.of("modrinth", d, "github", d)));
+        assertFalse(SequencePolicy.stagingCoverage(seed, trust3(), Map.of("modrinth", d, "github", d)));
     }
 
     @Test
@@ -282,13 +369,14 @@ class SequencePolicyTest {
         VerifiedDocument<ReleaseManifest> m1 = release(trust3(), releaseBytes(5, "a", ""), K2);
         VerifiedDocument<ReleaseManifest> m2 = release(trust3(), releaseBytes(9, "b", ""), K2);
         Snapshot before = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
-        assertEquals(ManifestDecision.ACCEPT, SequencePolicy.manifestDecision(m1, before, TRUST));
+        assertEquals(ManifestDecision.ACCEPT, SequencePolicy.manifestDecision(m1, before, TRUST, trust3()));
 
         AcceptResult accepted = SequencePolicy.acceptManifest(
-                before, m2, TRUST, "fabric-26x", version("0.4.0"));
+                before, m2, TRUST, trust3(), "fabric-26x", version("0.4.0"));
         Snapshot after = new Snapshot(accepted.delta().newState(), accepted.delta().newRevoked());
-        assertEquals(ManifestDecision.STALE, SequencePolicy.manifestDecision(m1, after, TRUST));
-        assertEquals(ManifestDecision.REPLAY_SAME, SequencePolicy.manifestDecision(m2, after, TRUST));
+        assertEquals(ManifestDecision.STALE, SequencePolicy.manifestDecision(m1, after, TRUST, trust3()));
+        assertEquals(ManifestDecision.REPLAY_SAME,
+                SequencePolicy.manifestDecision(m2, after, TRUST, trust3()));
     }
 
     @Test
@@ -299,7 +387,8 @@ class SequencePolicyTest {
         VerifiedDocument<ReleaseManifest> m = release(trust3(),
                 releaseBytes(9, "a", w1 + "," + w2 + "," + w3), K2);
         Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
-        AcceptResult result = SequencePolicy.acceptManifest(s, m, TRUST, "fabric-26x", version("0.4.0"));
+        AcceptResult result = SequencePolicy.acceptManifest(
+                s, m, TRUST, trust3(), "fabric-26x", version("0.4.0"));
         assertFalse(result.stateFull());
         List<WithdrawnEntry> withdrawn = result.delta().newState().withdrawn();
         assertEquals(1, withdrawn.size());
@@ -317,7 +406,8 @@ class SequencePolicyTest {
         UpdaterState st = state(SEED, full, List.of());
         Snapshot s = new Snapshot(st, RevokedState.empty());
         AcceptResult result = SequencePolicy.acceptManifest(s,
-                release(trust3(), releaseBytes(9, "a", ""), K2), TRUST, "fabric-26x", version("0.4.0"));
+                release(trust3(), releaseBytes(9, "a", ""), K2), TRUST, trust3(), "fabric-26x",
+                version("0.4.0"));
         assertTrue(result.stateFull());
         assertEquals(st, result.delta().newState());
     }
@@ -332,7 +422,8 @@ class SequencePolicyTest {
         Snapshot s = new Snapshot(st, RevokedState.empty());
         String w1 = withdrawal("fabric-26x", "0.5.0", h(10));
         AcceptResult result = SequencePolicy.acceptManifest(s,
-                release(trust3(), releaseBytes(9, "a", w1), K2), TRUST, "fabric-26x", version("0.4.0"));
+                release(trust3(), releaseBytes(9, "a", w1), K2), TRUST, trust3(), "fabric-26x",
+                version("0.4.0"));
         assertTrue(result.stateFull());
         assertEquals(st, result.delta().newState());
     }
@@ -347,12 +438,31 @@ class SequencePolicyTest {
                         TEST3_PUB, Set.of(KeyRole.RELEASE)));
     }
 
+    /** Same keys and roles as {@link #trust3()} but a different epoch, so a different snapshot. */
+    private static TrustSnapshot otherSnapshot() throws Exception {
+        TrustSnapshot t = trust3();
+        return new TrustSnapshot(2, t.keySetFingerprint(), t.revokedPubs(), t.pubByKid(), t.rolesByPub());
+    }
+
     /** TEST 1 holds only the revocation role, so a document signed by it alone verifies as revocations. */
     private static TrustSnapshot revocationSnapshot() {
         return new TrustSnapshot(1, FP, Set.of(),
                 Map.of(TestKeys.KID_1, TestKeys.PUB_1, TestKeys.KID_2, TestKeys.PUB_2),
                 Map.of(TestKeys.PUB_1, Set.of(KeyRole.REVOCATION),
                         TestKeys.PUB_2, Set.of(KeyRole.RELEASE, KeyRole.REVOCATION)));
+    }
+
+    /**
+     * A revocations document that did not go through the parser, signed (as claimed) by TEST 2 and
+     * bound to {@code snap}. Used to test structural rules that the parser may not enforce.
+     */
+    private static VerifiedDocument<Revocations> direct(TrustSnapshot snap, long seq, Instant expires,
+            Instant issued, List<UpdateDocuments.RevokedKey> revokedKeys, List<String> blockedArtifacts) {
+        Revocations doc = new Revocations(seq, issued, expires, 0, revokedKeys, blockedArtifacts);
+        byte[] bytes = SignedFixtures.bytes("direct-" + seq + "-" + expires + "-" + issued);
+        VerifiedSigners signers = new VerifiedSigners(List.of(new VerifiedSigner(
+                TestKeys.KID_2, TestKeys.PUB_2, Set.of(KeyRole.RELEASE, KeyRole.REVOCATION))));
+        return new VerifiedDocument<>(doc, bytes, signers, snap);
     }
 
     private static UpdateVersion version(String text) throws UpdateRejectedException {

@@ -24,13 +24,14 @@ import rs.sudoe.quicraft.updater.UpdateDocuments.Withdrawal;
 
 /**
  * Pure sequence, floor, restriction and coverage rules (docs/updater.md 12.4, 12.6 and 12.12;
- * invariants 6, 8 and 9 of the updater runtime plan).
+ * invariants 2, 6, 8 and 9 of the updater runtime plan).
  *
  * <p>Every method takes its state and clock values as arguments, performs no I/O and reads no
  * clock. State changes are returned as {@link StateDelta} values; nothing is mutated in place.
- * Inputs are never trusted beyond their documented types: {@link VerifiedDocument} values are the
- * only evidence of authenticity, and every caller is expected to pass documents verified by
- * {@link AuthenticatedDocuments}.
+ *
+ * <p>Signer evidence is bound to the trust snapshot of the current run ({@code currentTrust}).
+ * A {@link VerifiedDocument} verified under any other {@link TrustSnapshot} is ignored, and role,
+ * revocation and key checks use {@code currentTrust}, never the document's own snapshot.
  */
 public final class SequencePolicy {
 
@@ -43,6 +44,10 @@ public final class SequencePolicy {
     /** The host origins that count for staging coverage (12.6 item 5). */
     private static final Set<String> COVERAGE_ORIGINS = Set.of("modrinth", "github", "sudoe");
 
+    /** Fixed WARN text for a revocations document verified under another trust snapshot. */
+    private static final String OTHER_SNAPSHOT_WARNING =
+            "revocations document from another trust snapshot ignored";
+
     private SequencePolicy() {
     }
 
@@ -50,7 +55,8 @@ public final class SequencePolicy {
      * The result of {@link #manifestDecision}. {@code ACCEPT} advances the floor, {@code
      * REPLAY_SAME} is the same document fetched again, {@code STALE} is older than the floor or an
      * unbacked floor value, {@code EQUIVOCATION} is the same seq with different bytes, and
-     * {@code UNTRUSTED} means no verified signer holds the release role and is not revoked.
+     * {@code UNTRUSTED} means no signer is a current, unrevoked release key or the document was
+     * verified under another trust snapshot.
      */
     public enum ManifestDecision {
         ACCEPT,
@@ -94,17 +100,23 @@ public final class SequencePolicy {
     }
 
     /**
-     * Decides what a verified release manifest means for the persisted sequence state. Only
-     * release-role signers that are not revoked count. A {@code seq} equal to the floor is accepted
-     * only when a persisted non-revoked kid holds the identical SHA-256 for that seq (the same
-     * document fetched again); any other persisted hash for that seq is equivocation.
+     * Decides what a verified release manifest means for the persisted sequence state. The
+     * manifest must have been verified under {@code currentTrust}; otherwise it is {@code
+     * UNTRUSTED}. Only signers that are current release keys and not revoked count. A {@code seq}
+     * equal to the floor is accepted only when a persisted non-revoked kid holds the identical
+     * SHA-256 for that seq (the same document fetched again); any other persisted hash for that seq
+     * is equivocation.
      */
     public static ManifestDecision manifestDecision(
-            VerifiedDocument<ReleaseManifest> m, Snapshot snap, Trust trust) {
+            VerifiedDocument<ReleaseManifest> m, Snapshot snap, Trust trust, TrustSnapshot currentTrust) {
         Objects.requireNonNull(m, "m");
         Objects.requireNonNull(snap, "snap");
         Objects.requireNonNull(trust, "trust");
-        Set<String> trustedKids = trustedReleaseKids(m, snap.revoked().revokedPubs());
+        Objects.requireNonNull(currentTrust, "currentTrust");
+        if (!m.snapshot().equals(currentTrust)) {
+            return ManifestDecision.UNTRUSTED;
+        }
+        Set<String> trustedKids = trustedReleaseKids(m, snap, currentTrust);
         if (trustedKids.isEmpty()) {
             return ManifestDecision.UNTRUSTED;
         }
@@ -133,16 +145,19 @@ public final class SequencePolicy {
     }
 
     /**
-     * Merges the restrictions of a revocations document (12.4 item 1). The document must be signed
-     * by the current revocation key, which must not be revoked; otherwise the delta is unchanged.
-     * There is no expiry, {@code seq} or {@code issued} condition. Adds the revoked keys and blocked
-     * artifacts to the permanent union, maxes {@code minManifestSeq}, and prunes entries of revoked
-     * kids.
+     * Merges the restrictions of a revocations document (12.4 item 1, 12.12 R7). The document must
+     * be verified under {@code currentTrust}, be signed by the current revocation key (which must
+     * not be revoked), and have structurally valid times (R6). Otherwise the delta is unchanged.
+     * There is no expiry, {@code seq} or {@code issued} condition beyond R6. Adds the revoked keys
+     * and blocked artifacts to the permanent union, maxes {@code minManifestSeq}, and prunes
+     * entries of revoked kids.
      */
-    public static StateDelta mergeRestrictions(Snapshot snap, VerifiedDocument<Revocations> doc) {
+    public static StateDelta mergeRestrictions(
+            Snapshot snap, TrustSnapshot currentTrust, VerifiedDocument<Revocations> doc) {
         Objects.requireNonNull(snap, "snap");
+        Objects.requireNonNull(currentTrust, "currentTrust");
         Objects.requireNonNull(doc, "doc");
-        if (!signedByCurrentRevocationKey(snap, doc)) {
+        if (!admissible(snap, currentTrust, doc)) {
             return unchanged(snap);
         }
         Snapshot merged = applyRestrictions(snap, doc.document());
@@ -151,14 +166,18 @@ public final class SequencePolicy {
 
     /**
      * Selects the current revocations document (12.4 item 2) and merges the restrictions of every
-     * structurally valid document signed by the current revocation key, whatever its {@code issued}
-     * or {@code seq}. Only documents with {@code issued <= systemNow + 24 h} may become current.
-     * Two different documents with the same winning {@code seq} are equivocation: no change and a
-     * WARN.
+     * admissible document (see {@link #mergeRestrictions}), whatever its {@code issued} or {@code
+     * seq}. Only admissible documents with {@code issued <= systemNow + 24 h} may become current.
+     * A document verified under another trust snapshot is ignored with a fixed WARN. Two different
+     * documents with the same winning {@code seq} are equivocation: no change and a WARN.
      */
     public static SelectionResult selectCurrent(
-            Snapshot snap, List<VerifiedDocument<Revocations>> docs, Instant systemNow) {
+            Snapshot snap,
+            TrustSnapshot currentTrust,
+            List<VerifiedDocument<Revocations>> docs,
+            Instant systemNow) {
         Objects.requireNonNull(snap, "snap");
+        Objects.requireNonNull(currentTrust, "currentTrust");
         Objects.requireNonNull(docs, "docs");
         Objects.requireNonNull(systemNow, "systemNow");
         List<String> warnings = new ArrayList<>();
@@ -166,17 +185,16 @@ public final class SequencePolicy {
         List<VerifiedDocument<Revocations>> candidates = new ArrayList<>();
         for (VerifiedDocument<Revocations> doc : docs) {
             Objects.requireNonNull(doc, "doc");
-            Revocations r = doc.document();
-            if (signedByCurrentRevocationKey(snap, doc)
-                    && FreshnessPolicy.structuralTimesValid(
-                            r.issued(), r.expires(), FreshnessPolicy.REVOCATIONS_MAX_LIFETIME)) {
+            if (!doc.snapshot().equals(currentTrust)) {
+                warnings.add(OTHER_SNAPSHOT_WARNING);
+            } else if (admissible(snap, currentTrust, doc)) {
                 candidates.add(doc);
             }
         }
 
-        Snapshot current = snap;
+        Snapshot folded = snap;
         for (VerifiedDocument<Revocations> doc : candidates) {
-            current = applyRestrictions(current, doc.document());
+            folded = applyRestrictions(folded, doc.document());
         }
 
         CurrentRevocations persisted = snap.state().revocations();
@@ -203,7 +221,7 @@ public final class SequencePolicy {
         }
 
         if (pool.isEmpty()) {
-            return new SelectionResult(new StateDelta(current.state(), current.revoked()), warnings);
+            return new SelectionResult(new StateDelta(folded.state(), folded.revoked()), warnings);
         }
         long highest = Long.MIN_VALUE;
         for (VerifiedDocument<Revocations> doc : pool) {
@@ -222,7 +240,7 @@ public final class SequencePolicy {
         if (winnerHashes.size() > 1) {
             warnings.add("revocations equivocation at seq " + highest);
         } else {
-            UpdaterState state = current.state();
+            UpdaterState state = folded.state();
             CurrentRevocations old = state.revocations();
             Revocations doc = winner.document();
             CurrentRevocations next = new CurrentRevocations(
@@ -231,9 +249,9 @@ public final class SequencePolicy {
                     doc.issued(),
                     doc.expires(),
                     old.minManifestSeq());
-            current = new Snapshot(withRevocations(state, next), current.revoked());
+            folded = new Snapshot(withRevocations(state, next), folded.revoked());
         }
-        return new SelectionResult(new StateDelta(current.state(), current.revoked()), warnings);
+        return new SelectionResult(new StateDelta(folded.state(), folded.revoked()), warnings);
     }
 
     /**
@@ -257,14 +275,18 @@ public final class SequencePolicy {
 
     /**
      * Staging coverage (12.6 item 5, invariant 9): true when at least two distinct coverage origins
-     * return a current revocations document whose SHA-256 equals the persisted one. Keys are origin
-     * names; a {@link Map} holds each origin once, so callers collapse retries and aliases before
-     * calling. Origins other than modrinth, github and sudoe are ignored. The seed never has
+     * return an admissible revocations document under {@code currentTrust} whose SHA-256 equals the
+     * persisted one. Keys are origin names; a {@link Map} holds each origin once, so callers collapse
+     * retries and aliases before calling. Origins other than modrinth, github and sudoe are
+     * ignored, and so are documents verified under another trust snapshot. The seed never has
      * coverage.
      */
     public static boolean stagingCoverage(
-            Snapshot snap, Map<String, VerifiedDocument<Revocations>> currentByOrigin) {
+            Snapshot snap,
+            TrustSnapshot currentTrust,
+            Map<String, VerifiedDocument<Revocations>> currentByOrigin) {
         Objects.requireNonNull(snap, "snap");
+        Objects.requireNonNull(currentTrust, "currentTrust");
         Objects.requireNonNull(currentByOrigin, "currentByOrigin");
         String persisted = snap.state().revocations().sha256();
         if (persisted.isEmpty()) {
@@ -277,7 +299,9 @@ public final class SequencePolicy {
             if (!COVERAGE_ORIGINS.contains(entry.getKey())) {
                 continue;
             }
-            if (Hex.sha256(entry.getValue().exactBytes()).equals(persisted)) {
+            VerifiedDocument<Revocations> doc = entry.getValue();
+            if (admissible(snap, currentTrust, doc)
+                    && Hex.sha256(doc.exactBytes()).equals(persisted)) {
                 matches++;
             }
         }
@@ -286,30 +310,32 @@ public final class SequencePolicy {
 
     /**
      * Persists the effect of an accepted manifest (12.4, 12.12 M7). Only {@code ACCEPT} and {@code
-     * REPLAY_SAME} change state. For every trusted release-role signer, {@code seqByKid} takes the
-     * manifest's seq, hash and issued time. Withdrawn entries are added for the compiled platform
-     * only, for versions above {@code maxRunningOrOnDisk}, attributed to the first trusted signing
-     * kid in sorted order and deduplicated by sha512. Entries of revoked kids are pruned. If a cap
-     * would be exceeded, the delta is unchanged and {@code stateFull} is set.
+     * REPLAY_SAME} change state. For every current, unrevoked release-role signer, {@code seqByKid}
+     * takes the manifest's seq, hash and issued time. Withdrawn entries are added for the compiled
+     * platform only, for versions above {@code maxRunningOrOnDisk}, attributed to the first trusted
+     * signing kid in sorted order and deduplicated by sha512. Entries of revoked kids are pruned. If
+     * a cap would be exceeded, the delta is unchanged and {@code stateFull} is set.
      */
     public static AcceptResult acceptManifest(
             Snapshot snap,
             VerifiedDocument<ReleaseManifest> m,
             Trust trust,
+            TrustSnapshot currentTrust,
             String compiledPlatform,
             UpdateVersion maxRunningOrOnDisk) {
         Objects.requireNonNull(snap, "snap");
         Objects.requireNonNull(m, "m");
         Objects.requireNonNull(trust, "trust");
+        Objects.requireNonNull(currentTrust, "currentTrust");
         Objects.requireNonNull(compiledPlatform, "compiledPlatform");
         Objects.requireNonNull(maxRunningOrOnDisk, "maxRunningOrOnDisk");
-        ManifestDecision decision = manifestDecision(m, snap, trust);
+        ManifestDecision decision = manifestDecision(m, snap, trust, currentTrust);
         if (decision != ManifestDecision.ACCEPT && decision != ManifestDecision.REPLAY_SAME) {
             return new AcceptResult(unchanged(snap), false);
         }
 
         ReleaseManifest manifest = m.document();
-        Set<String> signingKids = trustedReleaseKids(m, snap.revoked().revokedPubs());
+        Set<String> signingKids = trustedReleaseKids(m, snap, currentTrust);
         String hash = Hex.sha256(m.exactBytes());
 
         Map<String, KidSeq> seqByKid = new TreeMap<>(snap.state().seqByKid());
@@ -353,6 +379,28 @@ public final class SequencePolicy {
             return new AcceptResult(unchanged(snap), true);
         }
         return new AcceptResult(new StateDelta(pruned.state(), pruned.revoked()), false);
+    }
+
+    /**
+     * True when the document was verified under {@code currentTrust}, is signed by the current
+     * revocation key (a current, unrevoked revocation-role key), and has structurally valid times
+     * (R6). The signer check uses {@code currentTrust} only.
+     */
+    private static boolean admissible(
+            Snapshot snap, TrustSnapshot currentTrust, VerifiedDocument<Revocations> doc) {
+        if (!doc.snapshot().equals(currentTrust)) {
+            return false;
+        }
+        String key = snap.state().revocationKey();
+        if (snap.revoked().revokedPubs().contains(key) || !currentTrust.revocationPubs().contains(key)) {
+            return false;
+        }
+        if (!doc.signers().containsPub(key)) {
+            return false;
+        }
+        Revocations r = doc.document();
+        return FreshnessPolicy.structuralTimesValid(
+                r.issued(), r.expires(), FreshnessPolicy.REVOCATIONS_MAX_LIFETIME);
     }
 
     /** Applies the restriction merge of one document and prunes, returning the new snapshot. */
@@ -431,19 +479,20 @@ public final class SequencePolicy {
                 s.tornSince());
     }
 
-    /** True when the document has a verified signer equal to the current, unrevoked key. */
-    private static boolean signedByCurrentRevocationKey(
-            Snapshot snap, VerifiedDocument<?> doc) {
-        String key = snap.state().revocationKey();
-        return !snap.revoked().revokedPubs().contains(key) && doc.signers().containsPub(key);
-    }
-
-    /** Kids of the verified release-role signers whose public key is not revoked, sorted. */
+    /**
+     * Kids of the signers that are current release keys (per {@code currentTrust}), whose public key
+     * is not revoked, and whose kid maps to that public key in the current trust. Sorted.
+     */
     private static Set<String> trustedReleaseKids(
-            VerifiedDocument<ReleaseManifest> m, Set<String> revokedPubs) {
+            VerifiedDocument<ReleaseManifest> m, Snapshot snap, TrustSnapshot currentTrust) {
+        Set<String> releasePubs = currentTrust.releasePubs();
+        Set<String> revokedPubs = snap.revoked().revokedPubs();
         Set<String> kids = new TreeSet<>();
         for (VerifiedSigner signer : m.signers().signers()) {
-            if (signer.roles().contains(KeyRole.RELEASE) && !revokedPubs.contains(signer.pub())) {
+            String pub = signer.pub();
+            if (releasePubs.contains(pub)
+                    && !revokedPubs.contains(pub)
+                    && pub.equals(currentTrust.pubByKid().get(signer.kid()))) {
                 kids.add(signer.kid());
             }
         }
