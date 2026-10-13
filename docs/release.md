@@ -57,15 +57,17 @@ listener binds, merged on `feat/phase4-alpha` after verifier, peer and security 
 - [x] Per-IP and global limits on connection attempts and open connections. `ConnectionAdmission` is
       wired into both listener binds, merged on `feat/phase4-alpha` after verifier, peer and security
       review; the settings are documented in [`server-security.md`](server-security.md) section 3.
-- [ ] Server-owner UDP firewall and DDoS documentation reviewed against
-      [`server-security.md`](server-security.md).
+- [x] Server-owner UDP firewall and DDoS documentation security-reviewed against
+      [`server-security.md`](server-security.md) (2026-10-13). Includes TCP-only frontend bypass
+      and hidden-origin warnings. This is a documentation review, not firewall execution,
+      provider coverage confirmation, load testing, or release approval.
 
 ## 5. Updater gates
 
 The updater is not in the alpha until all of these pass. See [`updater.md`](updater.md) section 10:
 
 - [ ] Manifest and key-set wire formats frozen and documented.
-- [ ] Signing tool exists and produces `release.json` and `release.json.sig`.
+- [ ] Signing tool exists and produces `release.v1.json` and `release.v1.json.sig`.
 - [ ] Signature, revocation, freshness, and downgrade tests pass ([`updater.md`](updater.md) section 8).
 - [ ] Live `ATOMIC_MOVE` replacement on Linux and macOS: loader-generation safety evidence and
       crash-recovery tests. Without this evidence release is blocked. Failure must keep the installed

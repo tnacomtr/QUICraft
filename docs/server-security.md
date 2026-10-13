@@ -119,7 +119,11 @@ attempts for honest players. They are **not** DDoS prevention (section 4).
 - Volumetric attacks need upstream protection at the network or hosting provider. This project does
   not provide it.
 - Blocking UDP entirely is a valid choice. Clients then use TCP.
-- The TCP game port has the same exposure, and the same upstream protection applies to it.
+- TCP protection does not imply UDP protection. Confirm with the provider that protection covers
+  the actual QUIC destination address and UDP port, not just the TCP frontend.
+- Do not expose an origin that is intended to remain hidden behind a TCP-only protected frontend.
+  Direct UDP to that origin can bypass the frontend and saturate the shared link, affecting TCP too.
+  Keeping UDP blocked and using TCP fallback is a valid choice.
 
 ## 5. TCP fallback invariants
 

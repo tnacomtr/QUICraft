@@ -65,8 +65,9 @@ Not released yet. When it is:
   moves to the game port + 1 (configurable).
 
 Alpha preparation guidance: [UDP firewall and DDoS caveats](docs/server-security.md) and
-[release checklist](docs/release.md). The [server updater](docs/updater.md) is planned, not
-implemented: its default will be hourly checks against Modrinth (primary), GitHub, and
+[release checklist](docs/release.md). The [server updater](docs/updater.md) is not runtime-wired:
+an isolated Java 21 verification module is under development. Its default will be hourly checks
+against Modrinth (primary), GitHub, and
 `git.sudoe.rs`, disclosing the server's IP and potentially version/platform information to those
 hosts. Owners will be able to turn checks off; downloads require an explicit command. No updater
 check or download runs in current builds.

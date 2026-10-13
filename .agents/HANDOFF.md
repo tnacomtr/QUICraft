@@ -1,53 +1,31 @@
 # Handoff: Phase 4 (2026-10-13)
 
-Branch `feat/phase4-alpha` @ 0ae5fe6, local only. `main` = 22b4e80 on both remotes. Nothing pushed.
-Read first: `CLAUDE.md`, `.agents/plans/2026-10-13-phase4-alpha.md` ("Wave 2"), `.agents/memory/decisions.md`.
+Branch `feat/phase4-alpha`, implementation integration through `f96738b`, local only. Nothing pushed.
+Read first: `CLAUDE.md`, `.agents/plans/2026-10-13-updater-implementation.md`, Phase 4 plan, `.agents/memory/decisions.md` and `gotchas.md`.
 
-## Done (verified)
-- **Listener protections merged.**
-  - `IngressGuard`: drops Initials under 1200 bytes and enforces the Initial budget.
-  - `AdmissionTokenHandler`: HMAC Retry, separate token-less and validated budgets, per-IP checks first, IPv6 per /64.
-  - Open-connection leases with a 10 s handshake deadline.
-  - Settings `quicraft.admission.*` (protocol.md §9, docs/server-security.md §3).
-  - Gates: verifier PASS, Sol approve, Opus security clean.
-- **Full clean build:** 77 tasks, 0 failures. Tests: core 196, shadedTest 4, testUpstreamNative 19, velocity 16, bridges 23+23, build-logic 5.
-- **Platform gates on the new code:**
-  - Fabric gametests (26.x and 1.21.11) PASS: QUIC, 0-RTT, fallback, fault injection with a TCP join.
-  - `run-real-client.sh` PASS: real client over QUIC, 0-RTT rejoin, earlyReleases 0→1. Run it as `MOCKSESSION_PORT=18080 xvfb-run -a testkit/run-real-client.sh` (searxng holds 8080).
-- **Updater spec:** `docs/updater.md` §12 is a **proposal**, reviewed over 4 security + peer rounds. The live-swap evidence is in the plan.
+## Approved choices (do not ask again)
+- User approved 30-day manifests / 14-day refresh, 365-day revocations / yearly backup signing, 2-of-3 staging coverage, console `reset-state`, cross-filesystem fail-manual, and backup authentication for key-set changes.
+- Explicit clarification: manual restore only, no v1 rollback command; atomic on-disk replacement while running, new code activates after restart. Own-jar resources must be preloaded; JDK21/macOS and crash safety remain release gates.
+- Initial cwnd default64, retaining `quicraft.initialCwndPackets`; explicit0 selects native10,1..1000 supported, malformed/out-of-range ->64.
+- No publishing/push/deploy/PR, generated signing keys, real updater requests or worktree cleanup authorized.
 
-## Blocked on the user (ask, don't decide)
-1. **Seven updater decisions in §12.** Recommendations in brackets:
-   - Manifest expiry/re-sign [30 d / 14 d].
-   - Revocation lifetime [365 d; the backup key signs yearly].
-   - Staging quorum [2 of 3 hosts].
-   - `reset-state` command [add, console only].
-   - Update dir on another filesystem [fail with manual instructions].
-   - Backup-key co-signature on jars that change the key set [yes; needs a format change].
-   - `rollback` command [undecided; manual restore is the baseline].
-2. **Live-swap semantics.** The atomic rename is safe, but the new version only runs after a restart, and on Velocity the plugin must read no own-jar resources after the swap. The user asked for an "atomic live swap": get sign-off and don't silently downgrade it.
-3. **Initial cwnd default.** Make 64 packets the default (protocol.md §9), keeping `-Dquicraft.initialCwndPackets` as the override. Recommended: yes.
+## Merged and independently gated
+- Prior listener protections remain merged: HMAC Retry, ingress/attempt/open budgets, IPv6 /64,10s deadline. Prior Fabric gametests and real-client QUIC/0-RTT/fallback gates are historical, not freshly rerun after cwnd64.
+- New Java21 `updater/` module, separate from Java8 core: bounded strict JSON, immutable four-document schemas, hex/kid derivation and semantic version ordering. 229 tests and8killed isolated mutants; verifierPASS, peerapprove, securityclean. Merged `6734de9` and earlier parser merge.
+- Cwnd unit merged `f96738b`:209core tests,20upstream (1expectedskip),4shaded;13config tests prove6base failures/13fixed passes. Native loss-ratio fixture is explicitly calibrated at10; separate64test verifies2MiB byte-exact delivery. No64reorder-performance-parity claim.
+- UDP/DDoS owner-doc security review passed after warning about TCP-only frontend bypass and hidden-origin exposure. Checklist tick is documentation-only.
+- Root full integrated build and final docs review are pending in this checkpoint. Do not substitute unit evidence for that gate.
 
-## Next (after the answers)
-- Implement the updater (Velocity and Fabric dedicated servers). Its remaining blockers:
-  - signing tool (key-set fingerprint bytes, seq-floor checks)
-  - URL/redirect policy
-  - Windows post-exit helper
-  - loader tests on JDK 21 and macOS
-- Release checklist (`docs/release.md`): the UDP/DDoS owner-docs review is still unticked. Phase 3 prerequisites.
-- No alpha-complete claim until all of the above is done. Releases, pushes and Modrinth uploads each need the user's go-ahead. Never open PRs.
+## Next
+1. Finish fresh root `./gradlew build --rerun-tasks --no-build-cache` and final docs review; preserve unrelated untracked user/config paths. No other root Gradle build concurrently.
+2. Freeze Wave3B signature/fingerprint/freshness APIs, critique, then implement and test using public RFC8032 fixtures (no signing-key generation). Parsing alone is NOT authentication. Retain all valid signers; staged key-set changes require current non-revoked backup authorization at final locked revalidation too. Existing `.sig` envelope can carry both roles; no bypass flag.
+3. Persistent per-key floors/revocation unions/coverage, confined locks/state/journal, atomic transaction/crash recovery. Then offline signing validation tool, fixed URL/redirect policy, and dedicated-only platform lifecycle/config/commands. No updater is runtime-wired or shipped yet.
+4. Windows post-exit helper, exact-loader JDK21/macOS safety, platform/TCP-fallback/health/release gates. Controlled10/64 reorder benchmark before claiming parity. Actual hosting paths and owner public signing keys are not configured; do not invent them or enable traffic.
 
-## Housekeeping
-- **Quarantined, don't merge or delete:** `agent/phase4-retry-tests` (`.worktrees/phase4-retry-tests`).
-- **Old worktrees, retained until the user OKs cleanup:** phase4-admission, -admission-tests, -retry-reviewed, -retry-token, -spdx-tests, -updater-docs. Their work is merged.
-- **Never stage:** `.claude/`, `AGENTS.md`, `docs/.plans/`, `agent_skills/`, `agent_config.yaml`.
-- **Agents:**
-  - Briefs start with `.agents/plans/contract-L0.txt`.
-  - Advisor: Astra via opencode, never the built-in advisor().
-  - At most 6 parallel units.
-  - `opencode run` has no `--dir`; `cd` into the worktree first.
-- **Older open items:**
-  - Forgejo CI (runner labels, Docker/DinD, ARM64, actions mirror)
-  - online-mode real-client run
-  - the netty-quic-natives workflow has never run
-  - the relay's `--work` mode hangs
+## Safety and retained work
+- Quarantined, never merge/delete: `agent/phase4-retry-tests` and new `agent/phase4-cwnd-tests` (`c7b8536`, unauthorized evidence file). Only authorized cwnd test content was salvaged into the reviewed branch; all proof regenerated independently.
+- All old and new worktrees retained. `.worktrees/phase4-cwnd-red-proof` intentionally contains the test fixture against old production; don't merge it. Exact agent roster/disposition is in the implementation plan; all editing agents are stopped/done.
+- Never stage/edit/delete unrelated `.claude/`, `.opencode/`, root `AGENTS.md`, `docs/.plans/`, `agent_skills/`, `agent_config.yaml`/`.bak`, or existing `.agents/opencode-runs/`.
+- At most6parallel units and ONE llama.cpp tester; plan-only checkpoints prevent drift. Do not use built-in advisor; prior setup uses Astra via opencode. `opencode run` has no `--dir`.
+- Older open items: Forgejo CI environment, online-mode real-client run, native workflow never run, relay `--work` hangs. Historical real-client invocation: `MOCKSESSION_PORT=18080 xvfb-run -a testkit/run-real-client.sh`.
+- Phase4 remains incomplete. No public-alpha or live-loader-safety claim without all release gates and user publication approval.

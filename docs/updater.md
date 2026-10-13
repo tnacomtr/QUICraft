@@ -52,7 +52,7 @@ manual-only updater instead of this design is not allowed.
 
 ## 3. Commands and permissions (draft, not registered)
 
-Console, or a player with `quicraft.admin.update`:
+Console, or a player with `quicraft.admin.update`, except that `reset-state` is console-only:
 
 | Command | Effect |
 | --- | --- |
@@ -70,18 +70,19 @@ Console, or a player with `quicraft.admin.update`:
 ## 4. Keys, freshness, and revocation
 
 - **Keys.** Two Ed25519 pairs: a primary key (signs releases; offline; never in CI) and a backup key
-  (signs nothing in normal operation; offline media; used only for recovery). Both public keys ship
-  in every jar with short key IDs. PROPOSED change (12.5): with revocation freshness the backup key
-  also re-signs `revocations.json` once a year.
+  (offline media; recovery and key-set authorization). Both public keys ship in updater-enabled
+  jars with short key IDs. The approved freshness policy also requires the backup key to re-sign
+  `revocations.v1.json` yearly and immediately on any revocation (12.5).
 - **Signing tool.** A planned repo script that uses the JDK's Ed25519. It does not exist yet. The
-  wire format of `release.json` and `release.json.sig` is unresolved.
+  unreleased v1 wire formats are specified in 12.3; the tool must reuse their verifier.
 - **Signed content.** The signature covers the manifest. The draft's fields: version, platform,
   game-version range, file name, size, SHA-512 of the jar, release date, signing key ID.
 - **Freshness (both required).** The updater requires both:
   1. a signed, monotonic sequence number, with the highest value seen persisted, so an older
      manifest is never accepted after a newer one; and
   2. signed issued and expiry times, so a stale manifest is rejected.
-  Schemas, sequence field encoding, expiry lengths, and clock-skew thresholds are unresolved.
+  Schemas, sequence field encoding, expiry lengths, and clock-skew thresholds are specified in
+  12.3-12.5; implementation and tests are still required.
 - **Verification rules (specified, not implemented).** Verification runs over the exact received
   bytes. Parsing is size-bounded and rejects duplicate fields. A downgrade (version lower than or
   equal to the running one) is refused.
@@ -93,9 +94,9 @@ Console, or a player with `quicraft.admin.update`:
     updater persists the highest accepted revocation metadata and never accepts an older one. A
     stale revocation replay is never treated as fresh. Persisted revoked key IDs form a permanent
     union: a later response that omits one does not undo it.
-  - **Coverage rule (open):** fallback to an artifact or mirror source must never weaken fresh
-    revocation coverage. The exact coverage rule for a source that fails is unresolved.
-  - Encodings, clock policy, and required coverage remain unresolved (section 10).
+  - **Coverage rule:** fallback to an artifact or mirror source never weakens fresh revocation
+    coverage. Staging needs matching fresh current revocations from 2 of 3 hosts (12.6).
+  - Encodings and clock policy are specified in 12.3-12.5, not yet runtime-enforced.
 - **Rotation.** The trusted key set ships inside the jar. Primary lost: the next release is signed
   with the backup key and carries a new key set. Primary leaked: publish a backup-signed revocation,
   then a release signed with the backup key and a new key set. Both lost or leaked: owners install
@@ -148,25 +149,26 @@ completed check returns to `idle`, whether or not an update exists.
   `idle`. The installed bytes are unchanged, and the staged file is removed.
 - **Failure during or after the swap** that leaves the installed state unclear -> `recovery-required`.
   The backup and journal are kept, and the defined recovery procedure runs on next start. The
-  recovery procedure is unresolved.
+  recovery procedure is specified in 12.11, not yet implemented or proven crash-safe.
 - Cancellation does not roll back an installed generation on its own.
 
 ### Concurrency
 
 Operations are serialized by a process lock and a file lock. Only one transaction runs at a time.
-Lock file locations and journal format are unresolved.
+Lock file locations and journal format are specified in 12.8-12.9, not yet implemented.
 
 ### Installed jar discovery and placement
 
 - **Discovery.** The installed jar is found through platform-validated loader installation metadata,
   not by guessing a file name. `getProtectionDomain().getCodeSource()` alone is not sufficient for
-  Fabric, so it is not the sole method. Exact loader-specific discovery is unresolved.
+  Fabric, so it is not the sole method. Loader-specific discovery is specified in 12.14 and still
+  requires implementation and supported-loader tests.
 - **Validation.** The resolved origin must be exactly one canonical, writable, top-level supported
   jar. Reject nested jars, dev or build-output paths, ambiguous origins, and symlink destinations.
 - **No duplicates.** Never leave two loadable QUICraft jars in `plugins/` (Velocity) or `mods/`
   (Fabric). Velocity refuses duplicate plugin IDs.
-- **Placement.** Backup and staging files live outside loader-scanned directories. Exact paths are
-  unresolved for each loader.
+- **Placement.** Backup and staging files live outside loader-scanned directories, at the paths
+  specified in 12.8 and 12.14.
 
 ### Windows
 
@@ -186,7 +188,7 @@ update.log-bad-signatures: true
 
 Real key names and loading are pending. Velocity config lives in `plugins/quicraft/config.properties`.
 Fabric config lives in `config/quicraft/server.properties`. The draft's `update/` paths under
-`plugins/quicraft/` are Velocity-only. The Fabric staging and state paths are unresolved.
+`plugins/quicraft/` are Velocity-only. Fabric staging and state paths are specified in 12.14.
 
 ### Disclosure
 
@@ -210,8 +212,8 @@ conditional requests, backoff on host failure) is a draft intent; parameters are
 
 ### Notifications
 
-Once per version. The last announced version is stored in a state file (path unresolved; the
-draft's `update/state.json` is Velocity-only). Offline OPs get the notice on next join. The draft's
+Once per version. The last announced version is stored in the platform's `state.json` (12.8 and
+12.14; the draft's `update/state.json` path is Velocity-only). Offline OPs get the notice on next join. The draft's
 message is an example, not a release.
 
 ## 7. Safety and fail-safe requirements
@@ -319,7 +321,7 @@ authentication extension below needs its own implementation security review befo
 
 ### 12.2 Keys and the trust file (blocker 1)
 
-PROPOSED: keep the two-key design. No separate root/release/timestamp split.
+APPROVED: keep the two-key design. No separate root/release/timestamp split.
 
 - Reason: the backup key already acts as the offline root (it signs revocations and recovery
   releases). A timestamp or online freshness key would need an online machine or CI, which the
@@ -416,7 +418,7 @@ PROPOSED: keep the two-key design. No separate root/release/timestamp split.
 
 ### 12.3 Encodings and bounded parsing (blocker 2)
 
-PROPOSED:
+Specified encoding and parser rules:
 
 - **Signed bytes = the exact file bytes.** The signature is over the raw received bytes of
   `release.json` or `revocations.json`. No canonical JSON, no re-serialisation. Reason: nothing to get
@@ -544,7 +546,7 @@ staging cannot pass the coverage rule.
 
 ### 12.4 Rollback and sequence rules (blockers 2, 3)
 
-PROPOSED: persist the highest accepted manifest `seq` **per signing key**, and compute the floor only
+Specified: persist the highest accepted manifest `seq` **per signing key**, and compute the floor only
 over keys that are not revoked.
 
 - `floor = max(trust.manifestSeqFloor, minManifestSeq of the current revocation key,
@@ -587,7 +589,7 @@ over keys that are not revoked.
 
 ### 12.5 Freshness and clock policy (blocker 3)
 
-PROPOSED numbers:
+Approved publication defaults and structural limits:
 
 | Rule | Value |
 | --- | --- |
@@ -631,7 +633,7 @@ PROPOSED numbers:
 
 ### 12.6 Revocation coverage when a source fails (blockers 4, 17)
 
-PROPOSED:
+Approved coverage policy:
 
 1. Every check (scheduled or explicit) fetches `revocations.v1.json` and its `.sig` from **all three**
    hosts, and `release.v1.json` and its `.sig` from all three, independently of which host later serves
@@ -664,7 +666,7 @@ PROPOSED:
 
 ### 12.7 Release sequencing and withdrawal (blocker 6)
 
-PROPOSED release sequence (the signing tool itself is blocker 15):
+Specified release sequence (the signing tool itself is blocker 15):
 
 1. Tag the commit. Build the jars. CI may build them; CI never signs.
 2. On the offline signing machine, compute size and SHA-512 of each jar, and check the built jar's
@@ -678,7 +680,7 @@ PROPOSED release sequence (the signing tool itself is blocker 15):
 The manifest is published only after every jar it names is available, so a client never sees a
 manifest pointing at a missing jar. A refresh without a release is steps 4 to 6 with the same entries.
 
-PROPOSED withdrawal (bad build, no key compromise):
+Specified withdrawal (bad build, no key compromise):
 
 1. Publish a new manifest (`seq + 1`) that no longer lists the bad version, and lists its platform,
    version and SHA-512 under `withdrawn`.
@@ -890,7 +892,8 @@ gated on blocker 10 on every platform.
 6. `installed-pending-restart`: take `state.lock` (peer review: no check may merge a revocation
    between the last authorisation and the move) and hold it through this step. Under it: re-read
    `state.json` and `revoked.json` from disk and re-authorise from that persisted state alone (no
-   network): the signer of the authorising manifest is not revoked, the staged `sha512` is not blocked
+   network): the full set of actually verified signers still provides release authorization and,
+   for a changed key-set fingerprint, current non-revoked backup authentication (12.2); the staged `sha512` is not blocked
    or withdrawn, the manifest `seq` is still at or above the floor, the revocation state is still fresh,
    and the staged jar's trust file (held in memory since step 5) passes the 12.2 staged-jar validation
    again against this freshly read state (peer review: a revocation merged after step 5 that hits a key
@@ -946,10 +949,8 @@ jar), no project code can recover it. That is why the manual rollback command is
 **Baseline: restoration is manual only** (peer review). The owner stops the server, copies
 `backup/<txid>.jar` over the live jar, and starts it; step 4 recognises the restore.
 
-> **Pending user decision, not specified:** a `/quicraft update rollback` command. It would be a
-> second live swap and would need its own admission rules, staged-jar validation and crash-recovery
-> transitions (and blocker 10's evidence) before it could be specified. Those are deliberately not
-> designed here.
+The user approved manual restore as the v1 baseline. There is no `/quicraft update rollback`
+command. A future command would need separate admission, validation and recovery design.
 
 ### 12.12 Verification algorithm
 

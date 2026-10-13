@@ -1,0 +1,5 @@
+# Gotchas
+
+- **Native reordering fixture needs an explicit window:** `NativeFeaturesTest`'s comparative relaxed-loss ratio was calibrated at cwnd10. Inheriting the new default64 failed8/8 controls versus5/5 passes at10. Pinning this capability fixture to10 preserves its old assertions; a separate byte-exact2MiB transfer covers64. This is not evidence of reorder performance parity at64. (src: independent verifier/superior diagnosis and `af53885`, 2026-10-13, verified)
+- **Strict updater parsing is not authentication:** the separate Java21 module parses bounded immutable schemas only. Successful parsing does not imply signatures, freshness, sequence floors, revocation coverage or permission to stage a jar. Keep these as separate reviewed layers. (src: `DocumentParser` contract and verifier `9e49a57`, 2026-10-13, verified)
+- **TCP-only protection can be bypassed by origin UDP:** confirm provider coverage of the actual QUIC address and port before opening it; TCP frontend coverage is not sufficient and UDP exposure can harm the shared TCP link. (src: owner-doc security review and `docs/server-security.md` section4, 2026-10-13, verified)

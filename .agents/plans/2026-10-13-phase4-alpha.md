@@ -234,5 +234,17 @@ Updater spec: `docs/updater.md` §12 is a reviewed PROPOSAL. Implementation stay
 decisions listed in §12 (manifest expiry/refresh, revocation lifetime, 2-of-3 quorum, reset-state
 command, cross-filesystem behaviour, backup-key co-signature for key-set changes, rollback command)
 and the remaining blockers. Live swap: the evidence above means a swap takes effect only at restart,
-and Velocity must read no own-jar resources after a swap; this needs the user's sign-off, because
+and Velocity must read no own-jar resources after a swap; this needed the user's sign-off, because
 the request was an atomic live swap.
+
+### Wave 3: approved updater implementation (2026-10-13)
+
+The user approved the handoff recommendations and explicitly confirmed manual restore (no v1
+rollback command) and restart-required activation after atomic live replacement. The implementation
+plan and current unit roster are in `.agents/plans/2026-10-13-updater-implementation.md`.
+
+The Java 21 updater module is separate from the Java 8 core. Bounded JSON and version parsing are
+merged after independent verification (124 tests, four killed mutants), peer approval and security
+review. Schemas, cwnd64 and their remaining gates are tracked in the implementation plan; none of
+this enables updater network traffic or replaces installed jars. The UDP/DDoS owner-documentation
+review passed after correcting the TCP-only frontend/hidden-origin warning. Phase 4 is not complete.
