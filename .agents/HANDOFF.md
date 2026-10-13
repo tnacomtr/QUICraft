@@ -15,7 +15,7 @@ READ FIRST: `CLAUDE.md`, this file, `.agents/plans/2026-10-13-phase4-alpha.md` (
 
 ## NEXT
 1. Present the updater decisions and the live-swap implication to the user; record the answers in `.agents/memory/decisions.md`.
-2. Platform/fault-injection gates with the new listener code: Fabric gametests (26.x and 1.21.11), Velocity tests, testkit join/ping over QUIC with default admission settings, and the fault-injection TCP-join test.
+2. DONE 2026-10-13 with the new listener code: `:fabric-26x:runClientGameTest` and `:fabric-1.21.11:runClientGameTest` PASS (QUIC join, 0-RTT, fallback, fault injection with TCP join), `:velocity:test` 16/16, `testkit/run-real-client.sh` (MOCKSESSION_PORT=18080, since searxng holds 8080) PASS: real 26.1.2 client over QUIC, rejoin over 0-RTT, earlyReleases 0 -> 1. Logs in `.agents/opencode-runs/gates-*`.
 3. Release checklist (docs/release.md), the UDP/DDoS docs review item, Phase 3 prerequisites.
 4. Updater implementation only after step 1 and its remaining blockers (signing tool, endpoint/redirect policy, Windows helper, loader tests on JDK 21 and macOS).
 5. Still waiting on the user: default initial cwnd of 64 packets (protocol.md §9).
