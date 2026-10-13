@@ -11,6 +11,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -40,7 +41,8 @@ final class StartupRecovery {
     static final String MSG_KEPT = "update journal is in recovery-required; keeping every update file";
     static final String MSG_MANUAL_RESTORE = "backup was restored by hand; staged update discarded, backup kept";
     static final String MSG_UNEXPECTED_STAGING = "unexpected entry kept in staging: ";
-    static final String MSG_HEALTH_UNCONFIRMED = "health result could not be recorded; keeping the journal and backup";
+    static final String MSG_HEALTH_UNCONFIRMED = "health result could not be confirmed on disk; the next start re-checks";
+    static final String MSG_NOT_INSTALLED = "update was not installed; staging removed";
 
     /** Largest boot-pending attempt count that still gets another boot (12.11 step 7). */
     private static final int MAX_BOOT_ATTEMPTS_BEFORE_RECOVERY = 2;
@@ -140,8 +142,8 @@ final class StartupRecovery {
             } catch (IOException e) {
                 return required(dir, live, journal, MSG_UNCONFIRMED);
             }
-            return new RecoveryResult(RecoveryStatus.IDLE, Optional.empty(), Optional.of(live),
-                    List.of(MSG_MANUAL_RESTORE));
+            String message = j.phase() == JournalPhase.PREPARED ? MSG_NOT_INSTALLED : MSG_MANUAL_RESTORE;
+            return new RecoveryResult(RecoveryStatus.IDLE, Optional.empty(), Optional.of(live), List.of(message));
         }
 
         return switch (j.phase()) {
@@ -180,7 +182,8 @@ final class StartupRecovery {
             } catch (IOException e) {
                 return required(dir, live, Optional.of(j), MSG_UNCONFIRMED);
             }
-            return new RecoveryResult(RecoveryStatus.IDLE, Optional.empty(), Optional.of(live), List.of());
+            return new RecoveryResult(RecoveryStatus.IDLE, Optional.empty(), Optional.of(live),
+                    List.of(MSG_NOT_INSTALLED));
         }
         if (live.sha512().equals(j.staged().sha512())) {
             return recoverSwapped(ctx, dir, live, j, p);
@@ -260,28 +263,43 @@ final class StartupRecovery {
         }
     }
 
+
+    /** Delay between attempts to take {@code txn.lock} when it is busy at health completion. */
+    static final Duration HEALTH_LOCK_RETRY_DELAY = Duration.ofSeconds(1);
+    /** Attempts to take {@code txn.lock} at health completion before the stage fails. */
+    static final int HEALTH_LOCK_ATTEMPTS = 3;
+
     /**
      * Waits for the health verdict and then records it (docs/updater.md 12.10 step 7). No lock is held
-     * while waiting. On the completing thread, {@code txn.lock} is taken, the journal must still be
-     * boot-pending for {@code ticket}, and only then are files changed.
+     * while waiting.
      *
-     * <p>Outcomes: {@link HealthCompletion#HEALTHY} deletes the journal and the backups of earlier
-     * transactions only; {@link HealthCompletion#FAILED} and {@link HealthCompletion#TIMED_OUT} keep both;
-     * {@link HealthCompletion#JOURNAL_CHANGED} touches nothing. A signal that completes exceptionally with
-     * {@link TimeoutException} counts as a timeout; any other exceptional or {@code false} result counts as failed.
+     * <p><b>Thread model.</b> The recording step takes a file lock and does file I/O, so it runs on
+     * {@code executor}. The caller must pass a platform worker executor, never the server's main thread.
+     * A retry is scheduled on the same executor after {@link #HEALTH_LOCK_RETRY_DELAY}; the JDK delay thread
+     * only schedules and never blocks.
      *
-     * <p>Every other failure completes the stage exceptionally with a fixed-message
+     * <p><b>Busy lock.</b> {@code txn.lock} is tried up to {@link #HEALTH_LOCK_ATTEMPTS} times, one second
+     * apart. If every attempt fails, the stage completes exceptionally with the lock's
+     * {@link UpdateRejectedException}. The caller may retry later. Meanwhile the journal stays
+     * {@code BOOT_PENDING}, so the next start counts this boot as attempt two.
+     *
+     * <p>The stage always completes. Outcomes: {@link HealthCompletion#HEALTHY} deletes the journal and the
+     * backups of earlier transactions only; {@link HealthCompletion#FAILED} and {@link HealthCompletion#TIMED_OUT}
+     * keep both; {@link HealthCompletion#JOURNAL_CHANGED} touches nothing. A signal that completes
+     * exceptionally with {@link TimeoutException} counts as a timeout; any other exceptional or {@code false}
+     * result counts as failed. Every other failure completes the stage exceptionally with a fixed-message
      * {@link UpdateRejectedException}.
      *
      * @throws NullPointerException on a null argument, and {@link IllegalArgumentException} for a
      *     timeout that is not positive (both are programming errors, raised synchronously)
      */
     static CompletionStage<HealthCompletion> completeHealth(RecoveryContext ctx, RecoveryTicket ticket,
-            HealthSignal signal, Duration timeout) {
+            HealthSignal signal, Duration timeout, Executor executor) {
         Objects.requireNonNull(ctx, "ctx");
         Objects.requireNonNull(ticket, "ticket");
         Objects.requireNonNull(signal, "signal");
         Objects.requireNonNull(timeout, "timeout");
+        Objects.requireNonNull(executor, "executor");
         if (timeout.isNegative() || timeout.isZero()) {
             throw new IllegalArgumentException("timeout must be positive");
         }
@@ -303,14 +321,75 @@ final class StartupRecovery {
         bounded.whenComplete((healthy, error) -> {
             HealthCompletion verdict = verdictOf(healthy, error);
             try {
-                out.complete(finishHealth(ctx, ticket, verdict));
-            } catch (UpdateRejectedException e) {
-                out.completeExceptionally(e);
-            } catch (IOException | RuntimeException e) {
+                executor.execute(() -> attemptHealth(ctx, ticket, verdict, executor, out, 1));
+            } catch (RuntimeException e) {
                 out.completeExceptionally(new UpdateRejectedException(MSG_HEALTH_UNCONFIRMED));
             }
         });
         return out;
+    }
+
+    /** One attempt to record the verdict. Always completes {@code out}; rethrows a VirtualMachineError only after that. */
+    private static void attemptHealth(RecoveryContext ctx, RecoveryTicket ticket, HealthCompletion verdict,
+            Executor executor, CompletableFuture<HealthCompletion> out, int attempt) {
+        try {
+            TransactionLock.TxnLease lease;
+            try {
+                lease = TransactionLock.tryAcquire(ctx.updateDir());
+            } catch (UpdateRejectedException busy) {
+                if (attempt < HEALTH_LOCK_ATTEMPTS) {
+                    CompletableFuture.delayedExecutor(HEALTH_LOCK_RETRY_DELAY.toNanos(), TimeUnit.NANOSECONDS,
+                            executor).execute(() -> attemptHealth(ctx, ticket, verdict, executor, out, attempt + 1));
+                } else {
+                    out.completeExceptionally(busy);
+                }
+                return;
+            }
+            out.complete(recordHealth(ctx, ticket, verdict, lease));
+        } catch (UpdateRejectedException e) {
+            out.completeExceptionally(e);
+        } catch (Throwable t) {
+            out.completeExceptionally(new UpdateRejectedException(MSG_HEALTH_UNCONFIRMED));
+            if (t instanceof VirtualMachineError) {
+                throw (VirtualMachineError) t;
+            }
+        }
+    }
+
+    /** Records the verdict under the lease. The lease is closed on every path. */
+    private static HealthCompletion recordHealth(RecoveryContext ctx, RecoveryTicket ticket,
+            HealthCompletion verdict, TransactionLock.TxnLease lease) throws IOException, UpdateRejectedException {
+        HealthCompletion result;
+        try {
+            result = recordUnderLease(ctx, ticket, verdict);
+        } catch (Throwable t) {
+            closeQuietly(lease);
+            throw t;
+        }
+        if (result == HealthCompletion.HEALTHY) {
+            closeQuietly(lease);
+        } else {
+            lease.close();
+        }
+        return result;
+    }
+
+    private static HealthCompletion recordUnderLease(RecoveryContext ctx, RecoveryTicket ticket,
+            HealthCompletion verdict) throws IOException, UpdateRejectedException {
+        UpdateDirectory dir = new UpdateDirectory(ctx.updateDir(), ctx.ops());
+        dir.requireOwnedContents();
+        Optional<JournalRecord> journal = dir.readJournal();
+        if (journal.isEmpty() || !journal.get().txid().equals(ticket.txid())
+                || journal.get().phase() != JournalPhase.BOOT_PENDING) {
+            return HealthCompletion.JOURNAL_CHANGED;
+        }
+        if (verdict != HealthCompletion.HEALTHY) {
+            return verdict;
+        }
+        dir.deleteStaging(ticket.txid());
+        dir.deleteJournal();
+        pruneEarlierBackups(dir, ticket.txid());
+        return HealthCompletion.HEALTHY;
     }
 
     private static HealthCompletion verdictOf(Boolean healthy, Throwable error) {
@@ -320,29 +399,6 @@ final class StartupRecovery {
             return cause instanceof TimeoutException ? HealthCompletion.TIMED_OUT : HealthCompletion.FAILED;
         }
         return Boolean.TRUE.equals(healthy) ? HealthCompletion.HEALTHY : HealthCompletion.FAILED;
-    }
-
-    private static HealthCompletion finishHealth(RecoveryContext ctx, RecoveryTicket ticket, HealthCompletion verdict)
-            throws IOException, UpdateRejectedException {
-        TransactionLock.TxnLease lease = TransactionLock.tryAcquire(ctx.updateDir());
-        try {
-            UpdateDirectory dir = new UpdateDirectory(ctx.updateDir(), ctx.ops());
-            dir.requireOwnedContents();
-            Optional<JournalRecord> journal = dir.readJournal();
-            if (journal.isEmpty() || !journal.get().txid().equals(ticket.txid())
-                    || journal.get().phase() != JournalPhase.BOOT_PENDING) {
-                return HealthCompletion.JOURNAL_CHANGED;
-            }
-            if (verdict != HealthCompletion.HEALTHY) {
-                return verdict;
-            }
-            dir.deleteStaging(ticket.txid());
-            dir.deleteJournal();
-            pruneEarlierBackups(dir, ticket.txid());
-            return HealthCompletion.HEALTHY;
-        } finally {
-            lease.close();
-        }
     }
 
     /**
@@ -356,7 +412,7 @@ final class StartupRecovery {
                     dir.deleteBackup(txid);
                 }
             }
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
             // Keep the files. The next healthy transaction prunes every earlier backup.
         }
     }
