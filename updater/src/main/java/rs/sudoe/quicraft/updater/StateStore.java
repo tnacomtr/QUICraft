@@ -47,11 +47,19 @@ public final class StateStore {
     static final String STATE = "state.json";
     static final String REVOKED = "revoked.json";
     static final String LOCK = "state.lock";
+    static final String TXN_LOCK = "txn.lock";
     private static final String PREV = ".prev";
     private static final String TMP = ".tmp";
     private static final String OWNER_MISMATCH = "update directory not owned by the server user";
 
     private static final ConcurrentHashMap<Path, ReentrantLock> GUARDS = new ConcurrentHashMap<>();
+
+    /**
+     * True on a thread while it holds the state lock. Used to refuse re-entry into the store from a
+     * locked callback, and to refuse taking {@link TransactionLock} inside a state lock (lock order:
+     * txn before state).
+     */
+    private static final ThreadLocal<Boolean> IN_STATE_LOCK = ThreadLocal.withInitial(() -> false);
 
     private final Path dir;
     private final Runnable afterRevokedWrite;
@@ -102,6 +110,29 @@ public final class StateStore {
                 return new StateRecords.Snapshot(initial.newState(), initial.newRevoked());
             }
             return readSnapshot(warnings).snapshot();
+        });
+    }
+
+    /** A callback that runs while both locks are held and receives the freshly read state. */
+    public interface LockedStateOperation<T> {
+        T run(StateRecords.Snapshot freshlyRead) throws IOException, UpdateRejectedException;
+    }
+
+    /**
+     * Re-reads both files under the state lock (with the corruption rules) and runs {@code op} while
+     * both locks are held. The callback must not call any other {@link StateStore} method on this
+     * thread (re-entry raises IllegalStateException) and must not take {@link TransactionLock}.
+     *
+     * @throws IllegalStateException if the store was never initialised
+     */
+    public <T> T withLockedSnapshot(LockedStateOperation<T> op)
+            throws IOException, UpdateRejectedException {
+        Objects.requireNonNull(op, "op");
+        return withLocks(warnings -> {
+            if (!anyFileExists()) {
+                throw new IllegalStateException("state store not initialised");
+            }
+            return op.run(readSnapshot(warnings).snapshot());
         });
     }
 
@@ -202,11 +233,15 @@ public final class StateStore {
 
     /** Runs {@code op} with the in-process guard and the OS lock held. */
     private <T> T withLocks(Operation<T> op) throws IOException, UpdateRejectedException {
-        prepareDirectory();
+        if (IN_STATE_LOCK.get()) {
+            throw new IllegalStateException("StateStore re-entered while the state lock is held");
+        }
+        prepareDirectory(dir);
         ReentrantLock guard = GUARDS.computeIfAbsent(dir.toRealPath(), k -> new ReentrantLock());
         guard.lock();
+        IN_STATE_LOCK.set(true);
         try {
-            try (FileChannel channel = openLockFile()) {
+            try (FileChannel channel = openLock(dir, LOCK)) {
                 FileLock osLock;
                 try {
                     osLock = channel.tryLock();
@@ -228,16 +263,23 @@ public final class StateStore {
                 }
             }
         } finally {
+            IN_STATE_LOCK.set(false);
             guard.unlock();
         }
+    }
+
+    /** True when the current thread holds the state lock (inside a store callback). */
+    static boolean holdsStateLock() {
+        return IN_STATE_LOCK.get();
     }
 
     private interface Operation<T> {
         T run(List<String> warnings) throws IOException, UpdateRejectedException;
     }
 
-    private FileChannel openLockFile() throws IOException {
-        Path lock = dir.resolve(LOCK);
+    /** Opens (creating if needed) a lock file in {@code dir}, refusing links. */
+    static FileChannel openLock(Path dir, String name) throws IOException {
+        Path lock = dir.resolve(name);
         return FileChannel.open(lock,
                 Set.<OpenOption>of(StandardOpenOption.CREATE, StandardOpenOption.WRITE,
                         LinkOption.NOFOLLOW_LINKS),
@@ -251,7 +293,7 @@ public final class StateStore {
      * existing managed file belong to the user running this process. The process user is taken from
      * a probe file created here, so no attacker-planted file can supply the reference owner.
      */
-    private void prepareDirectory() throws IOException, UpdateRejectedException {
+    static void prepareDirectory(Path dir) throws IOException, UpdateRejectedException {
         if (Files.isSymbolicLink(dir)) {
             throw new UpdateRejectedException("update directory is a symbolic link");
         }
@@ -281,14 +323,14 @@ public final class StateStore {
         }
     }
 
-    private static List<String> managedNames() {
-        return List.of(STATE, STATE + PREV, REVOKED, REVOKED + PREV, LOCK);
+    static List<String> managedNames() {
+        return List.of(STATE, STATE + PREV, REVOKED, REVOKED + PREV, LOCK, TXN_LOCK);
     }
 
     /** True when a state or revoked file (or its {@code .prev}) exists. The lock file does not count. */
     private boolean anyFileExists() {
         for (String name : managedNames()) {
-            if (LOCK.equals(name)) {
+            if (LOCK.equals(name) || TXN_LOCK.equals(name)) {
                 continue;
             }
             if (Files.exists(dir.resolve(name), LinkOption.NOFOLLOW_LINKS)) {

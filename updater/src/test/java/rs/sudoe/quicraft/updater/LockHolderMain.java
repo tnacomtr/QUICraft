@@ -8,8 +8,9 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 
 /**
- * Test helper run in a child JVM: takes the OS lock on state.lock in the given directory, prints
- * "locked", and holds it until stdin reaches end of file.
+ * Test helper run in a child JVM: takes the OS lock on a lock file (default state.lock, or the
+ * second argument) in the given directory, prints "locked", and holds it until stdin reaches end of
+ * file.
  */
 public final class LockHolderMain {
 
@@ -17,7 +18,8 @@ public final class LockHolderMain {
     }
 
     public static void main(String[] args) throws IOException {
-        Path lock = Path.of(args[0]).resolve("state.lock");
+        String name = args.length > 1 ? args[1] : "state.lock";
+        Path lock = Path.of(args[0]).resolve(name);
         try (FileChannel ch = FileChannel.open(lock, StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE)) {
             FileLock held = ch.lock();
