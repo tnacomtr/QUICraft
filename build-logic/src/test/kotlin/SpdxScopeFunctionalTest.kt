@@ -71,6 +71,38 @@ class SpdxScopeFunctionalTest {
         assertFalse(missing.any { it.contains(".claude") }, "claude worktree files must not be reported, was: $missing")
     }
 
+    @Test
+    fun nestedWorktreeDirInsideModuleIsStillChecked(@TempDir fixtureDir: File) {
+        writeFixture(fixtureDir) { root ->
+            writeHeaderless(File(root, "module/.worktrees/X.java"), "public class X {}\n")
+        }
+
+        val result = runCheckExpectingFailure(fixtureDir)
+
+        assertEquals(TaskOutcome.FAILED, result.task(":checkSpdxHeaders")?.outcome, result.output)
+        val missing = missingFiles(result.output)
+        assertTrue(
+            missing.contains("module/.worktrees/X.java"),
+            "the .worktrees/** exclude is root-anchored and must not skip a nested .worktrees dir, was: $missing",
+        )
+    }
+
+    @Test
+    fun nestedAgentSkillsDirIsStillChecked(@TempDir fixtureDir: File) {
+        writeFixture(fixtureDir) { root ->
+            writeHeaderless(File(root, "module/agent_skills/Y.java"), "public class Y {}\n")
+        }
+
+        val result = runCheckExpectingFailure(fixtureDir)
+
+        assertEquals(TaskOutcome.FAILED, result.task(":checkSpdxHeaders")?.outcome, result.output)
+        val missing = missingFiles(result.output)
+        assertTrue(
+            missing.contains("module/agent_skills/Y.java"),
+            "the agent_skills/** exclude is root-anchored and must not skip a nested agent_skills dir, was: $missing",
+        )
+    }
+
     private fun writeFixture(root: File, body: (File) -> Unit) {
         writeLicensed(File(root, "settings.gradle.kts"), "rootProject.name = \"spdx-scope-fixture\"\n")
         writeLicensed(File(root, "build.gradle.kts"), "plugins { id(\"quicraft.spdx\") }\n")
