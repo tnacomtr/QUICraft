@@ -91,8 +91,25 @@ class DocumentParserTest {
         return String.format("%064x", n);
     }
 
+    /**
+     * The n-th (1-based) canonical, prime-order Ed25519 point encoding, scanning y = 2, 3, ... with
+     * the sign bit clear. Deterministic; the point's private key is never needed.
+     */
+    private static String validPointHex(long n) {
+        long found = 0;
+        for (long y = 2; ; y++) {
+            byte[] enc = new byte[32];
+            for (int i = 0; i < 8; i++) {
+                enc[i] = (byte) (y >>> (8 * i));
+            }
+            if (Ed25519Points.isCanonicalPrimeOrderCandidate(enc) && ++found == n) {
+                return Hex.encode(enc);
+            }
+        }
+    }
+
     private static String generatedKeyJson(long n, String roles) throws Exception {
-        String pub = pubHex(n);
+        String pub = validPointHex(n);
         return keyJson(independentKid(pub), pub, roles);
     }
 
@@ -1037,5 +1054,12 @@ class DocumentParserTest {
                 "\"tag\":\"v0.4.0\"", "\"tag\":\"" + MARKER + "\""))));
         assertNoEcho(() -> DocumentParser.parseRevocations(utf8(replaceOnce(validRevocations(),
                 "\"sha512\":\"" + H7 + "\"", "\"sha512\":\"" + MARKER + "\""))));
+    }
+
+    @Test
+    void trustFileWithAllZeroKeyIsRejected() throws Exception {
+        String zero = "00".repeat(32);
+        rejectsTrust(trustWithKeys(keyJson(Hex.kid(zero), zero, "[\"release\",\"revocation\"]")));
+        assertNotNull(parseTrust(validTrust()));
     }
 }

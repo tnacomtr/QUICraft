@@ -193,22 +193,57 @@ class TrustTransitionTest {
 
     @Test
     void normalInvalidAndOlderLeaveStateUnchanged() throws Exception {
-        Snapshot current = snapshot();
         UpdateDocuments.Trust sameEpoch = trust(1, PUB_2);
-        // Persisted epoch 1 in the snapshot; trust epoch 1 with a matching fingerprint for NORMAL.
-        TrustDecision normal = new TrustDecision(
-                Transition.NORMAL, 1, fingerprintOf(sameEpoch), PUB_2, Set.of(), true);
-        TrustDecision invalid = new TrustDecision(
-                Transition.INVALID_SAME_EPOCH, 1, STALE_FINGERPRINT, PUB_2, Set.of(), true);
-        TrustDecision older = new TrustDecision(
-                Transition.OLDER_EPOCH_REPORT_ONLY, 0, STALE_FINGERPRINT, PUB_2, Set.of(), true);
+        // NORMAL: persisted epoch 1 with the trust file's own fingerprint.
+        Snapshot base = snapshot();
+        Snapshot normalState = withEpochAndFingerprint(base, 1, fingerprintOf(sameEpoch));
+        TrustDecision normal = TrustTransition.classify(
+                normalState.state().persistedTrust(), sameEpoch);
+        assertEquals(Transition.NORMAL, normal.transition());
+        assertUnchanged(normal, sameEpoch, normalState);
 
-        for (TrustDecision d : List.of(normal, invalid, older)) {
-            StateDelta delta = TrustTransition.apply(d, sameEpoch, current);
-            assertEquals(current.state(), delta.newState(), d.transition().name());
-            assertEquals(current.revoked(), delta.newRevoked(), d.transition().name());
-        }
+        // INVALID_SAME_EPOCH: persisted epoch 1 with a different fingerprint.
+        TrustDecision invalid = TrustTransition.classify(base.state().persistedTrust(), sameEpoch);
+        assertEquals(Transition.INVALID_SAME_EPOCH, invalid.transition());
+        assertUnchanged(invalid, sameEpoch, base);
+
+        // OLDER_EPOCH_REPORT_ONLY: persisted epoch 2, trust file epoch 1.
+        Snapshot newerState = withEpochAndFingerprint(base, 2, STALE_FINGERPRINT);
+        TrustDecision older = TrustTransition.classify(
+                newerState.state().persistedTrust(), sameEpoch);
+        assertEquals(Transition.OLDER_EPOCH_REPORT_ONLY, older.transition());
+        assertUnchanged(older, sameEpoch, newerState);
+
+        // A hand-built decision that differs from classify() is refused.
+        TrustDecision handBuilt = new TrustDecision(
+                Transition.NORMAL, 1, fingerprintOf(sameEpoch), PUB_2, Set.of(), true);
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> TrustTransition.apply(handBuilt, sameEpoch, base));
     }
+
+    private static void assertUnchanged(TrustDecision d, UpdateDocuments.Trust trust, Snapshot current)
+            throws Exception {
+        StateDelta delta = TrustTransition.apply(d, trust, current);
+        assertEquals(current.state(), delta.newState(), d.transition().name());
+        assertEquals(current.revoked(), delta.newRevoked(), d.transition().name());
+    }
+
+    private static Snapshot withEpochAndFingerprint(Snapshot base, int epoch, String fingerprint) {
+        UpdaterState s = base.state();
+        UpdaterState changed = new UpdaterState(
+                epoch,
+                fingerprint,
+                s.revocationKey(),
+                s.revocations(),
+                s.seqByKid(),
+                s.withdrawn(),
+                s.lastAnnounced(),
+                s.warnedBad(),
+                s.tornSince());
+        return new Snapshot(changed, base.revoked());
+    }
+
 
     @Test
     void rotationReplacesEpochAndFingerprintOnly() throws Exception {
@@ -328,23 +363,28 @@ class TrustTransitionTest {
     }
 
     @Test
-    void replacementAppendsNewPubsSortedAfterExistingKeys() throws Exception {
+    void replacementAppendsOldRevocationPubAfterExistingKeysWithoutDuplicates() throws Exception {
+        UpdateDocuments.Trust trust = trust(3, PUB_3);
+        // Persisted revocation key is PUB_2 (from snapshot()); the revoked list holds OTHER_REVOKED.
         Snapshot current = snapshotWithRevokedKeys(List.of(
                 new UpdateDocuments.RevokedKey(Hex.kid(OTHER_REVOKED), OTHER_REVOKED)));
-        UpdateDocuments.Trust trust = trust(3, PUB_3);
-        TrustDecision d = new TrustDecision(
-                Transition.REVOCATION_KEY_REPLACEMENT,
-                3,
-                fingerprintOf(trust),
-                PUB_3,
-                Set.of(PUB_2, OLD_REVOKED),
-                true);
+        TrustDecision d = TrustTransition.classify(current.state().persistedTrust(), trust);
+        assertEquals(Transition.REVOCATION_KEY_REPLACEMENT, d.transition());
+        assertEquals(Set.of(PUB_2), d.newlyRevokedPubs());
 
         RevokedState revoked = TrustTransition.apply(d, trust, current).newRevoked();
-        // Existing first, then the new ones sorted by pub: "1..." before "3d40...".
         assertEquals(
-                List.of(OTHER_REVOKED, OLD_REVOKED, PUB_2),
+                List.of(OTHER_REVOKED, PUB_2),
                 revoked.revokedKeys().stream().map(UpdateDocuments.RevokedKey::pub).toList());
+
+        // PUB_2 already in the revoked list: it is not appended a second time.
+        Snapshot already = snapshotWithRevokedKeys(List.of(
+                new UpdateDocuments.RevokedKey(Hex.kid(OTHER_REVOKED), OTHER_REVOKED),
+                new UpdateDocuments.RevokedKey(Hex.kid(PUB_2), PUB_2)));
+        RevokedState again = TrustTransition.apply(d, trust, already).newRevoked();
+        assertEquals(
+                List.of(OTHER_REVOKED, PUB_2),
+                again.revokedKeys().stream().map(UpdateDocuments.RevokedKey::pub).toList());
     }
 
     @Test
@@ -413,5 +453,46 @@ class TrustTransitionTest {
         assertEquals(first, second);
         assertEquals(untouched, current);
         assertNotEquals(current.state(), first.newState());
+    }
+
+    @Test
+    void handBuiltReplacementWithoutNewlyRevokedKeyIsRefused() throws Exception {
+        Snapshot current = snapshot();
+        UpdateDocuments.Trust trust = trust(3, PUB_3);
+        TrustDecision forged = new TrustDecision(
+                Transition.REVOCATION_KEY_REPLACEMENT,
+                3,
+                fingerprintOf(trust),
+                PUB_3,
+                Set.of(),
+                true);
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> TrustTransition.apply(forged, trust, current));
+    }
+
+    @Test
+    void decisionClassifiedAgainstOlderStateIsRefusedForChangedState() throws Exception {
+        UpdateDocuments.Trust next = trust(2, PUB_2);
+        TrustDecision d = TrustTransition.classify(
+                new PersistedTrust(1, STALE_FINGERPRINT, PUB_2), next);
+        assertEquals(Transition.ROTATION, d.transition());
+
+        Snapshot base = snapshot();
+        UpdaterState s = base.state();
+        UpdaterState changed = new UpdaterState(
+                2,
+                s.keySetFingerprint(),
+                s.revocationKey(),
+                s.revocations(),
+                s.seqByKid(),
+                s.withdrawn(),
+                s.lastAnnounced(),
+                s.warnedBad(),
+                s.tornSince());
+        Snapshot changedSnapshot = new Snapshot(changed, base.revoked());
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> TrustTransition.apply(d, next, changedSnapshot));
     }
 }
