@@ -6,7 +6,9 @@ import com.velocitypowered.api.event.EventTask;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
+import com.velocitypowered.api.event.connection.PostLoginEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
+import com.velocitypowered.api.command.CommandMeta;
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
@@ -23,8 +25,11 @@ import io.netty.channel.socket.DatagramChannel;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
@@ -32,6 +37,8 @@ import rs.sudoe.quicraft.core.connect.FallbackReport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
+import rs.sudoe.quicraft.updater.UpdaterPlatform;
+import rs.sudoe.quicraft.updater.UpdaterRuntime;
 
 /**
  * QUICraft for Velocity (docs/platforms/velocity.md). Every step fails safe: whatever goes
@@ -46,6 +53,9 @@ public final class QuicraftVelocity {
     private EventLoopGroup workers;
     private QuicListener listener;
     private StatusAdvertiser advertiser;
+    /** Set once the updater has started; null when it did not (docs/updater.md). */
+    private volatile UpdaterRuntime updater;
+    private volatile VelocityUpdateNotifier updateNotifier;
     /** Set while QUIC runs: clients that fell back to TCP report it here (docs/protocol.md §6). */
     volatile FallbackReport.Log fallbackLog;
     static final MinecraftChannelIdentifier FALLBACK_CHANNEL = MinecraftChannelIdentifier.from(Protocol.FALLBACK_CHANNEL);
@@ -60,17 +70,106 @@ public final class QuicraftVelocity {
     /** Runs before Velocity binds its listeners, so the wrapped initializer covers every channel. */
     @Subscribe
     public void onProxyInitialize(ProxyInitializeEvent event) {
+        boolean quicInitOk = false;
         try {
             start();
+            quicInitOk = true;
         } catch (Throwable t) {
             logger.warn("QUICraft: QUIC disabled, players connect over TCP as usual", t);
             stop();
         }
+        // After QUIC init and in its own guard: the updater needs no QUIC, and neither affects the other.
+        startUpdater(quicInitOk);
     }
 
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
         stop();
+        stopUpdater();
+    }
+
+    /** Admin update notices wait for a joining admin (docs/updater.md 6, Notifications). */
+    @Subscribe
+    public void onPostLogin(PostLoginEvent event) {
+        try {
+            VelocityUpdateNotifier notifier = updateNotifier;
+            if (notifier != null) {
+                notifier.onJoin(event.getPlayer());
+            }
+        } catch (Throwable t) {
+            logger.debug("QUICraft: delivering an update notice failed", t);
+        }
+    }
+
+    /**
+     * Starts the updater (docs/updater.md) and registers {@code /quicraft update}. Every failure is
+     * logged once; QUIC and TCP are never affected. The health verdict completes last, so it reflects
+     * this whole init.
+     */
+    private void startUpdater(boolean quicInitOk) {
+        VelocityUpdaterPlatform platform = null;
+        try {
+            VelocityUpdateNotifier notifier = new VelocityUpdateNotifier(proxy::getAllPlayers);
+            updateNotifier = notifier;
+            String target = VelocityUpdaterPlatform.targetOf(proxy.getVersion().getVersion());
+            platform = new VelocityUpdaterPlatform(target, logger, dataDirectory, pluginSource(),
+                    Path.of("plugins"), notifier);
+            updater = runUpdaterStart(platform, logger, UpdaterRuntime::start);
+            registerUpdateCommand();
+        } catch (VirtualMachineError e) {
+            throw e;
+        } catch (Throwable t) {
+            logger.warn("QUICraft: the updater did not start; QUIC and TCP are unaffected", t);
+        } finally {
+            if (platform != null) {
+                platform.completeInit(quicInitOk);
+            }
+        }
+    }
+
+    /** Velocity's own record of this plugin's jar; empty when Velocity does not know it. */
+    private Supplier<Optional<Path>> pluginSource() {
+        return () -> proxy.getPluginManager().fromInstance(this).flatMap(c -> c.getDescription().getSource());
+    }
+
+    /**
+     * Runs the starter. A throw (including an Error other than a VirtualMachineError) gives null, so the
+     * caller goes on as if the updater were off. Static so the fail-safe rule is testable without Velocity.
+     */
+    static UpdaterRuntime runUpdaterStart(UpdaterPlatform platform, Logger logger,
+            Function<UpdaterPlatform, UpdaterRuntime> starter) {
+        try {
+            return starter.apply(platform);
+        } catch (VirtualMachineError e) {
+            throw e;
+        } catch (Throwable t) {
+            logger.warn("QUICraft: the updater did not start; QUIC and TCP are unaffected", t);
+            return null;
+        }
+    }
+
+    private void registerUpdateCommand() {
+        try {
+            CommandMeta meta = proxy.getCommandManager().metaBuilder("quicraft").plugin(this).build();
+            proxy.getCommandManager().register(meta, new UpdateCommand(() -> updater, logger));
+        } catch (Throwable t) {
+            logger.warn("QUICraft: the /quicraft update command is not available", t);
+        }
+    }
+
+    private void stopUpdater() {
+        UpdaterRuntime running = updater;
+        updater = null;
+        if (running == null) {
+            return;
+        }
+        try {
+            running.shutdown();
+        } catch (VirtualMachineError e) {
+            throw e;
+        } catch (Throwable t) {
+            logger.debug("QUICraft: stopping the updater failed", t);
+        }
     }
 
     /**
