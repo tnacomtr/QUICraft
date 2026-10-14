@@ -495,6 +495,21 @@ public final class QuicServer implements Closeable {
      * queued. Two source loops can both find room and overshoot by at most one each, so this is a
      * bound, not an exact count. Same-loop delivery is left to the dispatcher, which fires it
      * directly.
+     *
+     * <p>A hand-over also has to close the target socket's read cycle. Netty's dispatcher delivers
+     * a forwarded datagram by firing a read on the target's codec context, and records that it owes
+     * that context a read-complete
+     * ({@code QuicCodecDispatcher.ChannelHandlerContextDispatcher} sets its flag in
+     * {@code fireChannelRead} and fires {@code fireChannelReadComplete()} from
+     * {@code channelReadComplete}); the QUIC codec only flushes and completes a receive there
+     * ({@code QuicheQuicCodec.channelReadComplete()} calls {@code recvComplete()}). Nothing on the
+     * target socket fires that completion for a datagram it never read itself, so a connection
+     * whose packets all arrive on a foreign socket, as they do after a NAT rebind, would never be
+     * flushed and could stall with the datagrams already accounted for. The forwarding task
+     * therefore fires {@code fireChannelReadComplete()} on the target's context once the in-flight
+     * count for that target reaches zero: the last datagram of a burst closes the read that the
+     * burst opened, giving one completion per burst rather than one per datagram, and the next
+     * burst's own last task fires its own.
      */
     static final class ForwardLimiter extends ChannelInboundHandlerAdapter {
         /** Datagrams one loop may have handed to another and not seen processed, per target. */
@@ -571,7 +586,10 @@ public final class QuicServer implements Closeable {
          * {@link #MAX_PENDING_FORWARDS} of them waiting, and then releases it here instead of
          * queueing it. The hand-over runs through the target's own executor, so the read on its
          * context happens on its loop, and the pending count drops in a {@code finally} whether the
-         * read throws or an early shutdown rejects the task.
+         * read throws or an early shutdown rejects the task. The task that drops the count to zero
+         * also fires the target's read completion (see the class javadoc): the dispatcher delivers
+         * the read without one, and the QUIC codec flushes and completes the receive only from
+         * {@code channelReadComplete}.
          */
         private void forward(int target, ChannelHandlerContext to, Object msg) {
             if (pending.get(target) >= MAX_PENDING_FORWARDS) {
@@ -584,13 +602,31 @@ public final class QuicServer implements Closeable {
                     try {
                         to.fireChannelRead(msg);
                     } finally {
-                        pending.decrementAndGet(target);
+                        if (pending.decrementAndGet(target) == 0) {
+                            readComplete(target, to);
+                        }
                     }
                 });
             } catch (RuntimeException rejected) {
                 // Shutting down: do not leave the slot pending for ever, and do not leak the buffer.
                 pending.decrementAndGet(target);
                 drop(target, msg);
+            }
+        }
+
+        /**
+         * Closes the read cycle the target's dispatcher opened for the forwarded datagram, once no
+         * more of it is in flight. Fired from the target's loop, on the limiter's own context so it
+         * reaches the dispatcher and from there the codec the dispatcher selected. Never lets a
+         * throwing completion (a socket torn down mid-burst, say) affect the counter, which those
+         * tasks own.
+         */
+        private void readComplete(int target, ChannelHandlerContext to) {
+            try {
+                to.fireChannelReadComplete();
+            } catch (Throwable t) {
+                LOG.log(Level.FINE, "firing the read completion for forwarded datagrams on socket " + target
+                        + " failed", t);
             }
         }
 
