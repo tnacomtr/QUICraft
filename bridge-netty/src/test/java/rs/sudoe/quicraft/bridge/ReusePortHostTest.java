@@ -152,6 +152,7 @@ class ReusePortHostTest {
                 assertSame(workers, loop.parent(), "and on the platform's own worker group");
                 assertTrue(loop.inEventLoop(acceptThread.get()),
                         "acceptingLoop() names the accepting socket's loop, where the accept runs");
+                assertTrue(waitFor(readThread), "the pipeline never read the client's byte");
                 assertSame(acceptThread.get(), readThread.get(), "QUIC, the socket and the pipeline share a thread");
                 client.close();
             }

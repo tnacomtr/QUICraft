@@ -20,6 +20,7 @@ import io.netty.handler.codec.quic.SslEarlyDataReadyEvent;
 import io.netty.util.concurrent.Future;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -226,6 +227,42 @@ public final class QuicClient {
             CONTEXTS.clear();
         }
         EarlyCache.INSTANCE.clear();
+    }
+
+    /**
+     * Whether a cached TLS context for {@code fingerprint} holds a session ticket from the server
+     * at {@code remote}, so the next connect there can resume and offer 0-RTT data. Netty keeps
+     * that cache package-private, so this reads it by reflection and answers false on any
+     * failure; SessionResumptionTest checks that it still works. For tests and diagnostics.
+     */
+    public static boolean hasSessionTicket(InetSocketAddress remote, Fingerprint fingerprint) {
+        List<Tls> candidates = new ArrayList<>();
+        synchronized (CONTEXTS) {
+            for (Map.Entry<List<Object>, Tls> e : CONTEXTS.entrySet()) {
+                if (e.getKey().get(0).equals(fingerprint)) {
+                    candidates.add(e.getValue());
+                }
+            }
+        }
+        for (Tls tls : candidates) {
+            try {
+                java.lang.reflect.Method get = tls.context.getClass().getDeclaredMethod("getSessionCache");
+                get.setAccessible(true);
+                Object cache = get.invoke(tls.context);
+                if (cache == null) {
+                    continue;
+                }
+                java.lang.reflect.Method has = cache.getClass().getDeclaredMethod("hasSession", String.class, int.class);
+                has.setAccessible(true);
+                if ((Boolean) has.invoke(cache, remote.getAddress().getHostAddress(), remote.getPort())) {
+                    return true;
+                }
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                LOG.log(Level.FINE, "session cache not readable", e);
+                return false;
+            }
+        }
+        return false;
     }
 
     /**

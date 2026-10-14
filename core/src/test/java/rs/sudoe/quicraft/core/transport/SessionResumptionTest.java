@@ -40,6 +40,24 @@ class SessionResumptionTest {
     }
 
     @Test
+    void hasSessionTicketSeesTheTicket() throws Exception {
+        ServerIdentity identity = ServerIdentity.generate();
+        try (QuicServer server = Loopback.echoServer(identity, new CompletableFuture<>())) {
+            InetSocketAddress address = server.localAddress();
+            assertFalse(QuicClient.hasSessionTicket(address, identity.fingerprint()), "no ticket before a join");
+            echo(address, identity, TransportConfig.DEFAULT);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!QuicClient.hasSessionTicket(address, identity.fingerprint()) && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertTrue(QuicClient.hasSessionTicket(address, identity.fingerprint()),
+                    "the server's ticket is visible (Netty's session cache is still readable)");
+            QuicClient.forgetSessions();
+            assertFalse(QuicClient.hasSessionTicket(address, identity.fingerprint()), "forgotten");
+        }
+    }
+
+    @Test
     void withoutResumptionEveryConnectChecksTheCertificate() throws Exception {
         ServerIdentity identity = ServerIdentity.generate();
         TransportConfig fresh = TransportConfig.builder().sessionResumption(false).build();

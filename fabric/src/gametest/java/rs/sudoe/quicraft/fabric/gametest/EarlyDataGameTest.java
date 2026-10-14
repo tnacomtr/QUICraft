@@ -3,11 +3,14 @@ package rs.sudoe.quicraft.fabric.gametest;
 
 import static rs.sudoe.quicraft.fabric.gametest.GameTests.check;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestDedicatedServerContext;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
+import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.transport.QuicClient;
 import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.client.QuicraftClient;
@@ -77,6 +80,26 @@ public class EarlyDataGameTest implements FabricClientGameTest {
         join(context, server, quic, zeroRtt, what, false);
     }
 
+    /**
+     * Waits up to 100 ticks for the server's TLS session ticket, which the next join needs to
+     * send 0-RTT data. It arrives after the handshake, on its own schedule, so a fixed wait raced
+     * it on slow CI runners.
+     */
+    private static void awaitSessionTicket(ClientGameTestContext context, TestDedicatedServerContext server,
+            String what) {
+        Advertisement ad = server.computeOnServer(s -> ServerQuic.advertisement());
+        check(ad != null, what + ": the server advertises QUIC");
+        InetSocketAddress v4 = new InetSocketAddress(InetAddress.getLoopbackAddress(), ad.port());
+        InetSocketAddress v6 = new InetSocketAddress("::1", ad.port());
+        for (int i = 0; i < 100; i++) {
+            if (QuicClient.hasSessionTicket(v4, ad.fingerprint()) || QuicClient.hasSessionTicket(v6, ad.fingerprint())) {
+                return;
+            }
+            context.waitTick();
+        }
+        check(false, what + ": no TLS session ticket after 100 ticks");
+    }
+
     /** {@code play}: the full scripted session (PlaySession), checking for desync after the 0-RTT start. */
     private static void join(ClientGameTestContext context, TestDedicatedServerContext server, boolean quic,
             boolean zeroRtt, String what, boolean play) {
@@ -89,6 +112,9 @@ public class EarlyDataGameTest implements FabricClientGameTest {
             check(used == zeroRtt, what + ": 0-RTT " + (zeroRtt ? "used" : "not used"));
             if (play) {
                 PlaySession.run(context, server, connection);
+            }
+            if (quic) {
+                awaitSessionTicket(context, server, what);
             }
             context.waitTicks(10); // the session ticket and the next token arrive
         }
