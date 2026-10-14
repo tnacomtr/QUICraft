@@ -14,6 +14,12 @@ import rs.sudoe.quicraft.core.QuicSupport;
 final class Codecs {
     private Codecs() {}
 
+    /**
+     * Length of the connection ids the listener issues. Equal to Netty's default (quiche's maximum,
+     * 20); set explicitly so {@link IngressGuard} parses headers with the same value as the codec.
+     */
+    static final int LOCAL_CONNECTION_ID_LENGTH = io.netty.handler.codec.quic.Quic.MAX_CONN_ID_LEN;
+
     static <B extends QuicCodecBuilder<B>> B apply(B builder, TransportConfig config, boolean server) {
         // Only QUICraft's patched native has the binding; elsewhere quiche's default (off) stays.
         if (QuicSupport.hasRelaxedLossThreshold()) {
@@ -29,6 +35,7 @@ final class Codecs {
                 .initialMaxStreamsBidirectional(server ? 1 : 0)
                 .initialMaxStreamsUnidirectional(0)
                 .activeMigration(false)
+                .localConnectionIdLength(LOCAL_CONNECTION_ID_LENGTH)
                 .congestionControlAlgorithm(algorithm(config.congestionControl));
         if (config.initialCongestionWindowPackets() > 0) {
             configured.initialCongestionWindowPackets(config.initialCongestionWindowPackets());

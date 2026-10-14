@@ -10,4 +10,18 @@ dependencies {
     // MIT; build tooling only. Provides both net.fabricmc.fabric-loom (26.x, unobfuscated) and
     // net.fabricmc.fabric-loom-remap (1.21.11, Intermediary), so they share one classloader.
     implementation("net.fabricmc:fabric-loom:1.18.3")
+
+    // Existing approved JUnit version; Gradle TestKit is part of the build toolchain.
+    testImplementation(gradleTestKit())
+    testImplementation(platform("org.junit:junit-bom:5.14.4"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
+tasks.test {
+    useJUnitPlatform()
+    // UpdaterTrustTest and UpdaterMetadataFunctionalTest read the repository's development trust file.
+    inputs.file("../updater/dev-trust/updater-trust.json")
+        .withPropertyName("devTrustFile")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
 }

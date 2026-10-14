@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-13]
+        os: [macos-latest, macos-15-intel]
         test-jdk: [21, 25]
     runs-on: ${{ matrix.os }}
     steps:

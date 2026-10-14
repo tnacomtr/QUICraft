@@ -9,8 +9,9 @@ import java.util.Set;
 /**
  * Fault injection for core's own fail-safe points (CLAUDE.md "Working rules"): a stage listed
  * here throws where core would otherwise do its work, and core must carry on as if that work
- * weren't there. Off unless a test (or {@code -Dquicraft.faultInjection}, which platforms read)
- * turns stages on.
+ * weren't there. Off unless a test calls {@link #set} (the Fabric gametests do too). No system
+ * property maps onto these stages; {@code -Dquicraft.faultInjection} drives the platform hooks'
+ * own fault predicate, not this class.
  */
 public final class Faults {
     /** The 0-RTT stages, docs/protocol.md §8. */
@@ -21,6 +22,8 @@ public final class Faults {
     public static final String EARLY_TOKEN_REDEEM = "early token redeem";
     /** The QUIC attempt fails right after its 0-RTT data went out: TCP wins with a login started. */
     public static final String EARLY_ABANDON = "early abandon";
+    /** Scheduling a server connection's handshake deadline fails (docs/protocol.md §9). */
+    public static final String HANDSHAKE_DEADLINE = "handshake deadline";
 
     private static volatile Set<String> stages = Collections.emptySet();
 

@@ -1,0 +1,183 @@
+# Server security and firewall guidance (draft)
+
+**Status: draft for server owners, not yet reviewed for release.** The connection limits and Retry in
+section 3 are wired into both listener binds and merged on `feat/phase4-alpha` after verifier, peer
+and security review. Do not rely on any limit here until the Phase 4 gates in
+`docs/release.md` section 4 pass.
+
+## 1. Ports
+
+- **QUIC port.** By default QUIC uses the same number as the TCP game port, over UDP (for example
+  `25565/udp` on a default server, per `README.md`).
+- **Query collision.** If the platform's query protocol is enabled on the same UDP port, QUIC binds an
+  alternative port and advertises it instead.
+  - Velocity: `[query]` enabled on the game port. `alternative-port` in
+    `plugins/quicraft/config.properties`; `0` means game port + 1.
+  - Fabric dedicated server: `enable-query` on the game port. `alternative-port` in
+    `config/quicraft/server.properties`; `0` means game port + 1.
+  - If the bind fails, the server logs a warning and runs TCP-only. Startup is never failed over it
+    (`docs/protocol.md` section 2).
+- **SO_REUSEPORT shares the QUIC port with the same user.** On Linux the listener binds several UDP
+  sockets to the QUIC port with SO_REUSEPORT (`docs/protocol.md` section 11), one per game event loop,
+  because one event loop thread per listener does not reach the scale target in `CLAUDE.md`. How many
+  is `udp-sockets` in the platform's own config (`plugins/quicraft/config.properties` for Velocity,
+  `config/quicraft/server.properties` for the Fabric dedicated server): `auto` (the default) is one
+  per CPU core, at most 16, and 1..64 is that many. Any other process **of the same user** can bind
+  the same address and port with SO_REUSEPORT and receive a share of the players' UDP packets. A
+  process of a different user cannot. Run the server under its own user account and do not share that
+  account with anything untrusted. A value above 1 is ignored, and one socket is bound, where several
+  are impossible: any platform other than Linux (macOS and the BSDs do not balance unicast UDP over
+  such sockets and Windows has no SO_REUSEPORT), a transport without SO_REUSEPORT, or the option
+  being refused. The listener logs one INFO line with the socket count it bound at startup.
+- The server never intercepts query traffic.
+
+## 2. Firewall rules
+
+General firewall practice, shown as examples only. These have not been tested on any platform in this
+preparation unit.
+
+- Allow UDP on the QUIC port. That is the same number as the TCP game port (default `25565/udp`), or
+  the configured alternative port when the query collision moves QUIC (default: game port + 1). Keep
+  the TCP game port open. Do not close TCP to make QUIC work: TCP is the compatibility path.
+- Add the rule for **both IPv4 and IPv6** if the server is reachable over both; most firewalls keep
+  the two rule sets separate (see IPv6 below).
+- Example with `ufw` (adjust the port): `ufw allow 25565/udp`. Equivalent `nftables` or `iptables` rules
+  accept UDP to the chosen port.
+- If a TCP-only frontend (for example TCPShield, playit.gg, or Cloudflare Spectrum) sits in front of
+  the server, it cannot relay QUIC. Clients use TCP automatically (`CLAUDE.md`, Discovery point 3).
+
+### IPv6 (standard operator guidance; not checked in this preparation unit)
+
+- If the server is reachable over IPv6, the firewall rule for UDP on that port needs an IPv6 entry as
+  well. IPv4 and IPv6 rules are separate in most firewalls.
+- This preparation unit did not check whether QUIC binds IPv6 sockets, which addresses are advertised,
+  or how clients choose a family. Do not assume IPv6 QUIC works until the Phase 4 test matrix covers it.
+- The TCP IPv6 path is unchanged and must keep working.
+
+## 3. Connection limits and Retry
+
+The listener enforces per-IP and global limits on QUIC connection attempts and open connections,
+plus an address-validation Retry. Every setting is a JVM system property, read once at listener
+start, for example `-Dquicraft.admission.maxOpenPerIp=64`. They are wired into both listener binds.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `quicraft.admission.retry` | `adaptive` | Retry policy: `adaptive`, `always` or `never` (below). |
+| `quicraft.admission.globalAttemptsPerSecond` | 2000 | New connection attempts per second, all IPs. |
+| `quicraft.admission.perIpAttemptsPerSecond` | 20 | New connection attempts per second, per IP (see the attempt budget below). |
+| `quicraft.admission.retryThresholdPerSecond` | 50 | All-IP attempt rate at which `adaptive` starts Retry. |
+| `quicraft.admission.maxOpen` | 65536 | Open QUIC connections (pending plus established), all IPs. |
+| `quicraft.admission.maxOpenPerIp` | 32 | Open QUIC connections (pending plus established), per IP. |
+| `quicraft.admission.maxTrackedIps` | 131072 | IPs tracked at once for the per-IP counters. |
+| `quicraft.admission.ingressInitialsPerSecond` | 8000 | Initial datagrams per second, all IPs (packet guard). |
+| `quicraft.admission.ingressInitialsPerIpPerSecond` | 200 | Initial datagrams per second, per IP (packet guard). |
+
+- **`retry=adaptive` (default).** For admitted attempts, the server sends a QUIC Retry (address
+  validation, which costs the client one extra round trip and its 0-RTT early data) only once
+  connection attempts in the current second reach `retryThresholdPerSecond`. `adaptive` also forces
+  Retry while a handshake backlog exists (see the next bullet). `retryThresholdPerSecond` is clamped
+  to `globalAttemptsPerSecond`.
+- **`retry=always`.** Every new connection gets a Retry. Use this under attack: the server validates
+  the client's address before spending connection state on it.
+- **`retry=never`.** No Retry for admitted attempts. Refusals and a handshake backlog still get a
+  Retry, as in every mode (next bullet).
+- **Refusals and backlog (every mode).** A refused attempt gets a Retry and is then dropped. An
+  attempt is refused when it is over an attempt limit or the open-connection limits are full. A
+  token-less attempt is also refused while unconfirmed handshakes reach 25% or more of `maxOpen`
+  (a backlog, for example of spoofed half-open handshakes). A token-bearing attempt over its
+  validated limit, or one that arrives while the open-connection limits are full, is dropped without
+  a Retry. A token-bearing attempt is not refused by a backlog, because its address is already proven.
+- **Scale note.** The defaults leave room for the 50,000-concurrent-player-per-node target (CLAUDE.md
+  Architecture). The attempt cap of 2000/s would let a 50,000-player node refill in about 25 s,
+  but only with enough CPU: one event loop completes roughly 900 to 1000 handshakes/s on the test
+  machine (`docs/benchmarks.md`), so the refill rate depends on the number of UDP sockets and cores.
+  Retry applies above 50 attempts/s. The Retry backlog trigger is 25% of `maxOpen`, i.e. 16,384 unconfirmed handshakes
+  at the default `maxOpen=65536`. Memory is an extrapolation, not a measurement: `docs/benchmarks.md`
+  held 41,403 idle transport connections at ~37 KiB each, which gives ~2.3 GiB at the 65,536 cap
+  for the transport alone, before any game state.
+- **Ingress guard.** `ingressInitialsPerSecond` and `ingressInitialsPerIpPerSecond` drop excess QUIC
+  Initial datagrams before any QUIC processing. This is a cheap packet-level guard; other packets
+  (established connections) are never counted.
+- **Attempt budget.** One join under Retry can spend up to 3 connection attempts. So the default
+  `perIpAttemptsPerSecond=20` allows roughly 6-10 joins per second per IP while Retry is active.
+- **Many players behind one IP** (shared NAT: schools, LAN parties, carrier NAT): raise
+  `maxOpenPerIp` and `perIpAttemptsPerSecond` so one address does not starve the others. Raise
+  `maxOpen` too if the whole server, not one IP, is the limit.
+- **Invalid or out-of-range values** fall back to the default with one WARNING in the log.
+- A refused connection (over any attempt or open-connection limit) gets at most a Retry and is then
+  silently dropped, before any QUIC connection exists. A QUICraft client falls back to TCP after its
+  short head start (`docs/protocol.md` section 5). **TCP joins are never limited by these settings.**
+- **Retry tokens:** HMAC-SHA256, bound to the client IP and port, 30 s lifetime. The key is random
+  per listener start, so a restart invalidates outstanding tokens (harmless: the client retries or
+  falls back to TCP).
+- **Per-IP key.** An IPv4 address (IPv4-mapped IPv6 counts as IPv4) or an IPv6 /64. Hosts in one /64
+  share their budgets, while a holder of a /48 gets 65536 separate keys. Larger prefixes are not
+  aggregated on purpose: that would penalise unrelated users behind shared prefixes.
+- **Handshake deadline.** A QUIC connection whose handshake is not complete 10 s after it was created
+  is closed. A real client on a very slow link then falls back to TCP. The 10 s is fixed; there is no
+  system property for it.
+- **Short Initials.** An Initial datagram shorter than 1200 bytes is dropped without an answer
+  (RFC 9000 §14.1). Real clients always pad to 1200, so this only affects malformed or attack traffic.
+- **Validated budget.** An attempt that brings back a valid Retry token has its own budget, with the
+  same limits. A flood of token-less Initials cannot use it up, so clients that already proved their
+  address keep joining. Validated Initials still count against the ingress guard.
+- **Startup WARNINGs.** The listener logs one WARNING per condition at bind time:
+  - `maxTrackedIps` is below `maxOpen + globalAttemptsPerSecond`. New addresses may be refused while
+    the tracked ones fill the table.
+  - `maxTrackedIps` is below `ingressInitialsPerSecond`. The ingress guard shares that table, so
+    Initials from new addresses may be dropped while it is full.
+  Raising `maxTrackedIps` to at least `maxOpen + globalAttemptsPerSecond` and to at least
+  `ingressInitialsPerSecond` clears both.
+
+These limits are a **mitigation**, not DDoS protection. They reduce the cost of abusive connection
+attempts for honest players. They are **not** DDoS prevention (section 4).
+
+## 4. DDoS and spoofed traffic
+
+- UDP is cheap to send. Spoofed or real UDP can be sent in volume to an open port, and server-side
+  limits cannot absorb traffic that saturates the link.
+- Volumetric attacks need upstream protection at the network or hosting provider. This project does
+  not provide it.
+- Blocking UDP entirely is a valid choice. Clients then use TCP.
+- TCP protection does not imply UDP protection. Confirm with the provider that protection covers
+  the actual QUIC destination address and UDP port, not just the TCP frontend.
+- Do not expose an origin that is intended to remain hidden behind a TCP-only protected frontend.
+  Direct UDP to that origin can bypass the frontend and saturate the shared link, affecting TCP too.
+  Keeping UDP blocked and using TCP fallback is a valid choice.
+
+## 5. TCP fallback invariants
+
+These must hold for every configuration (`CLAUDE.md`):
+
+- The vanilla TCP listener is untouched.
+- A QUIC failure (no advertisement, UDP blocked, handshake failure, fingerprint mismatch, unsupported
+  platform) falls back to TCP silently.
+- A bug in this project must never stop a player from joining over TCP. Fault-injection tests cover
+  this (`docs/release.md` section 3).
+
+## 6. Update checks: disclosure and HTTPS
+
+- The updater (planned, not implemented; `docs/updater.md`) checks release hosts on its own schedule by
+  default.
+- Each check sends the server's IP, the running version, and the platform to those hosts.
+- **Disclosure is required before release** in the README and on project pages. It is not present yet.
+  The plugin also says so once on first start.
+- Downloads use HTTPS to fixed hosts only. Planned hosts: Modrinth, GitHub, and `git.sudoe.rs`.
+- Checks can be turned off with a config key (conceptual; not yet wired).
+- The updater never runs the new jar in the current process.
+
+## 7. Owner responsibilities for keys
+
+- The updater trusts only signatures from the primary and backup keys built into the jar.
+- Keep the primary key offline (owner's machine or hardware key). Keep the backup key offline on
+  separate media, with a paper copy. Neither enters the repo or CI.
+- If a private key leaks, follow the rotation steps in `docs/updater.md` section 4. If both keys are
+  lost or leaked, updates cannot be trusted, and the owner installs the next release by hand.
+- The first install is trusted by source. Download QUICraft only from the release hosts above.
+
+## 8. Not claimed
+
+- The section 3 settings are merged on `feat/phase4-alpha` but are not active in any release. Their
+  defaults have not been load-tested in this project.
+- IPv6 QUIC behavior has not been tested by this project (see section 2).
+- Hosting-rule compliance is not verified here (see `docs/updater.md` section 11).

@@ -4,10 +4,12 @@
 // pipeline through bridge-netty42 (Velocity 4.2 bundles Netty 4.2). The plugin jar bundles the
 // shaded core and the bridge as they are; core's Netty is already relocated.
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import org.gradle.api.tasks.PathSensitivity
 
 plugins {
     id("quicraft.java-conventions")
     id("com.gradleup.shadow")
+    id("quicraft.updater-trust")
 }
 
 tasks.withType<JavaCompile>().configureEach {
@@ -35,6 +37,7 @@ dependencies {
     compileOnly(files(velocityProxy))
     implementation(project(path = ":core", configuration = "shadowRuntimeElements"))
     implementation(project(":bridge-netty42"))
+    implementation(project(":updater"))
     // The proxy jar carries Velocity's API, Netty and the rest, as at runtime.
     testImplementation(files(velocityProxy))
 }
@@ -87,4 +90,21 @@ tasks.named<Test>("test") {
     workingDir = work.get().asFile
     doFirst { work.get().asFile.mkdirs() }
     jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // The updater metadata test reads the outer (shaded) jar, the one the updater swaps.
+    // An updatable version (e.g. 0.1.0-alpha.1) packages only with the development trust when
+    // -Pquicraft.allowDevTrust=true is passed, so the release-shaped test jar is built with:
+    //   ./gradlew :velocity:check -Pversion=0.1.0-alpha.1 -Pquicraft.allowDevTrust=true
+    // SNAPSHOT versions need no property. checkReleaseTrust refuses that property.
+    dependsOn(tasks.named("shadowJar"))
+    val shadowArchive = tasks.named<ShadowJar>("shadowJar").flatMap { it.archiveFile }
+    // The test reads the shaded jar's bytes, so the jar (and through it the trust file, the version
+    // and the Gradle properties that shape them) is a real input. Without it a changed trust could
+    // leave this task UP-TO-DATE with a stale result.
+    inputs.file(shadowArchive)
+        .withPropertyName("shadowJar")
+        .withPathSensitivity(PathSensitivity.NONE)
+    doFirst {
+        systemProperty("quicraft.shadowJar", shadowArchive.get().asFile.absolutePath)
+    }
+    systemProperty("quicraft.expectedVersion", project.version.toString())
 }

@@ -20,3 +20,16 @@ natives/build/
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# Isolated OpenCode agent worktrees
+.worktrees/
+
+# Antigravity subagent run logs (transient; see antigravity-subagent skill)
+.agents/antigravity-runs/
+
+# Signing keys: only public keys are ever tracked. Private keys stay offline with the owner.
+pubkeys/*
+!pubkeys/*.pub.pem
+*.key
+*private*.pem
+*.sec.pem

@@ -16,18 +16,19 @@
 # client has no Mojang account. The mock server runs in both modes but only online mode uses it.
 #
 # Needs a display or xvfb-run, docker, and ports 25565 (TCP and UDP) free on 127.0.0.1, plus
-# 8080 (TCP) in online mode.
+# MOCKSESSION_PORT (TCP, default 8080; the mock is published in both modes) free.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 compose=(docker compose -f "$here/docker/compose.yaml" -f "$here/docker/compose.real-client.yaml")
+export MOCKSESSION_PORT="${MOCKSESSION_PORT:-8080}"
 export VELOCITY_ONLINE_MODE="${VELOCITY_ONLINE_MODE:-false}" QUICRAFT_PLUGIN=true QUICRAFT_JAVA_OPTS="-Dquicraft.logStats=true"
 
 # Extra gradle args: the client is pointed at the mock session server only in online mode.
 gradle_args=()
 if [[ "$VELOCITY_ONLINE_MODE" == true ]]; then
-    gradle_args+=(-Pquicraft.minecraftApi=http://127.0.0.1:8080)
+    gradle_args+=(-Pquicraft.minecraftApi=http://127.0.0.1:$MOCKSESSION_PORT)
 fi
 
 log="${REAL_CLIENT_LOG:-$here/results/real-client-velocity.log}"
@@ -39,7 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$root/gradlew" -p "$root" -q :velocity:testkitPlugin
+"$root/gradlew" -p "$root" -q :velocity:testkitPlugin :testkit:installDist
 "${compose[@]}" build --quiet paper velocity mocksession
 "${compose[@]}" up -d mocksession paper velocity
 for svc in paper velocity; do

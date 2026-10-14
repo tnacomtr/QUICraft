@@ -89,6 +89,7 @@ Rules:
 - On a platform with no native (Windows ARM64, FreeBSD, possibly musl/Alpine), log once at INFO and run TCP-only. Never crash.
 - Platform modules are thin adapters: hook the connection path, hand bytes to `core`. Keep logic in `core`.
 - **Every hook fails safe.** Each mixin and plugin hook catches everything thrown by project code and continues down the vanilla TCP path.
+- **Scale target (user requirement, Oct 2026).** At least **50,000 concurrent players served over QUIC per node**, and higher wherever the hardware's measured limit allows. 2048 concurrent connections is far too low to ship as a default: it is a small-server safety default, not a product ceiling. Admission defaults must be raised (raise `maxOpen` together with `maxTrackedIps`) and backed by benchmarks in `docs/benchmarks.md`. The single event loop thread per listener is a known bottleneck at this scale; multi-socket scaling (SO_REUSEPORT or equivalent), per-connection memory and peak connections per node all need measurement. Never document, advertise or pitch a hard ceiling below the measured capacity, and TCP fallback is not an acceptable answer for the QUIC share at this scale.
 
 ## Discovery and connection protocol
 
@@ -142,8 +143,9 @@ Finish each phase's gate before starting the next. Report gate results to the us
    *Gate:* parity with TCP on a clean link, no desync in a full play session, fault-injection pass (`core` forced to throw at every hook, TCP join still succeeds), and loss/delay numbers measured and reported. The gate does **not** require single-stream to beat TCP under loss; it requires no regression.
 4. **Public alpha.** Release the Velocity plugin and the 26.x + 1.21.11 Fabric builds. Before release:
    - A real Retry token handler. Never ship `InsecureQuicTokenHandler` from Netty's examples.
-   - Per-IP and global limits on connection attempts and open connections.
+   - Per-IP and global limits on connection attempts and open connections. Shipped defaults must meet the scale target in Architecture (50,000+ concurrent players per node), so raise `maxOpen` well past 2048 before release, based on measurements.
    - Server-owner docs for the UDP firewall rule and DDoS caveats.
+   - **Server-side updater (user-approved addition, Oct 2026).** Velocity and Fabric dedicated servers only, not clients. Finalize `docs/updater.md` before implementation; the original input `docs/.plans/updater-plan.md` remains local user work. Signed manifests and persisted backup-key revocations; Modrinth is primary, with GitHub and `git.sudoe.rs` also supported. Hourly checks only by default, disclosed on first start; downloading requires an explicit command. Keep the requested atomic live jar swap on Linux/macOS in the design, subject to demonstrated loader safety and crash recovery; never rewrite a running jar in place. Windows needs a separately verified post-exit helper. Private signing keys remain owner-managed offline and never enter the repo or CI. This adds server-updater implementation to Phase 4, not permission to publish releases.
 5. **Multi-stream on 26.x.** Packets are categorized onto streams with explicit ordering rules: state changes and object create/destroy on one ordered control stream, plus sequence barriers wherever a dependency crosses streams. The routing table is kept as data.
    - **Prerequisite:** Minecraft's AES/CFB8 can't be split across streams. Chosen direction: channel binding over the QUIC TLS exporter, then drop Minecraft's cipher (`protocol.md` §12, point 8 above). It is a security design: finish the spec, then get the user's sign-off and a security review before release.
    - Offline-mode servers have no Minecraft encryption, so they can be tested first.
@@ -158,7 +160,7 @@ Finish each phase's gate before starting the next. Report gate results to the us
    *Gate per version:* the same join, play, fault-injection and fallback tests in CI.
 7. **Velocity multi-stream.** Per-version packet routing tables at the proxy.
 8. **Paper plugin** for single servers without a proxy. Paper has no API for extra listeners, so isolate the internals it hooks and test against every supported Paper build.
-9. **Performance and hardening.** Connection migration (verify what Netty's QUIC codec exposes first), TOFU pinning with change warnings for offline mode (online mode pins through channel binding in Phase 5), congestion-control tuning, proxy CPU cost per player, and a full security review.
+9. **Performance and hardening.** Connection migration (verify what Netty's QUIC codec exposes first), TOFU pinning with change warnings for offline mode (online mode pins through channel binding in Phase 5), congestion-control tuning, proxy CPU cost per player, per-node concurrent connection capacity against the 50,000+ concurrent player scale target, and a full security review.
 
 ## Working rules
 

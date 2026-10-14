@@ -6,7 +6,9 @@ import com.velocitypowered.api.event.EventTask;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.PreLoginEvent;
 import com.velocitypowered.api.event.connection.PluginMessageEvent;
+import com.velocitypowered.api.event.connection.PostLoginEvent;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
+import com.velocitypowered.api.command.CommandMeta;
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
@@ -23,8 +25,11 @@ import io.netty.channel.socket.DatagramChannel;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
@@ -32,6 +37,8 @@ import rs.sudoe.quicraft.core.connect.FallbackReport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
+import rs.sudoe.quicraft.updater.UpdaterPlatform;
+import rs.sudoe.quicraft.updater.UpdaterRuntime;
 
 /**
  * QUICraft for Velocity (docs/platforms/velocity.md). Every step fails safe: whatever goes
@@ -46,6 +53,13 @@ public final class QuicraftVelocity {
     private EventLoopGroup workers;
     private QuicListener listener;
     private StatusAdvertiser advertiser;
+    /** Set once the updater has started; null when it did not (docs/updater.md). */
+    private volatile UpdaterRuntime updater;
+    private volatile VelocityUpdateNotifier updateNotifier;
+    /** Set while QUIC init is under way; read by the late initialize handler for the health verdict. */
+    volatile boolean quicInitOk;
+    /** The updater platform, so the late initialize handler can complete the health verdict. */
+    volatile VelocityUpdaterPlatform updaterPlatform;
     /** Set while QUIC runs: clients that fell back to TCP report it here (docs/protocol.md §6). */
     volatile FallbackReport.Log fallbackLog;
     static final MinecraftChannelIdentifier FALLBACK_CHANNEL = MinecraftChannelIdentifier.from(Protocol.FALLBACK_CHANNEL);
@@ -60,17 +74,154 @@ public final class QuicraftVelocity {
     /** Runs before Velocity binds its listeners, so the wrapped initializer covers every channel. */
     @Subscribe
     public void onProxyInitialize(ProxyInitializeEvent event) {
-        try {
-            start();
-        } catch (Throwable t) {
-            logger.warn("QUICraft: QUIC disabled, players connect over TCP as usual", t);
-            stop();
+        // QUIC init failure is contained: the updater starts either way (docs/updater.md 6).
+        quicInitOk = startQuicThen(logger, this::start, this::stop);
+        // After QUIC init and in its own guard: the updater needs no QUIC, and neither affects the other.
+        startUpdater();
+    }
+
+    /**
+     * The health verdict completes here, late and provisionally. Registered with the lowest priority
+     * ({@code Short.MIN_VALUE}), so this handler runs after the other {@code ProxyInitializeEvent}
+     * handlers that use a higher priority. That is all it establishes: another subscriber may share the
+     * lowest priority and run after this one (Velocity 4.2; {@code PostOrder.LAST} is deprecated there and
+     * is only the second-to-last order), so a true verdict does not prove that every handler completed.
+     * It also says nothing about the TCP bind or about Velocity's query listener. It means only that
+     * QUICraft's own init did not fail, as judged at the moment this handler ran, and stays provisional
+     * while blocker 9 (docs/updater.md 10) is unresolved.
+     */
+    @Subscribe(priority = Short.MIN_VALUE)
+    public void onProxyInitializeLate(ProxyInitializeEvent event) {
+        VelocityUpdaterPlatform platform = updaterPlatform;
+        if (platform != null) {
+            platform.completeInit(quicInitOk);
         }
     }
 
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
-        stop();
+        // The updater stops even when the QUIC stop throws.
+        stopQuicThen(this::stop, this::stopUpdater);
+    }
+
+    /** A QUIC init step, which may fail with a checked exception and reports whether QUIC came up. */
+    @FunctionalInterface
+    interface QuicInit {
+        boolean run() throws Exception;
+    }
+
+    /**
+     * Starts QUIC and reports whether it came up. A thrown failure is logged and the cleanup runs; a
+     * failure of that cleanup is contained too, so the caller always reaches the updater start
+     * (docs/updater.md 6). Static so the rule is testable without Velocity.
+     */
+    static boolean startQuicThen(Logger logger, QuicInit start, Runnable cleanup) {
+        try {
+            return start.run();
+        } catch (Throwable t) {
+            logger.warn("QUICraft: QUIC disabled, players connect over TCP as usual", t);
+            try {
+                cleanup.run();
+            } catch (Throwable cleanupFailure) {
+                logger.debug("QUICraft: cleaning up after a failed QUIC init failed", cleanupFailure);
+            }
+            return false;
+        }
+    }
+
+    /** Runs {@code stopQuic}; {@code stopUpdater} always follows, even when the first throws. */
+    static void stopQuicThen(Runnable stopQuic, Runnable stopUpdater) {
+        try {
+            stopQuic.run();
+        } finally {
+            stopUpdater.run();
+        }
+    }
+
+    /** Admin update notices wait for a joining admin (docs/updater.md 6, Notifications). */
+    @Subscribe
+    public void onPostLogin(PostLoginEvent event) {
+        try {
+            VelocityUpdateNotifier notifier = updateNotifier;
+            if (notifier != null) {
+                notifier.onJoin(event.getPlayer());
+            }
+        } catch (Throwable t) {
+            logger.debug("QUICraft: delivering an update notice failed", t);
+        }
+    }
+
+    /**
+     * Starts the updater (docs/updater.md) and registers {@code /quicraft update}. Every failure is
+     * logged once; QUIC and TCP are never affected. It publishes the platform so the late initialize
+     * handler completes the health verdict for this whole init.
+     */
+    private void startUpdater() {
+        try {
+            VelocityUpdateNotifier notifier = new VelocityUpdateNotifier(proxy::getAllPlayers);
+            updateNotifier = notifier;
+            String target = VelocityUpdaterPlatform.targetOf(proxy.getVersion().getVersion());
+            VelocityUpdaterPlatform platform = new VelocityUpdaterPlatform(target, logger, dataDirectory,
+                    pluginSource(), Path.of("plugins"), notifier);
+            updaterPlatform = platform;
+            updater = runUpdaterStart(platform, logger, UpdaterRuntime::start);
+            registerUpdateCommand();
+        } catch (VirtualMachineError e) {
+            throw e;
+        } catch (Throwable t) {
+            logger.warn("QUICraft: the updater did not start; QUIC and TCP are unaffected", t);
+        }
+    }
+
+    /** The running updater's dispatch, or null when it did not start. */
+    private UpdateDispatcher updateDispatcher() {
+        UpdaterRuntime running = updater;
+        return running == null ? null : running::dispatch;
+    }
+
+    /** Velocity's own record of this plugin's jar; empty when Velocity does not know it. */
+    private Supplier<Optional<Path>> pluginSource() {
+        return () -> proxy.getPluginManager().fromInstance(this).flatMap(c -> c.getDescription().getSource());
+    }
+
+    /**
+     * Runs the starter. A throw (including an Error other than a VirtualMachineError) gives null, so the
+     * caller goes on as if the updater were off. Static so the fail-safe rule is testable without Velocity.
+     */
+    static UpdaterRuntime runUpdaterStart(UpdaterPlatform platform, Logger logger,
+            Function<UpdaterPlatform, UpdaterRuntime> starter) {
+        try {
+            return starter.apply(platform);
+        } catch (VirtualMachineError e) {
+            throw e;
+        } catch (Throwable t) {
+            logger.warn("QUICraft: the updater did not start; QUIC and TCP are unaffected", t);
+            return null;
+        }
+    }
+
+    private void registerUpdateCommand() {
+        try {
+            CommandMeta meta = proxy.getCommandManager().metaBuilder("quicraft").plugin(this).build();
+            proxy.getCommandManager().register(meta, new UpdateCommand(this::updateDispatcher, logger));
+        } catch (Throwable t) {
+            logger.warn("QUICraft: the /quicraft update command is not available", t);
+        }
+    }
+
+    private void stopUpdater() {
+        UpdaterRuntime running = updater;
+        updater = null;
+        if (running == null) {
+            return;
+        }
+        try {
+            running.shutdown();
+        } catch (VirtualMachineError e) {
+            throw e;
+        } catch (Throwable t) {
+            logger.debug("QUICraft: stopping the updater failed", t);
+        }
     }
 
     /**
@@ -137,17 +288,24 @@ public final class QuicraftVelocity {
                 CompletableFuture.delayedExecutor(10, TimeUnit.MILLISECONDS)).thenCompose(v -> whenNameFree(name, deadline));
     }
 
+    /**
+     * Starts QUIC.
+     *
+     * @return true when QUICraft's init succeeded. QUIC turned off on purpose (config, no native) is a
+     *     success; a failure to bind the UDP listener is not, so the health verdict never claims a
+     *     generation is healthy when its QUIC listener could not come up.
+     */
     @SuppressWarnings("deprecation") // ServerChannelInitializerHolder.set: internal, but the only hook
-    private void start() throws Exception {
+    private boolean start() throws Exception {
         Settings settings = Settings.load(dataDirectory);
         if (!settings.enabled()) {
             logger.info("QUICraft: disabled in {}", Settings.FILE);
-            return;
+            return true;
         }
         if (!QuicSupport.isAvailable()) {
             logger.info("QUICraft: no QUIC native for this platform ({}); TCP only",
                     String.valueOf(QuicSupport.unavailabilityCause()));
-            return;
+            return true;
         }
         ServerChannelInitializerHolder holder = connectionManager().serverChannelInitializer;
 
@@ -163,13 +321,13 @@ public final class QuicraftVelocity {
         workers = transport.createEventLoopGroup(TransportType.Type.WORKER);
         try {
             listener = QuicListener.bind(udp, identity, TransportConfig.DEFAULT, holder, workers,
-                    datagramChannels(transport), logger);
+                    datagramChannels(transport), settings.udpSockets(), logger);
         } catch (Exception e) {
             // docs/protocol.md §2: one WARN, no advertisement, TCP keeps running.
             logger.warn("QUICraft: could not bind UDP {} for QUIC ({}); not advertising QUIC, TCP only",
                     udp, e.toString());
             stop();
-            return;
+            return false;
         }
 
         advertiser = new StatusAdvertiser(
@@ -177,8 +335,9 @@ public final class QuicraftVelocity {
         holder.set(new AdvertisingInitializer(holder.get(), advertiser, logger));
         fallbackLog = new FallbackReport.Log(listener.localAddress().getPort());
         proxy.getChannelRegistrar().register(FALLBACK_CHANNEL);
-        logger.info("QUICraft: QUIC listening on UDP {} (fingerprint {}); open this UDP port in your firewall",
-                listener.localAddress(), identity.fingerprint());
+        logger.info("QUICraft: QUIC listening on UDP {} with {} socket(s) (fingerprint {}); open this UDP port in "
+                + "your firewall", listener.localAddress(), listener.socketCount(), identity.fingerprint());
+        return true;
     }
 
     /**

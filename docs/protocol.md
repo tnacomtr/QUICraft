@@ -336,7 +336,40 @@ flow control and stream counts, meaning nothing could be sent.
 | Datagrams (RFC 9221) | off | Not used before a later version. |
 | Congestion control | BBR, **provisional** | Phase 1 transport benchmark (docs/benchmarks.md): the only variant faster than TCP at +150 ms RTT (−509 ms on a 2.2 MiB burst). Reno, CUBIC and plain BBR trail TCP badly under heavy reordering; BBR with the relaxed loss threshold (next row) doesn't. Sender-side only, so changing it needs no protocol version. |
 | Relaxed loss threshold (quiche `enable_relaxed_loss_threshold`) | on, where the native supports it | Reordering makes quiche declare late packets lost and retransmit them. With this on, the first spurious loss disables the packet threshold, and each further one doubles the time-threshold overhead, up to 2× RTT. Transport benchmark, reorder profile (run `transport-20261010T010019Z`, N=5): 2.2 MiB burst 799 ms with it, 2754 ms without (−1955 ms [−2155, −1561]); TCP took 1212 ms. Lost packets per run were 93 against 579. No significant difference on a clean link or at +150 ms RTT. quiche 0.30 implements it only for BBR (gcongestion), so it does nothing under Reno or CUBIC. Sender-side only: no transport parameter, no protocol version. Needs QUICraft's patched native (§11). With an upstream native it is unavailable, and core logs one INFO line. |
-| Address validation (Retry) | when handshake rate exceeds a threshold | A real token handler is required before the public alpha (Phase 4). `InsecureQuicTokenHandler` is never used. |
+| Initial congestion window (`initialCongestionWindowPackets`) | 64 packets. System property `quicraft.initialCwndPackets` overrides it: an explicit `0` selects quiche's native default (10 packets), `1..1000` the value. A malformed or out-of-range value falls back to 64. | The initial window dominates connect-to-last-chunk under delay. At +150 ms, the 64-packet arm's connect-to-last-chunk median was 189 ms faster than TCP (run `20261011T184452Z-fabric-tcp-quic`, initial window experiment in docs/benchmarks.md). No clean-link regression of ~100 ms or larger was detected at 64, but equivalence is not established, and under 2% loss the two arms are indistinguishable (run `20261011T192603Z-fabric-tcp-quic`), so this is not a universal gain. Sender-side only, so changing it needs no protocol version. |
+| Address validation (Retry) | always for refusals: an attempt over a limit, full open-connection limits, or a handshake backlog. For admitted attempts it depends on the mode (`quicraft.admission.retry`): `adaptive` (default) once the listener's attempts in the current second reach a threshold (default 50), `always` for every one, `never` for none | Retry tokens are HMAC-authenticated, bound to the client's IP and port, and expire after 30 s. `InsecureQuicTokenHandler` is never used. |
+
+Retry and limits. Each listener limits connection attempts (per second, overall and per IP) and
+open connections (overall and per IP), and drops floods of Initial packets before the QUIC codec.
+
+- "Per IP" means per IPv4 address (IPv4-mapped IPv6 included) or per IPv6 /64. So the hosts of
+  one /64 share their budgets, while a holder of a /48 gets 65536 separate keys; aggregating
+  larger prefixes is left out on purpose, as it would penalise the many unrelated users behind
+  shared prefixes.
+- A datagram carrying an Initial that is shorter than 1200 bytes (RFC 9000 §14.1) is dropped
+  unanswered, so a Retry (at most 124 bytes with QUICraft's tokens) only ever answers a datagram
+  of at least 1200 bytes.
+- Ingress flood protection counts every Initial datagram per IP and overall (defaults 200 and
+  8000 per second), whether or not it carries a token, and drops those over budget before any
+  other check.
+- An Initial that passes ingress spends a connection attempt. A token-less one spends the
+  attempt budget; one that brings back a valid Retry token spends a separate validated budget
+  with the same limits, which a flood of token-less Initials can't use up. Validated Initials
+  still count against the shared ingress budget.
+- These are refusals, in every Retry mode: an attempt over its limit, an attempt while the
+  open-connection limits are full, and every token-less attempt while a quarter of the
+  open-connection limit is still in its handshake (a backlog, e.g. of spoofed half-open
+  handshakes). A token-less Initial is then answered with a Retry and nothing more. A
+  token-bearing Initial over its validated limit, or arriving while the open-connection limits
+  are full, is dropped unanswered; a backlog alone doesn't refuse it, as its address is proven.
+  The client falls back to TCP after its head start
+  (§5). The modes differ only for admitted attempts: `never` sends them no Retry, `adaptive`
+  sends Retry once the attempt rate reaches the threshold, and `always` sends it every time.
+- A connection whose handshake hasn't completed 10 s after it was created is closed (transport
+  error NO_ERROR); a real client that slow falls back to TCP.
+- A join that goes through Retry may spend up to 3 attempts: one for each token-less Initial
+  datagram of the client's first flight (often two), plus one when the token comes back. A Retry
+  also discards 0-RTT data sent before it, so such a rejoin completes as a 1-RTT join.
 
 Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
 
@@ -369,6 +402,22 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
   `FailedValidation`, `Closed`, `ReusedSourceConnectionId`, `PeerMigrated`), and
   `collectPathStats(int)` gives per-path stats. What a mid-session address change means for IP
   bans and forwarding is decided in Phase 9.
+- Known limit (measured 2026-10-14, `ReusePortListenerTest`, Linux, Netty QUIC 4.2.19): a
+  connection survives **one** NAT rebind, with one listener socket or several. After a second
+  rebind of the same connection the server's datagrams stop reaching the client and the connection
+  runs into its idle timeout. The same happens with one socket, so it comes from the codec's path
+  and connection-id handling, not from the socket dispatch. Changing it touches transport
+  parameters (for example the active connection-id limit) and is left to Phase 9.
+- Known limit (Retry against a changed 4-tuple, not fixed in v1): a Retry is a long header, so the
+  socket that received the Initial answers it and the connection id the client then uses names that
+  socket. If the client's next Initial arrives at a different socket (its 4-tuple changed in
+  between; a long header decodes no index), no single socket can serve the connection: the client's
+  later short-header datagrams are forwarded to the socket the id names, which knows no such
+  connection, and the Retry token is bound to the IP address and port it was issued to
+  (`HmacRetryTokenHandler`), so such an Initial is dropped rather than answered. Either way the
+  handshake does not complete, and the client falls back to TCP after its head start (§5). Retry
+  only starts under load in the default `ADAPTIVE` mode, so this needs the attempt rate to reach the
+  Retry threshold.
 
 ## 11. Native library and platforms
 
@@ -412,9 +461,77 @@ match TCP's exactly.
 
 Datagrams are copied between the two Netty copies (one copy each way); nothing is shared.
 Datagrams that arrive before core starts the socket are dropped (QUIC retransmits). Closing the
-QUIC connection (client) or the listener (server) closes the socket. The proxy runs all QUIC
-connections on one loop (one UDP socket); spreading them over several loops needs
-connection-ID routing between sockets (Phase 9).
+QUIC connection (client) or the listener (server) closes the socket.
+
+### Several UDP sockets per listener (SO_REUSEPORT)
+
+One event loop thread per listener is the known bottleneck at the scale target in `CLAUDE.md`
+(50,000+ concurrent players per node), so a listener can run on several UDP sockets bound to the
+same address with SO_REUSEPORT, each on its own event loop thread.
+
+- `QuicServer.bind(address, socketCount, identity, config, acceptor)`: core creates `socketCount`
+  NIO datagram channels on a group of `socketCount` threads, one channel per loop, each with
+  SO_REUSEPORT. The first socket binds the requested address; when the request had port 0, the
+  others bind the port the kernel gave the first one. SO_REUSEPORT is looked up reflectively
+  (`StandardSocketOptions.SO_REUSEPORT` exists only on JDK 9+ while core is Java 8 bytecode) and
+  set through `NioChannelOption`. Where the JDK or the platform does not support it, the listener
+  binds one socket, so a bind never depends on it.
+- `QuicServer.bind(List<HostLoop>, List<HostDatagramSocket>, ...)` for the hosted transport above:
+  the platform binds each of its own sockets with SO_REUSEPORT and hands one loop per socket. A
+  failure to bind sockets 2..N is not fatal there: the platform closes them and keeps the first
+  socket (see `udp-sockets` below).
+- `QuicServer.defaultSocketCount()`: `min(availableProcessors(), 16)` on Linux. Everywhere else it
+  is 1: macOS and the BSDs hash unicast UDP on the local address alone, so several sockets would
+  starve, and Windows has no SO_REUSEPORT. The system property `quicraft.udpSockets` (1..64; an
+  invalid value logs one warning and keeps the default) overrides it.
+- `udp-sockets` in the platform's own config (`plugins/quicraft/config.properties` for Velocity,
+  `config/quicraft/server.properties` for the Fabric dedicated server): `auto` (the default) is
+  `QuicServer.defaultSocketCount()`, an integer 1..64 is that many, and anything else is `auto` with
+  one warning. It is the count the hosted path binds: as many of the platform's own UDP sockets,
+  one per distinct loop of the game's worker group (fewer when the group has fewer loops), each with
+  SO_REUSEPORT found for that transport (the transport's own `ChannelOption`, or `NioChannelOption`
+  over `StandardSocketOptions.SO_REUSEPORT` for NIO), the first on the configured address and the
+  rest on its actual local address. An accepted stream stays on the loop of the socket that
+  received it, and the listener's startup line names the socket count it bound.
+- Only Linux, and only when the transport has a SO_REUSEPORT the kernel accepts, binds several:
+  anywhere else, or if the option is refused, the listener keeps one socket with one INFO line. If
+  binding a later socket fails, that socket is closed and the listener keeps the sockets already
+  bound, also with one INFO line. So `udp-sockets` can never fail a startup. SO_REUSEPORT is not
+  inert with one socket either: the first socket is configured with the option before it binds, so
+  any process of the same OS user can also bind that UDP port with SO_REUSEPORT and take a share of
+  the traffic (`docs/server-security.md`).
+- `close()` closes every socket and, for core's own transport, the thread group. A bind that fails
+  on a later socket closes the sockets already bound and the group, then rethrows.
+
+Routing between the sockets is Netty's `QuicCodecDispatcher`, one shared instance in every
+socket's pipeline. Its connection id generator encodes the socket's index in the first two bytes
+of every connection id that socket's codec issues: the initial source id, a Retry source id, and
+every extra source id issued later. A packet that the kernel's 4-tuple hash put on the wrong
+socket (NAT rebinding, migration, an idle socket) still reaches the codec that owns the
+connection: the dispatcher reads the destination connection id of a short-header packet, decodes
+the index and forwards the datagram to that socket's codec, on that socket's loop. Long headers,
+an Initial for example, always go to the socket that received them, and that socket then chooses
+the connection id the client uses. Because that forwarding crosses loops (it is one queued task on
+the target loop per datagram), it is bounded: at most 1024 datagrams may be pending per target
+socket at a time (`QuicServer.ForwardLimiter.MAX_PENDING_FORWARDS`), counted across all source
+sockets, plus at most one per source socket (each source socket measures the count and increments
+it on its own loop). Over that the datagram is released and counted per target socket, so a client
+that names one socket from many source ports can slow that socket down but cannot grow its queue
+without bound. One datagram never reaches the dispatcher at all: a short header that stops before
+the whole connection id (`40`, `40 00`, or a
+header without the full 20-byte id) is one the dispatcher's own parser throws for
+(`QuicHeaderParser.sliceCid`), and no handler on a datagram pipeline catches that, so Netty's tail
+would log a stack trace and leak the datagram, once per datagram, for anything a remote sender
+cares to send. The bound releases such a datagram and counts it against the socket that read it
+(`QuicServer.droppedMalformedPerSocket`), and a last handler on every socket of a multi-socket
+listener (`QuicServer.DatagramExceptionBackstop`) swallows whatever else a datagram handler throws,
+logging at most one FINE line a minute per listener instead of a stack trace per datagram.
+
+Only the sockets and their loops are multiplied. Admission (attempt budgets, open-connection
+leases, Retry), the Retry HMAC key and its token handler, the ingress datagram budget, the 0-RTT
+early tokens, the TLS context, the stream acceptor and `closeUnconfirmedEarly` stay one set per
+listener, so every limit in section 9 is node-wide, not per socket. A count of 1 is exactly the
+single-socket listener: no dispatcher is installed and the connection id length is unchanged.
 
 ### QUICraft's Netty QUIC build
 

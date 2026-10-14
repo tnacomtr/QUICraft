@@ -101,10 +101,22 @@ class NativeFeaturesTest {
         assertTrue(on * 4 <= off * 3, "relaxed threshold should cut spurious losses: " + off + " -> " + on);
     }
 
+    /**
+     * The comparative loss-ratio fixture, calibrated at an initial congestion window of 10 packets
+     * (the value the measured 1884 -> 908, 1969 -> 897, 1778 -> 466 ratios were taken at). cwnd is
+     * pinned here so the ratio assertions stay valid regardless of the production default (64);
+     * delivery at the production default is covered separately by
+     * {@link #reorderedTransferDeliversTwoMiBByteExactlyWithCwnd64()}.
+     */
     private static long spuriousLosses(boolean relaxed) throws Exception {
+        return spuriousLosses(relaxed, 10);
+    }
+
+    private static long spuriousLosses(boolean relaxed, int cwnd) throws Exception {
         TransportConfig config = TransportConfig.builder()
                 .congestionControl(TransportConfig.CongestionControl.BBR)
                 .relaxedLossThreshold(relaxed)
+                .initialCongestionWindowPackets(cwnd)
                 .build();
         int size = 2 << 20;
         byte[] payload = new byte[size];
@@ -137,10 +149,22 @@ class NativeFeaturesTest {
             client.setAutoRead(true);
             client.write(ByteBuffer.wrap(new byte[] {1}));
             client.flush();
-            assertEquals(size, collector.await(size, 30, TimeUnit.SECONDS).length, "transfer incomplete");
+            byte[] received = collector.await(size, 30, TimeUnit.SECONDS);
+            assertEquals(size, received.length, "transfer incomplete");
+            assertArrayEquals(payload, received, "reordered transfer bytes changed");
             Map<String, Long> stats = accepted.get(5, TimeUnit.SECONDS).connectionStats().get(5, TimeUnit.SECONDS);
             client.close();
             return stats.get("lost");
         }
+    }
+
+    /**
+     * Proves a reordered transfer still delivers all 2 MiB byte-for-byte at the production default
+     * cwnd of 64, with the relaxed threshold requested exactly where the native has it. Delivery is
+     * asserted inside the helper; this test deliberately makes no timing or loss-ratio claim.
+     */
+    @Test
+    void reorderedTransferDeliversTwoMiBByteExactlyWithCwnd64() throws Exception {
+        spuriousLosses(expected(), 64);
     }
 }
