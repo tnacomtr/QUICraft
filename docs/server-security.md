@@ -75,10 +75,11 @@ start, for example `-Dquicraft.admission.maxOpenPerIp=64`. They are wired into b
   (a backlog, for example of spoofed half-open handshakes). A token-bearing attempt over its
   validated limit, or one that arrives while the open-connection limits are full, is dropped without
   a Retry. A token-bearing attempt is not refused by a backlog, because its address is already proven.
-- **Scale note.** The defaults are sized for the 50,000-concurrent-player-per-node target (CLAUDE.md
-  Architecture, measured in `docs/benchmarks.md`): the Retry backlog trigger is 25% of `maxOpen`,
-  i.e. 16,384 unconfirmed handshakes at the default `maxOpen=65536`, and a full 65,536 open
-  connections costs about 2.4 GiB of server memory by the `docs/benchmarks.md` measurement.
+- **Scale note.** The defaults leave room for the 50,000-concurrent-player-per-node target (CLAUDE.md
+  Architecture). The Retry backlog trigger is 25% of `maxOpen`, i.e. 16,384 unconfirmed handshakes
+  at the default `maxOpen=65536`. Memory is an extrapolation, not a measurement: `docs/benchmarks.md`
+  held 41,403 idle transport connections at ~37 KiB each, which gives ~2.3 GiB at the 65,536 cap
+  for the transport alone, before any game state.
 - **Ingress guard.** `ingressInitialsPerSecond` and `ingressInitialsPerIpPerSecond` drop excess QUIC
   Initial datagrams before any QUIC processing. This is a cheap packet-level guard; other packets
   (established connections) are never counted.
