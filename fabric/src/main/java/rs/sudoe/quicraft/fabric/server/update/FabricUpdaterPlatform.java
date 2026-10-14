@@ -81,8 +81,10 @@ public final class FabricUpdaterPlatform implements UpdaterPlatform {
     }
 
     /**
-     * PROVISIONAL (blocker 9 is open): this runs only after the dedicated server's init returned true, so the
-     * verdict is "healthy" at once. It does not yet watch the first ticks or a crash after start.
+     * The alpha's settled health criterion (docs/updater.md section 10, blocker 9): the dedicated server
+     * finished starting. This platform is only reached after the server's init returned true, so the
+     * verdict is "healthy" at once. A crash or a failed start after this point is not detected, and the
+     * backup of the previous generation is kept until this verdict is recorded (section 5).
      */
     @Override
     public HealthSignal health() {
