@@ -80,6 +80,65 @@ class StateResetTest {
     }
 
     @Test
+    void failedRefetchResetsStateButKeepsStagingDisabled() throws Exception {
+        Path dir = dir();
+        StateStore store = store(dir, new StateDelta(raisedFloors(), revokedRelease()));
+        byte[] revokedBefore = Files.readAllBytes(dir.resolve(StateStore.REVOKED));
+        ScriptedFetcher unreachable = new ScriptedFetcher();
+
+        ResetResult result = StateReset.resetStateAndRefetch(store, pipeline(store, unreachable),
+                PipelineFixtures.identity(), UpdateVersion.parse("0.3.0"), new MutableCancelToken());
+
+        assertTrue(result.stateReset());
+        assertFalse(result.stagingEnabled(), "no fresh revocations after a failed refetch");
+        assertFalse(unreachable.requests.isEmpty(), "the refetch was attempted");
+        assertArrayEquals(revokedBefore, Files.readAllBytes(dir.resolve(StateStore.REVOKED)));
+        assertTrue(store.load().orElseThrow().revoked().revokedPubs().contains(TestKeys.PUB_1));
+    }
+
+    @Test
+    void overCapDocumentKeepsStagingDisabledEvenWithFreshRevocations() throws Exception {
+        Path dir = dir();
+        StateStore store = store(dir, new StateDelta(PipelineFixtures.seedState(), new RevokedState(List.of(), List.of())));
+        // Fill revoked.json to its cap of 64 keys: a document holds at most 16.
+        for (int run = 0; run < 4; run++) {
+            ScriptedFetcher fill = new ScriptedFetcher();
+            fill.answerEveryHost(PipelineFixtures.revocations(revokedKeys(run * 16, 16)), PipelineFixtures.manifest());
+            pipeline(store, fill).run(CheckMode.REPORT, UpdateVersion.parse("0.3.0"), new MutableCancelToken());
+        }
+        assertEquals(64, store.load().orElseThrow().revoked().revokedPubs().size());
+
+        // One host serves a newer document that would overflow the cap; the others serve a document
+        // that fits, so the refetch still ends with fresh revocations.
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        fetcher.answerEveryHost(PipelineFixtures.revocations(), PipelineFixtures.manifest());
+        byte[] overCap = PipelineFixtures.revocationsSeq(4, revokedKeys(100, 1));
+        fetcher.answer(PipelineFixtures.ENDPOINTS.revocations(PipelineFixtures.MOD), overCap);
+        fetcher.answer(PipelineFixtures.ENDPOINTS.revocationsSignature(PipelineFixtures.MOD),
+                PipelineFixtures.revocationsSig(overCap));
+        CheckResult probe = pipeline(store, fetcher).run(CheckMode.REPORT, UpdateVersion.parse("0.3.0"),
+                new MutableCancelToken());
+        assertTrue(probe.freshRevocations(), "precondition: fresh revocations " + probe.diagnostics());
+        assertTrue(probe.stateFull(), "precondition: over-cap document reported");
+
+        ResetResult result = StateReset.resetStateAndRefetch(store, pipeline(store, fetcher),
+                PipelineFixtures.identity(), UpdateVersion.parse("0.3.0"), new MutableCancelToken());
+
+        assertTrue(result.stateReset());
+        assertFalse(result.stagingEnabled(), "a full revoked.json keeps staging disabled");
+        assertEquals(64, store.load().orElseThrow().revoked().revokedPubs().size(), "nothing evicted");
+    }
+
+    private static String[] revokedKeys(int from, int count) throws Exception {
+        String[] keys = new String[count];
+        for (int i = 0; i < count; i++) {
+            String pub = Hex.sha256(("reset-over-cap-" + (from + i)).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            keys[i] = PipelineFixtures.revokedKey(Hex.kid(pub), pub);
+        }
+        return keys;
+    }
+
+    @Test
     void invalidRevokedWritesNothingAndDoesNotRefetch() throws Exception {
         Path dir = dir();
         StateStore store = store(dir, new StateDelta(raisedFloors(), revokedRelease()));

@@ -136,7 +136,12 @@ final class PipelineFixtures {
 
     /** Revocations document, seq 3, revoking the given (kid, pub) pairs. */
     static byte[] revocations(String... revokedKeysJson) {
-        return SignedFixtures.bytes("{\"type\":\"quicraft.revocations\",\"v\":1,\"seq\":3"
+        return revocationsSeq(3, revokedKeysJson);
+    }
+
+    /** Revocations document with the given seq, revoking the given (kid, pub) pairs. */
+    static byte[] revocationsSeq(int seq, String... revokedKeysJson) {
+        return SignedFixtures.bytes("{\"type\":\"quicraft.revocations\",\"v\":1,\"seq\":" + seq
                 + ",\"issued\":\"" + ISSUED + "\",\"expires\":\"" + REV_EXPIRES + "\""
                 + ",\"minManifestSeq\":0,\"revokedKeys\":[" + String.join(",", revokedKeysJson) + "]"
                 + ",\"blockedArtifacts\":[]}");

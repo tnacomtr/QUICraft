@@ -11,6 +11,11 @@ import rs.sudoe.quicraft.updater.StateRecords.UpdaterState;
  * The {@code /quicraft update reset-state} command (docs/updater.md 12.8). Rebuilds
  * {@code state.json} from the running trust seeds, keeps a valid {@code revoked.json} byte for byte,
  * and refetches revocations and manifests.
+ *
+ * <p>Known limit: an unreadable {@code revoked.json} is never rebuilt here. The reset writes nothing
+ * and the updater stays disabled until the owner restores the file; a rebuild from fetched
+ * revocations is deferred. Staging is enabled only when the refetch left fresh revocation state that
+ * fits the persisted caps.
  */
 final class StateReset {
 
