@@ -21,6 +21,7 @@ import java.nio.file.FileSystemException;
 import java.nio.file.FileSystems;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -557,6 +558,52 @@ class UpdateDirectoryTest {
         assertThrows(IOException.class, () -> d.moveOverLive(TXID, live));
         // The documented contract: the rename already happened, so the caller must re-check the file.
         assertArrayEquals(new byte[] {9}, Files.readAllBytes(live));
+    }
+
+    @Test
+    void moveOverLiveKeepsTheLiveJarPermissions() throws Exception {
+        assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        UpdateDirectory d = open(DurabilityOps.system());
+        Path live = Files.createDirectory(tmp.resolve("mods")).resolve("quicraft.jar");
+        Files.write(live, new byte[] {1, 1});
+        Files.setPosixFilePermissions(live, PosixFilePermissions.fromString("rw-r--r--"));
+        FileChannel ch = d.createPart(TXID);
+        ch.write(ByteBuffer.wrap(new byte[] {2, 2, 2}));
+        d.commitPart(TXID, ch);
+        assertEquals(PosixFilePermissions.fromString("rw-------"),
+                Files.getPosixFilePermissions(d.stagingJar(TXID)),
+                "the staging area stays private until the move");
+
+        d.moveOverLive(TXID, live);
+
+        assertArrayEquals(new byte[] {2, 2, 2}, Files.readAllBytes(live));
+        assertEquals(PosixFilePermissions.fromString("rw-r--r--"),
+                Files.getPosixFilePermissions(live),
+                "panels and deploy users must still read the swapped-in jar");
+    }
+
+    @Test
+    void aPermissionCopyFailureDoesNotFailTheSwap() throws Exception {
+        FakeOps ops = new FakeOps();
+        UpdateDirectory d = open(ops);
+        Path live = Files.createDirectory(tmp.resolve("mods")).resolve("quicraft.jar");
+        Files.write(live, new byte[] {1});
+        Files.write(d.stagingJar(TXID), new byte[] {2, 2});
+        List<Path> seen = new ArrayList<>();
+        ops.events.clear();
+
+        d.moveOverLive(TXID, live, (from, to) -> {
+            seen.add(from);
+            seen.add(to);
+            assertTrue(Files.isRegularFile(to), "the staged file exists at the copy");
+            throw new IOException("injected permission failure");
+        });
+
+        assertEquals(List.of(live, d.stagingJar(TXID)), seen, "the live jar and the staged file");
+        assertArrayEquals(new byte[] {2, 2}, Files.readAllBytes(live), "the swap still happened");
+        assertFalse(Files.exists(d.stagingJar(TXID)));
+        assertEquals(List.of("move", "sync"), ops.events);
+        assertEquals(List.of(), d.warnings());
     }
 
     @Test

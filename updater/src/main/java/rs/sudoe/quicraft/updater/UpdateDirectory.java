@@ -151,8 +151,26 @@ public final class UpdateDirectory {
     }
 
     /**
+     * Copies the permission bits of the live jar onto the staged file just before the move. A
+     * failing implementation is swallowed by {@link #moveOverLive(String, Path, PermissionCopier)}:
+     * permissions are best effort.
+     */
+    @FunctionalInterface
+    interface PermissionCopier {
+        void copy(Path live, Path staged) throws IOException;
+    }
+
+    /**
      * Atomically moves the verified staged jar of {@code txid} over the live jar at {@code livePath},
      * then syncs the live jar's directory.
+     *
+     * <p>Immediately before the move, the live jar's POSIX permission bits are copied onto the staged
+     * file, so a plugin or mod jar that was readable by panels, deploy users or backup tools stays
+     * readable after the swap. The copy is best effort and never fails the swap: on a file system
+     * without the {@code posix} view, or when reading or setting the bits fails, the live jar keeps
+     * the staged file's {@code 0600}. The staging area stays private until this moment. Owner and
+     * group are never changed: an unprivileged process cannot do that, and the rename keeps the
+     * owner of the staging directory's files (the server user).
      *
      * <p>If the directory sync throws, the move may already have happened. The caller must check the
      * live jar's hash before deciding anything (see the class note on failure after a rename).
@@ -160,9 +178,25 @@ public final class UpdateDirectory {
      * @throws IllegalArgumentException if {@code livePath} is not absolute or has no parent
      */
     public void moveOverLive(String txid, Path livePath) throws IOException {
+        moveOverLive(txid, livePath, UpdateDirectory::copyPermissions);
+    }
+
+    /**
+     * Test seam at the best-effort permission copy: {@code copier} runs on the staged file just
+     * before it is moved over the live jar, and a failure thrown by it never fails the swap.
+     * Production passes {@link #copyPermissions} through {@link #moveOverLive(String, Path)}.
+     */
+    void moveOverLive(String txid, Path livePath, PermissionCopier copier) throws IOException {
         Objects.requireNonNull(livePath, "livePath");
+        Objects.requireNonNull(copier, "copier");
         if (!livePath.isAbsolute() || livePath.getParent() == null) {
             throw new IllegalArgumentException("live path must be absolute");
+        }
+        try {
+            copier.copy(livePath, stagingJar(txid));
+        } catch (IOException | RuntimeException ignored) {
+            // Permissions are best effort (see the public overload): keep the staged 0600 and go on.
+            // Nothing is logged: the swap itself is not degraded, only less convenient afterwards.
         }
         ops.atomicMove(stagingJar(txid), livePath);
         syncDir(livePath.getParent());
@@ -531,11 +565,28 @@ public final class UpdateDirectory {
 
     private static FileAttribute<?>[] posix(String perms) {
         // Windows has no POSIX permission bits; the owner check is the protection there.
-        if (!FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+        if (!posixSupported()) {
             return new FileAttribute<?>[0];
         }
         return new FileAttribute<?>[] {
             PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString(perms))
         };
+    }
+
+    private static boolean posixSupported() {
+        return FileSystems.getDefault().supportedFileAttributeViews().contains("posix");
+    }
+
+    /**
+     * Copies the live jar's POSIX permission bits onto the staged file, so the swapped-in jar keeps
+     * the access it had before. Returns without doing anything when the default file system has no
+     * {@code posix} view. Owner and group are deliberately not touched.
+     */
+    private static void copyPermissions(Path live, Path staged) throws IOException {
+        if (!posixSupported()) {
+            return;
+        }
+        Files.setPosixFilePermissions(staged,
+                Files.getPosixFilePermissions(live, LinkOption.NOFOLLOW_LINKS));
     }
 }
