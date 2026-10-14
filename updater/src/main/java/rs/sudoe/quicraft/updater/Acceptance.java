@@ -75,7 +75,7 @@ public final class Acceptance {
         Map<String, Instant> torn = updateTorn(
                 selected.tornSince(), view.torn(), Set.of(), systemNow, diagnostics);
         StateDelta delta = new StateDelta(withTornSince(selected, torn), selection.delta().newRevoked());
-        return new RevocationAcceptance(delta, diagnostics);
+        return new RevocationAcceptance(delta, diagnostics, selection.stateFull());
     }
 
     /**
