@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.URI;
@@ -29,6 +30,8 @@ import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
@@ -169,11 +172,11 @@ final class MockReleaseHostTest {
                 .redirectErrorStream(true)
                 .start();
         List<String> log = new ArrayList<>();
-        try (BufferedReader out = new BufferedReader(
-                new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8))) {
+        ChildOutput out = new ChildOutput(child);
+        try {
             Ready ready = null;
             while (ready == null) {
-                String line = out.readLine();
+                String line = out.next();
                 assertNotNull(line, "the host stopped before MOCK READY: " + log);
                 log.add(line);
                 if (line.startsWith("MOCK READY ")) {
@@ -209,7 +212,7 @@ final class MockReleaseHostTest {
             // waiting once the four fetches above have returned.
             List<String> requests = new ArrayList<>();
             for (int i = 0; i < 4; i++) {
-                requests.add(out.readLine());
+                requests.add(out.next());
             }
             assertEquals(List.of(
                     "MOCK GET " + MockReleaseHostMain.MANIFEST_PATH + " 200",
@@ -217,8 +220,9 @@ final class MockReleaseHostTest {
                     "MOCK GET " + endpoints.artifact(host, entry).getPath() + " 200",
                     "MOCK GET /nope 404"), requests, log.toString());
         } finally {
+            // Kill first: that closes the pipe and ends the drain thread.
             child.destroyForcibly();
-            child.waitFor();
+            assertTrue(child.waitFor(10, TimeUnit.SECONDS), "the host did not exit");
         }
     }
 
@@ -334,6 +338,40 @@ final class MockReleaseHostTest {
     /** The SHA-512 recorded in the release manifest, computed independently of the host. */
     private static String sha512Of(Path jar) throws Exception {
         return Hex.encode(MessageDigest.getInstance("SHA-512").digest(Files.readAllBytes(jar)));
+    }
+
+    /**
+     * Drains a child's output on a daemon thread. A {@code readLine()} on the pipe itself ignores
+     * interrupts, so a host that stays alive without printing would outlive the test's
+     * {@code @Timeout}; polling a queue with a deadline cannot hang.
+     */
+    private static final class ChildOutput {
+        private static final String EOF = new String("EOF");
+        private final BlockingQueue<String> lines = new LinkedBlockingQueue<>();
+
+        ChildOutput(Process child) {
+            Thread drain = new Thread(() -> {
+                try (BufferedReader in = new BufferedReader(
+                        new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8))) {
+                    for (String line; (line = in.readLine()) != null; ) {
+                        lines.add(line);
+                    }
+                } catch (IOException ignored) {
+                    // the pipe closed when the child was killed
+                } finally {
+                    lines.add(EOF);
+                }
+            }, "mock-host-output");
+            drain.setDaemon(true);
+            drain.start();
+        }
+
+        /** The next line, or {@code null} once the child closed its output. */
+        String next() throws InterruptedException {
+            String line = lines.poll(30, TimeUnit.SECONDS);
+            assertNotNull(line, "no output from the host within 30 s");
+            return line == EOF ? null : line;
+        }
     }
 
     /** The parsed {@code MOCK READY sha512=<hex> size=<n> ports=<p1,p2,p3>} line. */
