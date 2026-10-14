@@ -10,6 +10,7 @@
 // field of the script object, which cannot be serialized). Every action copies what it needs into
 // a local first.
 import org.gradle.jvm.tasks.Jar
+import java.io.File
 import java.util.zip.ZipFile
 
 val platform: String = project.name
@@ -25,18 +26,47 @@ val trustFile = providers.gradleProperty("quicraft.updaterTrustFile")
 
 val metadataDir = layout.buildDirectory.dir("generated/updater-metadata")
 
+// Fail closed (fix 1): an updatable version (UpdateVersion grammar) with a development trust, the
+// dev file or any RFC 8032 TEST key, does not package. The only way through is the opt-in below,
+// which exists for a release-shaped TEST jar used by local tests. The documented command is
+// -Pversion=0.1.0-alpha.1 -Pquicraft.allowDevTrust=true (velocity/build.gradle.kts).
+val devTrustFile: File = rootProject.layout.projectDirectory.file(UpdaterTrust.DEV_TRUST_PATH).asFile
+val allowDevTrust = providers.gradleProperty("quicraft.allowDevTrust").map { it == "true" }.orElse(false)
+
 val generateUpdaterMetadata = tasks.register("generateUpdaterMetadata") {
     group = "build"
-    description = "Writes META-INF/quicraft/build.json and copies the configured trust file."
+    description = "Writes META-INF/quicraft/build.json and copies the configured trust file. Refuses a " +
+        "development trust for an updatable version unless -Pquicraft.allowDevTrust=true."
     val platformName = platform
+    val projectPath = project.path
     val versionName = buildVersion
     val trustSource = trustFile
+    val devSource = devTrustFile
+    val devOptIn = allowDevTrust
     val outDir = metadataDir
     inputs.property("platform", platformName)
     inputs.property("version", versionName)
+    inputs.property("allowDevTrust", devOptIn)
     inputs.file(trustSource)
     outputs.dir(outDir)
     doLast {
+        val trustFileNow = trustSource.get().asFile
+        if (UpdaterTrust.isUpdaterVersion(versionName) && !devOptIn.get()) {
+            val development = try {
+                UpdaterTrust.isDevelopmentTrust(trustFileNow, devSource)
+            } catch (e: IllegalArgumentException) {
+                throw GradleException("$projectPath: the trust file $trustFileNow cannot be decoded safely " +
+                    "(${e.message}); an updatable version needs a valid release trust file")
+            }
+            if (development) {
+                throw GradleException(
+                    "$projectPath: version $versionName is updatable but the trust file $trustFileNow is a " +
+                        "development trust (${UpdaterTrust.DEV_TRUST_PATH} or RFC 8032 TEST keys). A release " +
+                        "needs -Pquicraft.updaterTrustFile=<release trust>. A release-shaped TEST jar for " +
+                        "local tests needs -Pquicraft.allowDevTrust=true.",
+                )
+            }
+        }
         val dir = outDir.get().asFile.resolve("META-INF/quicraft")
         dir.mkdirs()
         dir.resolve("build.json").writeText(UpdaterTrust.buildJson(platformName, versionName), Charsets.UTF_8)

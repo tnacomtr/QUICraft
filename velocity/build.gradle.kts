@@ -90,6 +90,10 @@ tasks.named<Test>("test") {
     doFirst { work.get().asFile.mkdirs() }
     jvmArgs("--enable-native-access=ALL-UNNAMED")
     // The updater metadata test reads the outer (shaded) jar, the one the updater swaps.
+    // An updatable version (e.g. 0.1.0-alpha.1) packages only with the development trust when
+    // -Pquicraft.allowDevTrust=true is passed, so the release-shaped test jar is built with:
+    //   ./gradlew :velocity:check -Pversion=0.1.0-alpha.1 -Pquicraft.allowDevTrust=true
+    // SNAPSHOT versions need no property. checkReleaseTrust refuses that property.
     dependsOn(tasks.named("shadowJar"))
     val shadowArchive = tasks.named<ShadowJar>("shadowJar").flatMap { it.archiveFile }
     doFirst {
