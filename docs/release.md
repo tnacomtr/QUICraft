@@ -2,8 +2,8 @@
 
 **Status: checklist only. Nothing here is released, published, signed, or approved.** The Phase 4
 public alpha would ship the Velocity plugin and the Fabric builds for 26.x and 1.21.11 once the gates
-below pass and the user approves. No publishing command is run from this document. The signing tool
-and the release pipeline do not exist yet.
+below pass and the user approves. No publishing command is run from this document. The offline
+release-metadata tool exists (`release-tool/`, section 6); the release pipeline does not exist yet.
 
 Local input, not links: the user's updater draft is `docs/.plans/updater-plan.md` (untracked, local).
 The Phase 4 plan is `.agents/plans/2026-10-13-phase4-alpha.md`. The companion docs are `docs/updater.md`
@@ -101,7 +101,61 @@ The updater is not in the alpha until all of these pass. See [`updater.md`](upda
 - [ ] Signing runs offline, outside CI. CI never sees private keys.
 - [ ] The owner records custody of both keys. The project does not store them.
 
-Key generation and the signing script are not written. Do not describe them as existing.
+Key generation is not written, and the tool never signs: it holds no private key. Do not describe key
+generation as existing.
+
+### Signing: the offline release-metadata tool
+
+`release-tool/` (never shipped, no other module depends on it) writes the exact bytes of
+`release.v1.json` and `revocations.v1.json`, prints the OpenSSL command for each trust key, assembles
+the `.sig` file and re-checks every pair with the updater's own parser, `SignatureVerifier` and
+`TrustSnapshot` ([`updater.md`](updater.md) 12.2, 12.3, 12.12). It reads only the public trust file:
+it never generates, reads or stores a private key, and it never uses the network. Keys stay
+owner-managed and offline (owner decision, `updater.md` section 2).
+
+Run every command from the repository root; `--trust` then defaults to
+`updater/release-trust/updater-trust.json`. The first alpha is `v0.1.0-alpha.1`, and `TS` is a strict
+`YYYY-MM-DDTHH:MM:SSZ` UTC timestamp. `--seq` is always `previous + 1` and the owner supplies it: the
+tool never guesses a sequence, never publishes and never deletes a file.
+
+The revocations document goes first ([`updater.md`](updater.md) 12.7), because staging needs it:
+
+```sh
+./gradlew :release-tool:run --args="compose-revocations --out revocations.v1.json \
+    --seq 1 --issued 2026-11-01T12:00:00Z --days 365 --min-manifest-seq 0"
+./gradlew :release-tool:run --args="payload-info --payload revocations.v1.json"
+# Owner, offline: run the printed openssl pkeyutl -sign command with the backup key
+# (the only revocation-role key) and keep the private key on the offline machine.
+./gradlew :release-tool:run --args="assemble-sig --payload revocations.v1.json \
+    --sig <kid>=revocations.v1.json.<kid>.sigbin --out revocations.v1.json.sig"
+./gradlew :release-tool:run --args="verify --trust updater/release-trust/updater-trust.json \
+    --payload revocations.v1.json --sig revocations.v1.json.sig"
+```
+
+Then the manifest, after every jar it names is uploaded and read back ([`updater.md`](updater.md)
+12.7 steps 3 to 6). Each `--entry` is `PLATFORM=JARPATH=TARGET1,TARGET2,...`; the tool reads the
+jar's `META-INF/quicraft/build.json` for its platform and version, hashes the jar bytes, and refuses a
+jar whose `META-INF/quicraft/updater-trust.json` is not byte-identical to `--trust`:
+
+```sh
+./gradlew :release-tool:run --args="compose-release --out release.v1.json --seq 1 \
+    --days 30 --min-revocations-seq 1 --tag v0.1.0-alpha.1 \
+    --entry fabric-26x=build/libs/quicraft-fabric-26x-0.1.0-alpha.1.jar=26.1,26.1.1,26.3"
+./gradlew :release-tool:run --args="payload-info --payload release.v1.json"
+# Owner, offline: run the printed openssl pkeyutl -sign command with the primary key.
+./gradlew :release-tool:run --args="assemble-sig --payload release.v1.json \
+    --sig <kid>=release.v1.json.<kid>.sigbin --out release.v1.json.sig"
+./gradlew :release-tool:run --args="verify --trust updater/release-trust/updater-trust.json \
+    --payload release.v1.json --sig release.v1.json.sig"
+```
+
+Notes: `--days` accepts 1 to 45 for a manifest and 1 to 400 for revocations; `--issued` defaults to
+now (whole UTC seconds) only for `compose-release`; `assemble-sig` accepts the raw 64-byte signature
+or 128 hex characters per `--sig KID=SIGFILE` and exits non-zero (keeping the written file) when the
+pair does not verify; `verify` prints which kids verified and fails on a torn pair, an unknown kid,
+the wrong role for the document type, or an expired document. The tool does not yet check
+`revocationsSeqFloor` against the newest revocations document (`updater.md` 12.2, blocker 15), so that
+comparison stays a manual step.
 
 ## 7. Disclosure, hosting, and publishing (nothing published)
 
