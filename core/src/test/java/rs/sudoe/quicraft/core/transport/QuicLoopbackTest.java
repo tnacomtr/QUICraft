@@ -374,7 +374,8 @@ class QuicLoopbackTest {
                 accepted::complete)) {
             QuicByteStream stream = QuicClient.connect(server.localAddress(), identity.fingerprint(),
                     TransportConfig.DEFAULT).get(5, TimeUnit.SECONDS);
-            java.util.concurrent.CountDownLatch writableAgain = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CountDownLatch> writableAgain =
+                    new java.util.concurrent.atomic.AtomicReference<>(new java.util.concurrent.CountDownLatch(1));
             stream.setListener(new QuicByteStream.Listener() {
                 @Override
                 public void onData(ByteBuffer data) {}
@@ -382,33 +383,100 @@ class QuicLoopbackTest {
                 @Override
                 public void onWritabilityChanged(boolean writable) {
                     if (writable) {
-                        writableAgain.countDown();
+                        writableAgain.get().countDown();
                     }
                 }
 
                 @Override
                 public void onClosed(Throwable cause) {}
             });
+            // Keep writing whenever the stream is writable. A single moment of unwritability proves
+            // nothing: quiche accepts more as its congestion window grows, so the in-flight bytes
+            // drain again (and the stream is writable again) until the peer's flow-control window is
+            // full. "written" also counts bytes still queued in the writer (up to HIGH_WATER), so the
+            // test judges saturation by what the transport accepted ("taken"): written - inFlight, since a
+            // write completes (and leaves inFlight) once quiche took it. Quiche never accepts past
+            // the peer's stream window, which also covers this stream's few preamble bytes. A pause
+            // counts only when the taken bytes are within the slack of that window and neither
+            // taken nor in flight changed for the whole plateau while the stream was unwritable.
+            // The slack is one chunk (a partly accepted write stays in flight) plus room for the
+            // preamble. Earlier stalls keep retrying until the deadline.
             byte[] chunk = new byte[16384];
+            NettyQuicByteStream raw = ((PreambleStream) stream).raw;
+            long window = TransportConfig.DEFAULT.initialMaxStreamData;
+            long slack = chunk.length + 4096;
             long written = 0;
-            while (stream.isWritable() && written < (64L << 20)) {
-                stream.write(ByteBuffer.wrap(chunk));
-                stream.flush();
-                written += chunk.length;
+            long limit = 64L << 20;
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+            long lastTaken = -1;
+            long lastInFlight = -1;
+            long steadySince = System.nanoTime();
+            long taken = 0;
+            long inFlight = 0;
+            boolean saturated = false;
+            while (written < limit && System.nanoTime() < deadline) {
+                if (stream.isWritable()) {
+                    stream.write(ByteBuffer.wrap(chunk));
+                    stream.flush();
+                    written += chunk.length;
+                    lastTaken = -1;
+                } else {
+                    // a stale inFlight can only understate taken, which is the safe side.
+                    inFlight = raw.inFlightForTest();
+                    taken = written - inFlight;
+                    long now = System.nanoTime();
+                    if (taken != lastTaken || inFlight != lastInFlight) {
+                        lastTaken = taken;
+                        lastInFlight = inFlight;
+                        steadySince = now;
+                    } else if (taken >= window - slack && now - steadySince >= TimeUnit.MILLISECONDS.toNanos(1000)) {
+                        saturated = true;
+                        break;
+                    }
+                    Thread.sleep(5);
+                }
             }
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (stream.isWritable() && System.nanoTime() < deadline) {
+            System.out.println("aPeerThatDoesNotRead: at saturation written=" + written + " inFlight=" + inFlight
+                    + " accepted=" + taken);
+            assertTrue(saturated, "never saturated, wrote " + written + ", taken " + taken + " of the " + window
+                    + " byte peer window");
+            assertFalse(stream.isWritable(), "a stalled peer must make the stream unwritable");
+            assertTrue(taken <= window, "quiche accepted past the peer's window: " + taken);
+            assertTrue(inFlight <= 2 * NettyQuicByteStream.HIGH_WATER + chunk.length,
+                    "in flight must stay bounded, was " + inFlight);
+
+            // Arm a fresh observation now that saturation is established, then let the peer read.
+            java.util.concurrent.CountDownLatch recovered = new java.util.concurrent.CountDownLatch(1);
+            writableAgain.set(recovered);
+            java.util.concurrent.atomic.AtomicLong received = new java.util.concurrent.atomic.AtomicLong();
+            QuicByteStream serverSide = accepted.get(5, TimeUnit.SECONDS);
+            serverSide.setListener(new QuicByteStream.Listener() {
+                @Override
+                public void onData(ByteBuffer data) {
+                    received.addAndGet(data.remaining());
+                }
+
+                @Override
+                public void onWritabilityChanged(boolean writable) {}
+
+                @Override
+                public void onClosed(Throwable cause) {}
+            });
+            long receivedBeforeReads = received.get();
+            serverSide.setAutoRead(true);
+            assertTrue(recovered.await(10, TimeUnit.SECONDS), "writable again once the peer reads");
+            long writableDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (!stream.isWritable() && System.nanoTime() < writableDeadline) {
+                Thread.sleep(5);
+            }
+            assertTrue(stream.isWritable(), "writable after the peer drained the stream");
+            // Everything written before the stall must arrive once the peer reads.
+            long readDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+            while (received.get() < written && System.nanoTime() < readDeadline) {
                 Thread.sleep(10);
             }
-            assertFalse(stream.isWritable(), "a stalled peer must make the stream unwritable");
-            assertTrue(((PreambleStream) stream).raw.inFlightForTest() <= 2 * NettyQuicByteStream.HIGH_WATER + chunk.length,
-                    "in flight must stay bounded, was " + ((PreambleStream) stream).raw.inFlightForTest());
-
-            Loopback.Collector reader = new Loopback.Collector();
-            QuicByteStream serverSide = accepted.get(5, TimeUnit.SECONDS);
-            serverSide.setListener(reader);
-            serverSide.setAutoRead(true);
-            assertTrue(writableAgain.await(10, TimeUnit.SECONDS), "writable again once the peer reads");
+            assertTrue(received.get() > receivedBeforeReads, "the server received nothing after reads resumed");
+            assertEquals(written, received.get(), "every written byte must reach the server once it reads");
             stream.close();
         }
     }
