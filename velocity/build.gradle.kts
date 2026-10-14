@@ -4,6 +4,7 @@
 // pipeline through bridge-netty42 (Velocity 4.2 bundles Netty 4.2). The plugin jar bundles the
 // shaded core and the bridge as they are; core's Netty is already relocated.
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+import org.gradle.api.tasks.PathSensitivity
 
 plugins {
     id("quicraft.java-conventions")
@@ -96,6 +97,12 @@ tasks.named<Test>("test") {
     // SNAPSHOT versions need no property. checkReleaseTrust refuses that property.
     dependsOn(tasks.named("shadowJar"))
     val shadowArchive = tasks.named<ShadowJar>("shadowJar").flatMap { it.archiveFile }
+    // The test reads the shaded jar's bytes, so the jar (and through it the trust file, the version
+    // and the Gradle properties that shape them) is a real input. Without it a changed trust could
+    // leave this task UP-TO-DATE with a stale result.
+    inputs.file(shadowArchive)
+        .withPropertyName("shadowJar")
+        .withPathSensitivity(PathSensitivity.NONE)
     doFirst {
         systemProperty("quicraft.shadowJar", shadowArchive.get().asFile.absolutePath)
     }
