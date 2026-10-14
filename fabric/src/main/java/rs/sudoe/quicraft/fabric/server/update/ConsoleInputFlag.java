@@ -11,8 +11,10 @@ import org.jspecify.annotations.Nullable;
  * <p>What is marked is the exact {@code CommandSourceStack} instance the drain hands to the command, never the
  * thread that happens to run it. The server thread can run unrelated queued work while a drained command is
  * still running (a console {@code /reload} waits on the task queue inside the command), and none of that work
- * is console input. Identity is therefore the whole test: a stack the drain did not hand over, for instance
- * one {@code /execute} wrapped, is not console input.
+ * is console input. Identity is therefore the whole test: a stack the drain did not hand over is not console
+ * input. An {@code /execute} modifier that copies the stack ({@code as}, {@code at}, ...) makes a new one and
+ * so loses console status; a plain {@code execute run} typed at the console keeps the same stack, which is
+ * correct because it is the console.
  *
  * <p>Plain logic with no game classes: the marked source is kept as an {@link Object} and compared by
  * identity, so it is easy to unit test later. Fail closed: the mark starts unset and only the dedicated
@@ -26,8 +28,9 @@ public final class ConsoleInputFlag {
     }
 
     /**
-     * Marks {@code source} as the console source running now. The drain and the commands it runs are both on
-     * the server thread, so the plain field is written and read by that one thread.
+     * Marks {@code source} as the console source running now. Only the drain on the server thread writes the
+     * field. Other threads may read it (a {@code requires} check can run anywhere), which is harmless: only the
+     * console's own stack ever matches, and nothing else holds a reference to it.
      *
      * @return the mark this one replaced, for the caller to restore when the command returns
      */

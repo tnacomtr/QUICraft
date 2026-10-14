@@ -127,7 +127,7 @@ public final class ServerUpdater {
      * True only for real server-console input. A source that is the server is not proof: datapack functions
      * run with the server as their source too, so the source must also be the exact object the dedicated
      * server's console-input drain handed to the command (docs/updater.md section 3, 12.8). Any other stack,
-     * including one a command re-wrapped with {@code /execute}, is not console input, and anything that cannot
+     * including a copy an {@code /execute} modifier made, is not console input, and anything that cannot
      * answer counts as "not the console": {@code reset-state} is then refused. Fail closed.
      */
     static boolean isConsole(CommandSourceStack source) {
