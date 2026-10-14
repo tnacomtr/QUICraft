@@ -726,3 +726,63 @@ through Velocity, 10 of 10, earlier in this file.)
 The first attempt failed with "You are already connected to this proxy!": the test disconnected
 with `Minecraft.disconnect`, which leaves the network connection open (the pause menu closes it
 first through `disconnectFromWorld`). A bug in the test, not in QUICraft.
+
+## Connection capacity: the 50k concurrent target (2026-10-14)
+
+First measurement of the Architecture scale target (50,000 concurrent QUIC players per node).
+Transport level only: the real `QuicServer` and the real `QuicClient`, handshakes completed and then
+held idle. No Minecraft protocol and no game traffic. Harness: `load-server`/`load-client` in
+`testkit` plus `testkit/run-load-spike.sh`, branch `agent/phase4-load-spike` (unmerged, commits
+0a86a4d and 1aaa00a). Raw logs and the sampling TSV are gitignored; the run is
+`testkit/results/load-spike-20261013-233834`.
+
+### Method
+
+- One `QuicServer` on `127.0.0.1:65530` with admission limits raised, since the test measures
+  capacity rather than the limits: maxOpen 100,000, maxTrackedIps 300,000, globalAttemptsPerSecond
+  100,000, idle timeout 10 min.
+- One client JVM, one virtual thread per connection, one unique `127.x.y.z` source address per
+  connection (bypasses the ~28k ephemeral-port wall and the per-IP limits), ramp target 600/s, hold 60 s.
+- Guards (machine: 20 cores, 62 GiB RAM, ~43 GiB available, linux-x86_64, JDK 25, loopback): one
+  systemd scope per JVM with `MemoryMax=40G` and `MemorySwapMax=0`; the driver aborts below 8 GiB
+  `MemAvailable` or above 36 GiB client RSS and kills both JVMs.
+
+### Results
+
+| Metric | Value |
+| --- | --- |
+| Concurrent connections held | 41,403 |
+| Failed connections | 0 |
+| Server RSS at peak | 1,625 MiB, ~37 KiB/connection |
+| Server CPU (single event loop) | 23 s total, ~27% of one event-loop thread over the ~85 s run |
+| Client RSS at peak | ~35 GiB, ~850 KiB/connection |
+| Client CPU | 126 s total, ~3 ms/connection |
+| Actual ramp | ~500 connections/s |
+| Stop reason | free-RAM guardrail at 8 GiB, by design |
+
+Server-side extrapolation to 50,000 connections: about 1.9 GiB RSS. The server is not the limit.
+
+### Finding
+
+The wall is the synthetic client JVM: ~850 KiB of native memory per connection. It is untracked by
+NMT and by JFR's direct-buffer statistics, while the same native library costs ~37 KiB per
+connection on the server side of the same process pair. 50,000 client connections in one JVM would
+need about 42 GiB, more than this machine can give while keeping the 8 GiB safety margin.
+
+This is a limitation of the test harness, not of the product. In production each player carries one
+connection on their own machine, where 850 KiB is irrelevant, and a proxy carries the server-side
+cost measured above.
+
+Tested and ruled out as the cause, each with no change to the slope: plain sockets (3,000 JDK
+datagram sockets cost 131 MiB in total), Java heap (52 MiB live at 3,000 connections), JDK direct
+buffers (JFR reports zero), transparent huge pages (off), glibc arenas (`MALLOC_ARENA_MAX=1`), UDP
+payload size (`maxRecv`/`maxSendUdpPayloadSize=1350`), flow-control windows (`initialMaxData` and
+`initialMaxStreamData` at 256 KiB), TLS session resumption (shared context), and Netty allocator
+settings (`io.netty.noPreferDirect=true`, `allocator.type=unpooled`).
+
+### Next
+
+- Root-cause the client-native per-connection cost in a follow-up unit. If it can be cut, one
+  machine can generate 50k; otherwise the harness runs sharded across two machines.
+- Game-traffic CPU per player on the proxy path is still unmeasured (Phase 9). This test covers
+  connection state only, not gameplay.
