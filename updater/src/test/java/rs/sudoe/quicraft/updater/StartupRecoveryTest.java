@@ -131,12 +131,14 @@ class StartupRecoveryTest {
     @org.junit.jupiter.api.BeforeEach
     void setUp() throws Exception {
         updateDir = tmp.resolve("upd");
-        liveJar = tmp.resolve("server.jar").toAbsolutePath();
+        // Real paths, the way LiveJarValidator reports the live jar.
+        Path realTmp = tmp.toRealPath();
+        liveJar = realTmp.resolve("server.jar");
         Files.write(liveJar, new byte[] {1, 2, 3});
         new UpdateDirectory(updateDir, DurabilityOps.system());
         ops = new FaultOps();
         discovery = new FakeDiscovery();
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, OLD, V1);
+        discovery.result = new LiveJar(liveJar, realTmp, 3, OLD, V1);
     }
 
     // ---- fixtures ----------------------------------------------------------------------------
@@ -406,7 +408,7 @@ class StartupRecoveryTest {
     @Test
     void manualRestoreDiscardsStagedAndJournalKeepsBackup() throws Exception {
         setUpTransaction(journal(JournalPhase.SWAPPED, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, OLD, V1);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, OLD, V1);
 
         RecoveryResult result = StartupRecovery.run(ctx(V2));
 
@@ -425,7 +427,7 @@ class StartupRecoveryTest {
         put(staging(TXID, ".jar"), "staged");
         put(backup(TXID), "old");
         writeJournal(journal(TXID, JournalPhase.RECOVERY_REQUIRED, liveJar.toString(), oldReal, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
 
         RecoveryResult result = StartupRecovery.run(ctx(V1));
 
@@ -442,7 +444,7 @@ class StartupRecoveryTest {
         put(staging(TXID, ".jar"), "staged");
         put(backup(TXID), "xyz"); // same size as the journaled live jar, different bytes
         writeJournal(journal(TXID, JournalPhase.RECOVERY_REQUIRED, liveJar.toString(), oldReal, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
 
         RecoveryResult result = StartupRecovery.run(ctx(V1));
 
@@ -458,7 +460,7 @@ class StartupRecoveryTest {
         String oldReal = sha512Of("old");
         put(staging(TXID, ".jar"), "staged");
         writeJournal(journal(TXID, JournalPhase.RECOVERY_REQUIRED, liveJar.toString(), oldReal, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
 
         RecoveryResult result = StartupRecovery.run(ctx(V1));
 
@@ -534,7 +536,7 @@ class StartupRecoveryTest {
     @Test
     void preparedWithStagedLiveContinuesToBootPending() throws Exception {
         setUpTransaction(journal(JournalPhase.PREPARED, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
 
         RecoveryResult result = StartupRecovery.run(ctx(V2));
 
@@ -548,7 +550,7 @@ class StartupRecoveryTest {
     @Test
     void preparedWithUnknownLiveIsRecoveryRequired() throws Exception {
         setUpTransaction(journal(JournalPhase.PREPARED, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, OTHER, V1);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, OTHER, V1);
         byte[] before = journalBytes();
 
         RecoveryResult result = StartupRecovery.run(ctx(V1));
@@ -563,7 +565,7 @@ class StartupRecoveryTest {
     @Test
     void swappedWithMatchingVersionAndHashStartsBootPendingAttemptOne() throws Exception {
         setUpTransaction(journal(JournalPhase.SWAPPED, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
 
         RecoveryResult result = StartupRecovery.run(ctx(V2));
 
@@ -577,7 +579,7 @@ class StartupRecoveryTest {
     @Test
     void swappedWithMismatchingVersionIsRecoveryRequiredAndJournalUntouched() throws Exception {
         setUpTransaction(journal(JournalPhase.SWAPPED, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
         byte[] before = journalBytes();
 
         RecoveryResult result = StartupRecovery.run(ctx(V1));
@@ -590,7 +592,7 @@ class StartupRecoveryTest {
     @Test
     void swappedWithMismatchingHashIsRecoveryRequiredAndJournalUntouched() throws Exception {
         setUpTransaction(journal(JournalPhase.SWAPPED, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, OTHER, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, OTHER, V2);
         byte[] before = journalBytes();
 
         RecoveryResult result = StartupRecovery.run(ctx(V2));
@@ -605,7 +607,7 @@ class StartupRecoveryTest {
     @Test
     void bootPendingAttemptOneBecomesAttemptTwo() throws Exception {
         setUpTransaction(journal(JournalPhase.BOOT_PENDING, V2, NEW, 1));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
 
         RecoveryResult result = StartupRecovery.run(ctx(V2));
 
@@ -617,7 +619,7 @@ class StartupRecoveryTest {
     @Test
     void bootPendingAttemptTwoIsRecoveryRequiredAndJournalUntouched() throws Exception {
         setUpTransaction(journal(JournalPhase.BOOT_PENDING, V2, NEW, 2));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
         byte[] before = journalBytes();
 
         RecoveryResult result = StartupRecovery.run(ctx(V2));
@@ -630,7 +632,7 @@ class StartupRecoveryTest {
     @Test
     void bootPendingWithMismatchedRunningVersionIsRecoveryRequired() throws Exception {
         setUpTransaction(journal(JournalPhase.BOOT_PENDING, V2, NEW, 1));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
         byte[] before = journalBytes();
 
         RecoveryResult result = StartupRecovery.run(ctx(V3));
@@ -649,7 +651,7 @@ class StartupRecoveryTest {
         put(staging(TXID, ".jar"), "staged");
         put(backup(TXID), "old");
         writeJournal(journal(TXID, JournalPhase.RECOVERY_REQUIRED, liveJar.toString(), oldReal, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
         byte[] before = journalBytes();
 
         RecoveryResult result = StartupRecovery.run(ctx(V1));
@@ -664,7 +666,7 @@ class StartupRecoveryTest {
     @Test
     void journalWriteFailureIsRecoveryRequiredAndKeepsSwappedJournal() throws Exception {
         setUpTransaction(journal(JournalPhase.SWAPPED, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
         ops.failForce = true;
         byte[] before = journalBytes();
 
@@ -679,7 +681,7 @@ class StartupRecoveryTest {
     @Test
     void syncFailureAfterJournalRenameNeverReportsIdle() throws Exception {
         setUpTransaction(journal(JournalPhase.SWAPPED, V2, NEW, 0));
-        discovery.result = new LiveJar(liveJar, tmp.toAbsolutePath(), 3, NEW, V2);
+        discovery.result = new LiveJar(liveJar, liveJar.getParent(), 3, NEW, V2);
         ops.failSync = true;
 
         RecoveryResult result = StartupRecovery.run(ctx(V2));
