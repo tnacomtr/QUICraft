@@ -23,3 +23,6 @@ natives/build/
 
 # Isolated OpenCode agent worktrees
 .worktrees/
+
+# Antigravity subagent run logs (transient; see antigravity-subagent skill)
+.agents/antigravity-runs/
