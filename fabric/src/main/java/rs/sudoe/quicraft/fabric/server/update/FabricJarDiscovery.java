@@ -22,8 +22,6 @@ final class FabricJarDiscovery implements LiveJarDiscovery {
     static final String OWN_ID = "quicraft";
     private static final String MODS_PROPERTY = "fabric.modsFolder";
 
-    private volatile LiveJar found;
-
     @Override
     public LiveJar discover() throws IOException, UpdateRejectedException {
         ModContainer mod = FabricLoader.getInstance().getModContainer(OWN_ID)
@@ -36,15 +34,8 @@ final class FabricJarDiscovery implements LiveJarDiscovery {
         if (paths.size() != 1) {
             throw new UpdateRejectedException("QUICraft is loaded from more than one path");
         }
-        LiveJar live = LiveJarValidator.validate(paths.get(0), modsDirectory(), FabricJarRules::loaderWouldLoad,
+        return LiveJarValidator.validate(paths.get(0), modsDirectory(), FabricJarRules::loaderWouldLoad,
                 FabricJarRules::idOf, OWN_ID, FabricJarDiscovery::versionOf);
-        found = live;
-        return live;
-    }
-
-    /** @return the jar {@link #discover} accepted, or null before that */
-    LiveJar found() {
-        return found;
     }
 
     /** The loader's mods directory: {@code fabric.modsFolder} when set, else {@code <gameDir>/mods}. */

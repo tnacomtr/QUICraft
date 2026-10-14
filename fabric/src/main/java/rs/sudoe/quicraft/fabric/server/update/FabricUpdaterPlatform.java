@@ -1,19 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.server.update;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import net.fabricmc.loader.api.FabricLoader;
+import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.fabric.QuicraftFabric;
-import rs.sudoe.quicraft.updater.DocumentParser;
 import rs.sudoe.quicraft.updater.HealthSignal;
-import rs.sudoe.quicraft.updater.LiveJar;
 import rs.sudoe.quicraft.updater.LiveJarDiscovery;
-import rs.sudoe.quicraft.updater.OwnJarResources;
-import rs.sudoe.quicraft.updater.UpdateRejectedException;
 import rs.sudoe.quicraft.updater.UpdaterLog;
 import rs.sudoe.quicraft.updater.UpdaterPlatform;
 
@@ -27,32 +23,41 @@ public final class FabricUpdaterPlatform implements UpdaterPlatform {
     private final FabricJarDiscovery discovery = new FabricJarDiscovery();
     private final Path updateDir;
     private final boolean updateDirExisted;
+    /** Derived once, in the constructor, because the facade asks for the platform more than once. */
+    private final @Nullable String platform;
 
     public FabricUpdaterPlatform() {
         this.updateDir = QuicraftFabric.configDir().resolve("update");
         // Read before the facade's first step creates anything under config/quicraft.
         this.updateDirExisted = Files.exists(updateDir, LinkOption.NOFOLLOW_LINKS);
+        this.platform = FabricPlatformNames.platformOrNull(gameVersion());
     }
 
-    /** The platform name comes from the discovered jar's own build metadata, never from this class. */
+    /**
+     * The platform this jar was built for, taken from the loaded Minecraft version alone. It never comes
+     * from the discovered jar: the facade compares that jar's own build metadata against this value. A game
+     * version this project ships no jar for throws, so the facade disables the updater.
+     */
     @Override
     public String platform() {
-        LiveJar live = discovery.found();
-        if (live == null) {
-            throw new IllegalStateException("the live jar has not been discovered");
+        String cached = platform;
+        if (cached == null) {
+            throw new IllegalStateException(
+                    "no QUICraft platform for the loaded Minecraft version " + gameVersion());
         }
-        try {
-            return DocumentParser.parseBuild(OwnJarResources.read(live.realPath()).buildJson()).platform();
-        } catch (IOException | UpdateRejectedException e) {
-            throw new IllegalStateException("the live jar's build metadata cannot be read", e);
-        }
+        return cached;
+    }
+
+    /** @return the version the loader reports for {@code minecraft} */
+    private static String gameVersion() {
+        return FabricLoader.getInstance().getModContainer(GAME_MOD)
+                .map(mod -> mod.getMetadata().getVersion().getFriendlyString())
+                .orElseThrow(() -> new IllegalStateException("the game version is not known to the loader"));
     }
 
     @Override
     public String gameTarget() {
-        return FabricLoader.getInstance().getModContainer(GAME_MOD)
-                .map(mod -> mod.getMetadata().getVersion().getFriendlyString())
-                .orElseThrow(() -> new IllegalStateException("the game version is not known to the loader"));
+        return gameVersion();
     }
 
     @Override
