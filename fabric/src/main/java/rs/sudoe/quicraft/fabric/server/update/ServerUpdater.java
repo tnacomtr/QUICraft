@@ -110,6 +110,7 @@ public final class ServerUpdater {
         }
         onServerThread(s, () -> {
             try {
+                Hooks.enter("updater notice");
                 NOTICES.replace(message);
                 for (ServerPlayer player : s.getPlayerList().getPlayers()) {
                     if (isAdmin(player)) {
@@ -135,15 +136,44 @@ public final class ServerUpdater {
         return player.permissions().hasPermission(Permissions.COMMANDS_ADMIN);
     }
 
+    /** Sends one answer line to the invoker. A failure here never reaches the command or the server. */
     private static void reply(CommandSourceStack source, String line) {
-        source.sendSuccess(() -> Component.literal(line), false);
+        try {
+            source.sendSuccess(() -> Component.literal(line), false);
+        } catch (Throwable t) {
+            Hooks.failed("updater reply", t);
+        }
     }
 
+    /**
+     * Runs {@code task} on the server thread, now when the caller is the server thread already, else through
+     * the server's own queue. Work for a server that has stopped is dropped.
+     */
     private static void onServerThread(MinecraftServer s, Runnable task) {
+        if (!s.isRunning()) {
+            return;
+        }
         if (s.isSameThread()) {
-            task.run();
+            runOnServerThread(s, task);
         } else {
-            s.execute(task);
+            s.execute(() -> runOnServerThread(s, task));
+        }
+    }
+
+    /**
+     * The task body: the server thread and the running server are checked once more, so a queued task that
+     * arrives after a stop, or on any other thread, touches nothing. A failure is logged once and never
+     * reaches the server's tick loop.
+     */
+    private static void runOnServerThread(MinecraftServer s, Runnable task) {
+        try {
+            Hooks.enter("updater task");
+            if (!s.isRunning() || !s.isSameThread()) {
+                return;
+            }
+            task.run();
+        } catch (Throwable t) {
+            Hooks.failed("updater task", t);
         }
     }
 }
