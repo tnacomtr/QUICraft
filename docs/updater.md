@@ -305,7 +305,8 @@ Modrinth upload for this alpha, and whether `git.sudoe.rs` redirects asset downl
 on the first publish. Blocker 6: sequencing follows the release tool (revocations first, then the
 manifest after its jars are uploaded); withdrawal is still unresolved. Blocker 10: the local Linux
 end-to-end run (`testkit/run-updater-e2e.sh`) passed on Velocity, Fabric 26.x and Fabric 1.21.11, and
-CI runs it on Linux and macOS; macOS `FileChannel.force` semantics and Velocity builds other than
+CI passed it on Linux, macOS arm64 and macOS Intel for all three servers (9 of 9 jobs, run
+38624635521); macOS `FileChannel.force` semantics and Velocity builds other than
 4.2.0-30 remain open. Blocker 11: Windows stages only. Blocker 13: the README discloses the check.
 Blocker 14: Modrinth is not used for this alpha. Blocker 15: the release tool exists and the owner's
 public keys are in `pubkeys/` and `updater/release-trust/updater-trust.json`; signing stays offline
