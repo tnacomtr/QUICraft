@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.server.update;
 
-import com.google.gson.JsonElement;
-import com.google.gson.JsonParseException;
-import com.google.gson.JsonParser;
 import java.io.IOException;
 import java.io.InputStream;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
@@ -32,12 +28,29 @@ final class FabricJarRules {
             return false;
         }
         String text = name.toString();
-        return !text.startsWith(".") && text.endsWith(".jar") && Files.isRegularFile(entry);
+        if (text.startsWith(".") || !text.endsWith(".jar") || !Files.isRegularFile(entry)) {
+            return false;
+        }
+        return !hidden(entry);
     }
 
     /**
-     * Reads the {@code id} of {@code jar}'s {@code fabric.mod.json}: one entry, bounded. A missing or unparsable
-     * descriptor is "not a mod" (empty); an unreadable archive or an oversized descriptor throws.
+     * The loader's hidden test. When the platform cannot answer, the entry counts as one the loader would
+     * load: the conservative choice, because a duplicate scan must not miss a second QUICraft jar.
+     */
+    private static boolean hidden(Path entry) {
+        try {
+            return Files.isHidden(entry);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Reads the id that {@code jar}'s {@code fabric.mod.json} answers to: one entry, bounded. A missing or
+     * unparsable descriptor is "not a mod" (empty); an unreadable archive or an oversized descriptor throws.
+     * A mod that only declares the QUICraft id in its {@code provides} counts as QUICraft too, so the
+     * duplicate scan sees a second entry the loader would load.
      */
     static Optional<String> idOf(Path jar) throws IOException {
         try (ZipFile zip = new ZipFile(jar.toFile())) {
@@ -52,23 +65,7 @@ final class FabricJarRules {
             if (bytes.length > DESCRIPTOR_MAX_BYTES) {
                 throw new IOException("fabric.mod.json is larger than the limit");
             }
-            return idFrom(bytes);
-        }
-    }
-
-    private static Optional<String> idFrom(byte[] bytes) {
-        try {
-            JsonElement root = JsonParser.parseString(new String(bytes, StandardCharsets.UTF_8));
-            if (!root.isJsonObject()) {
-                return Optional.empty();
-            }
-            JsonElement id = root.getAsJsonObject().get("id");
-            if (id == null || !id.isJsonPrimitive() || !id.getAsJsonPrimitive().isString()) {
-                return Optional.empty();
-            }
-            return Optional.of(id.getAsString());
-        } catch (JsonParseException | IllegalStateException e) {
-            return Optional.empty();
+            return FabricModDescriptor.idOf(bytes, FabricJarDiscovery.OWN_ID);
         }
     }
 }
