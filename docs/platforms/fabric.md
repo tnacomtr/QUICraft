@@ -38,12 +38,13 @@ crashing the game.
 
 - The dedicated server only (`MinecraftServer.isDedicatedServer()`); a singleplayer world opened
   to LAN stays TCP.
-- QUIC runs on one loop of the game's own TCP event loop group
-  (`EventLoopGroupHolder.remote(useNativeTransport)`), over a datagram channel of the same
+- QUIC runs on loops of the game's own TCP event loop group
+  (`EventLoopGroupHolder.remote(useNativeTransport)`), over datagram channels of the same
   transport (`EpollDatagramChannel` next to `EpollSocketChannel`, etc.; `GameHost.datagramChannelsLike`).
-  Each QUIC stream becomes a `QuicBridgeChannel` with vanilla's own initializer, registered on that
-  loop, so the game sees an ordinary connection with the player's UDP address. All QUIC players
-  share that one loop (the same trade-off as on Velocity; Phase 9).
+  With `udp-sockets` above 1 (Linux), each SO_REUSEPORT socket gets its own loop; otherwise one
+  socket and one loop serve every QUIC player. Each QUIC stream becomes a `QuicBridgeChannel` with
+  vanilla's own initializer, registered on the loop of the socket that accepted it, so the game sees
+  an ordinary connection with the player's UDP address.
 - Advertisement at the byte level (`bridge-netty`'s `StatusAdvertising`): one handler after the
   frame decoder reads the handshake's intent; if it is "status", a second handler after the frame
   encoder rewrites the first outbound packet with id 0 (the status response) through
