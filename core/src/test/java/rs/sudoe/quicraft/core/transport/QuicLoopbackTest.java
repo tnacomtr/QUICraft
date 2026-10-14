@@ -393,38 +393,57 @@ class QuicLoopbackTest {
             // Keep writing whenever the stream is writable. A single moment of unwritability proves
             // nothing: quiche accepts more as its congestion window grows, so the in-flight bytes
             // drain again (and the stream is writable again) until the peer's flow-control window is
-            // full. A pause only counts as saturation once the writer has pushed at least the peer's
-            // whole stream window: below that, a stall is a delayed event loop or a small congestion
-            // window, and the writer keeps retrying until the deadline.
+            // full. "written" also counts bytes still queued in the writer (up to HIGH_WATER), so the
+            // test judges saturation by what the transport accepted ("taken"): written - inFlight, since a
+            // write completes (and leaves inFlight) once quiche took it. Quiche never accepts past
+            // the peer's stream window, which also covers this stream's few preamble bytes. A pause
+            // counts only when the taken bytes are within the slack of that window and neither
+            // taken nor in flight changed for the whole plateau while the stream was unwritable.
+            // The slack is one chunk (a partly accepted write stays in flight) plus room for the
+            // preamble. Earlier stalls keep retrying until the deadline.
             byte[] chunk = new byte[16384];
+            NettyQuicByteStream raw = ((PreambleStream) stream).raw;
             long window = TransportConfig.DEFAULT.initialMaxStreamData;
+            long slack = chunk.length + 4096;
             long written = 0;
             long limit = 64L << 20;
-            long lastProgress = System.nanoTime();
-            long deadline = lastProgress + TimeUnit.SECONDS.toNanos(60);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(60);
+            long lastTaken = -1;
+            long lastInFlight = -1;
+            long steadySince = System.nanoTime();
+            long taken = 0;
+            long inFlight = 0;
             boolean saturated = false;
             while (written < limit && System.nanoTime() < deadline) {
                 if (stream.isWritable()) {
                     stream.write(ByteBuffer.wrap(chunk));
                     stream.flush();
                     written += chunk.length;
-                    lastProgress = System.nanoTime();
+                    lastTaken = -1;
                 } else {
-                    if (written >= window && System.nanoTime() - lastProgress >= TimeUnit.MILLISECONDS.toNanos(1000)) {
+                    // a stale inFlight can only understate taken, which is the safe side.
+                    inFlight = raw.inFlightForTest();
+                    taken = written - inFlight;
+                    long now = System.nanoTime();
+                    if (taken != lastTaken || inFlight != lastInFlight) {
+                        lastTaken = taken;
+                        lastInFlight = inFlight;
+                        steadySince = now;
+                    } else if (taken >= window - slack && now - steadySince >= TimeUnit.MILLISECONDS.toNanos(1000)) {
                         saturated = true;
                         break;
                     }
                     Thread.sleep(5);
                 }
             }
-            System.out.println("aPeerThatDoesNotRead: written at saturation = " + written);
-            assertTrue(saturated, "never saturated, wrote " + written + " of the " + window + " byte peer window");
+            System.out.println("aPeerThatDoesNotRead: at saturation written=" + written + " inFlight=" + inFlight
+                    + " accepted=" + taken);
+            assertTrue(saturated, "never saturated, wrote " + written + ", taken " + taken + " of the " + window
+                    + " byte peer window");
             assertFalse(stream.isWritable(), "a stalled peer must make the stream unwritable");
-            // The peer's stream window (8 MiB) plus what the writer may hold back in flight.
-            long bound = window + 2 * NettyQuicByteStream.HIGH_WATER;
-            assertTrue(written <= bound, "a stalled peer must stop the writer near its window, wrote " + written);
-            assertTrue(((PreambleStream) stream).raw.inFlightForTest() <= 2 * NettyQuicByteStream.HIGH_WATER + chunk.length,
-                    "in flight must stay bounded, was " + ((PreambleStream) stream).raw.inFlightForTest());
+            assertTrue(taken <= window, "quiche accepted past the peer's window: " + taken);
+            assertTrue(inFlight <= 2 * NettyQuicByteStream.HIGH_WATER + chunk.length,
+                    "in flight must stay bounded, was " + inFlight);
 
             // Arm a fresh observation now that saturation is established, then let the peer read.
             java.util.concurrent.CountDownLatch recovered = new java.util.concurrent.CountDownLatch(1);
