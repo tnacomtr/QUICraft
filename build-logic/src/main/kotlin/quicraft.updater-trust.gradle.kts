@@ -50,6 +50,9 @@ val generateUpdaterMetadata = tasks.register("generateUpdaterMetadata") {
     inputs.file(trustSource)
     outputs.dir(outDir)
     doLast {
+        if (!UpdaterTrust.isSafeVersionText(versionName)) {
+            throw GradleException("$projectPath: version '$versionName' has characters outside [0-9A-Za-z.+-]")
+        }
         val trustFileNow = trustSource.get().asFile
         if (UpdaterTrust.isUpdaterVersion(versionName) && !devOptIn.get()) {
             val development = try {

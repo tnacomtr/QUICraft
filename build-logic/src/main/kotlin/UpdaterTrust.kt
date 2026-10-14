@@ -32,6 +32,14 @@ object UpdaterTrust {
             "(?:-(alpha|beta|rc)\\.(0|[1-9][0-9]{0,4}))?",
     )
 
+    private val SAFE_VERSION_TEXT = Regex("[0-9A-Za-z.+-]+")
+
+    /**
+     * True when the text holds only characters a version may be templated with. Stricter than the
+     * grammar on purpose: the version is written verbatim into build.json, so nothing else may pass.
+     */
+    fun isSafeVersionText(text: String): Boolean = SAFE_VERSION_TEXT.matches(text)
+
     /** True when UpdateVersion.parse would accept the text (length cap, then full grammar match). */
     fun isUpdaterVersion(text: String): Boolean =
         text.length <= MAX_VERSION_LENGTH && VERSION_GRAMMAR.matches(text)
