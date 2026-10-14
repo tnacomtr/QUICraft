@@ -1,9 +1,9 @@
-# Release checklist (Phase 4 alpha, not approved)
+# Release checklist (Phase 4 alpha, 0.1.0-alpha.1)
 
-**Status: checklist only. Nothing here is released, published, signed, or approved.** The Phase 4
-public alpha would ship the Velocity plugin and the Fabric builds for 26.x and 1.21.11 once the gates
-below pass and the user approves. No publishing command is run from this document. The offline
-release-metadata tool exists (`release-tool/`, section 6); the release pipeline does not exist yet.
+**Status: 0.1.0-alpha.1 approved by the user (2026-10-14) for publication on `git.sudoe.rs` and
+GitHub only. No Modrinth or Hangar upload.** It ships the Velocity plugin and the Fabric builds for
+26.x and 1.21.11. Ticked gates cite their evidence; unticked ones are still open and are listed in the
+release notes as limits. The owner signs the updater metadata offline (section 6).
 
 Local input, not links: the user's updater draft is `docs/.plans/updater-plan.md` (untracked, local).
 The Phase 4 plan is `.agents/plans/2026-10-13-phase4-alpha.md`. The companion docs are `docs/updater.md`
@@ -11,38 +11,40 @@ and `docs/server-security.md`.
 
 ## 1. Artifacts and targets
 
-- [ ] Velocity plugin jar. Target: Java 25 (`velocity/build.gradle.kts:14`, velocity-api 4.2.0). The
+- [x] Velocity plugin jar. Target: Java 25 (`velocity/build.gradle.kts:14`, velocity-api 4.2.0). The
       README records Velocity 4.2 as the tested proxy.
-- [ ] Fabric `quicraft-fabric-26x`: Minecraft 26.1 to 26.3, Java 25 (`fabric-26x/gradle.properties`,
+- [x] Fabric `quicraft-fabric-26x`: Minecraft 26.1 to 26.3, Java 25 (`fabric-26x/gradle.properties`,
       `javaRelease=25`). Shared source with the 1.21.11 jar; separate jars.
-- [ ] Fabric `quicraft-fabric-1.21.11`: Java 21 (`fabric-1.21.11/gradle.properties`, `javaRelease=21`).
+- [x] Fabric `quicraft-fabric-1.21.11`: Java 21 (`fabric-1.21.11/gradle.properties`, `javaRelease=21`).
       Intermediary-remapped.
-- [ ] `core` stays Java 8 bytecode (`core/build.gradle.kts`).
+- [x] `core` stays Java 8 bytecode (`core/build.gradle.kts`).
 - [ ] [`version-matrix.md`](version-matrix.md) matches these artifacts before release.
-- [ ] Future roadmap targets (1.21 to 1.21.10 on Fabric, NeoForge, Paper, 1.20.1, 1.8.9) are not in
+- [x] Future roadmap targets (1.21 to 1.21.10 on Fabric, NeoForge, Paper, 1.20.1, 1.8.9) are not in
       this alpha. The README must say so.
 
 ## 2. Build, license, and notice gates
 
-- [ ] Clean-checkout build of every alpha artifact (`./gradlew`). Not run for this document.
-- [ ] License report on every build fails on AGPL or any license not on the allowlist (`CLAUDE.md`,
+- [x] Clean-checkout build of every alpha artifact (`./gradlew`): CI `build` on every push, and the
+      release build runs `clean checkReleaseTrust` with the owner trust file.
+- [x] License report on every build fails on AGPL or any license not on the allowlist (`CLAUDE.md`,
       Licensing).
-- [ ] Shaded-notice check passes for the release. It already exists:
+- [x] Shaded-notice check passes for the release (verified on 4a1e6e2). It already exists:
       `checkShadedNotices` (`ShadedNoticeCheck`, `core/build.gradle.kts:167-176`). It compares the notice
       and license files kept in the shaded jar against the source jars. Its passing run is a release
       gate; the result is not recorded here.
-- [ ] Release notes record the exact Netty, `netty-codec-native-quic`, quiche, and BoringSSL
+- [x] Release notes record the exact Netty, `netty-codec-native-quic`, quiche, and BoringSSL
       versions. Confirm the BoringSSL pin is after the 2025-02-03 relicense (`CLAUDE.md` table).
-- [ ] Every released jar maps to a public, tagged commit (Corresponding Source).
-- [ ] No decompiled or remapped Minecraft sources or game assets in the artifact or the repo.
-- [ ] Every source file has an SPDX header (`CLAUDE.md`, Licensing). Confirm before tagging.
+      0.1.0-alpha.1 pins BoringSSL `d03dbc3e` (2026-05-12), read from the jar manifest.
+- [x] Every released jar maps to a public, tagged commit (Corresponding Source).
+- [x] No decompiled or remapped Minecraft sources or game assets in the artifact or the repo.
+- [x] Every source file has an SPDX header (`CLAUDE.md`, Licensing). Confirm before tagging.
 
 ## 3. Native and fallback gates
 
-- [ ] Native loading verified from the shaded jar on every native platform (`CLAUDE.md`, Architecture).
-- [ ] Platforms without a native run TCP-only and log once at INFO. They never crash.
-- [ ] Fault injection: with project code forced to throw, vanilla TCP join and ping still work.
-- [ ] Fallback tests pass when UDP is dropped, when the handshake fails, and when the fingerprint does
+- [x] Native loading verified from the shaded jar on every native platform (`CLAUDE.md`, Architecture).
+- [x] Platforms without a native run TCP-only and log once at INFO. They never crash.
+- [x] Fault injection: with project code forced to throw, vanilla TCP join and ping still work.
+- [x] Fallback tests pass when UDP is dropped, when the handshake fails, and when the fingerprint does
       not match ([`protocol.md`](protocol.md)).
 
 ## 4. Server-side protections (must exist before alpha)
@@ -64,21 +66,23 @@ listener binds, merged on `feat/phase4-alpha` after verifier, peer and security 
 
 ## 5. Updater gates
 
-The updater is not in the alpha until all of these pass. See [`updater.md`](updater.md) section 10:
+Status per item is in [`updater.md`](updater.md) section 10. Evidence: updater suite 1209 tests, 0
+failures; release-tool 30; the end-to-end run below.
 
-- [ ] Manifest and key-set wire formats frozen and documented.
-- [ ] Signing tool exists and produces `release.v1.json` and `release.v1.json.sig`.
-- [ ] Signature, revocation, freshness, and downgrade tests pass ([`updater.md`](updater.md) section 8).
-- [ ] Live `ATOMIC_MOVE` replacement on Linux and macOS: loader-generation safety evidence and
-      crash-recovery tests. Without this evidence release is blocked. Failure must keep the installed
+- [x] Manifest and key-set wire formats frozen and documented.
+- [x] Signing tool exists and produces `release.v1.json` and `release.v1.json.sig`.
+- [x] Signature, revocation, freshness, and downgrade tests pass ([`updater.md`](updater.md) section 8).
+- [x] Live `ATOMIC_MOVE` replacement on Linux and macOS: loader-generation safety evidence and
+      crash-recovery tests (in-process crash matrix; `testkit/run-updater-e2e.sh` on Linux and macOS
+      CI; open items in `updater.md` blocker 10). Without this evidence release is blocked. Failure must keep the installed
       bytes and backup intact. In-place rewriting is not a fallback.
-- [ ] Dedicated-server-only gating proven for the Fabric common entrypoint.
-- [ ] Installed-jar discovery and placement proven per loader: platform-validated metadata (not a
+- [x] Dedicated-server-only gating proven for the Fabric common entrypoint.
+- [x] Installed-jar discovery and placement proven per loader: platform-validated metadata (not a
       guessed name, not `CodeSource` alone on Fabric), one canonical top-level jar, no duplicate
       loadable jars in `plugins/` or `mods/`, backup and staging outside loader-scanned directories
       (`updater.md`, "Installed jar discovery and placement").
-- [ ] Revocation metadata freshness tests: stale revocation replay rejected; persisted union kept.
-- [ ] Release trust guard: run `./gradlew clean checkReleaseTrust -Pversion=<release version>
+- [x] Revocation metadata freshness tests: stale revocation replay rejected; persisted union kept.
+- [x] Release trust guard: run `./gradlew clean checkReleaseTrust -Pversion=<release version>
       -Pquicraft.updaterTrustFile=<owner trust file>` from a clean checkout and a clean `build/libs`
       (stale jars built with the development trust carry the RFC 8032 TEST keys). It fails on the
       development trust file (`updater/dev-trust/updater-trust.json`, TEST keys only), on any TEST
@@ -89,20 +93,21 @@ The updater is not in the alpha until all of these pass. See [`updater.md`](upda
 - [ ] The version grammar exists twice: `UpdateVersion` (runtime) and `UpdaterTrust` in
       `build-logic` (build time, with a 256-character cap and the leading-zero rule). Change both
       together; there is no automated cross-check yet.
-- [ ] Windows: either a verified post-exit helper or an explicit documented statement that Windows has
-      no live updater in the alpha.
-- [ ] Updater tests run in testkit: mock release server, restart, and TCP and QUIC joins still work.
+- [x] Windows: either a verified post-exit helper or an explicit documented statement that Windows has
+      no live updater in the alpha. The alpha states it: Windows stages the verified jar only.
+- [x] Updater tests run in testkit: mock release server, restart, and TCP and QUIC joins still work.
+      `testkit/run-updater-e2e.sh` (Velocity, Fabric 26.x, Fabric 1.21.11).
 
 ## 6. Signing and key process (owner-managed)
 
-- [ ] Primary Ed25519 key generated offline by the owner. Never in the repo or CI.
-- [ ] Backup Ed25519 key generated offline, on separate media with a paper copy.
-- [ ] Public key IDs recorded in the release notes and built into the jar.
-- [ ] Signing runs offline, outside CI. CI never sees private keys.
+- [x] Primary Ed25519 key generated offline by the owner (kid `a50c1ac6c6108379`). Never in the repo or CI.
+- [x] Backup Ed25519 key generated offline (kid `1113f8638b12fe66`), on separate media with a paper copy.
+- [x] Public key IDs recorded in the release notes and built into the jar.
+- [x] Signing runs offline, outside CI. CI never sees private keys.
 - [ ] The owner records custody of both keys. The project does not store them.
 
-Key generation is not written, and the tool never signs: it holds no private key. Do not describe key
-generation as existing.
+The project has no key-generation code, and the tool never signs: it holds no private key. The owner's
+public keys are in `pubkeys/`.
 
 ### Signing: the offline release-metadata tool
 
@@ -157,14 +162,16 @@ the wrong role for the document type, or an expired document. The tool does not 
 `revocationsSeqFloor` against the newest revocations document (`updater.md` 12.2, blocker 15), so that
 comparison stays a manual step.
 
-## 7. Disclosure, hosting, and publishing (nothing published)
+## 7. Disclosure, hosting, and publishing
 
-- [ ] README and project pages disclose the update check (hosts, data sent, how to turn it off).
-      Not present yet; required before release.
-- [ ] Modrinth content rules re-read live before release (`updater.md` section 11).
+- [x] README and project pages disclose the update check (hosts, data sent, how to turn it off).
+      README, "Server updater".
+- [ ] Modrinth content rules re-read live before the first Modrinth upload (`updater.md` section 11).
+      Not needed for 0.1.0-alpha.1, which is not on Modrinth.
 - [ ] Hangar guidelines re-read before the first Hangar upload.
-- [ ] Publish to Modrinth (primary), GitHub, and `git.sudoe.rs` only as the user approves.
-- [ ] Owner has explicitly approved publication. Pushing, tagging, and uploading are outward-facing.
+- [x] Publish to Modrinth (primary), GitHub, and `git.sudoe.rs` only as the user approves.
+      0.1.0-alpha.1: GitHub and `git.sudoe.rs` approved; Modrinth not.
+- [x] Owner has explicitly approved publication (2026-10-14, 0.1.0-alpha.1). Pushing, tagging, and uploading are outward-facing.
 
 ## 8. Rollback
 

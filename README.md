@@ -4,9 +4,10 @@ QUIC transport for Minecraft: Java Edition. QUICraft is a client mod plus server
 plugins. When both sides have it, the game connection runs over QUIC (UDP). In every other case
 it runs over plain TCP, exactly like vanilla.
 
-> **Status: early development (Phase 3 done, Phase 4 in progress).** Nothing is released yet. The Velocity plugin
-> and the Fabric client and server mod for 26.x and 1.21.11 build, run and pass their tests; a
-> public alpha requires Phase 4's active rate limits, Retry tokens, and server-updater gates. See [Roadmap](#roadmap).
+> **Status: public alpha (0.1.0-alpha.1).** The Velocity plugin and the Fabric client and server mod
+> for 26.x and 1.21.11 are released for testing on [GitHub](https://github.com/tnacomtr/QUICraft/releases)
+> and [git.sudoe.rs](https://git.sudoe.rs/tna/QUICraft/releases). Expect rough edges; TCP keeps working
+> whatever happens. See [Roadmap](#roadmap).
 
 ## What it does, and what it doesn't
 
@@ -40,7 +41,8 @@ The protocol is specified in [`docs/protocol.md`](docs/protocol.md).
 
 ## Installing
 
-Not released yet. When it is:
+Download the jars from the [releases](https://github.com/tnacomtr/QUICraft/releases) page (the same
+files are on [git.sudoe.rs](https://git.sudoe.rs/tna/QUICraft/releases)).
 
 - **Players:** install the client mod for your loader and game version. Nothing to configure.
   The multiplayer screen has a **QUICraft** button (top right) with the transport setting:
@@ -70,13 +72,30 @@ Not released yet. When it is:
   (`config/quicraft/quic-key.pem`, `quic-cert.pem`). With `enable-query` on the game port, QUIC
   moves to the game port + 1 (configurable).
 
-Alpha preparation guidance: [UDP firewall and DDoS caveats](docs/server-security.md) and
-[release checklist](docs/release.md). The [server updater](docs/updater.md) is not runtime-wired:
-an isolated Java 21 verification module is under development. Its default will be hourly checks
-against Modrinth (primary), GitHub, and
-`git.sudoe.rs`, disclosing the server's IP and potentially version/platform information to those
-hosts. Owners will be able to turn checks off; downloads require an explicit command. No updater
-check or download runs in current builds.
+Before opening the UDP port, read [UDP firewall and DDoS caveats](docs/server-security.md), which
+also lists the admission limits and their defaults.
+
+### Server updater (Velocity and Fabric dedicated servers)
+
+The server side checks for new QUICraft releases. **What it sends:** once an hour by default, the
+server asks `github.com` and `git.sudoe.rs` for the signed release list. Those hosts see the server's
+IP address, and the request reveals the running QUICraft version and platform. Nothing else is sent.
+The server says this once in its log on first start.
+
+- **Turn checks off:** `update.check-interval=off` in `plugins/quicraft/updater.properties`
+  (Velocity) or `config/quicraft/updater.properties` (Fabric). `daily` is also accepted.
+- **Nothing is downloaded on its own.** An admin runs `quicraft update check`, then
+  `quicraft update` (console, or `/quicraft update` in game: Velocity needs the
+  `quicraft.admin.update` permission, Fabric accepts the server's OPs).
+- Every release list and jar is checked against Ed25519 signatures built into the jar before it is
+  used; an unsigned, tampered, older or revoked release is refused.
+- **Linux and macOS:** the new jar replaces the old one in place (atomically, with a backup) and
+  takes effect on the next restart. **Windows and other systems**, or `update.install=stage-only`:
+  the verified jar is only staged, and the log says where; copy it over the old jar while the
+  server is stopped.
+- Manual rollback: stop the server, put the backed-up jar (named in the log) back, start.
+
+Details: [`docs/updater.md`](docs/updater.md).
 
 ## Supported versions
 
@@ -95,7 +114,7 @@ Exact version ranges per module: [`docs/version-matrix.md`](docs/version-matrix.
 | 1 | `core`: QUIC client/listener, discovery, racing, fallback, fingerprint check | done (loopback gate) |
 | 2 | Velocity plugin (single stream) | done ([gate](docs/benchmarks.md)) |
 | 3 | Fabric client + dedicated server for 26.x and 1.21.11 | done ([gate and gaps](docs/benchmarks.md)) |
-| 4 | Public alpha: Retry, admission limits, server-owner docs, signed server updater | in progress; not release-ready |
+| 4 | Public alpha: Retry, admission limits, multi-socket listener, server-owner docs, signed server updater | done (0.1.0-alpha.1) |
 | 5 | Multi-stream on 26.x | |
 | 6–9 | More versions and loaders, Velocity multi-stream, Paper, hardening | |
 

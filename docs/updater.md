@@ -299,6 +299,18 @@ These are requirements for the design. None is proven by implementation.
 
 ## 10. Unresolved release blockers
 
+**Status for 0.1.0-alpha.1 (2026-10-14).** Implemented and tested, updater suite 1209 tests, 0
+failures: blockers 1, 2, 3, 4, 7, 8, 9, 12, 16 and 17. Blocker 5: GitHub and `git.sudoe.rs` only; no
+Modrinth upload for this alpha, and whether `git.sudoe.rs` redirects asset downloads is checked live
+on the first publish. Blocker 6: sequencing follows the release tool (revocations first, then the
+manifest after its jars are uploaded); withdrawal is still unresolved. Blocker 10: the local Linux
+end-to-end run (`testkit/run-updater-e2e.sh`) passed on Velocity, Fabric 26.x and Fabric 1.21.11, and
+CI runs it on Linux and macOS; macOS `FileChannel.force` semantics and Velocity builds other than
+4.2.0-30 remain open. Blocker 11: Windows stages only. Blocker 13: the README discloses the check.
+Blocker 14: Modrinth is not used for this alpha. Blocker 15: the release tool exists and the owner's
+public keys are in `pubkeys/` and `updater/release-trust/updater-trust.json`; signing stays offline
+with the owner.
+
 1. Runtime integration and release freeze of the approved manifest, signature, trust and revocation
    schemas (12.2, 12.3). Disconnected structural parsers are implemented and tested, not authentication.
 2. Signed-byte authentication and sequence/expiry enforcement under the approved encodings (12.3,
@@ -347,6 +359,8 @@ These are requirements for the design. None is proven by implementation.
 - Hangar: the draft found no rule on runtime downloads but could not fetch the page. Re-read before
   the first Hangar upload.
 - Rules change without versioning. Re-check before the first release that ships the updater.
+- 0.1.0-alpha.1 is published on GitHub and `git.sudoe.rs` only, with no Modrinth or Hangar upload,
+  so neither rule set applies to it. Re-check both before the first upload there.
 
 ## 12. Approved implementation specification
 
