@@ -147,11 +147,11 @@ resolve_java() {
     if [ -z "${1:-}" ]; then
         return 1
     fi
-    if [ -x "$1" ]; then
+    if [ -f "$1" ] && [ -x "$1" ]; then
         printf '%s\n' "$1"
         return 0
     fi
-    if [ -x "$1/bin/java" ]; then
+    if [ -f "$1/bin/java" ] && [ -x "$1/bin/java" ]; then
         printf '%s\n' "$1/bin/java"
         return 0
     fi
