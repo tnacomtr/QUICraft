@@ -15,6 +15,7 @@ import net.fabricmc.loom.api.LoomGradleExtensionAPI
 
 plugins {
     id("quicraft.java-conventions")
+    id("quicraft.updater-trust")
 }
 
 val loom = extensions.getByType<LoomGradleExtensionAPI>()
@@ -119,6 +120,7 @@ dependencies {
     for (dep in listOf(
         project.dependencies.project(mapOf("path" to ":core", "configuration" to "shadowRuntimeElements")),
         project.dependencies.project(mapOf("path" to ":bridge-netty42")),
+        project.dependencies.project(mapOf("path" to ":updater")),
     )) {
         "implementation"(dep)
         "include"(dep)

@@ -4,6 +4,7 @@
 // check to every module); the root only checks SPDX headers across the whole tree.
 plugins {
     id("quicraft.spdx")
+    id("quicraft.release-trust")
 }
 
 tasks.named("check") {
