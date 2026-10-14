@@ -397,6 +397,9 @@ announce-forge = false
 kick-existing-players = true
 
 [servers]
+# Never joined: Velocity refuses to start without the fallback server it names in try.
+lobby = "127.0.0.1:1"
+try = ["lobby"]
 
 [forced-hosts]
 
