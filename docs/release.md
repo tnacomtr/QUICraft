@@ -78,6 +78,17 @@ The updater is not in the alpha until all of these pass. See [`updater.md`](upda
       loadable jars in `plugins/` or `mods/`, backup and staging outside loader-scanned directories
       (`updater.md`, "Installed jar discovery and placement").
 - [ ] Revocation metadata freshness tests: stale revocation replay rejected; persisted union kept.
+- [ ] Release trust guard: run `./gradlew clean checkReleaseTrust -Pversion=<release version>
+      -Pquicraft.updaterTrustFile=<owner trust file>` from a clean checkout and a clean `build/libs`
+      (stale jars built with the development trust carry the RFC 8032 TEST keys). It fails on the
+      development trust file (`updater/dev-trust/updater-trust.json`, TEST keys only), on any TEST
+      key, on a version outside the updater grammar, on outer jars whose `META-INF/quicraft` trust
+      bytes differ from the configured file, and whenever `-Pquicraft.allowDevTrust` is set. Never set
+      `allowDevTrust` for a release; it exists only for local and testkit update runs. Any future
+      release or publish task must depend on `checkReleaseTrust`.
+- [ ] The version grammar exists twice: `UpdateVersion` (runtime) and `UpdaterTrust` in
+      `build-logic` (build time, with a 256-character cap and the leading-zero rule). Change both
+      together; there is no automated cross-check yet.
 - [ ] Windows: either a verified post-exit helper or an explicit documented statement that Windows has
       no live updater in the alpha.
 - [ ] Updater tests run in testkit: mock release server, restart, and TCP and QUIC joins still work.

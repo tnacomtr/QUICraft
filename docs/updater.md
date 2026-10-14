@@ -908,7 +908,10 @@ gated on blocker 10 on every platform.
 5. `backup-ready`: validate the staged jar's own trust file and version metadata (12.2) without
    loading it as code; copy the live jar to `backup/<txid>.jar`, `force(true)`, fsync `backup/`,
    check its SHA-512; write the journal with `phase=prepared` (atomic). Log the exact manual rollback
-   command.
+   command. As implemented, the line goes to a mandatory progress sink (`TransactionProgress`, which
+   the platform facade wires to the server log at WARN and to the command output). If emitting it
+   fails, the transaction ends FAILED before step 6 ("the rollback instructions could not be logged;
+   nothing was installed") and cleans up: a swap never happens without the logged command.
 6. `installed-pending-restart`: take `state.lock` (peer review: no check may merge a revocation
    between the last authorisation and the move) and hold it through this step. Under it: re-read
    `state.json` and `revoked.json` from disk and re-authorise from that persisted state alone (no
@@ -918,8 +921,14 @@ gated on blocker 10 on every platform.
    and the staged jar's trust file (held in memory since step 5) passes the 12.2 staged-jar validation
    again against this freshly read state (peer review: a revocation merged after step 5 that hits a key
    in the staged trust file must stop the swap). If any of these fails: release `state.lock`, delete
-   `staging/<txid>.*` and the journal under `txn.lock`, keep the backup, and end the command with the
-   reason (security review); the live jar is unchanged. Otherwise re-hash `staging/<txid>.jar` (security review); `ATOMIC_MOVE` it over the live path (same file
+   `staging/<txid>.*` and the journal under `txn.lock`, and end the command with the reason (security
+   review); the live jar is unchanged. As implemented, this attempt's own backup is deleted too: the
+   live jar was never replaced, so the backup is a copy of the running jar and restores nothing.
+   Backups of earlier transactions are never touched here. Also as implemented: the live jar is
+   re-hashed immediately before the move, and a changed live jar ends the command with "the live jar
+   changed during the update; nothing was installed"; after the move the live jar is re-hashed
+   against `staged.sha512`, and a mismatch keeps the `prepared` journal and the backup as recovery
+   evidence (12.11 step 5 then reports `recovery-required`), logs a WARN and fails the command. Otherwise re-hash `staging/<txid>.jar` (security review); `ATOMIC_MOVE` it over the live path (same file
    store required; on `AtomicMoveNotSupportedException` the transaction ends before any change, journal
    removed); fsync the live jar's directory; set `phase=swapped`. Release `state.lock`, then
    `txn.lock`. A scheduled check that wants `state.lock` meanwhile waits for this step (in-process) or
