@@ -3,18 +3,21 @@ package rs.sudoe.quicraft.updater;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
-/** {@link UpdaterOrigins#resolve}: production has none, the dev override is strict. */
+/** {@link UpdaterOrigins#resolve}: the production hosts by default, the dev override is strict. */
 class UpdaterOriginsTest {
 
     private static final String VALID = "modrinth=https://localhost:9001,github=https://localhost:9002,"
             + "sudoe=https://localhost:9003";
+    private static final URI FROM = URI.create("https://github.com/tnacomtr/QUICraft/releases/download/v1/a.jar");
 
     private final List<String> infos = new ArrayList<>();
     private final List<String> warnings = new ArrayList<>();
@@ -35,22 +38,45 @@ class UpdaterOriginsTest {
         }
     };
 
-    private Optional<ReleaseHosts> resolve(String value) {
+    private Optional<ReleaseSetup> resolve(String value) {
         return UpdaterOrigins.resolve(value, log);
     }
 
     @Test
-    void noPropertyMeansNoOriginsAndOneInfoLine() {
-        assertFalse(resolve(null).isPresent());
-        assertEquals(List.of(UpdaterOrigins.NOT_CONFIGURED), infos);
+    void noPropertyMeansTheProductionHostsWithOneInfoLine() {
+        ReleaseSetup setup = resolve(null).orElseThrow();
+        assertEquals(List.of("github", "sudoe"),
+                setup.hosts().hosts().stream().map(ReleaseHost::key).toList());
+        assertEquals(List.of("https://github.com", "https://git.sudoe.rs"),
+                setup.hosts().hosts().stream().map(host -> host.origin().toString()).toList());
+        assertInstanceOf(ProductionReleaseEndpoints.class, setup.endpoints());
+        assertEquals(List.of("github", "sudoe"), setup.redirects().keySet().stream().sorted().toList());
+        assertEquals(List.of(UpdaterOrigins.PRODUCTION_IN_USE), infos);
         assertTrue(warnings.isEmpty());
     }
 
     @Test
+    void theGithubHostFollowsOnlyItsCdnAndTheSudoeHostOnlyItself() {
+        ReleaseSetup setup = UpdaterOrigins.production();
+        ReleaseHost github = setup.hosts().byKey("github").orElseThrow();
+        ReleaseHost sudoe = setup.hosts().byKey("sudoe").orElseThrow();
+        RedirectPolicy githubRedirects = setup.redirects().get("github");
+        RedirectPolicy sudoeRedirects = setup.redirects().get("sudoe");
+        assertTrue(githubRedirects.allows(github, FROM,
+                URI.create("https://release-assets.githubusercontent.com/x")));
+        assertFalse(githubRedirects.allows(github, FROM, URI.create("https://git.sudoe.rs/x")));
+        assertTrue(sudoeRedirects.allows(sudoe, FROM, URI.create("https://git.sudoe.rs/x")));
+        assertFalse(sudoeRedirects.allows(sudoe, FROM,
+                URI.create("https://release-assets.githubusercontent.com/x")));
+    }
+
+    @Test
     void aValidLocalhostTripleIsAcceptedInOrderWithOneWarning() {
-        ReleaseHosts hosts = resolve(VALID).orElseThrow();
+        ReleaseSetup setup = resolve(VALID).orElseThrow();
         assertEquals(List.of("modrinth", "github", "sudoe"),
-                hosts.hosts().stream().map(ReleaseHost::key).toList());
+                setup.hosts().hosts().stream().map(ReleaseHost::key).toList());
+        assertInstanceOf(DevReleaseEndpoints.class, setup.endpoints());
+        assertTrue(setup.redirects().isEmpty(), "the dev setup refuses every redirect");
         assertEquals(List.of(UpdaterOrigins.DEV_IN_USE), warnings);
         assertTrue(infos.isEmpty());
     }
@@ -61,6 +87,7 @@ class UpdaterOriginsTest {
                 "github=https://example.com")).isPresent());
         assertEquals(1, warnings.size());
         assertTrue(warnings.get(0).startsWith("dev release origins ignored: "));
+        assertTrue(infos.isEmpty(), "an invalid override never falls back to the production hosts");
     }
 
     @Test
