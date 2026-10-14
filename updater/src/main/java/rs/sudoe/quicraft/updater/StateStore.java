@@ -68,6 +68,7 @@ public final class StateStore {
     private final Path dir;
     private final Runnable afterRevokedWrite;
     private final DirectoryForce directoryForce;
+    private final AtomicWriteHook atomicWriteHook;
     private static final ConcurrentHashMap<Path, Boolean> FSYNC_SUPPORT = new ConcurrentHashMap<>();
     private static final int MAX_FILE_BYTES = RevokedCodec.MAX_BYTES + 1;
     private static final long PROBE_STALE_SECONDS = 60;
@@ -90,9 +91,30 @@ public final class StateStore {
 
     /** Test seam with an injectable directory fsync. */
     StateStore(Path updateDir, Runnable afterRevokedWrite, DirectoryForce directoryForce) {
+        this(updateDir, afterRevokedWrite, directoryForce, (step, fileName) -> { });
+    }
+
+    /** Test seam with an injectable directory fsync and a hook at every step of {@link #atomicWrite}. */
+    StateStore(Path updateDir, Runnable afterRevokedWrite, DirectoryForce directoryForce,
+            AtomicWriteHook atomicWriteHook) {
         this.dir = Objects.requireNonNull(updateDir, "updateDir").toAbsolutePath().normalize();
         this.afterRevokedWrite = Objects.requireNonNull(afterRevokedWrite, "afterRevokedWrite");
         this.directoryForce = Objects.requireNonNull(directoryForce, "directoryForce");
+        this.atomicWriteHook = Objects.requireNonNull(atomicWriteHook, "atomicWriteHook");
+    }
+
+    /** The steps of {@link #atomicWrite}, each reported before and after its file operation. */
+    enum AtomicStep {
+        TMP_WRITE_BEFORE, TMP_WRITE_AFTER,
+        PREV_TMP_WRITE_BEFORE, PREV_TMP_WRITE_AFTER,
+        PREV_RENAME_BEFORE, PREV_RENAME_AFTER,
+        TARGET_RENAME_BEFORE, TARGET_RENAME_AFTER
+    }
+
+    /** Test seam: called around every file operation of {@link #atomicWrite}. Production uses a no-op. */
+    @FunctionalInterface
+    interface AtomicWriteHook {
+        void at(AtomicStep step, String fileName) throws IOException;
     }
 
     /**
@@ -633,14 +655,22 @@ public final class StateStore {
         }
         Path target = dir.resolve(name);
         Path tmp = dir.resolve(name + TMP);
+        atomicWriteHook.at(AtomicStep.TMP_WRITE_BEFORE, name);
         writeSynced(tmp, content);
+        atomicWriteHook.at(AtomicStep.TMP_WRITE_AFTER, name);
         byte[] current = readOptional(name);
         if (current != null && validCurrent.test(current)) {
             Path prevTmp = dir.resolve(name + PREV + TMP);
+            atomicWriteHook.at(AtomicStep.PREV_TMP_WRITE_BEFORE, name);
             writeSynced(prevTmp, current);
+            atomicWriteHook.at(AtomicStep.PREV_TMP_WRITE_AFTER, name);
+            atomicWriteHook.at(AtomicStep.PREV_RENAME_BEFORE, name);
             Files.move(prevTmp, dir.resolve(name + PREV), StandardCopyOption.ATOMIC_MOVE);
+            atomicWriteHook.at(AtomicStep.PREV_RENAME_AFTER, name);
         }
+        atomicWriteHook.at(AtomicStep.TARGET_RENAME_BEFORE, name);
         Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
+        atomicWriteHook.at(AtomicStep.TARGET_RENAME_AFTER, name);
         syncDirectory(warnings);
     }
 
