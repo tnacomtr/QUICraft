@@ -1,6 +1,6 @@
 # Handoff: Phase 4, after the user's four decisions (2026-10-14)
 
-Branch `feat/phase4-alpha`. Pushed to origin and github up to 71cf7d8; everything after that is local.
+Branch `feat/phase4-alpha`, pushed to origin and github.
 Routing: DeepSeek codes (gate.sh default-coder), Haiku verifies, Astra peer-reviews (opencode),
 security via Antigravity Opus when its quota allows, else the native security-reviewer.
 Test keys, the dev trust file and the TLS fixture are throwaway (user told; they will swap keys).
@@ -23,11 +23,9 @@ Test keys, the dev trust file and the TLS fixture are throwaway (user told; they
 - Full fresh build after all merges: core 210/0, velocity 73/0, updater 1166/0.
 
 ## Next steps
-1. (done) push feat.
-2. Dispatch updater-macos on feat (`gh workflow run updater-macos --ref feat/phase4-alpha`), record the
-   result in docs/updater.md 12.13.
-3. Update plan Progress and gotchas (flake root cause; workflow_dispatch needs the file on main;
-   macOS tmpdir is a symlink; JAVA_TOOL_OPTIONS banner breaks the lock tests that read child output).
+All four decisions are done and pushed. macOS run 38600235420 green (4 jobs, 1166/0 each), recorded in
+docs/updater.md 12.13 (16a616d). Worktrees of the merged branches phase4-core-flake, phase4-admission-defaults,
+phase4-fabric-oplist and phase4-macos-paths are retained (removal not yet asked for).
 
 ## Open follow-ups (not done)
 readJournal exists-then-owner race vs deleteJournal (fails closed; availability only; check whether UpdaterTransaction admit holds the lease); Attempt-rate limits (globalAttemptsPerSecond 200 etc.) not raised for 50k; SO_REUSEPORT multi-socket scaling;
