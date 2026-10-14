@@ -203,6 +203,23 @@ class UpdaterRuntimeCommandTest {
     }
 
     @Test
+    void aGarbageInstallConfigOnALinuxNamedPlatformStagesOnly() throws Exception {
+        Files.writeString(p.configFile, "update.install=helper\n");
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        startOn("Linux", new TransactionFixtures.ArtifactFetcher(metadata, newJar));
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true));
+        awaitIdle();
+
+        assertTrue(out.contains("update finished: STAGED_ONLY"), () -> "output was " + out.snapshot());
+        assertArrayEquals(liveBytes, Files.readAllBytes(live.realPath()));
+    }
+
+    @Test
     void emptyArgsStageAnUpdateAndTheUpdateWordIsUsage() throws Exception {
         // Stage-only, so this test measures the dispatch form and not what the platform may do.
         optOutOfTheSwap();

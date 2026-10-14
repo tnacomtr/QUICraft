@@ -15,8 +15,8 @@ import rs.sudoe.quicraft.updater.UpdaterConfig.InstallMode;
  * {@code update.install=stage-only} keep the verified staging path only.
  *
  * <p>This decision is not the last word on a swap: {@link UpdaterTransaction} still downgrades to
- * staging when the update directory cannot be synced, and still refuses a swap whose update directory
- * is on another file store than the live jar.
+ * staging when the update directory cannot be synced and when it is on another file store than the
+ * live jar.
  */
 final class InstallCapabilities {
 

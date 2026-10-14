@@ -971,8 +971,9 @@ Windows (peer review): steps 5 to 7 never run on Windows. A Windows transaction 
    re-hashed immediately before the move, and a changed live jar ends the command with "the live jar
    changed during the update; nothing was installed"; after the move the live jar is re-hashed
    against `staged.sha512`, and a mismatch keeps the `prepared` journal and the backup as recovery
-   evidence (12.11 step 5 then reports `recovery-required`), logs a WARN and fails the command. Otherwise re-hash `staging/<txid>.jar` (security review); `ATOMIC_MOVE` it over the live path (same file
-   store required; on `AtomicMoveNotSupportedException` the transaction ends before any change, journal
+   evidence (12.11 step 5 then reports `recovery-required`), logs a WARN and fails the command. Otherwise re-hash `staging/<txid>.jar` (security review); `ATOMIC_MOVE` it over the live path (step 1 already
+   downgraded to staging when `<updateDir>` and the live jar are on different file stores; if the move
+   still reports `AtomicMoveNotSupportedException` the transaction ends before any change, journal
    removed); fsync the live jar's directory; set `phase=swapped`. Release `state.lock`, then
    `txn.lock`. A scheduled check that wants `state.lock` meanwhile waits for this step (in-process) or
    skips its write until the next check (other process); the step does no network I/O, so the wait is
@@ -1170,12 +1171,17 @@ Both:
   that directory carrying QUICraft's plugin or mod id (checked at init by reading each jar's
   `velocity-plugin.json` or `fabric.mod.json`). Otherwise the updater is disabled with a WARN.
 - Same file store: `ATOMIC_MOVE` needs `<updateDir>` and the scan directory on one file store
-  (container setups often mount `mods/` separately). If they differ, the transaction ends before step
-  5 with manual install instructions (section 2 allows this).
-- **APPROVED (separate file stores):** keep the "fail with instructions" rule above.
-  Alternative: put a temporary `.quicraft-<txid>.swap` copy (no `.jar` suffix, hidden; neither loader
-  loads it, per the filters above) in the scan directory just before the move. That conflicts with
-  section 5's rule that staging lives outside loader-scanned directories, so I did not choose it.
+  (container setups often mount `mods/` separately). If they differ, the transaction downgrades the
+  capability to verified staging before any download, like the directory-fsync downgrade: the jar is
+  downloaded, verified and staged with `STAGED_ONLY`, the live jar is never written, and the message
+  names the staged jar path and the manual steps (stop the server, copy the staged jar over the live
+  jar, start the server).
+- **Peer review (separate file stores):** the former "fail with instructions" rule was wrong: that
+  refusal runs before any download, so the owner had no release jar to copy. Superseded by the
+  downgrade above. Alternative: put a temporary `.quicraft-<txid>.swap` copy (no `.jar` suffix, hidden;
+  neither loader loads it, per the filters above) in the scan directory just before the move. That
+  conflicts with section 5's rule that staging lives outside loader-scanned directories, so I did not
+  choose it.
 
 ### 12.15 Dependencies on blockers not resolved here
 
