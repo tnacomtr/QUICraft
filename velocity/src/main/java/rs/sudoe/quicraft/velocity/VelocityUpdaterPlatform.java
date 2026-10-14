@@ -22,8 +22,8 @@ import rs.sudoe.quicraft.updater.UpdaterPlatform;
  * routed. It holds no updater logic.
  *
  * <p>{@link #health()} is PROVISIONAL. Blocker 9 (docs/updater.md 10) is unresolved, so the verdict is only
- * "QUICraft's init did not fail, and the proxy finished its ProxyInitializeEvent handling". It does not
- * look at player joins.
+ * "QUICraft's own init did not fail", observed by a late, lowest-priority ProxyInitializeEvent handler. It
+ * does not prove that every other handler finished, nor the TCP bind, and it does not look at player joins.
  */
 final class VelocityUpdaterPlatform implements UpdaterPlatform {
     static final String PLATFORM = "velocity";
