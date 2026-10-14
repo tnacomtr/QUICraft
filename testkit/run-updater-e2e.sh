@@ -351,6 +351,17 @@ say "mock origin ports: modrinth=$port1 github=$port2 sudoe=$port3"
 if [ ! -f "$out/truststore.p12" ]; then
     fail "the mock release host did not export its truststore"
 fi
+# The trustStore property replaces the JDK's CAs, and the Fabric launcher downloads the Minecraft
+# server from Mojang over HTTPS, so add the server JDK's public CAs to the exported store.
+server_home="$(cd "$(dirname "$server_java")/.." && pwd)"
+if [ -f "$server_home/lib/security/cacerts" ] && [ -x "$server_home/bin/keytool" ]; then
+    "$server_home/bin/keytool" -importkeystore -noprompt \
+        -srckeystore "$server_home/lib/security/cacerts" -srcstorepass changeit \
+        -destkeystore "$out/truststore.p12" -deststoretype PKCS12 -deststorepass "$TRUSTSTORE_PASSWORD" \
+        > "$out/truststore-import.log" 2>&1 || fail "could not add the JDK CAs to the truststore (see $out/truststore-import.log)"
+else
+    say "NOTE: no cacerts next to $server_java; the truststore holds only the mock host"
+fi
 
 origins="modrinth=https://localhost:$port1,github=https://localhost:$port2,sudoe=https://localhost:$port3"
 server_jvm_args="-Dquicraft.updater.devOrigins=$origins -Djavax.net.ssl.trustStore=$out/truststore.p12 -Djavax.net.ssl.trustStorePassword=$TRUSTSTORE_PASSWORD"
