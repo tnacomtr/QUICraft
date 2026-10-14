@@ -24,9 +24,10 @@ import java.util.Optional;
 public interface JarIdReader {
 
     /**
-     * @return the id, or empty when the jar is not a plugin or mod or its descriptor is missing or
-     *     unparsable
-     * @throws IOException when the jar cannot be read, or a limit above is exceeded
+     * @return the id, or empty when the jar is not a plugin or mod or its descriptor is missing
+     * @throws IOException when the jar cannot be read, a limit above is exceeded, or a sibling descriptor
+     *     exists but cannot be parsed. An adapter must throw rather than return empty for an unparsable sibling:
+     *     the validator fails closed and refuses with the "cannot inspect" reason
      */
     Optional<String> idOf(Path jar) throws IOException;
 }

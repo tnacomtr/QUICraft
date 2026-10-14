@@ -91,6 +91,16 @@ class OwnJarVersionTest {
     }
 
     @Test
+    void snapshotBuildEntryIsADevelopmentBuild() throws Exception {
+        Path jar = JarFixtures.jar(tmp, "quicraft.jar", null,
+                "{\"type\":\"quicraft.build\",\"v\":1,\"platform\":\"velocity\",\"version\":\"1.2.3-SNAPSHOT\"}");
+
+        DevelopmentBuildException e = assertThrows(DevelopmentBuildException.class,
+                () -> OwnJarVersion.read(jar));
+        assertEquals(DevelopmentBuildException.MESSAGE, e.getMessage());
+    }
+
+    @Test
     void notAZipIsAnIoException() throws Exception {
         Path file = tmp.resolve("plain.jar");
         Files.write(file, "garbage".getBytes(StandardCharsets.UTF_8));

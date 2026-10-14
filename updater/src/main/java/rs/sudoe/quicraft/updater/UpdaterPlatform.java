@@ -49,6 +49,13 @@ public interface UpdaterPlatform {
      * Tells the online admins that a new version is available. The adapter also delivers it to admins
      * who join later. Called once per version.
      *
+     * <p>The facade already writes the console/log line for every notice, so the adapter delivers the
+     * notice to players only and must not log it again.
+     *
+     * <p>Delivery is at-least-once: a crash between this call and the runtime's commit of the announcement
+     * repeats the notice on the next start. A thrown exception means "not delivered"; the runtime retries on
+     * the next check.
+     *
      * @param message the notice text
      */
     void notifyAdmins(String message);
