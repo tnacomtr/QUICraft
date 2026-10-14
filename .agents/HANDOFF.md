@@ -12,10 +12,14 @@ Phase 4 merged into main as 5186825 (tree identical to the verified feat c586d32
 - GitHub pre-release v0.1.0-alpha.1 with the 3 jars; read back byte-identical.
 - release.v1.json (seq 1, expires 2026-11-13T19:52:53Z) and revocations.v1.json (seq 1) composed, unsigned.
 
-## Waiting on the user
-1. Sign revocations.v1.json with the backup key (1113f8638b12fe66), release.v1.json with the primary (a50c1ac6c6108379).
-2. Run dist/finish-forgejo.sh (token from a file): assembles + verifies sigs, git.sudoe.rs release + updater-metadata.
-Then: GitHub updater-metadata release (gh), live check of both hosts, report.
+## Published (2026-10-14)
+- Owner signed both documents; release-tool verify passed with the release trust.
+- GitHub: v0.1.0-alpha.1 pre-release (3 jars) and updater-metadata (4 files), read back identical; downloads 302 to
+  release-assets.githubusercontent.com (on the allowlist).
+- git.sudoe.rs: same two releases via finish-forgejo.sh, read back identical; answers 200 directly.
+- Live check: Velocity 4.2.0-30 + release jar, `quicraft update check` -> "no update"; state.json holds revocations
+  seq 1 (0a2022...) and manifest seq 1 from a50c1ac6c6108379 (400fc5...).
+- Manifest expires 2026-11-13T19:52:53Z: compose seq 2 (same entries) and have the owner sign before then.
 
 ## Open follow-ups
 - EarlyDataGameTest timing flake on slow runners (10-tick wait for the ticket).
