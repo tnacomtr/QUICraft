@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Live updater end-to-end test on real servers (docs/updater.md section 10 blocker 10): build two
+# jars of one module, run the mock release host, swap the live jar of a running Velocity proxy or
+# Fabric dedicated server, restart it and read the new version back. The evidence for the macOS and
+# JDK 21 gaps of 12.13 is this workflow's runs, not a local claim.
+#
+# Three servers x three platforms: Velocity 4.2.0-30 on JDK 25, Fabric 1.21.11 (Loader 0.19.5) on
+# JDK 21 and Fabric 26.1.2 on JDK 25. The Ubuntu legs also cover the Linux swap; the macOS legs
+# cover APFS rename, fsync and the arm64 and x86_64 JDKs.
+name: updater-e2e
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/phase4-alpha, main]
+    paths:
+      - "updater/**"
+      - "velocity/**"
+      - "fabric*/**"
+      - "testkit/run-updater-e2e.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  # QUICraft's patched Netty QUIC jars (natives/build/out/repo): core needs them and every server
+  # module builds against core. Docker is Linux-only, so the macOS legs download this artifact
+  # (the same split as .github/workflows/natives.yml).
+  netty-quic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/netty-quic-linux
+      - uses: actions/upload-artifact@v7
+        with:
+          name: netty-quic-repo
+          path: natives/build/out/repo/
+
+  updater-e2e:
+    needs: netty-quic
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-15-intel]
+        server: [velocity, fabric-1.21.11, fabric-26x]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: netty-quic-repo
+          path: natives/build/out/repo/
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          # The build runs on 25 (toolchain); 21 is the 1.21.11 Fabric server's JVM.
+          java-version: |
+            21
+            25
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Updater end-to-end (${{ matrix.server }})
+        run: |
+          JAVA21="${JAVA_HOME_21_X64:-${JAVA_HOME_21_ARM64:-}}"
+          JAVA25="${JAVA_HOME_25_X64:-${JAVA_HOME_25_ARM64:-}}"
+          export JAVA21 JAVA25
+          testkit/run-updater-e2e.sh ${{ matrix.server }}
+      - name: Upload results on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: updater-e2e-${{ matrix.server }}-${{ matrix.os }}
+          path: testkit/results/
