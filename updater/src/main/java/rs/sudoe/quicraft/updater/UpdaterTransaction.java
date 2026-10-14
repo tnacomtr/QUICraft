@@ -553,9 +553,9 @@ final class UpdaterTransaction {
         } catch (UpdateRejectedException e) {
             return messageOf(e);
         }
-        // The manifest that chose this release, verified under the snapshot it was checked with. Any
-        // revocation merged since then makes the snapshots differ, so the change is refused here.
-        if (!KeySetChangeAuthorization.check(candidate.manifest(), a.staged.stagedKeySetFingerprint(),
+        // The manifest just verified under the fresh trust snapshot. Using the step 4 evidence instead would
+        // refuse every revocation merged since then, even one for an unrelated key.
+        if (!KeySetChangeAuthorization.check(reverified, a.staged.stagedKeySetFingerprint(),
                 fresh.state().persistedTrust(), currentTrust)) {
             return KEY_SET_REFUSED;
         }

@@ -782,20 +782,18 @@ class UpdaterTransactionTest {
     }
 
     @Test
-    void keySetChangeCheckAloneRejectsAFreshSnapshotThatDiffersFromTheVerifiedOne() throws Exception {
+    void unrelatedRevocationMergedAfterStepFiveDoesNotRefuseTheSameKeySet() throws Exception {
         Rig r = standardRig();
         UpdaterTransaction txn = txn(r);
-        // A revocation of an unrelated key merged between step 5 and step 6. Verification, freshness and
-        // the staged trust checks still pass; only the key-set check compares against the verified snapshot.
+        // A revocation of an unrelated key merged between step 5 and step 6. The key set does not change,
+        // so the key-set check passes against the freshly re-verified manifest and the swap installs.
         String unrelated = Hex.sha256("unrelated-revocation".getBytes(java.nio.charset.StandardCharsets.UTF_8));
         String unrelatedKid = Hex.kid(unrelated);
         txn.hooks.afterBackupReady = () -> mergeRevocation(r, unrelatedKid, unrelated);
         TransactionResult result = txn.execute(atomic(r));
-        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
-        assertEquals(UpdaterTransaction.KEY_SET_REFUSED, result.messages().get(0));
+        assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
+        assertArrayEquals(r.jar, Files.readAllBytes(r.live));
         assertEquals(1, backupCount(r), "the backup is kept");
-        assertEquals(0, journalCount(r));
-        assertLiveUntouched(r);
     }
 
     @Test
