@@ -81,7 +81,7 @@ public final class UpdaterRuntime {
 
     static final String BUSY_TEXT = "another updater command is already running";
     static final String STOPPING_TEXT = "updater is stopping; the command was not run";
-    static final String USAGE = "usage: check [-s] | update | cancel | reset-state";
+    static final String USAGE = "usage: update | update check | update check -s | update cancel | update reset-state";
     static final String NOT_CONSOLE = "reset-state is available only from the server console";
     static final String RESET_JOURNAL = "reset refused: an update is pending restart or recovery";
     static final String RESET_BUSY = "reset refused: an update transaction or another state operation is active";
@@ -227,6 +227,12 @@ public final class UpdaterRuntime {
     /**
      * Runs one command line. Never throws, except a {@link VirtualMachineError}.
      *
+     * <p>The five accepted forms are exactly the docs/updater.md section 3 table, with the command
+     * prefix ({@code update}) already removed: an empty array is {@code /quicraft update} and stages the
+     * new jar, {@code {"check"}} and {@code {"check", "-s"}} are the two checks, {@code {"cancel"}}
+     * cancels, and {@code {"reset-state"}} is the console-only reset. Anything else, including the
+     * literal word {@code update}, prints {@link #USAGE}.
+     *
      * @param args the words after the command prefix, for example {@code {"check", "-s"}}
      * @param console true when the command came from the server console
      * @param out receives every line of the answer; may be called from the worker thread, so an adapter
@@ -308,9 +314,17 @@ public final class UpdaterRuntime {
             emit(out, STOPPING_TEXT);
             return Reply.DONE;
         }
-        if (args == null || args.length == 0) {
+        if (args == null) {
             emit(out, USAGE);
             return Reply.DONE;
+        }
+        if (args.length == 0) {
+            // '/quicraft update' with no further word: download, verify and stage the new jar.
+            if (txn == null) {
+                emit(out, REASON_NO_HOSTS);
+                return Reply.DONE;
+            }
+            return startWorker(out, () -> runUpdate(out));
         }
         switch (args[0]) {
             case "check": {
@@ -324,17 +338,6 @@ public final class UpdaterRuntime {
                     return Reply.DONE;
                 }
                 return startWorker(out, () -> runCheck(out, silent, false));
-            }
-            case "update": {
-                if (args.length != 1) {
-                    emit(out, USAGE);
-                    return Reply.DONE;
-                }
-                if (txn == null) {
-                    emit(out, REASON_NO_HOSTS);
-                    return Reply.DONE;
-                }
-                return startWorker(out, () -> runUpdate(out));
             }
             case "cancel": {
                 if (args.length != 1) {

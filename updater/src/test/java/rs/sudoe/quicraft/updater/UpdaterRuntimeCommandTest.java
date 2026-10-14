@@ -105,7 +105,7 @@ class UpdaterRuntimeCommandTest {
         assertTrue(entered.await(WAIT.toSeconds(), TimeUnit.SECONDS));
 
         Output second = new Output();
-        assertEquals(Reply.BUSY, dispatch(second, true, "update"));
+        assertEquals(Reply.BUSY, dispatch(second, true));
         assertTrue(second.contains(UpdaterRuntime.BUSY_TEXT));
 
         release.countDown();
@@ -144,11 +144,29 @@ class UpdaterRuntimeCommandTest {
         start(new TransactionFixtures.ArtifactFetcher(metadata, newJar));
 
         Output out = new Output();
-        assertEquals(Reply.STARTED, dispatch(out, true, "update"));
+        assertEquals(Reply.STARTED, dispatch(out, true));
         awaitIdle();
 
         assertTrue(out.contains("update finished: STAGED_ONLY"), () -> "output was " + out.snapshot());
         assertArrayEquals(liveBytes, Files.readAllBytes(live.realPath()));
+    }
+
+    @Test
+    void emptyArgsStageAnUpdateAndTheUpdateWordIsUsage() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        start(new TransactionFixtures.ArtifactFetcher(metadata, newJar));
+
+        Output usageOnly = new Output();
+        assertEquals(Reply.DONE, dispatch(usageOnly, true, "update"));
+        assertTrue(usageOnly.contains(UpdaterRuntime.USAGE), () -> "output was " + usageOnly.snapshot());
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true));
+        awaitIdle();
+        assertTrue(out.contains("update finished: STAGED_ONLY"), () -> "output was " + out.snapshot());
     }
 
     @Test
@@ -211,7 +229,7 @@ class UpdaterRuntimeCommandTest {
         Output out = new Output();
         assertEquals(Reply.DONE, dispatch(out, true, "explode"));
         assertEquals(Reply.DONE, dispatch(out, true, "check", "-x"));
-        assertEquals(Reply.DONE, dispatch(out, true));
+        assertEquals(Reply.DONE, dispatch(out, true, "update"));
         assertEquals(3, out.snapshot().stream().filter(UpdaterRuntime.USAGE::equals).count());
     }
 
@@ -401,7 +419,7 @@ class UpdaterRuntimeCommandTest {
             }
         };
         start(fetcher);
-        assertEquals(Reply.STARTED, dispatch(new Output(), true, "update"));
+        assertEquals(Reply.STARTED, dispatch(new Output(), true));
         assertTrue(entered.await(WAIT.toSeconds(), TimeUnit.SECONDS));
 
         rt.shutdown();
