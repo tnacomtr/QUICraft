@@ -47,10 +47,12 @@ final class FabricJarRules {
     }
 
     /**
-     * Reads the id that {@code jar}'s {@code fabric.mod.json} answers to: one entry, bounded. A missing or
-     * unparsable descriptor is "not a mod" (empty); an unreadable archive or an oversized descriptor throws.
-     * A mod that only declares the QUICraft id in its {@code provides} counts as QUICraft too, so the
-     * duplicate scan sees a second entry the loader would load.
+     * Reads the id that {@code jar}'s {@code fabric.mod.json} answers to: one entry, bounded. A jar with no
+     * descriptor is "not a mod" (empty), and so is a descriptor that is an object with nothing the scan
+     * recognizes. An unreadable archive, an oversized descriptor, or a descriptor that is present but cannot
+     * be parsed throws, so the validator refuses a jar it cannot inspect. A mod that only declares the
+     * QUICraft id in its {@code provides} counts as QUICraft too, so the duplicate scan sees a second entry
+     * the loader would load.
      */
     static Optional<String> idOf(Path jar) throws IOException {
         try (ZipFile zip = new ZipFile(jar.toFile())) {
