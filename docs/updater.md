@@ -1073,9 +1073,14 @@ Rules derived from it (user-approved semantics, implementation safety still gate
   Fabric showed a consistent old view, but the same rule applies to both loaders.
 - Required test: swap, then run a check and the other QUICraft code paths that might read resources,
   on Velocity and Fabric; nothing may read from the new jar.
-- Gaps that keep blocker 10 open: JDK 21 not tested (1.21.11 ran on JDK 25), macOS not tested,
-  directory fsync and `F_FULLFSYNC` on macOS, crash-recovery tests of 12.11, and Velocity builds other
-  than 4.2.0-30.
+- Gaps that keep blocker 10 open: a live server swap on JDK 21 and on macOS (1.21.11 ran on JDK 25;
+  the macOS CI job below runs the updater suite, not a server), directory fsync and `F_FULLFSYNC` on
+  macOS, crash-recovery tests of 12.11, and Velocity builds other than 4.2.0-30.
+- macOS CI (`updater-macos` workflow, run 38600235420, 2026-10-14, feat d9f3514): the full updater
+  suite, transaction and crash-matrix tests included, passed 1166/0 on macos-latest (ARM64) and
+  macos-15-intel, each with JDK 21 and JDK 25 as the test launcher. The first run (38577920195)
+  failed 2 tests: fixtures used the symlinked macOS temp path (`/var` -> `/private/var`), and the
+  ownership scan rejected a `.owner-*.probe` file removed between listing and check. Both fixed.
 
 Swap-then-read run (2026-10-14, manual, scratch only; the required test above, run once by hand,
 not yet automated): `0.1.0-alpha.1` jars with localhost dev origins on Velocity 4.2.0-30, Fabric
