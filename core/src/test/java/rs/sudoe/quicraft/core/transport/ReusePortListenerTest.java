@@ -428,6 +428,11 @@ class ReusePortListenerTest {
             }
 
             assertEquals(REBINDS, proven, "every round rebound onto a socket that did not own the connection");
+            int[] dropped = server.droppedForwardsPerSocket();
+            assertEquals(SOCKETS, dropped.length, "one forward-drop counter per socket");
+            assertEquals(0, sum(dropped),
+                    "every rebound datagram was forwarded to the owning socket, not dropped: "
+                            + Arrays.toString(dropped));
             System.out.println("NAT rebind over " + SOCKETS + " sockets: " + proven + " connections each accepted on"
                     + " the socket their first port predicted and kept echoing after a rebind onto another socket,"
                     + " owner -> receiving socket per round " + pairs + ". Kernel source-port hash: " + socketOfPort);
