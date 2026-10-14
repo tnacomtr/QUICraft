@@ -47,6 +47,7 @@ import rs.sudoe.quicraft.updater.StateRecords.RevokedState;
 import rs.sudoe.quicraft.updater.StateRecords.Snapshot;
 import rs.sudoe.quicraft.updater.StateRecords.StateDelta;
 import rs.sudoe.quicraft.updater.StateRecords.UpdaterState;
+import rs.sudoe.quicraft.updater.StateRecords.WithdrawnEntry;
 import rs.sudoe.quicraft.updater.UpdateDocuments.RevokedKey;
 import rs.sudoe.quicraft.updater.UpdaterTransaction.SameStore;
 
@@ -68,6 +69,11 @@ class UpdateCrashMatrixTest {
     private static final String HEX_C = "c".repeat(64);
     private static final String PUB_X = Hex.sha256("matrix-revocation".getBytes(StandardCharsets.UTF_8));
     private static final String KID_X = kidOf(PUB_X);
+    /** A key and a blocked artifact that the seeded state already restricts before any transaction runs. */
+    private static final String PUB_OLD = Hex.sha256("matrix-seeded-revocation".getBytes(StandardCharsets.UTF_8));
+    private static final String KID_OLD = kidOf(PUB_OLD);
+    private static final String BLOCKED = "b".repeat(128);
+    private static final String WITHDRAWN = "a".repeat(128);
 
     private static String kidOf(String pub) {
         try {
@@ -218,6 +224,34 @@ class UpdateCrashMatrixTest {
 
     // ---- rig, identity, discovery, transaction ----------------------------------------------------
 
+    /**
+     * The seeded state: non-empty revoked keys, a blocked artifact, a withdrawn entry and a per-key floor, so
+     * monotonicity is checked against real restrictions rather than empty sets. The withdrawn entry and the
+     * floor belong to the unrevoked release kid and the withdrawn version is above the running and new versions:
+     * entries of revoked kids and versions not above max(running, on-disk) are pruned by design (docs/updater.md
+     * 12.8, "Growth policy"), so seeding them would test the pruning, not the monotonicity.
+     */
+    private static StateDelta seededDelta() throws Exception {
+        UpdaterState s = PipelineFixtures.seedState();
+        Map<String, KidSeq> seqs = new HashMap<>(s.seqByKid());
+        seqs.put(TestKeys.KID_1, new KidSeq(2, HEX_C, Instant.parse(SignedFixtures.TS1)));
+        List<WithdrawnEntry> withdrawn = new ArrayList<>(s.withdrawn());
+        withdrawn.add(new WithdrawnEntry(WITHDRAWN, UpdateVersion.parse("9.9.9"), TestKeys.KID_1));
+        UpdaterState seeded = new UpdaterState(s.epoch(), s.keySetFingerprint(), s.revocationKey(),
+                s.revocations(), seqs, withdrawn, s.lastAnnounced(), s.warnedBad(), s.tornSince());
+        RevokedState revoked = new RevokedState(List.of(new RevokedKey(KID_OLD, PUB_OLD)), List.of(BLOCKED));
+        return new StateDelta(seeded, revoked);
+    }
+
+    /**
+     * The revocations the served metadata carries: the seeded key plus {@link #PUB_X}. PUB_X is new to the
+     * state, so the check that fetches it introduces a restriction during the transaction.
+     */
+    private static byte[] servedRevocations() throws Exception {
+        return PipelineFixtures.revocations(PipelineFixtures.revokedKey(KID_OLD, PUB_OLD),
+                PipelineFixtures.revokedKey(KID_X, PUB_X));
+    }
+
     /** The standard rig at {@code root}: a newer release that matches the jar, the live jar holding the old bytes. */
     private static Rig release(Path root) throws Exception {
         byte[] jar = TransactionFixtures.releaseJar(NEW);
@@ -229,10 +263,9 @@ class UpdateCrashMatrixTest {
         r.live = root.resolve("live").resolve("quicraft.jar");
         Files.createDirectories(r.live.getParent());
         PipelineFixtures.writePrivate(r.live, OLD);
-        new StateStore(r.upd).initialiseIfAbsent(new StateDelta(PipelineFixtures.seedState(), RevokedState.empty()),
-                true);
+        new StateStore(r.upd).initialiseIfAbsent(seededDelta(), true);
         r.metadata = new PipelineFixtures.ScriptedFetcher();
-        TransactionFixtures.serveMetadata(r.metadata, PipelineFixtures.revocations(), manifest);
+        TransactionFixtures.serveMetadata(r.metadata, servedRevocations(), manifest);
         r.artifact = new TransactionFixtures.ArtifactFetcher(r.metadata, jar);
         return r;
     }
@@ -262,7 +295,7 @@ class UpdateCrashMatrixTest {
         }, directory -> b.step(() -> {
             directory.force(true);
             return null;
-        }));
+        }), (step, fileName) -> b.step(() -> null));
     }
 
     private static DurabilityOps countingOps(Boundaries b) {
@@ -409,6 +442,9 @@ class UpdateCrashMatrixTest {
         TransactionOutcome expected = cap == InstallCapability.VERIFIED_STAGING_ONLY
                 ? TransactionOutcome.STAGED_ONLY : TransactionOutcome.INSTALLED_RESTART_PENDING;
         assertEquals(expected, result.outcome(), result.messages().toString());
+        // The served revocation is new to the seeded state, so the check introduced it during the transaction.
+        assertTrue(pubs(new StateStore(r.upd).load().orElseThrow().revoked()).contains(PUB_X),
+                "the transaction introduced a new restriction");
         System.out.println("N_max " + cap + " = " + b.count);
         return b.count;
     }
@@ -434,12 +470,15 @@ class UpdateCrashMatrixTest {
         // Restart: the crash-time image is the disk. Cleanup code that ran after the throw is discarded.
         deleteTree(r.root);
         copyTree(b.snapshot, r.root);
+        // The crash-time baseline: loaded from the restored disk, before any recovery code runs.
+        Snapshot crashTime = new StateStore(r.upd).load().orElseThrow();
 
         boolean liveNew = assertCrashImage(r, before);
         byte[] crashLive = Files.readAllBytes(r.live);
 
         RecoveryResult rr = StartupRecovery.run(recoveryContext(r, identity(liveNew ? NEW : RUNNING, crashLive)));
         assertNotEquals(RecoveryStatus.DISABLED, rr.status(), rr.messages().toString());
+        assertMonotone(crashTime, new StateStore(r.upd).load().orElseThrow());
         assertArrayEquals(crashLive, Files.readAllBytes(r.live), "recovery does not move the live jar");
         if (liveNew) {
             assertTrue(rr.status() == RecoveryStatus.HEALTH_PENDING
@@ -465,18 +504,113 @@ class UpdateCrashMatrixTest {
         if (!liveNew && rr.status() == RecoveryStatus.IDLE) {
             assertFalse(journalOf(r.upd).isPresent(), "an idle recovery with the old jar leaves no journal");
         }
+        if (rr.status() != RecoveryStatus.RECOVERY_REQUIRED) {
+            assertEquals(0, stagingCount(r.upd), "no abandoned staging file after recovery or health");
+        }
         assertMonotone(before, new StateStore(r.upd).load().orElseThrow());
+        assertMonotone(crashTime, new StateStore(r.upd).load().orElseThrow());
+
+        // Backups that exist before the next command must survive it unchanged (12.10 step 7).
+        Map<String, byte[]> predecessors = backupBytes(r.upd);
 
         // The next command on the restarted identity, now that no journal is pending.
         byte[] nowLive = Files.readAllBytes(r.live);
         RuntimeIdentity restarted = identity(Arrays.equals(nowLive, r.jar) ? NEW : RUNNING, nowLive);
         assertFalse(journalOf(r.upd).isPresent(), "no journal is pending for the next command");
+        int stagedBefore = stagingCount(r.upd);
+        int backupsBefore = backupCount(r.upd);
         follow = transaction(r, restarted, r.artifact, new StateStore(r.upd), DurabilityOps.system())
                 .execute(new UpdateRequest(restarted, cap, NO_OP));
-        assertNotNull(follow.outcome(), "the next command returns an outcome");
+        TransactionOutcome expected = expectedFollow(cap, liveNew, rr.status());
+        assertEquals(expected, follow.outcome(), follow.messages().toString());
+        assertFollowDisk(r, expected, nowLive, stagedBefore, backupsBefore);
+        assertPredecessorsUnchanged(r.upd, predecessors);
         assertMonotone(before, new StateStore(r.upd).load().orElseThrow());
+        assertMonotone(crashTime, new StateStore(r.upd).load().orElseThrow());
+        replayRefused(r, cap);
         System.out.println("CASE " + name + " liveNew=" + liveNew + " recovery=" + rr.status()
                 + " follow=" + follow.outcome());
+    }
+
+    /** The exact next-command outcome for a recovered state (12.10 admission, 12.11 recovery). */
+    private static TransactionOutcome expectedFollow(InstallCapability cap, boolean liveNew, RecoveryStatus status) {
+        if (status == RecoveryStatus.RECOVERY_REQUIRED) {
+            return TransactionOutcome.NOT_ADMITTED;
+        }
+        if (liveNew) {
+            return TransactionOutcome.NO_UPDATE;
+        }
+        return cap == InstallCapability.VERIFIED_STAGING_ONLY
+                ? TransactionOutcome.STAGED_ONLY : TransactionOutcome.INSTALLED_RESTART_PENDING;
+    }
+
+    /** The disk state that each recovered outcome leaves behind. */
+    private static void assertFollowDisk(Rig r, TransactionOutcome outcome, byte[] liveBefore, int stagedBefore,
+            int backupsBefore) throws Exception {
+        byte[] live = Files.readAllBytes(r.live);
+        switch (outcome) {
+            case NO_UPDATE:
+                assertArrayEquals(liveBefore, live, "no update leaves the live jar alone");
+                assertFalse(journalOf(r.upd).isPresent(), "no update leaves no journal");
+                assertEquals(0, stagingCount(r.upd), "no update stages nothing");
+                break;
+            case NOT_ADMITTED:
+                assertArrayEquals(liveBefore, live, "a refused command leaves the live jar alone");
+                assertEquals(stagedBefore, stagingCount(r.upd), "a refused command leaves staging alone");
+                assertEquals(backupsBefore, backupCount(r.upd), "a refused command leaves the backups alone");
+                break;
+            case STAGED_ONLY:
+                assertArrayEquals(OLD, live, "a staged-only command never replaces the live jar");
+                assertEquals(1, stagingCount(r.upd), "the verified jar is staged");
+                assertEquals(0, backupCount(r.upd) - backupsBefore, "a staged-only command makes no backup");
+                break;
+            case INSTALLED_RESTART_PENDING:
+                assertArrayEquals(r.jar, live, "the atomic command installs the new jar");
+                assertTrue(journalOf(r.upd).isPresent(), "an installed jar keeps its journal until health");
+                assertEquals(backupsBefore + 1, backupCount(r.upd), "the install keeps one new backup");
+                break;
+            default:
+                fail("unexpected follow-up outcome " + outcome);
+        }
+    }
+
+    private static Map<String, byte[]> backupBytes(Path upd) throws Exception {
+        Map<String, byte[]> out = new HashMap<>();
+        UpdateDirectory ud = new UpdateDirectory(upd, DurabilityOps.system());
+        for (String txid : ud.backupTxids()) {
+            out.put(txid, Files.readAllBytes(ud.backupJar(txid)));
+        }
+        return out;
+    }
+
+    /** Backups the next command could not have deleted (only a later transaction that passes health may). */
+    private static void assertPredecessorsUnchanged(Path upd, Map<String, byte[]> predecessors) throws Exception {
+        UpdateDirectory ud = new UpdateDirectory(upd, DurabilityOps.system());
+        for (Map.Entry<String, byte[]> e : predecessors.entrySet()) {
+            assertArrayEquals(e.getValue(), Files.readAllBytes(ud.backupJar(e.getKey())),
+                    "a predecessor backup is unchanged: " + e.getKey());
+        }
+    }
+
+    /**
+     * An older revocations document and an older manifest are served after recovery. The document omits
+     * {@link #PUB_X}, so accepting it would remove a restriction. Nothing is installed and nothing is removed.
+     */
+    private static void replayRefused(Rig r, InstallCapability cap) throws Exception {
+        byte[] revokedBefore = Files.readAllBytes(r.upd.resolve("revoked.json"));
+        byte[] liveBefore = Files.readAllBytes(r.live);
+        TransactionFixtures.serveMetadata(r.metadata, PipelineFixtures.revocationsSeq(2,
+                PipelineFixtures.revokedKey(KID_OLD, PUB_OLD)), TransactionFixtures.manifestFor(r.jar, NEW, 41));
+        RuntimeIdentity id = identity(Arrays.equals(liveBefore, r.jar) ? NEW : RUNNING, liveBefore);
+        TransactionResult replay = transaction(r, id, r.artifact, new StateStore(r.upd), DurabilityOps.system())
+                .execute(new UpdateRequest(id, cap, NO_OP));
+        assertTrue(replay.outcome() != TransactionOutcome.STAGED_ONLY
+                && replay.outcome() != TransactionOutcome.INSTALLED_RESTART_PENDING, replay.messages().toString());
+        assertArrayEquals(liveBefore, Files.readAllBytes(r.live), "a replayed older release leaves the live jar");
+        assertArrayEquals(revokedBefore, Files.readAllBytes(r.upd.resolve("revoked.json")),
+                "a replayed older revocations document removes nothing");
+        assertTrue(pubs(new StateStore(r.upd).load().orElseThrow().revoked()).contains(PUB_X),
+                "the restriction stays after the replay");
     }
 
     @TestFactory
@@ -564,35 +698,79 @@ class UpdateCrashMatrixTest {
         assertEquals(1, backupCount(r.upd), "the backup is kept");
     }
 
+    /** A key-set change (epoch 2) naming the backup key, as the staged jar's trust file. */
+    private static final String KEY_SET_EPOCH2 = "{\"type\":\"quicraft.trust\",\"v\":1,\"epoch\":2,\"built\":\""
+            + SignedFixtures.TS1 + "\",\"revocationsSeqFloor\":0,\"manifestSeqFloor\":0,\"keys\":[{\"kid\":\""
+            + TestKeys.KID_2 + "\",\"pub\":\"" + TestKeys.PUB_2 + "\",\"roles\":[\"release\",\"revocation\"]}]}";
+
+    /**
+     * The rig for the key-set change. The served manifest is co-signed by the release key and by the current
+     * backup key (KID_2, revocation role), which KeySetChangeAuthorization requires for a changed fingerprint.
+     */
+    private Rig keySetRig(String name) throws Exception {
+        Rig r = release(tmp.resolve(name));
+        byte[] jar = TransactionFixtures.releaseJar(NEW, KEY_SET_EPOCH2);
+        byte[] manifest = TransactionFixtures.manifestFor(jar, NEW);
+        TransactionFixtures.serveMetadata(r.metadata, servedRevocations(), manifest);
+        for (ReleaseHost host : PipelineFixtures.HOSTS.hosts()) {
+            r.metadata.answer(PipelineFixtures.ENDPOINTS.manifestSignature(host), SignedFixtures.envelopeFor(manifest,
+                    SignedFixtures.signedEntry(TestKeys.KID_1, TestKeys.SEED_1, manifest),
+                    SignedFixtures.signedEntry(TestKeys.KID_2, TestKeys.SEED_2, manifest)));
+        }
+        r.jar = jar;
+        r.artifact = new TransactionFixtures.ArtifactFetcher(r.metadata, jar);
+        return r;
+    }
+
+    @Test
+    void authorisedKeySetChangeWithBackupCoSignatureInstalls() throws Exception {
+        Rig r = keySetRig("keyset-authorised");
+        RuntimeIdentity id = identity(RUNNING, OLD);
+        TransactionResult result = transaction(r, id, r.artifact, new StateStore(r.upd), DurabilityOps.system())
+                .execute(new UpdateRequest(id, InstallCapability.ATOMIC_REPLACEMENT, NO_OP));
+        assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
+        assertArrayEquals(r.jar, Files.readAllBytes(r.live));
+        assertTrue(journalOf(r.upd).isPresent(), "the install keeps its journal until health");
+        assertEquals(1, backupCount(r.upd), "the backup is kept");
+    }
+
     @Test
     void backupKeyRevokedAfterTheStagedKeySetCheckMustNotSwap() throws Exception {
-        // A key-set change (epoch 2) naming the backup key. Without a backup co-signature the step 5 check refuses,
-        // so the swap never starts; the revocation hook must not be reached and the live jar must stay the old one.
-        String epoch2 = "{\"type\":\"quicraft.trust\",\"v\":1,\"epoch\":2,\"built\":\"" + SignedFixtures.TS1
-                + "\",\"revocationsSeqFloor\":0,\"manifestSeqFloor\":0,\"keys\":[{\"kid\":\"" + TestKeys.KID_2
-                + "\",\"pub\":\"" + TestKeys.PUB_2 + "\",\"roles\":[\"release\",\"revocation\"]}]}";
-        byte[] jar = TransactionFixtures.releaseJar(NEW, epoch2);
-        Rig r = release(tmp.resolve("keyset"));
-        Rig keySet = new Rig();
-        keySet.root = r.root;
-        keySet.upd = r.upd;
-        keySet.live = r.live;
-        keySet.jar = jar;
-        keySet.metadata = r.metadata;
-        TransactionFixtures.serveMetadata(r.metadata, PipelineFixtures.revocations(),
-                TransactionFixtures.manifestFor(jar, NEW));
-        keySet.artifact = new TransactionFixtures.ArtifactFetcher(r.metadata, jar);
+        // The same authorised key-set change. The backup key is revoked after the step 5 check (the race): the
+        // step 6 re-authorisation must refuse, the swap never starts, the live jar stays the old one and the
+        // backup is kept (docs/updater.md 12.10 step 6).
+        Rig r = keySetRig("keyset");
         RuntimeIdentity id = identity(RUNNING, OLD);
-        UpdaterTransaction txn = transaction(keySet, id, keySet.artifact, new StateStore(r.upd),
-                DurabilityOps.system());
+        UpdaterTransaction txn = transaction(r, id, r.artifact, new StateStore(r.upd), DurabilityOps.system());
         boolean[] reached = {false};
         txn.hooks.afterBackupReady = () -> {
             reached[0] = true;
             mergeRevocation(r.upd, TestKeys.KID_2, TestKeys.PUB_2);
         };
         TransactionResult result = txn.execute(new UpdateRequest(id, InstallCapability.ATOMIC_REPLACEMENT, NO_OP));
+        assertTrue(reached[0], "the revocation hook ran after the step 5 check, before the swap");
         assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
-        assertFalse(reached[0], "the revocation hook is never reached: the swap never starts");
+        assertArrayEquals(OLD, Files.readAllBytes(r.live), "the old live jar stays");
+        assertEquals(0, stagingCount(r.upd), "staging is cleaned");
+        assertFalse(journalOf(r.upd).isPresent(), "the journal is removed");
+        assertEquals(1, backupCount(r.upd), "the backup is kept (12.10 step 6)");
+    }
+
+    @Test
+    void keySetChangeWithoutBackupCoSignatureNeverStartsTheSwap() throws Exception {
+        // A release-only signature on a changed key set: the step 5 check refuses, so the swap never starts.
+        byte[] jar = TransactionFixtures.releaseJar(NEW, KEY_SET_EPOCH2);
+        Rig r = release(tmp.resolve("keyset-release-only"));
+        TransactionFixtures.serveMetadata(r.metadata, servedRevocations(), TransactionFixtures.manifestFor(jar, NEW));
+        r.jar = jar;
+        r.artifact = new TransactionFixtures.ArtifactFetcher(r.metadata, jar);
+        RuntimeIdentity id = identity(RUNNING, OLD);
+        UpdaterTransaction txn = transaction(r, id, r.artifact, new StateStore(r.upd), DurabilityOps.system());
+        boolean[] reached = {false};
+        txn.hooks.afterBackupReady = () -> reached[0] = true;
+        TransactionResult result = txn.execute(new UpdateRequest(id, InstallCapability.ATOMIC_REPLACEMENT, NO_OP));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertFalse(reached[0], "the swap never starts");
         assertTrue(result.messages().get(0).contains("not authorized by the backup key"), result.messages().toString());
         assertArrayEquals(OLD, Files.readAllBytes(r.live));
         assertFalse(journalOf(r.upd).isPresent());
