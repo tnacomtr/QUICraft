@@ -82,6 +82,32 @@ that its early-release count goes from 0 to 1 over the two connections and saves
 under `results/`. Needs a display or `xvfb-run`, and port 25565 free. Offline mode only: the
 client's authlib finds its session server through a discovery URL the mock doesn't serve.
 
+### Updater end-to-end on a real server
+
+```sh
+testkit/run-updater-e2e.sh velocity          # or fabric-1.21.11, or fabric-26x
+```
+
+The evidence for docs/updater.md section 10 blocker 10: the live atomic jar swap on Linux and macOS,
+including JDK 21. No Docker. One run builds the module twice (0.1.0-alpha.1 and 0.1.0-alpha.2, with
+the development trust file), starts the mock release host from the updater test sources on three
+ephemeral localhost HTTPS ports, installs the old jar and starts the real server with the console on
+a pipe. On the console it runs `quicraft update check` (must offer alpha.2) and `quicraft update`
+(must install and ask for a restart), then asserts that the live jar's SHA-512 is the new one, that a
+backup of the old jar is in the updater's `backup/` directory, and that a TCP status ping still
+answers. It stops the server cleanly (`end` for Velocity, `stop` for Fabric), asserts exit code 0 and
+no exception stack frame from `rs.sudoe.quicraft`, starts it again, and asserts that the log names
+alpha.2, that the updater reached its health completion, and that a check reports no update.
+
+Needs JDK 25 (and JDK 21 for the 1.21.11 Fabric server; without JDK 21 that server runs on 25 and the
+run says so), `python3`, `curl` or `wget`, a network for the server jars, and the patched Netty QUIC
+build under `natives/build/out/repo` (`natives/build-linux.sh`). `JAVA21` and `JAVA25` name the two
+server JVMs as a `java` launcher or a `JAVA_HOME`. Results go to
+`testkit/results/updater-e2e-<server>-<timestamp>/`: the summary with the console transcript, both
+server logs, the mock host's log, the status pings and `FAILED` on a failed run.
+`.github/workflows/updater-e2e.yml` runs all three servers on ubuntu-latest, macos-latest and
+macos-15-intel and uploads that directory when a run fails.
+
 ## Notes
 
 - netem's counters: every bench run ends by printing the packets, bytes and drops netem handled
