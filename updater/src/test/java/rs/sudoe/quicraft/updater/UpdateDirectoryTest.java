@@ -292,7 +292,7 @@ class UpdateDirectoryTest {
                 }
             }
         }));
-        assertArrayEquals(secret, Files.readAllBytes(victim), "the link target was not read");
+        assertArrayEquals(secret, Files.readAllBytes(victim), "the link target was not modified");
     }
 
     @Test
