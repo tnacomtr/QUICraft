@@ -63,6 +63,26 @@ class OwnJarVersionTest {
         assertEquals("build metadata too large", e.getMessage());
     }
 
+    /** parseBuild enforces a 1 KiB cap; a valid document padded to 1025 bytes is refused. */
+    @Test
+    void buildEntryOverOneKibibyteIsRefusedByParser() throws Exception {
+        String padded = JarFixtures.BUILD_JSON_V1
+                + " ".repeat(1025 - JarFixtures.BUILD_JSON_V1.length());
+        assertEquals(1025, padded.getBytes(StandardCharsets.UTF_8).length);
+        Path jar = JarFixtures.jar(tmp, "quicraft.jar", null, padded);
+
+        assertThrows(UpdateRejectedException.class, () -> OwnJarVersion.read(jar));
+    }
+
+    @Test
+    void buildEntryAtOneKibibyteIsAccepted() throws Exception {
+        String padded = JarFixtures.BUILD_JSON_V1
+                + " ".repeat(1024 - JarFixtures.BUILD_JSON_V1.length());
+        Path jar = JarFixtures.jar(tmp, "quicraft.jar", null, padded);
+
+        assertEquals(UpdateVersion.parse("1.2.3"), OwnJarVersion.read(jar));
+    }
+
     @Test
     void unparsableBuildEntryIsRefused() throws Exception {
         Path jar = JarFixtures.jar(tmp, "quicraft.jar", null, "{not json");
