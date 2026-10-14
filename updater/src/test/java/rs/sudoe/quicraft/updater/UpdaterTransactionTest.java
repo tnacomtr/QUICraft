@@ -25,6 +25,7 @@ import rs.sudoe.quicraft.updater.StateRecords.RevokedState;
 import rs.sudoe.quicraft.updater.StateRecords.Snapshot;
 import rs.sudoe.quicraft.updater.StateRecords.StateDelta;
 import rs.sudoe.quicraft.updater.TransactionFixtures.ArtifactFetcher;
+import rs.sudoe.quicraft.updater.TestKeys;
 import rs.sudoe.quicraft.updater.UpdaterTransaction.SameStore;
 
 /**
@@ -97,7 +98,53 @@ class UpdaterTransactionTest {
     }
 
     private static UpdateRequest request(Rig r) {
-        return new UpdateRequest(r.identity, InstallCapability.ATOMIC_REPLACEMENT);
+        return request(r, InstallCapability.ATOMIC_REPLACEMENT);
+    }
+
+    private static UpdateRequest request(Rig r, InstallCapability capability) {
+        return new UpdateRequest(r.identity, capability);
+    }
+
+    /** Durability ops that run {@code onSecondForce} at the second force (after the step 3 force). */
+    private static DurabilityOps countingForce(Runnable onSecondForce) {
+        DurabilityOps system = DurabilityOps.system();
+        int[] forces = {0};
+        return new DurabilityOps() {
+            @Override
+            public void force(FileChannel ch) throws IOException {
+                forces[0]++;
+                if (forces[0] == 2) {
+                    onSecondForce.run();
+                }
+                system.force(ch);
+            }
+
+            @Override
+            public void atomicMove(Path from, Path to) throws IOException {
+                system.atomicMove(from, to);
+            }
+
+            @Override
+            public boolean syncDirectory(Path dir) throws IOException {
+                return system.syncDirectory(dir);
+            }
+        };
+    }
+
+    private static int journalCount(Rig r) throws IOException {
+        try {
+            return new UpdateDirectory(r.upd, DurabilityOps.system()).readJournal().isPresent() ? 1 : 0;
+        } catch (UpdateRejectedException e) {
+            throw new IOException(e);
+        }
+    }
+
+    private static int backupCount(Rig r) throws IOException {
+        try {
+            return new UpdateDirectory(r.upd, DurabilityOps.system()).backupTxids().size();
+        } catch (UpdateRejectedException e) {
+            throw new IOException(e);
+        }
     }
 
     private static boolean stagingIsEmpty(Rig r) throws IOException {
@@ -311,8 +358,94 @@ class UpdaterTransactionTest {
         Rig r = standardRig();
         TransactionResult result = txn(r, noDirectorySync(), () -> true, UpdateDirectory::sameFileStore)
                 .execute(request(r));
+        assertEquals(TransactionOutcome.STAGED_ONLY, result.outcome(), result.messages().toString());
         assertTrue(result.messages().contains(UpdaterTransaction.DOWNGRADED), result.messages().toString());
         assertEquals(1, r.fetcher.downloads.size(), "the staged path still downloads once");
+        assertEquals(0, backupCount(r), "no backup on the staging-only path");
+        assertEquals(0, journalCount(r), "no journal on the staging-only path");
+        assertLiveUntouched(r);
+    }
+
+    // ---- step 5: backup-ready ---------------------------------------------------------------
+
+    @Test
+    void verifiedStagingOnlyStopsAfterTheStepFiveChecks() throws Exception {
+        Rig r = standardRig();
+        TransactionResult result = txn(r).execute(request(r, InstallCapability.VERIFIED_STAGING_ONLY));
+        assertEquals(TransactionOutcome.STAGED_ONLY, result.outcome(), result.messages().toString());
+        assertArrayEquals(r.jar, Files.readAllBytes(result.stagedJar().orElseThrow()));
+        assertTrue(result.messages().get(result.messages().size() - 1).contains("install it manually"),
+                result.messages().toString());
+        assertEquals(0, backupCount(r));
+        assertEquals(0, journalCount(r));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void atomicPathCopiesTheBackupAndWritesThePreparedJournal() throws Exception {
+        Rig r = standardRig();
+        TransactionResult result = txn(r).execute(request(r));
+        assertEquals(1, backupCount(r));
+        assertArrayEquals(LIVE_BYTES, Files.readAllBytes(
+                new UpdateDirectory(r.upd, DurabilityOps.system()).backupJar(result.txid().orElseThrow())));
+        JournalRecord journal = new UpdateDirectory(r.upd, DurabilityOps.system()).readJournal().orElseThrow();
+        assertEquals(JournalPhase.PREPARED, journal.phase());
+        assertEquals(0, journal.bootAttempts());
+        assertEquals(result.txid().orElseThrow(), journal.txid());
+        assertTrue(result.messages().stream().anyMatch(m -> m.contains("copy ") && m.contains(r.live.toString())),
+                result.messages().toString());
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void stagedJarWithAnUnverifiableTrustFileIsRefusedBeforeAnyBackup() throws Exception {
+        // One revocation key is required; a trust file with only a release key fails the verifier.
+        String releaseOnly = "{\"type\":\"quicraft.trust\",\"v\":1,\"epoch\":1,\"built\":\""
+                + SignedFixtures.TS1 + "\",\"revocationsSeqFloor\":0,\"manifestSeqFloor\":0,\"keys\":["
+                + "{\"kid\":\"" + TestKeys.KID_1 + "\",\"pub\":\"" + TestKeys.PUB_1
+                + "\",\"roles\":[\"release\"]}]}";
+        byte[] jar = TransactionFixtures.releaseJar(TransactionFixtures.NEW_VERSION, releaseOnly);
+        Rig r = rig(jar, TransactionFixtures.manifestFor(jar, TransactionFixtures.NEW_VERSION));
+        TransactionResult result = txn(r).execute(request(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome());
+        assertTrue(result.messages().get(0).contains("failed verification"), result.messages().toString());
+        assertEquals(0, backupCount(r));
+        assertEquals(0, journalCount(r));
+        assertTrue(stagingIsEmpty(r));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void cancelAtTheStepFiveBoundaryDeletesStagingAndJournalAndKeepsTheBackup() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction[] ref = new UpdaterTransaction[1];
+        // The second force is the backup copy's; the journal is written after it, then the cancel check.
+        DurabilityOps ops = countingForce(() -> ref[0].cancelActive());
+        ref[0] = txn(r, ops, () -> true, UpdateDirectory::sameFileStore);
+        TransactionResult result = ref[0].execute(request(r));
+        assertEquals(TransactionOutcome.CANCELLED, result.outcome(), result.messages().toString());
+        assertTrue(stagingIsEmpty(r));
+        assertEquals(0, journalCount(r), "the journal this attempt wrote is removed");
+        assertEquals(1, backupCount(r), "the backup is kept");
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void cancelAtTheStepFourBoundaryStopsBeforeAnyBackup() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        boolean[] armed = {false};
+        r.fetcher.beforeDownload = () -> armed[0] = true;
+        r.metadata.onFetch = uri -> {
+            if (armed[0] && uri.getPath().endsWith("/manifest.json")) {
+                txn.cancelActive();
+            }
+        };
+        TransactionResult result = txn.execute(request(r));
+        assertEquals(TransactionOutcome.CANCELLED, result.outcome(), result.messages().toString());
+        assertEquals(0, backupCount(r));
+        assertEquals(0, journalCount(r));
+        assertTrue(stagingIsEmpty(r));
         assertLiveUntouched(r);
     }
 

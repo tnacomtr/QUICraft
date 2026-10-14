@@ -20,6 +20,9 @@ import rs.sudoe.quicraft.updater.UpdateDocuments.ReleaseEntry;
 /**
  * Runs one update transaction (docs/updater.md 12.9, 12.10). The only code that replaces the live
  * jar. One transaction at a time per instance; {@link #cancelActive} never takes the transaction lock.
+ *
+ * <p>The update directory is created before the cheap refusals. Its owner-private staging and backup
+ * directories are a harmless side effect of a refused run.
  */
 final class UpdaterTransaction {
 
@@ -50,6 +53,10 @@ final class UpdaterTransaction {
     static final String SAME_STORE_REFUSED = "the update directory is on another file system than the live "
             + "jar, so the swap cannot be atomic";
     static final String NO_UPDATE = "no newer release is available";
+    static final String KEY_SET_REFUSED = "the staged key-set change is not authorized by the backup key";
+    static final String STAGED_ONLY_TEXT = "the verified jar is staged but not installed; install it manually: "
+            + "stop the server, copy the staged jar over the live jar, start the server. Recovery deletes "
+            + "orphan staging on the next start, so install it before restarting";
     static final String NO_LONGER_OFFERED = "the release no longer matches the staged jar; nothing was installed";
     static final String RESTARTING = "the release changed during the check; restarting the update once";
     static final String RELEASE_CHANGED_TWICE = "the release changed again during the update; run the update "
@@ -183,7 +190,7 @@ final class UpdaterTransaction {
                 return stop;
             }
             if (!a.restartRequested) {
-                return stopBeforeStepFive(a);
+                return backupReady(a);
             }
             // The release changed under us. Restart once from step 1 under the same lease with a new
             // txid; the first attempt's staging goes first and the backup is never touched.
@@ -342,10 +349,67 @@ final class UpdaterTransaction {
         return null;
     }
 
-    /** Placeholder until steps 5 and 6 land: the revalidated jar stays in staging for inspection. */
-    private TransactionResult stopBeforeStepFive(Attempt a) {
+    /**
+     * Step 5 (backup-ready): authenticate the staged jar against the state, then either stop as
+     * STAGED_ONLY or copy the live jar to the backup and write the prepared journal.
+     */
+    private TransactionResult backupReady(Attempt a) throws IOException, UpdateRejectedException {
+        Optional<StateRecords.Snapshot> loaded = store.load();
+        if (loaded.isEmpty()) {
+            return abort(a, TransactionOutcome.FAILED, NOT_INITIALISED);
+        }
+        StateRecords.Snapshot snap = loaded.get();
+        StagedArtifact staged;
+        try {
+            staged = ArtifactVerifier.verify(a.stagedJar, a.candidate, a.request.identity(),
+                    a.live.onDiskVersion(), snap);
+        } catch (UpdateRejectedException e) {
+            return abort(a, TransactionOutcome.FAILED, "the staged jar failed verification: " + messageOf(e));
+        }
+        TrustSnapshot current = TrustSnapshot.of(a.request.identity().runningTrust(),
+                snap.revoked().revokedPubs());
+        if (!KeySetChangeAuthorization.check(a.candidate.manifest(), staged.stagedKeySetFingerprint(),
+                snap.state().persistedTrust(), current)) {
+            return abort(a, TransactionOutcome.FAILED, KEY_SET_REFUSED);
+        }
+        a.staged = staged;
+        if (a.token.isCancelled()) {
+            return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
+        }
+        if (a.capability == InstallCapability.VERIFIED_STAGING_ONLY) {
+            List<String> out = new ArrayList<>(a.messages);
+            out.add(STAGED_ONLY_TEXT + " Staged jar: " + a.stagedJar + "; live jar: " + a.live.realPath());
+            return new TransactionResult(TransactionOutcome.STAGED_ONLY, Optional.of(a.txid),
+                    Optional.of(a.stagedJar), Optional.empty(), out);
+        }
+        String backupSha = a.dir.copyBackup(a.txid, a.live.realPath());
+        Path backup = a.dir.backupJar(a.txid);
+        if (!backupSha.equals(a.live.sha512())) {
+            a.dir.deleteBackup(a.txid);
+            return abort(a, TransactionOutcome.FAILED, "the backup copy does not match the live jar");
+        }
+        UpdateDocuments.ReleaseEntry entry = a.candidate.entry();
+        JournalRecord journal = new JournalRecord(a.txid, JournalPhase.PREPARED,
+                a.request.identity().platform(), a.candidate.manifest().document().seq(),
+                new JournalLive(a.live.realPath().toString(), a.live.size(), a.live.sha512(),
+                        a.live.onDiskVersion()),
+                new JournalStaged(entry.size(), entry.sha512(), entry.version()),
+                backupSha, clock.instant(), 0);
+        a.journalWritten = true;
+        a.dir.writeJournal(journal);
+        a.journal = journal;
+        a.messages.add("if the update fails after the swap, stop the server, copy " + backup + " over "
+                + a.live.realPath() + ", start the server");
+        if (a.token.isCancelled()) {
+            return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
+        }
+        return stopBeforeStepSix(a);
+    }
+
+    /** Placeholder until step 6 lands: the staged jar, the backup and the journal stay for inspection. */
+    private TransactionResult stopBeforeStepSix(Attempt a) {
         List<String> out = new ArrayList<>(a.messages);
-        out.add("steps 5 and 6 are not implemented in this build");
+        out.add("step 6 is not implemented in this build");
         return new TransactionResult(TransactionOutcome.FAILED, Optional.of(a.txid),
                 Optional.of(a.stagedJar), Optional.empty(), out);
     }
@@ -432,6 +496,8 @@ final class UpdaterTransaction {
         boolean journalWritten;
         boolean restartRequested;
         int restarts;
+        StagedArtifact staged;
+        JournalRecord journal;
 
         Attempt(UpdateRequest request, CancelToken token) {
             this.request = request;

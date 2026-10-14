@@ -33,12 +33,17 @@ final class TransactionFixtures {
 
     /** A well-formed release jar with the trust file of the running trust and build metadata. */
     static byte[] releaseJar(String version) throws IOException {
+        return releaseJar(version, SignedFixtures.trustJson());
+    }
+
+    /** A release jar whose trust file is {@code trustJson}, for refusal tests. */
+    static byte[] releaseJar(String version, String trustJson) throws IOException {
         byte[] payload = new byte[4096];
         for (int i = 0; i < payload.length; i++) {
             payload[i] = (byte) (i * 31 + version.length());
         }
         return zip(entry(PAYLOAD_NAME, payload),
-                entry(ArtifactVerifier.TRUST_ENTRY, bytes(SignedFixtures.trustJson())),
+                entry(ArtifactVerifier.TRUST_ENTRY, bytes(trustJson)),
                 entry(ArtifactVerifier.BUILD_ENTRY, bytes("{\"type\":\"quicraft.build\",\"v\":1,\"platform\":\""
                         + PLATFORM + "\",\"version\":\"" + version + "\"}")));
     }
