@@ -4,8 +4,10 @@ package rs.sudoe.quicraft.updater;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -222,7 +224,25 @@ class UpdaterRuntimeCommandTest {
     }
 
     @Test
-    void silentCheckWritesOnlyTheSectionSixRowsToOut() throws Exception {
+    void aBadManifestFromAPlayerGoesToTheLogOnlyAndNeverToOut() throws Exception {
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        UpdaterFacadeFixtures.answerBadManifest(metadata, UpdaterFacadeFixtures.alteredManifest(43));
+        start(metadata);
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, false, "check", "-s"));
+        awaitIdle();
+
+        assertEquals(List.of(), out.snapshot(), () -> "output was " + out.snapshot());
+        assertEquals(1, p.log.lines.stream()
+                .filter(l -> l.startsWith("WARN: ") && l.contains("was rejected")).count(),
+                () -> "log was " + p.log.lines);
+        assertTrue(p.log.lines.stream().anyMatch(l -> l.contains("manifest document rejected")),
+                "the diagnostic text stays in the log");
+    }
+
+    @Test
+    void aBadManifestAnswersTheConsoleOnlyThroughTheLog() throws Exception {
         ScriptedFetcher metadata = new ScriptedFetcher();
         UpdaterFacadeFixtures.answerBadManifest(metadata, UpdaterFacadeFixtures.alteredManifest(43));
         start(metadata);
@@ -231,9 +251,80 @@ class UpdaterRuntimeCommandTest {
         assertEquals(Reply.STARTED, dispatch(out, true, "check", "-s"));
         awaitIdle();
 
-        assertEquals(List.of("release manifest from host modrinth failed signature verification"), out.snapshot());
-        assertTrue(p.log.lines.stream().anyMatch(l -> l.contains("manifest document rejected")),
-                "the diagnostic text stays in the log");
+        assertEquals(List.of(), out.snapshot(), () -> "output was " + out.snapshot());
+        assertTrue(p.log.lines.contains("WARN: release manifest from host modrinth was rejected"),
+                () -> "log was " + p.log.lines);
+    }
+
+    @Test
+    void aSilentAnnouncementFromAPlayerIsLoggedAtInfoAndAnswersOut() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        start(metadata);
+
+        Output out = new Output();
+        String notice = "a new QUICraft version is available: " + UpdaterFacadeFixtures.NEWER;
+        assertEquals(Reply.STARTED, dispatch(out, false, "check", "-s"));
+        awaitIdle();
+
+        assertTrue(out.contains(notice), () -> "output was " + out.snapshot());
+        assertTrue(p.log.lines.contains("INFO: " + notice), () -> "log was " + p.log.lines);
+    }
+
+    @Test
+    void aSilentHostFailureIsOneDebugLineAndNothingForTheInvoker() throws Exception {
+        start(new ScriptedFetcher());
+        awaitIdle();
+        // A state file that no longer parses makes the next check fail as a host failure.
+        Files.writeString(p.updateDir.resolve(StateStore.STATE), "not json");
+
+        Output silent = new Output();
+        assertEquals(Reply.STARTED, dispatch(silent, false, "check", "-s"));
+        awaitIdle();
+        assertEquals(List.of(), silent.snapshot(), () -> "output was " + silent.snapshot());
+        assertEquals(1, p.log.lines.stream().filter(l -> l.startsWith("DEBUG: update check failed (")).count(),
+                () -> "log was " + p.log.lines);
+        assertEquals(0, p.log.lines.stream().filter(l -> l.startsWith("WARN: update check failed")).count());
+
+        Output verbose = new Output();
+        assertEquals(Reply.STARTED, dispatch(verbose, true, "check"));
+        awaitIdle();
+        assertTrue(verbose.snapshot().stream().anyMatch(l -> l.startsWith("update check failed (")),
+                () -> "output was " + verbose.snapshot());
+    }
+
+    @Test
+    void shutdownDuringAResetCancelsItsToken() throws Exception {
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        fetcher.onFetch = uri -> {
+            entered.countDown();
+            try {
+                release.await(WAIT.toSeconds(), TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        start(fetcher);
+        assertEquals(Reply.STARTED, dispatch(new Output(), true, "reset-state"));
+        assertTrue(entered.await(WAIT.toSeconds(), TimeUnit.SECONDS));
+
+        MutableCancelToken token = resetTokenOf(rt);
+        assertFalse(token.isCancelled());
+        rt.shutdown();
+        assertTrue(token.isCancelled(), "shutdown cancels the running reset");
+        release.countDown();
+    }
+
+    private static MutableCancelToken resetTokenOf(UpdaterRuntime runtime) throws Exception {
+        Field field = UpdaterRuntime.class.getDeclaredField("resetToken");
+        field.setAccessible(true);
+        MutableCancelToken token = (MutableCancelToken) field.get(runtime);
+        assertNotNull(token, "a running reset holds a token");
+        return token;
     }
 
     @Test

@@ -2,11 +2,15 @@
 package rs.sudoe.quicraft.updater;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Clock;
@@ -17,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
@@ -63,6 +68,8 @@ public final class UpdaterRuntime {
     static final String WORKER_NAME = "quicraft-updater";
     /** The disclosure marker, keyed to the disclosed host set (see {@code Boot#disclose}). */
     static final String DISCLOSURE_MARKER = "disclosure-shown";
+    /** The disclosure marker is read at most this many bytes; a larger file never matches. */
+    static final int MARKER_READ_LIMIT = 256;
     /** Most bad-manifest digests kept for log suppression (docs/updater.md 12.8: 0..32). */
     static final int WARNED_BAD_LIMIT = 32;
 
@@ -113,6 +120,7 @@ public final class UpdaterRuntime {
     private final AtomicBoolean busy = new AtomicBoolean();
     private volatile boolean stopping;
     private volatile MutableCancelToken checkToken;
+    private volatile MutableCancelToken resetToken;
 
     private UpdaterRuntime(UpdaterLog log, String disabledReason) {
         this.log = log;
@@ -150,16 +158,25 @@ public final class UpdaterRuntime {
         final Function<ThreadFactory, ScheduledExecutorService> executors;
         final Function<UpdaterLog, Optional<ReleaseHosts>> origins;
         final ReleaseEndpoints endpoints;
+        final Function<Path, StateStore> stores;
 
         Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
                 Function<ThreadFactory, ScheduledExecutorService> executors,
                 Function<UpdaterLog, Optional<ReleaseHosts>> origins, ReleaseEndpoints endpoints) {
+            this(fetcher, clock, ops, executors, origins, endpoints, StateStore::new);
+        }
+
+        Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
+                Function<ThreadFactory, ScheduledExecutorService> executors,
+                Function<UpdaterLog, Optional<ReleaseHosts>> origins, ReleaseEndpoints endpoints,
+                Function<Path, StateStore> stores) {
             this.fetcher = Objects.requireNonNull(fetcher, "fetcher");
             this.clock = Objects.requireNonNull(clock, "clock");
             this.ops = Objects.requireNonNull(ops, "ops");
             this.executors = Objects.requireNonNull(executors, "executors");
             this.origins = Objects.requireNonNull(origins, "origins");
             this.endpoints = Objects.requireNonNull(endpoints, "endpoints");
+            this.stores = Objects.requireNonNull(stores, "stores");
         }
 
         static Seams system() {
@@ -178,7 +195,7 @@ public final class UpdaterRuntime {
      * @return the runtime, enabled or disabled
      */
     public static UpdaterRuntime start(UpdaterPlatform p) {
-        return start(p, Seams::system);
+        return start(p, () -> Seams.system());
     }
 
     static UpdaterRuntime start(UpdaterPlatform p, Seams seams) {
@@ -238,6 +255,10 @@ public final class UpdaterRuntime {
             MutableCancelToken token = checkToken;
             if (token != null) {
                 token.cancel();
+            }
+            MutableCancelToken reset = resetToken;
+            if (reset != null) {
+                reset.cancel();
             }
             if (txn != null) {
                 txn.cancelActive();
@@ -413,7 +434,8 @@ public final class UpdaterRuntime {
         } catch (IOException | UpdateRejectedException e) {
             String text = "update check failed (" + e.getClass().getName() + ")";
             if (silent) {
-                silentLine(Level.WARN, text, out, scheduled);
+                // A host failure: section 6 allows nothing to the invoker, one DEBUG line to the log.
+                debugSafe(text);
             } else if (scheduled) {
                 infoSafe(text);
             } else {
@@ -443,8 +465,8 @@ public final class UpdaterRuntime {
 
     /**
      * The silent table of docs/updater.md section 6, for {@code check -s} and silent scheduled checks. Every
-     * diagnostic goes to the log at DEBUG only. Out (or the console, for a scheduled tick) gets just the
-     * bad-manifest WARN rows and the announcement INFO row.
+     * diagnostic goes to the log at DEBUG only. The bad-manifest WARN rows go to the log only; a command's
+     * {@code out} gets just the announcement INFO row.
      */
     private void silentOutput(CheckResult result, Consumer<String> out, boolean scheduled)
             throws IOException, UpdateRejectedException {
@@ -461,38 +483,46 @@ public final class UpdaterRuntime {
      * Logs one WARN per distinct bad manifest that is not already in {@code state.warnedBad}. The list is
      * updated in the same commit, so the same document warns once across runs and restarts.
      */
-    private void reportBadManifests(List<BadManifest> events, Consumer<String> out, boolean scheduled)
-            throws IOException, UpdateRejectedException {
+    private void reportBadManifests(List<BadManifest> events, Consumer<String> out, boolean scheduled) {
         if (events.isEmpty()) {
             return;
         }
         List<BadManifest> fresh = new ArrayList<>();
-        store.commit(snap -> {
-            List<String> seen = new ArrayList<>(snap.state().warnedBad());
-            fresh.clear();
-            for (BadManifest event : events) {
-                if (!seen.contains(event.sha256())) {
-                    seen.add(event.sha256());
-                    fresh.add(event);
+        try {
+            store.commit(snap -> {
+                List<String> seen = new ArrayList<>(snap.state().warnedBad());
+                fresh.clear();
+                for (BadManifest event : events) {
+                    if (!seen.contains(event.sha256())) {
+                        seen.add(event.sha256());
+                        fresh.add(event);
+                    }
                 }
-            }
-            if (fresh.isEmpty()) {
-                return snap;
-            }
-            while (seen.size() > WARNED_BAD_LIMIT) {
-                seen.remove(0);
-            }
-            return new Snapshot(withWarnedBad(snap.state(), seen), snap.revoked());
-        });
+                if (fresh.isEmpty()) {
+                    return snap;
+                }
+                while (seen.size() > WARNED_BAD_LIMIT) {
+                    seen.remove(0);
+                }
+                return new Snapshot(withWarnedBad(snap.state(), seen), snap.revoked());
+            });
+        } catch (IOException | UpdateRejectedException | RuntimeException e) {
+            // The record is not saved, so these documents may warn again on the next check. The announcement
+            // that follows must still run, so this failure does not propagate.
+            debugSafe("bad-manifest record could not be saved (" + e.getClass().getName() + ")");
+        }
         for (BadManifest event : fresh) {
             silentLine(Level.WARN, "release manifest from host " + event.hostKey()
-                    + " failed signature verification", out, scheduled);
+                    + " was rejected", out, scheduled);
         }
     }
 
     /**
      * Announces a valid newer release once per version. The version is recorded as {@code lastAnnounced}
      * only after the admins were told, so a failed notice is retried by the next check.
+     *
+     * <p>Delivery is at-least-once: a crash between {@link UpdaterPlatform#notifyAdmins} and the commit repeats
+     * the notice on the next start.
      */
     private void announceIfNew(CheckResult result, Consumer<String> out, boolean scheduled)
             throws IOException, UpdateRejectedException {
@@ -554,19 +584,22 @@ public final class UpdaterRuntime {
             emit(out, "reset failed (" + e.getClass().getName() + ")");
             return;
         }
+        MutableCancelToken token = new MutableCancelToken();
+        resetToken = token;
         try {
             if (Files.exists(updateDir.resolve(UpdateDirectory.JOURNAL), LinkOption.NOFOLLOW_LINKS)) {
                 emit(out, RESET_JOURNAL);
                 return;
             }
             StateReset.ResetResult result = StateReset.resetStateAndRefetch(store, pipeline, identity,
-                    live.onDiskVersion(), new MutableCancelToken());
+                    live.onDiskVersion(), token);
             for (String message : result.messages()) {
                 emit(out, message);
             }
         } catch (IOException | UpdateRejectedException e) {
             emit(out, "reset failed (" + e.getClass().getName() + ")");
         } finally {
+            resetToken = null;
             closeQuietly(lease, out);
         }
     }
@@ -597,21 +630,19 @@ public final class UpdaterRuntime {
     }
 
     /**
-     * One section 6 row. A scheduled tick writes it to the log at its level. A command writes it to
-     * {@code out}, and a WARN is also logged.
+     * One section 6 row. The log always gets it at its level. Only an INFO row of a command also goes to
+     * {@code out}: WARN and DEBUG rows never do, because the invoker may be a player.
      */
     private void silentLine(Level level, String text, Consumer<String> out, boolean scheduled) {
-        if (scheduled) {
-            switch (level) {
-                case DEBUG -> debugSafe(text);
-                case INFO -> infoSafe(text);
-                default -> warnSafe(log, text);
+        switch (level) {
+            case DEBUG -> debugSafe(text);
+            case INFO -> {
+                infoSafe(text);
+                if (!scheduled) {
+                    emit(out, text);
+                }
             }
-            return;
-        }
-        emit(out, text);
-        if (level == Level.WARN) {
-            warnSafe(log, text);
+            default -> warnSafe(log, text);
         }
     }
 
@@ -839,7 +870,7 @@ public final class UpdaterRuntime {
                 healthStage.whenComplete((verdict, error) -> logHealth(verdict, error));
             }
 
-            store = new StateStore(dir);
+            store = s.stores.apply(dir);
             try {
                 UpdateDocuments.Trust runningTrust = identity.runningTrust();
                 StateRecords.StateDelta initial = TrustTransition.apply(
@@ -903,34 +934,12 @@ public final class UpdaterRuntime {
             String wanted = "disclosure-v1 " + (dev ? "dev" : "production") + " " + keys + "\n";
             Path marker = dir.resolve(DISCLOSURE_MARKER);
             try {
-                if (Files.isSymbolicLink(marker)) {
-                    log.debug("disclosure marker is a link; not followed");
-                    return;
-                }
-                if (Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS) && Files.size(marker) <= 256
-                        && wanted.equals(Files.readString(marker, StandardCharsets.UTF_8))) {
-                    return;
-                }
-                log.info("update checks send this server's IP address, the running version and the platform to "
-                        + keys.replace(",", ", ") + "; set update.check-interval=off in " + p.configFile()
-                        + " to turn checks off");
-                Files.deleteIfExists(marker);
-                writePrivate(marker, wanted);
+                recordDisclosure(marker, wanted, "update checks send this server's IP address, the running version and "
+                        + "the platform to " + keys.replace(",", ", ") + "; set update.check-interval=off in "
+                        + p.configFile() + " to turn checks off", log);
             } catch (IOException | RuntimeException e) {
                 log.debug("disclosure marker could not be written (" + e.getClass().getName() + ")");
             }
-        }
-
-        /** Creates the marker owner-only (0600 where POSIX applies), so it is never world-readable. */
-        private static void writePrivate(Path marker, String text) throws IOException {
-            if (marker.getFileSystem().supportedFileAttributeViews().contains("posix")) {
-                Files.createFile(marker, PosixFilePermissions.asFileAttribute(
-                        EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)));
-            } else {
-                Files.createFile(marker);
-            }
-            Files.writeString(marker, text, StandardCharsets.UTF_8, StandardOpenOption.WRITE,
-                    StandardOpenOption.TRUNCATE_EXISTING);
         }
 
         UpdaterRuntime fail(String reason) {
@@ -956,6 +965,60 @@ public final class UpdaterRuntime {
         }
     }
 
+    /**
+     * Writes the disclosure marker unless it is already current. A linked marker is never read or written, but the
+     * disclosure is still logged. Never throws except IO and runtime errors, which the caller logs.
+     */
+    static void recordDisclosure(Path marker, String wanted, String text, UpdaterLog log) throws IOException {
+        boolean linked = Files.isSymbolicLink(marker);
+        if (!linked && markerMatches(marker, wanted)) {
+            return;
+        }
+        log.info(text);
+        if (linked) {
+            log.debug("disclosure marker is a link; not followed");
+            return;
+        }
+        Files.deleteIfExists(marker);
+        writePrivate(marker, wanted);
+    }
+
+    /** Reads at most {@value #MARKER_READ_LIMIT} bytes, never following a link. */
+    static boolean markerMatches(Path marker, String wanted) throws IOException {
+        if (!Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)) {
+            return false;
+        }
+        Set<OpenOption> options = Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+        try (SeekableByteChannel channel = Files.newByteChannel(marker, options)) {
+            ByteBuffer buffer = ByteBuffer.allocate(MARKER_READ_LIMIT + 1);
+            while (buffer.hasRemaining() && channel.read(buffer) > 0) {
+                // fill the buffer up to one byte past the limit, so an oversized marker never matches
+            }
+            if (buffer.position() > MARKER_READ_LIMIT) {
+                return false;
+            }
+            return wanted.equals(new String(buffer.array(), 0, buffer.position(), StandardCharsets.UTF_8));
+        }
+    }
+
+    /**
+     * Creates the marker owner-only (0600 where POSIX applies), so it is never world-readable. CREATE_NEW and
+     * NOFOLLOW_LINKS: an existing file or a link at the path is refused, never written through.
+     */
+    static void writePrivate(Path marker, String text) throws IOException {
+        Set<OpenOption> options = Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
+                LinkOption.NOFOLLOW_LINKS);
+        FileAttribute<?>[] attrs = marker.getFileSystem().supportedFileAttributeViews().contains("posix")
+                ? new FileAttribute<?>[] {PosixFilePermissions.asFileAttribute(
+                        EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE))}
+                : new FileAttribute<?>[0];
+        try (SeekableByteChannel channel = Files.newByteChannel(marker, options, attrs)) {
+            ByteBuffer buffer = ByteBuffer.wrap(text.getBytes(StandardCharsets.UTF_8));
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
+        }
+    }
     private static boolean looksLikeSnapshot(byte[] buildJson) {
         return new String(buildJson, StandardCharsets.UTF_8).contains("SNAPSHOT");
     }
