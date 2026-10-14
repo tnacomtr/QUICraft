@@ -85,7 +85,7 @@ client's authlib finds its session server through a discovery URL the mock doesn
 ### Updater end-to-end on a real server
 
 ```sh
-testkit/run-updater-e2e.sh velocity          # or fabric-1.21.11, or fabric-26x
+bash testkit/run-updater-e2e.sh velocity         # or fabric-1.21.11, or fabric-26x
 ```
 
 The evidence for docs/updater.md section 10 blocker 10: the live atomic jar swap on Linux and macOS,
