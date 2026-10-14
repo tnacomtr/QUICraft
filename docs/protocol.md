@@ -515,10 +515,10 @@ the connection id the client uses. Because that forwarding crosses loops (it is 
 the target loop per datagram), it is bounded: at most 1024 datagrams may be pending per target
 socket at a time (`QuicServer.ForwardLimiter.MAX_PENDING_FORWARDS`), counted across all source
 sockets, plus at most one per source socket (each source socket measures the count and increments
-it on its own loop). Over that the datagram is
-released and counted per target socket, so a client that names one socket from many source ports
-can slow that socket down but cannot grow its queue without bound. One datagram never reaches the
-dispatcher at all: a short header that stops before the whole connection id (`40`, `40 00`, or a
+it on its own loop). Over that the datagram is released and counted per target socket, so a client
+that names one socket from many source ports can slow that socket down but cannot grow its queue
+without bound. One datagram never reaches the dispatcher at all: a short header that stops before
+the whole connection id (`40`, `40 00`, or a
 header without the full 20-byte id) is one the dispatcher's own parser throws for
 (`QuicHeaderParser.sliceCid`), and no handler on a datagram pipeline catches that, so Netty's tail
 would log a stack trace and leak the datagram, once per datagram, for anything a remote sender

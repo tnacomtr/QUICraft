@@ -287,7 +287,6 @@ class SocketForwardBoundTest {
     void aTruncatedShortHeaderNeverReachesTheParserOnTheProductionPipeline() throws Exception {
         EventLoopGroup loops = new MultiThreadIoEventLoopGroup(2, NioIoHandler.newFactory());
         List<ByteBuf> datagrams = new ArrayList<>();
-        // Queued for the target socket, to prove nothing of that either reaches the capture handler.
         ByteBuf twoBytes = shortHeader(0, 2);
         ByteBuf oneByte = shortHeader(0, 1);
         ByteBuf oneByteShortOfTheId = shortHeader(0, Codecs.LOCAL_CONNECTION_ID_LENGTH);
