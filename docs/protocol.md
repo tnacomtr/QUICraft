@@ -484,8 +484,9 @@ same address with SO_REUSEPORT, each on its own event loop thread.
   rest on its actual local address. An accepted stream stays on the loop of the socket that
   received it, and the listener's startup line names the socket count it bound.
 - Only Linux, and only when the transport has a SO_REUSEPORT the kernel accepts, binds several:
-  anywhere else, or if the option is refused, or if binding sockets 2..N fails, they are closed and
-  the listener keeps one socket with one INFO line, so `udp-sockets` can never fail a startup. The
+  anywhere else, or if the option is refused, the listener keeps one socket with one INFO line. If
+  binding a later socket fails, that socket is closed and the listener keeps the sockets already
+  bound, also with one INFO line. So `udp-sockets` can never fail a startup. The
   first socket keeps the option when it was applied to it, which changes nothing on its own.
 - `close()` closes every socket and, for core's own transport, the thread group. A bind that fails
   on a later socket closes the sockets already bound and the group, then rethrows.

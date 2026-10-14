@@ -25,6 +25,7 @@ import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Protocol;
@@ -107,8 +108,15 @@ public final class QuicServer implements Closeable {
      * socket's event loop, for tests.
      */
     int[] acceptedConnectionsPerSocket() {
-        int[] accepted = shared.accepted;
-        return accepted == null ? new int[0] : accepted.clone();
+        AtomicIntegerArray accepted = shared.accepted;
+        if (accepted == null) {
+            return new int[0];
+        }
+        int[] copy = new int[accepted.length()];
+        for (int i = 0; i < copy.length; i++) {
+            copy[i] = accepted.get(i);
+        }
+        return copy;
     }
 
     /**
@@ -154,6 +162,7 @@ public final class QuicServer implements Closeable {
      * <p>The first socket binds {@code address}; when the request had port 0, the others bind the
      * port the first one got. If binding any later socket fails, the ones already bound and the
      * group are closed before the failure is rethrown.
+     * Outside Linux the count is always 1.
      */
     public static QuicServer bind(InetSocketAddress address, int socketCount, ServerIdentity identity,
             TransportConfig config, StreamAcceptor acceptor) throws Exception {
@@ -164,6 +173,11 @@ public final class QuicServer implements Closeable {
                         + MAX_UDP_SOCKETS + " of the requested " + socketCount);
             }
             count = MAX_UDP_SOCKETS;
+        }
+        if (count > 1 && !System.getProperty("os.name", "").startsWith("Linux")) {
+            // Only Linux balances unicast UDP over SO_REUSEPORT sockets; elsewhere one socket
+            // would receive everything while the others sit idle (docs/protocol.md §11).
+            count = 1;
         }
         if (count <= 1) {
             Shared shared = new Shared(1, identity, config, acceptor);
@@ -339,13 +353,13 @@ public final class QuicServer implements Closeable {
         final EarlyTokens tokens = new EarlyTokens();
         final QuicSslContext ssl;
         /** Connections accepted per socket, in bind order; null with a single socket. */
-        final int[] accepted;
+        final AtomicIntegerArray accepted;
 
         Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor)
                 throws Exception {
             this.config = config;
             this.acceptor = acceptor;
-            this.accepted = sockets > 1 ? new int[sockets] : null;
+            this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.admission = admission(config);
             this.ingress = IngressGuard.budget(config);
             // Attempts with a valid token get their own budget; its open caps are unused.
@@ -418,7 +432,7 @@ public final class QuicServer implements Closeable {
                         }
                         if (shared.accepted != null) {
                             // Written only by this socket's own loop, so no synchronization.
-                            shared.accepted[socketIndex]++;
+                            shared.accepted.incrementAndGet(socketIndex);
                         }
                         connection.pipeline().addLast(admitted,
                                 new Connection(shared.acceptor, shared.tokens, shared.config.earlyData,
