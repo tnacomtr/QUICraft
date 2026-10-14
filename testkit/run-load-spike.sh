@@ -127,6 +127,9 @@ sample() {
     if (( crss > MAX_RSS_MB )); then
         fail "client RSS $crss MiB above cap $MAX_RSS_MB MiB"
     fi
+    if (( srss > MAX_RSS_MB )); then
+        fail "server RSS $srss MiB above cap $MAX_RSS_MB MiB"
+    fi
     kill -0 "$server_jvm_pid" 2>/dev/null || fail "server exited during the run"
 }
 

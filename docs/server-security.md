@@ -76,8 +76,10 @@ start, for example `-Dquicraft.admission.maxOpenPerIp=64`. They are wired into b
   validated limit, or one that arrives while the open-connection limits are full, is dropped without
   a Retry. A token-bearing attempt is not refused by a backlog, because its address is already proven.
 - **Scale note.** The defaults leave room for the 50,000-concurrent-player-per-node target (CLAUDE.md
-  Architecture). At the default, a 50,000-player node refills in about 25 s, and Retry applies above
-  50 attempts/s. The Retry backlog trigger is 25% of `maxOpen`, i.e. 16,384 unconfirmed handshakes
+  Architecture). The attempt cap of 2000/s would let a 50,000-player node refill in about 25 s,
+  but only with enough CPU: one event loop completes roughly 900 to 1000 handshakes/s on the test
+  machine (`docs/benchmarks.md`), so the refill rate depends on the number of UDP sockets and cores.
+  Retry applies above 50 attempts/s. The Retry backlog trigger is 25% of `maxOpen`, i.e. 16,384 unconfirmed handshakes
   at the default `maxOpen=65536`. Memory is an extrapolation, not a measurement: `docs/benchmarks.md`
   held 41,403 idle transport connections at ~37 KiB each, which gives ~2.3 GiB at the 65,536 cap
   for the transport alone, before any game state.
