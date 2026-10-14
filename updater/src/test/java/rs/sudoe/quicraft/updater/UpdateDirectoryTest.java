@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -88,6 +89,15 @@ class UpdateDirectoryTest {
 
     private static String sha512(byte[] data) throws Exception {
         return Hex.encode(MessageDigest.getInstance("SHA-512").digest(data));
+    }
+
+    /** Deletes a path from inside a test hook, which cannot throw a checked exception. */
+    private static void deleteUnchecked(Path p) {
+        try {
+            Files.delete(p);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     @Test
@@ -284,6 +294,73 @@ class UpdateDirectoryTest {
         Files.write(victim, new byte[] {1});
         Files.createSymbolicLink(d.backupJar(TXID), victim);
         assertThrows(UpdateRejectedException.class, d::requireOwnedContents);
+    }
+
+    @Test
+    void requireOwnedContentsSkipsAnEntryThatVanishesAfterTheListing() throws Exception {
+        // StateStore.prepareDirectory creates and removes a .owner-*.probe file in the update
+        // directory, so the scan can be handed an entry that is already gone when it is checked.
+        UpdateDirectory d = open(DurabilityOps.system());
+        Path probe = tmp.resolve("upd/.owner-vanished.probe");
+        Files.write(probe, new byte[] {1});
+        Files.write(tmp.resolve("upd/staging/readme.txt"), new byte[] {2});
+        Files.write(tmp.resolve("upd/backup/notes.txt"), new byte[] {3});
+
+        List<String> listed = new ArrayList<>();
+        d.requireOwnedContents(p -> {
+            listed.add(p.getFileName().toString());
+            if (".owner-vanished.probe".equals(p.getFileName().toString())) {
+                deleteUnchecked(p);
+            }
+        });
+
+        assertTrue(listed.contains(".owner-vanished.probe"), "the probe was listed");
+        assertFalse(Files.exists(probe), "the probe was removed by the hook");
+        assertTrue(listed.contains("readme.txt"), "the scan continued into staging/");
+        assertTrue(listed.contains("notes.txt"), "the scan continued into backup/");
+    }
+
+    @Test
+    void requireOwnedContentsStillRefusesALinkAfterAVanishedEntry() throws Exception {
+        assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        UpdateDirectory d = open(DurabilityOps.system());
+        Path probe = tmp.resolve("upd/.owner-vanished.probe");
+        Files.write(probe, new byte[] {1});
+        Path victim = tmp.resolve("victim.bin");
+        Files.write(victim, new byte[] {2});
+        Files.createSymbolicLink(d.backupJar(TXID), victim);
+
+        assertThrows(UpdateRejectedException.class, () -> d.requireOwnedContents(p -> {
+            if (".owner-vanished.probe".equals(p.getFileName().toString())) {
+                deleteUnchecked(p);
+            }
+        }));
+    }
+
+    @Test
+    void requireOwnedContentsStillFailsWhenASubdirectoryVanishesDuringTheScan() throws Exception {
+        UpdateDirectory d = open(DurabilityOps.system());
+        Files.write(tmp.resolve("upd/.owner-vanished.probe"), new byte[] {1});
+        // The hook fires while upd/ is listed, which is before upd/staging/ is listed. The vanished
+        // probe is skipped, but a directory that is gone must still fail closed.
+        assertThrows(NoSuchFileException.class, () -> d.requireOwnedContents(p -> {
+            if ("staging".equals(p.getFileName().toString())) {
+                deleteUnchecked(p);
+            }
+        }));
+    }
+
+    @Test
+    void requireOwnedContentsStillFailsWhenAFileInsideStagingVanishes() throws Exception {
+        // Only top-level files vanish legitimately; staging/ and backup/ change under the transaction
+        // lease the scan's callers hold, so a file gone from them fails closed.
+        UpdateDirectory d = open(DurabilityOps.system());
+        Files.write(tmp.resolve("upd/staging/readme.txt"), new byte[] {2});
+        assertThrows(NoSuchFileException.class, () -> d.requireOwnedContents(p -> {
+            if ("readme.txt".equals(p.getFileName().toString())) {
+                deleteUnchecked(p);
+            }
+        }));
     }
 
     @Test

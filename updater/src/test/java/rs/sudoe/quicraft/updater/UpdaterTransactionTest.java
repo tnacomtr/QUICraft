@@ -71,8 +71,12 @@ class UpdaterTransactionTest {
 
     private Rig rig(byte[] jar, byte[] manifest) throws Exception {
         Rig r = new Rig();
-        r.upd = PipelineFixtures.privateDir(tmp.resolve("upd"));
-        r.live = tmp.resolve("live").resolve("quicraft.jar");
+        // Production builds the LiveJar through LiveJarValidator, which resolves real paths. The rig
+        // does the same, so a temp directory reached through a symlink (macOS /var -> /private/var)
+        // does not make the rig's "realPath" differ from the one the product prints.
+        Path base = tmp.toRealPath();
+        r.upd = PipelineFixtures.privateDir(base.resolve("upd"));
+        r.live = base.resolve("live").resolve("quicraft.jar");
         Files.createDirectories(r.live.getParent());
         PipelineFixtures.writePrivate(r.live, LIVE_BYTES);
         r.jar = jar;

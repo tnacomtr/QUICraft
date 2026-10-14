@@ -307,12 +307,15 @@ final class UpdaterFacadeFixtures {
                 + version + "\"}";
     }
 
-    /** Writes the live jar under {@code dir} and returns its discovery record. */
+    /** Writes the live jar under {@code dir} and returns its discovery record, with real paths. */
     static LiveJar writeLive(Path dir, byte[] bytes, String version) throws Exception {
         Files.createDirectories(dir);
-        Path live = dir.resolve("quicraft.jar");
+        // The resolved real directory, the way LiveJarValidator reports it: a temp directory reached
+        // through a symlink (macOS /var -> /private/var) must not leave a non-real path in the fixture.
+        Path realDir = dir.toRealPath();
+        Path live = realDir.resolve("quicraft.jar");
         Files.write(live, bytes);
-        return new LiveJar(live, dir, bytes.length, TransactionFixtures.sha512Hex(bytes),
+        return new LiveJar(live, realDir, bytes.length, TransactionFixtures.sha512Hex(bytes),
                 UpdateVersion.parse(version));
     }
 
