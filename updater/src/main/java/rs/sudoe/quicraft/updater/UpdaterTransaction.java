@@ -7,11 +7,14 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import rs.sudoe.quicraft.updater.UpdateAdmission.AdmissionContext;
 import rs.sudoe.quicraft.updater.UpdateAdmission.AdmissionDecision;
@@ -53,6 +56,21 @@ final class UpdaterTransaction {
     static final String SAME_STORE_REFUSED = "the update directory is on another file system than the live "
             + "jar, so the swap cannot be atomic";
     static final String NO_UPDATE = "no newer release is available";
+    static final String RELEASE_NO_LONGER_VERIFIES = "the release manifest no longer verifies under the current "
+            + "revocations";
+    static final String MANIFEST_REFUSED = "the release manifest is refused under the current state: ";
+    static final String REVOCATIONS_STALE = "the revocation state is no longer fresh";
+    static final String NOT_LISTED = "the verified manifest no longer lists the staged jar for this target";
+    static final String BLOCKED = "the staged jar is blocked by a revocation";
+    static final String WITHDRAWN = "the staged jar was withdrawn";
+    static final String STAGED_CHANGED = "the staged jar changed after verification";
+    static final String NOTHING_MOVED_TEXT = "the swap did not happen; nothing was installed";
+    static final String RECOVERY_TEXT = "the swap may have started; nothing was deleted; recovery will check the "
+            + "installed jar at next start";
+    static final String DURABILITY_UNCERTAIN = "WARN: the live jar was replaced but the directory sync failed; "
+            + "durability is uncertain; recovery will check the installed jar at next start";
+    static final String JOURNAL_SWAP_FAILED = "the journal could not be marked swapped; recovery will check the "
+            + "installed jar at next start";
     static final String KEY_SET_REFUSED = "the staged key-set change is not authorized by the backup key";
     static final String STAGED_ONLY_TEXT = "the verified jar is staged but not installed; install it manually: "
             + "stop the server, copy the staged jar over the live jar, start the server. Recovery deletes "
@@ -75,6 +93,15 @@ final class UpdaterTransaction {
     private final Clock clock;
     private final SameStore sameStore;
     private final AtomicReference<Active> active = new AtomicReference<>();
+
+    /** Test seams at the step 6 boundaries. Production leaves them empty. */
+    static final class Hooks {
+        Runnable afterBackupReady = () -> { };
+        Runnable beforeSwapFlip = () -> { };
+        Runnable afterSwapFlip = () -> { };
+    }
+
+    final Hooks hooks = new Hooks();
 
     UpdaterTransaction(Path updateDir, DurabilityOps ops, StateStore store, CheckPipeline pipeline,
             SourceFetcher fetcher, ReleaseEndpoints endpoints, Map<String, RedirectPolicy> redirects,
@@ -146,13 +173,13 @@ final class UpdaterTransaction {
             return TransactionResult.of(TransactionOutcome.NOT_ADMITTED, BUSY);
         }
         try {
-            return lockedRun(req, mine.token);
+            return lockedRun(req, mine);
         } finally {
             leave(mine);
         }
     }
 
-    private TransactionResult lockedRun(UpdateRequest req, CancelToken token) {
+    private TransactionResult lockedRun(UpdateRequest req, Active mine) {
         TransactionLock.TxnLease lease;
         try {
             lease = TransactionLock.tryAcquire(updateDir);
@@ -161,10 +188,15 @@ final class UpdaterTransaction {
         } catch (IOException e) {
             return TransactionResult.of(TransactionOutcome.FAILED, "the update directory could not be locked");
         }
-        Attempt a = new Attempt(req, token);
+        Attempt a = new Attempt(req, mine);
         try {
             return runSteps(a);
         } catch (IOException | UpdateRejectedException | RuntimeException e) {
+            if (a.swapStarted) {
+                // Past the point of no return nothing is deleted; recovery checks the installed jar.
+                return new TransactionResult(TransactionOutcome.FAILED, Optional.ofNullable(a.txid),
+                        Optional.empty(), Optional.empty(), List.of(RECOVERY_TEXT, messageOf(e)));
+            }
             return abort(a, TransactionOutcome.FAILED, "the update failed before the swap: " + messageOf(e));
         } finally {
             releaseQuietly(lease);
@@ -403,15 +435,178 @@ final class UpdaterTransaction {
         if (a.token.isCancelled()) {
             return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
         }
-        return stopBeforeStepSix(a);
+        return installPending(a);
     }
 
-    /** Placeholder until step 6 lands: the staged jar, the backup and the journal stay for inspection. */
-    private TransactionResult stopBeforeStepSix(Attempt a) {
+    /**
+     * Step 6 (installed-pending-restart). Under the state lock, with no network I/O, re-authorise from
+     * the freshly read state, re-hash the staged jar, flip to SWAPPING and move it over the live jar.
+     * Nothing is deleted after the flip starts.
+     */
+    private TransactionResult installPending(Attempt a) throws IOException, UpdateRejectedException {
+        hooks.afterBackupReady.run();
+        if (a.token.isCancelled()) {
+            return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
+        }
+        Swap swap = store.withLockedSnapshot(fresh -> swapUnderLock(a, fresh));
         List<String> out = new ArrayList<>(a.messages);
-        out.add("step 6 is not implemented in this build");
-        return new TransactionResult(TransactionOutcome.FAILED, Optional.of(a.txid),
-                Optional.of(a.stagedJar), Optional.empty(), out);
+        out.addAll(swap.messages());
+        Optional<Path> backup = Optional.of(a.dir.backupJar(a.txid));
+        switch (swap.kind()) {
+            case INSTALLED:
+                return new TransactionResult(TransactionOutcome.INSTALLED_RESTART_PENDING,
+                        Optional.of(a.txid), Optional.empty(), backup, out);
+            case KEPT:
+                return new TransactionResult(TransactionOutcome.FAILED, Optional.of(a.txid),
+                        Optional.empty(), backup, out);
+            case CANCELLED:
+                return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
+            case NOTHING_MOVED:
+                // The move did not happen, so the backup this attempt created is not needed.
+                a.dir.deleteBackup(a.txid);
+                return abort(a, TransactionOutcome.FAILED, NOTHING_MOVED_TEXT);
+            default:
+                return abort(a, TransactionOutcome.FAILED, swap.messages().get(0));
+        }
+    }
+
+    /** Runs under the state lock: the re-authorisation, the flip and the move. No network. */
+    private Swap swapUnderLock(Attempt a, StateRecords.Snapshot fresh) throws IOException, UpdateRejectedException {
+        String rejection = authorizeForSwap(a, fresh);
+        if (rejection != null) {
+            return new Swap(SwapKind.REJECTED, List.of(rejection));
+        }
+        hooks.beforeSwapFlip.run();
+        if (!a.active.phase.compareAndSet(Phase.RUNNING, Phase.SWAPPING)) {
+            return new Swap(SwapKind.CANCELLED, List.of(CANCELLED_BEFORE_SWAP));
+        }
+        a.swapStarted = true;
+        hooks.afterSwapFlip.run();
+        try {
+            a.dir.moveOverLive(a.txid, a.live.realPath());
+        } catch (IOException moveFailure) {
+            return classifyFailedMove(a);
+        }
+        return journalSwapped(a, List.of());
+    }
+
+    /**
+     * Re-authorises the staged release from the freshly read state. Returns the refusal reason, or null
+     * when every check passes. The checks: the manifest verifies under the fresh trust snapshot, its
+     * times and sequence are accepted, the revocations are fresh, the staged identity is still listed
+     * for this target, the artifact is neither blocked nor withdrawn, the staged trust still passes,
+     * the key-set change is authorised under the fresh snapshot, and the staged bytes are unchanged.
+     */
+    private String authorizeForSwap(Attempt a, StateRecords.Snapshot fresh) throws IOException, UpdateRejectedException {
+        UpdateDocuments.Trust running = a.request.identity().runningTrust();
+        TrustSnapshot currentTrust = TrustSnapshot.of(running, fresh.revoked().revokedPubs());
+        AcceptedCandidate candidate = a.candidate;
+        DocumentVerification<UpdateDocuments.ReleaseManifest> verification = AuthenticatedDocuments.verifyRelease(
+                candidate.evidence().exactManifestBytes(), candidate.evidence().exactSignatureBytes(),
+                currentTrust);
+        if (verification.outcome() != VerificationOutcome.VERIFIED) {
+            return RELEASE_NO_LONGER_VERIFIES;
+        }
+        VerifiedDocument<UpdateDocuments.ReleaseManifest> reverified = verification.verified();
+        Instant systemNow = clock.instant();
+        Set<String> revokedKids = new HashSet<>();
+        for (String pub : fresh.revoked().revokedPubs()) {
+            revokedKids.add(Hex.kid(pub));
+        }
+        Instant clockFloor = ClockFloor.of(running.built(), fresh.state().revocations(),
+                fresh.state().seqByKid(), revokedKids);
+        Instant effectiveNow = FreshnessPolicy.effectiveNow(systemNow, clockFloor);
+        SequencePolicy.ManifestDecision decision = SequencePolicy.manifestDecision(reverified, fresh, running,
+                currentTrust, systemNow, effectiveNow);
+        if (decision != SequencePolicy.ManifestDecision.ACCEPT
+                && decision != SequencePolicy.ManifestDecision.REPLAY_SAME) {
+            return MANIFEST_REFUSED + decision;
+        }
+        if (!SequencePolicy.freshRevocations(fresh, reverified.document(), running, effectiveNow)) {
+            return REVOCATIONS_STALE;
+        }
+        ArtifactIdentity staged = a.staged.identity();
+        boolean listed = false;
+        for (ReleaseEntry e : reverified.document().releases()) {
+            if (e.platform().equals(staged.platform()) && e.version().equals(staged.version())
+                    && e.size() == staged.size() && e.sha512().equals(staged.sha512())
+                    && e.targets().contains(a.request.identity().target())) {
+                listed = true;
+            }
+        }
+        if (!listed) {
+            return NOT_LISTED;
+        }
+        if (fresh.revoked().blockedArtifacts().contains(staged.sha512())) {
+            return BLOCKED;
+        }
+        for (StateRecords.WithdrawnEntry w : fresh.state().withdrawn()) {
+            if (w.sha512().equals(staged.sha512())) {
+                return WITHDRAWN;
+            }
+        }
+        try {
+            ArtifactVerifier.validateStagedTrust(a.staged.stagedTrust(), fresh);
+        } catch (UpdateRejectedException e) {
+            return messageOf(e);
+        }
+        // The manifest that chose this release, verified under the snapshot it was checked with. Any
+        // revocation merged since then makes the snapshots differ, so the change is refused here.
+        if (!KeySetChangeAuthorization.check(candidate.manifest(), a.staged.stagedKeySetFingerprint(),
+                fresh.state().persistedTrust(), currentTrust)) {
+            return KEY_SET_REFUSED;
+        }
+        Path jar = a.dir.stagingJar(a.txid);
+        if (Files.size(jar) != staged.size() || !UpdateDirectory.sha512Of(jar).equals(staged.sha512())) {
+            return STAGED_CHANGED;
+        }
+        return null;
+    }
+
+    /**
+     * The move threw. Re-reads the live jar: equal to the staged jar means the move happened; equal to
+     * the pre-move jar means nothing moved; anything else, or a failed read, keeps every file.
+     */
+    private Swap classifyFailedMove(Attempt a) throws UpdateRejectedException {
+        String now;
+        try {
+            now = UpdateDirectory.sha512Of(a.live.realPath());
+        } catch (IOException readFailure) {
+            return new Swap(SwapKind.KEPT, List.of(RECOVERY_TEXT));
+        }
+        if (now.equals(a.staged.identity().sha512())) {
+            return journalSwapped(a, List.of(DURABILITY_UNCERTAIN));
+        }
+        if (now.equals(a.live.sha512())) {
+            return new Swap(SwapKind.NOTHING_MOVED, List.of());
+        }
+        return new Swap(SwapKind.KEPT, List.of(RECOVERY_TEXT));
+    }
+
+    /** Records the swap in the journal. A failed write keeps the installed jar and says so. */
+    private Swap journalSwapped(Attempt a, List<String> notes) {
+        List<String> out = new ArrayList<>(notes);
+        try {
+            a.dir.writeJournal(a.journal.withPhase(JournalPhase.SWAPPED));
+        } catch (IOException writeFailure) {
+            out.add(JOURNAL_SWAP_FAILED);
+        }
+        return new Swap(SwapKind.INSTALLED, out);
+    }
+
+    private enum SwapKind {
+        REJECTED,
+        CANCELLED,
+        NOTHING_MOVED,
+        INSTALLED,
+        KEPT
+    }
+
+    /** The result of the locked step 6 section, decided before anything outside the lock runs. */
+    private record Swap(SwapKind kind, List<String> messages) {
+        Swap {
+            messages = List.copyOf(messages);
+        }
     }
 
     /**
@@ -484,6 +679,7 @@ final class UpdaterTransaction {
     /** Per-command state carried through the steps. */
     private static final class Attempt {
         final UpdateRequest request;
+        final Active active;
         final CancelToken token;
         final List<String> messages = new ArrayList<>();
         UpdateDirectory dir;
@@ -496,12 +692,14 @@ final class UpdaterTransaction {
         boolean journalWritten;
         boolean restartRequested;
         int restarts;
+        boolean swapStarted;
         StagedArtifact staged;
         JournalRecord journal;
 
-        Attempt(UpdateRequest request, CancelToken token) {
+        Attempt(UpdateRequest request, Active active) {
             this.request = request;
-            this.token = token;
+            this.active = active;
+            this.token = active.token;
         }
     }
 }

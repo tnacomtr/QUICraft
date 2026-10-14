@@ -13,7 +13,10 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -97,7 +100,12 @@ class UpdaterTransactionTest {
         return txn(r, DurabilityOps.system(), () -> true, UpdateDirectory::sameFileStore);
     }
 
+    /** The default request stops after the step 5 checks, so step 2 to 4 tests see the staged jar. */
     private static UpdateRequest request(Rig r) {
+        return request(r, InstallCapability.VERIFIED_STAGING_ONLY);
+    }
+
+    private static UpdateRequest atomic(Rig r) {
         return request(r, InstallCapability.ATOMIC_REPLACEMENT);
     }
 
@@ -344,7 +352,7 @@ class UpdaterTransactionTest {
     void crossStoreRefusedBeforeAnyStagingWrite() throws Exception {
         Rig r = standardRig();
         TransactionResult result = txn(r, DurabilityOps.system(), () -> true, (dir, live) -> false)
-                .execute(request(r));
+                .execute(atomic(r));
         assertEquals(TransactionOutcome.FAILED, result.outcome());
         assertTrue(result.messages().get(0).contains("another file system"), result.messages().toString());
         assertTrue(result.messages().get(0).contains(r.live.toString()), "manual instructions name the live jar");
@@ -357,7 +365,7 @@ class UpdaterTransactionTest {
     void directorySyncNotSupportedDowngradesAtomicReplacementToStagingOnly() throws Exception {
         Rig r = standardRig();
         TransactionResult result = txn(r, noDirectorySync(), () -> true, UpdateDirectory::sameFileStore)
-                .execute(request(r));
+                .execute(atomic(r));
         assertEquals(TransactionOutcome.STAGED_ONLY, result.outcome(), result.messages().toString());
         assertTrue(result.messages().contains(UpdaterTransaction.DOWNGRADED), result.messages().toString());
         assertEquals(1, r.fetcher.downloads.size(), "the staged path still downloads once");
@@ -382,19 +390,20 @@ class UpdaterTransactionTest {
     }
 
     @Test
-    void atomicPathCopiesTheBackupAndWritesThePreparedJournal() throws Exception {
+    void atomicPathCopiesTheBackupAndJournalsTheSwap() throws Exception {
         Rig r = standardRig();
-        TransactionResult result = txn(r).execute(request(r));
+        TransactionResult result = txn(r).execute(atomic(r));
         assertEquals(1, backupCount(r));
         assertArrayEquals(LIVE_BYTES, Files.readAllBytes(
                 new UpdateDirectory(r.upd, DurabilityOps.system()).backupJar(result.txid().orElseThrow())));
         JournalRecord journal = new UpdateDirectory(r.upd, DurabilityOps.system()).readJournal().orElseThrow();
-        assertEquals(JournalPhase.PREPARED, journal.phase());
+        // The swap completes in step 6, so the journal ends SWAPPED; the backup and txid stay the same.
+        assertEquals(JournalPhase.SWAPPED, journal.phase());
         assertEquals(0, journal.bootAttempts());
         assertEquals(result.txid().orElseThrow(), journal.txid());
         assertTrue(result.messages().stream().anyMatch(m -> m.contains("copy ") && m.contains(r.live.toString())),
                 result.messages().toString());
-        assertLiveUntouched(r);
+        assertArrayEquals(r.jar, Files.readAllBytes(r.live));
     }
 
     @Test
@@ -422,7 +431,7 @@ class UpdaterTransactionTest {
         // The second force is the backup copy's; the journal is written after it, then the cancel check.
         DurabilityOps ops = countingForce(() -> ref[0].cancelActive());
         ref[0] = txn(r, ops, () -> true, UpdateDirectory::sameFileStore);
-        TransactionResult result = ref[0].execute(request(r));
+        TransactionResult result = ref[0].execute(atomic(r));
         assertEquals(TransactionOutcome.CANCELLED, result.outcome(), result.messages().toString());
         assertTrue(stagingIsEmpty(r));
         assertEquals(0, journalCount(r), "the journal this attempt wrote is removed");
@@ -617,5 +626,254 @@ class UpdaterTransactionTest {
         assertEquals(1, r.fetcher.downloads.size());
         assertArrayEquals(r.jar, Files.readAllBytes(result.stagedJar().orElseThrow()));
         assertFalse(result.messages().contains(UpdaterTransaction.RESTARTING));
+    }
+
+    // ---- step 6: locked re-checks, the flip and the move ------------------------------------
+
+    /** Durability ops whose move and sync failures are armed by the test at a chosen boundary. */
+    private static final class FlakyOps implements DurabilityOps {
+        private final DurabilityOps system = DurabilityOps.system();
+        boolean failMove;
+        int failSyncs;
+
+        @Override
+        public void force(FileChannel ch) throws IOException {
+            system.force(ch);
+        }
+
+        @Override
+        public void atomicMove(Path from, Path to) throws IOException {
+            if (failMove) {
+                throw new IOException("move refused");
+            }
+            system.atomicMove(from, to);
+        }
+
+        @Override
+        public boolean syncDirectory(Path dir) throws IOException {
+            if (failSyncs > 0) {
+                failSyncs--;
+                throw new IOException("sync refused");
+            }
+            return system.syncDirectory(dir);
+        }
+    }
+
+    /** A clock the test can move forward. */
+    private static final class MutableClock extends Clock {
+        Instant now;
+
+        MutableClock(Instant now) {
+            this.now = now;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+    }
+
+    private UpdaterTransaction atomicTxn(Rig r, DurabilityOps ops) {
+        return txn(r, ops, () -> true, UpdateDirectory::sameFileStore);
+    }
+
+    @Test
+    void atomicSwapInstallsTheJarKeepsTheBackupAndMarksTheJournalSwapped() throws Exception {
+        Rig r = standardRig();
+        TransactionResult result = txn(r).execute(atomic(r));
+        assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
+        assertArrayEquals(r.jar, Files.readAllBytes(r.live));
+        UpdateDirectory dir = new UpdateDirectory(r.upd, DurabilityOps.system());
+        assertArrayEquals(LIVE_BYTES, Files.readAllBytes(dir.backupJar(result.txid().orElseThrow())));
+        assertEquals(JournalPhase.SWAPPED, dir.readJournal().orElseThrow().phase());
+        assertTrue(stagingIsEmpty(r));
+        assertTrue(result.messages().stream().anyMatch(m -> m.contains("copy ")), result.messages().toString());
+    }
+
+    @Test
+    void syncFailureAfterTheRenameKeepsEverythingAndWarns() throws Exception {
+        Rig r = standardRig();
+        FlakyOps ops = new FlakyOps();
+        UpdaterTransaction txn = atomicTxn(r, ops);
+        txn.hooks.afterSwapFlip = () -> ops.failSyncs = 1;
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
+        assertArrayEquals(r.jar, Files.readAllBytes(r.live));
+        assertEquals(1, backupCount(r), "the backup is kept");
+        assertEquals(JournalPhase.SWAPPED,
+                new UpdateDirectory(r.upd, DurabilityOps.system()).readJournal().orElseThrow().phase());
+        assertTrue(result.messages().stream().anyMatch(m -> m.startsWith("WARN")), result.messages().toString());
+    }
+
+    @Test
+    void moveFailureThatMovedNothingCleansUpAndFails() throws Exception {
+        Rig r = standardRig();
+        FlakyOps ops = new FlakyOps();
+        UpdaterTransaction txn = atomicTxn(r, ops);
+        txn.hooks.afterSwapFlip = () -> ops.failMove = true;
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertTrue(result.messages().contains(UpdaterTransaction.NOTHING_MOVED_TEXT), result.messages().toString());
+        assertTrue(stagingIsEmpty(r));
+        assertEquals(0, journalCount(r));
+        assertEquals(0, backupCount(r), "the backup this attempt created is removed");
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void unexpectedLiveJarAfterAFailedMoveKeepsEverything() throws Exception {
+        Rig r = standardRig();
+        FlakyOps ops = new FlakyOps();
+        UpdaterTransaction txn = atomicTxn(r, ops);
+        txn.hooks.afterSwapFlip = () -> {
+            ops.failMove = true;
+            try {
+                Files.write(r.live, "neither the old nor the new jar".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                throw new IllegalStateException(e);
+            }
+        };
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertTrue(result.messages().stream().anyMatch(m -> m.contains("recovery")), result.messages().toString());
+        assertEquals(1, stagedCount(r), "staging is kept");
+        assertEquals(1, journalCount(r), "the journal is kept");
+        assertEquals(1, backupCount(r), "the backup is kept");
+    }
+
+    @Test
+    void cancelBeforeTheFlipWinsAndCleansUpKeepingTheBackup() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        CancelReply[] reply = new CancelReply[1];
+        txn.hooks.beforeSwapFlip = () -> reply[0] = txn.cancelActive();
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(CancelReply.REQUESTED, reply[0]);
+        assertEquals(TransactionOutcome.CANCELLED, result.outcome(), result.messages().toString());
+        assertTrue(stagingIsEmpty(r));
+        assertEquals(0, journalCount(r));
+        assertEquals(1, backupCount(r));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void cancelAfterTheFlipIsReportedAsInstalledAndDeletesNothing() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        CancelReply[] reply = new CancelReply[1];
+        txn.hooks.afterSwapFlip = () -> reply[0] = txn.cancelActive();
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(CancelReply.INSTALLED_RESTART_PENDING, reply[0]);
+        assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
+        assertArrayEquals(r.jar, Files.readAllBytes(r.live));
+        assertEquals(1, backupCount(r));
+        assertEquals(JournalPhase.SWAPPED,
+                new UpdateDirectory(r.upd, DurabilityOps.system()).readJournal().orElseThrow().phase());
+    }
+
+    @Test
+    void keySetChangeCheckAloneRejectsAFreshSnapshotThatDiffersFromTheVerifiedOne() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        // A revocation of an unrelated key merged between step 5 and step 6. Verification, freshness and
+        // the staged trust checks still pass; only the key-set check compares against the verified snapshot.
+        String unrelated = Hex.sha256("unrelated-revocation".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        String unrelatedKid = Hex.kid(unrelated);
+        txn.hooks.afterBackupReady = () -> mergeRevocation(r, unrelatedKid, unrelated);
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertEquals(UpdaterTransaction.KEY_SET_REFUSED, result.messages().get(0));
+        assertEquals(1, backupCount(r), "the backup is kept");
+        assertEquals(0, journalCount(r));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void revocationOfTheReleaseSignerMergedAfterStepFiveStopsTheSwap() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        txn.hooks.afterBackupReady = () -> mergeRevocation(r, TestKeys.KID_1, TestKeys.PUB_1);
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertEquals(UpdaterTransaction.RELEASE_NO_LONGER_VERIFIES, result.messages().get(0));
+        assertEquals(1, backupCount(r), "the backup is kept");
+        assertEquals(0, journalCount(r));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void clockAdvancedPastTheManifestExpiryFailsBeforeTheMove() throws Exception {
+        Rig r = standardRig();
+        MutableClock clock = new MutableClock(PipelineFixtures.NOW);
+        UpdaterTransaction txn = new UpdaterTransaction(r.upd, DurabilityOps.system(), r.store, r.pipeline,
+                r.fetcher, PipelineFixtures.ENDPOINTS, Map.of(), FetchTimeouts.defaults(), r::discover,
+                () -> true, clock, UpdateDirectory::sameFileStore);
+        txn.hooks.afterBackupReady = () -> clock.now = Instant.parse(SignedFixtures.TS2).plusSeconds(1);
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertTrue(result.messages().get(0).startsWith(UpdaterTransaction.MANIFEST_REFUSED),
+                result.messages().toString());
+        assertEquals(0, journalCount(r));
+        assertEquals(1, backupCount(r));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void stagedJarModifiedAfterStepFiveIsCaughtByTheRehash() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        txn.hooks.afterBackupReady = () -> {
+            try {
+                UpdateDirectory dir = new UpdateDirectory(r.upd, DurabilityOps.system());
+                Path staged = dir.stagingJar(dir.stagingTxids().get(0));
+                byte[] bytes = Files.readAllBytes(staged);
+                bytes[bytes.length / 2] ^= 1;
+                Files.write(staged, bytes);
+            } catch (IOException | UpdateRejectedException e) {
+                throw new IllegalStateException(e);
+            }
+        };
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertEquals(UpdaterTransaction.STAGED_CHANGED, result.messages().get(0));
+        assertTrue(stagingIsEmpty(r));
+        assertEquals(0, journalCount(r));
+        assertEquals(1, backupCount(r));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void concurrentExecuteIsRefusedWhileATransactionIsActive() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        assertNotNull(txn.tryEnter());
+        TransactionResult result = txn.execute(request(r));
+        assertEquals(TransactionOutcome.NOT_ADMITTED, result.outcome());
+        assertEquals(UpdaterTransaction.BUSY, result.messages().get(0));
+        assertTrue(r.metadata.requests.isEmpty());
+    }
+
+    /** Merges one revoked key into the persisted revocations, as a concurrent command would. */
+    private static void mergeRevocation(Rig r, String kid, String pub) {
+        try {
+            r.store.commit(snap -> {
+                List<UpdateDocuments.RevokedKey> keys = new ArrayList<>(snap.revoked().revokedKeys());
+                keys.add(new UpdateDocuments.RevokedKey(kid, pub));
+                return new Snapshot(snap.state(),
+                        new RevokedState(keys, snap.revoked().blockedArtifacts()));
+            });
+        } catch (IOException | UpdateRejectedException e) {
+            throw new IllegalStateException(e);
+        }
     }
 }
