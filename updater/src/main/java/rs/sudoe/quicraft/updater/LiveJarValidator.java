@@ -48,11 +48,14 @@ public final class LiveJarValidator {
      * @param filter the loader's directory filter
      * @param ids reads the id of a jar; a throw refuses the validation
      * @param ownId the id of this project's jar
-     * @param onDiskVersion reads the version from a jar's build metadata; a throw refuses the jar
+     * @param onDiskVersion reads the version from a jar's build metadata; a throw refuses the jar, except
+     *     a {@link DevelopmentBuildException}, which is rethrown unchanged
      * @return the validated live jar
      * @throws IOException declared for compatibility; I/O failures are reported as
      *     {@link UpdateRejectedException} with a fixed reason
      * @throws UpdateRejectedException when the jar is not acceptable
+     * @throws DevelopmentBuildException when {@code onDiskVersion} finds a development build; it is
+     *     rethrown unchanged, before the generic refusal, so the facade can name that reason
      */
     public static LiveJar validate(Path reportedSource, Path scanDirectory, ScanFilter filter,
             JarIdReader ids, String ownId, Function<Path, UpdateVersion> onDiskVersion)
@@ -105,6 +108,9 @@ public final class LiveJarValidator {
         UpdateVersion version;
         try {
             version = onDiskVersion.apply(real);
+        } catch (DevelopmentBuildException e) {
+            // A development build is not a broken jar: the facade must see the reason unchanged.
+            throw e;
         } catch (RuntimeException e) {
             throw new UpdateRejectedException("cannot read the live jar version", e);
         }

@@ -105,6 +105,8 @@ public final class UpdaterRuntime {
     private static final Duration HEALTH_TIMEOUT = Duration.ofSeconds(120);
     private static final long MIN_OFFSET_MS = 60_000L;
     private static final long SHUTDOWN_WAIT_SECONDS = 5L;
+    /** How far {@link Boot#isDevelopmentBuild} walks a cause chain before giving up. */
+    private static final int MAX_CAUSE_DEPTH = 10;
 
     private final UpdaterLog log;
     private final String disabledReason;
@@ -819,8 +821,14 @@ public final class UpdaterRuntime {
             LiveJarDiscovery discovery = p.discovery();
             try {
                 live = discovery.discover();
+            } catch (DevelopmentBuildException e) {
+                return fail(REASON_DEV_BUILD);
             } catch (IOException | UpdateRejectedException e) {
-                return fail(REASON_DISCOVERY);
+                return fail(isDevelopmentBuild(e) ? REASON_DEV_BUILD : REASON_DISCOVERY);
+            } catch (RuntimeException e) {
+                // A runtime failure from the adapter is an internal start failure, unless it carries the
+                // development-build reason, which deserves its own line.
+                return fail(isDevelopmentBuild(e) ? REASON_DEV_BUILD : REASON_INTERNAL);
             }
 
             OwnJarResources.Resources resources;
@@ -945,6 +953,26 @@ public final class UpdaterRuntime {
             }
         }
 
+        /**
+         * True when {@code t} or one of its causes is a {@link DevelopmentBuildException}, so an adapter
+         * that wraps the discovery failure still gets {@link #REASON_DEV_BUILD}. The cause chain is walked
+         * with a depth cap, and a self-referencing cause ends the walk.
+         */
+        private static boolean isDevelopmentBuild(Throwable t) {
+            Throwable current = t;
+            for (int depth = 0; current != null && depth < MAX_CAUSE_DEPTH; depth++) {
+                if (current instanceof DevelopmentBuildException) {
+                    return true;
+                }
+                Throwable next = current.getCause();
+                if (next == current) {
+                    return false;
+                }
+                current = next;
+            }
+            return false;
+        }
+
         UpdaterRuntime fail(String reason) {
             warnSafe(log, "updater disabled: " + reason);
             stopExecutor();
@@ -1023,6 +1051,6 @@ public final class UpdaterRuntime {
         }
     }
     private static boolean looksLikeSnapshot(byte[] buildJson) {
-        return new String(buildJson, StandardCharsets.UTF_8).contains("SNAPSHOT");
+        return DevelopmentBuildException.looksLikeDevelopmentBuild(buildJson);
     }
 }

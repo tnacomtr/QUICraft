@@ -152,6 +152,22 @@ class UpdaterRuntimeInitTest {
     }
 
     @Test
+    void discoveryReportingADevelopmentBuildDisablesTheUpdater() {
+        UpdaterFacadeFixtures.FixedDiscovery d = new UpdaterFacadeFixtures.FixedDiscovery();
+        d.runtimeFailure = new DevelopmentBuildException();
+        p.discovery = d;
+        assertDisabledWith(start(UpdaterFacadeFixtures.testHosts()), UpdaterRuntime.REASON_DEV_BUILD);
+    }
+
+    @Test
+    void developmentBuildWrappedByDiscoveryIsStillNamed() {
+        UpdaterFacadeFixtures.FixedDiscovery d = new UpdaterFacadeFixtures.FixedDiscovery();
+        d.runtimeFailure = new IllegalStateException("wrapped", new DevelopmentBuildException());
+        p.discovery = d;
+        assertDisabledWith(start(UpdaterFacadeFixtures.testHosts()), UpdaterRuntime.REASON_DEV_BUILD);
+    }
+
+    @Test
     void storeInitialiseFailureDisablesTheUpdater() throws Exception {
         // An existing but empty directory means a state file vanished after use: never rebuilt silently.
         PipelineFixtures.privateDir(p.updateDir);
