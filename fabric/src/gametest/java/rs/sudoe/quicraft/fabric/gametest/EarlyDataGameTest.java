@@ -109,7 +109,8 @@ public class EarlyDataGameTest implements FabricClientGameTest {
             check(GameTests.connectedOverQuic(context) == quic, what + ": over " + (quic ? "QUIC" : "TCP"));
             boolean used = context.computeOnClient(c -> c.getConnection() != null
                     && Transports.usedZeroRtt(c.getConnection().getConnection()));
-            check(used == zeroRtt, what + ": 0-RTT " + (zeroRtt ? "used" : "not used"));
+            check(used == zeroRtt, what + ": 0-RTT " + (zeroRtt ? "used" : "not used")
+                    + " (client: " + QuicClient.lastEarlyOutcome() + ")");
             if (play) {
                 PlaySession.run(context, server, connection);
             }

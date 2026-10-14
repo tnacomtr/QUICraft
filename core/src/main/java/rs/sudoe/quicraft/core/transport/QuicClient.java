@@ -265,6 +265,17 @@ public final class QuicClient {
         return false;
     }
 
+    private static volatile String lastEarly = "no attempt";
+
+    /**
+     * What the latest QUIC attempt did about 0-RTT: {@code sent}, or why it sent nothing (no
+     * early-data event from TLS, no recorded flight, no early token, ...). For tests and
+     * diagnostics; attempts running at once overwrite each other's answer.
+     */
+    public static String lastEarlyOutcome() {
+        return lastEarly;
+    }
+
     /**
      * Certificate checks run so far for connections to servers with {@code fingerprint}; a
      * resumed session runs none. For tests and diagnostics.
@@ -297,6 +308,7 @@ public final class QuicClient {
             this.remote = remote;
             this.server = server;
             this.early = early;
+            lastEarly = early == null ? "not requested" : "no early-data event";
             this.result = result;
             this.dial = dial;
         }
@@ -426,6 +438,8 @@ public final class QuicClient {
          */
         private void sendEarly(QuicChannel connection) {
             if (early == null || retrying || result.isDone() || earlyStream != null) {
+                lastEarly = early == null ? "not requested" : retrying ? "retrying" : result.isDone()
+                        ? "attempt already done" : "already sent";
                 return;
             }
             byte[] flight;
@@ -435,13 +449,16 @@ public final class QuicClient {
                 EarlyCache cache = EarlyCache.INSTANCE;
                 flight = cache.flight(server, early.joinInputs());
                 if (flight == null || !cache.hasToken(server)) {
+                    lastEarly = flight == null ? "no recorded flight" : "no early token";
                     return;
                 }
                 token = cache.takeToken(server);
                 if (token == null) {
+                    lastEarly = "no early token";
                     return;
                 }
             } catch (Throwable t) {
+                lastEarly = "skipped: " + t;
                 LOG.log(Level.FINE, "0-RTT skipped", t);
                 return;
             }
@@ -467,6 +484,7 @@ public final class QuicClient {
                             raw.write(out);
                             raw.flush();
                             early.markSent();
+                            lastEarly = "sent";
                             sent.complete(stream);
                             try {
                                 Faults.check(Faults.EARLY_ABANDON);
