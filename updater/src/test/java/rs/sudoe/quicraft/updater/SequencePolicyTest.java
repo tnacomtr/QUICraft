@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -105,9 +106,9 @@ class SequencePolicyTest {
                 TestKeys.KID_2, new KidSeq(42, Hex.sha256(docA), ISSUED));
         Snapshot s = new Snapshot(state(SEED, seqByKid, List.of()), RevokedState.empty());
         assertEquals(ManifestDecision.REPLAY_SAME,
-                SequencePolicy.manifestDecision(release(trust3(), docA, K2), s, TRUST, trust3()));
+                SequencePolicy.manifestDecision(release(trust3(), docA, K2), s, TRUST, trust3(), NOW, NOW));
         assertEquals(ManifestDecision.EQUIVOCATION,
-                SequencePolicy.manifestDecision(release(trust3(), docB, K2), s, TRUST, trust3()));
+                SequencePolicy.manifestDecision(release(trust3(), docB, K2), s, TRUST, trust3(), NOW, NOW));
     }
 
     @Test
@@ -116,7 +117,7 @@ class SequencePolicyTest {
         Map<String, KidSeq> seqByKid = Map.of(TestKeys.KID_2, new KidSeq(42, Hex.sha256(doc), ISSUED));
         Snapshot s = new Snapshot(state(SEED, seqByKid, List.of()), RevokedState.empty());
         AcceptResult result = SequencePolicy.acceptManifest(
-                s, release(trust3(), doc, K2), TRUST, trust3(), "fabric-26x", version("0.4.0"));
+                s, release(trust3(), doc, K2), TRUST, trust3(), "fabric-26x", version("0.4.0"), NOW, NOW);
         assertFalse(result.stateFull());
         assertEquals(42L, result.delta().newState().seqByKid().get(TestKeys.KID_2).seq());
         assertEquals(Hex.sha256(doc), result.delta().newState().seqByKid().get(TestKeys.KID_2).sha256());
@@ -128,7 +129,7 @@ class SequencePolicyTest {
                 List.of(new UpdateDocuments.RevokedKey(TestKeys.KID_2, TestKeys.PUB_2)), List.of());
         Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), revoked);
         assertEquals(ManifestDecision.UNTRUSTED, SequencePolicy.manifestDecision(
-                release(trust3(), releaseBytes(5, "a", ""), K2), s, TRUST, trust3()));
+                release(trust3(), releaseBytes(5, "a", ""), K2), s, TRUST, trust3(), NOW, NOW));
     }
 
     @Test
@@ -138,10 +139,10 @@ class SequencePolicyTest {
         TrustSnapshot rotated = new TrustSnapshot(2, FP, Set.of(),
                 Map.of(TEST3_KID, TEST3_PUB),
                 Map.of(TEST3_PUB, Set.of(KeyRole.RELEASE, KeyRole.REVOCATION)));
-        assertEquals(ManifestDecision.ACCEPT, SequencePolicy.manifestDecision(m, s, TRUST, trust3()));
-        assertEquals(ManifestDecision.UNTRUSTED, SequencePolicy.manifestDecision(m, s, TRUST, rotated));
+        assertEquals(ManifestDecision.ACCEPT, SequencePolicy.manifestDecision(m, s, TRUST, trust3(), NOW, NOW));
+        assertEquals(ManifestDecision.UNTRUSTED, SequencePolicy.manifestDecision(m, s, TRUST, rotated, NOW, NOW));
         AcceptResult result = SequencePolicy.acceptManifest(
-                s, m, TRUST, rotated, "fabric-26x", version("0.4.0"));
+                s, m, TRUST, rotated, "fabric-26x", version("0.4.0"), NOW, NOW);
         assertFalse(result.stateFull());
         assertEquals(s.state(), result.delta().newState());
     }
@@ -158,7 +159,7 @@ class SequencePolicyTest {
                 m.document(), m.exactBytes(), m.signers(), roleRemoved);
         Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
         assertEquals(ManifestDecision.UNTRUSTED,
-                SequencePolicy.manifestDecision(forged, s, TRUST, roleRemoved));
+                SequencePolicy.manifestDecision(forged, s, TRUST, roleRemoved, NOW, NOW));
     }
 
     @Test
@@ -369,14 +370,14 @@ class SequencePolicyTest {
         VerifiedDocument<ReleaseManifest> m1 = release(trust3(), releaseBytes(5, "a", ""), K2);
         VerifiedDocument<ReleaseManifest> m2 = release(trust3(), releaseBytes(9, "b", ""), K2);
         Snapshot before = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
-        assertEquals(ManifestDecision.ACCEPT, SequencePolicy.manifestDecision(m1, before, TRUST, trust3()));
+        assertEquals(ManifestDecision.ACCEPT, SequencePolicy.manifestDecision(m1, before, TRUST, trust3(), NOW, NOW));
 
         AcceptResult accepted = SequencePolicy.acceptManifest(
-                before, m2, TRUST, trust3(), "fabric-26x", version("0.4.0"));
+                before, m2, TRUST, trust3(), "fabric-26x", version("0.4.0"), NOW, NOW);
         Snapshot after = new Snapshot(accepted.delta().newState(), accepted.delta().newRevoked());
-        assertEquals(ManifestDecision.STALE, SequencePolicy.manifestDecision(m1, after, TRUST, trust3()));
+        assertEquals(ManifestDecision.STALE, SequencePolicy.manifestDecision(m1, after, TRUST, trust3(), NOW, NOW));
         assertEquals(ManifestDecision.REPLAY_SAME,
-                SequencePolicy.manifestDecision(m2, after, TRUST, trust3()));
+                SequencePolicy.manifestDecision(m2, after, TRUST, trust3(), NOW, NOW));
     }
 
     @Test
@@ -388,7 +389,7 @@ class SequencePolicyTest {
                 releaseBytes(9, "a", w1 + "," + w2 + "," + w3), K2);
         Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
         AcceptResult result = SequencePolicy.acceptManifest(
-                s, m, TRUST, trust3(), "fabric-26x", version("0.4.0"));
+                s, m, TRUST, trust3(), "fabric-26x", version("0.4.0"), NOW, NOW);
         assertFalse(result.stateFull());
         List<WithdrawnEntry> withdrawn = result.delta().newState().withdrawn();
         assertEquals(1, withdrawn.size());
@@ -407,7 +408,7 @@ class SequencePolicyTest {
         Snapshot s = new Snapshot(st, RevokedState.empty());
         AcceptResult result = SequencePolicy.acceptManifest(s,
                 release(trust3(), releaseBytes(9, "a", ""), K2), TRUST, trust3(), "fabric-26x",
-                version("0.4.0"));
+                version("0.4.0"), NOW, NOW);
         assertTrue(result.stateFull());
         assertEquals(st, result.delta().newState());
     }
@@ -423,9 +424,136 @@ class SequencePolicyTest {
         String w1 = withdrawal("fabric-26x", "0.5.0", h(10));
         AcceptResult result = SequencePolicy.acceptManifest(s,
                 release(trust3(), releaseBytes(9, "a", w1), K2), TRUST, trust3(), "fabric-26x",
-                version("0.4.0"));
+                version("0.4.0"), NOW, NOW);
         assertTrue(result.stateFull());
         assertEquals(st, result.delta().newState());
+    }
+
+    @Test
+    void manifestWithInvalidTimesIsRejectedBeforeAnyFloorLogic() throws Exception {
+        Map<String, KidSeq> seqByKid = Map.of(TestKeys.KID_2, kidSeq(10));
+        Snapshot s = new Snapshot(state(SEED, seqByKid, List.of()), RevokedState.empty());
+        String[][] bad = {
+            // Year 9999 issued: future-issued and a far-future window.
+            {"9999-01-01T00:00:00Z", "9999-02-01T00:00:00Z"},
+            // Expired at NOW.
+            {"2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"},
+            // Lifetime 45 days plus one second: structurally invalid.
+            {"2026-11-01T12:00:00Z", "2026-12-16T12:00:01Z"},
+        };
+        for (String[] times : bad) {
+            // seq 50 is far above the floor, so only the time check can refuse it.
+            VerifiedDocument<ReleaseManifest> m =
+                    release(trust3(), releaseBytesAt(50, "t", "", times[0], times[1]), K2);
+            assertEquals(ManifestDecision.INVALID_TIMES,
+                    SequencePolicy.manifestDecision(m, s, TRUST, trust3(), NOW, NOW));
+            AcceptResult result = SequencePolicy.acceptManifest(
+                    s, m, TRUST, trust3(), "fabric-26x", version("0.4.0"), NOW, NOW);
+            assertFalse(result.stateFull());
+            assertEquals(s.state(), result.delta().newState());
+            assertEquals(s.revoked(), result.delta().newRevoked());
+            assertEquals(10L, SequencePolicy.manifestFloor(s, TRUST));
+        }
+    }
+
+    @Test
+    void manifestAtExactly45DaysAndExpiryOnlyAfterEffectiveNowIsAdmissible() throws Exception {
+        Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
+        VerifiedDocument<ReleaseManifest> exact =
+                release(trust3(), releaseBytesAt(1, "e", "", "2026-11-01T12:00:00Z", "2026-12-16T12:00:00Z"), K2);
+        assertEquals(ManifestDecision.ACCEPT,
+                SequencePolicy.manifestDecision(exact, s, TRUST, trust3(), NOW, NOW));
+        // expires equal to effectiveNow is expired (no grace period).
+        assertEquals(ManifestDecision.INVALID_TIMES, SequencePolicy.manifestDecision(exact, s, TRUST,
+                trust3(), NOW, Instant.parse("2026-12-16T12:00:00Z")));
+    }
+
+    @Test
+    void revocationsAtExactly64KeysMergeAnd65KeysAreSkippedWithoutEviction() throws Exception {
+        Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
+        VerifiedDocument<Revocations> at64 = direct(trust3(), 3, EXPIRES, ISSUED, revokedKeys(0, 64), List.of());
+        SelectionResult ok = SequencePolicy.selectCurrent(s, trust3(), List.of(at64), NOW);
+        assertFalse(ok.stateFull());
+        assertEquals(64, ok.delta().newRevoked().revokedKeys().size());
+        assertEquals(3L, ok.delta().newState().revocations().seq());
+        assertTrue(ok.warnings().isEmpty());
+
+        VerifiedDocument<Revocations> at65 = direct(trust3(), 4, EXPIRES, ISSUED, revokedKeys(0, 65), List.of());
+        SelectionResult full = SequencePolicy.selectCurrent(s, trust3(), List.of(at65), NOW);
+        assertTrue(full.stateFull());
+        assertEquals(List.of("revocations state full; document not merged"), full.warnings());
+        assertEquals(s.revoked(), full.delta().newRevoked());
+        assertEquals(SEED, full.delta().newState().revocations());
+        assertEquals(s.revoked(), SequencePolicy.mergeRestrictions(s, trust3(), at65).newRevoked());
+    }
+
+    @Test
+    void mergeNeverEvictsAlreadyPersistedKeysWhenALaterDocumentWouldOverflow() throws Exception {
+        Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
+        VerifiedDocument<Revocations> sixty = direct(trust3(), 3, EXPIRES, ISSUED, revokedKeys(0, 60), List.of());
+        VerifiedDocument<Revocations> ten = direct(trust3(), 4, EXPIRES, ISSUED, revokedKeys(60, 70), List.of());
+        SelectionResult result = SequencePolicy.selectCurrent(s, trust3(), List.of(sixty, ten), NOW);
+        assertTrue(result.stateFull());
+        assertEquals(60, result.delta().newRevoked().revokedKeys().size());
+        assertEquals(3L, result.delta().newState().revocations().seq());
+    }
+
+    @Test
+    void blockedArtifactsAtExactly1024MergeAnd1025AreSkipped() throws Exception {
+        Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
+        VerifiedDocument<Revocations> at1024 = direct(trust3(), 3, EXPIRES, ISSUED, List.of(), blockedRange(0, 1024));
+        SelectionResult ok = SequencePolicy.selectCurrent(s, trust3(), List.of(at1024), NOW);
+        assertFalse(ok.stateFull());
+        assertEquals(1024, ok.delta().newRevoked().blockedArtifacts().size());
+        assertEquals(3L, ok.delta().newState().revocations().seq());
+
+        VerifiedDocument<Revocations> at1025 = direct(trust3(), 4, EXPIRES, ISSUED, List.of(), blockedRange(0, 1025));
+        SelectionResult full = SequencePolicy.selectCurrent(s, trust3(), List.of(at1025), NOW);
+        assertTrue(full.stateFull());
+        assertEquals(s.revoked(), full.delta().newRevoked());
+        assertEquals(SEED, full.delta().newState().revocations());
+    }
+
+    @Test
+    void withdrawalIsAttributedToLowestSortedSigningKidAndPrunedWhenThatKidIsRevoked() throws Exception {
+        // K1 and K3 are both trusted release keys. The withdrawal is attributed to the lowest kid.
+        String lowestKid = Collections.min(List.of(TestKeys.KID_1, TEST3_KID));
+        String lowestPub = lowestKid.equals(TestKeys.KID_1) ? TestKeys.PUB_1 : TEST3_PUB;
+        byte[] doc = releaseBytes(40, "w", withdrawal("fabric-26x", "0.5.0", h(7)));
+        Snapshot s = new Snapshot(state(SEED, Map.of(), List.of()), RevokedState.empty());
+        AcceptResult accepted = SequencePolicy.acceptManifest(
+                s, release(trust3(), doc, K1, K3), TRUST, trust3(), "fabric-26x", version("0.4.0"), NOW, NOW);
+        assertEquals(1, accepted.delta().newState().withdrawn().size());
+        assertEquals(lowestKid, accepted.delta().newState().withdrawn().get(0).kid());
+
+        // Revoking the attributed kid prunes the withdrawal with its floor (12.4), even though the
+        // other signer of the same manifest is still trusted.
+        VerifiedDocument<Revocations> revokeLowest = direct(trust3(), 2, EXPIRES, ISSUED,
+                List.of(new UpdateDocuments.RevokedKey(lowestKid, lowestPub)), List.of());
+        StateDelta afterRevoke = SequencePolicy.mergeRestrictions(
+                new Snapshot(accepted.delta().newState(), accepted.delta().newRevoked()),
+                trust3(), revokeLowest);
+        assertTrue(afterRevoke.newRevoked().revokedPubs().contains(lowestPub));
+        assertTrue(afterRevoke.newState().withdrawn().isEmpty());
+    }
+
+    /** Revoked keys {@code from} (inclusive) to {@code to} (exclusive), valid 64-hex publics. */
+    private static List<UpdateDocuments.RevokedKey> revokedKeys(int from, int to) throws Exception {
+        List<UpdateDocuments.RevokedKey> keys = new ArrayList<>();
+        for (int i = from; i < to; i++) {
+            String pub = String.format("%064x", 0x1000 + i);
+            keys.add(new UpdateDocuments.RevokedKey(Hex.kid(pub), pub));
+        }
+        return keys;
+    }
+
+    /** Blocked artifacts {@code from} (inclusive) to {@code to} (exclusive). */
+    private static List<String> blockedRange(int from, int to) {
+        List<String> out = new ArrayList<>();
+        for (int i = from; i < to; i++) {
+            out.add(h(i));
+        }
+        return out;
     }
 
     // ---------------------------------------------------------------- helpers
@@ -493,8 +621,14 @@ class SequencePolicyTest {
 
     /** Release manifest with one fabric-26x entry; {@code variant} changes the bytes, not the seq. */
     private static byte[] releaseBytes(long seq, String variant, String withdrawn) {
+        return releaseBytesAt(seq, variant, withdrawn, ISSUED_TEXT, EXPIRES_TEXT);
+    }
+
+    /** Same as {@link #releaseBytes} with explicit {@code issued} and {@code expires} text. */
+    private static byte[] releaseBytesAt(long seq, String variant, String withdrawn,
+            String issued, String expires) {
         return SignedFixtures.bytes("{\"type\":\"quicraft.release\",\"v\":1,\"seq\":" + seq
-                + ",\"issued\":\"" + ISSUED_TEXT + "\",\"expires\":\"" + EXPIRES_TEXT + "\""
+                + ",\"issued\":\"" + issued + "\",\"expires\":\"" + expires + "\""
                 + ",\"minRevocationsSeq\":3,\"releases\":[{\"platform\":\"fabric-26x\""
                 + ",\"version\":\"0.4.0\",\"targets\":[\"26.1\"]"
                 + ",\"file\":\"q-" + variant + ".jar\",\"size\":1"

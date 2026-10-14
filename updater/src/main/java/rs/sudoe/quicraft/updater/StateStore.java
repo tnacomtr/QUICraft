@@ -51,6 +51,7 @@ public final class StateStore {
     static final String REVOKED = "revoked.json";
     static final String LOCK = "state.lock";
     static final String TXN_LOCK = "txn.lock";
+    static final String STATE_FILES_MISSING = "updater state files are missing; not rebuilt silently";
     private static final String PREV = ".prev";
     private static final String TMP = ".tmp";
     private static final String OWNER_MISMATCH = "update directory not owned by the server user";
@@ -136,21 +137,34 @@ public final class StateStore {
     }
 
     /**
-     * Writes the initial files when neither exists; otherwise returns the loaded state unchanged.
-     * {@code revoked.json} is written first.
+     * Writes the initial files when neither exists and {@code firstRunAllowed} is true; otherwise
+     * returns the loaded state unchanged. {@code revoked.json} is written first. With no files and
+     * {@code firstRunAllowed} false, throws {@link StateUnavailableException} (updater disabled): the
+     * owner then removes the whole update directory, which makes the next start a first run.
+     *
+     * <p>A missing {@code state.json} with a present {@code revoked.json} is reseeded only when
+     * {@code firstRunAllowed} is true. Platforms pass true only when no QUICraft update directory
+     * existed before this start (they determine this before creating it). Otherwise the store
+     * stays unavailable, because a state file vanished after the directory was in use and must
+     * not be rebuilt silently (docs/updater.md, Corruption and Initialisation).
      */
-    public StateRecords.Snapshot initialiseIfAbsent(StateRecords.StateDelta initial)
+    public StateRecords.Snapshot initialiseIfAbsent(StateRecords.StateDelta initial, boolean firstRunAllowed)
             throws IOException, UpdateRejectedException {
         Objects.requireNonNull(initial, "initial");
         return withLocks(warnings -> {
             if (!anyFileExists()) {
+                if (!firstRunAllowed) {
+                    // Both files vanished after the directory was in use: never rebuild them silently.
+                    throw new StateUnavailableException(false, STATE_FILES_MISSING);
+                }
                 atomicWrite(REVOKED, RevokedCodec.encode(initial.newRevoked()),
                         StateStore::validRevoked, warnings);
                 atomicWrite(STATE, StateCodec.encode(initial.newState()),
                         StateStore::validState, warnings);
                 return new StateRecords.Snapshot(initial.newState(), initial.newRevoked());
             }
-            if (!Files.exists(dir.resolve(STATE), LinkOption.NOFOLLOW_LINKS)
+            if (firstRunAllowed
+                    && !Files.exists(dir.resolve(STATE), LinkOption.NOFOLLOW_LINKS)
                     && !Files.exists(dir.resolve(STATE + PREV), LinkOption.NOFOLLOW_LINKS)) {
                 // Interrupted first run: revoked.json was written, state.json never was. Only this
                 // case reseeds; a later deletion still goes through load() and stays unavailable.
@@ -534,21 +548,27 @@ public final class StateStore {
         }
     }
 
-    private static boolean validRevoked(byte[] bytes) {
+    static boolean validRevoked(byte[] bytes) {
         return tryDecode(RevokedCodec::decode, bytes) != null;
     }
 
-    private static boolean validState(byte[] bytes) {
+    static boolean validState(byte[] bytes) {
         return tryDecode(StateCodec::decode, bytes) != null;
     }
 
     /**
      * Atomic replace of one file: write {@code name.tmp} and force it, copy the current file to
      * {@code name.prev} only when the current file is itself valid, move the temp over the target,
-     * then fsync the directory.
+     * then fsync the directory. The new content must pass {@code validCurrent}, the same validator
+     * used on reads, before anything is written, so an invalid encoding never reaches disk.
+     *
+     * <p>Package-private so tests can inject a bad encoding directly.
      */
-    private void atomicWrite(String name, byte[] content, Predicate<byte[]> validCurrent,
+    void atomicWrite(String name, byte[] content, Predicate<byte[]> validCurrent,
             List<String> warnings) throws IOException {
+        if (!validCurrent.test(content)) {
+            throw new IOException("refusing to write an invalid state file");
+        }
         Path target = dir.resolve(name);
         Path tmp = dir.resolve(name + TMP);
         writeSynced(tmp, content);

@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.nio.file.attribute.UserPrincipal;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -107,7 +108,7 @@ class StateStoreTest {
     void initialiseWritesBothFilesAndReturnsSeeds() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
-        Snapshot s = store.initialiseIfAbsent(seedDelta());
+        Snapshot s = store.initialiseIfAbsent(seedDelta(), true);
         assertEquals(seedDelta().newState(), s.state());
         assertTrue(Files.exists(dir.resolve("state.json")));
         assertTrue(Files.exists(dir.resolve("revoked.json")));
@@ -118,9 +119,9 @@ class StateStoreTest {
     void initialiseKeepsExistingStateUnchanged() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(seedDelta());
+        store.initialiseIfAbsent(seedDelta(), true);
         StateDelta other = new StateDelta(seedState(9), RevokedState.empty());
-        Snapshot again = store.initialiseIfAbsent(other);
+        Snapshot again = store.initialiseIfAbsent(other, true);
         assertEquals(seedState(0), again.state());
     }
 
@@ -133,7 +134,7 @@ class StateStoreTest {
     void commitWritesOnlyChangedFilesAndReturnsNewSnapshot() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
-        Snapshot initial = store.initialiseIfAbsent(seedDelta());
+        Snapshot initial = store.initialiseIfAbsent(seedDelta(), true);
         Snapshot next = store.commit(before -> addKid(before, KID_1, 1));
         assertEquals(1, next.state().seqByKid().get(KID_1).seq());
         assertEquals(Optional.of(next), new StateStore(dir).load());
@@ -144,7 +145,7 @@ class StateStoreTest {
     void commitWithNoChangeDoesNothing() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(seedDelta());
+        store.initialiseIfAbsent(seedDelta(), true);
         byte[] before = Files.readAllBytes(dir.resolve("state.json"));
         store.commit(s -> s);
         assertArrayEquals(before, Files.readAllBytes(dir.resolve("state.json")));
@@ -154,7 +155,7 @@ class StateStoreTest {
     @Test
     void crashAfterRevokedWriteLeavesNewRevokedOldStateAndNextCommitConverges() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         String blocked = "d".repeat(128);
         StateStore crashing = new StateStore(dir, () -> {
             throw new IllegalStateException("simulated crash");
@@ -177,7 +178,7 @@ class StateStoreTest {
     void corruptStateUsesPrevWithWarning() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(seedDelta());
+        store.initialiseIfAbsent(seedDelta(), true);
         Snapshot first = store.commit(before -> addKid(before, KID_1, 1));
         store.commit(before -> addKid(before, KID_2, 2));
         Files.write(dir.resolve("state.json"), "{ not json".getBytes(StandardCharsets.UTF_8));
@@ -194,7 +195,7 @@ class StateStoreTest {
     void invalidMainIsNotCopiedOverGoodPrev() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(seedDelta());
+        store.initialiseIfAbsent(seedDelta(), true);
         Snapshot first = store.commit(before -> addKid(before, KID_1, 1));
         store.commit(before -> addKid(before, KID_2, 2));
         byte[] goodPrev = Files.readAllBytes(dir.resolve("state.json.prev"));
@@ -211,7 +212,7 @@ class StateStoreTest {
     void bothStateCopiesCorruptRaisesUnavailableWithRevokedValid() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(seedDelta());
+        store.initialiseIfAbsent(seedDelta(), true);
         store.commit(before -> addKid(before, KID_1, 1));
         Files.write(dir.resolve("state.json"), "x".getBytes(StandardCharsets.UTF_8));
         Files.write(dir.resolve("state.json.prev"), "y".getBytes(StandardCharsets.UTF_8));
@@ -225,7 +226,7 @@ class StateStoreTest {
     void bothRevokedCopiesCorruptRaisesUnavailableWithRevokedInvalid() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(seedDelta());
+        store.initialiseIfAbsent(seedDelta(), true);
         store.commit(before -> addKid(before, KID_1, 1));
         Files.write(dir.resolve("revoked.json"), "x".getBytes(StandardCharsets.UTF_8));
         writePrivate(dir.resolve("revoked.json.prev"), "y".getBytes(StandardCharsets.UTF_8));
@@ -238,7 +239,7 @@ class StateStoreTest {
     @Test
     void stateFileMissingWithRevokedPresentIsUnavailable() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         Files.delete(dir.resolve("state.json"));
         StateUnavailableException e = assertThrows(StateUnavailableException.class,
                 () -> new StateStore(dir).load());
@@ -249,7 +250,7 @@ class StateStoreTest {
     void resetStateKeepsRevokedByteIdentical() throws Exception {
         Path dir = updateDir();
         StateStore store = new StateStore(dir);
-        store.initialiseIfAbsent(seedDelta());
+        store.initialiseIfAbsent(seedDelta(), true);
         store.commit(before -> blockOne(before, "e".repeat(128)));
         byte[] revokedBefore = Files.readAllBytes(dir.resolve("revoked.json"));
         Files.write(dir.resolve("state.json"), "broken".getBytes(StandardCharsets.UTF_8));
@@ -264,7 +265,7 @@ class StateStoreTest {
     @Test
     void resetStateRefusesWhenRevokedInvalid() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         Files.write(dir.resolve("revoked.json"), "x".getBytes(StandardCharsets.UTF_8));
         UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
                 () -> new StateStore(dir).resetState(seedState(5)));
@@ -274,7 +275,7 @@ class StateStoreTest {
     @Test
     void concurrentCommitsInOneJvmAreSerialised() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         ExecutorService pool = Executors.newFixedThreadPool(2);
         CountDownLatch start = new CountDownLatch(1);
         try {
@@ -305,7 +306,7 @@ class StateStoreTest {
     @Test
     void lockHeldByAnotherProcessIsRefusedWithoutWaiting() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         Process child = new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"),
                 LockHolderMain.class.getName(), dir.toString())
@@ -335,7 +336,7 @@ class StateStoreTest {
             assumeTrue(false, "symlinks unsupported here");
         }
         assertThrows(UpdateRejectedException.class,
-                () -> new StateStore(link).initialiseIfAbsent(seedDelta()));
+                () -> new StateStore(link).initialiseIfAbsent(seedDelta(), true));
     }
 
     @Test
@@ -360,13 +361,13 @@ class StateStoreTest {
             assumeTrue(false, "symlinks unsupported here");
         }
         assertThrows(UpdateRejectedException.class,
-                () -> new StateStore(dir).initialiseIfAbsent(seedDelta()));
+                () -> new StateStore(dir).initialiseIfAbsent(seedDelta(), true));
     }
 
     @Test
     void ownerOfStoreFilesIsTheProcessUserPositivePath() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         UserPrincipal owner = Files.getOwner(dir.resolve("state.json"));
         StateStore.requireOwner(dir.resolve("state.json"), owner);
         StateStore.requireOwner(dir, owner);
@@ -375,7 +376,7 @@ class StateStoreTest {
     @Test
     void ownerMismatchIsRefused() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         UserPrincipal other = new UserPrincipal() {
             @Override
             public String getName() {
@@ -391,7 +392,7 @@ class StateStoreTest {
     void posixPermissionsAre700And600WhenSupported() throws Exception {
         assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
         Path dir = Path.of(tmp.toString(), "perm");
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         assertEquals(PosixFilePermissions.fromString("rwx------"),
                 Files.getPosixFilePermissions(dir));
         assertEquals(PosixFilePermissions.fromString("rw-------"),
@@ -431,10 +432,10 @@ class StateStoreTest {
     @Test
     void initialisationCrashAfterRevokedWriteConvergesByReseeding() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         Files.delete(dir.resolve("state.json"));
         StateStore store = new StateStore(dir);
-        Snapshot s = store.initialiseIfAbsent(seedDelta());
+        Snapshot s = store.initialiseIfAbsent(seedDelta(), true);
         assertEquals(seedDelta().newState(), s.state());
         assertTrue(store.warnings().contains(
                 "state.json missing after interrupted initialisation; reseeded"),
@@ -443,13 +444,52 @@ class StateStoreTest {
     }
 
     @Test
+    void interruptedInitialisationIsNotReseededWhenFirstRunNotAllowed() throws Exception {
+        Path dir = updateDir();
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
+        Files.delete(dir.resolve("state.json"));
+        StateStore store = new StateStore(dir);
+        assertThrows(StateUnavailableException.class,
+                () -> store.initialiseIfAbsent(seedDelta(), false));
+        assertFalse(Files.exists(dir.resolve("state.json")));
+        assertFalse(store.warnings().contains(
+                "state.json missing after interrupted initialisation; reseeded"));
+    }
+
+    @Test
+    void emptyDirectoryIsNotInitialisedWhenFirstRunNotAllowed() throws Exception {
+        Path dir = updateDir();
+        StateStore store = new StateStore(dir);
+        StateUnavailableException e = assertThrows(StateUnavailableException.class,
+                () -> store.initialiseIfAbsent(seedDelta(), false));
+        assertFalse(e.revokedValid());
+        assertFalse(Files.exists(dir.resolve("state.json")));
+        assertFalse(Files.exists(dir.resolve("revoked.json")));
+    }
+
+    @Test
+    void atomicWriteRefusesContentThatFailsTheReadValidator() throws Exception {
+        Path dir = updateDir();
+        StateStore store = new StateStore(dir);
+        store.initialiseIfAbsent(seedDelta(), true);
+        byte[] before = Files.readAllBytes(dir.resolve("state.json"));
+        IOException e = assertThrows(IOException.class, () -> store.atomicWrite(StateStore.STATE,
+                "not a state file".getBytes(StandardCharsets.UTF_8), StateStore::validState,
+                new ArrayList<>()));
+        assertEquals("refusing to write an invalid state file", e.getMessage());
+        assertArrayEquals(before, Files.readAllBytes(dir.resolve("state.json")));
+        assertFalse(Files.exists(dir.resolve("state.json.tmp")));
+        assertFalse(Files.exists(dir.resolve("state.json.prev")));
+    }
+
+    @Test
     void initialiseWithCorruptRevokedAndMissingStateStaysUnavailable() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         Files.delete(dir.resolve("state.json"));
         Files.write(dir.resolve("revoked.json"), "x".getBytes(StandardCharsets.UTF_8));
         StateUnavailableException e = assertThrows(StateUnavailableException.class,
-                () -> new StateStore(dir).initialiseIfAbsent(seedDelta()));
+                () -> new StateStore(dir).initialiseIfAbsent(seedDelta(), true));
         assertFalse(e.revokedValid());
     }
 
@@ -465,7 +505,7 @@ class StateStoreTest {
             throw new IOException("fsync failed");
         });
         IOException e = assertThrows(IOException.class,
-                () -> failing.initialiseIfAbsent(seedDelta()));
+                () -> failing.initialiseIfAbsent(seedDelta(), true));
         assertEquals("fsync failed", e.getMessage());
     }
 
@@ -473,7 +513,7 @@ class StateStoreTest {
     void groupOrOtherBitsOnDirectoryAreRefused() throws Exception {
         assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxr-xr-x"));
         UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
                 () -> new StateStore(dir).load());
@@ -484,7 +524,7 @@ class StateStoreTest {
     void groupOrOtherBitsOnStateFileAreRefused() throws Exception {
         assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         Files.setPosixFilePermissions(dir.resolve("state.json"),
                 PosixFilePermissions.fromString("rw-r--r--"));
         UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
@@ -495,7 +535,7 @@ class StateStoreTest {
     @Test
     void oversizedStateFileIsTreatedAsInvalid() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         Files.write(dir.resolve("state.json"), new byte[300_000]);
         StateUnavailableException e = assertThrows(StateUnavailableException.class,
                 () -> new StateStore(dir).load());
@@ -505,7 +545,7 @@ class StateStoreTest {
     @Test
     void staleProbeFilesAreSweptButFreshOnesKept() throws Exception {
         Path dir = updateDir();
-        new StateStore(dir).initialiseIfAbsent(seedDelta());
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
         Path stale = Files.createFile(dir.resolve(".owner-stale.probe"));
         Files.setLastModifiedTime(stale,
                 java.nio.file.attribute.FileTime.from(Instant.now().minusSeconds(600)));
