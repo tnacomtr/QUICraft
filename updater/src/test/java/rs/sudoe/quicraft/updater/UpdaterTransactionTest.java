@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -859,6 +860,69 @@ class UpdaterTransactionTest {
         assertEquals(TransactionOutcome.NOT_ADMITTED, result.outcome());
         assertEquals(UpdaterTransaction.BUSY, result.messages().get(0));
         assertTrue(r.metadata.requests.isEmpty());
+    }
+
+    // ---- execute() is exception-total ------------------------------------------------------
+
+    @Test
+    void executeWhileTheCallerHoldsTheStateLockFailsWithoutThrowing() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        // TransactionLock.tryAcquire refuses a caller that holds the state lock with an IllegalStateException.
+        TransactionResult result = r.store.withLockedSnapshot(fresh -> txn.execute(request(r)));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertEquals("the update directory could not be locked", result.messages().get(0));
+        assertLiveUntouched(r);
+        assertTrue(stagingIsEmpty(r));
+        assertEquals(0, journalCount(r));
+        assertTrue(r.metadata.requests.isEmpty(), "no network before the lock is taken");
+        leaveFree(txn);
+    }
+
+    @Test
+    void nullRequestIsNotAdmittedAndLeavesTheSlotFree() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        TransactionResult result = txn.execute(null);
+        assertEquals(TransactionOutcome.NOT_ADMITTED, result.outcome());
+        assertEquals("no update request was given", result.messages().get(0));
+        leaveFree(txn);
+    }
+
+    @Test
+    void unexpectedErrorBeforeTheSwapCleansUpAndFails() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        txn.hooks.afterBackupReady = () -> {
+            throw new AssertionError("injected before the swap");
+        };
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertTrue(result.messages().get(0).startsWith("the update failed before the swap"),
+                result.messages().toString());
+        assertTrue(stagingIsEmpty(r));
+        assertEquals(0, journalCount(r));
+        assertEquals(1, backupCount(r), "the backup is kept");
+        assertLiveUntouched(r);
+        leaveFree(txn);
+    }
+
+    @Test
+    void virtualMachineErrorIsNotSwallowedAndTheSlotIsStillReleased() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        txn.hooks.afterBackupReady = () -> {
+            throw new OutOfMemoryError("injected");
+        };
+        assertThrows(OutOfMemoryError.class, () -> txn.execute(atomic(r)));
+        leaveFree(txn);
+    }
+
+    /** Asserts the active slot is free (a successful claim), then gives it back. */
+    private static void leaveFree(UpdaterTransaction txn) {
+        UpdaterTransaction.Active claimed = txn.tryEnter();
+        assertNotNull(claimed, "the active slot must be released");
+        txn.leave(claimed);
     }
 
     // ---- the pre-swap rollback line through the progress sink ------------------------------

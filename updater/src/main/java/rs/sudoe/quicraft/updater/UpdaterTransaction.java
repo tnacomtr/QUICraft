@@ -162,18 +162,28 @@ final class UpdaterTransaction {
     }
 
     /**
-     * Runs the transaction up to the point the later steps will add. Steps 4 to 6 are not written
-     * yet: a run that gets past step 3 stops with FAILED and keeps the verified staged jar, so the
-     * tests can inspect it.
+     * Runs one update command from step 1 to the installed-pending-restart step (docs/updater.md 12.10).
+     * Never throws except for a {@link VirtualMachineError}: any other runtime failure or error becomes
+     * a FAILED result. A null request is NOT_ADMITTED. The active slot is always released. Failures
+     * before the swap clean up this attempt's staging and journal (the backup is kept); a failure after
+     * the swap started deletes nothing and leaves the check to startup recovery.
      */
     TransactionResult execute(UpdateRequest req) {
-        Objects.requireNonNull(req, "req");
+        if (req == null) {
+            return TransactionResult.of(TransactionOutcome.NOT_ADMITTED, "no update request was given");
+        }
         Active mine = tryEnter();
         if (mine == null) {
             return TransactionResult.of(TransactionOutcome.NOT_ADMITTED, BUSY);
         }
         try {
             return lockedRun(req, mine);
+        } catch (VirtualMachineError e) {
+            throw e;
+        } catch (RuntimeException | Error e) {
+            return TransactionResult.of(TransactionOutcome.FAILED,
+                    "the update stopped unexpectedly: " + messageOf(e) + "; files were left in place for "
+                            + "startup recovery to check");
         } finally {
             leave(mine);
         }
@@ -185,13 +195,15 @@ final class UpdaterTransaction {
             lease = TransactionLock.tryAcquire(updateDir);
         } catch (UpdateRejectedException e) {
             return TransactionResult.of(TransactionOutcome.NOT_ADMITTED, messageOf(e));
-        } catch (IOException e) {
+        } catch (IOException | RuntimeException e) {
             return TransactionResult.of(TransactionOutcome.FAILED, "the update directory could not be locked");
         }
         Attempt a = new Attempt(req, mine);
         try {
             return runSteps(a);
-        } catch (IOException | UpdateRejectedException | RuntimeException e) {
+        } catch (VirtualMachineError e) {
+            throw e;
+        } catch (IOException | UpdateRejectedException | RuntimeException | Error e) {
             if (a.swapStarted) {
                 // Past the point of no return nothing is deleted; recovery checks the installed jar.
                 return new TransactionResult(TransactionOutcome.FAILED, Optional.ofNullable(a.txid),
@@ -670,12 +682,12 @@ final class UpdaterTransaction {
     private static void releaseQuietly(TransactionLock.TxnLease lease) {
         try {
             lease.close();
-        } catch (IOException ignored) {
+        } catch (IOException | RuntimeException ignored) {
             // The OS releases the file lock when the process exits; a busy lock is reported next time.
         }
     }
 
-    private static String messageOf(Exception e) {
+    private static String messageOf(Throwable e) {
         return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
     }
 
