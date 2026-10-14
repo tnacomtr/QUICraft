@@ -123,6 +123,7 @@ public final class Acceptance {
         Set<String> manifestVerified = new TreeSet<>();
         Map<String, VerifiedManifest> verifiedByKey = new TreeMap<>();
         List<VerifiedManifest> verifiedInOrder = new ArrayList<>();
+        List<BadManifest> badManifests = new ArrayList<>();
         for (HostEvidence ev : manifestResponses.responses()) {
             String key = ev.host().key();
             if (!configured.contains(ev.host())) {
@@ -146,6 +147,7 @@ public final class Acceptance {
                 verifiedInOrder.add(vm);
             } else {
                 diagnostics.add(key + ": manifest document rejected (" + outcome + ")");
+                badManifests.add(new BadManifest(key, Hex.sha256(pair.documentBytes())));
             }
         }
 
@@ -196,7 +198,7 @@ public final class Acceptance {
         Map<String, Instant> torn = updateTorn(
                 folded.state().tornSince(), tornNow, cleared, systemNow, diagnostics);
         StateDelta delta = new StateDelta(withTornSince(folded.state(), torn), folded.revoked());
-        return new ManifestAcceptance(delta, candidate, stateFull, diagnostics);
+        return new ManifestAcceptance(delta, candidate, stateFull, diagnostics, badManifests);
     }
 
     /** One manifest that verified under the run's trust, with the pair it came from. */

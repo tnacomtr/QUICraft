@@ -79,7 +79,7 @@ final class CheckPipeline {
         // A skipped revocations document leaves restrictions unapplied: never offer a candidate then.
         boolean stateFull = manifest.stateFull() || revocations.get().stateFull();
         return new CheckResult(mode, stateFull ? Optional.empty() : manifest.candidate(), stateFull, fresh,
-                diagnostics);
+                diagnostics, manifest.badManifests());
     }
 
     private void commitRevocations(HostCollection responses, AtomicReference<RevocationAcceptance> out)
