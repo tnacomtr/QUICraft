@@ -52,13 +52,30 @@ class UpdaterConfigTest {
     }
 
     @Test
-    void anUnknownIntervalFallsBackToTheDefaultAndNamesTheKeyOnly() throws Exception {
+    void anUnknownIntervalFailsClosedToOffAndNamesTheKeyOnly() throws Exception {
         List<String> warnings = new ArrayList<>();
         UpdaterConfig c = load("update.check-interval=weekly\n", warnings);
-        assertEquals(CheckInterval.HOURLY, c.checkInterval());
+        assertEquals(CheckInterval.OFF, c.checkInterval());
         assertEquals(1, warnings.size());
         assertTrue(warnings.get(0).contains("update.check-interval"));
         assertFalse(warnings.get(0).contains("weekly"));
+    }
+
+    @Test
+    void intervalValuesAreMatchedCaseInsensitively() throws Exception {
+        List<String> warnings = new ArrayList<>();
+        assertEquals(CheckInterval.DAILY, load("update.check-interval=DAILY\n", warnings).checkInterval());
+        assertEquals(CheckInterval.OFF, load("update.check-interval=Off\n", warnings).checkInterval());
+        assertTrue(warnings.isEmpty());
+    }
+
+    @Test
+    void aMalformedFileWarnsWithoutEchoingItsValuesAndGivesTheDefaults() throws Exception {
+        List<String> warnings = new ArrayList<>();
+        UpdaterConfig c = load("update.check-silent=\\uZZZZ\n", warnings);
+        assertEquals(UpdaterConfig.defaults(), c);
+        assertEquals(1, warnings.size());
+        assertFalse(warnings.get(0).contains("ZZZZ"));
     }
 
     @Test

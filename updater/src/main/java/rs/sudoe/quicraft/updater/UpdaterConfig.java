@@ -9,14 +9,18 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.function.Consumer;
 
 /**
  * Updater settings from a {@code .properties} file (docs/updater.md section 6). Loading only reads the
- * file: it never creates or rewrites it. A missing or unreadable file gives the defaults. An unknown
- * value gives the default for that key and one warning that names the key, never the value.
+ * file: it never creates or rewrites it. A missing file gives the defaults silently. A file that cannot
+ * be read or parsed gives the defaults with one WARN and no values echoed. An unrecognised
+ * {@code update.check-interval} value fails closed to {@link CheckInterval#OFF} with one WARN that names
+ * the key; the interval values are matched case-insensitively. Other unknown booleans keep their default
+ * with one WARN that names the key.
  */
 public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, boolean logBadSignatures) {
 
@@ -65,7 +69,7 @@ public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, bo
      * Loads the file.
      *
      * @param file the config file, possibly absent
-     * @param warnings receives one fixed line per unknown value, naming the key
+     * @param warnings receives one fixed line per problem, naming the key or the file only
      * @return the parsed settings, or the defaults
      */
     public static UpdaterConfig load(Path file, Consumer<String> warnings) {
@@ -78,6 +82,7 @@ public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, bo
         } catch (NoSuchFileException e) {
             return defaults();
         } catch (IOException | IllegalArgumentException e) {
+            warnings.accept("updater config: the file could not be read or parsed; using the defaults");
             return defaults();
         }
         CheckInterval interval = parseInterval(props.getProperty(KEY_INTERVAL), warnings);
@@ -91,7 +96,7 @@ public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, bo
         if (raw == null) {
             return CheckInterval.HOURLY;
         }
-        switch (raw.trim()) {
+        switch (raw.trim().toLowerCase(Locale.ROOT)) {
             case "hourly":
                 return CheckInterval.HOURLY;
             case "daily":
@@ -99,8 +104,8 @@ public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, bo
             case "off":
                 return CheckInterval.OFF;
             default:
-                warnings.accept("updater config: unknown value for " + KEY_INTERVAL + "; using the default");
-                return CheckInterval.HOURLY;
+                warnings.accept("updater config: unknown value for " + KEY_INTERVAL + "; checks are off");
+                return CheckInterval.OFF;
         }
     }
 
