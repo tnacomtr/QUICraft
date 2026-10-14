@@ -580,10 +580,12 @@ public final class UpdateDirectory {
     /**
      * Copies the live jar's POSIX permission bits onto the staged file, so the swapped-in jar keeps
      * the access it had before. Returns without doing anything when the default file system has no
-     * {@code posix} view. Owner and group are deliberately not touched.
+     * {@code posix} view, or when {@code live} is not a regular file (a symbolic link would give its
+     * own wide bits, not the jar's), which leaves the staged file private. Owner and group are
+     * deliberately not touched.
      */
     private static void copyPermissions(Path live, Path staged) throws IOException {
-        if (!posixSupported()) {
+        if (!posixSupported() || !Files.isRegularFile(live, LinkOption.NOFOLLOW_LINKS)) {
             return;
         }
         Files.setPosixFilePermissions(staged,

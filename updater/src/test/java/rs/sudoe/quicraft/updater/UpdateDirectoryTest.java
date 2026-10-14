@@ -14,6 +14,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
@@ -580,6 +581,27 @@ class UpdateDirectoryTest {
         assertEquals(PosixFilePermissions.fromString("rw-r--r--"),
                 Files.getPosixFilePermissions(live),
                 "panels and deploy users must still read the swapped-in jar");
+    }
+
+    @Test
+    void aSymlinkedLivePathNeverWidensTheStagedJar() throws Exception {
+        assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        UpdateDirectory d = open(DurabilityOps.system());
+        Path mods = Files.createDirectory(tmp.resolve("mods"));
+        Path target = mods.resolve("real.jar");
+        Files.write(target, new byte[] {1});
+        Files.setPosixFilePermissions(target, PosixFilePermissions.fromString("rw-------"));
+        Path live = Files.createSymbolicLink(mods.resolve("quicraft.jar"), target);
+        FileChannel ch = d.createPart(TXID);
+        ch.write(ByteBuffer.wrap(new byte[] {2, 2}));
+        d.commitPart(TXID, ch);
+
+        d.moveOverLive(TXID, live);
+
+        // The link's own bits are rwxrwxrwx; they must not reach the swapped-in jar.
+        assertArrayEquals(new byte[] {2, 2}, Files.readAllBytes(live));
+        assertEquals(PosixFilePermissions.fromString("rw-------"),
+                Files.getPosixFilePermissions(live, LinkOption.NOFOLLOW_LINKS));
     }
 
     @Test
