@@ -8,6 +8,7 @@ name: natives
 
 on:
   push:
+    branches: ["**"]
     paths:
       - "core/**"
       - "natives/**"
