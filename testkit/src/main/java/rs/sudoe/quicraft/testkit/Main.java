@@ -27,6 +27,8 @@ public final class Main {
             case "transport-client" -> TransportClient.run(Args.parse(rest));
             case "transport-summarize" -> TransportSummarize.run(Args.parse(rest));
             case "latency" -> rs.sudoe.quicraft.testkit.latency.LatencyBench.run(Args.parse(rest));
+            case "load-server" -> rs.sudoe.quicraft.testkit.load.LoadServer.run(Args.parse(rest));
+            case "load-client" -> rs.sudoe.quicraft.testkit.load.LoadClient.run(Args.parse(rest));
             default -> {
                 usage();
                 yield 2;
@@ -44,6 +46,8 @@ public final class Main {
                   transport-server     QUIC (Reno, CUBIC, BBR) and TCP servers with Minecraft-shaped traffic
                   transport-client     compare those transports: handshake, burst and play RTT
                   transport-summarize  medians and bootstrap CIs of QUIC minus TCP
-                  latency      in-process loopback ping-pong: TCP vs QUIC vs QUIC through the bridge""");
+                  latency      in-process loopback ping-pong: TCP vs QUIC vs QUIC through the bridge
+                  load-server  many-connection load spike: real QuicServer, admission limits raised unless --shipped-limits
+                  load-client  many-connection load spike: real QuicClient, one loopback source IP per connection""");
     }
 }
