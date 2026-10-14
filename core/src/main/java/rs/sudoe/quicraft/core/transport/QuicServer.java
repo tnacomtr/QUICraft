@@ -57,7 +57,10 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
  * names another socket's codec to that socket, so a packet the kernel's 4-tuple hash put on the
  * wrong socket still reaches the connection's codec. That hand-over is bounded per target socket
  * ({@link ForwardLimiter}): over the bound the datagram is released and counted, so one socket's
- * loop can never queue unbounded work on another.
+ * loop can never queue unbounded work on another. A short-header datagram that stops before the
+ * whole connection id is dropped and counted there too, because the dispatcher's own parse of it
+ * throws; anything else a datagram handler throws is swallowed by a last handler on each socket's
+ * pipeline ({@link DatagramExceptionBackstop}), which would otherwise reach Netty's tail.
  */
 public final class QuicServer implements Closeable {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -136,6 +139,24 @@ public final class QuicServer implements Closeable {
      */
     int[] droppedForwardsPerSocket() {
         AtomicIntegerArray dropped = shared.droppedForwards;
+        if (dropped == null) {
+            return new int[0];
+        }
+        int[] copy = new int[dropped.length()];
+        for (int i = 0; i < copy.length; i++) {
+            copy[i] = dropped.get(i);
+        }
+        return copy;
+    }
+
+    /**
+     * Datagrams each UDP socket dropped because they were a short header that stopped before the
+     * whole connection id, indexed in bind order; empty when the listener has a single socket, which
+     * has no dispatcher and drops none. Each such datagram is counted on the socket that read it
+     * ({@link ForwardLimiter}). Diagnostics for tests, like {@link #acceptedConnectionsPerSocket()}.
+     */
+    int[] droppedMalformedPerSocket() {
+        AtomicIntegerArray dropped = shared.droppedMalformed;
         if (dropped == null) {
             return new int[0];
         }
@@ -386,6 +407,12 @@ public final class QuicServer implements Closeable {
          * socket, which never forwards (docs/protocol.md §11).
          */
         final AtomicIntegerArray droppedForwards;
+        /**
+         * Datagrams each socket dropped because they were a short header too short for the whole
+         * connection id, in bind order; null with a single socket, which never parses an index
+         * (docs/protocol.md §11).
+         */
+        final AtomicIntegerArray droppedMalformed;
 
         Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor)
                 throws Exception {
@@ -393,6 +420,7 @@ public final class QuicServer implements Closeable {
             this.acceptor = acceptor;
             this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.droppedForwards = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
+            this.droppedMalformed = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.admission = admission(config);
             this.ingress = IngressGuard.budget(config);
             // Attempts with a valid token get their own budget; its open caps are unused.
@@ -443,6 +471,9 @@ public final class QuicServer implements Closeable {
         /** Not expected to be used; see {@link IndexedQuicConnectionIdGenerator#indexOf}. */
         private final java.util.concurrent.atomic.AtomicInteger added =
                 new java.util.concurrent.atomic.AtomicInteger();
+        /** When this listener last logged a swallowed datagram exception, in millis; one per listener. */
+        private final java.util.concurrent.atomic.AtomicLong lastSwallowedLog =
+                new java.util.concurrent.atomic.AtomicLong();
 
         SocketDispatcher(Shared shared, int sockets) {
             super(Codecs.LOCAL_CONNECTION_ID_LENGTH);
@@ -467,13 +498,15 @@ public final class QuicServer implements Closeable {
                 socketIndex = added.getAndIncrement();
             }
             ForwardLimiter limiter = new ForwardLimiter(socketIndex, localConnectionIdLength, pending,
-                    shared.droppedForwards, limiterOfSocket);
+                    shared.droppedForwards, shared.droppedMalformed, limiterOfSocket);
             // In front of this dispatcher: it sees a datagram first, and whatever it passes on is
             // dispatched exactly as before. The dispatcher is already in the pipeline here, because
             // the base class calls this from its own handlerAdded.
             String dispatcher = channel.pipeline().context(this).name();
             channel.pipeline().addBefore(dispatcher, LIMITER + "-" + socketIndex, limiter);
             channel.pipeline().addLast(codec(shared, localConnectionIdLength, idGenerator, socketIndex));
+            // Last, after the codec: nothing else on a datagram pipeline catches an exception.
+            channel.pipeline().addLast(new DatagramExceptionBackstop(lastSwallowedLog, socketIndex));
         }
     }
 
@@ -487,14 +520,23 @@ public final class QuicServer implements Closeable {
      * socket's task queue without bound: heap growth, and stalls on the loops that also serve TCP
      * players. Netty's {@code channelRead} is {@code final}, so this bound is a handler of its own,
      * installed in front of the dispatcher; a datagram it does not hand over itself (a long header,
-     * a truncated short header, a socket that is not registered yet) is passed on unchanged, so the
-     * dispatcher still decodes it, and throws for it, exactly as before.
+     * a socket that is not registered yet) is passed on unchanged, so the dispatcher still decodes
+     * it exactly as before.
      *
-     * <p>At most {@link #MAX_PENDING_FORWARDS} datagrams may be waiting on one target socket. Over
-     * that, the datagram is released here and counted in {@link Shared#droppedForwards}, never
-     * queued. Two source loops can both find room and overshoot by at most one each, so this is a
-     * bound, not an exact count. Same-loop delivery is left to the dispatcher, which fires it
-     * directly.
+     * <p>The one datagram it does not pass on is a short header that stops before the whole
+     * connection id, including a single byte and {@code 40 00}: Netty's dispatcher reads the index
+     * out of that id and its parser throws when there are too few bytes
+     * ({@code QuicHeaderParser.sliceCid}), and no handler on a datagram pipeline catches that, so the
+     * tail would log a stack trace per datagram, which any remote sender can trigger, and the buffer
+     * the throwing handler never released would leak. Such a datagram can never be decoded or
+     * delivered, so it is released here and counted in {@link Shared#droppedMalformed} against the
+     * socket that read it, and never reaches the dispatcher.
+     *
+     * <p>At most {@link #MAX_PENDING_FORWARDS} datagrams may be waiting on one target socket, counted
+     * across all source sockets. Over that, the datagram is released here and counted in
+     * {@link Shared#droppedForwards}, never queued. Two source loops can both find room and overshoot
+     * by at most one each, so this is a bound, not an exact count. Same-loop delivery is left to the
+     * dispatcher, which fires it directly.
      *
      * <p>A hand-over also has to close the target socket's read cycle. Netty's dispatcher delivers
      * a forwarded datagram by firing a read on the target's codec context, and records that it owes
@@ -514,6 +556,8 @@ public final class QuicServer implements Closeable {
     static final class ForwardLimiter extends ChannelInboundHandlerAdapter {
         /** Datagrams one loop may have handed to another and not seen processed, per target. */
         static final int MAX_PENDING_FORWARDS = 1024;
+        /** {@link #targetSocket}: a short header that stops before the whole connection id. */
+        private static final int MALFORMED = -2;
 
         /** The index the listener's ids encode for this socket; indexes {@link #limiterOfSocket}. */
         private final int socketIndex;
@@ -523,15 +567,19 @@ public final class QuicServer implements Closeable {
         private final AtomicIntegerArray pending;
         /** Drops per target socket, shared by every socket's limiter. */
         private final AtomicIntegerArray dropped;
+        /** Malformed drops per receiving socket, shared by every socket's limiter. */
+        private final AtomicIntegerArray droppedMalformed;
         /** The limiter of each socket, so a datagram can be handed to that socket's loop. */
         private final AtomicReferenceArray<ChannelHandlerContext> limiterOfSocket;
 
         ForwardLimiter(int socketIndex, int localConnectionIdLength, AtomicIntegerArray pending,
-                AtomicIntegerArray dropped, AtomicReferenceArray<ChannelHandlerContext> limiterOfSocket) {
+                AtomicIntegerArray dropped, AtomicIntegerArray droppedMalformed,
+                AtomicReferenceArray<ChannelHandlerContext> limiterOfSocket) {
             this.socketIndex = socketIndex;
             this.localConnectionIdLength = localConnectionIdLength;
             this.pending = pending;
             this.dropped = dropped;
+            this.droppedMalformed = droppedMalformed;
             this.limiterOfSocket = limiterOfSocket;
         }
 
@@ -550,6 +598,13 @@ public final class QuicServer implements Closeable {
         public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
             if (msg instanceof DatagramPacket) {
                 int target = targetSocket((DatagramPacket) msg);
+                if (target == MALFORMED) {
+                    // A short header this listener can never decode, and one the dispatcher's own
+                    // parse throws for: drop it here (see the class javadoc) rather than let the
+                    // whole pipeline log a stack trace and leak the buffer.
+                    dropMalformed(msg);
+                    return;
+                }
                 // Out of range is not a socket: hand it to the dispatcher, which answers for it the
                 // same way (an id naming a socket that does not exist goes to the local codec).
                 ChannelHandlerContext to = target < 0 || target >= limiterOfSocket.length()
@@ -565,18 +620,24 @@ public final class QuicServer implements Closeable {
         /**
          * The index the datagram's destination connection id names, decoded exactly as
          * {@link QuicCodecDispatcher} decodes it (the first two bytes of the id of a short-header
-         * packet, RFC 9000 §17.3), or -1 for a datagram this bound must not touch: a long header, or
-         * a short header with too few bytes for the whole connection id, which the dispatcher
-         * itself rejects and therefore has to see.
+         * packet, RFC 9000 §17.3); {@link #MALFORMED} for a short header that stops before the whole
+         * connection id, which the dispatcher's parser throws for; or -1 for a datagram this bound
+         * must not touch, and the dispatcher has to see: a long header, or one whose first byte it
+         * cannot read at all.
          */
         private int targetSocket(DatagramPacket packet) {
             ByteBuf content = packet.content();
             int readable = content.readableBytes();
-            if (readable <= Byte.BYTES || (content.getByte(content.readerIndex()) & 0x80) != 0) {
+            if (readable == 0) {
+                // No header byte to classify, and not a datagram this bound may drop for anyone.
+                return -1;
+            }
+            if ((content.getByte(content.readerIndex()) & 0x80) != 0) {
+                // A long header, an Initial for example: it carries no index.
                 return -1;
             }
             if (readable < Byte.BYTES + localConnectionIdLength) {
-                return -1;
+                return MALFORMED;
             }
             return content.getUnsignedShort(content.readerIndex() + Byte.BYTES);
         }
@@ -633,6 +694,58 @@ public final class QuicServer implements Closeable {
         private void drop(int target, Object msg) {
             ReferenceCountUtil.release(msg);
             dropped.incrementAndGet(target);
+        }
+
+        /**
+         * Releases a datagram that can never be decoded and counts it against the socket that read
+         * it (the only socket that could know about it: a short header truncated before the
+         * connection id has no readable index).
+         */
+        private void dropMalformed(Object msg) {
+            ReferenceCountUtil.release(msg);
+            droppedMalformed.incrementAndGet(socketIndex);
+        }
+    }
+
+    /**
+     * The last handler on every socket of a multi-socket listener: swallows what no other handler on
+     * a datagram pipeline would.
+     *
+     * <p>A datagram pipeline has no {@code exceptionCaught} of its own, and Netty's dispatcher
+     * parses the destination connection id of every short-header datagram, so a datagram its parser
+     * throws for reaches Netty's tail, which logs a stack trace per datagram and releases nothing.
+     * The bound in front of the dispatcher already drops the truncated short headers it can
+     * recognise (see {@link ForwardLimiter}); this is the backstop for whatever else a datagram
+     * handler throws, so a remote sender can never turn one packet into one logged stack trace, and
+     * at most one FINE line per minute per listener is logged instead. Installed by
+     * {@link SocketDispatcher#initChannel}, so both the core-owned and the hosted path get it.
+     *
+     * <p>One instance per socket, all sharing the listener's timestamp of its last swallowed log, so
+     * the rate limit is the listener's however many sockets it has.
+     */
+    static final class DatagramExceptionBackstop extends ChannelInboundHandlerAdapter {
+        /** At most one log line per listener per this period. */
+        static final long LOG_INTERVAL_MILLIS = java.util.concurrent.TimeUnit.MINUTES.toMillis(1);
+
+        /** This listener's last swallowed-exception log, in millis; shared by all its sockets. */
+        private final java.util.concurrent.atomic.AtomicLong lastLog;
+        /** The socket this instance sits on, for the log line. */
+        private final int socketIndex;
+
+        DatagramExceptionBackstop(java.util.concurrent.atomic.AtomicLong lastLog, int socketIndex) {
+            this.lastLog = lastLog;
+            this.socketIndex = socketIndex;
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            long now = System.currentTimeMillis();
+            long last = lastLog.get();
+            if (now - last >= LOG_INTERVAL_MILLIS && lastLog.compareAndSet(last, now)) {
+                LOG.log(Level.FINE, "a datagram on QUIC socket " + socketIndex + " was dropped: a handler threw "
+                        + "for it (at most one of these per minute per listener)", cause);
+            }
+            // Deliberately not forwarded: Netty's tail would log a stack trace per datagram.
         }
     }
 
