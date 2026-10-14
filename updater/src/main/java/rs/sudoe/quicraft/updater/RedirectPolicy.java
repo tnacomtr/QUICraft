@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.updater;
 
 import java.net.URI;
+import java.util.Set;
 
 /**
  * Decides whether a redirect hop is followed.
@@ -30,5 +31,18 @@ public interface RedirectPolicy {
      */
     static RedirectPolicy denyAll() {
         return (host, from, to) -> false;
+    }
+
+    /**
+     * The production rule (docs/updater.md 12.15): a hop may only target the release host's own
+     * origin host or one of the given CDN host names, over HTTPS, with no userinfo, no fragment, no
+     * port other than 443, and no IP literal. Every other configured host's origin is refused
+     * unless it is named here, which production never does.
+     *
+     * @param cdnHosts the extra host names whose redirect targets are followed; copied and lowercased
+     * @return the policy
+     */
+    static RedirectPolicy allowlist(Set<String> cdnHosts) {
+        return new AllowlistRedirectPolicy(cdnHosts);
     }
 }

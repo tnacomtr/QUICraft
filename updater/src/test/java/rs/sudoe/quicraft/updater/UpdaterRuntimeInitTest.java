@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.updater;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -12,7 +13,9 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
@@ -265,7 +268,7 @@ class UpdaterRuntimeInitTest {
         p.existedBeforeStart = true;
         Optional<ReleaseHosts> dev = UpdaterOrigins.resolve(
                 "modrinth=https://localhost:9001,github=https://localhost:9002,sudoe=https://localhost:9003",
-                p.log);
+                p.log).map(ReleaseSetup::hosts);
         UpdaterRuntime devRun = start(dev);
         assertFalse(devRun == production);
         assertEquals(2, p.log.lines.stream().filter(l -> l.contains("update checks send")).count());
@@ -303,6 +306,30 @@ class UpdaterRuntimeInitTest {
         Output out = check(rt);
         assertTrue(out.contains("updater disabled: " + UpdaterRuntime.REASON_INTERNAL),
                 () -> "output was " + out.snapshot());
+    }
+
+    @Test
+    void theRedirectPolicyOfEachHostKeyReachesTheFetcher() throws Exception {
+        PipelineFixtures.ScriptedFetcher fetcher = new PipelineFixtures.ScriptedFetcher();
+        Map<String, RedirectPolicy> redirects = Map.of(
+                "modrinth", (host, from, to) -> true,
+                "github", RedirectPolicy.allowlist(Set.of("release-assets.githubusercontent.com")),
+                "sudoe", RedirectPolicy.denyAll());
+        ReleaseSetup setup = new ReleaseSetup(PipelineFixtures.HOSTS, PipelineFixtures.ENDPOINTS, redirects);
+        UpdaterRuntime rt = UpdaterRuntime.start(p, new UpdaterRuntime.Seams(fetcher,
+                PipelineFixtures.CLOCK, DurabilityOps.system(), UpdaterFacadeFixtures.realExecutors(),
+                log -> Optional.of(setup)));
+        started.add(new UpdaterUnderTest(rt));
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, rt.dispatch(new String[] {"check", "-s"}, true, out::add));
+        assertTrue(rt.awaitIdle(Duration.ofSeconds(30)), "the check did not finish");
+
+        assertFalse(fetcher.requests.isEmpty(), () -> "output was " + out.snapshot());
+        for (FetchRequest request : fetcher.requests) {
+            assertSame(redirects.get(request.host().key()), request.redirects(),
+                    () -> "policy of " + request.host().key() + " did not reach " + request.uri());
+        }
     }
 
     private static boolean workerAlive() {

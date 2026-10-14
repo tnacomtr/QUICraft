@@ -207,7 +207,14 @@ final class UpdaterFacadeFixtures {
     static Seams seams(SourceFetcher fetcher, Function<ThreadFactory, ScheduledExecutorService> executors,
             Optional<ReleaseHosts> hosts) {
         return new Seams(fetcher, PipelineFixtures.CLOCK, DurabilityOps.system(), executors,
-                log -> hosts.isPresent() ? hosts : UpdaterOrigins.resolve(null, log),
+                log -> {
+                    if (hosts.isEmpty()) {
+                        // A production build always has hosts now; the fixture keeps the old line of
+                        // the no-hosts case, which is what the runtime reports as its fixed reason.
+                        log.info(UpdaterOrigins.NOT_CONFIGURED);
+                    }
+                    return hosts;
+                },
                 PipelineFixtures.ENDPOINTS);
     }
 

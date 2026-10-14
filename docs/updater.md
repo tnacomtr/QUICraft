@@ -285,7 +285,11 @@ These are requirements for the design. None is proven by implementation.
 3. Implementation and tests of the approved freshness thresholds and clock policy (12.5).
 4. Implementation and tests of the approved failed-source coverage rule: fallback never weakens
    fresh coverage (12.6).
-5. Exact endpoints, CDN redirects, and the role of `git.sudoe.rs` in source priority.
+5. Exact endpoints and CDN redirects. Resolved for the first alpha (12.15): the updater compiles in
+   the GitHub and `git.sudoe.rs` hosts; each serves the four metadata files from the
+   `updater-metadata` release of its own repository, replaced on every publish, and each artifact
+   from the release tag of its own repository. Source priority between the hosts is not implemented
+   yet.
 6. Prove the specified release sequencing and withdrawal workflow (12.7).
 7. Dedicated-server gating mechanism (section 7).
 8. Permission integration for Fabric and Velocity, and command registration.
@@ -666,7 +670,8 @@ Approved coverage policy:
 5. **Staging** (`/quicraft update`), and again at the revalidation before the swap: requires fresh
    revocation state, and at least **2 of the 3 hosts** returned, in this run, a valid revocations
    document whose SHA-256 equals the current one. Otherwise staging fails before download, the
-   installed jar is untouched, and the command says which hosts failed.
+   installed jar is untouched, and the command says which hosts failed. With the two hosts of the
+   first alpha, staging needs both.
 6. The selected entry's `sha512` must not be in `blockedArtifacts` or the persisted withdrawn set, and
    its signer must not be revoked. Checked again before the swap.
 7. A host whose document and `.sig` disagree (`payloadSha256` mismatch) is DEBUG at first; if the same
@@ -1151,13 +1156,26 @@ Both:
 ### 12.15 Dependencies on blockers not resolved here
 
 - Blocker 5: URLs per host, redirect policy, which host serves which file.
-  Settled so far: each host origin is `https://` with no path, query or fragment. Its host part is
+  Settled for the first alpha: the compiled-in hosts are `github` (`https://github.com`, repository
+  `/tnacomtr/QUICraft`) and `sudoe` (`https://git.sudoe.rs`, repository `/tna/QUICraft`). There is
+  no `modrinth` host, because Modrinth is not a publish target yet. Every host serves the four
+  metadata files from the `updater-metadata` release of its own repository, replaced on every
+  publish:
+  `<origin><repo>/releases/download/updater-metadata/release.v1.json` and the same path for
+  `release.v1.json.sig`, `revocations.v1.json` and `revocations.v1.json.sig`; an artifact comes from
+  `<origin><repo>/releases/download/<tag>/<file>`, with the tag and file name re-checked against
+  `v[0-9A-Za-z.-]{1,40}` and `[A-Za-z0-9._+-]{1,124}.jar` before they become a URL.
+  Each host origin is `https://` with no path, query or fragment. Its host part is
   a plain LDH DNS name (two or more labels of 1..63 letters, digits or hyphens, no leading or trailing
   hyphen, no IP literals, no trailing dot) or exactly `localhost` (tests only). Redirects are denied
   unless an injected policy allows them.
-  A real redirect policy (security review) allows only a fixed CDN allowlist per host, never an IP
+  The production redirect policy allows a hop only to the release host's own origin host or to a
+  fixed CDN allowlist per host (GitHub: `release-assets.githubusercontent.com` and
+  `objects.githubusercontent.com`, which is where a GitHub release download answers with a 302;
+  Forgejo answers a release download directly, so the `sudoe` allowlist is empty), never an IP
   literal and never another configured host's origin, so one origin cannot count as two hosts in the
-  2-of-3 coverage rule. Response header size is bounded only by the JDK HTTP client
+  2-of-3 coverage rule. A hop must also be absolute HTTPS with no userinfo, no fragment and no port
+  other than 443. Response header size is bounded only by the JDK HTTP client
   (`jdk.http.maxHeaderSize`); the minimum supported JDK update must have that limit, checked
   before release.
 - Blocker 9: health criteria that end `health-check-pending`.

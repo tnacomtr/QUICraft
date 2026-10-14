@@ -184,27 +184,50 @@ public final class UpdaterRuntime {
         final Clock clock;
         final DurabilityOps ops;
         final Function<ThreadFactory, ScheduledExecutorService> executors;
-        final Function<UpdaterLog, Optional<ReleaseHosts>> origins;
-        final ReleaseEndpoints endpoints;
+        final Function<UpdaterLog, Optional<ReleaseSetup>> setup;
         final Function<Path, StateStore> stores;
 
         Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
                 Function<ThreadFactory, ScheduledExecutorService> executors,
+                Function<UpdaterLog, Optional<ReleaseSetup>> setup) {
+            this(fetcher, clock, ops, executors, setup, StateStore::new);
+        }
+
+        Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
+                Function<ThreadFactory, ScheduledExecutorService> executors,
+                Function<UpdaterLog, Optional<ReleaseSetup>> setup,
+                Function<Path, StateStore> stores) {
+            this.fetcher = Objects.requireNonNull(fetcher, "fetcher");
+            this.clock = Objects.requireNonNull(clock, "clock");
+            this.ops = Objects.requireNonNull(ops, "ops");
+            this.executors = Objects.requireNonNull(executors, "executors");
+            this.setup = Objects.requireNonNull(setup, "setup");
+            this.stores = Objects.requireNonNull(stores, "stores");
+        }
+
+        /**
+         * Tests that inject hosts and endpoints separately get the empty redirect map, so a host key
+         * missing from it is refused every hop ({@link RedirectPolicy#denyAll()}).
+         */
+        Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
+                Function<ThreadFactory, ScheduledExecutorService> executors,
                 Function<UpdaterLog, Optional<ReleaseHosts>> origins, ReleaseEndpoints endpoints) {
-            this(fetcher, clock, ops, executors, origins, endpoints, StateStore::new);
+            this(fetcher, clock, ops, executors, fromOrigins(origins, endpoints));
         }
 
         Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
                 Function<ThreadFactory, ScheduledExecutorService> executors,
                 Function<UpdaterLog, Optional<ReleaseHosts>> origins, ReleaseEndpoints endpoints,
                 Function<Path, StateStore> stores) {
-            this.fetcher = Objects.requireNonNull(fetcher, "fetcher");
-            this.clock = Objects.requireNonNull(clock, "clock");
-            this.ops = Objects.requireNonNull(ops, "ops");
-            this.executors = Objects.requireNonNull(executors, "executors");
-            this.origins = Objects.requireNonNull(origins, "origins");
-            this.endpoints = Objects.requireNonNull(endpoints, "endpoints");
-            this.stores = Objects.requireNonNull(stores, "stores");
+            this(fetcher, clock, ops, executors, fromOrigins(origins, endpoints), stores);
+        }
+
+        private static Function<UpdaterLog, Optional<ReleaseSetup>> fromOrigins(
+                Function<UpdaterLog, Optional<ReleaseHosts>> origins, ReleaseEndpoints endpoints) {
+            Objects.requireNonNull(origins, "origins");
+            Objects.requireNonNull(endpoints, "endpoints");
+            return log -> origins.apply(log)
+                    .map(hosts -> new ReleaseSetup(hosts, endpoints, Map.of()));
         }
 
         /**
@@ -215,8 +238,7 @@ public final class UpdaterRuntime {
             return new Seams(HttpSourceFetcher.create(), Clock.tickSeconds(ZoneOffset.UTC),
                     DurabilityOps.system(),
                     Executors::newSingleThreadScheduledExecutor,
-                    log -> UpdaterOrigins.resolve(System.getProperty(UpdaterOrigins.PROPERTY), log),
-                    new DevReleaseEndpoints());
+                    log -> UpdaterOrigins.resolve(System.getProperty(UpdaterOrigins.PROPERTY), log));
         }
     }
 
@@ -980,7 +1002,8 @@ public final class UpdaterRuntime {
             boolean dirExisted = p.updateDirExistedBeforeStart();
             dir = Objects.requireNonNull(p.updateDir(), "updateDir");
             config = UpdaterConfig.load(p.configFile(), log::warn);
-            hosts = s.origins.apply(log).orElse(null);
+            ReleaseSetup release = s.setup.apply(log).orElse(null);
+            hosts = release == null ? null : release.hosts();
 
             LiveJarDiscovery discovery = p.discovery();
             try {
@@ -1057,12 +1080,12 @@ public final class UpdaterRuntime {
 
             InitBarrier barrier = ready::get;
             ready.set(true);
-            if (hosts != null) {
-                MetadataCollector collector = new MetadataCollector(s.fetcher, s.endpoints, Map.of(),
-                        FetchTimeouts.defaults());
+            if (release != null) {
+                MetadataCollector collector = new MetadataCollector(s.fetcher, release.endpoints(),
+                        release.redirects(), FetchTimeouts.defaults());
                 pipeline = new CheckPipeline(store, collector, hosts, identity, s.clock);
-                txn = new UpdaterTransaction(dir, s.ops, store, pipeline, s.fetcher, s.endpoints, Map.of(),
-                        FetchTimeouts.defaults(), discovery, barrier, s.clock);
+                txn = new UpdaterTransaction(dir, s.ops, store, pipeline, s.fetcher, release.endpoints(),
+                        release.redirects(), FetchTimeouts.defaults(), discovery, barrier, s.clock);
             }
 
             disclose();
