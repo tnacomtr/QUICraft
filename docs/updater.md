@@ -73,6 +73,9 @@ Console, RCON, or an operator (Fabric: any player on the server's OP list; Veloc
   `/execute` cannot widen this: the command needs both the source that typed it and the source it runs
   as to be allowed. Live check on 26.1.2: the console's `execute as <non-op>` is refused, and a command
   block's `execute as <op>` is refused when the command is parsed.
+  Every OP-list entry, level 1 included, can stage and cancel updates, so give op only to people you
+  trust with server maintenance. In offline mode, or on a backend reachable without proxy forwarding,
+  anyone can join under an operator's name and pass this check.
 
 ## 4. Keys, freshness, and revocation
 
