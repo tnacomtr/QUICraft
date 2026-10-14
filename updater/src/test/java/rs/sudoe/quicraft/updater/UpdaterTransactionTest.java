@@ -852,6 +852,31 @@ class UpdaterTransactionTest {
     }
 
     @Test
+    void liveJarRewrittenAfterBackupReadyStopsTheSwapBeforeTheFlip() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        byte[] rewritten = "a different live jar, written by someone else".getBytes(
+                java.nio.charset.StandardCharsets.UTF_8);
+        boolean[] flipped = {false};
+        txn.hooks.afterBackupReady = () -> {
+            try {
+                Files.write(r.live, rewritten);
+            } catch (IOException e) {
+                throw new IllegalStateException(e);
+            }
+        };
+        txn.hooks.afterSwapFlip = () -> flipped[0] = true;
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertEquals(UpdaterTransaction.LIVE_CHANGED, result.messages().get(0));
+        assertFalse(flipped[0], "the flip never starts");
+        assertArrayEquals(rewritten, Files.readAllBytes(r.live), "the live jar is left as the other party wrote it");
+        assertTrue(stagingIsEmpty(r));
+        assertEquals(0, journalCount(r));
+        assertEquals(0, backupCount(r), "this attempt's backup is removed");
+    }
+
+    @Test
     void concurrentExecuteIsRefusedWhileATransactionIsActive() throws Exception {
         Rig r = standardRig();
         UpdaterTransaction txn = txn(r);

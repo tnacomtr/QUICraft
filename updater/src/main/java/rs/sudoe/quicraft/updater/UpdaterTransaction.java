@@ -64,6 +64,7 @@ final class UpdaterTransaction {
     static final String BLOCKED = "the staged jar is blocked by a revocation";
     static final String WITHDRAWN = "the staged jar was withdrawn";
     static final String STAGED_CHANGED = "the staged jar changed after verification";
+    static final String LIVE_CHANGED = "the live jar changed during the update; nothing was installed";
     static final String NOTHING_MOVED_TEXT = "the swap did not happen; nothing was installed";
     static final String RECOVERY_TEXT = "the swap may have started; nothing was deleted; recovery will check the "
             + "installed jar at next start";
@@ -476,6 +477,10 @@ final class UpdaterTransaction {
                         Optional.empty(), backup, out);
             case CANCELLED:
                 return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
+            case LIVE_CHANGED:
+                // Nothing moved; this attempt's backup is not needed either.
+                a.dir.deleteBackup(a.txid);
+                return abort(a, TransactionOutcome.FAILED, LIVE_CHANGED);
             case NOTHING_MOVED:
                 // The move did not happen, so the backup this attempt created is not needed.
                 a.dir.deleteBackup(a.txid);
@@ -492,6 +497,9 @@ final class UpdaterTransaction {
             return new Swap(SwapKind.REJECTED, List.of(rejection));
         }
         hooks.beforeSwapFlip.run();
+        if (!liveUnchanged(a)) {
+            return new Swap(SwapKind.LIVE_CHANGED, List.of(LIVE_CHANGED));
+        }
         if (!a.active.phase.compareAndSet(Phase.RUNNING, Phase.SWAPPING)) {
             return new Swap(SwapKind.CANCELLED, List.of(CANCELLED_BEFORE_SWAP));
         }
@@ -609,9 +617,22 @@ final class UpdaterTransaction {
         return new Swap(SwapKind.INSTALLED, out);
     }
 
+    /**
+     * True when the live jar still has the SHA-512 this process read at step 1. A read failure counts as
+     * a change: the swap is refused when the live jar cannot be checked.
+     */
+    private static boolean liveUnchanged(Attempt a) {
+        try {
+            return a.live.sha512().equals(UpdateDirectory.sha512Of(a.live.realPath()));
+        } catch (IOException readFailure) {
+            return false;
+        }
+    }
+
     private enum SwapKind {
         REJECTED,
         CANCELLED,
+        LIVE_CHANGED,
         NOTHING_MOVED,
         INSTALLED,
         KEPT
