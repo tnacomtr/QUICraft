@@ -348,6 +348,33 @@ class UpdaterRuntimeCommandTest {
     }
 
     @Test
+    void aResetThatPublishesItsTokenAfterShutdownStartsTouchesNoState() throws Exception {
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        AtomicInteger fetches = new AtomicInteger();
+        fetcher.onFetch = uri -> fetches.incrementAndGet();
+        UpdaterFacadeFixtures.QueuedExecutor executor = new UpdaterFacadeFixtures.QueuedExecutor();
+        p.existedBeforeStart = false;
+        rt = UpdaterRuntime.start(p, new UpdaterRuntime.Seams(fetcher, PipelineFixtures.CLOCK,
+                DurabilityOps.system(), factory -> executor, log -> UpdaterFacadeFixtures.testHosts(),
+                PipelineFixtures.ENDPOINTS));
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true, "reset-state"));
+        assertEquals(1, executor.queuedCount(), "the reset waits for the test");
+
+        // shutdown runs to its end while the reset has published no token, so there is none to cancel.
+        rt.shutdown();
+        executor.runQueued();
+
+        assertEquals(0, fetches.get(), "a reset that sees the stopping flag never refetches");
+        assertFalse(out.contains("state.json rebuilt"), () -> "output was " + out.snapshot());
+        assertTrue(out.contains(UpdaterRuntime.STOPPING_TEXT), () -> "output was " + out.snapshot());
+
+        TransactionLock.TxnLease lease = TransactionLock.tryAcquire(p.updateDir);
+        lease.close();
+    }
+
+    @Test
     void aScheduledTickInVerboseModeLogsEveryResultAtInfo() throws Exception {
         Files.writeString(p.configFile, "update.check-silent=false\n");
         start(new ScriptedFetcher());

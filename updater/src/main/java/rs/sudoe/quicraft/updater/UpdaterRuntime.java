@@ -624,6 +624,13 @@ public final class UpdaterRuntime {
         MutableCancelToken token = new MutableCancelToken();
         resetToken = token;
         try {
+            if (stopping) {
+                // shutdown ran between the lease and this publish, so it saw no token to cancel: the reset
+                // cancels itself here instead of resetting state while the runtime is stopping.
+                token.cancel();
+                emit(out, STOPPING_TEXT);
+                return;
+            }
             if (Files.exists(updateDir.resolve(UpdateDirectory.JOURNAL), LinkOption.NOFOLLOW_LINKS)) {
                 emit(out, RESET_JOURNAL);
                 return;
