@@ -103,4 +103,5 @@ each release of the plugin.
   rejoin was acted on (2026-10-11: real 26.1.2 Fabric client, offline mode, first join over QUIC
   in the world after 1744 ms, 0-RTT rejoin after 551 ms, count 0 then 1).
 - `Settings`: `enabled`, `port` (0 = game port), `alternative-port` (0 = game port + 1, used
-  when `[query]` is on the same UDP port).
+  when `[query]` is on the same UDP port), `udp-sockets` (`auto` or 1..64: SO_REUSEPORT sockets on Velocity's worker
+  loops, Linux only; see docs/server-security.md).

@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.server;
 
-import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFactory;
 import io.netty.channel.ChannelHandler;
-import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.EventLoop;
 import io.netty.channel.socket.DatagramChannel;
@@ -45,11 +43,14 @@ public final class ServerQuic {
     private final QuicServer server;
     private final Advertisement advertisement;
     private final FallbackReport.Log fallbackLog;
+    /** UDP sockets the listener bound, for the startup line. */
+    private final int sockets;
 
-    private ServerQuic(QuicServer server, Advertisement advertisement, int port) {
+    private ServerQuic(QuicServer server, Advertisement advertisement, int port, int sockets) {
         this.server = server;
         this.advertisement = advertisement;
         this.fallbackLog = new FallbackReport.Log(port);
+        this.sockets = sockets;
     }
 
     private static final java.util.concurrent.atomic.AtomicInteger FALLBACK_REPORTS =
@@ -116,9 +117,10 @@ public final class ServerQuic {
             InetSocketAddress udp = address != null ? new InetSocketAddress(address, quicPort)
                     : new InetSocketAddress(quicPort);
             ServerIdentity identity = ServerIdentity.loadOrCreate(dir);
-            current = bind(minecraft, udp, identity, init);
-            QuicraftFabric.LOG.info("QUICraft: QUIC listening on UDP {} (fingerprint {}); open this UDP port in your "
-                    + "firewall", current.server.localAddress(), identity.fingerprint());
+            current = bind(minecraft, udp, identity, init, settings.udpSockets());
+            QuicraftFabric.LOG.info("QUICraft: QUIC listening on UDP {} with {} socket(s) (fingerprint {}); open this "
+                    + "UDP port in your firewall", current.server.localAddress(), current.sockets,
+                    identity.fingerprint());
         } catch (Throwable t) {
             // docs/protocol.md §2: one WARN, no advertisement, TCP keeps running.
             QuicraftFabric.LOG.warn("QUICraft: QUIC disabled, players connect over TCP as usual: {}", t.toString());
@@ -127,20 +129,22 @@ public final class ServerQuic {
     }
 
     private static ServerQuic bind(MinecraftServer minecraft, InetSocketAddress udp, ServerIdentity identity,
-            ChannelInitializer<Channel> init) throws Exception {
-        // The group vanilla's TCP listener runs on; QUIC players share one of its loops.
+            ChannelInitializer<Channel> init, int udpSockets) throws Exception {
+        // The group vanilla's TCP listener runs on; QUIC players share its loops, one UDP socket
+        // per loop with SO_REUSEPORT so the server's QUIC work spreads over several of them
+        // (docs/protocol.md §11). bindHosted fails safe: one socket wherever several are not
+        // possible, and only a failure to bind the first one throws.
         EventLoopGroupHolder holder = EventLoopGroupHolder.remote(minecraft.useNativeTransport());
-        EventLoop loop = holder.eventLoopGroup().next();
         ChannelFactory<? extends DatagramChannel> datagrams = GameHost.datagramChannelsLike(holder.channelCls());
-        DatagramChannel socket = (DatagramChannel) new Bootstrap().group(loop).channelFactory(datagrams)
-                .handler(new ChannelInboundHandlerAdapter()).bind(udp).sync().channel();
+        GameHost.HostedSockets sockets = GameHost.bindHosted(holder.eventLoopGroup(), udpSockets, udp, datagrams);
         try {
-            QuicServer server = QuicServer.bind(GameHost.loop(loop), GameHost.socket(socket), identity,
-                    TransportConfig.DEFAULT, stream -> accept(stream, init, loop));
+            QuicServer server = QuicServer.bind(sockets.hostLoops(), sockets.hostSockets(), identity,
+                    TransportConfig.DEFAULT, stream -> accept(stream, init, sockets.acceptingLoop()));
             return new ServerQuic(server, Advertisement.v1(server.localAddress().getPort(), identity.fingerprint()),
-                    server.localAddress().getPort());
+                    server.localAddress().getPort(), sockets.size());
         } catch (Exception | Error e) {
-            socket.close();
+            // Core closes the sockets it registered; this covers a failure before it did.
+            sockets.close();
             throw e;
         }
     }

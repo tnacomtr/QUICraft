@@ -17,6 +17,18 @@ and security review. Do not rely on any limit here until the Phase 4 gates in
     `config/quicraft/server.properties`; `0` means game port + 1.
   - If the bind fails, the server logs a warning and runs TCP-only. Startup is never failed over it
     (`docs/protocol.md` section 2).
+- **SO_REUSEPORT shares the QUIC port with the same user.** On Linux the listener binds several UDP
+  sockets to the QUIC port with SO_REUSEPORT (`docs/protocol.md` section 11), one per game event loop,
+  because one event loop thread per listener does not reach the scale target in `CLAUDE.md`. How many
+  is `udp-sockets` in the platform's own config (`plugins/quicraft/config.properties` for Velocity,
+  `config/quicraft/server.properties` for the Fabric dedicated server): `auto` (the default) is one
+  per CPU core, at most 16, and 1..64 is that many. Any other process **of the same user** can bind
+  the same address and port with SO_REUSEPORT and receive a share of the players' UDP packets. A
+  process of a different user cannot. Run the server under its own user account and do not share that
+  account with anything untrusted. A value above 1 is ignored, and one socket is bound, where several
+  are impossible: any platform other than Linux (macOS and the BSDs do not balance unicast UDP over
+  such sockets and Windows has no SO_REUSEPORT), a transport without SO_REUSEPORT, or the option
+  being refused. The listener logs one INFO line with the socket count it bound at startup.
 - The server never intercepts query traffic.
 
 ## 2. Firewall rules

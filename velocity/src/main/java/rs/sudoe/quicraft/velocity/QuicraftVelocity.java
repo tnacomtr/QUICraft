@@ -321,7 +321,7 @@ public final class QuicraftVelocity {
         workers = transport.createEventLoopGroup(TransportType.Type.WORKER);
         try {
             listener = QuicListener.bind(udp, identity, TransportConfig.DEFAULT, holder, workers,
-                    datagramChannels(transport), logger);
+                    datagramChannels(transport), settings.udpSockets(), logger);
         } catch (Exception e) {
             // docs/protocol.md §2: one WARN, no advertisement, TCP keeps running.
             logger.warn("QUICraft: could not bind UDP {} for QUIC ({}); not advertising QUIC, TCP only",
@@ -335,8 +335,8 @@ public final class QuicraftVelocity {
         holder.set(new AdvertisingInitializer(holder.get(), advertiser, logger));
         fallbackLog = new FallbackReport.Log(listener.localAddress().getPort());
         proxy.getChannelRegistrar().register(FALLBACK_CHANNEL);
-        logger.info("QUICraft: QUIC listening on UDP {} (fingerprint {}); open this UDP port in your firewall",
-                listener.localAddress(), identity.fingerprint());
+        logger.info("QUICraft: QUIC listening on UDP {} with {} socket(s) (fingerprint {}); open this UDP port in "
+                + "your firewall", listener.localAddress(), listener.socketCount(), identity.fingerprint());
         return true;
     }
 

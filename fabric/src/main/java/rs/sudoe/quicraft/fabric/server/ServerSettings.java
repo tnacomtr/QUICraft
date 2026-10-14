@@ -8,10 +8,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Properties;
+import rs.sudoe.quicraft.bridge.GameHost;
+import rs.sudoe.quicraft.core.transport.QuicServer;
 
 /** {@code config/quicraft/server.properties}. Missing or invalid values fall back to defaults. */
-record ServerSettings(boolean enabled, int port, int alternativePort) {
+record ServerSettings(boolean enabled, int port, int alternativePort, String udpSocketsSetting) {
     static final String FILE = "server.properties";
+    static final String UDPS_SOCKETS_DEFAULT = "auto";
 
     private static final String TEMPLATE = """
             # QUICraft dedicated server. TCP is never affected by anything here.
@@ -27,6 +30,13 @@ record ServerSettings(boolean enabled, int port, int alternativePort) {
 
             # Used when the query listener takes the game port. 0 = server-port + 1.
             alternative-port=0
+
+            # UDP sockets the QUIC listener binds, one per game worker loop, each with
+            # SO_REUSEPORT, so a busy server spreads QUIC over several threads instead of one
+            # (docs/protocol.md section 11). "auto" = one per CPU core, at most 16, where
+            # SO_REUSEPORT balances UDP (Linux); 1..64 = that many. One socket everywhere several
+            # are impossible (another OS, a transport without SO_REUSEPORT, the option refused).
+            udp-sockets=auto
             """;
 
     /** Reads the file, writing the commented default first if there is none. */
@@ -43,7 +53,17 @@ record ServerSettings(boolean enabled, int port, int alternativePort) {
             p.load(r);
         }
         return new ServerSettings(!"false".equalsIgnoreCase(p.getProperty("enabled", "true").trim()),
-                port(p, "port"), port(p, "alternative-port"));
+                port(p, "port"), port(p, "alternative-port"),
+                p.getProperty("udp-sockets", UDPS_SOCKETS_DEFAULT).trim());
+    }
+
+    /**
+     * UDP sockets the QUIC listener binds: {@code "auto"} is
+     * {@link QuicServer#defaultSocketCount()} (one per CPU core, at most 16, on Linux), 1..64 is
+     * that many, and anything else is {@code "auto"} with one warning (docs/protocol.md §11).
+     */
+    int udpSockets() {
+        return GameHost.socketCount(udpSocketsSetting);
     }
 
     private static int port(Properties p, String key) {

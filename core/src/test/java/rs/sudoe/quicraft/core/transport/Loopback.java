@@ -29,7 +29,12 @@ final class Loopback {
 
     static QuicServer echoServer(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
             CompletableFuture<QuicByteStream> accepted) throws Exception {
-        return QuicServer.bind(address, identity, config, stream -> {
+        return QuicServer.bind(address, identity, config, echo(accepted));
+    }
+
+    /** The echo acceptor on its own, so a test can bind one listener on several sockets. */
+    static QuicServer.StreamAcceptor echo(CompletableFuture<QuicByteStream> accepted) {
+        return stream -> {
             accepted.complete(stream);
             stream.setListener(new QuicByteStream.Listener() {
                 @Override
@@ -45,7 +50,7 @@ final class Loopback {
                 public void onClosed(Throwable cause) {}
             });
             stream.setAutoRead(true);
-        });
+        };
     }
 
     /** Collects received bytes; {@link #await} waits for a byte count. */
