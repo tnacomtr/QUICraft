@@ -558,6 +558,9 @@ public final class UpdaterRuntime {
      * Announces a valid newer release once per version. The version is recorded as {@code lastAnnounced}
      * only after the admins were told, so a failed notice is retried by the next check.
      *
+     * <p>The delivered notice is logged before that state write, so a failed write never loses the record
+     * of a notice the admins already received.
+     *
      * <p>Delivery is at-least-once: a crash between {@link UpdaterPlatform#notifyAdmins} and the commit repeats
      * the notice on the next start.
      */
@@ -575,10 +578,12 @@ public final class UpdaterRuntime {
         if (!notifyAdmins(notice)) {
             return;
         }
+        // The notice is delivered, so it is logged before the state write: a failed commit still leaves the
+        // delivered notice in the log, and the version is not recorded, so the next check re-announces it.
+        silentLine(Level.INFO, notice, out, scheduled);
         store.commit(snap -> version.equals(snap.state().lastAnnounced())
                 ? snap
                 : new Snapshot(withLastAnnounced(snap.state(), version), snap.revoked()));
-        silentLine(Level.INFO, notice, out, scheduled);
     }
 
     private static UpdaterState withLastAnnounced(UpdaterState s, String version) {
@@ -624,6 +629,13 @@ public final class UpdaterRuntime {
         MutableCancelToken token = new MutableCancelToken();
         resetToken = token;
         try {
+            if (stopping) {
+                // shutdown ran between the lease and this publish, so it saw no token to cancel: the reset
+                // cancels itself here instead of resetting state while the runtime is stopping.
+                token.cancel();
+                emit(out, STOPPING_TEXT);
+                return;
+            }
             if (Files.exists(updateDir.resolve(UpdateDirectory.JOURNAL), LinkOption.NOFOLLOW_LINKS)) {
                 emit(out, RESET_JOURNAL);
                 return;
@@ -676,10 +688,22 @@ public final class UpdaterRuntime {
             case INFO -> {
                 infoSafe(text);
                 if (!scheduled) {
-                    emit(out, text);
+                    emitLogged(out, text);
                 }
             }
             default -> warnSafe(log, text);
+        }
+    }
+
+    /**
+     * Sends a row the log already holds to the command sink. A player's {@link PlayerOutput} would log it a
+     * second time, so it is told the row is logged already; every other sink gets it as usual.
+     */
+    private static void emitLogged(Consumer<String> out, String text) {
+        if (out instanceof PlayerOutput player) {
+            player.preLogged(text);
+        } else {
+            emit(out, text);
         }
     }
 
@@ -700,6 +724,18 @@ public final class UpdaterRuntime {
         @Override
         public void accept(String line) {
             infoSafe(OUTPUT_LOG_PREFIX + line);
+            deliver(line);
+        }
+
+        /**
+         * Delivers a line the log already recorded, without logging it a second time. The disclosure
+         * filter is the same as {@link #accept}: the invoker reads it or the one redacted line.
+         */
+        void preLogged(String line) {
+            deliver(line);
+        }
+
+        private void deliver(String line) {
             if (visibleToPlayer(line)) {
                 emit(inner, line);
             } else if (redacted.compareAndSet(false, true)) {
