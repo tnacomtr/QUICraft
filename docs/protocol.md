@@ -512,10 +512,20 @@ connection: the dispatcher reads the destination connection id of a short-header
 the index and forwards the datagram to that socket's codec, on that socket's loop. Long headers,
 an Initial for example, always go to the socket that received them, and that socket then chooses
 the connection id the client uses. Because that forwarding crosses loops (it is one queued task on
-the target loop per datagram), it is bounded: a socket hands over at most 1024 datagrams to one
-target socket at a time (`QuicServer.ForwardLimiter.MAX_PENDING_FORWARDS`). Over that the datagram
-is released and counted per target socket, so a client that names one socket from many source ports
-can slow that socket down but cannot grow its queue without bound.
+the target loop per datagram), it is bounded: at most 1024 datagrams may be pending per target
+socket at a time (`QuicServer.ForwardLimiter.MAX_PENDING_FORWARDS`), counted across all source
+sockets, plus at most one per source socket (each source socket measures the count and increments
+it on its own loop). Over that the datagram is
+released and counted per target socket, so a client that names one socket from many source ports
+can slow that socket down but cannot grow its queue without bound. One datagram never reaches the
+dispatcher at all: a short header that stops before the whole connection id (`40`, `40 00`, or a
+header without the full 20-byte id) is one the dispatcher's own parser throws for
+(`QuicHeaderParser.sliceCid`), and no handler on a datagram pipeline catches that, so Netty's tail
+would log a stack trace and leak the datagram, once per datagram, for anything a remote sender
+cares to send. The bound releases such a datagram and counts it against the socket that read it
+(`QuicServer.droppedMalformedPerSocket`), and a last handler on every socket of a multi-socket
+listener (`QuicServer.DatagramExceptionBackstop`) swallows whatever else a datagram handler throws,
+logging at most one FINE line a minute per listener instead of a stack trace per datagram.
 
 Only the sockets and their loops are multiplied. Admission (attempt budgets, open-connection
 leases, Retry), the Retry HMAC key and its token handler, the ingress datagram budget, the 0-RTT
