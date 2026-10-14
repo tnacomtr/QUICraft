@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.releasetool;
 
 import java.io.PrintStream;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -11,6 +12,7 @@ import java.util.TreeSet;
 import rs.sudoe.quicraft.updater.DocumentParser;
 import rs.sudoe.quicraft.updater.EnvelopeStatus;
 import rs.sudoe.quicraft.updater.EnvelopeVerification;
+import rs.sudoe.quicraft.updater.FreshnessPolicy;
 import rs.sudoe.quicraft.updater.KeyRole;
 import rs.sudoe.quicraft.updater.SignatureVerifier;
 import rs.sudoe.quicraft.updater.TrustSnapshot;
@@ -26,9 +28,11 @@ import rs.sudoe.quicraft.updater.VerifiedSigner;
  * <p>It checks, in order: that the payload is a valid release manifest or revocations document; that
  * the envelope parses and its {@code payloadSha256} matches the exact payload bytes; that at least
  * one signature verifies under a trusted, non-revoked key holding the role the document type
- * requires ({@code release} for a manifest, {@code revocation} for revocations); and that the
- * document has not expired at {@code --now}. It exits non-zero on any failure and prints which kid
- * verified.
+ * requires ({@code release} for a manifest, {@code revocation} for revocations); that the document's
+ * lifetime obeys the updater's own rule for its type, {@code issued < expires} and at most 45 days
+ * for a manifest or 400 days for revocations ({@link FreshnessPolicy#structuralTimesValid}); and
+ * that the document has not expired at {@code --now} ({@link FreshnessPolicy#unexpired}). It exits
+ * non-zero on any failure and prints which kid verified.
  */
 final class Verify {
 
@@ -89,7 +93,16 @@ final class Verify {
             return ReleaseTool.EXIT_FAILED;
         }
 
-        if (!payload.expires().isAfter(now)) {
+        if (!FreshnessPolicy.structuralTimesValid(payload.issued(), payload.expires(),
+                payload.maxLifetime())) {
+            err.println("release-tool: the " + payload.description() + " has an invalid lifetime:"
+                    + " issued " + Timestamps.formatUnchecked(payload.issued()) + ", expires "
+                    + Timestamps.formatUnchecked(payload.expires()) + " (the updater requires"
+                    + " issued < expires and at most " + payload.maxLifetime().toDays() + " days)");
+            return ReleaseTool.EXIT_FAILED;
+        }
+
+        if (!FreshnessPolicy.unexpired(payload.expires(), now)) {
             err.println("release-tool: the " + payload.description() + " expired at "
                     + Timestamps.formatUnchecked(payload.expires()) + " (now "
                     + Timestamps.formatUnchecked(now) + ")");
@@ -112,8 +125,14 @@ final class Verify {
         return String.join(",", new TreeSet<>(names));
     }
 
-    /** The parsed payload with the policy facts the type decides. */
-    private record Payload(String description, KeyRole requiredRole, long seq, Instant expires) {
+    /**
+     * The parsed payload with the policy facts the type decides. {@code issued} is kept because the
+     * lifetime rules ({@link FreshnessPolicy#structuralTimesValid}) need it, and the
+     * {@link DocumentParser} deliberately does not enforce them.
+     */
+    private record Payload(
+            String description, KeyRole requiredRole, long seq, Instant issued, Instant expires,
+            Duration maxLifetime) {
     }
 
     /**
@@ -123,12 +142,13 @@ final class Verify {
     private static Payload parsePayload(byte[] bytes) throws UpdateRejectedException {
         try {
             UpdateDocuments.ReleaseManifest release = DocumentParser.parseRelease(bytes);
-            return new Payload("release manifest", KeyRole.RELEASE, release.seq(),
-                    release.expires());
+            return new Payload("release manifest", KeyRole.RELEASE, release.seq(), release.issued(),
+                    release.expires(), FreshnessPolicy.MANIFEST_MAX_LIFETIME);
         } catch (UpdateRejectedException notRelease) {
             UpdateDocuments.Revocations revocations = DocumentParser.parseRevocations(bytes);
             return new Payload("revocations document", KeyRole.REVOCATION, revocations.seq(),
-                    revocations.expires());
+                    revocations.issued(), revocations.expires(),
+                    FreshnessPolicy.REVOCATIONS_MAX_LIFETIME);
         }
     }
 }

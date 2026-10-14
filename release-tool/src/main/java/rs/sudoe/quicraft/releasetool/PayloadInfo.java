@@ -39,9 +39,18 @@ final class PayloadInfo {
         out.println("size: " + bytes.length);
         out.println("sha256: " + Hexes.sha256Hex(bytes));
         for (UpdateDocuments.TrustedKey key : trust.keys()) {
-            out.println("openssl pkeyutl -sign -inkey <private-key.pem> -rawin -in " + name
-                    + " -out " + name + "." + key.kid() + ".sigbin");
+            out.println("openssl pkeyutl -sign -inkey <private-key.pem> -rawin -in " + quote(name)
+                    + " -out " + quote(name + "." + key.kid() + ".sigbin"));
         }
         return ReleaseTool.EXIT_OK;
+    }
+
+    /**
+     * POSIX shell-quoting of one filename for the printed command line: the whole name goes inside
+     * {@code '...'} and an embedded {@code '} becomes {@code '\''}. A name with a space, a
+     * {@code $}, a backtick or a {@code ;} therefore reaches OpenSSL as one literal argument.
+     */
+    private static String quote(String name) {
+        return "'" + name.replace("'", "'\\''") + "'";
     }
 }
