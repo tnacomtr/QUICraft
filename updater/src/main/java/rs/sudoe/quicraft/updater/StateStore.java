@@ -17,6 +17,7 @@ import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -485,12 +486,25 @@ public final class StateStore {
         Instant cutoff = Instant.now().minusSeconds(PROBE_STALE_SECONDS);
         try (DirectoryStream<Path> probes = Files.newDirectoryStream(dir, ".owner-*.probe")) {
             for (Path probe : probes) {
-                if (Files.isRegularFile(probe, LinkOption.NOFOLLOW_LINKS)
-                        && Files.getLastModifiedTime(probe, LinkOption.NOFOLLOW_LINKS)
-                                .toInstant().isBefore(cutoff)) {
-                    Files.deleteIfExists(probe);
-                }
+                deleteIfStale(probe, cutoff);
             }
+        }
+    }
+
+    /**
+     * Deletes one probe older than {@code cutoff}. The sweep runs before the in-process guard, so
+     * another thread may delete its own fresh probe between the listing and the timestamp read; a
+     * probe that vanished is simply gone.
+     */
+    static void deleteIfStale(Path probe, Instant cutoff) throws IOException {
+        try {
+            BasicFileAttributes attrs =
+                    Files.readAttributes(probe, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (attrs.isRegularFile() && attrs.lastModifiedTime().toInstant().isBefore(cutoff)) {
+                Files.deleteIfExists(probe);
+            }
+        } catch (NoSuchFileException gone) {
+            // Deleted concurrently by the thread that created it.
         }
     }
 

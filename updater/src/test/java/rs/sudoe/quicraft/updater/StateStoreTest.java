@@ -297,6 +297,42 @@ class StateStoreTest {
         assertEquals(Map.of(KID_1, 1L, KID_2, 2L), seqs(finalState));
     }
 
+    @Test
+    void concurrentPreparationsToleratePeerProbesVanishing() throws Exception {
+        // Each operation creates and deletes an owner probe before taking the in-process guard,
+        // while sweeping the probes it lists; a peer's probe may vanish in between.
+        Path dir = updateDir();
+        new StateStore(dir).initialiseIfAbsent(seedDelta(), true);
+        int threads = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            List<Future<?>> runs = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                runs.add(pool.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < 300; i++) {
+                        new StateStore(dir).load();
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (Future<?> run : runs) {
+                run.get();
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void staleProbeSweepIgnoresAMissingProbe() throws Exception {
+        Path dir = updateDir();
+        Files.createDirectories(dir);
+        StateStore.deleteIfStale(dir.resolve(".owner-gone.probe"), Instant.now());
+    }
+
     private static Map<String, Long> seqs(Snapshot s) {
         Map<String, Long> out = new java.util.HashMap<>();
         s.state().seqByKid().forEach((k, v) -> out.put(k, v.seq()));
