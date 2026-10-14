@@ -45,7 +45,15 @@ final class TransactionFixtures {
 
     /** A signed release manifest with one entry for {@code jar}, targeting {@link #TARGET}. */
     static byte[] manifestFor(byte[] jar, String version) throws Exception {
-        String json = "{\"type\":\"quicraft.release\",\"v\":1,\"seq\":42"
+        return manifestFor(jar, version, 42);
+    }
+
+    /**
+     * A signed manifest with the given sequence number. A newer release must carry a higher sequence:
+     * the same sequence with other bytes is an equivocation and is refused.
+     */
+    static byte[] manifestFor(byte[] jar, String version, long seq) throws Exception {
+        String json = "{\"type\":\"quicraft.release\",\"v\":1,\"seq\":" + seq
                 + ",\"issued\":\"" + SignedFixtures.TS1 + "\",\"expires\":\"" + SignedFixtures.TS2 + "\""
                 + ",\"minRevocationsSeq\":3,\"releases\":[{\"platform\":\"" + PLATFORM + "\""
                 + ",\"version\":\"" + version + "\",\"targets\":[\"" + TARGET + "\"]"

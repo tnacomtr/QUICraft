@@ -50,6 +50,10 @@ final class UpdaterTransaction {
     static final String SAME_STORE_REFUSED = "the update directory is on another file system than the live "
             + "jar, so the swap cannot be atomic";
     static final String NO_UPDATE = "no newer release is available";
+    static final String NO_LONGER_OFFERED = "the release no longer matches the staged jar; nothing was installed";
+    static final String RESTARTING = "the release changed during the check; restarting the update once";
+    static final String RELEASE_CHANGED_TWICE = "the release changed again during the update; run the update "
+            + "command again";
 
     private final Path updateDir;
     private final DurabilityOps ops;
@@ -161,19 +165,69 @@ final class UpdaterTransaction {
     }
 
     private TransactionResult runSteps(Attempt a) throws IOException, UpdateRejectedException {
-        TransactionResult stop = checkAndAdmit(a);
-        if (stop != null) {
-            return stop;
+        while (true) {
+            TransactionResult stop = checkAndAdmit(a);
+            if (stop != null) {
+                return stop;
+            }
+            stop = downloadArtifact(a);
+            if (stop != null) {
+                return stop;
+            }
+            stop = verifyStaged(a);
+            if (stop != null) {
+                return stop;
+            }
+            stop = revalidate(a);
+            if (stop != null) {
+                return stop;
+            }
+            if (!a.restartRequested) {
+                return stopBeforeStepFive(a);
+            }
+            // The release changed under us. Restart once from step 1 under the same lease with a new
+            // txid; the first attempt's staging goes first and the backup is never touched.
+            a.restartRequested = false;
+            if (a.restarts >= 1) {
+                return abort(a, TransactionOutcome.FAILED, RELEASE_CHANGED_TWICE);
+            }
+            a.restarts++;
+            cleanupBeforeSwap(a);
+            a.messages.add(RESTARTING);
         }
-        stop = downloadArtifact(a);
-        if (stop != null) {
-            return stop;
+    }
+
+    /**
+     * Step 4 (revalidation): a fresh check run must offer a release that matches the staged identity.
+     * MATCH continues with the new candidate's evidence. RESTART_REQUIRED asks the caller to restart once.
+     * Anything else ends the attempt.
+     */
+    private TransactionResult revalidate(Attempt a) throws IOException, UpdateRejectedException {
+        if (a.token.isCancelled()) {
+            return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
         }
-        stop = verifyStaged(a);
-        if (stop != null) {
-            return stop;
+        CheckResult check = pipeline.run(CheckMode.STAGE, a.live.onDiskVersion(), a.token);
+        if (a.token.isCancelled()) {
+            return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
         }
-        return stopBeforeStepFour(a);
+        if (check.candidate().isEmpty()) {
+            return abort(a, TransactionOutcome.FAILED, NO_LONGER_OFFERED);
+        }
+        AcceptedCandidate fresh = check.candidate().get();
+        UpdateDocuments.ReleaseEntry staged = a.candidate.entry();
+        ArtifactIdentity stagedIdentity = new ArtifactIdentity(a.request.identity().platform(),
+                staged.version(), staged.size(), staged.sha512());
+        RevalidationDecision decision = Revalidation.compare(stagedIdentity, fresh.entry(),
+                a.request.identity().platform());
+        if (decision == RevalidationDecision.MATCH) {
+            a.candidate = fresh;
+            return null;
+        }
+        if (decision == RevalidationDecision.RESTART_REQUIRED) {
+            a.restartRequested = true;
+            return null;
+        }
+        return abort(a, TransactionOutcome.FAILED, NO_LONGER_OFFERED);
     }
 
     /** Step 1 (checking): admission, the check pipeline, the second admission and the capability. */
@@ -288,10 +342,10 @@ final class UpdaterTransaction {
         return null;
     }
 
-    /** Placeholder until steps 4 to 6 land: the verified jar stays in staging for inspection. */
-    private TransactionResult stopBeforeStepFour(Attempt a) {
+    /** Placeholder until steps 5 and 6 land: the revalidated jar stays in staging for inspection. */
+    private TransactionResult stopBeforeStepFive(Attempt a) {
         List<String> out = new ArrayList<>(a.messages);
-        out.add("steps 4 to 6 are not implemented in this build");
+        out.add("steps 5 and 6 are not implemented in this build");
         return new TransactionResult(TransactionOutcome.FAILED, Optional.of(a.txid),
                 Optional.of(a.stagedJar), Optional.empty(), out);
     }
@@ -304,6 +358,17 @@ final class UpdaterTransaction {
         List<String> out = new ArrayList<>();
         out.add(message);
         out.addAll(a.messages);
+        cleanupBeforeSwap(a, out);
+        return new TransactionResult(outcome, Optional.ofNullable(a.txid), Optional.empty(),
+                Optional.empty(), out);
+    }
+
+    /** Removes this attempt's staging files and the journal it wrote; keeps the backup. */
+    private void cleanupBeforeSwap(Attempt a) {
+        cleanupBeforeSwap(a, new ArrayList<>());
+    }
+
+    private void cleanupBeforeSwap(Attempt a, List<String> out) {
         closeQuietly(a.part);
         a.part = null;
         if (a.dir != null && a.txid != null) {
@@ -320,8 +385,8 @@ final class UpdaterTransaction {
                 }
             }
         }
-        return new TransactionResult(outcome, Optional.ofNullable(a.txid), Optional.empty(),
-                Optional.empty(), out);
+        a.txid = null;
+        a.stagedJar = null;
     }
 
     private static TransactionResult notAdmitted(List<String> reasons) {
@@ -365,6 +430,8 @@ final class UpdaterTransaction {
         FileChannel part;
         Path stagedJar;
         boolean journalWritten;
+        boolean restartRequested;
+        int restarts;
 
         Attempt(UpdateRequest request, CancelToken token) {
             this.request = request;

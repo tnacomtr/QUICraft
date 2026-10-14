@@ -12,8 +12,11 @@ import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.GeneralSecurityException;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -394,5 +397,92 @@ class UpdaterTransactionTest {
         assertTrue(result.txid().isPresent());
         assertArrayEquals(r.jar, Files.readAllBytes(result.stagedJar().orElseThrow()));
         assertLiveUntouched(r);
+    }
+
+    /** A manifest and jar that replace the served release at the next step 4 revalidation. */
+    private record Flip(byte[] manifest, byte[] jar) {
+    }
+
+    /**
+     * Serves each flip at the first manifest fetch after a download, so the step 4 run sees a
+     * changed release while the staged bytes were the old ones.
+     */
+    private static void flipOnRevalidation(Rig r, Flip... flips) {
+        List<Flip> queue = new ArrayList<>(List.of(flips));
+        boolean[] armed = {false};
+        r.fetcher.beforeDownload = () -> armed[0] = !queue.isEmpty();
+        r.metadata.onFetch = uri -> {
+            if (armed[0] && uri.getPath().endsWith("/manifest.json")) {
+                Flip next = queue.remove(0);
+                armed[0] = false;
+                try {
+                    TransactionFixtures.serveMetadata(r.metadata, PipelineFixtures.revocations(), next.manifest());
+                } catch (GeneralSecurityException e) {
+                    throw new IllegalStateException(e);
+                }
+                r.fetcher.body = next.jar();
+            }
+        };
+    }
+
+    private static int stagedCount(Rig r) throws IOException {
+        try {
+            return new UpdateDirectory(r.upd, DurabilityOps.system()).stagingTxids().size();
+        } catch (UpdateRejectedException e) {
+            throw new IOException(e);
+        }
+    }
+
+    // ---- step 4: revalidation ---------------------------------------------------------------
+
+    @Test
+    void revalidationRestartsOnceWithANewTxidAndTheFirstStagingIsRemoved() throws Exception {
+        Rig r = standardRig();
+        byte[] jarB = TransactionFixtures.releaseJar("0.4.1");
+        flipOnRevalidation(r, new Flip(TransactionFixtures.manifestFor(jarB, "0.4.1", 43), jarB));
+        TransactionResult result = txn(r).execute(request(r));
+        assertEquals(2, r.fetcher.downloads.size(), "one download per attempt");
+        assertTrue(result.messages().contains(UpdaterTransaction.RESTARTING), result.messages().toString());
+        assertEquals(1, stagedCount(r), "only the second attempt's staging remains");
+        assertArrayEquals(jarB, Files.readAllBytes(result.stagedJar().orElseThrow()));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void secondRevalidationMismatchFailsAndAsksForARerun() throws Exception {
+        Rig r = standardRig();
+        byte[] jarB = TransactionFixtures.releaseJar("0.4.1");
+        byte[] jarC = TransactionFixtures.releaseJar("0.4.2");
+        flipOnRevalidation(r,
+                new Flip(TransactionFixtures.manifestFor(jarB, "0.4.1", 43), jarB),
+                new Flip(TransactionFixtures.manifestFor(jarC, "0.4.2", 44), jarC));
+        TransactionResult result = txn(r).execute(request(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome());
+        assertTrue(result.messages().get(0).contains("run the update command again"), result.messages().toString());
+        assertEquals(2, r.fetcher.downloads.size());
+        assertTrue(stagingIsEmpty(r));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void releaseNoLongerOfferedAfterTheStagedDownloadFails() throws Exception {
+        Rig r = standardRig();
+        flipOnRevalidation(r, new Flip(TransactionFixtures.manifestFor(r.jar, TransactionFixtures.RUNNING_VERSION, 43),
+                r.jar));
+        TransactionResult result = txn(r).execute(request(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome());
+        assertTrue(result.messages().get(0).contains("no longer"), result.messages().toString());
+        assertEquals(1, r.fetcher.downloads.size());
+        assertTrue(stagingIsEmpty(r));
+        assertLiveUntouched(r);
+    }
+
+    @Test
+    void matchingRevalidationContinuesWithTheStagedJar() throws Exception {
+        Rig r = standardRig();
+        TransactionResult result = txn(r).execute(request(r));
+        assertEquals(1, r.fetcher.downloads.size());
+        assertArrayEquals(r.jar, Files.readAllBytes(result.stagedJar().orElseThrow()));
+        assertFalse(result.messages().contains(UpdaterTransaction.RESTARTING));
     }
 }
