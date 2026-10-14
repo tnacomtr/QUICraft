@@ -299,7 +299,8 @@ public final class Acceptance {
         }
         if (mode == CheckMode.STAGE
                 && !SequencePolicy.stagingCoverage(folded, currentTrust, revocations.byKey())) {
-            diagnostics.add("staging coverage below 2 of 3 hosts; not matching: "
+            diagnostics.add("staging coverage: fewer than 2 release hosts agree ("
+                    + configured.hosts().size() + " configured); not matching: "
                     + String.join(", ", notMatching(configured, revocations.byKey(), folded)));
             return Optional.empty();
         }

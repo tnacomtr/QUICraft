@@ -189,6 +189,13 @@ Lock file locations and journal format are specified in 12.8-12.9, not yet imple
   (Fabric). Velocity refuses duplicate plugin IDs.
 - **Placement.** Backup and staging files live outside loader-scanned directories, at the paths
   specified in 12.8 and 12.14.
+- **Permissions after a swap.** The staged jar is created private (`0600`) and stays private until the
+  move. Immediately before the `ATOMIC_MOVE`, the live jar's POSIX permission bits are copied onto the
+  staged file, so a jar that was readable by a panel, a deploy user or a backup tool stays readable
+  after the update. The copy is best effort: on a platform without POSIX bits, or when reading or
+  setting them fails, the new jar keeps `0600` and the swap still proceeds. The new jar is owned by the
+  server's user, because the rename keeps the staged file's owner; owner and group are never changed
+  (an unprivileged process cannot, and group ownership is not something the updater may choose).
 
 ### Windows
 

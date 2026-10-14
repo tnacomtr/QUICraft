@@ -440,6 +440,27 @@ class AcceptanceTest {
     }
 
     @Test
+    void stageCoverageDiagnosticNamesTheConfiguredHostCount() throws Exception {
+        ReleaseHosts twoHosts = ReleaseHosts.of(List.of(GH, SU));
+        byte[] rev = revocations();
+        byte[] differentRev = revocations(3, ISSUED, REV_EXPIRES, "", blockedJson(BLOCKED));
+        Snapshot persisted = after(revs(hosts(ok(GH, rev, K2), ok(SU, rev, K2)), twoHosts,
+                seedSnapshot(), NOW).delta());
+        byte[] man = release(42, standardEntry(A512), "");
+
+        ManifestAcceptance noCoverage = mans(
+                hosts(ok(GH, rev, K2), ok(SU, differentRev, K2)),
+                hosts(ok(GH, man, K1)), twoHosts, persisted, identity(), CheckMode.STAGE, NOW);
+
+        assertTrue(noCoverage.candidate().isEmpty(), "one matching host is not coverage");
+        String coverage = noCoverage.diagnostics().stream()
+                .filter(d -> d.contains("staging coverage")).findFirst().orElseThrow();
+        assertTrue(coverage.contains("(2 configured)"), coverage);
+        assertFalse(coverage.contains("of 3"), "the text must not claim three hosts: " + coverage);
+        assertTrue(coverage.contains("not matching: sudoe"), coverage);
+    }
+
+    @Test
     void clockBehindGivesDiagnosticAndFutureIssuedManifestIsSkipped() throws Exception {
         Instant behind = Instant.parse("2026-10-30T00:00:00Z");
         byte[] man = release(42, standardEntry(A512), "");
