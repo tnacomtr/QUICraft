@@ -97,6 +97,38 @@ class UpdateAdmissionTest {
     }
 
     @Test
+    void emptyLiveHashesAreRefused() throws Exception {
+        AdmissionDecision d = admit(ctx(true, false, "", "", false), matching());
+        assertFalse(d.admitted());
+        assertEquals(List.of(UpdateAdmission.LIVE_HASH_UNKNOWN), d.reasons());
+    }
+
+    @Test
+    void uppercaseAndShortLiveHashesAreRefused() throws Exception {
+        String upper = LIVE.toUpperCase(java.util.Locale.ROOT);
+        String shortHash = LIVE.substring(1);
+        assertEquals(List.of(UpdateAdmission.LIVE_HASH_UNKNOWN),
+                admit(ctx(true, false, upper, upper, false), matching()).reasons());
+        assertEquals(List.of(UpdateAdmission.LIVE_HASH_UNKNOWN),
+                admit(ctx(true, false, shortHash, shortHash, false), matching()).reasons());
+        assertEquals(List.of(UpdateAdmission.LIVE_HASH_UNKNOWN),
+                admit(ctx(true, false, LIVE, shortHash, false), matching()).reasons());
+    }
+
+    @Test
+    void rotationPersistedStateIsRefusedUntilTheTrustIsApplied() throws Exception {
+        UpdateDocuments.Trust trust = PipelineFixtures.trust();
+        UpdateDocuments.Trust newer = new UpdateDocuments.Trust(trust.epoch() + 1, trust.built(),
+                trust.revocationsSeqFloor(), trust.manifestSeqFloor(), trust.keys());
+        RuntimeIdentity runningNewer = new RuntimeIdentity("fabric-26x", "26.1",
+                UpdateVersion.parse("0.3.0"), newer, PipelineFixtures.RUNNING_SHA512);
+        // Same revocation key as the running file, lower epoch: classify gives ROTATION.
+        AdmissionDecision d = UpdateAdmission.admit(healthy(), runningNewer, matching());
+        assertFalse(d.admitted());
+        assertEquals(List.of(UpdateAdmission.TRUST_NOT_APPLIED), d.reasons());
+    }
+
+    @Test
     void everyReasonIsCollectedInRuleOrder() throws Exception {
         UpdateDocuments.Trust trust = PipelineFixtures.trust();
         Snapshot older = snapshot(trust.epoch() + 1, KeySetFingerprint.of(trust.keys()), TestKeys.PUB_2);
