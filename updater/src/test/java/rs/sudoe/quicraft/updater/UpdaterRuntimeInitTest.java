@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -151,6 +152,22 @@ class UpdaterRuntimeInitTest {
     }
 
     @Test
+    void discoveryReportingADevelopmentBuildDisablesTheUpdater() {
+        UpdaterFacadeFixtures.FixedDiscovery d = new UpdaterFacadeFixtures.FixedDiscovery();
+        d.runtimeFailure = new DevelopmentBuildException();
+        p.discovery = d;
+        assertDisabledWith(start(UpdaterFacadeFixtures.testHosts()), UpdaterRuntime.REASON_DEV_BUILD);
+    }
+
+    @Test
+    void developmentBuildWrappedByDiscoveryIsStillNamed() {
+        UpdaterFacadeFixtures.FixedDiscovery d = new UpdaterFacadeFixtures.FixedDiscovery();
+        d.runtimeFailure = new IllegalStateException("wrapped", new DevelopmentBuildException());
+        p.discovery = d;
+        assertDisabledWith(start(UpdaterFacadeFixtures.testHosts()), UpdaterRuntime.REASON_DEV_BUILD);
+    }
+
+    @Test
     void storeInitialiseFailureDisablesTheUpdater() throws Exception {
         // An existing but empty directory means a state file vanished after use: never rebuilt silently.
         PipelineFixtures.privateDir(p.updateDir);
@@ -256,12 +273,25 @@ class UpdaterRuntimeInitTest {
 
     @Test
     void theDisclosureMarkerIsOwnerOnlyOnPosix() throws Exception {
-        UpdaterRuntime rt = start(UpdaterFacadeFixtures.testHosts());
+        start(UpdaterFacadeFixtures.testHosts());
         Path marker = p.updateDir.resolve(UpdaterRuntime.DISCLOSURE_MARKER);
-        if (marker.getFileSystem().supportedFileAttributeViews().contains("posix")) {
-            assertEquals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"),
-                    Files.getPosixFilePermissions(marker));
-        }
+        Assumptions.assumeTrue(marker.getFileSystem().supportedFileAttributeViews().contains("posix"));
+        assertEquals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"),
+                Files.getPosixFilePermissions(marker));
+    }
+
+    @Test
+    void aSymlinkedDisclosureMarkerIsLoggedButNeitherReadNorWritten() throws Exception {
+        Path target = tmp.resolve("elsewhere.txt");
+        Files.writeString(target, "kept");
+        Path marker = tmp.resolve(UpdaterRuntime.DISCLOSURE_MARKER);
+        Files.createSymbolicLink(marker, target);
+
+        UpdaterRuntime.recordDisclosure(marker, "disclosure-v1 production github\n", "update checks send", p.log);
+        assertEquals(1, p.log.lines.stream().filter(l -> l.equals("INFO: update checks send")).count(),
+                () -> "log was " + p.log.lines);
+        assertTrue(Files.isSymbolicLink(marker), "the link is still a link");
+        assertEquals("kept", Files.readString(target), "the link target is unchanged");
     }
 
     @Test

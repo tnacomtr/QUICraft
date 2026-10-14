@@ -233,6 +233,38 @@ class LiveJarValidatorTest {
     }
 
     @Test
+    void developmentBuildFromTheVersionReaderIsRethrownUnchanged() throws Exception {
+        Path scan = tmp.resolve("plugins");
+        Path jar = JarFixtures.jar(scan, "quicraft.jar", JarFixtures.OWN_ID,
+                JarFixtures.BUILD_JSON_V1);
+
+        DevelopmentBuildException e = assertThrows(DevelopmentBuildException.class,
+                () -> LiveJarValidator.validate(jar, scan, JarFixtures::velocityLike,
+                        JarFixtures::testIds, JarFixtures.OWN_ID, p -> {
+                            throw new DevelopmentBuildException();
+                        }));
+        assertEquals(DevelopmentBuildException.MESSAGE, e.getMessage());
+    }
+
+    @Test
+    void snapshotBuildThroughTheRealReaderIsADevelopmentBuild() throws Exception {
+        Path scan = tmp.resolve("plugins");
+        Path jar = JarFixtures.jar(scan, "quicraft.jar", JarFixtures.OWN_ID,
+                "{\"type\":\"quicraft.build\",\"v\":1,\"platform\":\"velocity\",\"version\":\"1.2.3-SNAPSHOT\"}");
+
+        assertThrows(DevelopmentBuildException.class, () -> validate(jar, scan));
+    }
+
+    @Test
+    void nonSnapshotInvalidBuildIsStillAPlainRefusal() throws Exception {
+        Path scan = tmp.resolve("plugins");
+        Path jar = JarFixtures.jar(scan, "quicraft.jar", JarFixtures.OWN_ID, "{not json");
+
+        UpdateRejectedException e = assertThrows(UpdateRejectedException.class, () -> validate(jar, scan));
+        assertEquals("cannot read the live jar version", e.getMessage());
+    }
+
+    @Test
     void versionReaderThatThrowsRefusesTheJar() throws Exception {
         Path scan = tmp.resolve("plugins");
         Path jar = JarFixtures.jar(scan, "quicraft.jar", JarFixtures.OWN_ID,

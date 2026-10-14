@@ -4,8 +4,11 @@ package rs.sudoe.quicraft.updater;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -19,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import rs.sudoe.quicraft.updater.PipelineFixtures.ScriptedFetcher;
 import rs.sudoe.quicraft.updater.UpdaterFacadeFixtures.FakePlatform;
+import rs.sudoe.quicraft.updater.UpdaterFacadeFixtures.FixedDiscovery;
 import rs.sudoe.quicraft.updater.UpdaterFacadeFixtures.Output;
 import rs.sudoe.quicraft.updater.UpdaterRuntime.Reply;
 
@@ -103,7 +107,7 @@ class UpdaterRuntimeCommandTest {
         assertTrue(entered.await(WAIT.toSeconds(), TimeUnit.SECONDS));
 
         Output second = new Output();
-        assertEquals(Reply.BUSY, dispatch(second, true, "update"));
+        assertEquals(Reply.BUSY, dispatch(second, true));
         assertTrue(second.contains(UpdaterRuntime.BUSY_TEXT));
 
         release.countDown();
@@ -125,6 +129,8 @@ class UpdaterRuntimeCommandTest {
         String notice = "a new QUICraft version is available: " + UpdaterFacadeFixtures.NEWER;
         assertTrue(first.contains(notice), () -> "output was " + first.snapshot());
         assertEquals(1, p.notices.size());
+        assertEquals(1, p.log.lines.stream().filter(l -> l.contains(notice)).count(),
+                () -> "the console records the announcement once, log was " + p.log.lines);
 
         Output second = new Output();
         assertEquals(Reply.STARTED, dispatch(second, true, "check", "-s"));
@@ -142,11 +148,29 @@ class UpdaterRuntimeCommandTest {
         start(new TransactionFixtures.ArtifactFetcher(metadata, newJar));
 
         Output out = new Output();
-        assertEquals(Reply.STARTED, dispatch(out, true, "update"));
+        assertEquals(Reply.STARTED, dispatch(out, true));
         awaitIdle();
 
         assertTrue(out.contains("update finished: STAGED_ONLY"), () -> "output was " + out.snapshot());
         assertArrayEquals(liveBytes, Files.readAllBytes(live.realPath()));
+    }
+
+    @Test
+    void emptyArgsStageAnUpdateAndTheUpdateWordIsUsage() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        start(new TransactionFixtures.ArtifactFetcher(metadata, newJar));
+
+        Output usageOnly = new Output();
+        assertEquals(Reply.DONE, dispatch(usageOnly, true, "update"));
+        assertTrue(usageOnly.contains(UpdaterRuntime.USAGE), () -> "output was " + usageOnly.snapshot());
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true));
+        awaitIdle();
+        assertTrue(out.contains("update finished: STAGED_ONLY"), () -> "output was " + out.snapshot());
     }
 
     @Test
@@ -209,7 +233,7 @@ class UpdaterRuntimeCommandTest {
         Output out = new Output();
         assertEquals(Reply.DONE, dispatch(out, true, "explode"));
         assertEquals(Reply.DONE, dispatch(out, true, "check", "-x"));
-        assertEquals(Reply.DONE, dispatch(out, true));
+        assertEquals(Reply.DONE, dispatch(out, true, "update"));
         assertEquals(3, out.snapshot().stream().filter(UpdaterRuntime.USAGE::equals).count());
     }
 
@@ -222,7 +246,25 @@ class UpdaterRuntimeCommandTest {
     }
 
     @Test
-    void silentCheckWritesOnlyTheSectionSixRowsToOut() throws Exception {
+    void aBadManifestFromAPlayerGoesToTheLogOnlyAndNeverToOut() throws Exception {
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        UpdaterFacadeFixtures.answerBadManifest(metadata, UpdaterFacadeFixtures.alteredManifest(43));
+        start(metadata);
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, false, "check", "-s"));
+        awaitIdle();
+
+        assertEquals(List.of(), out.snapshot(), () -> "output was " + out.snapshot());
+        assertEquals(1, p.log.lines.stream()
+                .filter(l -> l.startsWith("WARN: ") && l.contains("was rejected")).count(),
+                () -> "log was " + p.log.lines);
+        assertTrue(p.log.lines.stream().anyMatch(l -> l.contains("manifest document rejected")),
+                "the diagnostic text stays in the log");
+    }
+
+    @Test
+    void aBadManifestAnswersTheConsoleOnlyThroughTheLog() throws Exception {
         ScriptedFetcher metadata = new ScriptedFetcher();
         UpdaterFacadeFixtures.answerBadManifest(metadata, UpdaterFacadeFixtures.alteredManifest(43));
         start(metadata);
@@ -231,9 +273,109 @@ class UpdaterRuntimeCommandTest {
         assertEquals(Reply.STARTED, dispatch(out, true, "check", "-s"));
         awaitIdle();
 
-        assertEquals(List.of("release manifest from host modrinth failed signature verification"), out.snapshot());
-        assertTrue(p.log.lines.stream().anyMatch(l -> l.contains("manifest document rejected")),
-                "the diagnostic text stays in the log");
+        assertEquals(List.of(), out.snapshot(), () -> "output was " + out.snapshot());
+        assertTrue(p.log.lines.contains("WARN: release manifest from host modrinth was rejected"),
+                () -> "log was " + p.log.lines);
+    }
+
+    @Test
+    void aSilentAnnouncementFromAPlayerIsLoggedAndAnsweredExactlyOnce() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        start(metadata);
+
+        Output out = new Output();
+        String notice = "a new QUICraft version is available: " + UpdaterFacadeFixtures.NEWER;
+        assertEquals(Reply.STARTED, dispatch(out, false, "check", "-s"));
+        awaitIdle();
+
+        assertEquals(List.of(notice), out.snapshot(), () -> "output was " + out.snapshot());
+        List<String> announcement = p.log.lines.stream().filter(l -> l.contains(notice)).toList();
+        assertEquals(List.of("INFO: " + notice), announcement,
+                () -> "the announcement is logged once at INFO, log was " + p.log.lines);
+    }
+
+    @Test
+    void aSilentHostFailureIsOneDebugLineAndNothingForTheInvoker() throws Exception {
+        start(new ScriptedFetcher());
+        awaitIdle();
+        // A state file that no longer parses makes the next check fail as a host failure.
+        Files.writeString(p.updateDir.resolve(StateStore.STATE), "not json");
+
+        Output silent = new Output();
+        assertEquals(Reply.STARTED, dispatch(silent, false, "check", "-s"));
+        awaitIdle();
+        assertEquals(List.of(), silent.snapshot(), () -> "output was " + silent.snapshot());
+        assertEquals(1, p.log.lines.stream().filter(l -> l.startsWith("DEBUG: update check failed (")).count(),
+                () -> "log was " + p.log.lines);
+        assertEquals(0, p.log.lines.stream().filter(l -> l.startsWith("WARN: update check failed")).count());
+
+        Output verbose = new Output();
+        assertEquals(Reply.STARTED, dispatch(verbose, true, "check"));
+        awaitIdle();
+        assertTrue(verbose.snapshot().stream().anyMatch(l -> l.startsWith("update check failed (")),
+                () -> "output was " + verbose.snapshot());
+    }
+
+    @Test
+    void shutdownDuringAResetCancelsItsToken() throws Exception {
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        fetcher.onFetch = uri -> {
+            entered.countDown();
+            try {
+                release.await(WAIT.toSeconds(), TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        start(fetcher);
+        assertEquals(Reply.STARTED, dispatch(new Output(), true, "reset-state"));
+        assertTrue(entered.await(WAIT.toSeconds(), TimeUnit.SECONDS));
+
+        MutableCancelToken token = resetTokenOf(rt);
+        assertFalse(token.isCancelled());
+        rt.shutdown();
+        assertTrue(token.isCancelled(), "shutdown cancels the running reset");
+        release.countDown();
+    }
+
+    private static MutableCancelToken resetTokenOf(UpdaterRuntime runtime) throws Exception {
+        Field field = UpdaterRuntime.class.getDeclaredField("resetToken");
+        field.setAccessible(true);
+        MutableCancelToken token = (MutableCancelToken) field.get(runtime);
+        assertNotNull(token, "a running reset holds a token");
+        return token;
+    }
+
+    @Test
+    void aResetThatPublishesItsTokenAfterShutdownStartsTouchesNoState() throws Exception {
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        AtomicInteger fetches = new AtomicInteger();
+        fetcher.onFetch = uri -> fetches.incrementAndGet();
+        UpdaterFacadeFixtures.QueuedExecutor executor = new UpdaterFacadeFixtures.QueuedExecutor();
+        p.existedBeforeStart = false;
+        rt = UpdaterRuntime.start(p, new UpdaterRuntime.Seams(fetcher, PipelineFixtures.CLOCK,
+                DurabilityOps.system(), factory -> executor, log -> UpdaterFacadeFixtures.testHosts(),
+                PipelineFixtures.ENDPOINTS));
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true, "reset-state"));
+        assertEquals(1, executor.queuedCount(), "the reset waits for the test");
+
+        // shutdown runs to its end while the reset has published no token, so there is none to cancel.
+        rt.shutdown();
+        executor.runQueued();
+
+        assertEquals(0, fetches.get(), "a reset that sees the stopping flag never refetches");
+        assertFalse(out.contains("state.json rebuilt"), () -> "output was " + out.snapshot());
+        assertTrue(out.contains(UpdaterRuntime.STOPPING_TEXT), () -> "output was " + out.snapshot());
+
+        TransactionLock.TxnLease lease = TransactionLock.tryAcquire(p.updateDir);
+        lease.close();
     }
 
     @Test
@@ -310,7 +452,7 @@ class UpdaterRuntimeCommandTest {
             }
         };
         start(fetcher);
-        assertEquals(Reply.STARTED, dispatch(new Output(), true, "update"));
+        assertEquals(Reply.STARTED, dispatch(new Output(), true));
         assertTrue(entered.await(WAIT.toSeconds(), TimeUnit.SECONDS));
 
         rt.shutdown();
@@ -318,5 +460,97 @@ class UpdaterRuntimeCommandTest {
         TransactionLock.TxnLease lease = TransactionLock.tryAcquire(p.updateDir);
         lease.close();
         assertTrue(new StateStore(p.updateDir).load().isPresent(), "the state store is still usable");
+    }
+
+    // ---- disclosure: a non-console invoker is a player with the admin permission -----------------
+
+    /**
+     * Makes the transaction's first live-jar discovery fail with a message that carries the update
+     * directory path, which is one of the leaks the filter must hold back.
+     */
+    private void failTheNextDiscovery() {
+        FixedDiscovery discovery = (FixedDiscovery) p.discovery;
+        discovery.ioFailure = new IOException("cannot read the live jar: " + p.updateDir);
+    }
+
+    @Test
+    void aFailingUpdateShowsAPlayerTheFixedLineAndKeepsTheFullLineInTheLog() throws Exception {
+        start(new ScriptedFetcher());
+        failTheNextDiscovery();
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, false));
+        awaitIdle();
+
+        assertEquals(List.of(UpdaterRuntime.REDACTED_TEXT), out.snapshot(),
+                () -> "output was " + out.snapshot());
+        assertTrue(p.log.lines.stream()
+                        .anyMatch(l -> l.startsWith("INFO: " + UpdaterRuntime.OUTPUT_LOG_PREFIX)
+                                && l.contains("cannot read the live jar: " + p.updateDir)),
+                () -> "log was " + p.log.lines);
+    }
+
+    @Test
+    void theSameFailingUpdateReachesTheConsoleInFull() throws Exception {
+        start(new ScriptedFetcher());
+        failTheNextDiscovery();
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true));
+        awaitIdle();
+
+        assertTrue(out.contains("cannot read the live jar: " + p.updateDir),
+                () -> "output was " + out.snapshot());
+        assertTrue(out.contains("update finished: FAILED"), () -> "output was " + out.snapshot());
+        assertFalse(out.contains(UpdaterRuntime.REDACTED_TEXT), () -> "output was " + out.snapshot());
+    }
+
+    @Test
+    void aPlayerReadsTheNoUpdateRowUnchanged() throws Exception {
+        start(new ScriptedFetcher());
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, false, "check"));
+        awaitIdle();
+
+        List<String> lines = out.snapshot();
+        assertEquals("no update", lines.get(0), () -> "output was " + lines);
+        assertFalse(lines.stream().anyMatch(l -> l.contains("fetch failed")),
+                () -> "the diagnostics are held back, output was " + lines);
+    }
+
+    @Test
+    void aPlayerReadsTheOfferRowUnchanged() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        start(metadata);
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, false, "check"));
+        awaitIdle();
+
+        assertTrue(out.contains("update available: " + UpdaterFacadeFixtures.NEWER),
+                () -> "output was " + out.snapshot());
+    }
+
+    @Test
+    void aPlayerReadsTheUsageRowUnchanged() {
+        start(new ScriptedFetcher());
+        Output out = new Output();
+        assertEquals(Reply.DONE, dispatch(out, false, "explode"));
+
+        assertEquals(List.of(UpdaterRuntime.USAGE), out.snapshot(), () -> "output was " + out.snapshot());
+    }
+
+    @Test
+    void aVersionRowAdmitsOnlyAVersionAndNeverAPath() {
+        assertTrue(UpdaterRuntime.visibleToPlayer("update available: " + UpdaterFacadeFixtures.NEWER));
+        assertTrue(UpdaterRuntime.visibleToPlayer(
+                "a new QUICraft version is available: " + UpdaterFacadeFixtures.NEWER));
+        assertFalse(UpdaterRuntime.visibleToPlayer("update available: " + p.updateDir));
+        assertFalse(UpdaterRuntime.visibleToPlayer("a new QUICraft version is available: " + p.updateDir));
+        assertFalse(UpdaterRuntime.visibleToPlayer("no update: " + p.updateDir));
+        assertFalse(UpdaterRuntime.visibleToPlayer("update check failed (java.io.IOException)"));
     }
 }

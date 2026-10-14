@@ -2,11 +2,15 @@
 package rs.sudoe.quicraft.updater;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Clock;
@@ -17,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ExecutorService;
@@ -63,6 +68,8 @@ public final class UpdaterRuntime {
     static final String WORKER_NAME = "quicraft-updater";
     /** The disclosure marker, keyed to the disclosed host set (see {@code Boot#disclose}). */
     static final String DISCLOSURE_MARKER = "disclosure-shown";
+    /** The disclosure marker is read at most this many bytes; a larger file never matches. */
+    static final int MARKER_READ_LIMIT = 256;
     /** Most bad-manifest digests kept for log suppression (docs/updater.md 12.8: 0..32). */
     static final int WARNED_BAD_LIMIT = 32;
 
@@ -74,12 +81,27 @@ public final class UpdaterRuntime {
 
     static final String BUSY_TEXT = "another updater command is already running";
     static final String STOPPING_TEXT = "updater is stopping; the command was not run";
-    static final String USAGE = "usage: check [-s] | update | cancel | reset-state";
+    static final String USAGE = "usage: update | update check | update check -s | update cancel | update reset-state";
     static final String NOT_CONSOLE = "reset-state is available only from the server console";
     static final String RESET_JOURNAL = "reset refused: an update is pending restart or recovery";
     static final String RESET_BUSY = "reset refused: an update transaction or another state operation is active";
     static final String STATE_FULL_TEXT = "updater state is full; no update is offered";
     static final String STALE_TEXT = "revocation state is not fresh";
+
+    /** The row of a check that found nothing newer (docs/updater.md section 6). */
+    static final String NO_UPDATE_TEXT = "no update";
+    /** The prefix of the row that offers a newer release. */
+    static final String AVAILABLE_PREFIX = "update available: ";
+    /** The prefix of the announcement row sent to the admins. */
+    static final String ANNOUNCE_PREFIX = "a new QUICraft version is available: ";
+    /** The prefix of the row that ends an update command. */
+    static final String UPDATE_FINISHED_PREFIX = "update finished: ";
+    /** The prefix of the disabled line. */
+    static final String DISABLED_PREFIX = "updater disabled: ";
+    /** The log prefix of every command output line. */
+    static final String OUTPUT_LOG_PREFIX = "update command output: ";
+    /** What a non-console invoker reads in place of a line it may not see. */
+    static final String REDACTED_TEXT = "details are in the server console";
 
     static final String REASON_DISCOVERY = "live jar could not be located";
     static final String REASON_LIVE_READ = "live jar could not be read";
@@ -94,10 +116,22 @@ public final class UpdaterRuntime {
     static final String REASON_INTERNAL = "unexpected failure during start";
     static final String REASON_NO_HOSTS = UpdaterOrigins.NOT_CONFIGURED;
 
+    /** Every fixed reason a runtime can be disabled with; {@link #visibleToPlayer} accepts these lines. */
+    private static final List<String> DISABLED_REASONS = List.of(REASON_DISCOVERY, REASON_LIVE_READ,
+            REASON_METADATA, REASON_DEV_BUILD, REASON_BUILD, REASON_PLATFORM, REASON_VERSION, REASON_TRUST,
+            REASON_RECOVERY, REASON_STATE, REASON_INTERNAL, REASON_NO_HOSTS);
+    /** The fixed details {@link #REASON_METADATA} is appended to when the own-jar read is refused. */
+    private static final List<String> METADATA_DETAILS = List.of(OwnJarResources.MISSING,
+            OwnJarResources.DUPLICATE, OwnJarResources.TOO_LARGE);
+    /** The fixed prefixes of a row that carries exactly one version and nothing else. */
+    private static final List<String> VERSION_ROW_PREFIXES = List.of(AVAILABLE_PREFIX, ANNOUNCE_PREFIX);
+
     private static final String WARN_PREFIX = "WARN:";
     private static final Duration HEALTH_TIMEOUT = Duration.ofSeconds(120);
     private static final long MIN_OFFSET_MS = 60_000L;
     private static final long SHUTDOWN_WAIT_SECONDS = 5L;
+    /** How far {@link Boot#isDevelopmentBuild} walks a cause chain before giving up. */
+    private static final int MAX_CAUSE_DEPTH = 10;
 
     private final UpdaterLog log;
     private final String disabledReason;
@@ -113,6 +147,7 @@ public final class UpdaterRuntime {
     private final AtomicBoolean busy = new AtomicBoolean();
     private volatile boolean stopping;
     private volatile MutableCancelToken checkToken;
+    private volatile MutableCancelToken resetToken;
 
     private UpdaterRuntime(UpdaterLog log, String disabledReason) {
         this.log = log;
@@ -150,16 +185,25 @@ public final class UpdaterRuntime {
         final Function<ThreadFactory, ScheduledExecutorService> executors;
         final Function<UpdaterLog, Optional<ReleaseHosts>> origins;
         final ReleaseEndpoints endpoints;
+        final Function<Path, StateStore> stores;
 
         Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
                 Function<ThreadFactory, ScheduledExecutorService> executors,
                 Function<UpdaterLog, Optional<ReleaseHosts>> origins, ReleaseEndpoints endpoints) {
+            this(fetcher, clock, ops, executors, origins, endpoints, StateStore::new);
+        }
+
+        Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
+                Function<ThreadFactory, ScheduledExecutorService> executors,
+                Function<UpdaterLog, Optional<ReleaseHosts>> origins, ReleaseEndpoints endpoints,
+                Function<Path, StateStore> stores) {
             this.fetcher = Objects.requireNonNull(fetcher, "fetcher");
             this.clock = Objects.requireNonNull(clock, "clock");
             this.ops = Objects.requireNonNull(ops, "ops");
             this.executors = Objects.requireNonNull(executors, "executors");
             this.origins = Objects.requireNonNull(origins, "origins");
             this.endpoints = Objects.requireNonNull(endpoints, "endpoints");
+            this.stores = Objects.requireNonNull(stores, "stores");
         }
 
         static Seams system() {
@@ -178,7 +222,7 @@ public final class UpdaterRuntime {
      * @return the runtime, enabled or disabled
      */
     public static UpdaterRuntime start(UpdaterPlatform p) {
-        return start(p, Seams::system);
+        return start(p, () -> Seams.system());
     }
 
     static UpdaterRuntime start(UpdaterPlatform p, Seams seams) {
@@ -210,6 +254,18 @@ public final class UpdaterRuntime {
     /**
      * Runs one command line. Never throws, except a {@link VirtualMachineError}.
      *
+     * <p>The five accepted forms are exactly the docs/updater.md section 3 table, with the command
+     * prefix ({@code update}) already removed: an empty array is {@code /quicraft update} and stages the
+     * new jar, {@code {"check"}} and {@code {"check", "-s"}} are the two checks, {@code {"cancel"}}
+     * cancels, and {@code {"reset-state"}} is the console-only reset. Anything else, including the
+     * literal word {@code update}, prints {@link #USAGE}.
+     *
+     * <p><b>Disclosure.</b> The command may come from the console or from a player holding the updater
+     * permission. With {@code console} true every line reaches {@code out} unchanged. With {@code false}
+     * the sink is wrapped: every line is written to the log in full at INFO, and only the facade's own
+     * fixed texts reach the invoker; anything else becomes one fixed line (see {@link PlayerOutput} and
+     * {@link #visibleToPlayer}).
+     *
      * @param args the words after the command prefix, for example {@code {"check", "-s"}}
      * @param console true when the command came from the server console
      * @param out receives every line of the answer; may be called from the worker thread, so an adapter
@@ -217,13 +273,14 @@ public final class UpdaterRuntime {
      * @return how the command was handled
      */
     public Reply dispatch(String[] args, boolean console, Consumer<String> out) {
+        Consumer<String> sink = console ? out : new PlayerOutput(out);
         try {
-            return dispatchChecked(args, console, out);
+            return dispatchChecked(args, console, sink);
         } catch (VirtualMachineError e) {
             throw e;
         } catch (Throwable t) {
             warnSafe(log, "updater command failed (" + t.getClass().getName() + ")");
-            emit(out, "updater command failed; see the server log");
+            emit(sink, "updater command failed; see the server log");
             return Reply.DONE;
         }
     }
@@ -238,6 +295,10 @@ public final class UpdaterRuntime {
             MutableCancelToken token = checkToken;
             if (token != null) {
                 token.cancel();
+            }
+            MutableCancelToken reset = resetToken;
+            if (reset != null) {
+                reset.cancel();
             }
             if (txn != null) {
                 txn.cancelActive();
@@ -280,16 +341,24 @@ public final class UpdaterRuntime {
 
     private Reply dispatchChecked(String[] args, boolean console, Consumer<String> out) {
         if (disabledReason != null) {
-            emit(out, "updater disabled: " + disabledReason);
+            emit(out, DISABLED_PREFIX + disabledReason);
             return Reply.DONE;
         }
         if (stopping) {
             emit(out, STOPPING_TEXT);
             return Reply.DONE;
         }
-        if (args == null || args.length == 0) {
+        if (args == null) {
             emit(out, USAGE);
             return Reply.DONE;
+        }
+        if (args.length == 0) {
+            // '/quicraft update' with no further word: download, verify and stage the new jar.
+            if (txn == null) {
+                emit(out, REASON_NO_HOSTS);
+                return Reply.DONE;
+            }
+            return startWorker(out, () -> runUpdate(out));
         }
         switch (args[0]) {
             case "check": {
@@ -303,17 +372,6 @@ public final class UpdaterRuntime {
                     return Reply.DONE;
                 }
                 return startWorker(out, () -> runCheck(out, silent, false));
-            }
-            case "update": {
-                if (args.length != 1) {
-                    emit(out, USAGE);
-                    return Reply.DONE;
-                }
-                if (txn == null) {
-                    emit(out, REASON_NO_HOSTS);
-                    return Reply.DONE;
-                }
-                return startWorker(out, () -> runUpdate(out));
             }
             case "cancel": {
                 if (args.length != 1) {
@@ -413,7 +471,8 @@ public final class UpdaterRuntime {
         } catch (IOException | UpdateRejectedException e) {
             String text = "update check failed (" + e.getClass().getName() + ")";
             if (silent) {
-                silentLine(Level.WARN, text, out, scheduled);
+                // A host failure: section 6 allows nothing to the invoker, one DEBUG line to the log.
+                debugSafe(text);
             } else if (scheduled) {
                 infoSafe(text);
             } else {
@@ -426,9 +485,9 @@ public final class UpdaterRuntime {
 
     private void verboseOutput(CheckResult result, Consumer<String> sink) {
         if (result.candidate().isPresent()) {
-            emit(sink, "update available: " + result.candidate().get().entry().version());
+            emit(sink, AVAILABLE_PREFIX + result.candidate().get().entry().version());
         } else {
-            emit(sink, "no update");
+            emit(sink, NO_UPDATE_TEXT);
         }
         if (result.stateFull()) {
             emit(sink, STATE_FULL_TEXT);
@@ -443,8 +502,8 @@ public final class UpdaterRuntime {
 
     /**
      * The silent table of docs/updater.md section 6, for {@code check -s} and silent scheduled checks. Every
-     * diagnostic goes to the log at DEBUG only. Out (or the console, for a scheduled tick) gets just the
-     * bad-manifest WARN rows and the announcement INFO row.
+     * diagnostic goes to the log at DEBUG only. The bad-manifest WARN rows go to the log only; a command's
+     * {@code out} gets just the announcement INFO row.
      */
     private void silentOutput(CheckResult result, Consumer<String> out, boolean scheduled)
             throws IOException, UpdateRejectedException {
@@ -461,38 +520,49 @@ public final class UpdaterRuntime {
      * Logs one WARN per distinct bad manifest that is not already in {@code state.warnedBad}. The list is
      * updated in the same commit, so the same document warns once across runs and restarts.
      */
-    private void reportBadManifests(List<BadManifest> events, Consumer<String> out, boolean scheduled)
-            throws IOException, UpdateRejectedException {
+    private void reportBadManifests(List<BadManifest> events, Consumer<String> out, boolean scheduled) {
         if (events.isEmpty()) {
             return;
         }
         List<BadManifest> fresh = new ArrayList<>();
-        store.commit(snap -> {
-            List<String> seen = new ArrayList<>(snap.state().warnedBad());
-            fresh.clear();
-            for (BadManifest event : events) {
-                if (!seen.contains(event.sha256())) {
-                    seen.add(event.sha256());
-                    fresh.add(event);
+        try {
+            store.commit(snap -> {
+                List<String> seen = new ArrayList<>(snap.state().warnedBad());
+                fresh.clear();
+                for (BadManifest event : events) {
+                    if (!seen.contains(event.sha256())) {
+                        seen.add(event.sha256());
+                        fresh.add(event);
+                    }
                 }
-            }
-            if (fresh.isEmpty()) {
-                return snap;
-            }
-            while (seen.size() > WARNED_BAD_LIMIT) {
-                seen.remove(0);
-            }
-            return new Snapshot(withWarnedBad(snap.state(), seen), snap.revoked());
-        });
+                if (fresh.isEmpty()) {
+                    return snap;
+                }
+                while (seen.size() > WARNED_BAD_LIMIT) {
+                    seen.remove(0);
+                }
+                return new Snapshot(withWarnedBad(snap.state(), seen), snap.revoked());
+            });
+        } catch (IOException | UpdateRejectedException | RuntimeException e) {
+            // The record is not saved, so these documents may warn again on the next check. The announcement
+            // that follows must still run, so this failure does not propagate.
+            debugSafe("bad-manifest record could not be saved (" + e.getClass().getName() + ")");
+        }
         for (BadManifest event : fresh) {
             silentLine(Level.WARN, "release manifest from host " + event.hostKey()
-                    + " failed signature verification", out, scheduled);
+                    + " was rejected", out, scheduled);
         }
     }
 
     /**
      * Announces a valid newer release once per version. The version is recorded as {@code lastAnnounced}
      * only after the admins were told, so a failed notice is retried by the next check.
+     *
+     * <p>The delivered notice is logged before that state write, so a failed write never loses the record
+     * of a notice the admins already received.
+     *
+     * <p>Delivery is at-least-once: a crash between {@link UpdaterPlatform#notifyAdmins} and the commit repeats
+     * the notice on the next start.
      */
     private void announceIfNew(CheckResult result, Consumer<String> out, boolean scheduled)
             throws IOException, UpdateRejectedException {
@@ -504,14 +574,16 @@ public final class UpdaterRuntime {
         if (current.isPresent() && version.equals(current.get().state().lastAnnounced())) {
             return;
         }
-        String notice = "a new QUICraft version is available: " + version;
+        String notice = ANNOUNCE_PREFIX + version;
         if (!notifyAdmins(notice)) {
             return;
         }
+        // The notice is delivered, so it is logged before the state write: a failed commit still leaves the
+        // delivered notice in the log, and the version is not recorded, so the next check re-announces it.
+        silentLine(Level.INFO, notice, out, scheduled);
         store.commit(snap -> version.equals(snap.state().lastAnnounced())
                 ? snap
                 : new Snapshot(withLastAnnounced(snap.state(), version), snap.revoked()));
-        silentLine(Level.INFO, notice, out, scheduled);
     }
 
     private static UpdaterState withLastAnnounced(UpdaterState s, String version) {
@@ -534,7 +606,7 @@ public final class UpdaterRuntime {
                 warnSafe(log, stripWarn(message));
             }
         }
-        emit(out, "update finished: " + result.outcome());
+        emit(out, UPDATE_FINISHED_PREFIX + result.outcome());
     }
 
     /** The transaction's progress sink: WARN in the log and a copy to the command output. Never throws. */
@@ -554,19 +626,29 @@ public final class UpdaterRuntime {
             emit(out, "reset failed (" + e.getClass().getName() + ")");
             return;
         }
+        MutableCancelToken token = new MutableCancelToken();
+        resetToken = token;
         try {
+            if (stopping) {
+                // shutdown ran between the lease and this publish, so it saw no token to cancel: the reset
+                // cancels itself here instead of resetting state while the runtime is stopping.
+                token.cancel();
+                emit(out, STOPPING_TEXT);
+                return;
+            }
             if (Files.exists(updateDir.resolve(UpdateDirectory.JOURNAL), LinkOption.NOFOLLOW_LINKS)) {
                 emit(out, RESET_JOURNAL);
                 return;
             }
             StateReset.ResetResult result = StateReset.resetStateAndRefetch(store, pipeline, identity,
-                    live.onDiskVersion(), new MutableCancelToken());
+                    live.onDiskVersion(), token);
             for (String message : result.messages()) {
                 emit(out, message);
             }
         } catch (IOException | UpdateRejectedException e) {
             emit(out, "reset failed (" + e.getClass().getName() + ")");
         } finally {
+            resetToken = null;
             closeQuietly(lease, out);
         }
     }
@@ -597,21 +679,133 @@ public final class UpdaterRuntime {
     }
 
     /**
-     * One section 6 row. A scheduled tick writes it to the log at its level. A command writes it to
-     * {@code out}, and a WARN is also logged.
+     * One section 6 row. The log always gets it at its level. Only an INFO row of a command also goes to
+     * {@code out}: WARN and DEBUG rows never do, because the invoker may be a player.
      */
     private void silentLine(Level level, String text, Consumer<String> out, boolean scheduled) {
-        if (scheduled) {
-            switch (level) {
-                case DEBUG -> debugSafe(text);
-                case INFO -> infoSafe(text);
-                default -> warnSafe(log, text);
+        switch (level) {
+            case DEBUG -> debugSafe(text);
+            case INFO -> {
+                infoSafe(text);
+                if (!scheduled) {
+                    emitLogged(out, text);
+                }
             }
-            return;
+            default -> warnSafe(log, text);
         }
-        emit(out, text);
-        if (level == Level.WARN) {
-            warnSafe(log, text);
+    }
+
+    /**
+     * Sends a row the log already holds to the command sink. A player's {@link PlayerOutput} would log it a
+     * second time, so it is told the row is logged already; every other sink gets it as usual.
+     */
+    private static void emitLogged(Consumer<String> out, String text) {
+        if (out instanceof PlayerOutput player) {
+            player.preLogged(text);
+        } else {
+            emit(out, text);
+        }
+    }
+
+    /**
+     * The command sink of a non-console invoker: a player holding the updater permission. Every line is
+     * written to the log in full, at INFO, with {@value #OUTPUT_LOG_PREFIX} in front, so the owner can
+     * still read it. Only a line that {@link #visibleToPlayer} accepts reaches the invoker; every other
+     * line is replaced by {@link #REDACTED_TEXT}, which is sent at most once per command.
+     */
+    private final class PlayerOutput implements Consumer<String> {
+        private final Consumer<String> inner;
+        private final AtomicBoolean redacted = new AtomicBoolean();
+
+        PlayerOutput(Consumer<String> inner) {
+            this.inner = inner;
+        }
+
+        @Override
+        public void accept(String line) {
+            infoSafe(OUTPUT_LOG_PREFIX + line);
+            deliver(line);
+        }
+
+        /**
+         * Delivers a line the log already recorded, without logging it a second time. The disclosure
+         * filter is the same as {@link #accept}: the invoker reads it or the one redacted line.
+         */
+        void preLogged(String line) {
+            deliver(line);
+        }
+
+        private void deliver(String line) {
+            if (visibleToPlayer(line)) {
+                emit(inner, line);
+            } else if (redacted.compareAndSet(false, true)) {
+                emit(inner, REDACTED_TEXT);
+            }
+        }
+    }
+
+    /**
+     * The exact lines a non-console invoker may read unchanged: the facade's own fixed texts and its
+     * formatted rows, and nothing else.
+     *
+     * <p>The accepted set: the usage text, the disabled line, the stopping and busy lines, the no-update
+     * row, the two rows that carry exactly one {@link UpdateVersion} (the offer and the announcement),
+     * the full-state and stale-revocation lines, the three cancel replies, the console-only line, the two
+     * reset refusals, the not-configured line, and the staged or installed outcome rows.
+     *
+     * <p>Every accepted line is either an exact match of one of the facade's constants (or of a row built
+     * from one constant plus one of a small fixed set of detail words), or one fixed prefix followed by
+     * exactly one version token. No prefix match accepts arbitrary text, so a path, another jar's file
+     * name, a host key or a raw exception message can never pass.
+     *
+     * @param line one line of the command output
+     * @return true when the line may reach a non-console invoker unchanged
+     */
+    static boolean visibleToPlayer(String line) {
+        if (line == null) {
+            return false;
+        }
+        if (line.equals(USAGE) || line.equals(STOPPING_TEXT) || line.equals(BUSY_TEXT)
+                || line.equals(NOT_CONSOLE) || line.equals(RESET_BUSY) || line.equals(RESET_JOURNAL)
+                || line.equals(STATE_FULL_TEXT) || line.equals(STALE_TEXT) || line.equals(NO_UPDATE_TEXT)
+                || line.equals(REASON_NO_HOSTS)
+                || line.equals(UPDATE_FINISHED_PREFIX + TransactionOutcome.STAGED_ONLY)
+                || line.equals(UPDATE_FINISHED_PREFIX + TransactionOutcome.INSTALLED_RESTART_PENDING)) {
+            return true;
+        }
+        for (CancelReply reply : CancelReply.values()) {
+            if (line.equals(cancelText(reply))) {
+                return true;
+            }
+        }
+        for (String reason : DISABLED_REASONS) {
+            if (line.equals(DISABLED_PREFIX + reason)) {
+                return true;
+            }
+        }
+        for (String detail : METADATA_DETAILS) {
+            if (line.equals(DISABLED_PREFIX + REASON_METADATA + detail)) {
+                return true;
+            }
+        }
+        for (String prefix : VERSION_ROW_PREFIXES) {
+            if (line.startsWith(prefix)) {
+                return isVersion(line.substring(prefix.length()));
+            }
+        }
+        return false;
+    }
+
+    /** True when {@code text} is exactly one version token. A path, a file name or a message never is. */
+    private static boolean isVersion(String text) {
+        if (text.isEmpty() || text.length() > UpdateVersion.MAX_LENGTH) {
+            return false;
+        }
+        try {
+            UpdateVersion.parse(text);
+            return true;
+        } catch (UpdateRejectedException e) {
+            return false;
         }
     }
 
@@ -785,8 +979,14 @@ public final class UpdaterRuntime {
             LiveJarDiscovery discovery = p.discovery();
             try {
                 live = discovery.discover();
+            } catch (DevelopmentBuildException e) {
+                return fail(REASON_DEV_BUILD);
             } catch (IOException | UpdateRejectedException e) {
-                return fail(REASON_DISCOVERY);
+                return fail(isDevelopmentBuild(e) ? REASON_DEV_BUILD : REASON_DISCOVERY);
+            } catch (RuntimeException e) {
+                // A runtime failure from the adapter is an internal start failure, unless it carries the
+                // development-build reason, which deserves its own line.
+                return fail(isDevelopmentBuild(e) ? REASON_DEV_BUILD : REASON_INTERNAL);
             }
 
             OwnJarResources.Resources resources;
@@ -839,7 +1039,7 @@ public final class UpdaterRuntime {
                 healthStage.whenComplete((verdict, error) -> logHealth(verdict, error));
             }
 
-            store = new StateStore(dir);
+            store = s.stores.apply(dir);
             try {
                 UpdateDocuments.Trust runningTrust = identity.runningTrust();
                 StateRecords.StateDelta initial = TrustTransition.apply(
@@ -903,38 +1103,36 @@ public final class UpdaterRuntime {
             String wanted = "disclosure-v1 " + (dev ? "dev" : "production") + " " + keys + "\n";
             Path marker = dir.resolve(DISCLOSURE_MARKER);
             try {
-                if (Files.isSymbolicLink(marker)) {
-                    log.debug("disclosure marker is a link; not followed");
-                    return;
-                }
-                if (Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS) && Files.size(marker) <= 256
-                        && wanted.equals(Files.readString(marker, StandardCharsets.UTF_8))) {
-                    return;
-                }
-                log.info("update checks send this server's IP address, the running version and the platform to "
-                        + keys.replace(",", ", ") + "; set update.check-interval=off in " + p.configFile()
-                        + " to turn checks off");
-                Files.deleteIfExists(marker);
-                writePrivate(marker, wanted);
+                recordDisclosure(marker, wanted, "update checks send this server's IP address, the running version and "
+                        + "the platform to " + keys.replace(",", ", ") + "; set update.check-interval=off in "
+                        + p.configFile() + " to turn checks off", log);
             } catch (IOException | RuntimeException e) {
                 log.debug("disclosure marker could not be written (" + e.getClass().getName() + ")");
             }
         }
 
-        /** Creates the marker owner-only (0600 where POSIX applies), so it is never world-readable. */
-        private static void writePrivate(Path marker, String text) throws IOException {
-            if (marker.getFileSystem().supportedFileAttributeViews().contains("posix")) {
-                Files.createFile(marker, PosixFilePermissions.asFileAttribute(
-                        EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)));
-            } else {
-                Files.createFile(marker);
+        /**
+         * True when {@code t} or one of its causes is a {@link DevelopmentBuildException}, so an adapter
+         * that wraps the discovery failure still gets {@link #REASON_DEV_BUILD}. The cause chain is walked
+         * with a depth cap, and a self-referencing cause ends the walk.
+         */
+        private static boolean isDevelopmentBuild(Throwable t) {
+            Throwable current = t;
+            for (int depth = 0; current != null && depth < MAX_CAUSE_DEPTH; depth++) {
+                if (current instanceof DevelopmentBuildException) {
+                    return true;
+                }
+                Throwable next = current.getCause();
+                if (next == current) {
+                    return false;
+                }
+                current = next;
             }
-            Files.writeString(marker, text, StandardCharsets.UTF_8, StandardOpenOption.WRITE,
-                    StandardOpenOption.TRUNCATE_EXISTING);
+            return false;
         }
 
         UpdaterRuntime fail(String reason) {
-            warnSafe(log, "updater disabled: " + reason);
+            warnSafe(log, DISABLED_PREFIX + reason);
             stopExecutor();
             return new UpdaterRuntime(log, reason);
         }
@@ -956,7 +1154,61 @@ public final class UpdaterRuntime {
         }
     }
 
+    /**
+     * Writes the disclosure marker unless it is already current. A linked marker is never read or written, but the
+     * disclosure is still logged. Never throws except IO and runtime errors, which the caller logs.
+     */
+    static void recordDisclosure(Path marker, String wanted, String text, UpdaterLog log) throws IOException {
+        boolean linked = Files.isSymbolicLink(marker);
+        if (!linked && markerMatches(marker, wanted)) {
+            return;
+        }
+        log.info(text);
+        if (linked) {
+            log.debug("disclosure marker is a link; not followed");
+            return;
+        }
+        Files.deleteIfExists(marker);
+        writePrivate(marker, wanted);
+    }
+
+    /** Reads at most {@value #MARKER_READ_LIMIT} bytes, never following a link. */
+    static boolean markerMatches(Path marker, String wanted) throws IOException {
+        if (!Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)) {
+            return false;
+        }
+        Set<OpenOption> options = Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+        try (SeekableByteChannel channel = Files.newByteChannel(marker, options)) {
+            ByteBuffer buffer = ByteBuffer.allocate(MARKER_READ_LIMIT + 1);
+            while (buffer.hasRemaining() && channel.read(buffer) > 0) {
+                // fill the buffer up to one byte past the limit, so an oversized marker never matches
+            }
+            if (buffer.position() > MARKER_READ_LIMIT) {
+                return false;
+            }
+            return wanted.equals(new String(buffer.array(), 0, buffer.position(), StandardCharsets.UTF_8));
+        }
+    }
+
+    /**
+     * Creates the marker owner-only (0600 where POSIX applies), so it is never world-readable. CREATE_NEW and
+     * NOFOLLOW_LINKS: an existing file or a link at the path is refused, never written through.
+     */
+    static void writePrivate(Path marker, String text) throws IOException {
+        Set<OpenOption> options = Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE,
+                LinkOption.NOFOLLOW_LINKS);
+        FileAttribute<?>[] attrs = marker.getFileSystem().supportedFileAttributeViews().contains("posix")
+                ? new FileAttribute<?>[] {PosixFilePermissions.asFileAttribute(
+                        EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE))}
+                : new FileAttribute<?>[0];
+        try (SeekableByteChannel channel = Files.newByteChannel(marker, options, attrs)) {
+            ByteBuffer buffer = ByteBuffer.wrap(text.getBytes(StandardCharsets.UTF_8));
+            while (buffer.hasRemaining()) {
+                channel.write(buffer);
+            }
+        }
+    }
     private static boolean looksLikeSnapshot(byte[] buildJson) {
-        return new String(buildJson, StandardCharsets.UTF_8).contains("SNAPSHOT");
+        return DevelopmentBuildException.looksLikeDevelopmentBuild(buildJson);
     }
 }
