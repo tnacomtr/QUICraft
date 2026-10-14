@@ -7,7 +7,11 @@
     "ConnectionAccessor",
     "DiscardedPayloadMixin",
     "ServerCommonPacketListenerImplMixin",
-    "ServerConnectionListenerMixin"
+    "ServerConnectionListenerMixin",
+    "UpdaterCommandsMixin",
+    "UpdaterDedicatedServerMixin",
+    "UpdaterPlayerListMixin",
+    "CommandSourceStackAccessor"
   ],
   "injectors": {
     "defaultRequire": 0
