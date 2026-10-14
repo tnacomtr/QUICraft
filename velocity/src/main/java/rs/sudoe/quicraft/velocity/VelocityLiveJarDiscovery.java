@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.velocity;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import rs.sudoe.quicraft.updater.DevelopmentBuildException;
 import rs.sudoe.quicraft.updater.LiveJar;
 import rs.sudoe.quicraft.updater.LiveJarDiscovery;
 import rs.sudoe.quicraft.updater.LiveJarValidator;
 import rs.sudoe.quicraft.updater.OwnJarVersion;
-import rs.sudoe.quicraft.updater.StrictJson;
 import rs.sudoe.quicraft.updater.UpdateRejectedException;
 
 /**
@@ -33,7 +37,8 @@ final class VelocityLiveJarDiscovery implements LiveJarDiscovery {
     static final String DESCRIPTOR = "velocity-plugin.json";
     /** Cap on the descriptor's decompressed bytes; the entry's declared size is not trusted. */
     static final int MAX_DESCRIPTOR_BYTES = 64 * 1024;
-    private static final int MAX_STRING_CHARS = 512;
+    private static final String ID = "id";
+    private static final String PROVIDES = "provides";
     private static final String JAR_SUFFIX = ".jar";
 
     private final Supplier<Optional<Path>> source;
@@ -71,10 +76,16 @@ final class VelocityLiveJarDiscovery implements LiveJarDiscovery {
     }
 
     /**
-     * Reads the {@code id} of a plugin jar from its {@code velocity-plugin.json}, reading only that one
-     * entry, capped at {@link #MAX_DESCRIPTOR_BYTES}. A jar without the descriptor is not a plugin and
-     * gives empty. Any read failure, oversize entry or unparsable descriptor throws, so the validator
-     * refuses: a jar that cannot be inspected never counts as "not a duplicate".
+     * Reads the identity of a plugin jar from its {@code velocity-plugin.json}, reading only that one
+     * entry, capped at {@link #MAX_DESCRIPTOR_BYTES}. The descriptor is parsed with Gson in Velocity's
+     * own lenient mode, so an unknown field or a long string (Velocity's {@code description} has no
+     * limit) does not refuse the jar. A jar without the descriptor is not a plugin and gives empty.
+     *
+     * <p>A jar that provides {@code quicraft} through its {@code provides} aliases counts as a
+     * duplicate, so this returns {@link #OWN_ID} for it, like it does for a jar whose {@code id} is
+     * {@code quicraft}: Velocity would load both and refuse the duplicate. Any read failure, oversize
+     * entry or unparsable descriptor throws, so the validator refuses: a jar that cannot be inspected
+     * never counts as "not a duplicate".
      */
     static Optional<String> idOf(Path jar) throws IOException {
         try (ZipFile zip = new ZipFile(jar.toFile())) {
@@ -82,28 +93,71 @@ final class VelocityLiveJarDiscovery implements LiveJarDiscovery {
             if (entry == null || entry.isDirectory()) {
                 return Optional.empty();
             }
-            byte[] bytes;
-            try (InputStream in = zip.getInputStream(entry)) {
-                bytes = in.readNBytes(MAX_DESCRIPTOR_BYTES + 1);
+            JsonObject root = parseDescriptor(readCap(zip, entry));
+            String id = stringField(root, ID);
+            if (OWN_ID.equals(id) || providesOwnId(root)) {
+                return Optional.of(OWN_ID);
             }
-            if (bytes.length > MAX_DESCRIPTOR_BYTES) {
-                throw new IOException("plugin descriptor is larger than the limit");
-            }
-            Map<String, Object> root;
-            try {
-                root = StrictJson.parse(bytes, MAX_DESCRIPTOR_BYTES, MAX_STRING_CHARS);
-            } catch (UpdateRejectedException e) {
-                throw new IOException("plugin descriptor is not readable by the updater", e);
-            }
-            Object id = root.get("id");
-            return id instanceof String s ? Optional.of(s) : Optional.empty();
+            return id == null ? Optional.empty() : Optional.of(id);
         }
     }
 
-    /** The validator calls this only for the live jar; any failure refuses it. */
+    /** The descriptor's decompressed bytes, capped like the entry-size limit. */
+    private static byte[] readCap(ZipFile zip, ZipEntry entry) throws IOException {
+        try (InputStream in = zip.getInputStream(entry)) {
+            byte[] bytes = in.readNBytes(MAX_DESCRIPTOR_BYTES + 1);
+            if (bytes.length > MAX_DESCRIPTOR_BYTES) {
+                throw new IOException("plugin descriptor is larger than the limit");
+            }
+            return bytes;
+        }
+    }
+
+    /** Parses the descriptor the way Velocity does: Gson, lenient, from its UTF-8 bytes. */
+    private static JsonObject parseDescriptor(byte[] bytes) throws IOException {
+        JsonElement parsed;
+        try {
+            parsed = JsonParser.parseString(new String(bytes, StandardCharsets.UTF_8));
+        } catch (JsonParseException e) {
+            throw new IOException("plugin descriptor is not readable by the updater", e);
+        }
+        if (!parsed.isJsonObject()) {
+            throw new IOException("plugin descriptor root is not an object");
+        }
+        return parsed.getAsJsonObject();
+    }
+
+    private static String stringField(JsonObject root, String name) {
+        JsonElement field = root.get(name);
+        return field != null && field.isJsonPrimitive() && field.getAsJsonPrimitive().isString()
+                ? field.getAsString()
+                : null;
+    }
+
+    private static boolean providesOwnId(JsonObject root) {
+        JsonElement provides = root.get(PROVIDES);
+        if (provides == null || !provides.isJsonArray()) {
+            return false;
+        }
+        for (JsonElement entry : provides.getAsJsonArray()) {
+            if (entry.isJsonPrimitive() && entry.getAsJsonPrimitive().isString()
+                    && OWN_ID.equals(entry.getAsString())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The validator calls this only for the live jar; any read failure refuses it (the validator wraps
+     * the {@link IllegalStateException}). A {@link DevelopmentBuildException} is unchecked and is
+     * rethrown unchanged, so the facade names the development build instead of a generic refusal.
+     */
     static rs.sudoe.quicraft.updater.UpdateVersion versionOf(Path jar) {
         try {
             return OwnJarVersion.read(jar);
+        } catch (DevelopmentBuildException e) {
+            throw e;
         } catch (IOException | UpdateRejectedException e) {
             throw new IllegalStateException("cannot read the live jar version", e);
         }

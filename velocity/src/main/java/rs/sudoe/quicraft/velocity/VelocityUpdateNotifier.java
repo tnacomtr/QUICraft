@@ -33,29 +33,42 @@ final class VelocityUpdateNotifier {
         this.online = online;
     }
 
-    /** Remembers the message as the current one and sends it to the online admins now. */
+    /**
+     * Remembers the message as the current one and sends it to the online admins now. Only the roster is
+     * snapshotted under the lock; the permission checks and the sends run outside it, because Velocity may
+     * resolve a permission through a plugin that itself talks to the proxy.
+     */
     void announce(String message) {
-        List<Player> targets = new ArrayList<>();
+        List<Player> roster;
         synchronized (lock) {
             last = message;
             delivered.clear();
-            for (Player p : online.get()) {
-                if (isAdmin(p)) {
-                    targets.add(p);
-                    delivered.add(p.getUniqueId());
-                }
-            }
+            roster = new ArrayList<>(online.get());
         }
-        for (Player p : targets) {
+        for (Player p : roster) {
+            if (!isAdmin(p)) {
+                continue;
+            }
+            synchronized (lock) {
+                delivered.add(p.getUniqueId());
+            }
             send(p, message);
         }
     }
 
     /** Sends the current message to a player who has not had it yet and may see it. */
     void onJoin(Player player) {
+        synchronized (lock) {
+            if (last == null) {
+                return;
+            }
+        }
+        if (!isAdmin(player)) {
+            return;
+        }
         String message;
         synchronized (lock) {
-            if (last == null || !isAdmin(player) || !delivered.add(player.getUniqueId())) {
+            if (!delivered.add(player.getUniqueId())) {
                 return;
             }
             message = last;

@@ -12,10 +12,12 @@ import com.velocitypowered.api.proxy.Player;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -49,6 +51,20 @@ class VelocityUpdaterWiringTest {
         Path fresh = root.resolve("fresh");
         assertFalse(platform(fresh, root, notifier()).updateDirExistedBeforeStart());
         assertFalse(Files.exists(fresh.resolve("update")), "the platform must not create the update directory");
+    }
+
+    @Test
+    void aDanglingUpdateDirSymlinkCountsAsExisted(@TempDir Path root) throws Exception {
+        Path data = Files.createDirectories(root.resolve("data"));
+        Files.createSymbolicLink(data.resolve("update"), root.resolve("does-not-exist"));
+        assertTrue(platform(data, root, notifier()).updateDirExistedBeforeStart());
+    }
+
+    @Test
+    void aFileWhereTheUpdateDirWouldBeCountsAsExisted(@TempDir Path root) throws Exception {
+        Path data = Files.createDirectories(root.resolve("data"));
+        Files.writeString(data.resolve("update"), "a file, not a directory");
+        assertTrue(platform(data, root, notifier()).updateDirExistedBeforeStart());
     }
 
     @Test
@@ -114,6 +130,58 @@ class VelocityUpdaterWiringTest {
                 UUID.randomUUID());
         new VelocityUpdateNotifier(() -> List.of()).onJoin(admin);
         assertTrue(out.lines.isEmpty());
+    }
+
+    @Test
+    void announceChecksPermissionsOutsideTheLock() throws Exception {
+        CountDownLatch permissionEntered = new CountDownLatch(1);
+        CountDownLatch releasePermission = new CountDownLatch(1);
+        Player admin = UpdaterFakes.notifiedPlayer(new UpdaterFakes.Recorder(), permission -> {
+            if (!VelocityUpdateNotifier.NOTIFY_PERMISSION.equals(permission)) {
+                return false;
+            }
+            permissionEntered.countDown();
+            try {
+                releasePermission.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return true;
+        }, UUID.randomUUID());
+        Player plain = UpdaterFakes.notifiedPlayer(new UpdaterFakes.Recorder(), Set.of(), UUID.randomUUID());
+        VelocityUpdateNotifier notifier = new VelocityUpdateNotifier(() -> List.of(admin, plain));
+
+        Thread announce = new Thread(() -> notifier.announce("update 0.2.0 is available"), "announce");
+        announce.start();
+        assertTrue(permissionEntered.await(5, TimeUnit.SECONDS), "the permission check must run");
+
+        CountDownLatch joinDone = new CountDownLatch(1);
+        Thread join = new Thread(() -> {
+            notifier.onJoin(plain);
+            joinDone.countDown();
+        }, "join");
+        join.start();
+        boolean joined = joinDone.await(2, TimeUnit.SECONDS);
+
+        releasePermission.countDown();
+        announce.join(TimeUnit.SECONDS.toMillis(5));
+        join.join(TimeUnit.SECONDS.toMillis(5));
+        assertTrue(joined, "a join must not wait for a permission check held under the lock");
+    }
+
+    @Test
+    void notifyAdminsDoesNotLogToTheConsole(@TempDir Path root) {
+        List<String> log = new ArrayList<>();
+        UpdaterFakes.Recorder out = new UpdaterFakes.Recorder();
+        Player admin = UpdaterFakes.notifiedPlayer(out, Set.of(VelocityUpdateNotifier.NOTIFY_PERMISSION),
+                UUID.randomUUID());
+        VelocityUpdaterPlatform p = new VelocityUpdaterPlatform("4.2", UpdaterFakes.recordingLogger(log),
+                root, Optional::empty, root, new VelocityUpdateNotifier(() -> List.of(admin)));
+
+        p.notifyAdmins("a new QUICraft version is available: 0.2.0");
+
+        assertTrue(log.isEmpty(), "the facade logs the notice, not the adapter: " + log);
+        assertEquals(List.of("a new QUICraft version is available: 0.2.0"), out.lines);
     }
 
     private static VelocityUpdateNotifier notifier() {

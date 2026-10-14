@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.velocity;
 
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -54,9 +55,22 @@ final class VelocityUpdaterPlatform implements UpdaterPlatform {
         this.dataDirectory = dataDirectory;
         this.updateDir = dataDirectory.resolve(UPDATE_DIR);
         // Read here, before the updater's own init can create the directory.
-        this.updateDirExisted = Files.isDirectory(updateDir);
+        this.updateDirExisted = existedBeforeStart(updateDir);
         this.discovery = new VelocityLiveJarDiscovery(pluginSource, pluginsDir);
         this.notifier = notifier;
+    }
+
+    /**
+     * Anything at the path counts as "existed": a directory, a plain file, or a symbolic link (even a
+     * dangling one), checked without following links. Any failure to check counts as "existed" too, so
+     * the updater never treats an unreadable path as a fresh install.
+     */
+    private static boolean existedBeforeStart(Path dir) {
+        try {
+            return Files.exists(dir, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(dir);
+        } catch (RuntimeException e) {
+            return true;
+        }
     }
 
     /**
@@ -139,9 +153,12 @@ final class VelocityUpdaterPlatform implements UpdaterPlatform {
         };
     }
 
+    /**
+     * Delivers the notice to the online admins only. The facade already writes the console/log line for
+     * every notice, so nothing is logged here (docs/updater.md 6; {@link UpdaterPlatform#notifyAdmins}).
+     */
     @Override
     public void notifyAdmins(String message) {
-        logger.info(message);
         notifier.announce(message);
     }
 }

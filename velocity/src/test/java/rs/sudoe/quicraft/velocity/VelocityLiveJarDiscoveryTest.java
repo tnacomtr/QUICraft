@@ -14,6 +14,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import rs.sudoe.quicraft.updater.DevelopmentBuildException;
 import rs.sudoe.quicraft.updater.LiveJar;
 import rs.sudoe.quicraft.updater.UpdateRejectedException;
 
@@ -22,6 +23,8 @@ class VelocityLiveJarDiscoveryTest {
 
     private static final String BUILD_JSON =
             "{\"type\":\"quicraft.build\",\"v\":1,\"platform\":\"velocity\",\"version\":\"0.1.0-alpha.1\"}";
+    private static final String SNAPSHOT_BUILD_JSON =
+            "{\"type\":\"quicraft.build\",\"v\":1,\"platform\":\"velocity\",\"version\":\"0.1.0-SNAPSHOT\"}";
 
     private static Path plugins(Path root) throws IOException {
         return Files.createDirectories(root.resolve("plugins"));
@@ -29,10 +32,15 @@ class VelocityLiveJarDiscoveryTest {
 
     /** A jar with a velocity-plugin.json naming {@code id}, and the build metadata QUICraft ships. */
     private static Path jar(Path file, String id) throws IOException {
+        return jar(file, "{\"id\":\"" + id + "\",\"main\":\"x.Y\",\"version\":\"0.1.0\"}", BUILD_JSON);
+    }
+
+    /** A jar with a raw descriptor and raw build metadata, for the awkward cases. */
+    private static Path jar(Path file, String descriptor, String buildJson) throws IOException {
         Files.createDirectories(file.getParent());
         try (OutputStream raw = Files.newOutputStream(file); ZipOutputStream zip = new ZipOutputStream(raw)) {
-            put(zip, "velocity-plugin.json", "{\"id\":\"" + id + "\",\"main\":\"x.Y\",\"version\":\"0.1.0\"}");
-            put(zip, "META-INF/quicraft/build.json", BUILD_JSON);
+            put(zip, "velocity-plugin.json", descriptor);
+            put(zip, "META-INF/quicraft/build.json", buildJson);
         }
         return file;
     }
@@ -136,5 +144,44 @@ class VelocityLiveJarDiscoveryTest {
     void idOfReadsOnlyTheDescriptor(@TempDir Path root) throws Exception {
         Path jar = jar(root.resolve("x.jar"), "quicraft");
         assertEquals(Optional.of("quicraft"), VelocityLiveJarDiscovery.idOf(jar));
+    }
+
+    @Test
+    void siblingProvidingTheQuicraftIdIsRefused(@TempDir Path root) throws Exception {
+        Path scan = plugins(root);
+        Path live = jar(scan.resolve("quicraft.jar"), "quicraft");
+        jar(scan.resolve("alias.jar"),
+                "{\"id\":\"other\",\"main\":\"a.B\",\"version\":\"1.0.0\",\"provides\":[\"quicraft\"]}",
+                BUILD_JSON);
+        assertThrows(UpdateRejectedException.class, () -> discovery(live, scan).discover());
+    }
+
+    @Test
+    void aLongSiblingDescriptionDoesNotRefuse(@TempDir Path root) throws Exception {
+        Path scan = plugins(root);
+        Path live = jar(scan.resolve("quicraft.jar"), "quicraft");
+        // Velocity's descriptor has no limit on description; StrictJson's 512-char cap must not apply.
+        jar(scan.resolve("other.jar"),
+                "{\"id\":\"other\",\"main\":\"a.B\",\"version\":\"1.0.0\",\"description\":\""
+                        + "d".repeat(600) + "\"}",
+                BUILD_JSON);
+        assertEquals(live.toRealPath(), discovery(live, scan).discover().realPath());
+    }
+
+    @Test
+    void aSnapshotOwnJarReachesTheCallerAsADevelopmentBuild(@TempDir Path root) throws Exception {
+        Path scan = plugins(root);
+        Path live = jar(scan.resolve("quicraft.jar"),
+                "{\"id\":\"quicraft\",\"main\":\"x.Y\",\"version\":\"0.1.0-SNAPSHOT\"}",
+                SNAPSHOT_BUILD_JSON);
+        assertThrows(DevelopmentBuildException.class, () -> discovery(live, scan).discover());
+    }
+
+    @Test
+    void aCorruptSiblingDescriptorStillFailsClosed(@TempDir Path root) throws Exception {
+        Path scan = plugins(root);
+        Path live = jar(scan.resolve("quicraft.jar"), "quicraft");
+        jar(scan.resolve("corrupt.jar"), "{\"id\":\"other\",", BUILD_JSON);
+        assertThrows(UpdateRejectedException.class, () -> discovery(live, scan).discover());
     }
 }
