@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.updater;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -242,5 +243,71 @@ class LiveJarValidatorTest {
                         JarFixtures::testIds, JarFixtures.OWN_ID, p -> {
                             throw new IllegalStateException("boom");
                         }));
+    }
+
+    @Test
+    void dotDotThroughSymlinkIsRefusedNotNormalised() throws Exception {
+        // plugins/linkdir/../x.jar lexically means plugins/x.jar, but the loader would resolve
+        // linkdir first. Both jars are distinct, so a wrong validation would be visible.
+        Path scan = tmp.resolve("plugins");
+        JarFixtures.jar(scan, "x.jar", JarFixtures.OWN_ID, JarFixtures.BUILD_JSON_V1);
+        Path elsewhere = JarFixtures.jar(tmp.resolve("elsewhere").resolve("sub"), "x.jar",
+                JarFixtures.OWN_ID, JarFixtures.BUILD_JSON_V1);
+        Path linkDir = scan.resolve("linkdir");
+        assumeTrue(canSymlink(linkDir, elsewhere.getParent()), "symbolic links unsupported here");
+
+        assertRefused(scan.resolve("linkdir").resolve("..").resolve("x.jar"), scan,
+                "live jar path is not canonical");
+    }
+
+    @Test
+    void dotElementIsRefusedBeforeNormalisation() throws Exception {
+        Path scan = tmp.resolve("plugins");
+        JarFixtures.jar(scan, "quicraft.jar", JarFixtures.OWN_ID, JarFixtures.BUILD_JSON_V1);
+
+        assertRefused(scan.resolve("./quicraft.jar"), scan, "live jar path is not canonical");
+    }
+
+    @Test
+    void siblingRejectedByIdReaderIsRefusedAsUninspectable() throws Exception {
+        // The adapter's reader fails closed on an oversized descriptor by throwing IOException.
+        Path scan = tmp.resolve("plugins");
+        Path jar = JarFixtures.jar(scan, "quicraft.jar", JarFixtures.OWN_ID,
+                JarFixtures.BUILD_JSON_V1);
+        JarFixtures.jar(scan, "big.jar", JarFixtures.OWN_ID, JarFixtures.BUILD_JSON_V1);
+        JarIdReader failClosed = p -> {
+            if (p.getFileName().toString().equals("big.jar")) {
+                throw new IOException("descriptor exceeds limit");
+            }
+            return JarFixtures.testIds(p);
+        };
+
+        UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
+                () -> LiveJarValidator.validate(jar, scan, JarFixtures::velocityLike, failClosed,
+                        JarFixtures.OWN_ID, LiveJarValidatorTest::readVersion));
+        assertEquals("cannot inspect big.jar for a duplicate QUICraft jar", e.getMessage());
+    }
+
+    @Test
+    void missingReportedFileIsRefusedWithoutAPath() throws Exception {
+        Path scan = tmp.resolve("plugins");
+        Files.createDirectories(scan);
+
+        UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
+                () -> validate(scan.resolve("missing.jar"), scan));
+        assertEquals("live jar is not a regular file", e.getMessage());
+        assertFalse(e.getMessage().contains(tmp.toString()));
+    }
+
+    @Test
+    void missingScanDirectoryIsRefusedWithoutAPath() throws Exception {
+        Path jar = JarFixtures.jar(tmp.resolve("elsewhere"), "quicraft.jar", JarFixtures.OWN_ID,
+                JarFixtures.BUILD_JSON_V1);
+        Path scan = tmp.resolve("no-such-scan");
+
+        UpdateRejectedException e = assertThrows(UpdateRejectedException.class,
+                () -> validate(jar, scan));
+        assertEquals("cannot resolve loader scan directory", e.getMessage());
+        assertFalse(e.getMessage().contains(tmp.toString()));
     }
 }

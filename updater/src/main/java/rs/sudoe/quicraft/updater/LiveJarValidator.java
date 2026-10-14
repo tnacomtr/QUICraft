@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.updater;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.DirectoryIteratorException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -20,7 +21,8 @@ import java.util.function.Function;
  * Turns the path a loader reports for our own jar into a validated {@link LiveJar}
  * (docs/updater.md 12.14, "Both"). The loader adapter supplies only the reported path, the scan
  * directory, the loader's filter, the id reader and the own id. Every refusal is an
- * {@link UpdateRejectedException} with a fixed reason; a jar we cannot inspect is refused as well.
+ * {@link UpdateRejectedException} with a fixed reason and no path; the underlying IOException, if
+ * any, is kept as the cause. A jar we cannot inspect is refused as well.
  */
 public final class LiveJarValidator {
 
@@ -40,14 +42,16 @@ public final class LiveJarValidator {
     /**
      * Validates the live jar.
      *
-     * @param reportedSource the path the loader reports for our jar (not yet resolved)
+     * @param reportedSource the path the loader reports for our jar, absolute or relative; it must
+     *     not contain {@code .} or {@code ..} name elements
      * @param scanDirectory the loader's scan directory for this kind of jar
      * @param filter the loader's directory filter
-     * @param ids reads the id of a jar
+     * @param ids reads the id of a jar; a throw refuses the validation
      * @param ownId the id of this project's jar
      * @param onDiskVersion reads the version from a jar's build metadata; a throw refuses the jar
      * @return the validated live jar
-     * @throws IOException when a path cannot be inspected at all
+     * @throws IOException declared for compatibility; I/O failures are reported as
+     *     {@link UpdateRejectedException} with a fixed reason
      * @throws UpdateRejectedException when the jar is not acceptable
      */
     public static LiveJar validate(Path reportedSource, Path scanDirectory, ScanFilter filter,
@@ -60,13 +64,16 @@ public final class LiveJarValidator {
         Objects.requireNonNull(ownId, "ownId");
         Objects.requireNonNull(onDiskVersion, "onDiskVersion");
 
-        // (a) Symlink checks on the original path, before any resolution.
-        Path original = reportedSource.toAbsolutePath().normalize();
+        // (a) The spelling is checked before normalisation: "dir/link/../x.jar" must not be
+        // validated as "dir/x.jar" when "link" is a symbolic link elsewhere.
+        Path absolute = reportedSource.toAbsolutePath();
+        requireCanonicalSpelling(absolute);
+        Path original = absolute.normalize();
         requireOriginalIsPlainFile(original);
 
         // (b) Resolve, then check location, name and the loader's filter.
-        Path real = original.toRealPath();
-        Path realScan = scanDirectory.toRealPath();
+        Path real = realPath(original, "cannot resolve live jar path");
+        Path realScan = realPath(scanDirectory, "cannot resolve loader scan directory");
         Path realParent = real.getParent();
         if (realParent == null || !realParent.equals(realScan)) {
             throw refuse("live jar is outside the loader scan directory");
@@ -91,6 +98,8 @@ public final class LiveJarValidator {
                 throw refuse("live jar size is out of range");
             }
             sha512 = hashExactly(ch, size);
+        } catch (IOException e) {
+            throw new UpdateRejectedException("cannot read live jar", e);
         }
 
         UpdateVersion version;
@@ -105,6 +114,19 @@ public final class LiveJarValidator {
 
         // (e)
         return new LiveJar(real, realScan, size, sha512, version);
+    }
+
+    /**
+     * Refuses a path with a {@code .} or {@code ..} name element, checked on the path as reported
+     * (absolute, not normalised). Symbolic links above the parent are not rejected here.
+     */
+    private static void requireCanonicalSpelling(Path absolute) throws UpdateRejectedException {
+        for (int i = 0; i < absolute.getNameCount(); i++) {
+            String element = absolute.getName(i).toString();
+            if (".".equals(element) || "..".equals(element)) {
+                throw refuse("live jar path is not canonical");
+            }
+        }
     }
 
     /** Refuses a symbolic link, a non-regular file, or a parent directory that is a link. */
@@ -128,8 +150,16 @@ public final class LiveJarValidator {
         }
     }
 
+    private static Path realPath(Path path, String reason) throws UpdateRejectedException {
+        try {
+            return path.toRealPath();
+        } catch (IOException e) {
+            throw new UpdateRejectedException(reason, e);
+        }
+    }
+
     private static void requireUniqueOwnJar(Path real, Path realScan, ScanFilter filter,
-            JarIdReader ids, String ownId) throws IOException, UpdateRejectedException {
+            JarIdReader ids, String ownId) throws UpdateRejectedException {
         int matches = 0;
         Path matchedReal = null;
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(realScan)) {
@@ -151,11 +181,13 @@ public final class LiveJarValidator {
                 matches++;
                 try {
                     matchedReal = entry.toRealPath();
-                } catch (IOException | RuntimeException e) {
+                } catch (IOException e) {
                     throw new UpdateRejectedException(
                             "cannot inspect " + name + " for a duplicate QUICraft jar", e);
                 }
             }
+        } catch (IOException | DirectoryIteratorException e) {
+            throw new UpdateRejectedException("cannot list the loader scan directory", e);
         }
         if (matches == 0) {
             throw refuse("live jar does not carry the QUICraft id");
