@@ -635,7 +635,10 @@ class UpdaterTransactionTest {
     private static final class FlakyOps implements DurabilityOps {
         private final DurabilityOps system = DurabilityOps.system();
         boolean failMove;
+        boolean failJournalMove;
         int failSyncs;
+        /** When set, the live jar is overwritten with these bytes right after a successful move. */
+        byte[] tamperLiveAfterMove;
 
         @Override
         public void force(FileChannel ch) throws IOException {
@@ -647,7 +650,13 @@ class UpdaterTransactionTest {
             if (failMove) {
                 throw new IOException("move refused");
             }
+            if (failJournalMove && to.getFileName().toString().equals(UpdateDirectory.JOURNAL)) {
+                throw new IOException("journal write refused");
+            }
             system.atomicMove(from, to);
+            if (tamperLiveAfterMove != null && to.getFileName().toString().equals("quicraft.jar")) {
+                Files.write(to, tamperLiveAfterMove);
+            }
         }
 
         @Override
@@ -750,6 +759,93 @@ class UpdaterTransactionTest {
         assertEquals(1, stagedCount(r), "staging is kept");
         assertEquals(1, journalCount(r), "the journal is kept");
         assertEquals(1, backupCount(r), "the backup is kept");
+    }
+
+    @Test
+    void failedMoveWithAnUnreadableLiveJarKeepsEverything() throws Exception {
+        Rig r = standardRig();
+        FlakyOps ops = new FlakyOps();
+        UpdaterTransaction txn = atomicTxn(r, ops);
+        txn.hooks.afterSwapFlip = () -> {
+            ops.failMove = true;
+            try {
+                Files.delete(r.live);
+            } catch (IOException e) {
+                throw new IllegalStateException(e);
+            }
+        };
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertTrue(result.messages().contains(UpdaterTransaction.RECOVERY_TEXT), result.messages().toString());
+        assertEquals(1, stagedCount(r), "staging is kept");
+        assertEquals(1, journalCount(r), "the journal is kept");
+        assertEquals(1, backupCount(r), "the backup is kept");
+    }
+
+    @Test
+    void journalWriteFailureAfterASuccessfulMoveReportsRestartPendingWithAPreparedJournal() throws Exception {
+        Rig r = standardRig();
+        FlakyOps ops = new FlakyOps();
+        UpdaterTransaction txn = atomicTxn(r, ops);
+        txn.hooks.afterSwapFlip = () -> ops.failJournalMove = true;
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
+        assertTrue(result.messages().contains(UpdaterTransaction.JOURNAL_SWAP_FAILED), result.messages().toString());
+        // The state StartupRecovery handles: the journal says prepared and the live jar is the staged jar.
+        assertArrayEquals(r.jar, Files.readAllBytes(r.live));
+        UpdateDirectory dir = new UpdateDirectory(r.upd, DurabilityOps.system());
+        assertEquals(JournalPhase.PREPARED, dir.readJournal().orElseThrow().phase());
+        assertEquals(1, backupCount(r), "the backup is kept");
+        assertTrue(stagingIsEmpty(r), "the staged jar was moved onto the live path");
+    }
+
+    @Test
+    void liveJarThatDoesNotMatchTheStagedJarAfterTheMoveIsKeptAndWarned() throws Exception {
+        Rig r = standardRig();
+        FlakyOps ops = new FlakyOps();
+        UpdaterTransaction txn = atomicTxn(r, ops);
+        byte[] tampered = "written over the live path after the move".getBytes(
+                java.nio.charset.StandardCharsets.UTF_8);
+        txn.hooks.afterSwapFlip = () -> ops.tamperLiveAfterMove = tampered;
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertTrue(result.messages().contains(UpdaterTransaction.MOVED_MISMATCH), result.messages().toString());
+        assertTrue(result.messages().stream().anyMatch(m -> m.startsWith("WARN: ")), result.messages().toString());
+        assertArrayEquals(tampered, Files.readAllBytes(r.live), "nothing is rewritten after the move");
+        assertEquals(1, journalCount(r), "the journal stays");
+        assertEquals(JournalPhase.PREPARED,
+                new UpdateDirectory(r.upd, DurabilityOps.system()).readJournal().orElseThrow().phase());
+        assertEquals(1, backupCount(r), "the backup is kept");
+    }
+
+    @Test
+    void genuineKeySetChangeWithoutBackupCoSignatureIsRefusedEndToEnd() throws Exception {
+        // Epoch 2 names only the backup key, which is a real key-set change. The release manifest is
+        // signed by the release key alone, so no backup co-signature authorises it.
+        String epoch2 = "{\"type\":\"quicraft.trust\",\"v\":1,\"epoch\":2,\"built\":\"" + SignedFixtures.TS1
+                + "\",\"revocationsSeqFloor\":0,\"manifestSeqFloor\":0,\"keys\":[{\"kid\":\"" + TestKeys.KID_2
+                + "\",\"pub\":\"" + TestKeys.PUB_2 + "\",\"roles\":[\"release\",\"revocation\"]}]}";
+        byte[] jar = TransactionFixtures.releaseJar(TransactionFixtures.NEW_VERSION, epoch2);
+        Rig r = rig(jar, TransactionFixtures.manifestFor(jar, TransactionFixtures.NEW_VERSION));
+        TransactionResult result = txn(r).execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertTrue(result.messages().get(0).startsWith("the staged jar failed verification")
+                && result.messages().get(0).contains("not authorized by the backup key"), result.messages().toString());
+        assertLiveUntouched(r);
+        assertEquals(0, journalCount(r));
+        assertEquals(0, backupCount(r), "refused before any backup is copied");
+    }
+
+    @Test
+    void backupKeyRevokedAfterStepFiveStopsTheSwap() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        txn.hooks.afterBackupReady = () -> mergeRevocation(r, TestKeys.KID_2, TestKeys.PUB_2);
+        TransactionResult result = txn.execute(atomic(r));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertEquals(1, backupCount(r), "the backup is kept");
+        assertEquals(0, journalCount(r));
+        assertLiveUntouched(r);
     }
 
     @Test

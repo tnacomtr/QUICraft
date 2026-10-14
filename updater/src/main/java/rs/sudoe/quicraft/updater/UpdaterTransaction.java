@@ -65,6 +65,8 @@ final class UpdaterTransaction {
     static final String WITHDRAWN = "the staged jar was withdrawn";
     static final String STAGED_CHANGED = "the staged jar changed after verification";
     static final String LIVE_CHANGED = "the live jar changed during the update; nothing was installed";
+    static final String MOVED_MISMATCH = "WARN: the live jar does not match the staged jar after the move; "
+            + "nothing was deleted; recovery will check the installed jar at next start";
     static final String NOTHING_MOVED_TEXT = "the swap did not happen; nothing was installed";
     static final String RECOVERY_TEXT = "the swap may have started; nothing was deleted; recovery will check the "
             + "installed jar at next start";
@@ -510,6 +512,11 @@ final class UpdaterTransaction {
         } catch (IOException moveFailure) {
             return classifyFailedMove(a);
         }
+        // The move returned, but the live path must now hold the staged bytes. Anything else is kept
+        // for the operator and recovery, and the journal stays as it is.
+        if (!liveHoldsStaged(a)) {
+            return new Swap(SwapKind.KEPT, List.of(MOVED_MISMATCH));
+        }
         return journalSwapped(a, List.of());
     }
 
@@ -615,6 +622,15 @@ final class UpdaterTransaction {
             out.add(JOURNAL_SWAP_FAILED);
         }
         return new Swap(SwapKind.INSTALLED, out);
+    }
+
+    /** True when the live jar, read back after the move, has the staged SHA-512. A read failure counts as no. */
+    private static boolean liveHoldsStaged(Attempt a) {
+        try {
+            return a.staged.identity().sha512().equals(UpdateDirectory.sha512Of(a.live.realPath()));
+        } catch (IOException readFailure) {
+            return false;
+        }
     }
 
     /**
