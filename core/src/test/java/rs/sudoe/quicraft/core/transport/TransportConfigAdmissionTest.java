@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core.transport;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
 
@@ -23,12 +24,30 @@ class TransportConfigAdmissionTest {
         assertEquals(200, config.globalAttemptsPerSecond());
         assertEquals(20, config.perIpAttemptsPerSecond());
         assertEquals(50, config.retryThresholdPerSecond());
-        assertEquals(2048, config.maxOpen());
+        assertEquals(65536, config.maxOpen());
         assertEquals(32, config.maxOpenPerIp());
-        assertEquals(8192, config.maxTrackedIps());
+        assertEquals(131072, config.maxTrackedIps());
         assertEquals(4000, config.ingressInitialsPerSecond());
         assertEquals(200, config.ingressInitialsPerIpPerSecond());
         assertEquals(TransportConfig.RetryMode.ADAPTIVE, config.retryMode());
+    }
+
+    /**
+     * The defaults must ship the 50,000-concurrent-player scale target (CLAUDE.md Architecture) and
+     * must keep the listener's two cross-field admission WARNINGs clear at the default config:
+     * {@code maxTrackedIps >= maxOpen + globalAttemptsPerSecond} and
+     * {@code maxTrackedIps >= ingressInitialsPerSecond}.
+     */
+    @Test
+    void defaultConfigMeetsTheScaleTargetAndClearsBothCrossFieldWarnings() {
+        TransportConfig config = TransportConfig.DEFAULT;
+        assertEquals(65536, config.maxOpen());
+        assertEquals(32, config.maxOpenPerIp());
+        assertEquals(131072, config.maxTrackedIps());
+        assertTrue(config.maxTrackedIps() >= config.maxOpen() + config.globalAttemptsPerSecond(),
+                "maxTrackedIps must not be below maxOpen + globalAttemptsPerSecond");
+        assertTrue(config.maxTrackedIps() >= config.ingressInitialsPerSecond(),
+                "maxTrackedIps must not be below ingressInitialsPerSecond");
     }
 
     @Test
@@ -107,9 +126,9 @@ class TransportConfigAdmissionTest {
         assertEquals(200, config.globalAttemptsPerSecond());
         assertEquals(20, config.perIpAttemptsPerSecond());
         assertEquals(50, config.retryThresholdPerSecond());
-        assertEquals(2048, config.maxOpen());
+        assertEquals(65536, config.maxOpen());
         assertEquals(32, config.maxOpenPerIp());
-        assertEquals(8192, config.maxTrackedIps());
+        assertEquals(131072, config.maxTrackedIps());
         assertEquals(4000, config.ingressInitialsPerSecond());
         assertEquals(200, config.ingressInitialsPerIpPerSecond());
     }
@@ -130,9 +149,9 @@ class TransportConfigAdmissionTest {
         assertEquals(200, config.globalAttemptsPerSecond());
         assertEquals(20, config.perIpAttemptsPerSecond());
         assertEquals(50, config.retryThresholdPerSecond());
-        assertEquals(2048, config.maxOpen());
+        assertEquals(65536, config.maxOpen());
         assertEquals(32, config.maxOpenPerIp());
-        assertEquals(8192, config.maxTrackedIps());
+        assertEquals(131072, config.maxTrackedIps());
         assertEquals(4000, config.ingressInitialsPerSecond());
         assertEquals(200, config.ingressInitialsPerIpPerSecond());
     }
