@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -21,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import rs.sudoe.quicraft.updater.PipelineFixtures.ScriptedFetcher;
 import rs.sudoe.quicraft.updater.UpdaterFacadeFixtures.FakePlatform;
+import rs.sudoe.quicraft.updater.UpdaterFacadeFixtures.FixedDiscovery;
 import rs.sudoe.quicraft.updater.UpdaterFacadeFixtures.Output;
 import rs.sudoe.quicraft.updater.UpdaterRuntime.Reply;
 
@@ -427,5 +429,97 @@ class UpdaterRuntimeCommandTest {
         TransactionLock.TxnLease lease = TransactionLock.tryAcquire(p.updateDir);
         lease.close();
         assertTrue(new StateStore(p.updateDir).load().isPresent(), "the state store is still usable");
+    }
+
+    // ---- disclosure: a non-console invoker is a player with the admin permission -----------------
+
+    /**
+     * Makes the transaction's first live-jar discovery fail with a message that carries the update
+     * directory path, which is one of the leaks the filter must hold back.
+     */
+    private void failTheNextDiscovery() {
+        FixedDiscovery discovery = (FixedDiscovery) p.discovery;
+        discovery.ioFailure = new IOException("cannot read the live jar: " + p.updateDir);
+    }
+
+    @Test
+    void aFailingUpdateShowsAPlayerTheFixedLineAndKeepsTheFullLineInTheLog() throws Exception {
+        start(new ScriptedFetcher());
+        failTheNextDiscovery();
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, false));
+        awaitIdle();
+
+        assertEquals(List.of(UpdaterRuntime.REDACTED_TEXT), out.snapshot(),
+                () -> "output was " + out.snapshot());
+        assertTrue(p.log.lines.stream()
+                        .anyMatch(l -> l.startsWith("INFO: " + UpdaterRuntime.OUTPUT_LOG_PREFIX)
+                                && l.contains("cannot read the live jar: " + p.updateDir)),
+                () -> "log was " + p.log.lines);
+    }
+
+    @Test
+    void theSameFailingUpdateReachesTheConsoleInFull() throws Exception {
+        start(new ScriptedFetcher());
+        failTheNextDiscovery();
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true));
+        awaitIdle();
+
+        assertTrue(out.contains("cannot read the live jar: " + p.updateDir),
+                () -> "output was " + out.snapshot());
+        assertTrue(out.contains("update finished: FAILED"), () -> "output was " + out.snapshot());
+        assertFalse(out.contains(UpdaterRuntime.REDACTED_TEXT), () -> "output was " + out.snapshot());
+    }
+
+    @Test
+    void aPlayerReadsTheNoUpdateRowUnchanged() throws Exception {
+        start(new ScriptedFetcher());
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, false, "check"));
+        awaitIdle();
+
+        List<String> lines = out.snapshot();
+        assertEquals("no update", lines.get(0), () -> "output was " + lines);
+        assertFalse(lines.stream().anyMatch(l -> l.contains("fetch failed")),
+                () -> "the diagnostics are held back, output was " + lines);
+    }
+
+    @Test
+    void aPlayerReadsTheOfferRowUnchanged() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        start(metadata);
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, false, "check"));
+        awaitIdle();
+
+        assertTrue(out.contains("update available: " + UpdaterFacadeFixtures.NEWER),
+                () -> "output was " + out.snapshot());
+    }
+
+    @Test
+    void aPlayerReadsTheUsageRowUnchanged() {
+        start(new ScriptedFetcher());
+        Output out = new Output();
+        assertEquals(Reply.DONE, dispatch(out, false, "explode"));
+
+        assertEquals(List.of(UpdaterRuntime.USAGE), out.snapshot(), () -> "output was " + out.snapshot());
+    }
+
+    @Test
+    void aVersionRowAdmitsOnlyAVersionAndNeverAPath() {
+        assertTrue(UpdaterRuntime.visibleToPlayer("update available: " + UpdaterFacadeFixtures.NEWER));
+        assertTrue(UpdaterRuntime.visibleToPlayer(
+                "a new QUICraft version is available: " + UpdaterFacadeFixtures.NEWER));
+        assertFalse(UpdaterRuntime.visibleToPlayer("update available: " + p.updateDir));
+        assertFalse(UpdaterRuntime.visibleToPlayer("a new QUICraft version is available: " + p.updateDir));
+        assertFalse(UpdaterRuntime.visibleToPlayer("no update: " + p.updateDir));
+        assertFalse(UpdaterRuntime.visibleToPlayer("update check failed (java.io.IOException)"));
     }
 }
