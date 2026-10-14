@@ -15,7 +15,10 @@ import java.util.logging.Logger;
  * that starts with a long-header Initial but is shorter than 1200 bytes (RFC 9000 §14.1), so no
  * reply, Retry included, answers a small datagram. Counts every other such Initial against its own
  * datagram-level {@link ConnectionAdmission} and drops the ones over budget. Every other datagram, and any datagram it fails to classify, goes to the codec
- * unchanged. One instance per listener; runs on the listener's event loop.
+ * unchanged. The datagram budget it counts against is a shared, synchronized
+ * {@link ConnectionAdmission}, so when a listener runs several sockets its limits stay node-wide;
+ * one guard instance serves one socket only (never two loops), because the header parser and the
+ * classification flag below are confined to the socket's event loop.
  */
 final class IngressGuard extends ChannelInboundHandlerAdapter {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -36,12 +39,27 @@ final class IngressGuard extends ChannelInboundHandlerAdapter {
     }
 
     static IngressGuard forConfig(TransportConfig config) {
-        return new IngressGuard(new ConnectionAdmission(
+        return new IngressGuard(budget(config), Codecs.LOCAL_CONNECTION_ID_LENGTH);
+    }
+
+    /**
+     * As {@link #forConfig(TransportConfig)}, with {@code budget} shared with the listener's other
+     * sockets so its limits stay node-wide. The guard itself is never shared: its header parser and
+     * the {@link #initial} flag are confined to its own socket's event loop; only
+     * {@link ConnectionAdmission}, whose methods are synchronized, is common to the sockets.
+     */
+    static IngressGuard forConfig(ConnectionAdmission budget) {
+        return new IngressGuard(budget, Codecs.LOCAL_CONNECTION_ID_LENGTH);
+    }
+
+    /** The datagram budget on its own, so a listener with several sockets can share one instance. */
+    static ConnectionAdmission budget(TransportConfig config) {
+        return new ConnectionAdmission(
                 config.ingressInitialsPerSecond,
                 config.ingressInitialsPerIpPerSecond,
                 1, 1, // open leases: unused here
                 config.ingressInitialsPerSecond, // Retry threshold: unused here
-                config.maxTrackedIps), Codecs.LOCAL_CONNECTION_ID_LENGTH);
+                config.maxTrackedIps);
     }
 
     @Override

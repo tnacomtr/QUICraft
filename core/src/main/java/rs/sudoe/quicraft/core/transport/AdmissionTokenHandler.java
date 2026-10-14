@@ -30,10 +30,12 @@ import java.util.logging.Logger;
  * completed handshake and then a close, which reaches the game instead of falling back. The lease
  * itself is taken when the connection is created, right after this check on the same thread.
  *
- * <p>Netty calls the codec's token handler on the listener's single event loop (a one-thread
- * group, or the platform loop that owns the hosted channel), so {@link #forceRetry} is a plain
- * field: written in {@link #writeToken} just before the delegate reads it through its policy.
- * Admission failures fail open.
+ * <p>Netty calls the codec's token handler on the event loop that owns the socket the Initial
+ * arrived on. A listener with several SO_REUSEPORT sockets (docs/protocol.md §11) shares one
+ * instance, so these calls run on several loops at once: {@link #writeToken} is synchronized
+ * around the {@link #forceRetry} flag, which is only alive inside that call. Everything else the
+ * handler touches is already shared safely ({@link ConnectionAdmission} is synchronized, the HMAC
+ * handler is stateless, the counter is atomic). Admission failures fail open.
  */
 final class AdmissionTokenHandler implements QuicTokenHandler {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -72,7 +74,7 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
     }
 
     @Override
-    public boolean writeToken(ByteBuf out, ByteBuf dcid, InetSocketAddress address) {
+    public synchronized boolean writeToken(ByteBuf out, ByteBuf dcid, InetSocketAddress address) {
         boolean retry = mode == TransportConfig.RetryMode.ALWAYS;
         try {
             if (address != null && address.getAddress() != null) {
