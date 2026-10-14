@@ -1,28 +1,30 @@
-# Handoff: 0.1.0-alpha.1 release in progress (2026-10-14)
+# Handoff: after 0.1.0-alpha.1 (2026-10-15)
 
-main = feat/phase4-alpha = 594b890 ("release: 0.1.0-alpha.1"), tag v0.1.0-alpha.1, pushed to origin and github.
-Phase 4 merged into main as 5186825 (tree identical to the verified feat c586d32).
+0.1.0-alpha.1 is published (pre-releases on GitHub and git.sudoe.rs, jars plus signed updater metadata). main and
+feat/phase4-alpha are on the development version 0.1.0-alpha.2-SNAPSHOT.
 
-## Done
-- Haiku full feat verification PASS (core 231, velocity 79, updater 1209, release-tool 30, build-logic 56, bridges 30/30).
-- CI on 4a1e6e2: build, natives (5 platforms), fabric-gametest (fabric-1.21.11 EarlyDataGameTest flaked once on
-  "then 0-RTT again: 0-RTT used" after a 2 s server stall; rerun passed), updater-e2e 9/9 (ubuntu, macos-latest,
-  macos-15-intel x velocity, fabric-26x, fabric-1.21.11).
-- Release jars built with clean checkReleaseTrust (owner trust, 3 outer jars), in the scratchpad dist/.
-- GitHub pre-release v0.1.0-alpha.1 with the 3 jars; read back byte-identical.
-- release.v1.json (seq 1, expires 2026-11-13T19:52:53Z) and revocations.v1.json (seq 1) composed, unsigned.
+## History rewrite (2026-10-14, owner's request)
+- AI attribution trailers were stripped from every commit on main, feat and both tags, then force-pushed to both
+  remotes. Trees are unchanged. Tags v0.1.0-alpha.1 and updater-metadata point at 3bdcf64; release assets on both
+  hosts are unchanged.
+- Rule (CLAUDE.md, Working rules): no AI attribution in commits, tags, release notes or PRs; Microsoft Copilot keeps
+  its own. Local agent/* branches still carry the old history: re-apply their changes, don't merge them.
 
-## Published (2026-10-14)
-- Owner signed both documents; release-tool verify passed with the release trust.
-- GitHub: v0.1.0-alpha.1 pre-release (3 jars) and updater-metadata (4 files), read back identical; downloads 302 to
-  release-assets.githubusercontent.com (on the allowlist).
-- git.sudoe.rs: same two releases via finish-forgejo.sh, read back identical; answers 200 directly.
-- Live check: Velocity 4.2.0-30 + release jar, `quicraft update check` -> "no update"; state.json holds revocations
-  seq 1 (0a2022...) and manifest seq 1 from a50c1ac6c6108379 (400fc5...).
-- Manifest expires 2026-11-13T19:52:53Z: compose seq 2 (same entries) and have the owner sign before then.
+## CI
+- CI runs on branch pushes only (no tag pushes): release tags carry a release version that the development trust
+  refuses by design.
+- EarlyDataGameTest flakes on fabric-1.21.11 had two causes, both fixed in tests only:
+  1. the fixed 10-tick wait for the TLS session ticket (now waits on QuicClient.hasSessionTicket, which reads
+     Netty's package-private session cache by reflection; SessionResumptionTest guards it);
+  2. the 5 ms floor of the 0-RTT preamble grace (protocol.md section 8) on a busy runner: the client correctly
+     abandoned 0-RTT. The gametest sets QuicClient.setGraceFloorForTests(100); production is unchanged.
+  QuicClient.lastEarlyOutcome() names why an attempt sent no 0-RTT; failure messages include it.
 
 ## Open follow-ups
-- EarlyDataGameTest timing flake on slow runners (10-tick wait for the ticket).
+- Owner decision: after 0-RTT, the client delivers the connection only when the grace timer fires, even if the
+  server's preamble arrived earlier (QuicClient.awaitPreamble). That costs up to G (≤100 ms) of join latency
+  on real links. Delivering as soon as the preamble arrives would fix it; it changes transport timing, so ask first.
+- Re-sign a seq 2 release manifest before 2026-11-13T19:52:53Z (same entries; the owner signs).
 - updater.md blocker 6 (withdrawal), macOS FileChannel.force semantics, Velocity builds other than 4.2.0-30.
-- Bump main to the next -SNAPSHOT after the release.
+- The owner should revoke the Forgejo token pasted in chat and delete ~/.config/quicraft/forgejo-token.
 - Quarantined branches agent/phase4-retry-tests and agent/phase4-cwnd-tests: never merge or delete.
