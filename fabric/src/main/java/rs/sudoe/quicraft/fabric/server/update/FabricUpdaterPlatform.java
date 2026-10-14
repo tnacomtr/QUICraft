@@ -94,9 +94,9 @@ public final class FabricUpdaterPlatform implements UpdaterPlatform {
         return LOG;
     }
 
+    /** The facade writes the log line for every notice, so this delivers to the admins only. */
     @Override
     public void notifyAdmins(String message) {
-        LOG.info(message);
         ServerUpdater.notifyAdmins(message);
     }
 
