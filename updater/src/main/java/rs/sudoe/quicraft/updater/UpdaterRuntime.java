@@ -15,6 +15,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
@@ -206,8 +207,13 @@ public final class UpdaterRuntime {
             this.stores = Objects.requireNonNull(stores, "stores");
         }
 
+        /**
+         * The production seams. The clock ticks in whole seconds: state.json and the journal store
+         * instants read from it, and their encoder accepts whole seconds only.
+         */
         static Seams system() {
-            return new Seams(HttpSourceFetcher.create(), Clock.systemUTC(), DurabilityOps.system(),
+            return new Seams(HttpSourceFetcher.create(), Clock.tickSeconds(ZoneOffset.UTC),
+                    DurabilityOps.system(),
                     Executors::newSingleThreadScheduledExecutor,
                     log -> UpdaterOrigins.resolve(System.getProperty(UpdaterOrigins.PROPERTY), log),
                     new DevReleaseEndpoints());
