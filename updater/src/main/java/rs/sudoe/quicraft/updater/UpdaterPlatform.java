@@ -11,6 +11,9 @@ import java.nio.file.Path;
  * <p>The facade never uses a classloader {@code getResource} to read its own metadata. It reads
  * {@code META-INF/quicraft/build.json} and {@code META-INF/quicraft/updater-trust.json} from the
  * discovered live jar through {@link OwnJarResources}, because a loader can return another mod's copy.
+ *
+ * <p>Command output and the scheduled check's log lines may come from the updater worker thread. An adapter
+ * must hop to its server thread before it messages players.
  */
 public interface UpdaterPlatform {
 

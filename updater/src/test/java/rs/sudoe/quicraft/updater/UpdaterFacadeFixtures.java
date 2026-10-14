@@ -243,6 +243,35 @@ final class UpdaterFacadeFixtures {
         return raw;
     }
 
+    /** The standard release manifest with its sequence changed to {@code seq}; the signature is not redone. */
+    static byte[] alteredManifest(int seq) {
+        String text = PipelineFixtures.text(PipelineFixtures.manifest());
+        return SignedFixtures.bytes(text.replace("\"seq\":42", "\"seq\":" + seq));
+    }
+
+    /** A signature over {@code document} made with a TEST key other than the release key: a bad signature. */
+    static byte[] wrongKeySignature(byte[] document) throws Exception {
+        return SignedFixtures.envelopeFor(document,
+                SignedFixtures.signedEntry(TestKeys.KID_1, TestKeys.SEED_2, document));
+    }
+
+    /** Answers every host's manifest with {@code badDocument}, whose signature does not verify. */
+    static void answerBadManifest(PipelineFixtures.ScriptedFetcher fetcher, byte[] badDocument) throws Exception {
+        for (ReleaseHost host : PipelineFixtures.HOSTS.hosts()) {
+            fetcher.answer(PipelineFixtures.ENDPOINTS.manifest(host), badDocument);
+            fetcher.answer(PipelineFixtures.ENDPOINTS.manifestSignature(host), wrongKeySignature(badDocument));
+        }
+    }
+
+    /** Serves a valid release {@code NEWER} that matches the live jar's trust, for every host. */
+    static PipelineFixtures.ScriptedFetcher newerRelease() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(NEWER);
+        PipelineFixtures.ScriptedFetcher metadata = new PipelineFixtures.ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, NEWER));
+        return metadata;
+    }
+
     static String buildJson(String platform, String version) {
         return "{\"type\":\"quicraft.build\",\"v\":1,\"platform\":\"" + platform + "\",\"version\":\""
                 + version + "\"}";

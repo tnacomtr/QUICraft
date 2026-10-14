@@ -9,8 +9,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -217,5 +219,104 @@ class UpdaterRuntimeCommandTest {
         assertEquals(Reply.DONE, rt.dispatch(new String[] {"cancel"}, true, line -> {
             throw new IllegalStateException("sink");
         }));
+    }
+
+    @Test
+    void silentCheckWritesOnlyTheSectionSixRowsToOut() throws Exception {
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        UpdaterFacadeFixtures.answerBadManifest(metadata, UpdaterFacadeFixtures.alteredManifest(43));
+        start(metadata);
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true, "check", "-s"));
+        awaitIdle();
+
+        assertEquals(List.of("release manifest from host modrinth failed signature verification"), out.snapshot());
+        assertTrue(p.log.lines.stream().anyMatch(l -> l.contains("manifest document rejected")),
+                "the diagnostic text stays in the log");
+    }
+
+    @Test
+    void aScheduledTickInVerboseModeLogsEveryResultAtInfo() throws Exception {
+        Files.writeString(p.configFile, "update.check-silent=false\n");
+        start(new ScriptedFetcher());
+        rt.scheduledTick();
+        assertTrue(p.log.lines.contains("INFO: no update"), () -> "log was " + p.log.lines);
+    }
+
+    @Test
+    void aScheduledTickInSilentModeLogsNothingForNoUpdate() throws Exception {
+        start(new ScriptedFetcher());
+        rt.scheduledTick();
+        assertFalse(p.log.lines.stream().anyMatch(l -> l.contains("no update")),
+                () -> "log was " + p.log.lines);
+    }
+
+    @Test
+    void aScheduledTickIsSkippedWhileACommandRunsAndTheNextTickRuns() throws Exception {
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger fetches = new AtomicInteger();
+        fetcher.onFetch = uri -> {
+            fetches.incrementAndGet();
+            entered.countDown();
+            try {
+                release.await(WAIT.toSeconds(), TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        start(fetcher);
+        assertEquals(Reply.STARTED, dispatch(new Output(), true, "check"));
+        assertTrue(entered.await(WAIT.toSeconds(), TimeUnit.SECONDS));
+
+        int before = fetches.get();
+        rt.scheduledTick();
+        assertEquals(before, fetches.get(), "the busy tick did not run a check");
+
+        release.countDown();
+        awaitIdle();
+        int afterCommand = fetches.get();
+        rt.scheduledTick();
+        assertTrue(fetches.get() > afterCommand, "the next tick runs once the worker is free");
+    }
+
+    @Test
+    void aCommandDispatchedAfterShutdownStartsIsRefusedAndNeverRuns() throws Exception {
+        start(new ScriptedFetcher());
+        rt.shutdown();
+
+        Output out = new Output();
+        assertEquals(Reply.DONE, dispatch(out, true, "check"));
+        assertTrue(out.contains(UpdaterRuntime.STOPPING_TEXT), () -> "output was " + out.snapshot());
+        assertTrue(rt.awaitIdle(Duration.ofSeconds(1)), "no work was started");
+    }
+
+    @Test
+    void shutdownDuringAnActiveTransactionLeavesNoLockHeld() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        TransactionFixtures.ArtifactFetcher fetcher = new TransactionFixtures.ArtifactFetcher(metadata, newJar);
+        CountDownLatch entered = new CountDownLatch(1);
+        fetcher.beforeDownload = () -> {
+            entered.countDown();
+            try {
+                new CountDownLatch(1).await(WAIT.toSeconds(), TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        start(fetcher);
+        assertEquals(Reply.STARTED, dispatch(new Output(), true, "update"));
+        assertTrue(entered.await(WAIT.toSeconds(), TimeUnit.SECONDS));
+
+        rt.shutdown();
+
+        TransactionLock.TxnLease lease = TransactionLock.tryAcquire(p.updateDir);
+        lease.close();
+        assertTrue(new StateStore(p.updateDir).load().isPresent(), "the state store is still usable");
     }
 }

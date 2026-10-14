@@ -36,6 +36,11 @@ class UpdaterRuntimeHealthTest {
 
     /** Starts once to create the state, then leaves a SWAPPED journal for the newer jar, as after an install. */
     private void leaveSwappedJournal() throws Exception {
+        leaveSwappedJournal(false);
+    }
+
+    /** As {@link #leaveSwappedJournal()}; {@code removeState} also deletes the state files so init fails. */
+    private void leaveSwappedJournal(boolean removeState) throws Exception {
         UpdaterRuntime first = UpdaterRuntime.start(p, UpdaterFacadeFixtures.seams(
                 new PipelineFixtures.ScriptedFetcher(), UpdaterFacadeFixtures.realExecutors(),
                 UpdaterFacadeFixtures.testHosts()));
@@ -57,6 +62,10 @@ class UpdaterRuntimeHealthTest {
                 oldSum, Instant.parse("2026-11-01T00:00:00Z"), 0);
         new UpdateDirectory(p.updateDir, DurabilityOps.system()).writeJournal(journal);
         p.existedBeforeStart = true;
+        if (removeState) {
+            Files.deleteIfExists(p.updateDir.resolve(StateStore.STATE));
+            Files.deleteIfExists(p.updateDir.resolve(StateStore.REVOKED));
+        }
     }
 
     private void awaitLog(String part) throws InterruptedException {
@@ -116,6 +125,25 @@ class UpdaterRuntimeHealthTest {
             assertTrue(rt.awaitIdle(Duration.ofSeconds(30)));
             assertTrue(out.snapshot().stream().anyMatch(l -> l.contains("update finished: NOT_ADMITTED")),
                     () -> "output was " + out.snapshot());
+        } finally {
+            rt.shutdown();
+        }
+    }
+
+    @Test
+    void aFailedInitAfterRecoveryStillRecordsTheHealthVerdict() throws Exception {
+        leaveSwappedJournal(true);
+        p.health = UpdaterFacadeFixtures.healthy(true);
+        UpdaterRuntime rt = UpdaterRuntime.start(p, UpdaterFacadeFixtures.seams(
+                new PipelineFixtures.ScriptedFetcher(), UpdaterFacadeFixtures.realExecutors(),
+                UpdaterFacadeFixtures.testHosts()));
+        try {
+            UpdaterFacadeFixtures.Output out = new UpdaterFacadeFixtures.Output();
+            rt.dispatch(new String[] {"check"}, true, out::add);
+            assertTrue(out.contains("updater disabled: " + UpdaterRuntime.REASON_STATE),
+                    () -> "output was " + out.snapshot());
+            awaitLog("passed the health check");
+            assertFalse(Files.exists(p.updateDir.resolve(UpdateDirectory.JOURNAL)));
         } finally {
             rt.shutdown();
         }

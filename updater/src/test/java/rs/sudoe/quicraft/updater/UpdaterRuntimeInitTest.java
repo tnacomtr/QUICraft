@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.updater;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -176,7 +177,8 @@ class UpdaterRuntimeInitTest {
         Output out = check(rt);
         assertTrue(out.contains(UpdaterOrigins.NOT_CONFIGURED), () -> "output was " + out.snapshot());
         assertTrue(p.log.contains("release hosts not configured in this build"));
-        assertTrue(p.log.contains("no hosts configured"), "the disclosure names no hosts");
+        assertFalse(p.log.contains("update checks send"), "nothing is sent, so nothing is disclosed");
+        assertFalse(Files.exists(p.updateDir.resolve(UpdaterRuntime.DISCLOSURE_MARKER)));
         assertTrue(scheduled.isEmpty());
     }
 
@@ -206,7 +208,7 @@ class UpdaterRuntimeInitTest {
         long disclosures = p.log.lines.stream().filter(l -> l.contains("update checks send")).count();
         assertEquals(1, disclosures);
         assertTrue(Files.exists(p.updateDir.resolve(UpdaterRuntime.DISCLOSURE_MARKER)));
-        assertTrue(p.log.contains("modrinth, github, sudoe"));
+        assertTrue(p.log.contains("github, modrinth, sudoe"));
     }
 
     @Test
@@ -223,6 +225,54 @@ class UpdaterRuntimeInitTest {
             Thread.sleep(10);
         }
         assertFalse(workerAlive(), "no quicraft-updater thread after shutdown");
+    }
+
+    @Test
+    void aChangedHostSetIsDisclosedAgain() throws Exception {
+        UpdaterRuntime first = start(UpdaterFacadeFixtures.testHosts());
+        first.shutdown();
+        started.clear();
+        p.existedBeforeStart = true;
+        UpdaterRuntime second = start(Optional.of(ReleaseHosts.of(
+                List.of(PipelineFixtures.MOD, PipelineFixtures.GH))));
+        assertFalse(second == first);
+        assertEquals(2, p.log.lines.stream().filter(l -> l.contains("update checks send")).count());
+        assertTrue(p.log.contains("github, modrinth"));
+    }
+
+    @Test
+    void devOriginsDoNotConsumeTheProductionDisclosure() throws Exception {
+        UpdaterRuntime production = start(UpdaterFacadeFixtures.testHosts());
+        production.shutdown();
+        started.clear();
+        p.existedBeforeStart = true;
+        Optional<ReleaseHosts> dev = UpdaterOrigins.resolve(
+                "modrinth=https://localhost:9001,github=https://localhost:9002,sudoe=https://localhost:9003",
+                p.log);
+        UpdaterRuntime devRun = start(dev);
+        assertFalse(devRun == production);
+        assertEquals(2, p.log.lines.stream().filter(l -> l.contains("update checks send")).count());
+    }
+
+    @Test
+    void theDisclosureMarkerIsOwnerOnlyOnPosix() throws Exception {
+        UpdaterRuntime rt = start(UpdaterFacadeFixtures.testHosts());
+        Path marker = p.updateDir.resolve(UpdaterRuntime.DISCLOSURE_MARKER);
+        if (marker.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            assertEquals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"),
+                    Files.getPosixFilePermissions(marker));
+        }
+    }
+
+    @Test
+    void aSeamsSupplierThatFailsWithALinkageErrorGivesADisabledRuntime() {
+        UpdaterRuntime rt = assertDoesNotThrow(() -> UpdaterRuntime.start(p, () -> {
+            throw new NoClassDefFoundError("seams");
+        }));
+        started.add(new UpdaterUnderTest(rt));
+        Output out = check(rt);
+        assertTrue(out.contains("updater disabled: " + UpdaterRuntime.REASON_INTERNAL),
+                () -> "output was " + out.snapshot());
     }
 
     private static boolean workerAlive() {
