@@ -17,3 +17,11 @@ tasks.named<Test>("test") {
         .withPropertyName("devTrustFile")
         .withPathSensitivity(PathSensitivity.RELATIVE)
 }
+
+// CI only (the macOS/JDK 21 job in .github/workflows/updater-macos.yml): run the tests on another
+// JDK, for example -Pquicraft.updaterTestJdk=21, to cover the oldest Java the 1.21.11 jar supports.
+providers.gradleProperty("quicraft.updaterTestJdk").orNull?.let { jdk ->
+    tasks.named<Test>("test") {
+        javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(jdk.toInt()) }
+    }
+}

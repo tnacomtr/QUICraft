@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Updater tests on macOS (APFS rename and fsync semantics) under JDK 21 and JDK 25.
+# docs/updater.md 12.13 lists macOS and JDK 21 as open gaps for the live swap (blocker 10); this
+# job's result is the evidence, not a local claim. Manual trigger only until the owner enables more.
+name: updater-macos
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  updater:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-13]
+        test-jdk: [21, 25]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          # The build always runs on 25 (toolchain); 21 is the test launcher.
+          java-version: |
+            21
+            25
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Updater tests
+        run: >
+          ./gradlew :updater:test
+          -Pquicraft.updaterTestJdk=${{ matrix.test-jdk }}
+          -Porg.gradle.java.installations.fromEnv=JAVA_HOME_21_X64,JAVA_HOME_21_ARM64,JAVA_HOME_25_X64,JAVA_HOME_25_ARM64
+          -Porg.gradle.java.installations.auto-download=false
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: updater-tests-${{ matrix.os }}-jdk${{ matrix.test-jdk }}
+          path: |
+            updater/build/test-results/
+            updater/build/reports/tests/
