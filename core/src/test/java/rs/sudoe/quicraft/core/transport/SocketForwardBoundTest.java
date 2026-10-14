@@ -207,33 +207,140 @@ class SocketForwardBoundTest {
     void aDatagramTheDispatcherMustSeeIsPassedOnUnchanged() throws Exception {
         EventLoopGroup loops = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
         Recorder codec = new Recorder();
-        // A long header, and a short header with too few bytes for the whole connection id: the
-        // dispatcher decodes no index for either (and throws for the truncated one), so the bound
-        // must leave both to it, on the socket that received them.
-        ByteBuf longHeader = Unpooled.buffer(24);
-        longHeader.writeByte(0xC0);
-        longHeader.writeZero(23);
-        ByteBuf truncated = Unpooled.buffer(8);
-        truncated.writeByte(0x40);
-        truncated.writeZero(7);
+        // A long header carries no index, so the dispatcher decodes none for it (and creates no
+        // connection from it here): the bound must leave it to the dispatcher, on the socket that
+        // received it.
+        ByteBuf longHeader = longHeader();
         List<ByteBuf> datagrams = new ArrayList<>();
         datagrams.add(longHeader);
-        datagrams.add(truncated);
         try {
             Counters counters = new Counters(1);
             Channel socket = channel(loops, counters.limiter(0), codec);
 
             socket.pipeline().fireChannelRead(packet(longHeader));
-            socket.pipeline().fireChannelRead(packet(truncated));
-            assertTrue(codec.await(2, 5), "an undecodable datagram goes on to the dispatcher unchanged");
+            assertTrue(codec.await(1, 5), "a long header goes on to the dispatcher unchanged");
             drain(socket.eventLoop());
 
             assertEquals(1, longHeader.refCnt(), "a long header is neither queued nor released");
-            assertEquals(1, truncated.refCnt(), "a truncated short header is neither queued nor released");
-            assertEquals(0, counters.dropped.get(0), "the bound counted no drop for either");
+            assertEquals(0, counters.dropped.get(0), "the bound counted no forward drop for it");
+            assertEquals(0, counters.malformed.get(0), "the bound counted no malformed drop for it");
         } finally {
             release(datagrams);
             shutdown(loops);
+        }
+    }
+
+    /**
+     * A short header that stops before the whole connection id, including the single byte {@code 40}
+     * and {@code 40 00}, is a datagram the listener can never decode, and one Netty's dispatcher
+     * throws for: {@code QuicCodecDispatcher.getDestinationConnectionId} slices the index out of the
+     * id with {@code QuicHeaderParser.sliceCid}, which throws when there are too few bytes. Nothing
+     * on a datagram pipeline catches that (the tail logs a stack trace and the buffer is never
+     * released), so the bound releases it here instead and counts it against the socket that read
+     * it.
+     */
+    @Test
+    void aShortHeaderTruncatedBeforeTheConnectionIdIsReleasedAndCounted() throws Exception {
+        EventLoopGroup loops = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+        Recorder codec = new Recorder();
+        List<ByteBuf> datagrams = new ArrayList<>();
+        ByteBuf twoBytes = shortHeader(0, 2); // `40 00`
+        ByteBuf oneByte = shortHeader(0, 1); // `40`
+        // One byte short of the whole connection id: readable == 1 + localConnectionIdLength would
+        // be the first datagram the dispatcher can slice.
+        ByteBuf oneByteShortOfTheId = shortHeader(0, Codecs.LOCAL_CONNECTION_ID_LENGTH);
+        datagrams.add(twoBytes);
+        datagrams.add(oneByte);
+        datagrams.add(oneByteShortOfTheId);
+        try {
+            Counters counters = new Counters(1);
+            Channel socket = channel(loops, counters.limiter(0), codec);
+
+            socket.pipeline().fireChannelRead(packet(twoBytes));
+            socket.pipeline().fireChannelRead(packet(oneByte));
+            socket.pipeline().fireChannelRead(packet(oneByteShortOfTheId));
+            drain(socket.eventLoop());
+
+            assertEquals(0, codec.received.get(), "none of them may reach the dispatcher or the codec");
+            assertEquals(0, twoBytes.refCnt(), "`40 00` is released");
+            assertEquals(0, oneByte.refCnt(), "`40` is released");
+            assertEquals(0, oneByteShortOfTheId.refCnt(),
+                    "a short header one byte short of the whole connection id is released");
+            assertEquals(3, counters.malformed.get(0), "every one is counted on the socket that read it");
+            assertEquals(0, counters.dropped.get(0), "none of them is a forward drop");
+            assertEquals(0, counters.pending.get(0), "none of them was queued");
+        } finally {
+            release(datagrams);
+            shutdown(loops);
+        }
+    }
+
+    /**
+     * The pipeline one socket of a multi-socket listener really has
+     * ({@code SocketDispatcher.initChannel}): the bound, Netty's real dispatcher, the socket's codec
+     * and the {@link QuicServer.DatagramExceptionBackstop} last. A truncated short header must be
+     * gone by the end of the bound: its parser would throw, and an exception that reaches the tail
+     * is what floods the log (and leaks the datagram) in production. A capture handler after the
+     * backstop stands in for the tail, and records what would have reached it.
+     */
+    @Test
+    void aTruncatedShortHeaderNeverReachesTheParserOnTheProductionPipeline() throws Exception {
+        EventLoopGroup loops = new MultiThreadIoEventLoopGroup(2, NioIoHandler.newFactory());
+        List<ByteBuf> datagrams = new ArrayList<>();
+        // Queued for the target socket, to prove nothing of that either reaches the capture handler.
+        ByteBuf twoBytes = shortHeader(0, 2);
+        ByteBuf oneByte = shortHeader(0, 1);
+        ByteBuf oneByteShortOfTheId = shortHeader(0, Codecs.LOCAL_CONNECTION_ID_LENGTH);
+        datagrams.add(twoBytes);
+        datagrams.add(oneByte);
+        datagrams.add(oneByteShortOfTheId);
+        try {
+            Counters counters = new Counters(2);
+            QuicCodecDispatcher dispatcher = new RecorderDispatcher();
+            java.util.concurrent.atomic.AtomicLong lastLog = new java.util.concurrent.atomic.AtomicLong();
+            Tail tail = new Tail();
+            Channel source = channel(loops, counters.limiter(0), dispatcher,
+                    new QuicServer.DatagramExceptionBackstop(lastLog, 0), tail);
+            Channel sink = channel(loops, counters.limiter(1), dispatcher,
+                    new QuicServer.DatagramExceptionBackstop(lastLog, 1));
+            Recorder codec = sink.pipeline().get(Recorder.class);
+            assertNotSame(source.eventLoop(), sink.eventLoop(), "the two sockets must be on different loops");
+
+            source.pipeline().fireChannelRead(packet(twoBytes));
+            source.pipeline().fireChannelRead(packet(oneByte));
+            source.pipeline().fireChannelRead(packet(oneByteShortOfTheId));
+            drain(source.eventLoop());
+            drain(sink.eventLoop());
+
+            assertEquals(0, codec.received.get(), "a truncated short header reaches no codec");
+            assertEquals(0, twoBytes.refCnt(), "`40 00` is released before the dispatcher");
+            assertEquals(0, oneByte.refCnt(), "`40` is released before the dispatcher");
+            assertEquals(0, oneByteShortOfTheId.refCnt(), "the one-byte-short header is released");
+            assertEquals(3, counters.malformed.get(0), "every one is counted on the socket that read it");
+            assertEquals(0, tail.causes.size(), "nothing reached the pipeline tail: " + tail.causes);
+
+            // The bound still does its other job on the same pipeline: a datagram for the other
+            // socket is handed to that socket's loop and read there.
+            ByteBuf forwarded = shortHeaderFor(TARGET);
+            datagrams.add(forwarded);
+            source.pipeline().fireChannelRead(packet(forwarded));
+            assertTrue(codec.await(1, 5), "a datagram for the other socket still reaches its codec");
+            drain(sink.eventLoop());
+            assertEquals(0, tail.causes.size(), "a forwarded datagram reaches the tail with no exception either");
+            assertEquals(0, counters.dropped.get(TARGET), "it was under the bound");
+        } finally {
+            release(datagrams);
+            shutdown(loops);
+        }
+    }
+
+    /** Stands in for Netty's pipeline tail: records every exception that would have reached it. */
+    private static final class Tail extends ChannelInboundHandlerAdapter {
+        final List<Throwable> causes = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            causes.add(cause);
         }
     }
 
@@ -241,17 +348,19 @@ class SocketForwardBoundTest {
     private static final class Counters {
         final AtomicIntegerArray pending;
         final AtomicIntegerArray dropped;
+        final AtomicIntegerArray malformed;
         final AtomicReferenceArray<ChannelHandlerContext> limiters;
 
         Counters(int sockets) {
             pending = new AtomicIntegerArray(sockets);
             dropped = new AtomicIntegerArray(sockets);
+            malformed = new AtomicIntegerArray(sockets);
             limiters = new AtomicReferenceArray<>(sockets);
         }
 
         QuicServer.ForwardLimiter limiter(int socket) {
             return new QuicServer.ForwardLimiter(socket, Codecs.LOCAL_CONNECTION_ID_LENGTH,
-                    pending, dropped, limiters);
+                    pending, dropped, malformed, limiters);
         }
     }
 
@@ -322,6 +431,29 @@ class SocketForwardBoundTest {
         content.writeShort(socket);
         content.writeZero(18); // the rest of the 20-byte connection id
         content.writeZero(3); // a little payload
+        return content;
+    }
+
+    /**
+     * A short header of exactly {@code bytes} bytes: the header byte {@code 40}, then the socket's
+     * index when there is room for it, then zeroes. Shorter than
+     * {@code 1 + Codecs.LOCAL_CONNECTION_ID_LENGTH} this is a datagram Netty's dispatcher throws for.
+     */
+    private static ByteBuf shortHeader(int socket, int bytes) {
+        ByteBuf content = Unpooled.buffer(bytes);
+        content.writeByte(0x40);
+        if (bytes >= Byte.BYTES + Short.BYTES) {
+            content.writeShort(socket);
+        }
+        content.writeZero(bytes - content.writerIndex());
+        return content;
+    }
+
+    /** A long header (RFC 9000 §17.2): no index to decode, and the dispatcher leaves it alone. */
+    private static ByteBuf longHeader() {
+        ByteBuf content = Unpooled.buffer(24);
+        content.writeByte(0xC0);
+        content.writeZero(23);
         return content;
     }
 

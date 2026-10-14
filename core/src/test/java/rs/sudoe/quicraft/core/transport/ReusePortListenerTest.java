@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core.transport;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -24,6 +25,10 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.QuicSupport;
@@ -156,6 +161,99 @@ class ReusePortListenerTest {
                 stream.close();
             }
             server.close();
+        }
+    }
+
+    /**
+     * A short-header datagram that stops before the whole connection id, one byte {@code 40},
+     * {@code 40 00}, or a header without the full 20-byte id, must never reach Netty's dispatcher:
+     * its parser throws for one ({@code QuicHeaderParser.sliceCid}), and no handler on a datagram
+     * pipeline catches that, so the pipeline's tail logs a stack trace and the (direct, pooled)
+     * buffer leaks, once per datagram, for anything a remote sender cares to send to a listener with
+     * two or more sockets. The bound in front of the dispatcher drops and counts them instead, and
+     * the backstop swallows whatever else a datagram handler throws. The listener must be otherwise
+     * unaffected: a real connection still completes and echoes afterwards.
+     */
+    @Test
+    void aTruncatedShortHeaderIsDroppedAndTheListenerKeepsServing() throws Exception {
+        assumeSeveralSockets();
+        TransportConfig config = limits(1000);
+        Logger root = Logger.getLogger("");
+        WarningCollector warnings = new WarningCollector();
+        root.addHandler(warnings);
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), SOCKETS, identity, config,
+                Loopback.echo(new CompletableFuture<>()));
+                DatagramSocket sender = new DatagramSocket(
+                        new InetSocketAddress(InetAddress.getLoopbackAddress(), 0))) {
+            byte[] oneByte = {0x40};
+            byte[] twoBytes = {0x40, 0x00};
+            // 20 bytes: the header byte plus 19, one short of the whole 20-byte connection id.
+            byte[] headerWithoutTheWholeId = new byte[Codecs.LOCAL_CONNECTION_ID_LENGTH];
+            headerWithoutTheWholeId[0] = 0x40;
+            byte[][] malformed = {oneByte, twoBytes, headerWithoutTheWholeId};
+            int sent = 0;
+            for (int round = 0; round < 8; round++) {
+                for (byte[] bytes : malformed) {
+                    sender.send(new DatagramPacket(bytes, bytes.length, server.localAddress()));
+                    sent++;
+                }
+            }
+
+            assertTrue(awaitMalformed(server, sent, 5), "every datagram sent must be dropped and counted: "
+                    + Arrays.toString(server.droppedMalformedPerSocket()));
+            final int total = sent;
+            int[] dropped = server.droppedMalformedPerSocket();
+            assertAll("every truncated short header is dropped on the socket that read it, and logged nowhere",
+                    () -> assertEquals(SOCKETS, dropped.length, "one malformed-drop counter per socket"),
+                    () -> assertEquals(total, sum(dropped), "dropped: " + Arrays.toString(dropped)),
+                    () -> assertEquals(0, sum(server.droppedForwardsPerSocket()), "none of them is a forward drop"),
+                    () -> assertTrue(warnings.records.isEmpty(), "a log record at WARNING or above means "
+                            + "something reached a pipeline tail: " + warnings.records));
+
+            // The listener is untouched otherwise: a real connection still completes and echoes.
+            QuicByteStream stream = QuicClient.connect(server.localAddress(), identity.fingerprint(), config)
+                    .get(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            Loopback.Collector collector = new Loopback.Collector();
+            stream.setListener(collector);
+            stream.setAutoRead(true);
+            byte[] payload = "after the malformed datagrams".getBytes(StandardCharsets.UTF_8);
+            stream.write(ByteBuffer.wrap(payload));
+            stream.flush();
+            assertArrayEquals(payload, collector.await(payload.length, 5, TimeUnit.SECONDS),
+                    "a connection after the flood got its echo");
+            stream.close();
+        } finally {
+            root.removeHandler(warnings);
+        }
+    }
+
+    /** Waits until {@code expected} datagrams are counted as malformed across the listener's sockets. */
+    private static boolean awaitMalformed(QuicServer server, int expected, long seconds)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+        while (sum(server.droppedMalformedPerSocket()) < expected && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+        return sum(server.droppedMalformedPerSocket()) == expected;
+    }
+
+    /** Collects every record at WARNING or above, from any logger, so a test can assert there was none. */
+    private static final class WarningCollector extends Handler {
+        final List<String> records = java.util.Collections.synchronizedList(new ArrayList<String>());
+
+        @Override
+        public void publish(LogRecord record) {
+            if (record.getLevel().intValue() >= Level.WARNING.intValue()) {
+                records.add(record.getLevel() + " " + record.getLoggerName() + ": " + record.getMessage());
+            }
+        }
+
+        @Override
+        public void flush() {
+        }
+
+        @Override
+        public void close() {
         }
     }
 
