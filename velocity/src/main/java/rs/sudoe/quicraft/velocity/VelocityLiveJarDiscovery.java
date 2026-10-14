@@ -83,9 +83,11 @@ final class VelocityLiveJarDiscovery implements LiveJarDiscovery {
      *
      * <p>A jar that provides {@code quicraft} through its {@code provides} aliases counts as a
      * duplicate, so this returns {@link #OWN_ID} for it, like it does for a jar whose {@code id} is
-     * {@code quicraft}: Velocity would load both and refuse the duplicate. Any read failure, oversize
-     * entry or unparsable descriptor throws, so the validator refuses: a jar that cannot be inspected
-     * never counts as "not a duplicate".
+     * {@code quicraft}: Velocity would load both and refuse the duplicate. A jar whose central directory
+     * holds more than one {@link #DESCRIPTOR} entry throws, because {@link ZipFile} and Velocity's
+     * {@code JarInputStream} may disagree on which entry counts, so the identity read here need not be
+     * the identity Velocity loads. Any read failure, oversize entry or unparsable descriptor throws, so
+     * the validator refuses: a jar that cannot be inspected never counts as "not a duplicate".
      */
     static Optional<String> idOf(Path jar) throws IOException {
         try (ZipFile zip = new ZipFile(jar.toFile())) {
@@ -93,12 +95,25 @@ final class VelocityLiveJarDiscovery implements LiveJarDiscovery {
             if (entry == null || entry.isDirectory()) {
                 return Optional.empty();
             }
+            requireSingleDescriptor(zip);
             JsonObject root = parseDescriptor(readCap(zip, entry));
             String id = stringField(root, ID);
             if (OWN_ID.equals(id) || providesOwnId(root)) {
                 return Optional.of(OWN_ID);
             }
             return id == null ? Optional.empty() : Optional.of(id);
+        }
+    }
+
+    /**
+     * Refuses a jar holding more than one {@link #DESCRIPTOR} entry. Which of them a reader counts is
+     * reader-specific, so a jar with several descriptors has no single identity the updater could judge
+     * against Velocity's choice.
+     */
+    private static void requireSingleDescriptor(ZipFile zip) throws IOException {
+        long descriptors = zip.stream().filter(e -> DESCRIPTOR.equals(e.getName())).count();
+        if (descriptors > 1) {
+            throw new IOException("plugin descriptor appears more than once");
         }
     }
 

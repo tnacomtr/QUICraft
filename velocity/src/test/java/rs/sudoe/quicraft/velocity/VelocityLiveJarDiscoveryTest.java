@@ -5,11 +5,15 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+import java.util.zip.CRC32;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 import org.junit.jupiter.api.Test;
@@ -183,5 +187,110 @@ class VelocityLiveJarDiscoveryTest {
         Path live = jar(scan.resolve("quicraft.jar"), "quicraft");
         jar(scan.resolve("corrupt.jar"), "{\"id\":\"other\",", BUILD_JSON);
         assertThrows(UpdateRejectedException.class, () -> discovery(live, scan).discover());
+    }
+
+    @Test
+    void aSiblingWithTwoDescriptorsFailsClosed(@TempDir Path root) throws Exception {
+        Path scan = plugins(root);
+        Path live = jar(scan.resolve("quicraft.jar"), "quicraft");
+        twoDescriptorJar(scan.resolve("twin.jar"),
+                "{\"id\":\"other\",\"main\":\"a.B\",\"version\":\"1.0.0\"}",
+                "{\"id\":\"someone-else\",\"main\":\"a.B\",\"version\":\"1.0.0\"}");
+        assertThrows(UpdateRejectedException.class, () -> discovery(live, scan).discover());
+    }
+
+    @Test
+    void idOfRefusesTwoDescriptorEntries(@TempDir Path root) throws Exception {
+        Path twin = twoDescriptorJar(root.resolve("twin.jar"),
+                "{\"id\":\"other\",\"main\":\"a.B\",\"version\":\"1.0.0\"}",
+                "{\"id\":\"someone-else\",\"main\":\"a.B\",\"version\":\"1.0.0\"}");
+        assertThrows(IOException.class, () -> VelocityLiveJarDiscovery.idOf(twin));
+    }
+
+    /**
+     * A zip whose central directory holds two entries with the same name, assembled by hand:
+     * {@link ZipOutputStream} refuses a duplicate name ("duplicate entry"), while readers disagree on
+     * which of the entries counts, which is exactly what must be refused. Both entries are stored
+     * (uncompressed), so no compressor is involved.
+     */
+    private static Path twoDescriptorJar(Path file, String first, String second) throws IOException {
+        Files.createDirectories(file.getParent());
+        byte[] name = VelocityLiveJarDiscovery.DESCRIPTOR.getBytes(UTF_8);
+        List<byte[]> bodies = new ArrayList<>();
+        bodies.add(first.getBytes(UTF_8));
+        bodies.add(second.getBytes(UTF_8));
+
+        ByteArrayOutputStream zip = new ByteArrayOutputStream();
+        List<byte[]> records = new ArrayList<>();
+        for (byte[] body : bodies) {
+            int offset = zip.size();
+            zip.writeBytes(le32(0x04034b50L)); // local file header
+            zip.writeBytes(le16(20)); // version needed
+            zip.writeBytes(le16(0)); // flags
+            zip.writeBytes(le16(0)); // stored
+            zip.writeBytes(le16(0)); // time
+            zip.writeBytes(le16(0x21)); // 1980-01-01
+            zip.writeBytes(le32(crc32(body)));
+            zip.writeBytes(le32(body.length));
+            zip.writeBytes(le32(body.length));
+            zip.writeBytes(le16(name.length));
+            zip.writeBytes(le16(0)); // no extra field
+            zip.writeBytes(name);
+            zip.writeBytes(body);
+            records.add(centralRecord(name, body, offset));
+        }
+        int directoryOffset = zip.size();
+        for (byte[] record : records) {
+            zip.writeBytes(record);
+        }
+        int directorySize = zip.size() - directoryOffset;
+        zip.writeBytes(le32(0x06054b50L)); // end of central directory
+        zip.writeBytes(le16(0)); // this disk
+        zip.writeBytes(le16(0)); // directory start disk
+        zip.writeBytes(le16(records.size()));
+        zip.writeBytes(le16(records.size()));
+        zip.writeBytes(le32(directorySize));
+        zip.writeBytes(le32(directoryOffset));
+        zip.writeBytes(le16(0)); // no comment
+        Files.write(file, zip.toByteArray());
+        return file;
+    }
+
+    private static byte[] centralRecord(byte[] name, byte[] body, int offset) {
+        ByteArrayOutputStream record = new ByteArrayOutputStream();
+        record.writeBytes(le32(0x02014b50L));
+        record.writeBytes(le16(20)); // version made by
+        record.writeBytes(le16(20)); // version needed
+        record.writeBytes(le16(0)); // flags
+        record.writeBytes(le16(0)); // stored
+        record.writeBytes(le16(0)); // time
+        record.writeBytes(le16(0x21)); // date
+        record.writeBytes(le32(crc32(body)));
+        record.writeBytes(le32(body.length));
+        record.writeBytes(le32(body.length));
+        record.writeBytes(le16(name.length));
+        record.writeBytes(le16(0)); // no extra field
+        record.writeBytes(le16(0)); // no comment
+        record.writeBytes(le16(0)); // disk number start
+        record.writeBytes(le16(0)); // internal attributes
+        record.writeBytes(le32(0)); // external attributes
+        record.writeBytes(le32(offset));
+        record.writeBytes(name);
+        return record.toByteArray();
+    }
+
+    private static byte[] le16(int value) {
+        return new byte[] {(byte) (value & 0xff), (byte) ((value >>> 8) & 0xff)};
+    }
+
+    private static byte[] le32(long value) {
+        return new byte[] {(byte) (value & 0xff), (byte) ((value >>> 8) & 0xff),
+                (byte) ((value >>> 16) & 0xff), (byte) ((value >>> 24) & 0xff)};
+    }
+
+    private static long crc32(byte[] body) {
+        CRC32 crc = new CRC32();
+        crc.update(body);
+        return crc.getValue();
     }
 }
