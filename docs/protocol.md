@@ -408,6 +408,16 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
   runs into its idle timeout. The same happens with one socket, so it comes from the codec's path
   and connection-id handling, not from the socket dispatch. Changing it touches transport
   parameters (for example the active connection-id limit) and is left to Phase 9.
+- Known limit (Retry against a changed 4-tuple, not fixed in v1): a Retry is a long header, so the
+  socket that received the Initial answers it and the connection id the client then uses names that
+  socket. If the client's next Initial arrives at a different socket (its 4-tuple changed in
+  between; a long header decodes no index), no single socket can serve the connection: the client's
+  later short-header datagrams are forwarded to the socket the id names, which knows no such
+  connection, and the Retry token is bound to the address it was issued to
+  (`HmacRetryTokenHandler`), so such an Initial is dropped rather than answered. Either way the
+  handshake does not complete, and the client falls back to TCP after its head start (§5). Retry
+  only starts under load in the default `ADAPTIVE` mode, so this needs the attempt rate to reach the
+  Retry threshold.
 
 ## 11. Native library and platforms
 
@@ -486,8 +496,10 @@ same address with SO_REUSEPORT, each on its own event loop thread.
 - Only Linux, and only when the transport has a SO_REUSEPORT the kernel accepts, binds several:
   anywhere else, or if the option is refused, the listener keeps one socket with one INFO line. If
   binding a later socket fails, that socket is closed and the listener keeps the sockets already
-  bound, also with one INFO line. So `udp-sockets` can never fail a startup. The
-  first socket keeps the option when it was applied to it, which changes nothing on its own.
+  bound, also with one INFO line. So `udp-sockets` can never fail a startup. SO_REUSEPORT is not
+  inert with one socket either: the first socket is configured with the option before it binds, so
+  any process of the same OS user can also bind that UDP port with SO_REUSEPORT and take a share of
+  the traffic (`docs/server-security.md`).
 - `close()` closes every socket and, for core's own transport, the thread group. A bind that fails
   on a later socket closes the sockets already bound and the group, then rethrows.
 
@@ -499,7 +511,11 @@ socket (NAT rebinding, migration, an idle socket) still reaches the codec that o
 connection: the dispatcher reads the destination connection id of a short-header packet, decodes
 the index and forwards the datagram to that socket's codec, on that socket's loop. Long headers,
 an Initial for example, always go to the socket that received them, and that socket then chooses
-the connection id the client uses.
+the connection id the client uses. Because that forwarding crosses loops (it is one queued task on
+the target loop per datagram), it is bounded: a socket hands over at most 1024 datagrams to one
+target socket at a time (`QuicServer.ForwardLimiter.MAX_PENDING_FORWARDS`). Over that the datagram
+is released and counted per target socket, so a client that names one socket from many source ports
+can slow that socket down but cannot grow its queue without bound.
 
 Only the sockets and their loops are multiplied. Admission (attempt budgets, open-connection
 leases, Retry), the Retry HMAC key and its token handler, the ingress datagram budget, the 0-RTT
