@@ -73,15 +73,18 @@ public final class TransactionLock {
             return new Lease(channel, osLock, guard);
         } finally {
             if (!acquired) {
-                if (channel != null) {
-                    channel.close();
+                try {
+                    if (channel != null) {
+                        channel.close();
+                    }
+                } finally {
+                    guard.release();
                 }
-                guard.release();
             }
         }
     }
 
-    private static final class Lease implements TxnLease {
+    static final class Lease implements TxnLease {
         private final FileChannel channel;
         private final FileLock osLock;
         private final Semaphore guard;
@@ -99,8 +102,11 @@ public final class TransactionLock {
                 return;
             }
             try {
-                osLock.release();
-                channel.close();
+                try {
+                    osLock.release();
+                } finally {
+                    channel.close();
+                }
             } finally {
                 guard.release();
             }

@@ -2,12 +2,21 @@
 package rs.sudoe.quicraft.updater;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
@@ -41,11 +50,15 @@ final class StartupRecovery {
     static final String MSG_KEPT = "update journal is in recovery-required; keeping every update file";
     static final String MSG_MANUAL_RESTORE = "backup was restored by hand; staged update discarded, backup kept";
     static final String MSG_UNEXPECTED_STAGING = "unexpected entry kept in staging: ";
+    static final String MSG_BACKUP_MISMATCH = "backup does not match the journal; do not restore it";
     static final String MSG_HEALTH_UNCONFIRMED = "health result could not be confirmed on disk; the next start re-checks";
     static final String MSG_NOT_INSTALLED = "update was not installed; staging removed";
 
     /** Largest boot-pending attempt count that still gets another boot (12.11 step 7). */
     private static final int MAX_BOOT_ATTEMPTS_BEFORE_RECOVERY = 2;
+    /** Longest unexpected staging name echoed into a message, after sanitizing. */
+    static final int MAX_LOGGED_NAME_CHARS = 64;
+    private static final int HASH_BUFFER_BYTES = 8192;
 
     private StartupRecovery() {
     }
@@ -159,7 +172,8 @@ final class StartupRecovery {
         List<String> messages = new ArrayList<>();
         try {
             for (Path unexpected : dir.unexpectedStagingEntries()) {
-                messages.add(MSG_UNEXPECTED_STAGING + unexpected);
+                messages.add(MSG_UNEXPECTED_STAGING
+                        + printableName(String.valueOf(unexpected.getFileName())));
             }
             for (String txid : dir.stagingTxids()) {
                 p.mutated = true;
@@ -241,14 +255,74 @@ final class StartupRecovery {
         StringBuilder text = new StringBuilder("WARN: update recovery required; no new updates until resolved: ")
                 .append(reason).append(". ");
         if (journal.isPresent()) {
-            Path backup = dir.backupJar(journal.get().txid());
-            text.append("Manual restore: stop the server, copy ").append(backup)
-                    .append(" over ").append(live.realPath()).append(", start it.");
+            JournalRecord j = journal.get();
+            Path backup = dir.backupJar(j.txid());
+            boolean matches = backupSha512(backup, j.live().size())
+                    .filter(j.backupSha512()::equals)
+                    .isPresent();
+            if (matches) {
+                text.append("Manual restore: stop the server, copy ").append(backup)
+                        .append(" over ").append(live.realPath()).append(", start it. ");
+            } else {
+                text.append(MSG_BACKUP_MISMATCH).append(". Keep every file. ");
+            }
+            text.append("Expected backup SHA-512: ").append(j.backupSha512()).append('.');
         } else {
             text.append("Inspect the update directory by hand before starting again.");
         }
         return new RecoveryResult(RecoveryStatus.RECOVERY_REQUIRED, Optional.empty(), Optional.of(live),
                 List.of(text.toString()));
+    }
+
+    /**
+     * Hashes {@code backup} with SHA-512 without following links. Returns empty unless it is a regular
+     * file of exactly {@code expectedSize} bytes that can be read in full. Reads never exceed that size.
+     */
+    private static Optional<String> backupSha512(Path backup, long expectedSize) {
+        try {
+            BasicFileAttributes attributes =
+                    Files.readAttributes(backup, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!attributes.isRegularFile() || attributes.size() != expectedSize) {
+                return Optional.empty();
+            }
+            MessageDigest digest = MessageDigest.getInstance("SHA-512");
+            ByteBuffer buffer = ByteBuffer.allocate(HASH_BUFFER_BYTES);
+            long counted = 0;
+            try (FileChannel channel = FileChannel.open(
+                    backup, Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS))) {
+                while (true) {
+                    buffer.clear();
+                    if (channel.read(buffer) < 0) {
+                        break;
+                    }
+                    buffer.flip();
+                    counted += buffer.remaining();
+                    if (counted > expectedSize) {
+                        return Optional.empty();
+                    }
+                    digest.update(buffer);
+                }
+            }
+            if (counted != expectedSize) {
+                return Optional.empty();
+            }
+            return Optional.of(Hex.encode(digest.digest()));
+        } catch (IOException | NoSuchAlgorithmException | RuntimeException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * Makes an attacker-chosen name safe to print: every character outside printable ASCII (0x20 to
+     * 0x7E) becomes {@code '?'}, and the result is capped at {@link #MAX_LOGGED_NAME_CHARS} characters.
+     */
+    static String printableName(String name) {
+        StringBuilder out = new StringBuilder(Math.min(name.length(), MAX_LOGGED_NAME_CHARS));
+        for (int i = 0; i < name.length() && out.length() < MAX_LOGGED_NAME_CHARS; i++) {
+            char c = name.charAt(i);
+            out.append(c >= 0x20 && c <= 0x7E ? c : '?');
+        }
+        return out.toString();
     }
 
     private static RecoveryResult disabled(String message) {

@@ -93,6 +93,7 @@ public final class ArtifactVerifier {
             trustBytes = readCapped(zip, TRUST_ENTRY, TRUST_MAX_BYTES);
             buildBytes = readCapped(zip, BUILD_ENTRY, BUILD_MAX_BYTES);
         }
+        requireUnchanged(stagedJar, before);
 
         UpdateDocuments.Trust trust = DocumentParser.parseTrust(trustBytes);
         BuildInfo build = DocumentParser.parseBuild(buildBytes);
@@ -102,6 +103,7 @@ public final class ArtifactVerifier {
         validateStagedTrust(trust, current);
 
         String fingerprint = KeySetFingerprint.of(trust.keys());
+        requireKeySetChangeAuthorized(c, fingerprint, id, current);
         ArtifactIdentity identity = new ArtifactIdentity(
                 entry.platform(), entry.version(), entry.size(), entry.sha512());
         return new StagedArtifact(stagedJar, identity, trust, fingerprint);
@@ -152,6 +154,21 @@ public final class ArtifactVerifier {
         }
     }
 
+    /**
+     * Requires the staged key-set change to be authorized by the verified manifest and the persisted
+     * backup key (docs/updater.md 12.2, key-set change rule). This is an extra requirement on top of
+     * {@link #validateStagedTrust}, never a waiver.
+     */
+    private static void requireKeySetChangeAuthorized(
+            AcceptedCandidate c, String fingerprint, RuntimeIdentity id, StateRecords.Snapshot current)
+            throws UpdateRejectedException {
+        TrustSnapshot snapshot = TrustSnapshot.of(id.runningTrust(), current.revoked().revokedPubs());
+        if (!KeySetChangeAuthorization.check(
+                c.manifest(), fingerprint, current.state().persistedTrust(), snapshot)) {
+            throw reject("staged key-set change is not authorized by the backup key");
+        }
+    }
+
     private static BasicFileAttributes regularFileAttributes(Path path)
             throws IOException, UpdateRejectedException {
         BasicFileAttributes attributes =
@@ -162,11 +179,16 @@ public final class ArtifactVerifier {
         return attributes;
     }
 
-    /** Re-reads the path without following links and requires it to still name the same file. */
-    private static void requireUnchanged(Path path, BasicFileAttributes before)
+    /**
+     * Re-reads the path without following links and requires it to still name the same file with the
+     * same size and modification time. Package-private so the mtime check can be tested directly.
+     */
+    static void requireUnchanged(Path path, BasicFileAttributes before)
             throws IOException, UpdateRejectedException {
         BasicFileAttributes now = regularFileAttributes(path);
-        if (!Objects.equals(before.fileKey(), now.fileKey()) || before.size() != now.size()) {
+        if (!Objects.equals(before.fileKey(), now.fileKey())
+                || before.size() != now.size()
+                || !Objects.equals(before.lastModifiedTime(), now.lastModifiedTime())) {
             throw reject("artifact changed during verification");
         }
     }
