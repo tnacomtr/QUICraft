@@ -7,7 +7,7 @@ import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 
 /**
- * {@code /quicraft update check [-s] | cancel | reset-state} (docs/updater.md section 3). OP level 3 for the
+ * {@code /quicraft update [check [-s] | cancel | reset-state]} (docs/updater.md section 3). OP level 3 for the
  * whole command; {@code reset-state} is console only. The words are passed to the facade as they are typed.
  */
 public final class UpdaterCommands {
@@ -17,7 +17,7 @@ public final class UpdaterCommands {
     /** Registers the command on the dedicated server's dispatcher. */
     public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
         LiteralArgumentBuilder<CommandSourceStack> update = Commands.literal("update")
-                // Bare "/quicraft update": the facade answers with its usage line.
+                // Bare "/quicraft update": downloads, verifies and stages the new jar (docs/updater.md section 3).
                 .executes(c -> ServerUpdater.command(c, new String[0]))
                 .then(Commands.literal("check")
                         .executes(c -> ServerUpdater.command(c, new String[] {"check"}))
