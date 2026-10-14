@@ -89,6 +89,12 @@ public final class ServerUpdater {
         CommandSourceStack source = context.getSource();
         try {
             Hooks.enter("updater command");
+            // Brigadier checks requires() against the source that parsed the command; an /execute modifier
+            // can hand the command a different source. Judge the source that actually runs it as well.
+            if (!isAdmin(source)) {
+                reply(source, "you are not allowed to run /quicraft update");
+                return 0;
+            }
             UpdaterRuntime rt = runtime;
             MinecraftServer s = server;
             if (rt == null || s == null) {
@@ -149,7 +155,7 @@ public final class ServerUpdater {
     /**
      * The gate for {@code /quicraft update} (docs/updater.md section 3). Allowed when the source has no
      * entity and holds the admin permission (the console and RCON; command blocks and datapack functions run
-     * at level 2 and are refused), or when its entity is a player {@link #isAdmin(ServerPlayer) allowed} on
+     * at level 2 by default and are refused), or when its entity is a player {@link #isAdmin(ServerPlayer) allowed} on
      * their own. A source with any other entity, or one that cannot answer, is refused. Fail closed.
      */
     static boolean isAdmin(CommandSourceStack source) {
