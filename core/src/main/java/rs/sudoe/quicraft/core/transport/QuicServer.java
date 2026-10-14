@@ -2,12 +2,14 @@
 package rs.sudoe.quicraft.core.transport;
 
 import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.quic.QuicChannel;
 import io.netty.handler.codec.quic.QuicCodecDispatcher;
@@ -19,13 +21,16 @@ import io.netty.handler.codec.quic.QuicSslContextBuilder;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.handler.codec.quic.QuicStreamType;
 import io.netty.handler.ssl.SslHandshakeCompletionEvent;
+import io.netty.util.ReferenceCountUtil;
 import java.io.Closeable;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Protocol;
@@ -50,7 +55,9 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
  * key, the early tokens, the stream acceptor and everything else below stay node-wide, one set per
  * listener. Netty's {@link QuicCodecDispatcher} routes a datagram whose destination connection id
  * names another socket's codec to that socket, so a packet the kernel's 4-tuple hash put on the
- * wrong socket still reaches the connection's codec.
+ * wrong socket still reaches the connection's codec. That hand-over is bounded per target socket
+ * ({@link ForwardLimiter}): over the bound the datagram is released and counted, so one socket's
+ * loop can never queue unbounded work on another.
  */
 public final class QuicServer implements Closeable {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -105,7 +112,9 @@ public final class QuicServer implements Closeable {
     /**
      * Connections admitted on each UDP socket, indexed in bind order; empty when the listener has a
      * single socket, which keeps no per-socket counts. Each element is only ever written by its own
-     * socket's event loop, for tests.
+     * socket's event loop, for tests. The index comes from the connection id generator the base
+     * class built for the socket, so a connection is always counted on the socket that accepted it,
+     * even when sockets are added concurrently.
      */
     int[] acceptedConnectionsPerSocket() {
         AtomicIntegerArray accepted = shared.accepted;
@@ -115,6 +124,24 @@ public final class QuicServer implements Closeable {
         int[] copy = new int[accepted.length()];
         for (int i = 0; i < copy.length; i++) {
             copy[i] = accepted.get(i);
+        }
+        return copy;
+    }
+
+    /**
+     * Datagrams the forward bound dropped on each UDP socket, indexed by the socket each dropped
+     * datagram named ({@link ForwardLimiter}); empty when the listener has a single socket, which
+     * has no dispatcher and no forwards. Diagnostics for tests, like
+     * {@link #acceptedConnectionsPerSocket()}.
+     */
+    int[] droppedForwardsPerSocket() {
+        AtomicIntegerArray dropped = shared.droppedForwards;
+        if (dropped == null) {
+            return new int[0];
+        }
+        int[] copy = new int[dropped.length()];
+        for (int i = 0; i < copy.length; i++) {
+            copy[i] = dropped.get(i);
         }
         return copy;
     }
@@ -206,7 +233,7 @@ public final class QuicServer implements Closeable {
             return bind(address, identity, config, acceptor);
         }
         Shared shared = new Shared(count, identity, config, acceptor);
-        SocketDispatcher dispatcher = new SocketDispatcher(shared);
+        SocketDispatcher dispatcher = new SocketDispatcher(shared, count);
         EventLoopGroup group = Codecs.newGroup("quicraft-server", count);
         List<Channel> channels = new ArrayList<>(count);
         try {
@@ -261,7 +288,7 @@ public final class QuicServer implements Closeable {
                     + loops.size() + " loops and " + sockets.size() + " sockets");
         }
         Shared shared = new Shared(sockets.size(), identity, config, acceptor);
-        SocketDispatcher dispatcher = sockets.size() > 1 ? new SocketDispatcher(shared) : null;
+        SocketDispatcher dispatcher = sockets.size() > 1 ? new SocketDispatcher(shared, sockets.size()) : null;
         List<Channel> channels = new ArrayList<>(sockets.size());
         boolean inLoop = false;
         for (HostLoop loop : loops) {
@@ -354,12 +381,18 @@ public final class QuicServer implements Closeable {
         final QuicSslContext ssl;
         /** Connections accepted per socket, in bind order; null with a single socket. */
         final AtomicIntegerArray accepted;
+        /**
+         * Datagrams the forward bound dropped per target socket, in bind order; null with a single
+         * socket, which never forwards (docs/protocol.md §11).
+         */
+        final AtomicIntegerArray droppedForwards;
 
         Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor)
                 throws Exception {
             this.config = config;
             this.acceptor = acceptor;
             this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
+            this.droppedForwards = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.admission = admission(config);
             this.ingress = IngressGuard.budget(config);
             // Attempts with a valid token get their own budget; its open caps are unused.
@@ -390,23 +423,229 @@ public final class QuicServer implements Closeable {
      * by every socket's pipeline: it builds each socket's codec with the connection id generator
      * that encodes that socket's index into every id the codec issues, and forwards a datagram
      * whose destination connection id names another socket to that socket's codec.
+     *
+     * <p>Every socket also gets a {@link ForwardLimiter} in front of this dispatcher, which bounds
+     * what it may hand over to another socket's loop. Netty's {@code channelRead} is {@code final},
+     * so the bound is a handler of its own: it decodes the same index and either releases the
+     * datagram or passes it on untouched. The index it uses is exact: the base class builds the id
+     * generator with the socket's index and hands that generator to {@link #initChannel}, so the
+     * per-socket counters and the bound agree with the ids however concurrent boots interleave.
      */
     private static final class SocketDispatcher extends QuicCodecDispatcher {
+        /** Pipeline name of the bound in front of this dispatcher, one per socket. */
+        private static final String LIMITER = "quicraft-forward-bound";
+
         private final Shared shared;
-        /** Sockets added so far, in the same order as the dispatcher's own context list. */
-        private final java.util.concurrent.atomic.AtomicInteger next =
+        /** In-flight cross-loop hand-overs per target socket, shared by every socket's limiter. */
+        private final AtomicIntegerArray pending;
+        /** Each socket's limiter, indexed by the index the base class gave that socket. */
+        private final AtomicReferenceArray<ChannelHandlerContext> limiterOfSocket;
+        /** Not expected to be used; see {@link IndexedQuicConnectionIdGenerator#indexOf}. */
+        private final java.util.concurrent.atomic.AtomicInteger added =
                 new java.util.concurrent.atomic.AtomicInteger();
 
-        SocketDispatcher(Shared shared) {
+        SocketDispatcher(Shared shared, int sockets) {
             super(Codecs.LOCAL_CONNECTION_ID_LENGTH);
             this.shared = shared;
+            this.pending = new AtomicIntegerArray(sockets);
+            this.limiterOfSocket = new AtomicReferenceArray<ChannelHandlerContext>(sockets);
+        }
+
+        /** Carries the index the base class encodes into every id of this socket's codec. */
+        @Override
+        protected QuicConnectionIdGenerator newIdGenerator(int idx) {
+            return new IndexedQuicConnectionIdGenerator(idx, super.newIdGenerator(idx));
         }
 
         @Override
         protected void initChannel(Channel channel, int localConnectionIdLength, QuicConnectionIdGenerator idGenerator)
                 throws Exception {
-            int socketIndex = next.getAndIncrement();
+            int socketIndex = IndexedQuicConnectionIdGenerator.indexOf(idGenerator);
+            if (socketIndex < 0) {
+                // Only this class builds these generators, so this is not expected; keep a stable
+                // index rather than failing a bind over it.
+                socketIndex = added.getAndIncrement();
+            }
+            ForwardLimiter limiter = new ForwardLimiter(socketIndex, localConnectionIdLength, pending,
+                    shared.droppedForwards, limiterOfSocket);
+            // In front of this dispatcher: it sees a datagram first, and whatever it passes on is
+            // dispatched exactly as before. The dispatcher is already in the pipeline here, because
+            // the base class calls this from its own handlerAdded.
+            String dispatcher = channel.pipeline().context(this).name();
+            channel.pipeline().addBefore(dispatcher, LIMITER + "-" + socketIndex, limiter);
             channel.pipeline().addLast(codec(shared, localConnectionIdLength, idGenerator, socketIndex));
+        }
+    }
+
+    /**
+     * Bounds what one socket's loop may hand over to another socket's loop (docs/protocol.md §11).
+     *
+     * <p>Netty's {@link QuicCodecDispatcher} delivers a datagram to another socket by firing a read
+     * on that socket's context, which from another loop means one queued task per datagram and has
+     * no bound. A client that sends short-header datagrams whose destination connection id names
+     * one socket (two bytes {@code 00 00}) from many source ports would otherwise grow that
+     * socket's task queue without bound: heap growth, and stalls on the loops that also serve TCP
+     * players. Netty's {@code channelRead} is {@code final}, so this bound is a handler of its own,
+     * installed in front of the dispatcher; a datagram it does not hand over itself (a long header,
+     * a truncated short header, a socket that is not registered yet) is passed on unchanged, so the
+     * dispatcher still decodes it, and throws for it, exactly as before.
+     *
+     * <p>At most {@link #MAX_PENDING_FORWARDS} datagrams may be waiting on one target socket. Over
+     * that, the datagram is released here and counted in {@link Shared#droppedForwards}, never
+     * queued. Two source loops can both find room and overshoot by at most one each, so this is a
+     * bound, not an exact count. Same-loop delivery is left to the dispatcher, which fires it
+     * directly.
+     */
+    static final class ForwardLimiter extends ChannelInboundHandlerAdapter {
+        /** Datagrams one loop may have handed to another and not seen processed, per target. */
+        static final int MAX_PENDING_FORWARDS = 1024;
+
+        /** The index the listener's ids encode for this socket; indexes {@link #limiterOfSocket}. */
+        private final int socketIndex;
+        /** {@link Codecs#LOCAL_CONNECTION_ID_LENGTH}: how many bytes a connection id takes. */
+        private final int localConnectionIdLength;
+        /** In-flight hand-overs per target socket, shared by every socket's limiter. */
+        private final AtomicIntegerArray pending;
+        /** Drops per target socket, shared by every socket's limiter. */
+        private final AtomicIntegerArray dropped;
+        /** The limiter of each socket, so a datagram can be handed to that socket's loop. */
+        private final AtomicReferenceArray<ChannelHandlerContext> limiterOfSocket;
+
+        ForwardLimiter(int socketIndex, int localConnectionIdLength, AtomicIntegerArray pending,
+                AtomicIntegerArray dropped, AtomicReferenceArray<ChannelHandlerContext> limiterOfSocket) {
+            this.socketIndex = socketIndex;
+            this.localConnectionIdLength = localConnectionIdLength;
+            this.pending = pending;
+            this.dropped = dropped;
+            this.limiterOfSocket = limiterOfSocket;
+        }
+
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) {
+            limiterOfSocket.set(socketIndex, ctx);
+        }
+
+        @Override
+        public void handlerRemoved(ChannelHandlerContext ctx) {
+            // The socket is gone: stop handing datagrams to its loop.
+            limiterOfSocket.compareAndSet(socketIndex, ctx, null);
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            if (msg instanceof DatagramPacket) {
+                int target = targetSocket((DatagramPacket) msg);
+                // Out of range is not a socket: hand it to the dispatcher, which answers for it the
+                // same way (an id naming a socket that does not exist goes to the local codec).
+                ChannelHandlerContext to = target < 0 || target >= limiterOfSocket.length()
+                        ? null : limiterOfSocket.get(target);
+                if (to != null && !to.executor().inEventLoop()) {
+                    forward(target, to, msg);
+                    return;
+                }
+            }
+            ctx.fireChannelRead(msg);
+        }
+
+        /**
+         * The index the datagram's destination connection id names, decoded exactly as
+         * {@link QuicCodecDispatcher} decodes it (the first two bytes of the id of a short-header
+         * packet, RFC 9000 §17.3), or -1 for a datagram this bound must not touch: a long header, or
+         * a short header with too few bytes for the whole connection id, which the dispatcher
+         * itself rejects and therefore has to see.
+         */
+        private int targetSocket(DatagramPacket packet) {
+            ByteBuf content = packet.content();
+            int readable = content.readableBytes();
+            if (readable <= Byte.BYTES || (content.getByte(content.readerIndex()) & 0x80) != 0) {
+                return -1;
+            }
+            if (readable < Byte.BYTES + localConnectionIdLength) {
+                return -1;
+            }
+            return content.getUnsignedShort(content.readerIndex() + Byte.BYTES);
+        }
+
+        /**
+         * Hands {@code msg} to {@code to}'s loop, unless that loop already has
+         * {@link #MAX_PENDING_FORWARDS} of them waiting, and then releases it here instead of
+         * queueing it. The hand-over runs through the target's own executor, so the read on its
+         * context happens on its loop, and the pending count drops in a {@code finally} whether the
+         * read throws or an early shutdown rejects the task.
+         */
+        private void forward(int target, ChannelHandlerContext to, Object msg) {
+            if (pending.get(target) >= MAX_PENDING_FORWARDS) {
+                drop(target, msg);
+                return;
+            }
+            pending.incrementAndGet(target);
+            try {
+                to.executor().execute(() -> {
+                    try {
+                        to.fireChannelRead(msg);
+                    } finally {
+                        pending.decrementAndGet(target);
+                    }
+                });
+            } catch (RuntimeException rejected) {
+                // Shutting down: do not leave the slot pending for ever, and do not leak the buffer.
+                pending.decrementAndGet(target);
+                drop(target, msg);
+            }
+        }
+
+        private void drop(int target, Object msg) {
+            ReferenceCountUtil.release(msg);
+            dropped.incrementAndGet(target);
+        }
+    }
+
+    /**
+     * The connection id generator the base class built, plus the index it encodes, so
+     * {@link SocketDispatcher#initChannel} knows the socket's index without counting calls
+     * (which concurrent boots could interleave differently from the base class's own order).
+     * Every call goes straight through, so the ids are exactly the ones the base class produces.
+     */
+    private static final class IndexedQuicConnectionIdGenerator implements QuicConnectionIdGenerator {
+        private final int index;
+        private final QuicConnectionIdGenerator delegate;
+
+        IndexedQuicConnectionIdGenerator(int index, QuicConnectionIdGenerator delegate) {
+            this.index = index;
+            this.delegate = delegate;
+        }
+
+        /** The index of {@code generator}, or -1 if it is not one of ours. */
+        static int indexOf(QuicConnectionIdGenerator generator) {
+            if (generator instanceof IndexedQuicConnectionIdGenerator) {
+                return ((IndexedQuicConnectionIdGenerator) generator).index;
+            }
+            return -1;
+        }
+
+        @Override
+        public ByteBuffer newId(int length) {
+            return delegate.newId(length);
+        }
+
+        @Override
+        public ByteBuffer newId(ByteBuffer input, int length) {
+            return delegate.newId(input, length);
+        }
+
+        @Override
+        public ByteBuffer newId(ByteBuffer scid, ByteBuffer dcid, int length) {
+            return delegate.newId(scid, dcid, length);
+        }
+
+        @Override
+        public int maxConnectionIdLength() {
+            return delegate.maxConnectionIdLength();
+        }
+
+        @Override
+        public boolean isIdempotent() {
+            return delegate.isIdempotent();
         }
     }
 
