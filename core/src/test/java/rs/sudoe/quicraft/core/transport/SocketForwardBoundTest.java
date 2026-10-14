@@ -17,9 +17,12 @@ import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.nio.NioDatagramChannel;
+import io.netty.handler.codec.quic.QuicCodecDispatcher;
+import io.netty.handler.codec.quic.QuicConnectionIdGenerator;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -37,7 +40,9 @@ import org.junit.jupiter.api.Test;
  * a limiter in front of the handler that plays the codec, one shared set of counters, exactly as
  * {@code SocketDispatcher} shares them. No socket is bound and no QUIC native is needed: the
  * datagrams are fired into the source pipeline, and the hand-over is the same one the dispatcher
- * does, through the target's executor.
+ * does, through the target's executor. One test uses Netty's real dispatcher above the limiter, so
+ * the delivery and the read-completion it owes a forwarded datagram are the ones a live listener
+ * runs.
  */
 class SocketForwardBoundTest {
     /** The socket the test datagrams name: the other one, so every hand-over crosses loops. */
@@ -125,6 +130,79 @@ class SocketForwardBoundTest {
         }
     }
 
+    /**
+     * A forwarded burst must also close the target socket's read cycle. The real dispatcher
+     * delivers a forwarded datagram by firing the read on the target's codec context and records
+     * that it owes that context a read-complete ({@code ChannelHandlerContextDispatcher}); the
+     * completion is only paid by {@code channelReadComplete} on the target's own pipeline, which
+     * nothing fires for a datagram the target never read itself. The QUIC codec flushes and
+     * completes the receive in exactly that method, so without the completion a connection whose
+     * datagrams all arrive on a foreign socket, as they do after a NAT rebind, would never flush.
+     *
+     * <p>The dispatcher here is Netty's own, one instance shared by both sockets exactly as
+     * {@code SocketDispatcher} is, with the recorder standing in for the codec where
+     * {@code SocketDispatcher} installs it: after the dispatcher. The target loop is held while the
+     * burst is handed over, then released with no further traffic, so nothing but the hand-over
+     * itself can complete the read.
+     */
+    @Test
+    void theLastForwardedDatagramOfABurstCompletesTheReadOnTheTargetSocket() throws Exception {
+        EventLoopGroup loops = new MultiThreadIoEventLoopGroup(2, NioIoHandler.newFactory());
+        List<ByteBuf> datagrams = new ArrayList<>();
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            Counters counters = new Counters(2);
+            // Added to the source pipeline first: the dispatcher indexes the sockets in that order,
+            // and the datagrams name TARGET, the second one.
+            QuicCodecDispatcher dispatcher = new RecorderDispatcher();
+            Channel source = channel(loops, counters.limiter(0), dispatcher);
+            Channel sink = channel(loops, counters.limiter(1), dispatcher);
+            Recorder codec = sink.pipeline().get(Recorder.class);
+            assertNotSame(source.eventLoop(), sink.eventLoop(), "the two sockets must be on different loops");
+
+            CountDownLatch held = new CountDownLatch(1);
+            sink.eventLoop().execute(() -> {
+                held.countDown();
+                awaitQuietly(release, 60); // bounded, so a failing assertion cannot hold the loop for ever
+            });
+            assertTrue(held.await(5, TimeUnit.SECONDS), "the target loop is held");
+
+            int burst = 4;
+            for (int i = 0; i < burst; i++) {
+                ByteBuf content = shortHeaderFor(TARGET);
+                datagrams.add(content);
+                source.pipeline().fireChannelRead(packet(content));
+            }
+            drain(source.eventLoop());
+            assertEquals(burst, counters.pending.get(TARGET), "the whole burst is waiting on the target loop");
+
+            // No more traffic, and nothing else on the target socket: only the hand-over can close
+            // the read the dispatcher opened for these datagrams.
+            release.countDown();
+            drain(sink.eventLoop());
+            assertTrue(codec.await(burst, 5), "every forwarded datagram reached the target codec");
+            assertEquals(0, counters.pending.get(TARGET), "the in-flight count is released as the burst drains");
+            assertEquals(Arrays.asList("read", "read", "read", "read", "complete"), codec.events,
+                    "the burst's one read completion comes after its last read");
+
+            // A later burst closes its own read: the count is per hand-over, not one completion ever.
+            ByteBuf after = shortHeaderFor(TARGET);
+            datagrams.add(after);
+            source.pipeline().fireChannelRead(packet(after));
+            drain(source.eventLoop());
+            drain(sink.eventLoop());
+            assertTrue(codec.await(burst + 1, 5), "a later datagram still reaches the target codec");
+            assertEquals(2, codec.completed.get(), "the later burst fires its own read completion");
+            assertEquals(Arrays.asList("read", "read", "read", "read", "complete", "read", "complete"), codec.events,
+                    "each burst's completion follows its own last read: " + codec.events);
+        } finally {
+            // A failing assertion must not leave the target loop held.
+            release.countDown();
+            shutdown(loops);
+            release(datagrams);
+        }
+    }
+
     @Test
     void aDatagramTheDispatcherMustSeeIsPassedOnUnchanged() throws Exception {
         EventLoopGroup loops = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
@@ -177,15 +255,46 @@ class SocketForwardBoundTest {
         }
     }
 
-    /** Stands in for one socket's codec: counts what reaches it and keeps the buffers to release. */
+    /**
+     * Netty's real dispatcher, without a QUIC codec under it: the delivery of a forwarded datagram
+     * and the read-complete it owes are the dispatcher's own code, and what stands in for the codec
+     * is the {@link Recorder}, installed after the dispatcher exactly where
+     * {@code SocketDispatcher} installs the socket's codec.
+     */
+    private static final class RecorderDispatcher extends QuicCodecDispatcher {
+        RecorderDispatcher() {
+            super(Codecs.LOCAL_CONNECTION_ID_LENGTH);
+        }
+
+        @Override
+        protected void initChannel(Channel channel, int localConnectionIdLength, QuicConnectionIdGenerator idGenerator) {
+            channel.pipeline().addLast(new Recorder());
+        }
+    }
+
+    /**
+     * Stands in for one socket's codec: counts the reads and read-completions that reach it, keeps
+     * their order, and keeps the buffers to release.
+     */
     private static final class Recorder extends ChannelInboundHandlerAdapter {
         final AtomicInteger received = new AtomicInteger();
+        final AtomicInteger completed = new AtomicInteger();
+        /** Every read and read-completion in the order they arrived, as {@code read}/{@code complete}. */
+        final List<String> events = new CopyOnWriteArrayList<>();
         final List<ByteBuf> contents = new CopyOnWriteArrayList<>();
 
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             contents.add(((DatagramPacket) msg).content());
             received.incrementAndGet();
+            events.add("read");
+        }
+
+        @Override
+        public void channelReadComplete(ChannelHandlerContext ctx) {
+            completed.incrementAndGet();
+            events.add("complete");
+            ctx.fireChannelReadComplete();
         }
 
         /** Waits until {@code count} datagrams reached this codec. */
