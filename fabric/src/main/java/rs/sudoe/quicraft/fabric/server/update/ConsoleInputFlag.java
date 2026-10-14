@@ -1,33 +1,52 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.server.update;
 
+import org.jspecify.annotations.Nullable;
+
 /**
- * Marks the server thread while the dedicated server drains its queued console commands. The command
- * source alone cannot prove console input: a datapack function runs with the server as its source too, so
- * {@code reset-state} needs this mark as well (docs/updater.md section 3, 12.8).
+ * Holds the one command source the dedicated server's console-input drain is running right now. Being the
+ * server source is not proof of console input: a datapack function runs with the server as its source too, so
+ * {@code reset-state} needs the drain's mark as well (docs/updater.md section 3, 12.8).
  *
- * <p>Plain logic with no game classes, so it is easy to unit test later. Fail closed: the mark starts
- * unset and only the dedicated server's own console-input drain ever sets it, so a missing or failing hook
- * leaves the console unproven and {@code reset-state} refused.
+ * <p>What is marked is the exact {@code CommandSourceStack} instance the drain hands to the command, never the
+ * thread that happens to run it. The server thread can run unrelated queued work while a drained command is
+ * still running (a console {@code /reload} waits on the task queue inside the command), and none of that work
+ * is console input. Identity is therefore the whole test: a stack the drain did not hand over, for instance
+ * one {@code /execute} wrapped, is not console input.
+ *
+ * <p>Plain logic with no game classes: the marked source is kept as an {@link Object} and compared by
+ * identity, so it is easy to unit test later. Fail closed: the mark starts unset and only the dedicated
+ * server's own console-input drain ever sets it, so a missing or failing hook leaves the console unproven and
+ * {@code reset-state} refused.
  */
 public final class ConsoleInputFlag {
-    private static final ThreadLocal<Boolean> INSIDE_CONSOLE_INPUT = new ThreadLocal<>();
+    private static volatile @Nullable Object markedSource;
 
     private ConsoleInputFlag() {
     }
 
-    /** Marks the current thread as running inside a console-input drain. */
-    public static void enter() {
-        INSIDE_CONSOLE_INPUT.set(Boolean.TRUE);
+    /**
+     * Marks {@code source} as the console source running now. The drain and the commands it runs are both on
+     * the server thread, so the plain field is written and read by that one thread.
+     *
+     * @return the mark this one replaced, for the caller to restore when the command returns
+     */
+    public static @Nullable Object mark(Object source) {
+        Object previous = markedSource;
+        markedSource = source;
+        return previous;
     }
 
-    /** Clears the mark: a source seen after this on this thread is not console input. */
-    public static void exit() {
-        INSIDE_CONSOLE_INPUT.remove();
+    /** Puts {@code previous} back as the mark; {@code null} means nothing is marked. */
+    public static void restore(@Nullable Object previous) {
+        markedSource = previous;
     }
 
-    /** @return true only while this thread is inside a console-input drain */
-    public static boolean isSet() {
-        return Boolean.TRUE.equals(INSIDE_CONSOLE_INPUT.get());
+    /**
+     * @return true only for the exact object this holder marked; anything else, {@code null} included, is not
+     *     console input
+     */
+    public static boolean isMarked(@Nullable Object source) {
+        return source != null && source == markedSource;
     }
 }
