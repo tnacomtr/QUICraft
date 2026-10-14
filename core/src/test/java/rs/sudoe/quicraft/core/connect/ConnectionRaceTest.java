@@ -135,7 +135,8 @@ class ConnectionRaceTest {
             long tcpStartedAfter = TimeUnit.NANOSECONDS.toMillis(tcp.startedAtNanos.get() - start);
             assertNotNull(r.tcp());
             assertEquals(FallbackReason.FINGERPRINT_MISMATCH, r.quicFailure());
-            assertTrue(tcpStartedAfter < 500, "TCP started " + tcpStartedAfter + " ms in, not immediately");
+            // "Immediately" means well before the 5 s head start; 500 ms was too tight on shared CI runners (523 ms seen).
+            assertTrue(tcpStartedAfter < 1500, "TCP started " + tcpStartedAfter + " ms in, not immediately");
             assertEquals(0, accepted.get(), "the server must never accept a stream for a rejected certificate");
         }
     }
