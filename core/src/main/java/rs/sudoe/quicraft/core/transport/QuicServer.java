@@ -102,9 +102,9 @@ public final class QuicServer implements Closeable {
     }
 
     /**
-     * Connections accepted so far on each UDP socket, indexed in bind order; empty when the
-     * listener has a single socket, which keeps no per-socket counts. Each element is written only
-     * by its own socket's event loop, for tests.
+     * Connections admitted on each UDP socket, indexed in bind order; empty when the listener has a
+     * single socket, which keeps no per-socket counts. Each element is only ever written by its own
+     * socket's event loop, for tests.
      */
     int[] acceptedConnectionsPerSocket() {
         int[] accepted = shared.accepted;
@@ -412,12 +412,13 @@ public final class QuicServer implements Closeable {
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
-                        if (shared.accepted != null) {
-                            shared.accepted[socketIndex]++;
-                        }
                         Admitted admitted = Admitted.admit(connection, shared.admission);
                         if (admitted == null) {
                             return;
+                        }
+                        if (shared.accepted != null) {
+                            // Written only by this socket's own loop, so no synchronization.
+                            shared.accepted[socketIndex]++;
                         }
                         connection.pipeline().addLast(admitted,
                                 new Connection(shared.acceptor, shared.tokens, shared.config.earlyData,
