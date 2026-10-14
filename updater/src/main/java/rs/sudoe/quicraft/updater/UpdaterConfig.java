@@ -19,14 +19,28 @@ import java.util.function.Consumer;
  * file: it never creates or rewrites it. A missing file gives the defaults silently. A file that cannot
  * be read or parsed gives the defaults with one WARN and no values echoed. An unrecognised
  * {@code update.check-interval} value fails closed to {@link CheckInterval#OFF} with one WARN that names
- * the key; the interval values are matched case-insensitively. Other unknown booleans keep their default
- * with one WARN that names the key.
+ * the key; the interval values are matched case-insensitively. An unrecognised {@code update.install}
+ * value fails safe to {@link InstallMode#STAGE_ONLY} with one WARN that names the key; those values are
+ * matched case-insensitively too. Other unknown booleans keep their default with one WARN that names the
+ * key.
  */
-public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, boolean logBadSignatures) {
+public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, boolean logBadSignatures,
+        InstallMode installMode) {
 
     static final String KEY_INTERVAL = "update.check-interval";
     static final String KEY_SILENT = "update.check-silent";
     static final String KEY_BAD_SIGNATURES = "update.log-bad-signatures";
+    static final String KEY_INSTALL = "update.install";
+
+    /**
+     * What {@code update} does with the verified jar. {@link #SWAP} is the default: the platform decides
+     * whether the swap is available (see {@link InstallCapabilities}). {@link #STAGE_ONLY} is the owner
+     * opt-out: the jar is staged and verified but never installed, on every platform.
+     */
+    public enum InstallMode {
+        SWAP,
+        STAGE_ONLY
+    }
 
     /** The scheduled check period. */
     public enum CheckInterval {
@@ -46,9 +60,9 @@ public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, bo
         }
     }
 
-    /** The defaults: hourly, silent, bad signatures logged. */
+    /** The defaults: hourly, silent, bad signatures logged, swap where the platform allows it. */
     public static UpdaterConfig defaults() {
-        return new UpdaterConfig(CheckInterval.HOURLY, true, true);
+        return new UpdaterConfig(CheckInterval.HOURLY, true, true, InstallMode.SWAP);
     }
 
     public UpdaterConfig {
@@ -89,7 +103,8 @@ public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, bo
         boolean silent = parseBoolean(props.getProperty(KEY_SILENT), true, KEY_SILENT, warnings);
         boolean badSignatures = parseBoolean(props.getProperty(KEY_BAD_SIGNATURES), true, KEY_BAD_SIGNATURES,
                 warnings);
-        return new UpdaterConfig(interval, silent, badSignatures);
+        InstallMode install = parseInstall(props.getProperty(KEY_INSTALL), warnings);
+        return new UpdaterConfig(interval, silent, badSignatures, install);
     }
 
     private static CheckInterval parseInterval(String raw, Consumer<String> warnings) {
@@ -106,6 +121,22 @@ public record UpdaterConfig(CheckInterval checkInterval, boolean checkSilent, bo
             default:
                 warnings.accept("updater config: unknown value for " + KEY_INTERVAL + "; checks are off");
                 return CheckInterval.OFF;
+        }
+    }
+
+    private static InstallMode parseInstall(String raw, Consumer<String> warnings) {
+        if (raw == null) {
+            return InstallMode.SWAP;
+        }
+        switch (raw.trim().toLowerCase(Locale.ROOT)) {
+            case "swap":
+                return InstallMode.SWAP;
+            case "stage-only":
+                return InstallMode.STAGE_ONLY;
+            default:
+                warnings.accept("updater config: unknown value for " + KEY_INSTALL
+                        + "; the jar is staged, not installed");
+                return InstallMode.STAGE_ONLY;
         }
     }
 

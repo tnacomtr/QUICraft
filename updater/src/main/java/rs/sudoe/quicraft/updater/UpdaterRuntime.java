@@ -74,12 +74,6 @@ public final class UpdaterRuntime {
     /** Most bad-manifest digests kept for log suppression (docs/updater.md 12.8: 0..32). */
     static final int WARNED_BAD_LIMIT = 32;
 
-    /**
-     * What {@code update} may do. Only verified staging is allowed while the live swap is gated on
-     * blocker 10 (docs/updater.md 12.13). Change this only together with that gate.
-     */
-    static final InstallCapability UPDATE_CAPABILITY = InstallCapability.VERIFIED_STAGING_ONLY;
-
     static final String BUSY_TEXT = "another updater command is already running";
     static final String STOPPING_TEXT = "updater is stopping; the command was not run";
     static final String USAGE = "usage: update | update check | update check -s | update cancel | update reset-state";
@@ -145,6 +139,12 @@ public final class UpdaterRuntime {
     private final UpdaterTransaction txn;
     private final ScheduledExecutorService executor;
     private final UpdaterConfig config;
+    /**
+     * What {@code update} may do, decided once by {@link InstallCapabilities} from the owner's
+     * {@code update.install} setting and the platform's {@code os.name} (docs/updater.md 12.10, 12.13).
+     * The transaction still downgrades to staging when the update directory cannot be synced.
+     */
+    private final InstallCapability updateCapability;
     private final AtomicBoolean busy = new AtomicBoolean();
     private volatile boolean stopping;
     private volatile MutableCancelToken checkToken;
@@ -162,6 +162,7 @@ public final class UpdaterRuntime {
         this.txn = null;
         this.executor = null;
         this.config = UpdaterConfig.defaults();
+        this.updateCapability = InstallCapability.VERIFIED_STAGING_ONLY;
     }
 
     private UpdaterRuntime(Boot b) {
@@ -176,6 +177,7 @@ public final class UpdaterRuntime {
         this.txn = b.txn;
         this.executor = b.executor;
         this.config = b.config;
+        this.updateCapability = b.capability;
     }
 
     /** Test seams. Production uses {@link #system()}. */
@@ -187,6 +189,8 @@ public final class UpdaterRuntime {
         final Function<UpdaterLog, Optional<ReleaseHosts>> origins;
         final ReleaseEndpoints endpoints;
         final Function<Path, StateStore> stores;
+        /** The platform's {@code os.name}, injected so a test can pick the OS the updater sees. */
+        final String osName;
 
         Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
                 Function<ThreadFactory, ScheduledExecutorService> executors,
@@ -198,6 +202,13 @@ public final class UpdaterRuntime {
                 Function<ThreadFactory, ScheduledExecutorService> executors,
                 Function<UpdaterLog, Optional<ReleaseHosts>> origins, ReleaseEndpoints endpoints,
                 Function<Path, StateStore> stores) {
+            this(fetcher, clock, ops, executors, origins, endpoints, stores, systemOsName());
+        }
+
+        Seams(SourceFetcher fetcher, Clock clock, DurabilityOps ops,
+                Function<ThreadFactory, ScheduledExecutorService> executors,
+                Function<UpdaterLog, Optional<ReleaseHosts>> origins, ReleaseEndpoints endpoints,
+                Function<Path, StateStore> stores, String osName) {
             this.fetcher = Objects.requireNonNull(fetcher, "fetcher");
             this.clock = Objects.requireNonNull(clock, "clock");
             this.ops = Objects.requireNonNull(ops, "ops");
@@ -205,6 +216,20 @@ public final class UpdaterRuntime {
             this.origins = Objects.requireNonNull(origins, "origins");
             this.endpoints = Objects.requireNonNull(endpoints, "endpoints");
             this.stores = Objects.requireNonNull(stores, "stores");
+            this.osName = Objects.requireNonNull(osName, "osName");
+        }
+
+        /**
+         * The platform's {@code os.name}, read once at start. A property that is absent or unreadable
+         * counts as an unknown OS, which keeps verified staging only.
+         */
+        static String systemOsName() {
+            try {
+                return System.getProperty("os.name", "");
+            } catch (SecurityException ignored) {
+                // A property read that is not allowed counts as an unknown OS, so nothing is installed.
+                return "";
+            }
         }
 
         /**
@@ -603,7 +628,7 @@ public final class UpdaterRuntime {
     }
 
     private void runUpdate(Consumer<String> out) {
-        UpdateRequest request = new UpdateRequest(identity, UPDATE_CAPABILITY,
+        UpdateRequest request = new UpdateRequest(identity, updateCapability,
                 line -> progress(line, out));
         TransactionResult result = txn.execute(request);
         for (String message : result.messages()) {
@@ -958,6 +983,7 @@ public final class UpdaterRuntime {
         final UpdaterLog log;
         Path dir;
         UpdaterConfig config = UpdaterConfig.defaults();
+        InstallCapability capability = InstallCapability.VERIFIED_STAGING_ONLY;
         ReleaseHosts hosts;
         LiveJar live;
         RuntimeIdentity identity;
@@ -980,6 +1006,7 @@ public final class UpdaterRuntime {
             boolean dirExisted = p.updateDirExistedBeforeStart();
             dir = Objects.requireNonNull(p.updateDir(), "updateDir");
             config = UpdaterConfig.load(p.configFile(), log::warn);
+            capability = InstallCapabilities.decide(s.osName, config);
             hosts = s.origins.apply(log).orElse(null);
 
             LiveJarDiscovery discovery = p.discovery();
