@@ -56,12 +56,26 @@ final class FabricJarDiscovery implements LiveJarDiscovery {
         return FabricLoader.getInstance().getGameDir().resolve("mods").toAbsolutePath();
     }
 
-    /** The validator takes a function that cannot throw checked exceptions; a failure refuses the jar. */
+    /**
+     * The validator takes a function that cannot throw checked exceptions. A jar whose build metadata is rejected
+     * (a development build, for example) gets a placeholder version: the facade reads the same metadata next and
+     * disables the updater with the exact reason. An unreadable jar still refuses the live jar.
+     */
     private static UpdateVersion versionOf(Path jar) {
         try {
             return OwnJarVersion.read(jar);
-        } catch (IOException | UpdateRejectedException e) {
+        } catch (UpdateRejectedException e) {
+            return placeholderVersion();
+        } catch (IOException e) {
             throw new IllegalStateException("cannot read the live jar version", e);
+        }
+    }
+
+    private static UpdateVersion placeholderVersion() {
+        try {
+            return UpdateVersion.parse("0.0.0");
+        } catch (UpdateRejectedException e) {
+            throw new IllegalStateException("placeholder version is invalid", e);
         }
     }
 }
