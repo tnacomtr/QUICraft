@@ -5,8 +5,9 @@ import java.net.URI;
 import java.util.Objects;
 
 /**
- * The endpoint layout of a release host: the documents, their signatures and the artifacts under the
- * host's origin. Used with the dev origins; the production layout is decided with blocker 5.
+ * The endpoint layout of a local dev release host: the documents, their signatures and the artifacts
+ * under the host's origin. Used with the dev origins (docs/updater.md 12.15); the two real hosts use
+ * {@link ProductionReleaseEndpoints}.
  */
 public final class DevReleaseEndpoints implements ReleaseEndpoints {
 
