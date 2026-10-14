@@ -16,33 +16,21 @@ Test keys, the dev trust file and the TLS fixture are throwaway (user told; they
    1.21.11 not probed live (testkit speaks 26.1 only). Security review: lows only, documented.
 4. 31 `phase4-upd-*` worktrees removed (branches kept). Quarantined branches untouched.
 
-## In flight (not merged)
-- `agent/phase4-core-flake` (.worktrees/phase4-core-flake), Sonnet, commit b11b20e: QuicLoopbackTest
-  stalled-peer test now judges saturation on transport-accepted bytes (written - inFlight). Root cause of
-  the old flake: in-flight drains as the cwnd grows, so the stream turns writable again far below the
-  8 MiB window. Astra round 1 and round 2 both asked for changes; b11b20e answers round 2 and needs
-  Astra round 3 plus a Haiku verify. The first Astra *advisor* call timed out (300 s), so Astra peer review
-  stood in for the advisor.
-- `agent/phase4-macos-paths` (.worktrees/phase4-macos-paths), DeepSeek, commit 52733df: test fixtures
-  build LiveJar from real paths (fixes rollbackLineIsEmittedBeforeTheFlipAndBeforeStepSix on macOS,
-  /var -> /private/var); opt-in `-Pquicraft.testTmpDir`. 1162/0 default and symlinked tmpdir.
-  Pending: product fix for the macOS JDK21 health failure. Cause found: UpdateDirectory.requireOwnedContents()
-  (UpdateDirectory.java:282-293) races StateStore.prepareDirectory's `.owner-*.probe` create/delete;
-  NoSuchFileException -> UpdateRejectedException -> "health result could not be recorded". Planned fix:
-  skip an entry that vanished (as StateStore.deleteIfStale does), with a regression test.
-  Then: Haiku verify, Astra review, security review (ownership check is security code).
-- Not pushed yet: 600aa07 (ConnectionRaceTest CI bound 500 -> 1500 ms; CI build 38577594760 failed at 523 ms).
+## Merged since (2026-10-14 evening)
+- Core flake fixed, b70ac29 (Sonnet; Astra rounds 1-3; saturation judged on written - inFlight).
+- macOS fixes, f3d6bdc: real-path LiveJar fixtures (52733df), ownership scan skips only vanished top-level
+  files (b9f5e2e + f75a924 after a security low). Linux repro: -Pquicraft.testTmpDir=/var/run/user/1000/qc-tmp.
+- Full fresh build after all merges: core 210/0, velocity 73/0, updater 1166/0.
 
 ## Next steps
-1. Finish both branches above, merge one at a time, full fresh build
-   `./gradlew build --rerun-tasks --no-build-cache`, push feat to origin and github.
+1. (done) push feat.
 2. Dispatch updater-macos on feat (`gh workflow run updater-macos --ref feat/phase4-alpha`), record the
    result in docs/updater.md 12.13.
 3. Update plan Progress and gotchas (flake root cause; workflow_dispatch needs the file on main;
    macOS tmpdir is a symlink; JAVA_TOOL_OPTIONS banner breaks the lock tests that read child output).
 
 ## Open follow-ups (not done)
-Attempt-rate limits (globalAttemptsPerSecond 200 etc.) not raised for 50k; SO_REUSEPORT multi-socket scaling;
+readJournal exists-then-owner race vs deleteJournal (fails closed; availability only; check whether UpdaterTransaction admit holds the lease); Attempt-rate limits (globalAttemptsPerSecond 200 etc.) not raised for 50k; SO_REUSEPORT multi-socket scaling;
 revocation-event notify row; SNAPSHOT structured diagnostic; timeout/exceptional health tests; refuse TEST
 keys without dev origins; reconcile OwnJarResources/OwnJarVersion; brittle stack-name test seam; FIFO
 check-then-open [low]; mock host does not cross-check --version/--platform against build.json; empty

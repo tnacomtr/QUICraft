@@ -285,3 +285,4 @@ Advisor `ses_ec901f029fferSuXasStZoUdgO`, one question, no tools. Recommendation
 Rejected from the advice: none. The advisor's caveat that it had not read section 12 was handled by validating each point against the cited spec lines; the spec already covered locks, `.prev`, generation, journal phases, permanent union and coverage, so those became units and tests rather than new design.
 
 After the critique, the user resolved the three open decisions: fixtures approved, origins injected, Windows deferred to a future plan.
+- 2026-10-14, user decisions: admission defaults raised (bfb0068); OP-list rule for `/quicraft update` on Fabric with an execution-time recheck (b2ea6c4, live smoke 26.1.2); core flake fixed (b70ac29); 31 phase4-upd worktrees removed; macOS run 38577920195 found 2 failures (symlinked tmpdir fixtures; ownership-scan race) fixed on agent/phase4-macos-paths.
