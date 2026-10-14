@@ -57,25 +57,18 @@ final class FabricJarDiscovery implements LiveJarDiscovery {
     }
 
     /**
-     * The validator takes a function that cannot throw checked exceptions. A jar whose build metadata is rejected
-     * (a development build, for example) gets a placeholder version: the facade reads the same metadata next and
-     * disables the updater with the exact reason. An unreadable jar still refuses the live jar.
+     * The validator takes a function that cannot throw checked exceptions. A development build keeps its own
+     * unchecked {@code DevelopmentBuildException}, which the validator rethrows unchanged so the facade names
+     * that reason; any other unusable metadata becomes a runtime failure, which the validator turns into its
+     * generic "cannot read the live jar version" refusal. An unreadable jar is refused the same way.
      */
     private static UpdateVersion versionOf(Path jar) {
         try {
             return OwnJarVersion.read(jar);
         } catch (UpdateRejectedException e) {
-            return placeholderVersion();
+            throw new IllegalStateException("the live jar's build metadata is unusable", e);
         } catch (IOException e) {
             throw new IllegalStateException("cannot read the live jar version", e);
-        }
-    }
-
-    private static UpdateVersion placeholderVersion() {
-        try {
-            return UpdateVersion.parse("0.0.0");
-        } catch (UpdateRejectedException e) {
-            throw new IllegalStateException("placeholder version is invalid", e);
         }
     }
 }
