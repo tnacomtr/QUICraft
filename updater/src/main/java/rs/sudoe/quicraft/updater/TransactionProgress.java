@@ -6,14 +6,12 @@ package rs.sudoe.quicraft.updater;
  * it for information that must reach the operator even if the process dies before the result is
  * printed, such as the manual rollback command logged before the swap (docs/updater.md 12.10 step 5).
  *
- * <p>A line starting with {@code WARN:} is a warning. The transaction ignores any exception the sink
- * throws, so a broken sink never changes the outcome.
+ * <p>A line starting with {@code WARN:} is a warning. The rollback line is mandatory: if the sink
+ * throws while it is emitted, the transaction installs nothing. The transaction ignores failures of
+ * any other line.
  */
 @FunctionalInterface
 public interface TransactionProgress {
-
-    /** A sink that drops every line. */
-    TransactionProgress NONE = message -> { };
 
     /**
      * Receives one line.

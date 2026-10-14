@@ -65,6 +65,7 @@ final class UpdaterTransaction {
     static final String WITHDRAWN = "the staged jar was withdrawn";
     static final String STAGED_CHANGED = "the staged jar changed after verification";
     static final String LIVE_CHANGED = "the live jar changed during the update; nothing was installed";
+    static final String ROLLBACK_NOT_LOGGED = "the rollback instructions could not be logged; nothing was installed";
     static final String MOVED_MISMATCH = "WARN: the live jar does not match the staged jar after the move; "
             + "nothing was deleted; recovery will check the installed jar at next start";
     static final String NOTHING_MOVED_TEXT = "the swap did not happen; nothing was installed";
@@ -448,8 +449,12 @@ final class UpdaterTransaction {
         // Logged before anything else of step 6 so a crash after the move still leaves the command on screen.
         String rollback = "if the update fails after the swap, stop the server, copy " + backup + " over "
                 + a.live.realPath() + ", start the server";
-        emit(a, rollback);
         a.messages.add(rollback);
+        if (!emit(a, rollback)) {
+            // Without the manual rollback command on record, nothing may be installed.
+            a.dir.deleteBackup(a.txid);
+            return abort(a, TransactionOutcome.FAILED, ROLLBACK_NOT_LOGGED);
+        }
         if (a.token.isCancelled()) {
             return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
         }
@@ -728,12 +733,18 @@ final class UpdaterTransaction {
         return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
     }
 
-    /** Sends one progress line. A sink that throws is ignored: it must never change the outcome. */
-    private static void emit(Attempt a, String line) {
+    /**
+     * Sends one progress line. Returns false when the sink throws (a RuntimeException or a non-VM Error);
+     * the caller decides what that means for the transaction.
+     */
+    private static boolean emit(Attempt a, String line) {
         try {
             a.request.progress().line(line);
-        } catch (RuntimeException ignored) {
-            // The operator's log sink is not part of the transaction.
+            return true;
+        } catch (VirtualMachineError e) {
+            throw e;
+        } catch (RuntimeException | Error e) {
+            return false;
         }
     }
 

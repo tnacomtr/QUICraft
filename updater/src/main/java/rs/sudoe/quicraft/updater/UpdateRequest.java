@@ -16,8 +16,4 @@ public record UpdateRequest(RuntimeIdentity identity, InstallCapability capabili
         Objects.requireNonNull(progress, "progress");
     }
 
-    /** A request whose progress lines are dropped. */
-    public UpdateRequest(RuntimeIdentity identity, InstallCapability capability) {
-        this(identity, capability, TransactionProgress.NONE);
-    }
 }

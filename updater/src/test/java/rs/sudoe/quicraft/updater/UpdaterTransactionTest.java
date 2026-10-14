@@ -22,6 +22,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import rs.sudoe.quicraft.updater.PipelineFixtures.ScriptedFetcher;
@@ -111,8 +116,11 @@ class UpdaterTransactionTest {
     }
 
     private static UpdateRequest request(Rig r, InstallCapability capability) {
-        return new UpdateRequest(r.identity, capability);
+        return new UpdateRequest(r.identity, capability, NO_OP);
     }
+
+    /** A progress sink that drops every line. Production has no default; tests pass one explicitly. */
+    private static final TransactionProgress NO_OP = line -> { };
 
     /** Durability ops that run {@code onSecondForce} at the second force (after the step 3 force). */
     private static DurabilityOps countingForce(Runnable onSecondForce) {
@@ -972,6 +980,74 @@ class UpdaterTransactionTest {
         assertEquals(0, backupCount(r), "this attempt's backup is removed");
     }
 
+    // ---- cancel against the RUNNING->SWAPPING race: two threads, latch-controlled ------------
+
+    private static final long WAIT_SECONDS = 10;
+
+    /** Signals {@code reached}, then waits for {@code release}. A missing release fails this thread. */
+    private static void pauseAt(CountDownLatch reached, CountDownLatch release) {
+        reached.countDown();
+        try {
+            if (!release.await(WAIT_SECONDS, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("the test never released the transaction thread");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
+    }
+
+    @Test
+    void cancelThatWinsTheRaceBeforeTheFlipStopsTheSwap() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        CountDownLatch atFlipBoundary = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        txn.hooks.beforeSwapFlip = () -> pauseAt(atFlipBoundary, release);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<TransactionResult> run = pool.submit(() -> txn.execute(atomic(r)));
+            assertTrue(atFlipBoundary.await(WAIT_SECONDS, TimeUnit.SECONDS), "the transaction reached the flip");
+            CancelReply reply = txn.cancelActive();
+            release.countDown();
+            TransactionResult result = run.get(WAIT_SECONDS, TimeUnit.SECONDS);
+            assertEquals(CancelReply.REQUESTED, reply);
+            assertEquals(TransactionOutcome.CANCELLED, result.outcome(), result.messages().toString());
+            assertLiveUntouched(r);
+            assertTrue(stagingIsEmpty(r));
+            assertEquals(0, journalCount(r));
+            assertEquals(1, backupCount(r), "the backup is kept on a cancel before the flip");
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void swapThatWinsTheRaceReportsInstalledWhenCancelArrives() throws Exception {
+        Rig r = standardRig();
+        UpdaterTransaction txn = txn(r);
+        CountDownLatch flipped = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        txn.hooks.afterSwapFlip = () -> pauseAt(flipped, release);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<TransactionResult> run = pool.submit(() -> txn.execute(atomic(r)));
+            assertTrue(flipped.await(WAIT_SECONDS, TimeUnit.SECONDS), "the transaction passed the flip");
+            CancelReply reply = txn.cancelActive();
+            release.countDown();
+            TransactionResult result = run.get(WAIT_SECONDS, TimeUnit.SECONDS);
+            assertEquals(CancelReply.INSTALLED_RESTART_PENDING, reply);
+            assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
+            assertArrayEquals(r.jar, Files.readAllBytes(r.live));
+            assertEquals(JournalPhase.SWAPPED,
+                    new UpdateDirectory(r.upd, DurabilityOps.system()).readJournal().orElseThrow().phase());
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
     @Test
     void concurrentExecuteIsRefusedWhileATransactionIsActive() throws Exception {
         Rig r = standardRig();
@@ -1078,15 +1154,29 @@ class UpdaterTransactionTest {
     }
 
     @Test
-    void throwingProgressSinkDoesNotBreakTheTransaction() throws Exception {
+    void throwingRollbackSinkRefusesTheInstallAndKeepsTheLiveJar() throws Exception {
         Rig r = standardRig();
         TransactionResult result = txn(r).execute(atomic(r, line -> {
             throw new IllegalStateException("the log sink is broken");
         }));
-        assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
-        assertArrayEquals(r.jar, Files.readAllBytes(r.live));
-        assertTrue(result.messages().stream().anyMatch(m -> m.startsWith(ROLLBACK_PREFIX)),
-                result.messages().toString());
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertEquals(UpdaterTransaction.ROLLBACK_NOT_LOGGED, result.messages().get(0));
+        assertLiveUntouched(r);
+        assertTrue(stagingIsEmpty(r));
+        assertEquals(0, journalCount(r), "the journal this attempt wrote is removed");
+        assertEquals(0, backupCount(r), "this attempt's backup is removed");
+    }
+
+    @Test
+    void errorFromTheRollbackSinkAlsoRefusesTheInstall() throws Exception {
+        Rig r = standardRig();
+        TransactionResult result = txn(r).execute(atomic(r, line -> {
+            throw new AssertionError("the log sink failed");
+        }));
+        assertEquals(TransactionOutcome.FAILED, result.outcome(), result.messages().toString());
+        assertLiveUntouched(r);
+        assertEquals(0, journalCount(r));
+        assertEquals(0, backupCount(r));
     }
 
     /** Merges one revoked key into the persisted revocations, as a concurrent command would. */
