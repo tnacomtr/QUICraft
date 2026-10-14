@@ -29,9 +29,12 @@ tasks.register("checkReleaseTrust") {
         if (file.canonicalPath == devPath) {
             problems += "the trust file is the development file (${UpdaterTrust.DEV_TRUST_PATH})"
         }
-        val text = file.readText(Charsets.UTF_8)
-        for (pub in UpdaterTrust.TEST_PUBS) {
-            if (text.contains(pub)) problems += "the trust file holds the RFC 8032 test key $pub"
+        try {
+            for (pub in UpdaterTrust.testPubsIn(file.readText(Charsets.UTF_8))) {
+                problems += "the trust file holds the RFC 8032 test key $pub"
+            }
+        } catch (e: IllegalArgumentException) {
+            problems += "the trust file cannot be decoded safely: ${e.message}"
         }
         if (!UpdaterTrust.isUpdaterVersion(version)) {
             problems += "project version '$version' is outside the UpdateVersion grammar"
