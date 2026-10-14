@@ -21,14 +21,20 @@ object UpdaterTrust {
     const val BUILD_ENTRY = "META-INF/quicraft/build.json"
     const val TRUST_ENTRY = "META-INF/quicraft/updater-trust.json"
 
-    // Mirrors UpdateVersion.PATTERN (updater/src/main/java/rs/sudoe/quicraft/updater/UpdateVersion.java:26-28).
-    // Duplicated because build-logic must not depend on the updater module. Keep the two in sync.
+    // Mirrors UpdateVersion.PATTERN (updater/src/main/java/rs/sudoe/quicraft/updater/UpdateVersion.java,
+    // PATTERN at lines 26-28), the 256-character cap (MAX_LENGTH, line 17), and the leading-zero rule
+    // (component(), lines 84-85). Each numeric component is 0 or 1 to 5 digits with no leading zero,
+    // which is exactly the range 0 to MAX_COMPONENT (99999). Duplicated because build-logic must not
+    // depend on the updater module. SYNC DUTY: change both together.
+    private const val MAX_VERSION_LENGTH = 256
     private val VERSION_GRAMMAR = Regex(
-        "([0-9]{1,5})\\.([0-9]{1,5})\\.([0-9]{1,5})(?:-(alpha|beta|rc)\\.([0-9]{1,5}))?",
+        "(0|[1-9][0-9]{0,4})\\.(0|[1-9][0-9]{0,4})\\.(0|[1-9][0-9]{0,4})" +
+            "(?:-(alpha|beta|rc)\\.(0|[1-9][0-9]{0,4}))?",
     )
 
-    /** True when UpdateVersion.parse would accept the text (full match). */
-    fun isUpdaterVersion(text: String): Boolean = VERSION_GRAMMAR.matches(text)
+    /** True when UpdateVersion.parse would accept the text (length cap, then full grammar match). */
+    fun isUpdaterVersion(text: String): Boolean =
+        text.length <= MAX_VERSION_LENGTH && VERSION_GRAMMAR.matches(text)
 
     /**
      * Public keys (lowercase) declared by a trust document, parsed rather than substring-matched.
