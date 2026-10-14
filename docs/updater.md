@@ -1067,6 +1067,25 @@ Rules derived from it (user-approved semantics, implementation safety still gate
   directory fsync and `F_FULLFSYNC` on macOS, crash-recovery tests of 12.11, and Velocity builds other
   than 4.2.0-30.
 
+Swap-then-read run (2026-10-14, manual, scratch only; the required test above, run once by hand,
+not yet automated): `0.1.0-alpha.1` jars with localhost dev origins on Velocity 4.2.0-30, Fabric
+26.1.2 and Fabric 1.21.11 (Loader 0.19.5, JDK 25, Linux). While running, the jar was replaced by
+`rename(2)` with either a zip holding no QUICraft entries or the same module's `0.1.0-SNAPSHOT` jar.
+Then: a server-list ping, `check`, `check -s`, `update`, `cancel`, `reset-state`, another ping and a
+stop.
+
+| Loader | Probe jar | Ping advertisement | check / cancel / reset-state | `update` | Exceptions / stop |
+| --- | --- | --- | --- | --- | --- |
+| Velocity 4.2.0-30 | empty zip | unchanged | normal | refused: live jar does not carry the QUICraft id | 0 / clean |
+| Velocity 4.2.0-30 | SNAPSHOT jar | unchanged | normal, still alpha.1 | refused: development build | 0 / clean |
+| Fabric 26.1.2 | empty zip | unchanged | normal | refused: no QUICraft id | 0 / clean |
+| Fabric 26.1.2 | SNAPSHOT jar | unchanged | normal, still alpha.1 | refused: development build | 0 / clean |
+| Fabric 1.21.11 | empty zip | unchanged | normal | refused: no QUICraft id | 0 / clean |
+
+Only staging looks at the file, and it does so on purpose: it validates the on-disk live jar before
+anything else (12.14) and fails closed. Nothing else read the new jar. Not covered by this run: a
+new QUIC connection after the swap (the native is loaded at listener start), JDK 21, macOS.
+
 ### 12.14 Installed-jar discovery and placement (basis for blocker 16)
 
 Sources: an explorer report (`.agents/opencode-runs/phase4-jar-discovery.txt`) plus my own checks.
