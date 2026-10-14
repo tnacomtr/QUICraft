@@ -237,6 +237,65 @@ class UpdateDirectoryTest {
     }
 
     @Test
+    void journalDeletedAfterTheExistsCheckReadsAsAbsent() throws Exception {
+        // A concurrent deleteJournal can remove journal.json between this read's existence check
+        // and its owner check. That leaves the directory in the same state as no journal at all,
+        // so the read must report absence instead of failing.
+        UpdateDirectory d = open(DurabilityOps.system());
+        d.writeJournal(journal(TXID, JournalPhase.PREPARED));
+
+        Optional<JournalRecord> read = d.readJournal(UpdateDirectoryTest::deleteUnchecked);
+
+        assertEquals(Optional.empty(), read);
+        assertFalse(Files.exists(d.journal()), "the hook removed the journal");
+    }
+
+    @Test
+    void journalDeletedAfterTheOwnerCheckReadsAsAbsent() throws Exception {
+        // The other window: journal.json passes the owner check and is deleted before the open, so
+        // the open itself fails with NoSuchFileException.
+        UpdateDirectory d = open(DurabilityOps.system());
+        d.writeJournal(journal(TXID, JournalPhase.PREPARED));
+        int[] windows = new int[1];
+
+        Optional<JournalRecord> read = d.readJournal(p -> {
+            windows[0]++;
+            if (windows[0] == 2) {
+                deleteUnchecked(p);
+            }
+        });
+
+        assertEquals(2, windows[0], "both read windows were offered");
+        assertEquals(Optional.empty(), read);
+    }
+
+    @Test
+    void journalReplacedByASymlinkAfterTheExistsCheckIsStillRefused() throws Exception {
+        // Only a vanished journal reads as absent. A journal replaced by a link must still be
+        // refused, and NOFOLLOW_LINKS on the open is what refuses it.
+        assumeTrue(FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+        UpdateDirectory d = open(DurabilityOps.system());
+        d.writeJournal(journal(TXID, JournalPhase.PREPARED));
+        Path victim = tmp.resolve("victim.bin");
+        byte[] secret = "not a journal".getBytes(StandardCharsets.UTF_8);
+        Files.write(victim, secret);
+        boolean[] replaced = {false};
+
+        assertThrows(IOException.class, () -> d.readJournal(p -> {
+            if (!replaced[0]) {
+                replaced[0] = true;
+                deleteUnchecked(p);
+                try {
+                    Files.createSymbolicLink(p, victim);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+        }));
+        assertArrayEquals(secret, Files.readAllBytes(victim), "the link target was not read");
+    }
+
+    @Test
     void corruptJournalIsRejectedNotIgnored() throws Exception {
         UpdateDirectory d = open(DurabilityOps.system());
         Files.write(d.journal(), "{ not a journal".getBytes(StandardCharsets.UTF_8));
