@@ -20,4 +20,8 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    // UpdaterTrustTest and UpdaterMetadataFunctionalTest read the repository's development trust file.
+    inputs.file("../updater/dev-trust/updater-trust.json")
+        .withPropertyName("devTrustFile")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
 }

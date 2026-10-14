@@ -140,6 +140,19 @@ class UpdaterTrustTest {
     }
 
     @Test
+    fun theDevelopmentPathAloneMakesDevelopmentTrust(@TempDir dir: File) {
+        // A file without any TEST key is still development trust when it IS the development path,
+        // reached directly or through a non-normalised alias.
+        val nonTest = File(dir, "dev.json")
+        nonTest.writeText("""{"keys":[{"kid":"x","pub":"${"11".repeat(32)}","roles":["release"]}]}""")
+        File(dir, "sub").mkdir()
+        val alias = File(dir, "sub/../dev.json")
+        assertTrue(UpdaterTrust.isDevelopmentTrust(nonTest, nonTest))
+        assertTrue(UpdaterTrust.isDevelopmentTrust(alias, nonTest))
+        assertFalse(UpdaterTrust.isDevelopmentTrust(nonTest, File(dir, "other.json")))
+    }
+
+    @Test
     fun aCopyHoldingATestKeyIsDevelopmentTrust(@TempDir dir: File) {
         val copy = File(dir, "test-key.json")
         copy.writeText("""{"keys":[{"kid":"x","pub":"${UpdaterTrust.TEST_PUBS[1]}","roles":["release"]}]}""")
