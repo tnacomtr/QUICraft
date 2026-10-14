@@ -178,16 +178,21 @@ Windows live updater must not ship until this is resolved.
 
 ## 6. Configuration, disclosure, and output
 
-### Config (conceptual; `.properties` integration pending)
+### Config
+
+The updater reads its own file, separate from the transport settings: `plugins/quicraft/updater.properties`
+on Velocity and `config/quicraft/updater.properties` on Fabric. QUICraft never creates or rewrites it; a
+missing file means the defaults below.
 
 ```
-update.check-interval: hourly  # hourly (default) | daily | off
-update.check-silent: true      # same as -s
-update.log-bad-signatures: true
+update.check-interval=hourly   # hourly (default) | daily | off; matched case-insensitively
+update.check-silent=true       # same as -s
+update.log-bad-signatures=true
 ```
 
-Real key names and loading are pending. Velocity config lives in `plugins/quicraft/config.properties`.
-Fabric config lives in `config/quicraft/server.properties`. The draft's `update/` paths under
+An unrecognised `update.check-interval` value turns checks off and logs a WARN naming the key only. A
+malformed file logs a fixed WARN and uses the defaults. The transport settings stay in
+`plugins/quicraft/config.properties` (Velocity) and `config/quicraft/server.properties` (Fabric). The draft's `update/` paths under
 `plugins/quicraft/` are Velocity-only. Fabric staging and state paths are specified in 12.14.
 
 ### Disclosure
