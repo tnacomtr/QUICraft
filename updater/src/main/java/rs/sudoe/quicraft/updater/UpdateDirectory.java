@@ -208,10 +208,24 @@ public final class UpdateDirectory {
     }
 
     /**
-     * Reads {@code journal.json}. Returns empty when no journal exists. Refuses a symbolic link, a
-     * foreign owner and any file over {@link JournalCodec#MAX_BYTES}; decode errors propagate.
+     * Reads {@code journal.json}. Returns empty when no journal exists, and also when a journal
+     * that existed was deleted between the existence check and the read: the on-disk state is then
+     * the same as no journal at all. Refuses a symbolic link, a foreign owner and any file over
+     * {@link JournalCodec#MAX_BYTES}; decode errors propagate.
      */
     public Optional<JournalRecord> readJournal() throws IOException, UpdateRejectedException {
+        return readJournal(p -> { });
+    }
+
+    /**
+     * Test seam at the journal read: {@code atReadWindow} runs in the two windows in which a
+     * concurrent {@link #deleteJournal} can remove {@code journal.json} between the existence check
+     * and the read, once after the file is known to exist and to be a regular file and before its
+     * owner is checked, and again after the owner check and before the open. Production passes a
+     * no-op through {@link #readJournal()}.
+     */
+    Optional<JournalRecord> readJournal(Consumer<Path> atReadWindow)
+            throws IOException, UpdateRejectedException {
         Path p = journal();
         if (!Files.exists(p, LinkOption.NOFOLLOW_LINKS)) {
             return Optional.empty();
@@ -219,11 +233,22 @@ public final class UpdateDirectory {
         if (Files.isSymbolicLink(p) || !Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) {
             throw new UpdateRejectedException("journal is not a regular file");
         }
-        StateStore.requireOwner(p, owner);
         byte[] bytes;
-        try (FileChannel ch = FileChannel.open(p, Set.of(StandardOpenOption.READ,
-                LinkOption.NOFOLLOW_LINKS))) {
-            bytes = readAtMost(ch, JournalCodec.MAX_BYTES + 1);
+        try {
+            atReadWindow.accept(p);
+            StateStore.requireOwner(p, owner);
+            atReadWindow.accept(p);
+            try (FileChannel ch = FileChannel.open(p, Set.of(StandardOpenOption.READ,
+                    LinkOption.NOFOLLOW_LINKS))) {
+                bytes = readAtMost(ch, JournalCodec.MAX_BYTES + 1);
+            }
+        } catch (NoSuchFileException gone) {
+            // The journal was deleted after the existence check, by the owner check or by the open.
+            // That is the same on-disk state as no journal at all, so report it as absent rather
+            // than as a read failure. Only this exception is treated this way: a journal replaced
+            // by a link makes the NOFOLLOW_LINKS open fail with a different exception, which still
+            // propagates, and every other check still rejects.
+            return Optional.empty();
         }
         return Optional.of(JournalCodec.decode(bytes));
     }
