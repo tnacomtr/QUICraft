@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.velocity;
 
-import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFactory;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
-import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.socket.DatagramChannel;
 import io.netty.handler.codec.haproxy.HAProxyMessageDecoder;
@@ -27,44 +25,59 @@ import rs.sudoe.quicraft.core.transport.TransportConfig;
  * TCP connection. The channel's remote address is the player's UDP address, so IP bans and
  * forwarding keep working.
  *
- * <p>Hosted (the default): the UDP socket is a Velocity-native datagram channel (epoll on Linux)
- * on one Velocity worker loop, QUIC runs on that loop, and so do the players' pipelines and,
- * since Velocity connects backends on the player's loop, their backend connections. A packet
- * then crosses no thread between the wire and the backend, as with TCP. If the datagram channel
- * type can't be found, QUIC runs on core's own thread instead, one hop away.
+ * <p>Hosted (the default): the UDP sockets are Velocity-native datagram channels (epoll on Linux)
+ * on distinct Velocity worker loops, one socket per loop and the kernel balancing the port's
+ * datagrams over them (SO_REUSEPORT, docs/protocol.md §11), QUIC runs on those loops, and so do
+ * the players' pipelines and, since Velocity connects backends on the player's loop, their
+ * backend connections. A packet then crosses no thread between the wire and the backend, as with
+ * TCP, and one proxy's QUIC load spreads over several loops instead of one. If the datagram
+ * channel type can't be found, or several sockets are impossible here, QUIC runs on one loop, or
+ * on core's own thread instead, one hop away.
  */
 final class QuicListener implements AutoCloseable {
     private final QuicServer server;
+    /** UDP sockets the listener bound; 1 for core's own transport and for the single-socket path. */
+    private final int sockets;
 
-    private QuicListener(QuicServer server) {
+    private QuicListener(QuicServer server, int sockets) {
         this.server = server;
+        this.sockets = sockets;
     }
 
     static QuicListener bind(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
             Supplier<ChannelInitializer<Channel>> initializer, EventLoopGroup workers,
-            ChannelFactory<? extends DatagramChannel> datagrams, Logger logger) throws Exception {
+            ChannelFactory<? extends DatagramChannel> datagrams, int udpSockets, Logger logger) throws Exception {
         // For the stats line: the server's early-release count, once it exists.
         java.util.concurrent.atomic.AtomicReference<QuicServer> bound = new java.util.concurrent.atomic.AtomicReference<>();
         java.util.function.LongSupplier early = () -> bound.get() == null ? -1 : bound.get().earlyReleases();
         if (datagrams == null) {
+            // Core's own transport, one socket on core's own thread: with no datagram channel type
+            // there is no worker loop per socket to spread over, and core's own multi-socket bind
+            // turns a later socket's failure into a failed listener, not a one-socket one.
             QuicServer server = QuicServer.bind(address, identity, config,
                     stream -> accept(stream, initializer, workers, logger, early));
             bound.set(server);
-            return new QuicListener(server);
+            return new QuicListener(server, 1);
         }
-        EventLoop loop = workers.next();
-        DatagramChannel socket = (DatagramChannel) new Bootstrap().group(loop).channelFactory(datagrams)
-                .handler(new ChannelInboundHandlerAdapter())
-                .bind(address).sync().channel();
+        // One socket per distinct worker loop, each with SO_REUSEPORT, so the proxy's QUIC work
+        // spreads over several loops (docs/protocol.md §11). bindHosted fails safe: one socket
+        // wherever several are not possible, and only a failure to bind the first one throws.
+        GameHost.HostedSockets sockets = GameHost.bindHosted(workers, udpSockets, address, datagrams);
         try {
-            QuicServer server = QuicServer.bind(GameHost.loop(loop), GameHost.socket(socket), identity, config,
-                    stream -> accept(stream, initializer, loop, logger, early));
+            QuicServer server = QuicServer.bind(sockets.hostLoops(), sockets.hostSockets(), identity, config,
+                    stream -> accept(stream, initializer, sockets.acceptingLoop(), logger, early));
             bound.set(server);
-            return new QuicListener(server);
+            return new QuicListener(server, sockets.size());
         } catch (Exception | Error e) {
-            socket.close();
+            // Core closes the sockets it registered; this covers a failure before it did.
+            sockets.close();
             throw e;
         }
+    }
+
+    /** UDP sockets this listener bound, for the startup line. */
+    int socketCount() {
+        return sockets;
     }
 
     /** See {@link QuicServer#closeUnconfirmedEarly}. */
