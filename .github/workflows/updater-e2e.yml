@@ -65,7 +65,7 @@ jobs:
           JAVA21="${JAVA_HOME_21_X64:-${JAVA_HOME_21_ARM64:-}}"
           JAVA25="${JAVA_HOME_25_X64:-${JAVA_HOME_25_ARM64:-}}"
           export JAVA21 JAVA25
-          testkit/run-updater-e2e.sh ${{ matrix.server }}
+          bash testkit/run-updater-e2e.sh ${{ matrix.server }}
       - name: Upload results on failure
         if: failure()
         uses: actions/upload-artifact@v7
