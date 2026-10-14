@@ -136,6 +136,10 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+# A signal (a cancelled CI job, Ctrl-C) would otherwise end bash without the EXIT trap.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---- tools ------------------------------------------------------------------------------------
 
