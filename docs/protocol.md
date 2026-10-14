@@ -413,7 +413,7 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
   socket. If the client's next Initial arrives at a different socket (its 4-tuple changed in
   between; a long header decodes no index), no single socket can serve the connection: the client's
   later short-header datagrams are forwarded to the socket the id names, which knows no such
-  connection, and the Retry token is bound to the address it was issued to
+  connection, and the Retry token is bound to the IP address and port it was issued to
   (`HmacRetryTokenHandler`), so such an Initial is dropped rather than answered. Either way the
   handshake does not complete, and the client falls back to TCP after its head start (§5). Retry
   only starts under load in the default `ADAPTIVE` mode, so this needs the attempt rate to reach the
