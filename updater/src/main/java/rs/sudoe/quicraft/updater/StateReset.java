@@ -11,6 +11,7 @@ import java.util.stream.Collectors;
 import rs.sudoe.quicraft.updater.StateRecords.Snapshot;
 import rs.sudoe.quicraft.updater.StateRecords.UpdaterState;
 import rs.sudoe.quicraft.updater.StateRecords.WithdrawnEntry;
+import rs.sudoe.quicraft.updater.TrustTransition.Transition;
 
 /**
  * The {@code /quicraft update reset-state} command (docs/updater.md 12.8). Rebuilds
@@ -27,6 +28,10 @@ final class StateReset {
     static final String REVOKED_UNREADABLE = "revoked.json is unreadable; restore it from a backup or "
             + "reinstall; the updater stays disabled";
     static final String NOT_INITIALISED = "state store not initialised; nothing to reset";
+    static final String REFUSED_OLDER_EPOCH = "reset refused: the running jar's trust file has an older epoch "
+            + "than the persisted state; install the current release first";
+    static final String REFUSED_SAME_EPOCH_CONFLICT = "reset refused: the running jar's trust file conflicts "
+            + "with the persisted key set at the same epoch";
 
     private StateReset() {
     }
@@ -82,6 +87,14 @@ final class StateReset {
         UpdaterState seed = TrustTransition.apply(
                 TrustTransition.classify(null, trust), trust, null).newState();
         if (readable != null) {
+            Transition transition = TrustTransition.classify(
+                    readable.state().persistedTrust(), trust).transition();
+            if (transition == Transition.OLDER_EPOCH_REPORT_ONLY) {
+                return new ResetResult(false, false, List.of(REFUSED_OLDER_EPOCH));
+            }
+            if (transition == Transition.INVALID_SAME_EPOCH) {
+                return new ResetResult(false, false, List.of(REFUSED_SAME_EPOCH_CONFLICT));
+            }
             seed = withCarriedWithdrawn(seed, readable, id, onDiskVersion);
         }
         store.resetState(seed);

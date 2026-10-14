@@ -186,6 +186,50 @@ class StateResetTest {
                 "no readable state, so no withdrawn entries are carried");
     }
 
+    /** The seed state with the given persisted trust, otherwise as a first run writes it. */
+    private static UpdaterState withTrust(int epoch, String keySetFingerprint) throws Exception {
+        UpdaterState seed = PipelineFixtures.seedState();
+        return new UpdaterState(epoch, keySetFingerprint, seed.revocationKey(), seed.revocations(),
+                Map.of(), List.of(), "", List.of(), Map.of());
+    }
+
+    @Test
+    void persistedHigherEpochRefusesResetWithoutWritingOrFetching() throws Exception {
+        Path dir = dir();
+        UpdaterState newer = withTrust(2, PipelineFixtures.seedState().keySetFingerprint());
+        StateStore store = store(dir, new StateDelta(newer, revokedRelease()));
+        byte[] stateBefore = Files.readAllBytes(dir.resolve(StateStore.STATE));
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        fetcher.answerEveryHost(PipelineFixtures.revocations(), PipelineFixtures.manifest());
+
+        ResetResult result = StateReset.resetStateAndRefetch(store, pipeline(store, fetcher),
+                PipelineFixtures.identity(), UpdateVersion.parse("0.3.0"), new MutableCancelToken());
+
+        assertFalse(result.stateReset());
+        assertFalse(result.stagingEnabled());
+        assertEquals(List.of(StateReset.REFUSED_OLDER_EPOCH), result.messages());
+        assertArrayEquals(stateBefore, Files.readAllBytes(dir.resolve(StateStore.STATE)));
+        assertTrue(fetcher.requests.isEmpty(), "no refetch when the reset is refused");
+    }
+
+    @Test
+    void persistedSameEpochConflictRefusesResetWithoutWritingOrFetching() throws Exception {
+        Path dir = dir();
+        UpdaterState conflicting = withTrust(1, "ff".repeat(32));
+        StateStore store = store(dir, new StateDelta(conflicting, revokedRelease()));
+        byte[] stateBefore = Files.readAllBytes(dir.resolve(StateStore.STATE));
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        fetcher.answerEveryHost(PipelineFixtures.revocations(), PipelineFixtures.manifest());
+
+        ResetResult result = StateReset.resetStateAndRefetch(store, pipeline(store, fetcher),
+                PipelineFixtures.identity(), UpdateVersion.parse("0.3.0"), new MutableCancelToken());
+
+        assertFalse(result.stateReset());
+        assertEquals(List.of(StateReset.REFUSED_SAME_EPOCH_CONFLICT), result.messages());
+        assertArrayEquals(stateBefore, Files.readAllBytes(dir.resolve(StateStore.STATE)));
+        assertTrue(fetcher.requests.isEmpty(), "no refetch when the reset is refused");
+    }
+
     private static String[] revokedKeys(int from, int count) throws Exception {
         String[] keys = new String[count];
         for (int i = 0; i < count; i++) {
