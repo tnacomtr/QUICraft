@@ -81,11 +81,14 @@ public final class QuicraftVelocity {
     }
 
     /**
-     * The health verdict completes here, not in {@link #onProxyInitialize}: registered with the lowest
-     * priority, which runs last (checked against Velocity 4.2's event manager; {@code PostOrder.LAST} is
-     * deprecated in 4.2 and only the second-to-last order), this handler runs after every other
-     * ProxyInitializeEvent handler, so a true verdict means the proxy finished its initialize handling
-     * and QUICraft's own init did not fail.
+     * The health verdict completes here, late and provisionally. Registered with the lowest priority
+     * ({@code Short.MIN_VALUE}), so this handler runs after the other {@code ProxyInitializeEvent}
+     * handlers that use a higher priority. That is all it establishes: another subscriber may share the
+     * lowest priority and run after this one (Velocity 4.2; {@code PostOrder.LAST} is deprecated there and
+     * is only the second-to-last order), so a true verdict does not prove that every handler completed.
+     * It also says nothing about the TCP bind or about Velocity's query listener. It means only that
+     * QUICraft's own init did not fail, as judged at the moment this handler ran, and stays provisional
+     * while blocker 9 (docs/updater.md 10) is unresolved.
      */
     @Subscribe(priority = Short.MIN_VALUE)
     public void onProxyInitializeLate(ProxyInitializeEvent event) {
