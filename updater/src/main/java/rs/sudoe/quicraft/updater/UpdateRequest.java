@@ -4,13 +4,20 @@ package rs.sudoe.quicraft.updater;
 import java.util.Objects;
 
 /**
- * One update command: the running identity this process was started with and the install
- * capability the platform adapter allows.
+ * One update command: the running identity this process was started with, the install capability the
+ * platform adapter allows, and the sink for lines logged while the transaction runs.
  */
-public record UpdateRequest(RuntimeIdentity identity, InstallCapability capability) {
+public record UpdateRequest(RuntimeIdentity identity, InstallCapability capability,
+        TransactionProgress progress) {
 
     public UpdateRequest {
         Objects.requireNonNull(identity, "identity");
         Objects.requireNonNull(capability, "capability");
+        Objects.requireNonNull(progress, "progress");
+    }
+
+    /** A request whose progress lines are dropped. */
+    public UpdateRequest(RuntimeIdentity identity, InstallCapability capability) {
+        this(identity, capability, TransactionProgress.NONE);
     }
 }

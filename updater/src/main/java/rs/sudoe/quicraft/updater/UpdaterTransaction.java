@@ -430,8 +430,11 @@ final class UpdaterTransaction {
         a.journalWritten = true;
         a.dir.writeJournal(journal);
         a.journal = journal;
-        a.messages.add("if the update fails after the swap, stop the server, copy " + backup + " over "
-                + a.live.realPath() + ", start the server");
+        // Logged before anything else of step 6 so a crash after the move still leaves the command on screen.
+        String rollback = "if the update fails after the swap, stop the server, copy " + backup + " over "
+                + a.live.realPath() + ", start the server";
+        emit(a, rollback);
+        a.messages.add(rollback);
         if (a.token.isCancelled()) {
             return abort(a, TransactionOutcome.CANCELLED, CANCELLED_BEFORE_SWAP);
         }
@@ -674,6 +677,15 @@ final class UpdaterTransaction {
 
     private static String messageOf(Exception e) {
         return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+    }
+
+    /** Sends one progress line. A sink that throws is ignored: it must never change the outcome. */
+    private static void emit(Attempt a, String line) {
+        try {
+            a.request.progress().line(line);
+        } catch (RuntimeException ignored) {
+            // The operator's log sink is not part of the transaction.
+        }
     }
 
     /** Per-command state carried through the steps. */

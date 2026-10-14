@@ -863,6 +863,49 @@ class UpdaterTransactionTest {
         assertTrue(r.metadata.requests.isEmpty());
     }
 
+    // ---- the pre-swap rollback line through the progress sink ------------------------------
+
+    private static final String ROLLBACK_PREFIX = "if the update fails after the swap, stop the server, copy ";
+    private static final String ROLLBACK_SUFFIX = ", start the server";
+
+    private static UpdateRequest atomic(Rig r, TransactionProgress progress) {
+        return new UpdateRequest(r.identity, InstallCapability.ATOMIC_REPLACEMENT, progress);
+    }
+
+    @Test
+    void rollbackLineIsEmittedBeforeTheFlipAndBeforeStepSix() throws Exception {
+        Rig r = standardRig();
+        List<String> lines = new ArrayList<>();
+        int[] atStepSixStart = {-1};
+        int[] atFlip = {-1};
+        UpdaterTransaction txn = txn(r);
+        txn.hooks.afterBackupReady = () -> {
+            atStepSixStart[0] = lines.size();
+        };
+        txn.hooks.beforeSwapFlip = () -> atFlip[0] = lines.size();
+        TransactionResult result = txn.execute(atomic(r, lines::add));
+        assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
+        assertEquals(1, atStepSixStart[0], "the rollback line is already emitted when step 6 begins");
+        assertEquals(1, atFlip[0], "the rollback line is already emitted when the flip happens");
+        assertEquals(1, lines.size(), lines.toString());
+        String line = lines.get(0);
+        assertTrue(line.startsWith(ROLLBACK_PREFIX) && line.endsWith(ROLLBACK_SUFFIX), line);
+        assertTrue(line.contains(" over " + r.live.toRealPath() + ","), line);
+        assertTrue(result.messages().contains(line), "the same line stays in the result: " + result.messages());
+    }
+
+    @Test
+    void throwingProgressSinkDoesNotBreakTheTransaction() throws Exception {
+        Rig r = standardRig();
+        TransactionResult result = txn(r).execute(atomic(r, line -> {
+            throw new IllegalStateException("the log sink is broken");
+        }));
+        assertEquals(TransactionOutcome.INSTALLED_RESTART_PENDING, result.outcome(), result.messages().toString());
+        assertArrayEquals(r.jar, Files.readAllBytes(r.live));
+        assertTrue(result.messages().stream().anyMatch(m -> m.startsWith(ROLLBACK_PREFIX)),
+                result.messages().toString());
+    }
+
     /** Merges one revoked key into the persisted revocations, as a concurrent command would. */
     private static void mergeRevocation(Rig r, String kid, String pub) {
         try {
