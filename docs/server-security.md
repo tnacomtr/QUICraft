@@ -54,9 +54,9 @@ start, for example `-Dquicraft.admission.maxOpenPerIp=64`. They are wired into b
 | `quicraft.admission.globalAttemptsPerSecond` | 200 | New connection attempts per second, all IPs. |
 | `quicraft.admission.perIpAttemptsPerSecond` | 20 | New connection attempts per second, per IP (see the attempt budget below). |
 | `quicraft.admission.retryThresholdPerSecond` | 50 | All-IP attempt rate at which `adaptive` starts Retry. |
-| `quicraft.admission.maxOpen` | 2048 | Open QUIC connections (pending plus established), all IPs. |
+| `quicraft.admission.maxOpen` | 65536 | Open QUIC connections (pending plus established), all IPs. |
 | `quicraft.admission.maxOpenPerIp` | 32 | Open QUIC connections (pending plus established), per IP. |
-| `quicraft.admission.maxTrackedIps` | 8192 | IPs tracked at once for the per-IP counters. |
+| `quicraft.admission.maxTrackedIps` | 131072 | IPs tracked at once for the per-IP counters. |
 | `quicraft.admission.ingressInitialsPerSecond` | 4000 | Initial datagrams per second, all IPs (packet guard). |
 | `quicraft.admission.ingressInitialsPerIpPerSecond` | 200 | Initial datagrams per second, per IP (packet guard). |
 
@@ -75,6 +75,10 @@ start, for example `-Dquicraft.admission.maxOpenPerIp=64`. They are wired into b
   (a backlog, for example of spoofed half-open handshakes). A token-bearing attempt over its
   validated limit, or one that arrives while the open-connection limits are full, is dropped without
   a Retry. A token-bearing attempt is not refused by a backlog, because its address is already proven.
+- **Scale note.** The defaults are sized for the 50,000-concurrent-player-per-node target (CLAUDE.md
+  Architecture, measured in `docs/benchmarks.md`): the Retry backlog trigger is 25% of `maxOpen`,
+  i.e. 16,384 unconfirmed handshakes at the default `maxOpen=65536`, and a full 65,536 open
+  connections costs about 2.4 GiB of server memory by the `docs/benchmarks.md` measurement.
 - **Ingress guard.** `ingressInitialsPerSecond` and `ingressInitialsPerIpPerSecond` drop excess QUIC
   Initial datagrams before any QUIC processing. This is a cheap packet-level guard; other packets
   (established connections) are never counted.
