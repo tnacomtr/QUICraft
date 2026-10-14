@@ -173,6 +173,36 @@ final class UpdaterFacadeFixtures {
         return Executors::newSingleThreadScheduledExecutor;
     }
 
+    /**
+     * A scheduled executor that holds command tasks until {@link #runQueued} runs them, so a test decides the
+     * instant the worker starts. The pool underneath still serves the periodic tick and the shutdown.
+     */
+    static final class QueuedExecutor extends java.util.concurrent.ScheduledThreadPoolExecutor {
+        private final List<Runnable> queued = new CopyOnWriteArrayList<>();
+
+        QueuedExecutor() {
+            super(1);
+        }
+
+        @Override
+        public void execute(Runnable command) {
+            queued.add(command);
+        }
+
+        int queuedCount() {
+            return queued.size();
+        }
+
+        /** Runs every held command on the caller thread, in the order they were queued. */
+        void runQueued() {
+            List<Runnable> pending = List.copyOf(queued);
+            queued.clear();
+            for (Runnable command : pending) {
+                command.run();
+            }
+        }
+    }
+
     /** Seams with the scripted metadata fetcher, the test clock and the given origins. */
     static Seams seams(SourceFetcher fetcher, Function<ThreadFactory, ScheduledExecutorService> executors,
             Optional<ReleaseHosts> hosts) {

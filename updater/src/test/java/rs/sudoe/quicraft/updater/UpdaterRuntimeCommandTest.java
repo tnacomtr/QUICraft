@@ -129,6 +129,8 @@ class UpdaterRuntimeCommandTest {
         String notice = "a new QUICraft version is available: " + UpdaterFacadeFixtures.NEWER;
         assertTrue(first.contains(notice), () -> "output was " + first.snapshot());
         assertEquals(1, p.notices.size());
+        assertEquals(1, p.log.lines.stream().filter(l -> l.contains(notice)).count(),
+                () -> "the console records the announcement once, log was " + p.log.lines);
 
         Output second = new Output();
         assertEquals(Reply.STARTED, dispatch(second, true, "check", "-s"));
@@ -277,7 +279,7 @@ class UpdaterRuntimeCommandTest {
     }
 
     @Test
-    void aSilentAnnouncementFromAPlayerIsLoggedAtInfoAndAnswersOut() throws Exception {
+    void aSilentAnnouncementFromAPlayerIsLoggedAndAnsweredExactlyOnce() throws Exception {
         byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
         ScriptedFetcher metadata = new ScriptedFetcher();
         TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
@@ -289,8 +291,10 @@ class UpdaterRuntimeCommandTest {
         assertEquals(Reply.STARTED, dispatch(out, false, "check", "-s"));
         awaitIdle();
 
-        assertTrue(out.contains(notice), () -> "output was " + out.snapshot());
-        assertTrue(p.log.lines.contains("INFO: " + notice), () -> "log was " + p.log.lines);
+        assertEquals(List.of(notice), out.snapshot(), () -> "output was " + out.snapshot());
+        List<String> announcement = p.log.lines.stream().filter(l -> l.contains(notice)).toList();
+        assertEquals(List.of("INFO: " + notice), announcement,
+                () -> "the announcement is logged once at INFO, log was " + p.log.lines);
     }
 
     @Test
@@ -345,6 +349,33 @@ class UpdaterRuntimeCommandTest {
         MutableCancelToken token = (MutableCancelToken) field.get(runtime);
         assertNotNull(token, "a running reset holds a token");
         return token;
+    }
+
+    @Test
+    void aResetThatPublishesItsTokenAfterShutdownStartsTouchesNoState() throws Exception {
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        AtomicInteger fetches = new AtomicInteger();
+        fetcher.onFetch = uri -> fetches.incrementAndGet();
+        UpdaterFacadeFixtures.QueuedExecutor executor = new UpdaterFacadeFixtures.QueuedExecutor();
+        p.existedBeforeStart = false;
+        rt = UpdaterRuntime.start(p, new UpdaterRuntime.Seams(fetcher, PipelineFixtures.CLOCK,
+                DurabilityOps.system(), factory -> executor, log -> UpdaterFacadeFixtures.testHosts(),
+                PipelineFixtures.ENDPOINTS));
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true, "reset-state"));
+        assertEquals(1, executor.queuedCount(), "the reset waits for the test");
+
+        // shutdown runs to its end while the reset has published no token, so there is none to cancel.
+        rt.shutdown();
+        executor.runQueued();
+
+        assertEquals(0, fetches.get(), "a reset that sees the stopping flag never refetches");
+        assertFalse(out.contains("state.json rebuilt"), () -> "output was " + out.snapshot());
+        assertTrue(out.contains(UpdaterRuntime.STOPPING_TEXT), () -> "output was " + out.snapshot());
+
+        TransactionLock.TxnLease lease = TransactionLock.tryAcquire(p.updateDir);
+        lease.close();
     }
 
     @Test
