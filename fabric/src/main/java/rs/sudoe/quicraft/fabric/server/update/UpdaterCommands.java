@@ -7,8 +7,9 @@ import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 
 /**
- * {@code /quicraft update [check [-s] | cancel | reset-state]} (docs/updater.md section 3). OP level 3 for the
- * whole command; {@code reset-state} is console only. The words are passed to the facade as they are typed.
+ * {@code /quicraft update [check [-s] | cancel | reset-state]} (docs/updater.md section 3). The console,
+ * RCON, and any player on the server's OP list at any op level, for the whole command; {@code reset-state}
+ * is console only. The words are passed to the facade as they are typed.
  */
 public final class UpdaterCommands {
     private UpdaterCommands() {
