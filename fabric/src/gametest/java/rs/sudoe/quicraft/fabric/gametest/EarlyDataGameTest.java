@@ -29,6 +29,9 @@ public class EarlyDataGameTest implements FabricClientGameTest {
         Hooks.setFaultInjection(false);
         Faults.set();
         QuicClient.forgetSessions();
+        // The server's preamble can take more than the spec's 5 ms on a busy CI runner; the
+        // rejected-0-RTT path itself is covered by core's EarlyDataTest.
+        QuicClient.setGraceFloorForTests(100);
         QuicraftClient.get().setMode(Mode.AUTO);
         try (TestDedicatedServerContext server = GameTests.server(context)) {
             join(context, server, true, false, "first join: records the first flight");
@@ -72,6 +75,7 @@ public class EarlyDataGameTest implements FabricClientGameTest {
             Faults.set();
         } finally {
             Faults.set();
+            QuicClient.setGraceFloorForTests(0);
         }
     }
 

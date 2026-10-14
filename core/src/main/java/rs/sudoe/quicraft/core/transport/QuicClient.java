@@ -44,6 +44,8 @@ public final class QuicClient {
     /** Bounds of the grace period for a late server preamble after 0-RTT (docs/protocol.md §8). */
     private static final long MIN_GRACE_NANOS = TimeUnit.MILLISECONDS.toNanos(5);
     private static final long MAX_GRACE_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+    /** Tests only: a higher floor for the grace period; 0 keeps the specified one. */
+    private static volatile long testGraceFloorNanos;
     private static volatile EventLoopGroup group;
 
     private QuicClient() {}
@@ -268,6 +270,17 @@ public final class QuicClient {
     private static volatile String lastEarly = "no attempt";
 
     /**
+     * Tests only: raises the floor of the grace period a client waits for the server's preamble
+     * after 0-RTT (docs/protocol.md §8, "Rejected 0-RTT"; 5 ms by spec) to {@code millis}, or
+     * restores the specified floor with 0. On loopback the handshake is so short that the spec's
+     * floor applies, and a busy test machine can miss it, so the client rightly abandons 0-RTT
+     * data a test expected to see used.
+     */
+    public static void setGraceFloorForTests(long millis) {
+        testGraceFloorNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0, millis));
+    }
+
+    /**
      * What the latest QUIC attempt did about 0-RTT: {@code sent}, or why it sent nothing (no
      * early-data event from TLS, no recorded flight, no early token, ...). For tests and
      * diagnostics; attempts running at once overwrite each other's answer.
@@ -396,7 +409,8 @@ public final class QuicClient {
                 deliver(stream);
                 return;
             }
-            long grace = Math.max(MIN_GRACE_NANOS, Math.min(MAX_GRACE_NANOS, handshakeNanos / 4));
+            long grace = Math.max(Math.max(MIN_GRACE_NANOS, testGraceFloorNanos),
+                    Math.min(MAX_GRACE_NANOS, handshakeNanos / 4));
             connection.eventLoop().schedule(() -> {
                 if (stream.preambleRead() || !connection.isOpen() || result.isDone()) {
                     deliver(stream);
@@ -421,6 +435,7 @@ public final class QuicClient {
             try {
                 abandoned = connection;
                 retrying = true;
+                lastEarly = "sent, then abandoned: no server preamble within the grace period";
                 earlyStream = null;
                 dial.tls.set(freshTls(dial.fingerprint, dial.config));
                 Codecs.closeLater(connection, true, Protocol.CLOSE_EARLY_ABANDONED);
