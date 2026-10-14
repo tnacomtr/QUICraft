@@ -279,10 +279,11 @@ public final class UpdateDirectory {
      * {@code staging/} and {@code backup/} (docs/updater.md 12.8). Read-only; the caller decides
      * whether the updater disables itself.
      *
-     * <p>An entry that is already gone when its owner is checked is skipped: {@link
+     * <p>A top-level file that is already gone when its owner is checked is skipped: {@link
      * StateStore#prepareDirectory} creates and removes a {@code .owner-*.probe} file in the same
      * directory, so another thread of this process can remove a listed entry. Every other failure,
-     * including a present entry with a foreign owner, still rejects.
+     * including a present entry with a foreign owner, a missing {@code staging/} or {@code backup/},
+     * or a file that vanishes inside them, still rejects.
      *
      * @throws UpdateRejectedException on the first link or foreign owner found
      */
@@ -306,7 +307,12 @@ public final class UpdateDirectory {
                     try {
                         StateStore.requireOwner(p, owner);
                     } catch (NoSuchFileException gone) {
-                        // Removed after the listing, for example a concurrent prepareDirectory probe.
+                        // Only top-level files vanish legitimately (a concurrent prepareDirectory probe, a
+                        // state-store temp file). A missing staging/ or backup/, or a file inside them,
+                        // still fails closed.
+                        if (base != dir || p.equals(staging) || p.equals(backup)) {
+                            throw gone;
+                        }
                     }
                 }
             }

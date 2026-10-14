@@ -351,6 +351,19 @@ class UpdateDirectoryTest {
     }
 
     @Test
+    void requireOwnedContentsStillFailsWhenAFileInsideStagingVanishes() throws Exception {
+        // Only top-level files vanish legitimately; staging/ and backup/ change under the transaction
+        // lease the scan's callers hold, so a file gone from them fails closed.
+        UpdateDirectory d = open(DurabilityOps.system());
+        Files.write(tmp.resolve("upd/staging/readme.txt"), new byte[] {2});
+        assertThrows(NoSuchFileException.class, () -> d.requireOwnedContents(p -> {
+            if ("readme.txt".equals(p.getFileName().toString())) {
+                deleteUnchecked(p);
+            }
+        }));
+    }
+
+    @Test
     void missingLiveJarIsAnIoError() throws Exception {
         UpdateDirectory d = open(DurabilityOps.system());
         assertThrows(NoSuchFileException.class, () -> d.copyBackup(TXID, tmp.resolve("absent.jar")));
