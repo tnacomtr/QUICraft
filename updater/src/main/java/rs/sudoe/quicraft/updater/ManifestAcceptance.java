@@ -15,11 +15,19 @@ public record ManifestAcceptance(
         StateDelta delta,
         Optional<AcceptedCandidate> candidate,
         boolean stateFull,
-        List<String> diagnostics) {
+        List<String> diagnostics,
+        List<BadManifest> badManifests) {
 
     public ManifestAcceptance {
         Objects.requireNonNull(delta, "delta");
         Objects.requireNonNull(candidate, "candidate");
         diagnostics = List.copyOf(diagnostics);
+        badManifests = List.copyOf(badManifests);
+    }
+
+    /** The shape before bad-manifest events were added: no events. */
+    public ManifestAcceptance(StateDelta delta, Optional<AcceptedCandidate> candidate, boolean stateFull,
+            List<String> diagnostics) {
+        this(delta, candidate, stateFull, diagnostics, List.of());
     }
 }

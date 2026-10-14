@@ -19,11 +19,19 @@ public record CheckResult(
         Optional<AcceptedCandidate> candidate,
         boolean stateFull,
         boolean freshRevocations,
-        List<String> diagnostics) {
+        List<String> diagnostics,
+        List<BadManifest> badManifests) {
 
     public CheckResult {
         Objects.requireNonNull(mode, "mode");
         Objects.requireNonNull(candidate, "candidate");
         diagnostics = List.copyOf(diagnostics);
+        badManifests = List.copyOf(badManifests);
+    }
+
+    /** The shape before bad-manifest events were added: no events. */
+    public CheckResult(CheckMode mode, Optional<AcceptedCandidate> candidate, boolean stateFull,
+            boolean freshRevocations, List<String> diagnostics) {
+        this(mode, candidate, stateFull, freshRevocations, diagnostics, List.of());
     }
 }
