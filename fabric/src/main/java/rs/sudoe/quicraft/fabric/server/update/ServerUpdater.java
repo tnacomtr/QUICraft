@@ -123,8 +123,24 @@ public final class ServerUpdater {
         });
     }
 
-    /** The server console, as opposed to RCON, a command block or a player. */
+    /**
+     * True only for real server-console input on this thread. A source that is the server is not proof:
+     * datapack functions run with the server as their source too, so the mark the dedicated server's
+     * console-input drain sets is required as well (docs/updater.md section 3, 12.8). Anything that cannot
+     * answer counts as "not the console", and {@code reset-state} is then refused.
+     */
     static boolean isConsole(CommandSourceStack source) {
+        try {
+            Hooks.enter("updater console check");
+            return ConsoleInputFlag.isSet() && serverSource(source);
+        } catch (Throwable t) {
+            Hooks.failed("updater console check", t);
+            return false;
+        }
+    }
+
+    /** @return true when this command source is the server itself, which the console, RCON and functions share */
+    private static boolean serverSource(CommandSourceStack source) {
         return ((CommandSourceStackAccessor) (Object) source).quicraft$source() instanceof MinecraftServer;
     }
 

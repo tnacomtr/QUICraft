@@ -9,6 +9,7 @@
     "ServerCommonPacketListenerImplMixin",
     "ServerConnectionListenerMixin",
     "UpdaterCommandsMixin",
+    "UpdaterConsoleInputMixin",
     "UpdaterDedicatedServerMixin",
     "UpdaterPlayerListMixin",
     "CommandSourceStackAccessor"
