@@ -389,18 +389,31 @@ class QuicLoopbackTest {
                 @Override
                 public void onClosed(Throwable cause) {}
             });
+            // Keep writing whenever the stream is writable, until nothing more is accepted for a
+            // while. A single moment of unwritability proves nothing: quiche accepts more as its
+            // congestion window grows, so the in-flight bytes drain again (and the stream is
+            // writable again) until the peer's flow-control window is full. Only the plateau
+            // shows whether a stalled peer stops the writer.
             byte[] chunk = new byte[16384];
             long written = 0;
-            while (stream.isWritable() && written < (64L << 20)) {
-                stream.write(ByteBuffer.wrap(chunk));
-                stream.flush();
-                written += chunk.length;
-            }
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (stream.isWritable() && System.nanoTime() < deadline) {
-                Thread.sleep(10);
+            long limit = 64L << 20;
+            long lastProgress = System.nanoTime();
+            long deadline = lastProgress + TimeUnit.SECONDS.toNanos(30);
+            while (written < limit && System.nanoTime() < deadline
+                    && System.nanoTime() - lastProgress < TimeUnit.MILLISECONDS.toNanos(1000)) {
+                if (stream.isWritable()) {
+                    stream.write(ByteBuffer.wrap(chunk));
+                    stream.flush();
+                    written += chunk.length;
+                    lastProgress = System.nanoTime();
+                } else {
+                    Thread.sleep(5);
+                }
             }
             assertFalse(stream.isWritable(), "a stalled peer must make the stream unwritable");
+            // The peer's stream window (8 MiB) plus what the writer may hold back in flight.
+            long bound = TransportConfig.DEFAULT.initialMaxStreamData + 2 * NettyQuicByteStream.HIGH_WATER;
+            assertTrue(written <= bound, "a stalled peer must stop the writer near its window, wrote " + written);
             assertTrue(((PreambleStream) stream).raw.inFlightForTest() <= 2 * NettyQuicByteStream.HIGH_WATER + chunk.length,
                     "in flight must stay bounded, was " + ((PreambleStream) stream).raw.inFlightForTest());
 
