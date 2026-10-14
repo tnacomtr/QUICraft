@@ -11,7 +11,7 @@
 #
 # Env: COUNT, RAMP_RATE, HOLD_SEC, LOAD_BIND, SOURCE_BASE, IDLE_MIN, MAX_RSS_MB, MAX_FAIL_PCT,
 # SESSION_RESUMPTION (1 to allow), SHIPPED_LIMITS (1 measures the shipped admission defaults
-# instead of the raised ones), LAUNCHER (installed testkit launcher), NO_SCOPE (1 skips
+# instead of the raised ones), SOCKETS (SO_REUSEPORT socket count, default 1), LAUNCHER (installed testkit launcher), NO_SCOPE (1 skips
 # systemd-run even when present), MEM_MAX (per-JVM systemd MemoryMax, default 16G), JVM_OPTS.
 # Each JVM runs under systemd-run --user --scope with MemoryMax when systemd-run exists; otherwise
 # plain java.
@@ -135,6 +135,7 @@ sample() {
 
 server_args=(load-server --bind "$LOAD_BIND" --status-interval 5 --idle-minutes "$IDLE_MIN")
 [[ "${SHIPPED_LIMITS:-0}" == "1" ]] && server_args+=(--shipped-limits)
+[[ -n "${SOCKETS:-}" ]] && server_args+=(--sockets "$SOCKETS")
 launch "$results/server.log" "${server_args[@]}"
 server_pid="$LAST_PID"
 server_jvm_pid="$(jvm_pid "$results/server.log")"
@@ -152,6 +153,11 @@ grep -q '^FINGERPRINT ' "$results/server.log" && grep -q '^BOUND ' "$results/ser
 fingerprint="$(awk '/^FINGERPRINT / {print $2}' "$results/server.log")"
 remote="$(awk '/^BOUND / {print $2 ":" $3}' "$results/server.log")"
 echo "server bound at $remote, $fingerprint"
+if command -v ss >/dev/null 2>&1; then
+    # The sockets actually bound: core falls back to one where SO_REUSEPORT is unavailable.
+    bound_sockets="$(ss -Huan "sport = :${remote##*:}" | wc -l)"
+    echo "UDP sockets bound on port ${remote##*:}: $bound_sockets" | tee "$results/sockets.txt"
+fi
 
 client_args=(load-client --remote "$remote" --fingerprint "$fingerprint" --count "$COUNT"
     --rate "$RAMP_RATE" --source-base "$SOURCE_BASE" --hold-sec "$HOLD_SEC" --idle-minutes "$IDLE_MIN"

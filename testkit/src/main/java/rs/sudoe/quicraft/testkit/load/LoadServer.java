@@ -17,7 +17,8 @@ import rs.sudoe.quicraft.testkit.Args;
 /**
  * Load spike listener: the real {@link QuicServer} with admission limits raised for many clients
  * from one box. {@code --shipped-limits} skips the raise, so the spike measures the shipped
- * defaults instead. Transport only; each accepted stream is held open until the client closes it.
+ * defaults instead. {@code --sockets N} binds N SO_REUSEPORT sockets, one loop each, as the
+ * platforms do with {@code udp-sockets} (core falls back to one outside Linux). Transport only; each accepted stream is held open until the client closes it.
  * Runs until SIGTERM or SIGINT, then closes the listener.
  */
 public final class LoadServer {
@@ -27,6 +28,7 @@ public final class LoadServer {
         InetSocketAddress bind = hostPort(args.string("bind", "127.0.0.1:65530"));
         int statusSec = args.integer("status-interval", 5);
         int idleMin = args.integer("idle-minutes", 10);
+        int sockets = args.integer("sockets", 1);
 
         ServerIdentity identity = ServerIdentity.generate();
         TransportConfig.Builder builder = TransportConfig.builder()
@@ -45,7 +47,7 @@ public final class LoadServer {
 
         AtomicLong accepted = new AtomicLong();
         Set<QuicByteStream> open = ConcurrentHashMap.newKeySet();
-        QuicServer server = QuicServer.bind(bind, identity, config, stream -> {
+        QuicServer server = QuicServer.bind(bind, sockets, identity, config, stream -> {
             accepted.incrementAndGet();
             open.add(stream);
             stream.setListener(new QuicByteStream.Listener() {
@@ -69,6 +71,7 @@ public final class LoadServer {
         System.out.println("PID " + ProcessHandle.current().pid());
         System.out.println("BOUND " + local.getAddress().getHostAddress() + " " + local.getPort());
         System.out.println("FINGERPRINT " + identity.fingerprint());
+        System.out.println("SOCKETS requested=" + sockets);
 
         Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "load-server-status");

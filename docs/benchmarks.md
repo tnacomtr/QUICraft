@@ -780,6 +780,33 @@ payload size (`maxRecv`/`maxSendUdpPayloadSize=1350`), flow-control windows (`in
 `initialMaxStreamData` at 256 KiB), TLS session resumption (shared context), and Netty allocator
 settings (`io.netty.noPreferDirect=true`, `allocator.type=unpooled`).
 
+### Handshake burst and UDP sockets (2026-10-14)
+
+The held-connection test above ramps at ~500/s, which one event loop handles. A faster burst shows
+the single-loop limit, and the multi-socket listener (`udp-sockets`, SO_REUSEPORT, `docs/protocol.md`
+section 11) removes it. Same machine and harness as above, on `feat/phase4-alpha` after the reuseport
+merge: `COUNT=10000 RAMP_RATE=2000 HOLD_SEC=20 SOCKETS=<n> [SHIPPED_LIMITS=1] bash
+testkit/run-load-spike.sh`, one run each. `SOCKETS` sets the listener's socket count; the script
+records the sockets actually bound (`ss`). Receive-buffer drops are the change in the host's UDP
+`RcvbufErrors` (`/proc/net/snmp`) across the run.
+
+| Sockets | Admission limits | Connected / 10,000 | Failed | UDP receive-buffer drops | Attempts resolved in |
+| --- | --- | --- | --- | --- | --- |
+| 1 | raised | 9,091 (run aborted) | 686 at abort | 12,031 | aborted by the 5% failure guard |
+| 4 | raised | 10,000 | 0 | 0 | 5 s |
+| 8 | raised | 10,000 | 0 | 0 | 5 s |
+| 1 | shipped defaults | 9,537 | 463 | 8,658 | 10 s |
+| 4 | shipped defaults | 10,000 | 0 | 0 | 6 s |
+
+Run directories (gitignored): `testkit/results/load-spike-20261014-192918`, `-192941`, `-193018`,
+`-193050`, `-193132`. Server RSS at 10,000 connections stayed between 581 and 640 MiB.
+
+Finding: at a 2,000/s handshake burst, one socket's event loop falls behind, the kernel drops
+datagrams at its receive buffer, and handshakes time out (5 to 7% failed). With 4 or more sockets
+every handshake completed and nothing was dropped, with the shipped admission defaults as well as
+the raised ones: the shipped defaults are not what limits a burst of this size. One run per row,
+loopback only, transport only; 8 sockets showed no gain over 4 at this rate.
+
 ### Next
 
 - Root-cause the client-native per-connection cost in a follow-up unit. If it can be cut, one
