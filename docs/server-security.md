@@ -17,6 +17,13 @@ and security review. Do not rely on any limit here until the Phase 4 gates in
     `config/quicraft/server.properties`; `0` means game port + 1.
   - If the bind fails, the server logs a warning and runs TCP-only. Startup is never failed over it
     (`docs/protocol.md` section 2).
+- **SO_REUSEPORT shares the QUIC port with the same user.** On Linux the listener binds several UDP
+  sockets to the QUIC port with SO_REUSEPORT (`docs/protocol.md` section 11), because one event loop
+  thread per listener does not reach the scale target in `CLAUDE.md`. Any other process **of the
+  same user** can bind the same address and port with SO_REUSEPORT and receive a share of the
+  players' UDP packets. A process of a different user cannot. Run the server under its own user
+  account and do not share that account with anything untrusted. On other platforms the listener
+  binds one socket (`QuicServer.defaultSocketCount` is 1 there), so this does not apply.
 - The server never intercepts query traffic.
 
 ## 2. Firewall rules

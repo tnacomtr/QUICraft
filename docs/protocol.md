@@ -445,9 +445,45 @@ match TCP's exactly.
 
 Datagrams are copied between the two Netty copies (one copy each way); nothing is shared.
 Datagrams that arrive before core starts the socket are dropped (QUIC retransmits). Closing the
-QUIC connection (client) or the listener (server) closes the socket. The proxy runs all QUIC
-connections on one loop (one UDP socket); spreading them over several loops needs
-connection-ID routing between sockets (Phase 9).
+QUIC connection (client) or the listener (server) closes the socket.
+
+### Several UDP sockets per listener (SO_REUSEPORT)
+
+One event loop thread per listener is the known bottleneck at the scale target in `CLAUDE.md`
+(50,000+ concurrent players per node), so a listener can run on several UDP sockets bound to the
+same address with SO_REUSEPORT, each on its own event loop thread.
+
+- `QuicServer.bind(address, socketCount, identity, config, acceptor)`: core creates `socketCount`
+  NIO datagram channels on a group of `socketCount` threads, one channel per loop, each with
+  SO_REUSEPORT. The first socket binds the requested address; when the request had port 0, the
+  others bind the port the kernel gave the first one. SO_REUSEPORT is looked up reflectively
+  (`StandardSocketOptions.SO_REUSEPORT` exists only on JDK 9+ while core is Java 8 bytecode) and
+  set through `NioChannelOption`. Where the JDK or the platform does not support it, the listener
+  binds one socket, so a bind never depends on it.
+- `QuicServer.bind(List<HostLoop>, List<HostDatagramSocket>, ...)` for the hosted transport above:
+  the platform binds each of its own sockets with SO_REUSEPORT and hands one loop per socket.
+- `QuicServer.defaultSocketCount()`: `min(availableProcessors(), 16)` on Linux. Everywhere else it
+  is 1: macOS and the BSDs hash unicast UDP on the local address alone, so several sockets would
+  starve, and Windows has no SO_REUSEPORT. The system property `quicraft.udpSockets` (1..64; an
+  invalid value logs one warning and keeps the default) overrides it.
+- `close()` closes every socket and, for core's own transport, the thread group. A bind that fails
+  on a later socket closes the sockets already bound and the group, then rethrows.
+
+Routing between the sockets is Netty's `QuicCodecDispatcher`, one shared instance in every
+socket's pipeline. Its connection id generator encodes the socket's index in the first two bytes
+of every connection id that socket's codec issues: the initial source id, a Retry source id, and
+every extra source id issued later. A packet that the kernel's 4-tuple hash put on the wrong
+socket (NAT rebinding, migration, an idle socket) still reaches the codec that owns the
+connection: the dispatcher reads the destination connection id of a short-header packet, decodes
+the index and forwards the datagram to that socket's codec, on that socket's loop. Long headers,
+an Initial for example, always go to the socket that received them, and that socket then chooses
+the connection id the client uses.
+
+Only the sockets and their loops are multiplied. Admission (attempt budgets, open-connection
+leases, Retry), the Retry HMAC key and its token handler, the ingress datagram budget, the 0-RTT
+early tokens, the TLS context, the stream acceptor and `closeUnconfirmedEarly` stay one set per
+listener, so every limit in section 9 is node-wide, not per socket. A count of 1 is exactly the
+single-socket listener: no dispatcher is installed and the connection id length is unchanged.
 
 ### QUICraft's Netty QUIC build
 
