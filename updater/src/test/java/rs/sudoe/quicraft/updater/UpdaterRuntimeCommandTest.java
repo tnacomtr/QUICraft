@@ -129,6 +129,8 @@ class UpdaterRuntimeCommandTest {
         String notice = "a new QUICraft version is available: " + UpdaterFacadeFixtures.NEWER;
         assertTrue(first.contains(notice), () -> "output was " + first.snapshot());
         assertEquals(1, p.notices.size());
+        assertEquals(1, p.log.lines.stream().filter(l -> l.contains(notice)).count(),
+                () -> "the console records the announcement once, log was " + p.log.lines);
 
         Output second = new Output();
         assertEquals(Reply.STARTED, dispatch(second, true, "check", "-s"));
@@ -277,7 +279,7 @@ class UpdaterRuntimeCommandTest {
     }
 
     @Test
-    void aSilentAnnouncementFromAPlayerIsLoggedAtInfoAndAnswersOut() throws Exception {
+    void aSilentAnnouncementFromAPlayerIsLoggedAndAnsweredExactlyOnce() throws Exception {
         byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
         ScriptedFetcher metadata = new ScriptedFetcher();
         TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
@@ -289,8 +291,10 @@ class UpdaterRuntimeCommandTest {
         assertEquals(Reply.STARTED, dispatch(out, false, "check", "-s"));
         awaitIdle();
 
-        assertTrue(out.contains(notice), () -> "output was " + out.snapshot());
-        assertTrue(p.log.lines.contains("INFO: " + notice), () -> "log was " + p.log.lines);
+        assertEquals(List.of(notice), out.snapshot(), () -> "output was " + out.snapshot());
+        List<String> announcement = p.log.lines.stream().filter(l -> l.contains(notice)).toList();
+        assertEquals(List.of("INFO: " + notice), announcement,
+                () -> "the announcement is logged once at INFO, log was " + p.log.lines);
     }
 
     @Test

@@ -683,10 +683,22 @@ public final class UpdaterRuntime {
             case INFO -> {
                 infoSafe(text);
                 if (!scheduled) {
-                    emit(out, text);
+                    emitLogged(out, text);
                 }
             }
             default -> warnSafe(log, text);
+        }
+    }
+
+    /**
+     * Sends a row the log already holds to the command sink. A player's {@link PlayerOutput} would log it a
+     * second time, so it is told the row is logged already; every other sink gets it as usual.
+     */
+    private static void emitLogged(Consumer<String> out, String text) {
+        if (out instanceof PlayerOutput player) {
+            player.preLogged(text);
+        } else {
+            emit(out, text);
         }
     }
 
@@ -707,6 +719,18 @@ public final class UpdaterRuntime {
         @Override
         public void accept(String line) {
             infoSafe(OUTPUT_LOG_PREFIX + line);
+            deliver(line);
+        }
+
+        /**
+         * Delivers a line the log already recorded, without logging it a second time. The disclosure
+         * filter is the same as {@link #accept}: the invoker reads it or the one redacted line.
+         */
+        void preLogged(String line) {
+            deliver(line);
+        }
+
+        private void deliver(String line) {
             if (visibleToPlayer(line)) {
                 emit(inner, line);
             } else if (redacted.compareAndSet(false, true)) {
