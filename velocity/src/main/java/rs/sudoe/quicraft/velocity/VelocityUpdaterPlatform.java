@@ -62,12 +62,16 @@ final class VelocityUpdaterPlatform implements UpdaterPlatform {
 
     /**
      * Anything at the path counts as "existed": a directory, a plain file, or a symbolic link (even a
-     * dangling one), checked without following links. Any failure to check counts as "existed" too, so
-     * the updater never treats an unreadable path as a fresh install.
+     * dangling one), checked without following links. Only a check that definitely found nothing counts
+     * as a fresh install. When the state cannot be determined at all, for example an unreadable parent
+     * directory (EACCES), it counts as "existed" too: {@code Files.exists} and {@code Files.isSymbolicLink}
+     * both answer false for an unknown state, which would read as a fresh install, while
+     * {@code Files.notExists} answers false both for a path that is there and for one it cannot judge.
+     * A runtime failure of the check counts as "existed" as well.
      */
     private static boolean existedBeforeStart(Path dir) {
         try {
-            return Files.exists(dir, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(dir);
+            return !Files.notExists(dir, LinkOption.NOFOLLOW_LINKS);
         } catch (RuntimeException e) {
             return true;
         }

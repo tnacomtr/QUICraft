@@ -11,6 +11,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.velocitypowered.api.proxy.Player;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,6 +22,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.LoggerFactory;
@@ -66,6 +69,34 @@ class VelocityUpdaterWiringTest {
         Path data = Files.createDirectories(root.resolve("data"));
         Files.writeString(data.resolve("update"), "a file, not a directory");
         assertTrue(platform(data, root, notifier()).updateDirExistedBeforeStart());
+    }
+
+    @Test
+    void anUnreadableUpdateDirCountsAsExisted(@TempDir Path root) throws Exception {
+        Assumptions.assumeTrue(Files.getFileStore(root).supportsFileAttributeView(PosixFileAttributeView.class),
+                "POSIX file modes are needed to make the existence check fail");
+
+        // A probe: a check that cannot see through mode 000 answers "unknown", not "absent".
+        Path probe = Files.createDirectories(root.resolve("probe"));
+        Files.setPosixFilePermissions(probe, PosixFilePermissions.fromString("---------"));
+        try {
+            Assumptions.assumeFalse(Files.notExists(probe.resolve("missing")),
+                    "running with CAP_DAC_OVERRIDE (root): file modes are ignored");
+        } finally {
+            Files.setPosixFilePermissions(probe, PosixFilePermissions.fromString("rwx------"));
+        }
+
+        Path locked = Files.createDirectories(root.resolve("locked"));
+        Path data = locked.resolve("quicraft");
+        Files.setPosixFilePermissions(locked, PosixFilePermissions.fromString("---------"));
+        try {
+            // Files.exists and Files.isSymbolicLink both answer false here; only notExists tells them apart.
+            assertTrue(platform(data, root, notifier()).updateDirExistedBeforeStart(),
+                    "an unknown state is not a fresh install");
+        } finally {
+            Files.setPosixFilePermissions(locked, PosixFilePermissions.fromString("rwx------"));
+        }
+        assertFalse(Files.exists(data.resolve("update")), "the platform must not create the update directory");
     }
 
     @Test
