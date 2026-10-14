@@ -190,4 +190,54 @@ class UpdaterRuntimeNoticeTest {
         }
         return false;
     }
+
+    @Test
+    void aFailedLastAnnouncedCommitStillLogsTheDeliveredNoticeAndRetries() throws Exception {
+        ScriptedFetcher metadata = UpdaterFacadeFixtures.newerRelease();
+
+        // Refuse only the state write made to record the announcement, identified by its caller on the
+        // stack. The pipeline's own state writes in the same check are let through.
+        AtomicBoolean armed = new AtomicBoolean(false);
+        StateStore.AtomicWriteHook refuseAnnouncementRecord = (step, name) -> {
+            if (armed.get() && step == StateStore.AtomicStep.TMP_WRITE_BEFORE && StateStore.STATE.equals(name)
+                    && callerIsAnnounceIfNew()) {
+                throw new IOException("state write refused");
+            }
+        };
+        UpdaterRuntime.Seams seams = new UpdaterRuntime.Seams(metadata, PipelineFixtures.CLOCK,
+                DurabilityOps.system(), UpdaterFacadeFixtures.realExecutors(),
+                log -> UpdaterFacadeFixtures.testHosts(), PipelineFixtures.ENDPOINTS,
+                dir -> new StateStore(dir, () -> { }, directory -> directory.force(true),
+                        refuseAnnouncementRecord));
+        p.existedBeforeStart = false;
+        UpdaterRuntime rt = UpdaterRuntime.start(p, seams);
+        started.add(rt);
+
+        armed.set(true);
+        String notice = "a new QUICraft version is available: " + UpdaterFacadeFixtures.NEWER;
+        Output out = silentCheck(rt);
+        assertEquals(1, p.notices.size(), "the admins were told before the write was tried");
+        assertEquals(1, logged(notice), () -> "the delivered notice is logged, log was " + p.log.lines);
+        assertTrue(out.contains(notice), () -> "output was " + out.snapshot());
+        String recorded = new StateStore(p.updateDir).load().orElseThrow().state().lastAnnounced();
+        assertFalse(recorded.equals(UpdaterFacadeFixtures.NEWER), "a failed write records nothing");
+
+        armed.set(false);
+        Output retried = silentCheck(rt);
+        assertEquals(2, p.notices.size(), "the next check re-announces the version");
+        assertEquals(2, logged(notice), "the retry logs the notice too");
+        assertTrue(retried.contains(notice), () -> "output was " + retried.snapshot());
+        assertEquals(UpdaterFacadeFixtures.NEWER,
+                new StateStore(p.updateDir).load().orElseThrow().state().lastAnnounced(),
+                "a successful write records the version");
+    }
+
+    private static boolean callerIsAnnounceIfNew() {
+        for (StackTraceElement frame : Thread.currentThread().getStackTrace()) {
+            if ("announceIfNew".equals(frame.getMethodName())) {
+                return true;
+            }
+        }
+        return false;
+    }
 }

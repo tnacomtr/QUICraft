@@ -558,6 +558,9 @@ public final class UpdaterRuntime {
      * Announces a valid newer release once per version. The version is recorded as {@code lastAnnounced}
      * only after the admins were told, so a failed notice is retried by the next check.
      *
+     * <p>The delivered notice is logged before that state write, so a failed write never loses the record
+     * of a notice the admins already received.
+     *
      * <p>Delivery is at-least-once: a crash between {@link UpdaterPlatform#notifyAdmins} and the commit repeats
      * the notice on the next start.
      */
@@ -575,10 +578,12 @@ public final class UpdaterRuntime {
         if (!notifyAdmins(notice)) {
             return;
         }
+        // The notice is delivered, so it is logged before the state write: a failed commit still leaves the
+        // delivered notice in the log, and the version is not recorded, so the next check re-announces it.
+        silentLine(Level.INFO, notice, out, scheduled);
         store.commit(snap -> version.equals(snap.state().lastAnnounced())
                 ? snap
                 : new Snapshot(withLastAnnounced(snap.state(), version), snap.revoked()));
-        silentLine(Level.INFO, notice, out, scheduled);
     }
 
     private static UpdaterState withLastAnnounced(UpdaterState s, String version) {
