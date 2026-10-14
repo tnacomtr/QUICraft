@@ -203,6 +203,61 @@ class SocketForwardBoundTest {
         }
     }
 
+    /**
+     * Sustained forwarding can keep the in-flight count above zero, so completion cannot wait for
+     * it to drain: with the target loop held while more than one batch queues, a completion still
+     * follows every {@code COMPLETE_EVERY_FORWARDS}th read, and the last read closes the rest.
+     */
+    @Test
+    void forwardingThatNeverDrainsStillCompletesTheReadEveryBatch() throws Exception {
+        EventLoopGroup loops = new MultiThreadIoEventLoopGroup(2, NioIoHandler.newFactory());
+        List<ByteBuf> datagrams = new ArrayList<>();
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            Counters counters = new Counters(2);
+            QuicCodecDispatcher dispatcher = new RecorderDispatcher();
+            Channel source = channel(loops, counters.limiter(0), dispatcher);
+            Channel sink = channel(loops, counters.limiter(1), dispatcher);
+            Recorder codec = sink.pipeline().get(Recorder.class);
+
+            CountDownLatch held = new CountDownLatch(1);
+            sink.eventLoop().execute(() -> {
+                held.countDown();
+                awaitQuietly(release, 60);
+            });
+            assertTrue(held.await(5, TimeUnit.SECONDS), "the target loop is held");
+
+            int batch = QuicServer.ForwardLimiter.COMPLETE_EVERY_FORWARDS;
+            int forwards = 2 * batch + 22;
+            for (int i = 0; i < forwards; i++) {
+                ByteBuf content = shortHeaderFor(TARGET);
+                datagrams.add(content);
+                source.pipeline().fireChannelRead(packet(content));
+            }
+            drain(source.eventLoop());
+            assertEquals(forwards, counters.pending.get(TARGET), "every forward is waiting on the target loop");
+
+            release.countDown();
+            drain(sink.eventLoop());
+            assertTrue(codec.await(forwards, 5), "every forwarded datagram reached the target codec");
+            assertEquals(0, counters.pending.get(TARGET), "the in-flight count is released");
+
+            List<String> expected = new ArrayList<>();
+            for (int i = 1; i <= forwards; i++) {
+                expected.add("read");
+                if (i % batch == 0 || i == forwards) {
+                    expected.add("complete");
+                }
+            }
+            assertEquals(3, codec.completed.get(), "two full batches and the drained remainder each complete");
+            assertEquals(expected, codec.events, "a completion follows every batch while the count stays above zero");
+        } finally {
+            release.countDown();
+            shutdown(loops);
+            release(datagrams);
+        }
+    }
+
     @Test
     void aDatagramTheDispatcherMustSeeIsPassedOnUnchanged() throws Exception {
         EventLoopGroup loops = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());

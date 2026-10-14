@@ -551,11 +551,19 @@ public final class QuicServer implements Closeable {
      * therefore fires {@code fireChannelReadComplete()} on the target's context once the in-flight
      * count for that target reaches zero: the last datagram of a burst closes the read that the
      * burst opened, giving one completion per burst rather than one per datagram, and the next
-     * burst's own last task fires its own.
+     * burst's own last task fires its own. Sustained forwarding can keep the count above zero
+     * indefinitely, so every {@link #COMPLETE_EVERY_FORWARDS}th forwarded read fires a completion
+     * as well.
      */
     static final class ForwardLimiter extends ChannelInboundHandlerAdapter {
         /** Datagrams one loop may have handed to another and not seen processed, per target. */
         static final int MAX_PENDING_FORWARDS = 1024;
+        /**
+         * Forwarded reads after which the target's read completion fires even though more are still
+         * in flight, so sustained cross-socket traffic that never lets the count reach zero still
+         * flushes.
+         */
+        static final int COMPLETE_EVERY_FORWARDS = 64;
         /** {@link #targetSocket}: a short header that stops before the whole connection id. */
         private static final int MALFORMED = -2;
 
@@ -571,6 +579,11 @@ public final class QuicServer implements Closeable {
         private final AtomicIntegerArray droppedMalformed;
         /** The limiter of each socket, so a datagram can be handed to that socket's loop. */
         private final AtomicReferenceArray<ChannelHandlerContext> limiterOfSocket;
+        /**
+         * Datagrams handed to this socket since its last forwarded read completion. Touched only by
+         * the forwarding tasks, which all run on this socket's own loop.
+         */
+        private int forwardedSinceComplete;
 
         ForwardLimiter(int socketIndex, int localConnectionIdLength, AtomicIntegerArray pending,
                 AtomicIntegerArray dropped, AtomicIntegerArray droppedMalformed,
@@ -647,8 +660,9 @@ public final class QuicServer implements Closeable {
          * {@link #MAX_PENDING_FORWARDS} of them waiting, and then releases it here instead of
          * queueing it. The hand-over runs through the target's own executor, so the read on its
          * context happens on its loop, and the pending count drops in a {@code finally} whether the
-         * read throws or an early shutdown rejects the task. The task that drops the count to zero
-         * also fires the target's read completion (see the class javadoc): the dispatcher delivers
+         * read throws or an early shutdown rejects the task. The task that drops the count to zero,
+         * or the {@link #COMPLETE_EVERY_FORWARDS}th since the last one, also fires the target's read
+         * completion (see the class javadoc): the dispatcher delivers
          * the read without one, and the QUIC codec flushes and completes the receive only from
          * {@code channelReadComplete}.
          */
@@ -663,7 +677,10 @@ public final class QuicServer implements Closeable {
                     try {
                         to.fireChannelRead(msg);
                     } finally {
-                        if (pending.decrementAndGet(target) == 0) {
+                        boolean drained = pending.decrementAndGet(target) == 0;
+                        ForwardLimiter owner = (ForwardLimiter) to.handler();
+                        if (drained || ++owner.forwardedSinceComplete >= COMPLETE_EVERY_FORWARDS) {
+                            owner.forwardedSinceComplete = 0;
                             readComplete(target, to);
                         }
                     }
