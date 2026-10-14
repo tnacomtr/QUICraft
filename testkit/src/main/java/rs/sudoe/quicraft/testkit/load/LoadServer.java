@@ -16,7 +16,8 @@ import rs.sudoe.quicraft.testkit.Args;
 
 /**
  * Load spike listener: the real {@link QuicServer} with admission limits raised for many clients
- * from one box. Transport only; each accepted stream is held open until the client closes it.
+ * from one box. {@code --shipped-limits} skips the raise, so the spike measures the shipped
+ * defaults instead. Transport only; each accepted stream is held open until the client closes it.
  * Runs until SIGTERM or SIGINT, then closes the listener.
  */
 public final class LoadServer {
@@ -28,17 +29,19 @@ public final class LoadServer {
         int idleMin = args.integer("idle-minutes", 10);
 
         ServerIdentity identity = ServerIdentity.generate();
-        TransportConfig config = TransportConfig.builder()
-                .maxOpen(100_000)
-                .maxOpenPerIp(64)
-                .maxTrackedIps(300_000)
-                .globalAttemptsPerSecond(100_000)
-                .perIpAttemptsPerSecond(1_000)
-                .retryThresholdPerSecond(100_000)
-                .ingressInitialsPerSecond(100_000)
-                .ingressInitialsPerIpPerSecond(1_000)
-                .maxIdleTimeout(idleMin, TimeUnit.MINUTES)
-                .build();
+        TransportConfig.Builder builder = TransportConfig.builder()
+                .maxIdleTimeout(idleMin, TimeUnit.MINUTES);
+        if (!args.flag("shipped-limits")) {
+            builder.maxOpen(100_000)
+                    .maxOpenPerIp(64)
+                    .maxTrackedIps(300_000)
+                    .globalAttemptsPerSecond(100_000)
+                    .perIpAttemptsPerSecond(1_000)
+                    .retryThresholdPerSecond(100_000)
+                    .ingressInitialsPerSecond(100_000)
+                    .ingressInitialsPerIpPerSecond(1_000);
+        }
+        TransportConfig config = builder.build();
 
         AtomicLong accepted = new AtomicLong();
         Set<QuicByteStream> open = ConcurrentHashMap.newKeySet();

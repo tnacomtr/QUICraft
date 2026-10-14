@@ -21,13 +21,13 @@ class TransportConfigAdmissionTest {
     @Test
     void defaultsMatchTheDocumentedAdmissionLimits() {
         TransportConfig config = TransportConfig.DEFAULT;
-        assertEquals(200, config.globalAttemptsPerSecond());
+        assertEquals(2000, config.globalAttemptsPerSecond());
         assertEquals(20, config.perIpAttemptsPerSecond());
         assertEquals(50, config.retryThresholdPerSecond());
         assertEquals(65536, config.maxOpen());
         assertEquals(32, config.maxOpenPerIp());
         assertEquals(131072, config.maxTrackedIps());
-        assertEquals(4000, config.ingressInitialsPerSecond());
+        assertEquals(8000, config.ingressInitialsPerSecond());
         assertEquals(200, config.ingressInitialsPerIpPerSecond());
         assertEquals(TransportConfig.RetryMode.ADAPTIVE, config.retryMode());
     }
@@ -123,13 +123,13 @@ class TransportConfigAdmissionTest {
                 .ingressInitialsPerIpPerSecond(MAX_LIMIT + 1)
                 .build();
 
-        assertEquals(200, config.globalAttemptsPerSecond());
+        assertEquals(2000, config.globalAttemptsPerSecond());
         assertEquals(20, config.perIpAttemptsPerSecond());
         assertEquals(50, config.retryThresholdPerSecond());
         assertEquals(65536, config.maxOpen());
         assertEquals(32, config.maxOpenPerIp());
         assertEquals(131072, config.maxTrackedIps());
-        assertEquals(4000, config.ingressInitialsPerSecond());
+        assertEquals(8000, config.ingressInitialsPerSecond());
         assertEquals(200, config.ingressInitialsPerIpPerSecond());
     }
 
@@ -146,13 +146,13 @@ class TransportConfigAdmissionTest {
                 .ingressInitialsPerIpPerSecond(-1)
                 .build();
 
-        assertEquals(200, config.globalAttemptsPerSecond());
+        assertEquals(2000, config.globalAttemptsPerSecond());
         assertEquals(20, config.perIpAttemptsPerSecond());
         assertEquals(50, config.retryThresholdPerSecond());
         assertEquals(65536, config.maxOpen());
         assertEquals(32, config.maxOpenPerIp());
         assertEquals(131072, config.maxTrackedIps());
-        assertEquals(4000, config.ingressInitialsPerSecond());
+        assertEquals(8000, config.ingressInitialsPerSecond());
         assertEquals(200, config.ingressInitialsPerIpPerSecond());
     }
 

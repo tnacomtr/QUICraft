@@ -10,7 +10,8 @@
 #   bash testkit/run-load-spike.sh                                         # 50k, 500/s, 120 s hold
 #
 # Env: COUNT, RAMP_RATE, HOLD_SEC, LOAD_BIND, SOURCE_BASE, IDLE_MIN, MAX_RSS_MB, MAX_FAIL_PCT,
-# SESSION_RESUMPTION (1 to allow), LAUNCHER (installed testkit launcher), NO_SCOPE (1 skips
+# SESSION_RESUMPTION (1 to allow), SHIPPED_LIMITS (1 measures the shipped admission defaults
+# instead of the raised ones), LAUNCHER (installed testkit launcher), NO_SCOPE (1 skips
 # systemd-run even when present), MEM_MAX (per-JVM systemd MemoryMax, default 16G), JVM_OPTS.
 # Each JVM runs under systemd-run --user --scope with MemoryMax when systemd-run exists; otherwise
 # plain java.
@@ -129,7 +130,9 @@ sample() {
     kill -0 "$server_jvm_pid" 2>/dev/null || fail "server exited during the run"
 }
 
-launch "$results/server.log" load-server --bind "$LOAD_BIND" --status-interval 5 --idle-minutes "$IDLE_MIN"
+server_args=(load-server --bind "$LOAD_BIND" --status-interval 5 --idle-minutes "$IDLE_MIN")
+[[ "${SHIPPED_LIMITS:-0}" == "1" ]] && server_args+=(--shipped-limits)
+launch "$results/server.log" "${server_args[@]}"
 server_pid="$LAST_PID"
 server_jvm_pid="$(jvm_pid "$results/server.log")"
 [[ -n "$server_jvm_pid" ]] || { echo "server printed no PID line; see $results/server.log" >&2; exit 1; }

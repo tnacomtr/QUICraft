@@ -350,7 +350,7 @@ open connections (overall and per IP), and drops floods of Initial packets befor
   unanswered, so a Retry (at most 124 bytes with QUICraft's tokens) only ever answers a datagram
   of at least 1200 bytes.
 - Ingress flood protection counts every Initial datagram per IP and overall (defaults 200 and
-  4000 per second), whether or not it carries a token, and drops those over budget before any
+  8000 per second), whether or not it carries a token, and drops those over budget before any
   other check.
 - An Initial that passes ingress spends a connection attempt. A token-less one spends the
   attempt budget; one that brings back a valid Retry token spends a separate validated budget

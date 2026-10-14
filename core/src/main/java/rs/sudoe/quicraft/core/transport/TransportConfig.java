@@ -30,13 +30,15 @@ public final class TransportConfig {
     private static final int MAX_LIMIT = 10_000_000;
 
     // System properties are read once, so a bad value logs one WARNING per JVM.
-    private static final int DEFAULT_GLOBAL_ATTEMPTS = limitProperty("globalAttemptsPerSecond", 200);
+    // 2000/s refills a 50,000-player node after a restart in about 25 s (CLAUDE.md scale target).
+    private static final int DEFAULT_GLOBAL_ATTEMPTS = limitProperty("globalAttemptsPerSecond", 2000);
     private static final int DEFAULT_PER_IP_ATTEMPTS = limitProperty("perIpAttemptsPerSecond", 20);
     private static final int DEFAULT_RETRY_THRESHOLD = limitProperty("retryThresholdPerSecond", 50);
     private static final int DEFAULT_MAX_OPEN = limitProperty("maxOpen", 65536);
     private static final int DEFAULT_MAX_OPEN_PER_IP = limitProperty("maxOpenPerIp", 32);
     private static final int DEFAULT_MAX_TRACKED_IPS = limitProperty("maxTrackedIps", 131072);
-    private static final int DEFAULT_INGRESS_INITIALS = limitProperty("ingressInitialsPerSecond", 4000);
+    // 2x the attempt budget above: above 50 attempts/s each attempt costs two Initial packets (Retry).
+    private static final int DEFAULT_INGRESS_INITIALS = limitProperty("ingressInitialsPerSecond", 8000);
     private static final int DEFAULT_INGRESS_INITIALS_PER_IP = limitProperty("ingressInitialsPerIpPerSecond", 200);
     private static final RetryMode DEFAULT_RETRY_MODE = retryModeProperty();
 
