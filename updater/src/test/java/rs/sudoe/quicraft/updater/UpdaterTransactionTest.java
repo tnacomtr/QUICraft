@@ -362,15 +362,19 @@ class UpdaterTransactionTest {
     }
 
     @Test
-    void crossStoreRefusedBeforeAnyStagingWrite() throws Exception {
+    void crossStoreDowngradesToStagingBeforeAnyLiveWrite() throws Exception {
         Rig r = standardRig();
         TransactionResult result = txn(r, DurabilityOps.system(), () -> true, (dir, live) -> false)
                 .execute(atomic(r));
-        assertEquals(TransactionOutcome.FAILED, result.outcome());
+        assertEquals(TransactionOutcome.STAGED_ONLY, result.outcome(), result.messages().toString());
         assertTrue(result.messages().get(0).contains("another file system"), result.messages().toString());
-        assertTrue(result.messages().get(0).contains(r.live.toString()), "manual instructions name the live jar");
-        assertTrue(r.fetcher.downloads.isEmpty());
-        assertTrue(stagingIsEmpty(r));
+        assertArrayEquals(r.jar, Files.readAllBytes(result.stagedJar().orElseThrow()),
+                "the staged jar holds the verified release");
+        assertTrue(result.messages().stream().anyMatch(m -> m.contains("install it manually")
+                && m.contains(r.live.toString())), "manual instructions name the live jar: " + result.messages());
+        assertEquals(1, r.fetcher.downloads.size(), "the staging path downloads once");
+        assertEquals(0, backupCount(r), "no backup on the staging-only path");
+        assertEquals(0, journalCount(r), "no journal on the staging-only path");
         assertLiveUntouched(r);
     }
 

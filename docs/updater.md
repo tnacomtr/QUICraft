@@ -146,10 +146,20 @@ completed check returns to `idle`, whether or not an update exists.
    jar on Linux and macOS. The running jar is never rewritten in place. The JVM loads classes lazily,
    so an in-place rewrite can cause `NoClassDefFoundError` or a crash.
 6. `installed-pending-restart` -> `health-check-pending` -> `healthy` -> `idle`: after restart, the
-   new generation reports against platform health criteria. The recovery backup is retained
+   new generation reports against the health criteria below. The recovery backup is retained
    unconditionally until those criteria pass. The draft's rule of deleting `.bak` on the next
-   successful start is superseded by this rule. Only the health criteria and their mechanism are
-   unresolved (section 10).
+   successful start is superseded by this rule.
+
+   The alpha's criteria (blocker 9 of section 10):
+
+   - **Velocity:** the plugin's initialisation finished. QuicraftVelocity records the verdict at the
+     end of its own init, from a late, lowest-priority handler, so it covers QUICraft's init.
+   - **Fabric dedicated server:** the dedicated server finished starting. The updater is reached only
+     after the server's init returned true, so the verdict is recorded at that point.
+
+   A crash, a failed init or a failed start after either point is not detected; the timeout that
+   bounds the wait is unchanged. Health is a verdict on that one point, not a watch on the first
+   ticks, and the backup of the previous generation is kept until the verdict passes.
 
 ### Cancel and failure
 
@@ -198,11 +208,15 @@ missing file means the defaults below.
 update.check-interval=hourly   # hourly (default) | daily | off; matched case-insensitively
 update.check-silent=true       # same as -s
 update.log-bad-signatures=true
+update.install=swap            # swap (default, Linux and macOS) | stage-only
 ```
 
-An unrecognised `update.check-interval` value turns checks off and logs a WARN naming the key only. A
-malformed file logs a fixed WARN and uses the defaults. The transport settings stay in
-`plugins/quicraft/config.properties` (Velocity) and `config/quicraft/server.properties` (Fabric). The draft's `update/` paths under
+An unrecognised `update.check-interval` value turns checks off and logs a WARN naming the key only. An
+unrecognised `update.install` value fails safe to `stage-only`: the jar is staged and verified, never
+installed, and one WARN names the key only. `update.install=stage-only` is the owner opt-out and holds
+on every platform, whatever the OS. A malformed file logs a fixed WARN and uses the defaults. The
+transport settings stay in `plugins/quicraft/config.properties` (Velocity) and
+`config/quicraft/server.properties` (Fabric). The draft's `update/` paths under
 `plugins/quicraft/` are Velocity-only. Fabric staging and state paths are specified in 12.14.
 
 ### Disclosure
@@ -293,9 +307,22 @@ These are requirements for the design. None is proven by implementation.
 6. Prove the specified release sequencing and withdrawal workflow (12.7).
 7. Dedicated-server gating mechanism (section 7).
 8. Permission integration for Fabric and Velocity, and command registration.
-9. Platform health criteria and mechanism (backup retention until they pass is unconditional).
+9. Platform health criteria and mechanism. **Resolved for the alpha:** the criteria are settled in
+   section 5 (Velocity: the plugin's initialisation finished; Fabric: the dedicated server finished
+   starting). Backup retention until they pass is unconditional, and a crash after either point is not
+   detected.
 10. Loader-generation safety for live `ATOMIC_MOVE` replacement on Linux and macOS, with crash-recovery
-    evidence. Release is blocked until it exists. (Evidence so far and rules: 12.13; gaps remain.)
+    evidence (evidence and rules: 12.13). **The swap is enabled for the alpha on Linux and macOS:**
+    `update` installs the verified jar there and reports "installed, restart required"; every other OS
+    keeps verified staging only, and so does a Linux or macOS server whose owner sets
+    `update.install=stage-only` (section 6). Still open:
+    - Live-swap evidence on macOS and on JDK 21 server runs. A CI job is being added separately; the
+      macOS job in 12.13 runs the updater test suite, not a server.
+    - What JDK `FileChannel.force` does on macOS (`fsync` versus `F_FULLFSYNC`) is **not verified**.
+      No JDK source or documentation was read for this note, so the macOS durability of the swap and of
+      the directory sync rests on the recorded CI runs and not on a citation.
+    - Crash-recovery evidence from a live server run (the in-process crash matrix of 12.11 is tested).
+    - Velocity builds other than 4.2.0-30.
 11. Windows post-exit helper design and verification.
 12. Implement and prove the approved locks, journal and recovery design (12.8 to 12.11).
 13. Disclosure text in the README and on project pages (required before release).
@@ -911,8 +938,9 @@ copy: startup recovery (12.11) treats it as `recovery-required` and keeps every 
 ### 12.10 Transaction (Linux and macOS only)
 
 Windows (peer review): steps 5 to 7 never run on Windows. A Windows transaction stops at
-`verified-staged` and the rest is gated on blocker 11 (post-exit helper). Steps 5 to 7 also stay
-gated on blocker 10 on every platform.
+`verified-staged` and the rest is gated on blocker 11 (post-exit helper). On Linux and macOS steps 5 to
+7 run: the swap is enabled there for the alpha (blocker 10, 12.13), unless the owner sets
+`update.install=stage-only` (section 6).
 
 1. `checking`: under `txn.lock`, fetch and verify (12.12), admission rules (12.9).
 2. `downloading`: write `staging/<txid>.part`, created with `CREATE_NEW` and `NOFOLLOW_LINKS`; stop at
@@ -948,8 +976,9 @@ gated on blocker 10 on every platform.
    re-hashed immediately before the move, and a changed live jar ends the command with "the live jar
    changed during the update; nothing was installed"; after the move the live jar is re-hashed
    against `staged.sha512`, and a mismatch keeps the `prepared` journal and the backup as recovery
-   evidence (12.11 step 5 then reports `recovery-required`), logs a WARN and fails the command. Otherwise re-hash `staging/<txid>.jar` (security review); `ATOMIC_MOVE` it over the live path (same file
-   store required; on `AtomicMoveNotSupportedException` the transaction ends before any change, journal
+   evidence (12.11 step 5 then reports `recovery-required`), logs a WARN and fails the command. Otherwise re-hash `staging/<txid>.jar` (security review); `ATOMIC_MOVE` it over the live path (step 1 already
+   downgraded to staging when `<updateDir>` and the live jar are on different file stores; if the move
+   still reports `AtomicMoveNotSupportedException` the transaction ends before any change, journal
    removed); fsync the live jar's directory; set `phase=swapped`. Release `state.lock`, then
    `txn.lock`. A scheduled check that wants `state.lock` meanwhile waits for this step (in-process) or
    skips its write until the next check (other process); the step does no network I/O, so the wait is
@@ -1065,7 +1094,8 @@ run; 3 trials per mode, then a restart.
 | Fabric Loader 0.19.5, MC 1.21.11, JDK 25 | atomic rename / in-place | old / new | old / `ZipException` | not found | clean |
 | all three | restart after swap | new | new | found | clean |
 
-Rules derived from it (user-approved semantics, implementation safety still gated):
+Rules derived from it (user-approved semantics; enabled on Linux and macOS for the alpha, see
+blocker 10):
 
 - In-place overwrite is never used (unsafe on both loaders). Only `ATOMIC_MOVE` (12.10 step 6).
 - **The new jar takes effect only at restart.** The running version stays the old one, and the
@@ -1078,9 +1108,9 @@ Rules derived from it (user-approved semantics, implementation safety still gate
   Fabric showed a consistent old view, but the same rule applies to both loaders.
 - Required test: swap, then run a check and the other QUICraft code paths that might read resources,
   on Velocity and Fabric; nothing may read from the new jar.
-- Gaps that keep blocker 10 open: a live server swap on JDK 21 and on macOS (1.21.11 ran on JDK 25;
-  the macOS CI job below runs the updater suite, not a server), directory fsync and `F_FULLFSYNC` on
-  macOS, crash-recovery tests of 12.11, and Velocity builds other than 4.2.0-30.
+- Gaps recorded with this evidence (blocker 10): a live server swap on JDK 21 and on macOS (1.21.11
+  ran on JDK 25; the macOS CI job below runs the updater suite, not a server), directory fsync and
+  `F_FULLFSYNC` on macOS, crash-recovery tests of 12.11, and Velocity builds other than 4.2.0-30.
 - macOS CI (`updater-macos` workflow, run 38600235420, 2026-10-14, feat d9f3514): the full updater
   suite, transaction and crash-matrix tests included, passed 1166/0 on macos-latest (ARM64) and
   macos-15-intel, each with JDK 21 and JDK 25 as the test launcher. The first run (38577920195)
@@ -1146,12 +1176,17 @@ Both:
   that directory carrying QUICraft's plugin or mod id (checked at init by reading each jar's
   `velocity-plugin.json` or `fabric.mod.json`). Otherwise the updater is disabled with a WARN.
 - Same file store: `ATOMIC_MOVE` needs `<updateDir>` and the scan directory on one file store
-  (container setups often mount `mods/` separately). If they differ, the transaction ends before step
-  5 with manual install instructions (section 2 allows this).
-- **APPROVED (separate file stores):** keep the "fail with instructions" rule above.
-  Alternative: put a temporary `.quicraft-<txid>.swap` copy (no `.jar` suffix, hidden; neither loader
-  loads it, per the filters above) in the scan directory just before the move. That conflicts with
-  section 5's rule that staging lives outside loader-scanned directories, so I did not choose it.
+  (container setups often mount `mods/` separately). If they differ, the transaction downgrades the
+  capability to verified staging before any download, like the directory-fsync downgrade: the jar is
+  downloaded, verified and staged with `STAGED_ONLY`, the live jar is never written, and the message
+  names the staged jar path and the manual steps (stop the server, copy the staged jar over the live
+  jar, start the server).
+- **Peer review (separate file stores):** the former "fail with instructions" rule was wrong: that
+  refusal runs before any download, so the owner had no release jar to copy. Superseded by the
+  downgrade above. Alternative: put a temporary `.quicraft-<txid>.swap` copy (no `.jar` suffix, hidden;
+  neither loader loads it, per the filters above) in the scan directory just before the move. That
+  conflicts with section 5's rule that staging lives outside loader-scanned directories, so I did not
+  choose it.
 
 ### 12.15 Dependencies on blockers not resolved here
 

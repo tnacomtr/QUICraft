@@ -53,8 +53,8 @@ final class UpdaterTransaction {
     static final String CANCELLED_BEFORE_SWAP = "update cancelled before the swap; nothing was installed";
     static final String DOWNGRADED = "directory sync is not supported here; the jar is staged and verified "
             + "but will not be installed";
-    static final String SAME_STORE_REFUSED = "the update directory is on another file system than the live "
-            + "jar, so the swap cannot be atomic";
+    static final String SAME_STORE_DOWNGRADED = "the update directory is on another file system than the live "
+            + "jar, so the live swap was skipped; the verified jar is staged instead";
     static final String NO_UPDATE = "no newer release is available";
     static final String RELEASE_NO_LONGER_VERIFIES = "the release manifest no longer verifies under the current "
             + "revocations";
@@ -325,9 +325,11 @@ final class UpdaterTransaction {
             a.messages.add(DOWNGRADED);
         }
         if (capability == InstallCapability.ATOMIC_REPLACEMENT && !sameStore.test(a.dir, live.realPath())) {
-            return abort(a, TransactionOutcome.FAILED, SAME_STORE_REFUSED
-                    + "; install it manually: stop the server, copy the release jar over " + live.realPath()
-                    + ", start the server");
+            // A move across file stores cannot be atomic (12.14). Downgrade like the fsync case above:
+            // the jar is downloaded, verified and staged, and the outcome STAGED_ONLY names the staged
+            // jar and the manual steps. Refusing here would name a release jar this run never fetched.
+            capability = InstallCapability.VERIFIED_STAGING_ONLY;
+            a.messages.add(SAME_STORE_DOWNGRADED);
         }
         a.live = live;
         a.capability = capability;

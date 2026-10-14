@@ -206,6 +206,15 @@ final class UpdaterFacadeFixtures {
     /** Seams with the scripted metadata fetcher, the test clock and the given origins. */
     static Seams seams(SourceFetcher fetcher, Function<ThreadFactory, ScheduledExecutorService> executors,
             Optional<ReleaseHosts> hosts) {
+        return seams(fetcher, executors, hosts, Seams.systemOsName());
+    }
+
+    /**
+     * As {@link #seams}, with the platform's {@code os.name} fixed, so a test decides which OS the
+     * capability decision sees instead of depending on the machine that runs it.
+     */
+    static Seams seams(SourceFetcher fetcher, Function<ThreadFactory, ScheduledExecutorService> executors,
+            Optional<ReleaseHosts> hosts, String osName) {
         return new Seams(fetcher, PipelineFixtures.CLOCK, DurabilityOps.system(), executors,
                 log -> {
                     if (hosts.isEmpty()) {
@@ -215,7 +224,7 @@ final class UpdaterFacadeFixtures {
                     }
                     return hosts;
                 },
-                PipelineFixtures.ENDPOINTS);
+                PipelineFixtures.ENDPOINTS, StateStore::new, osName);
     }
 
     /** The configured hosts: the three test hosts. */

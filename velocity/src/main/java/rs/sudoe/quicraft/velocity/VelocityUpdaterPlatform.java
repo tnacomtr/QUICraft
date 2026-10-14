@@ -21,9 +21,11 @@ import rs.sudoe.quicraft.updater.UpdaterPlatform;
  * are, how the running plugin jar is found, how health is judged, and how logs and admin notices are
  * routed. It holds no updater logic.
  *
- * <p>{@link #health()} is PROVISIONAL. Blocker 9 (docs/updater.md 10) is unresolved, so the verdict is only
- * "QUICraft's own init did not fail", observed by a late, lowest-priority ProxyInitializeEvent handler. It
- * does not prove that every other handler finished, nor the TCP bind, and it does not look at player joins.
+ * <p>{@link #health()} reports the alpha's health criterion (docs/updater.md section 10, blocker 9): the
+ * plugin's initialisation finished. QuicraftVelocity completes the verdict from a late, lowest-priority
+ * ProxyInitializeEvent handler, so a healthy verdict means QUICraft's own init did not fail. It does not
+ * prove that every other handler finished, nor the TCP bind, and it does not look at player joins; a
+ * crash or a failed init after this point is not detected (section 5).
  */
 final class VelocityUpdaterPlatform implements UpdaterPlatform {
     static final String PLATFORM = "velocity";

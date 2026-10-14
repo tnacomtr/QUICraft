@@ -12,6 +12,7 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import rs.sudoe.quicraft.updater.UpdaterConfig.CheckInterval;
+import rs.sudoe.quicraft.updater.UpdaterConfig.InstallMode;
 
 /** {@link UpdaterConfig#load}: defaults, each valid value, unknown values and unreadable files. */
 class UpdaterConfigTest {
@@ -33,22 +34,50 @@ class UpdaterConfigTest {
     }
 
     @Test
-    void defaultsAreHourlySilentAndLogBadSignatures() {
+    void defaultsAreHourlySilentLogBadSignaturesAndSwap() {
         UpdaterConfig d = UpdaterConfig.defaults();
         assertEquals(CheckInterval.HOURLY, d.checkInterval());
         assertTrue(d.checkSilent());
         assertTrue(d.logBadSignatures());
+        assertEquals(InstallMode.SWAP, d.installMode());
     }
 
     @Test
     void everyValidValueIsHonoured() throws Exception {
         List<String> warnings = new ArrayList<>();
         UpdaterConfig daily = load("update.check-interval=daily\nupdate.check-silent=false\n"
-                + "update.log-bad-signatures=false\n", warnings);
-        assertEquals(new UpdaterConfig(CheckInterval.DAILY, false, false), daily);
+                + "update.log-bad-signatures=false\nupdate.install=stage-only\n", warnings);
+        assertEquals(new UpdaterConfig(CheckInterval.DAILY, false, false, InstallMode.STAGE_ONLY), daily);
         assertEquals(CheckInterval.OFF, load("update.check-interval=off\n", warnings).checkInterval());
         assertEquals(CheckInterval.HOURLY, load("update.check-interval=hourly\n", warnings).checkInterval());
         assertTrue(warnings.isEmpty());
+    }
+
+    @Test
+    void theInstallModeIsSwapByDefaultAndBothValuesAreHonoured() throws Exception {
+        List<String> warnings = new ArrayList<>();
+        assertEquals(InstallMode.SWAP, load("", warnings).installMode());
+        assertEquals(InstallMode.SWAP, load("update.install=swap\n", warnings).installMode());
+        assertEquals(InstallMode.STAGE_ONLY, load("update.install=stage-only\n", warnings).installMode());
+        assertTrue(warnings.isEmpty(), () -> "warnings were " + warnings);
+    }
+
+    @Test
+    void installModeValuesAreMatchedCaseInsensitively() throws Exception {
+        List<String> warnings = new ArrayList<>();
+        assertEquals(InstallMode.STAGE_ONLY, load("update.install=STAGE-ONLY\n", warnings).installMode());
+        assertEquals(InstallMode.SWAP, load("update.install=Swap\n", warnings).installMode());
+        assertTrue(warnings.isEmpty(), () -> "warnings were " + warnings);
+    }
+
+    @Test
+    void anUnknownInstallModeFailsSafeToStagingOnlyAndNamesTheKeyOnly() throws Exception {
+        List<String> warnings = new ArrayList<>();
+        UpdaterConfig c = load("update.install=helper\n", warnings);
+        assertEquals(InstallMode.STAGE_ONLY, c.installMode(), "an unknown value never swaps");
+        assertEquals(1, warnings.size(), () -> "warnings were " + warnings);
+        assertTrue(warnings.get(0).contains("update.install"));
+        assertFalse(warnings.get(0).contains("helper"));
     }
 
     @Test

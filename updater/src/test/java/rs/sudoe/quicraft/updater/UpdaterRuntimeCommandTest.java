@@ -62,6 +62,18 @@ class UpdaterRuntimeCommandTest {
         return rt;
     }
 
+    /** Starts with the OS name the capability decision sees fixed, instead of the test machine's. */
+    private UpdaterRuntime startOn(String osName, SourceFetcher fetcher) {
+        rt = UpdaterRuntime.start(p, UpdaterFacadeFixtures.seams(fetcher,
+                UpdaterFacadeFixtures.realExecutors(), UpdaterFacadeFixtures.testHosts(), osName));
+        return rt;
+    }
+
+    /** The owner opt-out of docs/updater.md section 6: stage and verify, never install. */
+    private void optOutOfTheSwap() throws IOException {
+        Files.writeString(p.configFile, "update.install=stage-only\n");
+    }
+
     private Reply dispatch(Output out, boolean console, String... args) {
         return rt.dispatch(args, console, out::add);
     }
@@ -140,7 +152,8 @@ class UpdaterRuntimeCommandTest {
     }
 
     @Test
-    void updateStagesTheVerifiedJarOnlyAndLeavesTheLiveJarAlone() throws Exception {
+    void aStageOnlyConfigStagesTheVerifiedJarOnlyAndLeavesTheLiveJarAlone() throws Exception {
+        optOutOfTheSwap();
         byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
         ScriptedFetcher metadata = new ScriptedFetcher();
         TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
@@ -156,7 +169,60 @@ class UpdaterRuntimeCommandTest {
     }
 
     @Test
+    void anUpdateOnALinuxNamedPlatformWithTheDefaultConfigSwapsTheLiveJar() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        startOn("Linux", new TransactionFixtures.ArtifactFetcher(metadata, newJar));
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true));
+        awaitIdle();
+
+        assertTrue(out.contains("update finished: INSTALLED_RESTART_PENDING"),
+                () -> "output was " + out.snapshot());
+        assertArrayEquals(newJar, Files.readAllBytes(live.realPath()),
+                "the live jar now holds the verified staged jar");
+    }
+
+    @Test
+    void anUpdateOnAWindowsNamedPlatformWithTheDefaultConfigStagesOnly() throws Exception {
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        startOn("Windows 11", new TransactionFixtures.ArtifactFetcher(metadata, newJar));
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true));
+        awaitIdle();
+
+        assertTrue(out.contains("update finished: STAGED_ONLY"), () -> "output was " + out.snapshot());
+        assertArrayEquals(liveBytes, Files.readAllBytes(live.realPath()));
+    }
+
+    @Test
+    void aGarbageInstallConfigOnALinuxNamedPlatformStagesOnly() throws Exception {
+        Files.writeString(p.configFile, "update.install=helper\n");
+        byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
+        ScriptedFetcher metadata = new ScriptedFetcher();
+        TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
+                TransactionFixtures.manifestFor(newJar, UpdaterFacadeFixtures.NEWER));
+        startOn("Linux", new TransactionFixtures.ArtifactFetcher(metadata, newJar));
+
+        Output out = new Output();
+        assertEquals(Reply.STARTED, dispatch(out, true));
+        awaitIdle();
+
+        assertTrue(out.contains("update finished: STAGED_ONLY"), () -> "output was " + out.snapshot());
+        assertArrayEquals(liveBytes, Files.readAllBytes(live.realPath()));
+    }
+
+    @Test
     void emptyArgsStageAnUpdateAndTheUpdateWordIsUsage() throws Exception {
+        // Stage-only, so this test measures the dispatch form and not what the platform may do.
+        optOutOfTheSwap();
         byte[] newJar = TransactionFixtures.releaseJar(UpdaterFacadeFixtures.NEWER);
         ScriptedFetcher metadata = new ScriptedFetcher();
         TransactionFixtures.serveMetadata(metadata, PipelineFixtures.revocations(),
