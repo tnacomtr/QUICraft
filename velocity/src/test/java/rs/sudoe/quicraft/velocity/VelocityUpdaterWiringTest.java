@@ -19,6 +19,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.LoggerFactory;
@@ -167,6 +168,54 @@ class VelocityUpdaterWiringTest {
         announce.join(TimeUnit.SECONDS.toMillis(5));
         join.join(TimeUnit.SECONDS.toMillis(5));
         assertTrue(joined, "a join must not wait for a permission check held under the lock");
+    }
+
+    /**
+     * An announcement and a join of the same admin overlapping: the announcement is held at the admin's
+     * permission check (outside the lock), the join claims the delivery first, so the announcement must
+     * not send it again. Latches only, no timing guesswork.
+     */
+    @Test
+    void aJoinOverlappingAnAnnouncementGetsTheNoticeOnce() throws Exception {
+        UpdaterFakes.Recorder out = new UpdaterFakes.Recorder();
+        CountDownLatch permissionEntered = new CountDownLatch(1);
+        CountDownLatch releasePermission = new CountDownLatch(1);
+        AtomicBoolean firstPermissionCheck = new AtomicBoolean(true);
+        Player admin = UpdaterFakes.notifiedPlayer(out, permission -> {
+            if (!VelocityUpdateNotifier.NOTIFY_PERMISSION.equals(permission)) {
+                return false;
+            }
+            if (firstPermissionCheck.compareAndSet(true, false)) {
+                permissionEntered.countDown();
+                try {
+                    releasePermission.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return true;
+        }, UUID.randomUUID());
+        VelocityUpdateNotifier notifier = new VelocityUpdateNotifier(() -> List.of(admin));
+
+        Thread announce = new Thread(() -> notifier.announce("update 0.2.0 is available"), "announce");
+        announce.start();
+        assertTrue(permissionEntered.await(5, TimeUnit.SECONDS),
+                "the announcement must reach the admin's permission check");
+
+        CountDownLatch joinDone = new CountDownLatch(1);
+        Thread join = new Thread(() -> {
+            notifier.onJoin(admin);
+            joinDone.countDown();
+        }, "join");
+        join.start();
+        assertTrue(joinDone.await(5, TimeUnit.SECONDS), "the joining admin must get the notice");
+
+        releasePermission.countDown();
+        announce.join(TimeUnit.SECONDS.toMillis(5));
+        join.join(TimeUnit.SECONDS.toMillis(5));
+
+        assertEquals(List.of("update 0.2.0 is available"), out.lines,
+                "the overlapping join already delivered it");
     }
 
     @Test

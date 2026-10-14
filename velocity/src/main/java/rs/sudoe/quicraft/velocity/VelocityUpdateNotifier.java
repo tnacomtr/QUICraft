@@ -37,6 +37,9 @@ final class VelocityUpdateNotifier {
      * Remembers the message as the current one and sends it to the online admins now. Only the roster is
      * snapshotted under the lock; the permission checks and the sends run outside it, because Velocity may
      * resolve a permission through a plugin that itself talks to the proxy.
+     *
+     * <p>Adding a player to {@link #delivered} is the claim on the delivery: a player an interleaved
+     * {@link #onJoin} already claimed is not sent the message again here.
      */
     void announce(String message) {
         List<Player> roster;
@@ -50,7 +53,10 @@ final class VelocityUpdateNotifier {
                 continue;
             }
             synchronized (lock) {
-                delivered.add(p.getUniqueId());
+                if (!delivered.add(p.getUniqueId())) {
+                    // A concurrent onJoin for this player already sent the notice.
+                    continue;
+                }
             }
             send(p, message);
         }
@@ -68,6 +74,7 @@ final class VelocityUpdateNotifier {
         }
         String message;
         synchronized (lock) {
+            // The claim: false means announce (or an earlier join) already delivered the current message.
             if (!delivered.add(player.getUniqueId())) {
                 return;
             }
