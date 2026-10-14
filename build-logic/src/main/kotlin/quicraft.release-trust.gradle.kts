@@ -4,7 +4,8 @@
 // trust file is the development file, holds an RFC 8032 TEST key, or when the project version is
 // outside the UpdateVersion grammar (a SNAPSHOT build is never updatable). It also inspects the
 // built outer jars (velocity, fabric-26x, fabric-1.21.11): their META-INF/quicraft entries must
-// name the right platform and version and must not carry a TEST key. Setting quicraft.allowDevTrust
+// name the right platform and version, the trust entry must equal the configured trust file byte
+// for byte, and no trust may carry a TEST key. Setting quicraft.allowDevTrust
 // at all fails it: that opt-in builds TEST-key jars for local tests only, never a release.
 //
 // Standalone: no release or publish task exists in the build (checked Oct 2026: none in any
@@ -20,14 +21,14 @@ val releaseTrustFile = providers.gradleProperty("quicraft.updaterTrustFile")
     .map { layout.projectDirectory.file(it) }
     .orElse(layout.projectDirectory.file(UpdaterTrust.DEV_TRUST_PATH))
 
-// The outer jar per platform; must match quicraft.updater-trust.gradle.kts. Resolved lazily: the
-// subprojects are not evaluated yet when this root script applies the plugin.
-val outerJars: List<Pair<String, Provider<AbstractArchiveTask>>> = listOf(
-    Triple("velocity", ":velocity", "shadowJar"),
-    Triple("fabric-26x", ":fabric-26x", "jar"),
-    Triple("fabric-1.21.11", ":fabric-1.21.11", "remapJar"),
-).map { (platformName, path, taskName) ->
-    Pair(platformName, providers.provider { project(path).tasks.named<AbstractArchiveTask>(taskName).get() })
+// The outer jar per platform, from the shared map (UpdaterTrust.OUTER_JAR_TASKS), the same map the
+// updater-trust plugin uses. Resolved lazily: the subprojects are not evaluated yet when this root
+// script applies the plugin.
+val outerJars: List<Pair<String, Provider<AbstractArchiveTask>>> = UpdaterTrust.OUTER_JAR_TASKS.map { (platformName, taskName) ->
+    Pair(
+        platformName,
+        providers.provider { project(":$platformName").tasks.named<AbstractArchiveTask>(taskName).get() },
+    )
 }
 
 tasks.register("checkReleaseTrust") {
@@ -48,6 +49,7 @@ tasks.register("checkReleaseTrust") {
     dependsOn(outerJars.map { it.second })
     doLast {
         val file = trustSource.get().asFile
+        val trustBytes = file.readBytes()
         val problems = mutableListOf<String>()
         if (devOptIn.get()) {
             problems += "quicraft.allowDevTrust is set; it is for local TEST jars, never a release"
@@ -56,7 +58,7 @@ tasks.register("checkReleaseTrust") {
             problems += "the trust file is the development file (${UpdaterTrust.DEV_TRUST_PATH})"
         }
         try {
-            for (pub in UpdaterTrust.testPubsIn(file.readText(Charsets.UTF_8))) {
+            for (pub in UpdaterTrust.testPubsIn(trustBytes.toString(Charsets.UTF_8))) {
                 problems += "the trust file holds the RFC 8032 test key $pub"
             }
         } catch (e: IllegalArgumentException) {
@@ -80,8 +82,13 @@ tasks.register("checkReleaseTrust") {
                     if (!build.contentEquals(UpdaterTrust.buildJson(platformName, version).toByteArray(Charsets.UTF_8))) {
                         problems += "${jarFile.name}: ${UpdaterTrust.BUILD_ENTRY} is not {platform=$platformName, version=$version}"
                     }
-                    val jarTrust = single(UpdaterTrust.TRUST_ENTRY).toString(Charsets.UTF_8)
-                    for (pub in UpdaterTrust.testPubsIn(jarTrust)) {
+                    // Byte equality with the configured trust file: a stale jar built with another
+                    // (non-TEST) trust must fail, not only one carrying a TEST key.
+                    val jarTrust = single(UpdaterTrust.TRUST_ENTRY)
+                    if (!jarTrust.contentEquals(trustBytes)) {
+                        problems += "${jarFile.name}: ${UpdaterTrust.TRUST_ENTRY} differs from the configured trust file $file"
+                    }
+                    for (pub in UpdaterTrust.testPubsIn(jarTrust.toString(Charsets.UTF_8))) {
                         problems += "${jarFile.name}: ${UpdaterTrust.TRUST_ENTRY} holds the RFC 8032 test key $pub"
                     }
                 }

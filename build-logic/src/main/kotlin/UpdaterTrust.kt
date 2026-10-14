@@ -2,6 +2,7 @@
 //
 // Build constants for the updater's build metadata and trust file (docs/updater.md 12.2 and the
 // build metadata section). Shared by the plugins below; uses only groovy-json (part of Gradle's API).
+import groovy.json.JsonException
 import groovy.json.JsonSlurper
 import java.io.File
 
@@ -15,8 +16,23 @@ object UpdaterTrust {
         "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
     )
 
-    /** Mirrors DocumentParser.PLATFORMS. */
-    val PLATFORMS = setOf("velocity", "fabric-26x", "fabric-1.21.11")
+    /**
+     * The outer jar per updater platform: the task that produces the jar the updater swaps. The
+     * platform name is also the project name (":$platform"). Both trust plugins read this map, so
+     * the metadata writer and the release guard cannot disagree about which jar carries the metadata.
+     */
+    val OUTER_JAR_TASKS: Map<String, String> = mapOf(
+        "velocity" to "shadowJar",
+        "fabric-26x" to "jar",
+        "fabric-1.21.11" to "remapJar",
+    )
+
+    /** Mirrors DocumentParser.PLATFORMS (the keys of [OUTER_JAR_TASKS]). */
+    val PLATFORMS: Set<String> = OUTER_JAR_TASKS.keys
+
+    /** The outer jar task name for a platform; throws for a platform the map does not know. */
+    fun outerJarTask(platform: String): String =
+        OUTER_JAR_TASKS[platform] ?: throw IllegalArgumentException("$platform is not an updater platform")
 
     const val BUILD_ENTRY = "META-INF/quicraft/build.json"
     const val TRUST_ENTRY = "META-INF/quicraft/updater-trust.json"
@@ -52,7 +68,14 @@ object UpdaterTrust {
      */
     fun declaredPubs(text: String): List<String> {
         require(!text.contains('\\')) { "trust file contains a backslash; the real trust file needs no escapes" }
-        val root = JsonSlurper().parseText(text) as? Map<*, *>
+        // Callers catch IllegalArgumentException only, so a JSON syntax error must not escape as
+        // groovy's JsonException.
+        val parsed = try {
+            JsonSlurper().parseText(text)
+        } catch (e: JsonException) {
+            throw IllegalArgumentException("trust file is not valid JSON: ${e.message}", e)
+        }
+        val root = parsed as? Map<*, *>
             ?: throw IllegalArgumentException("trust file is not a JSON object")
         val keys = root["keys"] as? List<*> ?: throw IllegalArgumentException("trust file has no keys array")
         return keys.map { key ->

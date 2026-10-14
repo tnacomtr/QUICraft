@@ -79,11 +79,7 @@ val generateUpdaterMetadata = tasks.register("generateUpdaterMetadata") {
 
 // Known only after evaluation: the Loom plugins apply after this one in some modules.
 afterEvaluate {
-    val outerJarName = when {
-        platform == "velocity" -> "shadowJar"
-        plugins.hasPlugin("net.fabricmc.fabric-loom-remap") -> "remapJar"
-        else -> "jar"
-    }
+    val outerJarName = UpdaterTrust.outerJarTask(platform)
     val outer = tasks.named<Jar>(outerJarName) {
         from(generateUpdaterMetadata)
     }
