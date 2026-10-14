@@ -47,7 +47,7 @@ public final class Main {
                   transport-client     compare those transports: handshake, burst and play RTT
                   transport-summarize  medians and bootstrap CIs of QUIC minus TCP
                   latency      in-process loopback ping-pong: TCP vs QUIC vs QUIC through the bridge
-                  load-server  many-connection load spike: real QuicServer, admission limits raised
+                  load-server  many-connection load spike: real QuicServer, admission limits raised unless --shipped-limits
                   load-client  many-connection load spike: real QuicClient, one loopback source IP per connection""");
     }
 }
