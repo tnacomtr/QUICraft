@@ -299,7 +299,10 @@ public final class GameHost {
      * something else) is closed and the bind continues with the sockets already bound, so a
      * listener that cannot use several always has one. Only the first socket failing throws, which
      * is exactly today's failure to listen (the platform turns QUIC off and leaves TCP alone). The
-     * first socket keeps the option when it was applied to it, which changes nothing on its own.
+     * first socket keeps the option when it was applied to it, so it is not inert with one socket:
+     * the first socket is configured with SO_REUSEPORT before it binds, and any process of the same
+     * OS user can then bind the same UDP port with SO_REUSEPORT too and take a share of the traffic
+     * (docs/server-security.md).
      */
     public static HostedSockets bindHosted(EventLoopGroup workers, int socketCount, InetSocketAddress address,
             ChannelFactory<? extends DatagramChannel> datagrams) throws Exception {
