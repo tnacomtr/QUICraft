@@ -259,6 +259,68 @@ public final class StateStore {
     }
 
     /**
+     * What the files held when a reset started, read under the state lock. {@code state} and
+     * {@code revoked} are empty when the file has no valid copy (a missing or an unreadable file).
+     *
+     * @param anyFileExists false when neither state file exists at all
+     */
+    record ResetInput(boolean anyFileExists, Optional<StateRecords.UpdaterState> state,
+            Optional<StateRecords.RevokedState> revoked) {
+    }
+
+    /** Decides a reset from its input: a refusal with messages, or the rebuilt state to write. */
+    interface ResetPlanner {
+        ResetDecision plan(ResetInput input) throws UpdateRejectedException;
+    }
+
+    /**
+     * The planner's decision. Exactly one of the two holds: {@code rebuilt} is present (write it)
+     * or {@code refusals} is non-empty (write nothing).
+     */
+    record ResetDecision(Optional<StateRecords.UpdaterState> rebuilt, List<String> refusals) {
+        ResetDecision {
+            Objects.requireNonNull(rebuilt, "rebuilt");
+            refusals = List.copyOf(refusals);
+            if (rebuilt.isPresent() == !refusals.isEmpty()) {
+                throw new IllegalArgumentException("a decision either rebuilds or refuses");
+            }
+        }
+
+        static ResetDecision write(StateRecords.UpdaterState rebuilt) {
+            return new ResetDecision(Optional.of(rebuilt), List.of());
+        }
+
+        static ResetDecision refuse(String... messages) {
+            return new ResetDecision(Optional.empty(), List.of(messages));
+        }
+    }
+
+    /**
+     * Reads both files, asks {@code planner} for a decision and writes {@code state.json} only when
+     * the decision rebuilds it. The read, the decision and the write all happen under one lock
+     * acquisition, so a commit from another thread cannot land between them. The planner runs with
+     * the state lock held and must not call any {@link StateStore} method.
+     */
+    ResetDecision resetLocked(ResetPlanner planner) throws IOException, UpdateRejectedException {
+        Objects.requireNonNull(planner, "planner");
+        return withLocks(warnings -> {
+            boolean any = anyFileExists();
+            Optional<StateRecords.RevokedState> revoked = Optional.empty();
+            Optional<StateRecords.UpdaterState> state = Optional.empty();
+            if (any) {
+                revoked = Optional.ofNullable(readFile(REVOKED, RevokedCodec::decode, warnings).value());
+                state = Optional.ofNullable(readFile(STATE, StateCodec::decode, warnings).value());
+            }
+            ResetDecision decision = planner.plan(new ResetInput(any, state, revoked));
+            if (decision.rebuilt().isPresent()) {
+                atomicWrite(STATE, StateCodec.encode(decision.rebuilt().get()), StateStore::validState,
+                        warnings);
+            }
+            return decision;
+        });
+    }
+
+    /**
      * Raises {@code revocations.seq} to the trust floor and {@code minManifestSeq} to the manifest
      * floor. A raised seq invalidates the stored hash, so the seed form is used instead. Pure.
      */

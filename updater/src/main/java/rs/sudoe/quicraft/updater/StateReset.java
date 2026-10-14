@@ -5,12 +5,13 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import rs.sudoe.quicraft.updater.StateRecords.Snapshot;
 import rs.sudoe.quicraft.updater.StateRecords.UpdaterState;
 import rs.sudoe.quicraft.updater.StateRecords.WithdrawnEntry;
+import rs.sudoe.quicraft.updater.StateStore.ResetDecision;
+import rs.sudoe.quicraft.updater.StateStore.ResetInput;
 import rs.sudoe.quicraft.updater.TrustTransition.Transition;
 
 /**
@@ -32,6 +33,8 @@ final class StateReset {
             + "than the persisted state; install the current release first";
     static final String REFUSED_SAME_EPOCH_CONFLICT = "reset refused: the running jar's trust file conflicts "
             + "with the persisted key set at the same epoch";
+    static final String REFUSED_TRUST_NOT_APPLIED = "reset refused: the running jar's trust file has not been "
+            + "applied yet; restart the server first";
 
     private StateReset() {
     }
@@ -50,7 +53,8 @@ final class StateReset {
     }
 
     /**
-     * Resets the state and refetches.
+     * Resets the state and refetches. The decision is taken by {@link #plan} under the same lock
+     * acquisition that writes the state, so no commit can land between the read and the write.
      *
      * @throws IOException on a filesystem failure
      * @throws UpdateRejectedException when the store rejects the reset or the refetch
@@ -63,41 +67,10 @@ final class StateReset {
         Objects.requireNonNull(onDiskVersion, "onDiskVersion");
         Objects.requireNonNull(cancel, "cancel");
 
-        Probe probe;
-        Snapshot readable = null;
-        try {
-            Optional<Snapshot> loaded = store.load();
-            if (loaded.isEmpty()) {
-                probe = Probe.NOT_INITIALISED;
-            } else {
-                probe = Probe.READY;
-                readable = loaded.get();
-            }
-        } catch (StateUnavailableException e) {
-            probe = e.revokedValid() ? Probe.READY : Probe.REVOKED_UNREADABLE;
+        ResetDecision decision = store.resetLocked(input -> plan(input, id, onDiskVersion));
+        if (decision.rebuilt().isEmpty()) {
+            return new ResetResult(false, false, decision.refusals());
         }
-        if (probe == Probe.REVOKED_UNREADABLE) {
-            return new ResetResult(false, false, List.of(REVOKED_UNREADABLE));
-        }
-        if (probe == Probe.NOT_INITIALISED) {
-            return new ResetResult(false, false, List.of(NOT_INITIALISED));
-        }
-
-        UpdateDocuments.Trust trust = id.runningTrust();
-        UpdaterState seed = TrustTransition.apply(
-                TrustTransition.classify(null, trust), trust, null).newState();
-        if (readable != null) {
-            Transition transition = TrustTransition.classify(
-                    readable.state().persistedTrust(), trust).transition();
-            if (transition == Transition.OLDER_EPOCH_REPORT_ONLY) {
-                return new ResetResult(false, false, List.of(REFUSED_OLDER_EPOCH));
-            }
-            if (transition == Transition.INVALID_SAME_EPOCH) {
-                return new ResetResult(false, false, List.of(REFUSED_SAME_EPOCH_CONFLICT));
-            }
-            seed = withCarriedWithdrawn(seed, readable, id, onDiskVersion);
-        }
-        store.resetState(seed);
 
         CheckResult refetch = pipeline.run(CheckMode.REPORT, onDiskVersion, cancel);
         List<String> messages = new ArrayList<>();
@@ -106,10 +79,45 @@ final class StateReset {
         return new ResetResult(true, refetch.freshRevocations() && !refetch.stateFull(), messages);
     }
 
-    private enum Probe {
-        READY,
-        NOT_INITIALISED,
-        REVOKED_UNREADABLE
+    /**
+     * Decides a reset from what the files held under the lock. Pure: it writes nothing and calls no
+     * store method.
+     *
+     * <ul>
+     *   <li>No state files at all: refused as not initialised.</li>
+     *   <li>No valid {@code revoked.json}: refused as unreadable.</li>
+     *   <li>A readable {@code state.json} whose trust is not NORMAL against the running trust file:
+     *       refused. A higher epoch is refused because the trust must be applied first, never
+     *       reseeded over.</li>
+     *   <li>Otherwise rebuilt from the trust seed, keeping the withdrawn entries that still apply.</li>
+     * </ul>
+     */
+    static ResetDecision plan(ResetInput input, RuntimeIdentity id, UpdateVersion onDiskVersion)
+            throws UpdateRejectedException {
+        if (!input.anyFileExists()) {
+            return ResetDecision.refuse(NOT_INITIALISED);
+        }
+        if (input.revoked().isEmpty()) {
+            return ResetDecision.refuse(REVOKED_UNREADABLE);
+        }
+        UpdateDocuments.Trust trust = id.runningTrust();
+        UpdaterState seed = TrustTransition.apply(
+                TrustTransition.classify(null, trust), trust, null).newState();
+        if (input.state().isEmpty()) {
+            return ResetDecision.write(seed);
+        }
+        Snapshot readable = new Snapshot(input.state().get(), input.revoked().get());
+        Transition transition = TrustTransition.classify(readable.state().persistedTrust(), trust).transition();
+        if (transition == Transition.OLDER_EPOCH_REPORT_ONLY) {
+            return ResetDecision.refuse(REFUSED_OLDER_EPOCH);
+        }
+        if (transition == Transition.INVALID_SAME_EPOCH) {
+            return ResetDecision.refuse(REFUSED_SAME_EPOCH_CONFLICT);
+        }
+        if (transition != Transition.NORMAL) {
+            return ResetDecision.refuse(REFUSED_TRUST_NOT_APPLIED);
+        }
+        return ResetDecision.write(withCarriedWithdrawn(seed, readable, id, onDiskVersion));
     }
 
     /**

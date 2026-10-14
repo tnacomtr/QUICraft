@@ -129,6 +129,20 @@ class UpdateAdmissionTest {
     }
 
     @Test
+    void revocationKeyReplacementPendingIsRefusedUntilTheTrustIsApplied() throws Exception {
+        UpdateDocuments.Trust trust = PipelineFixtures.trust();
+        UpdateDocuments.Trust newer = new UpdateDocuments.Trust(trust.epoch() + 1, trust.built(),
+                trust.revocationsSeqFloor(), trust.manifestSeqFloor(), trust.keys());
+        RuntimeIdentity runningNewer = new RuntimeIdentity("fabric-26x", "26.1",
+                UpdateVersion.parse("0.3.0"), newer, PipelineFixtures.RUNNING_SHA512);
+        // Persisted revocation key differs from the running one at a higher running epoch.
+        Snapshot persisted = snapshot(trust.epoch(), KeySetFingerprint.of(trust.keys()), TestKeys.PUB_1);
+        AdmissionDecision d = UpdateAdmission.admit(healthy(), runningNewer, persisted);
+        assertFalse(d.admitted());
+        assertEquals(List.of(UpdateAdmission.TRUST_NOT_APPLIED), d.reasons());
+    }
+
+    @Test
     void everyReasonIsCollectedInRuleOrder() throws Exception {
         UpdateDocuments.Trust trust = PipelineFixtures.trust();
         Snapshot older = snapshot(trust.epoch() + 1, KeySetFingerprint.of(trust.keys()), TestKeys.PUB_2);
