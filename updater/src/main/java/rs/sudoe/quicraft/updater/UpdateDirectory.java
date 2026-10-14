@@ -8,6 +8,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileAttribute;
@@ -23,6 +24,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -277,16 +279,35 @@ public final class UpdateDirectory {
      * {@code staging/} and {@code backup/} (docs/updater.md 12.8). Read-only; the caller decides
      * whether the updater disables itself.
      *
+     * <p>An entry that is already gone when its owner is checked is skipped: {@link
+     * StateStore#prepareDirectory} creates and removes a {@code .owner-*.probe} file in the same
+     * directory, so another thread of this process can remove a listed entry. Every other failure,
+     * including a present entry with a foreign owner, still rejects.
+     *
      * @throws UpdateRejectedException on the first link or foreign owner found
      */
     public void requireOwnedContents() throws IOException, UpdateRejectedException {
+        requireOwnedContents(p -> { });
+    }
+
+    /**
+     * Test seam at the ownership scan: {@code afterListed} runs for every listed entry between the
+     * directory listing and that entry's checks, so a test can remove the entry to reproduce the
+     * concurrent-probe race. Production passes a no-op through {@link #requireOwnedContents()}.
+     */
+    void requireOwnedContents(Consumer<Path> afterListed) throws IOException, UpdateRejectedException {
         for (Path base : List.of(dir, staging, backup)) {
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(base)) {
                 for (Path p : stream) {
+                    afterListed.accept(p);
                     if (Files.isSymbolicLink(p)) {
                         throw new UpdateRejectedException("update file is a symbolic link");
                     }
-                    StateStore.requireOwner(p, owner);
+                    try {
+                        StateStore.requireOwner(p, owner);
+                    } catch (NoSuchFileException gone) {
+                        // Removed after the listing, for example a concurrent prepareDirectory probe.
+                    }
                 }
             }
         }
