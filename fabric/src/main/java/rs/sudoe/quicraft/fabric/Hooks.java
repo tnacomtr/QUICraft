@@ -37,10 +37,17 @@ public final class Hooks {
         faultInjection = only::contains;
     }
 
-    /** Logs a hook's failure once per hook; the caller then takes the vanilla path. */
+    /**
+     * Logs a hook's failure once per hook; the caller then takes the vanilla path. Never throws: it runs
+     * inside the hooks' catch blocks, so a failing logger must not stop the vanilla code that follows.
+     */
     public static void failed(String hook, Throwable t) {
-        if (WARNED.add(hook)) {
-            QuicraftFabric.LOG.warn("QUICraft: {} failed; continuing as vanilla (TCP). Logged once.", hook, t);
+        try {
+            if (WARNED.add(hook)) {
+                QuicraftFabric.LOG.warn("QUICraft: {} failed; continuing as vanilla (TCP). Logged once.", hook, t);
+            }
+        } catch (Throwable ignored) {
+            // Logging is best effort; the vanilla path matters more.
         }
     }
 }
