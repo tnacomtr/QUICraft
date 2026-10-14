@@ -5,6 +5,8 @@ import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.proxy.ConsoleCommandSource;
 import com.velocitypowered.api.proxy.Player;
+import com.velocitypowered.api.proxy.ProxyServer;
+import com.velocitypowered.api.util.ProxyVersion;
 import java.lang.reflect.Proxy;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
@@ -12,8 +14,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.TextComponent;
+import org.slf4j.Logger;
 import rs.sudoe.quicraft.updater.HealthSignal;
 import rs.sudoe.quicraft.updater.LiveJarDiscovery;
 import rs.sudoe.quicraft.updater.UpdateRejectedException;
@@ -48,6 +53,11 @@ final class UpdaterFakes {
         return (Player) proxy(Player.class, out, permissions, id);
     }
 
+    /** A fake player whose permission decision is arbitrary, for checks that must not run under a lock. */
+    static Player notifiedPlayer(Recorder out, Predicate<String> permission, UUID id) {
+        return (Player) proxy(Player.class, out, permission, id);
+    }
+
     static SimpleCommand.Invocation invocation(CommandSource source, String... args) {
         return (SimpleCommand.Invocation) Proxy.newProxyInstance(
                 UpdaterFakes.class.getClassLoader(),
@@ -56,11 +66,64 @@ final class UpdaterFakes {
                     case "source" -> source;
                     case "arguments" -> args.clone();
                     case "alias" -> "quicraft";
-                    default -> defaultValue(method.getReturnType(), method.getName());
+                    default -> defaultValue(method.getReturnType());
                 });
     }
 
+    /**
+     * A fake proxy for the plugin's init. {@code getVersion()} answers with another dynamic proxy (its
+     * {@code getVersion()} gives null, which the adapter maps to an empty game target); everything else
+     * answers with a default, so a failure in the init path surfaces as a real exception.
+     */
+    static ProxyServer proxyServer() {
+        return (ProxyServer) Proxy.newProxyInstance(UpdaterFakes.class.getClassLoader(),
+                new Class<?>[] {ProxyServer.class},
+                (self, method, args) -> {
+                    if ("getVersion".equals(method.getName())) {
+                        return new ProxyVersion("Velocity", "PaperMC", "4.2.0-30");
+                    }
+                    Class<?> type = method.getReturnType();
+                    if (type.isInterface()) {
+                        return Proxy.newProxyInstance(UpdaterFakes.class.getClassLoader(),
+                                new Class<?>[] {type}, (nested, nestedMethod, nestedArgs) ->
+                                        defaultValue(nestedMethod.getReturnType()));
+                    }
+                    return defaultValue(type);
+                });
+    }
+
+    /** A logger that records only the fact that a level was called. */
+    static Logger recordingLogger(List<String> lines) {
+        return (Logger) Proxy.newProxyInstance(UpdaterFakes.class.getClassLoader(),
+                new Class<?>[] {Logger.class},
+                (self, method, args) -> {
+                    switch (method.getName()) {
+                        case "trace", "debug", "info", "warn", "error" -> lines.add(method.getName());
+                        default -> {
+                        }
+                    }
+                    return defaultValue(method.getReturnType());
+                });
+    }
+
+    /** Records every dispatch, so the command grammar can be checked without a live updater. */
+    static final class RecordingDispatcher implements UpdateDispatcher {
+        final List<String[]> calls = new ArrayList<>();
+        final List<Boolean> consoles = new ArrayList<>();
+
+        @Override
+        public UpdaterRuntime.Reply dispatch(String[] args, boolean console, Consumer<String> out) {
+            calls.add(args.clone());
+            consoles.add(console);
+            return UpdaterRuntime.Reply.DONE;
+        }
+    }
+
     private static Object proxy(Class<?> type, Recorder out, Set<String> permissions, UUID id) {
+        return proxy(type, out, permissions::contains, id);
+    }
+
+    private static Object proxy(Class<?> type, Recorder out, Predicate<String> permissions, UUID id) {
         return Proxy.newProxyInstance(UpdaterFakes.class.getClassLoader(), new Class<?>[] {type},
                 (self, method, args) -> {
                     switch (method.getName()) {
@@ -70,11 +133,11 @@ final class UpdaterFakes {
                             }
                             return null;
                         case "hasPermission":
-                            return permissions.contains((String) args[0]);
+                            return permissions.test((String) args[0]);
                         case "getUniqueId":
                             return id;
                         default:
-                            return defaultValue(method.getReturnType(), method.getName());
+                            return defaultValue(method.getReturnType());
                     }
                 });
     }
@@ -150,7 +213,7 @@ final class UpdaterFakes {
         throw new IllegalArgumentException("only plain text components are used in these tests");
     }
 
-    private static Object defaultValue(Class<?> type, String name) {
+    private static Object defaultValue(Class<?> type) {
         if (type == boolean.class) {
             return false;
         }
@@ -160,9 +223,21 @@ final class UpdaterFakes {
         if (type == long.class) {
             return 0L;
         }
-        if (type == void.class) {
-            return null;
+        if (type == short.class) {
+            return (short) 0;
         }
-        throw new UnsupportedOperationException(name + " is not faked");
+        if (type == byte.class) {
+            return (byte) 0;
+        }
+        if (type == char.class) {
+            return (char) 0;
+        }
+        if (type == float.class) {
+            return 0f;
+        }
+        if (type == double.class) {
+            return 0d;
+        }
+        return null;
     }
 }

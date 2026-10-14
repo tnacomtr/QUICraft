@@ -56,6 +56,10 @@ public final class QuicraftVelocity {
     /** Set once the updater has started; null when it did not (docs/updater.md). */
     private volatile UpdaterRuntime updater;
     private volatile VelocityUpdateNotifier updateNotifier;
+    /** Set while QUIC init is under way; read by the late initialize handler for the health verdict. */
+    volatile boolean quicInitOk;
+    /** The updater platform, so the late initialize handler can complete the health verdict. */
+    volatile VelocityUpdaterPlatform updaterPlatform;
     /** Set while QUIC runs: clients that fell back to TCP report it here (docs/protocol.md §6). */
     volatile FallbackReport.Log fallbackLog;
     static final MinecraftChannelIdentifier FALLBACK_CHANNEL = MinecraftChannelIdentifier.from(Protocol.FALLBACK_CHANNEL);
@@ -70,22 +74,65 @@ public final class QuicraftVelocity {
     /** Runs before Velocity binds its listeners, so the wrapped initializer covers every channel. */
     @Subscribe
     public void onProxyInitialize(ProxyInitializeEvent event) {
-        boolean quicInitOk = false;
-        try {
-            start();
-            quicInitOk = true;
-        } catch (Throwable t) {
-            logger.warn("QUICraft: QUIC disabled, players connect over TCP as usual", t);
-            stop();
-        }
+        // QUIC init failure is contained: the updater starts either way (docs/updater.md 6).
+        quicInitOk = startQuicThen(logger, this::start, this::stop);
         // After QUIC init and in its own guard: the updater needs no QUIC, and neither affects the other.
-        startUpdater(quicInitOk);
+        startUpdater();
+    }
+
+    /**
+     * The health verdict completes here, not in {@link #onProxyInitialize}: registered with the lowest
+     * priority, which runs last (checked against Velocity 4.2's event manager; {@code PostOrder.LAST} is
+     * deprecated in 4.2 and only the second-to-last order), this handler runs after every other
+     * ProxyInitializeEvent handler, so a true verdict means the proxy finished its initialize handling
+     * and QUICraft's own init did not fail.
+     */
+    @Subscribe(priority = Short.MIN_VALUE)
+    public void onProxyInitializeLate(ProxyInitializeEvent event) {
+        VelocityUpdaterPlatform platform = updaterPlatform;
+        if (platform != null) {
+            platform.completeInit(quicInitOk);
+        }
     }
 
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
-        stop();
-        stopUpdater();
+        // The updater stops even when the QUIC stop throws.
+        stopQuicThen(this::stop, this::stopUpdater);
+    }
+
+    /** A QUIC init step, which may fail with a checked exception and reports whether QUIC came up. */
+    @FunctionalInterface
+    interface QuicInit {
+        boolean run() throws Exception;
+    }
+
+    /**
+     * Starts QUIC and reports whether it came up. A thrown failure is logged and the cleanup runs; a
+     * failure of that cleanup is contained too, so the caller always reaches the updater start
+     * (docs/updater.md 6). Static so the rule is testable without Velocity.
+     */
+    static boolean startQuicThen(Logger logger, QuicInit start, Runnable cleanup) {
+        try {
+            return start.run();
+        } catch (Throwable t) {
+            logger.warn("QUICraft: QUIC disabled, players connect over TCP as usual", t);
+            try {
+                cleanup.run();
+            } catch (Throwable cleanupFailure) {
+                logger.debug("QUICraft: cleaning up after a failed QUIC init failed", cleanupFailure);
+            }
+            return false;
+        }
+    }
+
+    /** Runs {@code stopQuic}; {@code stopUpdater} always follows, even when the first throws. */
+    static void stopQuicThen(Runnable stopQuic, Runnable stopUpdater) {
+        try {
+            stopQuic.run();
+        } finally {
+            stopUpdater.run();
+        }
     }
 
     /** Admin update notices wait for a joining admin (docs/updater.md 6, Notifications). */
@@ -103,28 +150,30 @@ public final class QuicraftVelocity {
 
     /**
      * Starts the updater (docs/updater.md) and registers {@code /quicraft update}. Every failure is
-     * logged once; QUIC and TCP are never affected. The health verdict completes last, so it reflects
-     * this whole init.
+     * logged once; QUIC and TCP are never affected. It publishes the platform so the late initialize
+     * handler completes the health verdict for this whole init.
      */
-    private void startUpdater(boolean quicInitOk) {
-        VelocityUpdaterPlatform platform = null;
+    private void startUpdater() {
         try {
             VelocityUpdateNotifier notifier = new VelocityUpdateNotifier(proxy::getAllPlayers);
             updateNotifier = notifier;
             String target = VelocityUpdaterPlatform.targetOf(proxy.getVersion().getVersion());
-            platform = new VelocityUpdaterPlatform(target, logger, dataDirectory, pluginSource(),
-                    Path.of("plugins"), notifier);
+            VelocityUpdaterPlatform platform = new VelocityUpdaterPlatform(target, logger, dataDirectory,
+                    pluginSource(), Path.of("plugins"), notifier);
+            updaterPlatform = platform;
             updater = runUpdaterStart(platform, logger, UpdaterRuntime::start);
             registerUpdateCommand();
         } catch (VirtualMachineError e) {
             throw e;
         } catch (Throwable t) {
             logger.warn("QUICraft: the updater did not start; QUIC and TCP are unaffected", t);
-        } finally {
-            if (platform != null) {
-                platform.completeInit(quicInitOk);
-            }
         }
+    }
+
+    /** The running updater's dispatch, or null when it did not start. */
+    private UpdateDispatcher updateDispatcher() {
+        UpdaterRuntime running = updater;
+        return running == null ? null : running::dispatch;
     }
 
     /** Velocity's own record of this plugin's jar; empty when Velocity does not know it. */
@@ -151,7 +200,7 @@ public final class QuicraftVelocity {
     private void registerUpdateCommand() {
         try {
             CommandMeta meta = proxy.getCommandManager().metaBuilder("quicraft").plugin(this).build();
-            proxy.getCommandManager().register(meta, new UpdateCommand(() -> updater, logger));
+            proxy.getCommandManager().register(meta, new UpdateCommand(this::updateDispatcher, logger));
         } catch (Throwable t) {
             logger.warn("QUICraft: the /quicraft update command is not available", t);
         }
@@ -236,17 +285,24 @@ public final class QuicraftVelocity {
                 CompletableFuture.delayedExecutor(10, TimeUnit.MILLISECONDS)).thenCompose(v -> whenNameFree(name, deadline));
     }
 
+    /**
+     * Starts QUIC.
+     *
+     * @return true when QUICraft's init succeeded. QUIC turned off on purpose (config, no native) is a
+     *     success; a failure to bind the UDP listener is not, so the health verdict never claims a
+     *     generation is healthy when its QUIC listener could not come up.
+     */
     @SuppressWarnings("deprecation") // ServerChannelInitializerHolder.set: internal, but the only hook
-    private void start() throws Exception {
+    private boolean start() throws Exception {
         Settings settings = Settings.load(dataDirectory);
         if (!settings.enabled()) {
             logger.info("QUICraft: disabled in {}", Settings.FILE);
-            return;
+            return true;
         }
         if (!QuicSupport.isAvailable()) {
             logger.info("QUICraft: no QUIC native for this platform ({}); TCP only",
                     String.valueOf(QuicSupport.unavailabilityCause()));
-            return;
+            return true;
         }
         ServerChannelInitializerHolder holder = connectionManager().serverChannelInitializer;
 
@@ -268,7 +324,7 @@ public final class QuicraftVelocity {
             logger.warn("QUICraft: could not bind UDP {} for QUIC ({}); not advertising QUIC, TCP only",
                     udp, e.toString());
             stop();
-            return;
+            return false;
         }
 
         advertiser = new StatusAdvertiser(
@@ -278,6 +334,7 @@ public final class QuicraftVelocity {
         proxy.getChannelRegistrar().register(FALLBACK_CHANNEL);
         logger.info("QUICraft: QUIC listening on UDP {} (fingerprint {}); open this UDP port in your firewall",
                 listener.localAddress(), identity.fingerprint());
+        return true;
     }
 
     /**
