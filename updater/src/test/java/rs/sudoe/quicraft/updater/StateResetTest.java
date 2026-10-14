@@ -19,6 +19,7 @@ import rs.sudoe.quicraft.updater.StateRecords.RevokedState;
 import rs.sudoe.quicraft.updater.StateRecords.Snapshot;
 import rs.sudoe.quicraft.updater.StateRecords.StateDelta;
 import rs.sudoe.quicraft.updater.StateRecords.UpdaterState;
+import rs.sudoe.quicraft.updater.StateRecords.WithdrawnEntry;
 import rs.sudoe.quicraft.updater.StateReset.ResetResult;
 
 /** Tests for {@link StateReset} (docs/updater.md 12.8). */
@@ -127,6 +128,62 @@ class StateResetTest {
         assertTrue(result.stateReset());
         assertFalse(result.stagingEnabled(), "a full revoked.json keeps staging disabled");
         assertEquals(64, store.load().orElseThrow().revoked().revokedPubs().size(), "nothing evicted");
+    }
+
+    /** The seed state with the given withdrawn entries, otherwise as a first run writes it. */
+    private static UpdaterState withWithdrawn(List<WithdrawnEntry> withdrawn) throws Exception {
+        UpdaterState seed = PipelineFixtures.seedState();
+        return new UpdaterState(seed.epoch(), seed.keySetFingerprint(), seed.revocationKey(), seed.revocations(),
+                Map.of(), withdrawn, "", List.of(), Map.of());
+    }
+
+    @Test
+    void resetKeepsOnlyWithdrawnEntriesThatStillApply() throws Exception {
+        Path dir = dir();
+        WithdrawnEntry live = new WithdrawnEntry("11".repeat(64), UpdateVersion.parse("0.4.0"), TestKeys.KID_2);
+        WithdrawnEntry revokedKid = new WithdrawnEntry("22".repeat(64), UpdateVersion.parse("0.5.0"), TestKeys.KID_1);
+        StateStore store = store(dir, new StateDelta(withWithdrawn(List.of(live, revokedKid)), revokedRelease()));
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        fetcher.answerEveryHost(PipelineFixtures.revocations(), PipelineFixtures.manifest());
+
+        ResetResult result = StateReset.resetStateAndRefetch(store, pipeline(store, fetcher),
+                PipelineFixtures.identity(), UpdateVersion.parse("0.3.0"), new MutableCancelToken());
+
+        assertTrue(result.stateReset());
+        assertEquals(List.of(live), store.load().orElseThrow().state().withdrawn(),
+                "the non-revoked, newer entry survives; the revoked-kid entry does not");
+    }
+
+    @Test
+    void resetDropsWithdrawnEntriesNotNewerThanTheRunningOrOnDiskVersion() throws Exception {
+        Path dir = dir();
+        WithdrawnEntry older = new WithdrawnEntry("33".repeat(64), UpdateVersion.parse("0.3.0"), TestKeys.KID_2);
+        StateStore store = store(dir, new StateDelta(withWithdrawn(List.of(older)), revokedRelease()));
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        fetcher.answerEveryHost(PipelineFixtures.revocations(), PipelineFixtures.manifest());
+
+        StateReset.resetStateAndRefetch(store, pipeline(store, fetcher),
+                PipelineFixtures.identity(), UpdateVersion.parse("0.3.0"), new MutableCancelToken());
+
+        assertEquals(List.of(), store.load().orElseThrow().state().withdrawn(),
+                "an entry at the running version is no longer withdrawn");
+    }
+
+    @Test
+    void unreadableStateResetsWithEmptyWithdrawn() throws Exception {
+        Path dir = dir();
+        WithdrawnEntry live = new WithdrawnEntry("44".repeat(64), UpdateVersion.parse("0.4.0"), TestKeys.KID_2);
+        StateStore store = store(dir, new StateDelta(withWithdrawn(List.of(live)), revokedRelease()));
+        PipelineFixtures.writePrivate(dir.resolve(StateStore.STATE), SignedFixtures.bytes("garbage"));
+        ScriptedFetcher fetcher = new ScriptedFetcher();
+        fetcher.answerEveryHost(PipelineFixtures.revocations(), PipelineFixtures.manifest());
+
+        ResetResult result = StateReset.resetStateAndRefetch(store, pipeline(store, fetcher),
+                PipelineFixtures.identity(), UpdateVersion.parse("0.3.0"), new MutableCancelToken());
+
+        assertTrue(result.stateReset());
+        assertEquals(List.of(), store.load().orElseThrow().state().withdrawn(),
+                "no readable state, so no withdrawn entries are carried");
     }
 
     private static String[] revokedKeys(int from, int count) throws Exception {

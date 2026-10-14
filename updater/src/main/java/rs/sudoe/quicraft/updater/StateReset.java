@@ -5,7 +5,12 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
+import rs.sudoe.quicraft.updater.StateRecords.Snapshot;
 import rs.sudoe.quicraft.updater.StateRecords.UpdaterState;
+import rs.sudoe.quicraft.updater.StateRecords.WithdrawnEntry;
 
 /**
  * The {@code /quicraft update reset-state} command (docs/updater.md 12.8). Rebuilds
@@ -53,7 +58,19 @@ final class StateReset {
         Objects.requireNonNull(onDiskVersion, "onDiskVersion");
         Objects.requireNonNull(cancel, "cancel");
 
-        Probe probe = probe(store);
+        Probe probe;
+        Snapshot readable = null;
+        try {
+            Optional<Snapshot> loaded = store.load();
+            if (loaded.isEmpty()) {
+                probe = Probe.NOT_INITIALISED;
+            } else {
+                probe = Probe.READY;
+                readable = loaded.get();
+            }
+        } catch (StateUnavailableException e) {
+            probe = e.revokedValid() ? Probe.READY : Probe.REVOKED_UNREADABLE;
+        }
         if (probe == Probe.REVOKED_UNREADABLE) {
             return new ResetResult(false, false, List.of(REVOKED_UNREADABLE));
         }
@@ -64,6 +81,9 @@ final class StateReset {
         UpdateDocuments.Trust trust = id.runningTrust();
         UpdaterState seed = TrustTransition.apply(
                 TrustTransition.classify(null, trust), trust, null).newState();
+        if (readable != null) {
+            seed = withCarriedWithdrawn(seed, readable, id, onDiskVersion);
+        }
         store.resetState(seed);
 
         CheckResult refetch = pipeline.run(CheckMode.REPORT, onDiskVersion, cancel);
@@ -80,14 +100,23 @@ final class StateReset {
     }
 
     /**
-     * Decides whether a reset may proceed. A valid {@code revoked.json} is required; an invalid
-     * {@code state.json} is fine, because the reset rebuilds it.
+     * Keeps the withdrawn entries of a readable state that still apply: the kid is not revoked and the
+     * version is newer than both the running version and the on-disk version. Everything else is
+     * rebuilt from the trust seed, as before.
      */
-    private static Probe probe(StateStore store) throws IOException, UpdateRejectedException {
-        try {
-            return store.load().isPresent() ? Probe.READY : Probe.NOT_INITIALISED;
-        } catch (StateUnavailableException e) {
-            return e.revokedValid() ? Probe.READY : Probe.REVOKED_UNREADABLE;
-        }
+    private static UpdaterState withCarriedWithdrawn(UpdaterState seed, Snapshot readable, RuntimeIdentity id,
+            UpdateVersion onDiskVersion) {
+        UpdateVersion floor = id.runningVersion().compareTo(onDiskVersion) >= 0
+                ? id.runningVersion() : onDiskVersion;
+        Set<String> revokedKids = readable.revoked().revokedKeys().stream()
+                .map(UpdateDocuments.RevokedKey::kid)
+                .collect(Collectors.toSet());
+        List<WithdrawnEntry> kept = readable.state().withdrawn().stream()
+                .filter(w -> !revokedKids.contains(w.kid()))
+                .filter(w -> w.version().compareTo(floor) > 0)
+                .toList();
+        return new UpdaterState(seed.epoch(), seed.keySetFingerprint(), seed.revocationKey(),
+                seed.revocations(), seed.seqByKid(), kept, seed.lastAnnounced(), seed.warnedBad(),
+                seed.tornSince());
     }
 }
