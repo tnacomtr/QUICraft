@@ -51,6 +51,12 @@ Not released yet. When it is:
   through a TCP-only frontend (TCPShield, playit.gg, Cloudflare Spectrum and similar), QUIC can't
   reach you and clients use TCP automatically.
 
+  On Linux a server spreads QUIC over several UDP sockets with SO_REUSEPORT, one per game event
+  loop, because one loop is the bottleneck at the scale target (`udp-sockets` in
+  `plugins/quicraft/config.properties` or `config/quicraft/server.properties`: `auto` by default,
+  an integer 1..64 to pin it; see [server security](docs/server-security.md)). The startup line
+  names the socket count. Nothing to do for it in your firewall: they share the QUIC port.
+
   Velocity details (Velocity 4.2, Java 25): drop the jar into `plugins/`. On first start it
   writes `plugins/quicraft/config.properties` and a self-signed certificate
   (`quic-key.pem`, `quic-cert.pem`; keep them, since clients remember the fingerprint). If

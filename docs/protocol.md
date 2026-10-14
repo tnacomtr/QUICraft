@@ -461,11 +461,26 @@ same address with SO_REUSEPORT, each on its own event loop thread.
   set through `NioChannelOption`. Where the JDK or the platform does not support it, the listener
   binds one socket, so a bind never depends on it.
 - `QuicServer.bind(List<HostLoop>, List<HostDatagramSocket>, ...)` for the hosted transport above:
-  the platform binds each of its own sockets with SO_REUSEPORT and hands one loop per socket.
+  the platform binds each of its own sockets with SO_REUSEPORT and hands one loop per socket. A
+  failure to bind sockets 2..N is not fatal there: the platform closes them and keeps the first
+  socket (see `udp-sockets` below).
 - `QuicServer.defaultSocketCount()`: `min(availableProcessors(), 16)` on Linux. Everywhere else it
   is 1: macOS and the BSDs hash unicast UDP on the local address alone, so several sockets would
   starve, and Windows has no SO_REUSEPORT. The system property `quicraft.udpSockets` (1..64; an
   invalid value logs one warning and keeps the default) overrides it.
+- `udp-sockets` in the platform's own config (`plugins/quicraft/config.properties` for Velocity,
+  `config/quicraft/server.properties` for the Fabric dedicated server): `auto` (the default) is
+  `QuicServer.defaultSocketCount()`, an integer 1..64 is that many, and anything else is `auto` with
+  one warning. It is the count the hosted path binds: as many of the platform's own UDP sockets,
+  one per distinct loop of the game's worker group (fewer when the group has fewer loops), each with
+  SO_REUSEPORT found for that transport (the transport's own `ChannelOption`, or `NioChannelOption`
+  over `StandardSocketOptions.SO_REUSEPORT` for NIO), the first on the configured address and the
+  rest on its actual local address. An accepted stream stays on the loop of the socket that
+  received it, and the listener's startup line names the socket count it bound.
+- Only Linux, and only when the transport has a SO_REUSEPORT the kernel accepts, binds several:
+  anywhere else, or if the option is refused, or if binding sockets 2..N fails, they are closed and
+  the listener keeps one socket with one INFO line, so `udp-sockets` can never fail a startup. The
+  first socket keeps the option when it was applied to it, which changes nothing on its own.
 - `close()` closes every socket and, for core's own transport, the thread group. A bind that fails
   on a later socket closes the sockets already bound and the group, then rethrows.
 
