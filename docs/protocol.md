@@ -402,6 +402,12 @@ Verified against `netty-codec-classes-quic` 4.2.19.Final (Oct 2026):
   `FailedValidation`, `Closed`, `ReusedSourceConnectionId`, `PeerMigrated`), and
   `collectPathStats(int)` gives per-path stats. What a mid-session address change means for IP
   bans and forwarding is decided in Phase 9.
+- Known limit (measured 2026-10-14, `ReusePortListenerTest`, Linux, Netty QUIC 4.2.19): a
+  connection survives **one** NAT rebind, with one listener socket or several. After a second
+  rebind of the same connection the server's datagrams stop reaching the client and the connection
+  runs into its idle timeout. The same happens with one socket, so it comes from the codec's path
+  and connection-id handling, not from the socket dispatch. Changing it touches transport
+  parameters (for example the active connection-id limit) and is left to Phase 9.
 
 ## 11. Native library and platforms
 

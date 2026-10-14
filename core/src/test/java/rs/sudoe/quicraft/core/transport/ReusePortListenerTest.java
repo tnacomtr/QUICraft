@@ -8,6 +8,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import java.net.BindException;
+import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -16,7 +18,9 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -41,6 +45,12 @@ class ReusePortListenerTest {
     /** Threads of a listener's own group; a client's are named quicraft-client-. */
     private static final String SERVER_THREAD_PREFIX = "quicraft-server-";
     private static final long CONNECT_TIMEOUT_SECONDS = 10;
+    /** How many connections each rebinding test moves to a new local port, one rebind per connection. */
+    private static final int REBINDS = 8;
+    /** Source ports whose 4-tuple hash is measured before the rebind, to aim at another socket. */
+    private static final int CALIBRATIONS = 8;
+    /** The echo has to come back this fast; quiche retransmits a lost datagram well inside it. */
+    private static final long ECHO_TIMEOUT_SECONDS = 5;
 
     private static ServerIdentity identity;
 
@@ -304,6 +314,233 @@ class ReusePortListenerTest {
     }
 
     /**
+     * A NAT rebind with today's single-socket listener: the client's datagrams reach the listener
+     * from a new source port mid-connection, as they do when a home NAT picks a new external port.
+     * There is no second socket that could forward anything here, so this is the baseline: does the
+     * QUIC layer accept the peer-address change at all, with the transport parameters we send?
+     * ({@code Codecs.apply} leaves Netty's active-migration option at its default, off.)
+     *
+     * <p>It does, once per connection. A second rebind is silently dropped, which is quiche's path
+     * bookkeeping rather than a listener bug: a new 4-tuple needs a new path, and quiche's path map
+     * holds at most {@code active_connection_id_limit} paths (2, the RFC 9000 default, and what
+     * Netty's codec leaves it at), of which the old path stays non-removable because it keeps the
+     * connection's destination connection id. That is pinned below, so a quiche change surfaces
+     * here instead of silently in production.
+     */
+    @Test
+    void aRebindKeepsTheConnectionAliveOnOneSocket() throws Exception {
+        TransportConfig config = limits(1000);
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), 1, identity, config,
+                Loopback.echo(new CompletableFuture<>()));
+                RebindRelay relay = new RebindRelay(server.localAddress(), 0)) {
+            assertEquals(1, server.socketCount(), "the baseline is the single-socket listener every platform uses");
+            QuicByteStream stream = QuicClient.connect(relay.address(), identity.fingerprint(), config)
+                    .get(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            Loopback.Collector collector = new Loopback.Collector();
+            stream.setListener(collector);
+            stream.setAutoRead(true);
+            int received = echoRoundTrip(stream, collector, 0, "before the rebind");
+
+            relay.rebind(0);
+            System.out.println("single socket, rebind 1: the listener now sees the client at port "
+                    + relay.upstreamPort());
+            received = echoRoundTrip(stream, collector, received, "after the first rebind");
+            assertTrue(stream.isOpen(), "the connection is still open after the rebind");
+
+            relay.rebind(0);
+            byte[] second = "after the second rebind".getBytes(StandardCharsets.UTF_8);
+            stream.write(ByteBuffer.wrap(second));
+            stream.flush();
+            int afterSecond = collector.await(received + second.length, 3, TimeUnit.SECONDS).length;
+            System.out.println("single socket, rebind 2 (port " + relay.upstreamPort() + "): "
+                    + (afterSecond - received) + " of " + second.length + " bytes came back");
+            assertEquals(received, afterSecond,
+                    "quiche accepted a second peer address change on one connection: with the limits we send it "
+                            + "allows exactly one. Update this test if a dependency upgrade changed that");
+            assertTrue(stream.isOpen(), "a dropped rebind leaves the connection open, not closed");
+            stream.close();
+        }
+    }
+
+    /**
+     * The same rebind with {@link #SOCKETS} SO_REUSEPORT sockets. For each round the kernel's
+     * 4-tuple hash is measured first, one probe connection per candidate source port: the socket
+     * that counts the probe is the socket the kernel gives every datagram from that port. The
+     * connection is then made from a measured port, so the socket that accepts it is predicted
+     * before the connect and checked against the counters after it, and it is rebound onto a port
+     * the hash gives to a different socket. Those datagrams are read by a socket whose codec knows
+     * no such connection: only {@link io.netty.handler.codec.quic.QuicCodecDispatcher}
+     * (QuicServer.SocketDispatcher) can deliver them, by the connection id the listener issued. The
+     * echo proves they arrived; the counters prove no second connection was made for them.
+     *
+     * <p>Several connections with one rebind each rather than several rebinds on one connection:
+     * quiche accepts only one peer-address change per connection, see
+     * {@link #aRebindKeepsTheConnectionAliveOnOneSocket()}.
+     */
+    @Test
+    void aRebindOntoAnotherSocketKeepsTheConnectionAlive() throws Exception {
+        assumeSeveralSockets();
+        TransportConfig config = limits(1000);
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), SOCKETS, identity, config,
+                Loopback.echo(new CompletableFuture<>()))) {
+            assertEquals(SOCKETS, server.socketCount());
+            Map<Integer, Integer> socketOfPort = calibrateSourcePorts(server, config);
+            // The mapping is a property of the 4-tuple, not a one-off: the same port measured again,
+            // after the probes and their sockets are gone, still gets the same socket.
+            int firstPort = socketOfPort.keySet().iterator().next();
+            assertEquals(socketOfPort.get(firstPort).intValue(), socketForSourcePort(server, config, firstPort),
+                    "the kernel must give the same source port to the same socket every time: " + socketOfPort);
+
+            int proven = 0;
+            Map<String, Integer> pairs = new LinkedHashMap<>();
+            for (int round = 1; round <= REBINDS; round++) {
+                try (RebindRelay relay = new RebindRelay(server.localAddress(), 0)) {
+                    // Speak from a measured port, so the accepting socket is known in advance. The
+                    // rotation makes the rounds use different measured ports, hence different
+                    // owning and receiving sockets.
+                    int from = rebindToCalibratedPort(relay, socketOfPort, -1, round * 3);
+                    int[] beforeConnect = server.acceptedConnectionsPerSocket();
+                    QuicByteStream stream = QuicClient.connect(relay.address(), identity.fingerprint(), config)
+                            .get(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    int[] afterConnect = server.acceptedConnectionsPerSocket();
+                    int owner = theOnlySocketThatGained(beforeConnect, afterConnect);
+                    assertEquals(socketOfPort.get(from).intValue(), owner,
+                            "the measured hash must predict the socket that accepts the connection from port " + from
+                                    + ": " + socketOfPort);
+                    Loopback.Collector collector = new Loopback.Collector();
+                    stream.setListener(collector);
+                    stream.setAutoRead(true);
+                    int received = echoRoundTrip(stream, collector, 0, "round " + round + " before the rebind");
+
+                    int port = rebindToCalibratedPort(relay, socketOfPort, owner, round * 3 + 1);
+                    int receiver = socketOfPort.get(port);
+                    System.out.println("round " + round + ": the connection lives on socket " + owner
+                            + " (its packets arrive from port " + from + "); after the rebind they arrive from port "
+                            + port + ", which the kernel's 4-tuple hash gives to socket " + receiver);
+                    received = echoRoundTrip(stream, collector, received, "round " + round + " after the rebind");
+                    assertArrayEquals(afterConnect, server.acceptedConnectionsPerSocket(),
+                            "the rebind must reach the existing connection, not create one: "
+                                    + Arrays.toString(server.acceptedConnectionsPerSocket()));
+                    pairs.put("owner " + owner, receiver);
+                    proven++;
+                    stream.close();
+                }
+            }
+
+            assertEquals(REBINDS, proven, "every round rebound onto a socket that did not own the connection");
+            System.out.println("NAT rebind over " + SOCKETS + " sockets: " + proven + " connections each accepted on"
+                    + " the socket their first port predicted and kept echoing after a rebind onto another socket,"
+                    + " owner -> receiving socket per round " + pairs + ". Kernel source-port hash: " + socketOfPort);
+        }
+    }
+
+    /**
+     * Picks source ports and measures, for each, the socket the kernel's SO_REUSEPORT hash gives its
+     * traffic to. The hash is a function of the 4-tuple only (both ends on loopback, one listener
+     * address), so it stays valid for the rebind that later sends a connection's packets from that
+     * port. Ports outside the ephemeral range are used, so the kernel does not hand them out in
+     * between; a busy one is skipped.
+     */
+    private static Map<Integer, Integer> calibrateSourcePorts(QuicServer server, TransportConfig config)
+            throws Exception {
+        Map<Integer, Integer> socketOfPort = new LinkedHashMap<>();
+        int port = 20_000 + (int) (System.nanoTime() % 8_000L);
+        for (int tries = 0; socketOfPort.size() < CALIBRATIONS && tries < 200; tries++, port++) {
+            try {
+                socketOfPort.put(port, socketForSourcePort(server, config, port));
+            } catch (BindException busy) {
+                // something else holds this port; the next one will do
+            }
+        }
+        assertEquals(CALIBRATIONS, socketOfPort.size(),
+                "could not calibrate " + CALIBRATIONS + " source ports: " + socketOfPort);
+        return socketOfPort;
+    }
+
+    /**
+     * The socket the kernel's hash gives {@code sourcePort}'s traffic to: a QUIC connection is
+     * opened through a relay whose socket facing the listener is bound to exactly that port, and
+     * the socket whose accepted-connection count grows is the one the kernel picked for it.
+     */
+    private static int socketForSourcePort(QuicServer server, TransportConfig config, int sourcePort)
+            throws Exception {
+        int[] before = server.acceptedConnectionsPerSocket();
+        try (RebindRelay probe = new RebindRelay(server.localAddress(), sourcePort)) {
+            assertEquals(sourcePort, probe.upstreamPort(), "the probe must speak from the measured port");
+            QuicByteStream stream = QuicClient.connect(probe.address(), identity.fingerprint(), config)
+                    .get(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            stream.close();
+        }
+        return theOnlySocketThatGained(before, server.acceptedConnectionsPerSocket());
+    }
+
+    /**
+     * Moves the relay onto the first calibrated port that is free and whose measured socket is not
+     * {@code owner} ({@code -1}: any), starting {@code rotation} entries into the calibrated ports
+     * so the rounds do not all pick the same one, and returns it. A port something else took
+     * meanwhile is skipped; the relay keeps working from its previous port if none is left.
+     */
+    private static int rebindToCalibratedPort(RebindRelay relay, Map<Integer, Integer> socketOfPort, int owner,
+            int rotation) throws SocketException {
+        List<Integer> ports = new ArrayList<>(socketOfPort.keySet());
+        for (int i = 0; i < ports.size(); i++) {
+            int port = ports.get((i + rotation) % ports.size());
+            if (socketOfPort.get(port) == owner) {
+                continue;
+            }
+            try {
+                relay.rebind(port);
+                assertEquals(port, relay.upstreamPort());
+                return port;
+            } catch (BindException taken) {
+                // moved on since the calibration; the next candidate will do
+            }
+        }
+        throw new AssertionError("no free calibrated source port maps to a socket other than " + owner + ": "
+                + socketOfPort);
+    }
+
+    /** The one socket whose accepted-connection count grew by one from {@code before} to {@code after}. */
+    private static int theOnlySocketThatGained(int[] before, int[] after) {
+        int gained = -1;
+        for (int i = 0; i < after.length; i++) {
+            int delta = after[i] - before[i];
+            assertTrue(delta == 0 || delta == 1,
+                    "socket " + i + " accepted " + delta + " connections: " + Arrays.toString(before) + " -> "
+                            + Arrays.toString(after));
+            if (delta == 1) {
+                assertTrue(gained < 0, "two sockets accepted a connection: " + Arrays.toString(before) + " -> "
+                        + Arrays.toString(after));
+                gained = i;
+            }
+        }
+        assertTrue(gained >= 0, "no socket accepted the connection: " + Arrays.toString(before) + " -> "
+                + Arrays.toString(after));
+        return gained;
+    }
+
+    /**
+     * Writes {@code text} and requires its echo: the collector must hold {@code received} bytes plus
+     * the text within {@link #ECHO_TIMEOUT_SECONDS}, with the text as the tail. Returns the new
+     * total, so the next round trip awaits the bytes after it.
+     */
+    private static int echoRoundTrip(QuicByteStream stream, Loopback.Collector collector, int received, String text)
+            throws InterruptedException {
+        byte[] payload = text.getBytes(StandardCharsets.UTF_8);
+        long start = System.nanoTime();
+        stream.write(ByteBuffer.wrap(payload));
+        stream.flush();
+        int expected = received + payload.length;
+        byte[] all = collector.await(expected, ECHO_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        assertEquals(expected, all.length, "\"" + text + "\" was not echoed within " + ECHO_TIMEOUT_SECONDS
+                + " s: " + (all.length - received) + " of " + payload.length + " bytes came back in " + millis + " ms");
+        assertArrayEquals(payload, Arrays.copyOfRange(all, received, expected));
+        System.out.println("\"" + text + "\" echoed in " + millis + " ms");
+        return expected;
+    }
+
+    /**
      * The socket index the listener encoded into the source connection id of its first datagram to
      * the client. A long header is {@code byte0, version(4), dcidLength, dcid, scidLength, scid}
      * (RFC 9000 §17.2); Netty's generator puts the index in the first two bytes of every id.
@@ -367,6 +604,135 @@ class ReusePortListenerTest {
         @Override
         public void close() {
             socket.close();
+        }
+    }
+
+    /**
+     * A UDP relay that stands in for a NAT. The client talks to one socket, which never changes;
+     * the socket facing the listener can be moved to a new local port mid-connection, which is
+     * exactly what the listener sees when a NAT rebinds: the peer's address changes while both
+     * directions keep flowing. A datagram in flight through the switch can be lost, because the
+     * socket it was read from is gone; QUIC retransmits it.
+     */
+    private static final class RebindRelay implements AutoCloseable {
+        private final InetSocketAddress server;
+        /** Faces the client and never changes, so the client never sees the rebind. */
+        private final DatagramSocket facing;
+        /** Faces the listener; rebound to a new local port by {@link #rebind(int)}. */
+        private volatile DatagramSocket upstream;
+        /** The client's address, learned from its first datagram. */
+        private volatile InetSocketAddress client;
+
+        RebindRelay(InetSocketAddress server, int upstreamPort) throws SocketException {
+            this.server = server;
+            this.facing = new DatagramSocket(loopback(0));
+            this.upstream = new DatagramSocket(loopback(upstreamPort));
+            startUpstreamPump();
+            Thread toServer = new Thread(this::pumpToServer, "reuse-port-relay-to-server");
+            toServer.setDaemon(true);
+            toServer.start();
+        }
+
+        InetSocketAddress address() {
+            return (InetSocketAddress) facing.getLocalSocketAddress();
+        }
+
+        /** The local port the listener currently sees this relay at. */
+        int upstreamPort() {
+            return upstream.getLocalPort();
+        }
+
+        /**
+         * Moves the socket facing the listener to {@code port}, or to any free port when 0, which
+         * is never the one it had. Datagrams written from now on go out from the new port; the
+         * first one carrying data is what the listener reads as the peer-address change.
+         */
+        void rebind(int port) throws SocketException {
+            synchronized (this) {
+                DatagramSocket previous = upstream;
+                DatagramSocket next = null;
+                for (int attempt = 0; attempt < 8 && next == null; attempt++) {
+                    DatagramSocket candidate = new DatagramSocket(loopback(port));
+                    if (port != 0 || candidate.getLocalPort() != previous.getLocalPort()) {
+                        next = candidate;
+                    } else {
+                        candidate.close();
+                    }
+                }
+                if (next == null) {
+                    throw new SocketException("the kernel kept handing back the same local port");
+                }
+                upstream = next;
+                startUpstreamPump();
+                previous.close();
+            }
+        }
+
+        /** Reads the client's datagrams and sends them on from the current upstream socket. */
+        private void pumpToServer() {
+            byte[] buffer = new byte[65536];
+            while (true) {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                try {
+                    facing.receive(packet);
+                } catch (java.io.IOException closed) {
+                    return;
+                }
+                client = (InetSocketAddress) packet.getSocketAddress();
+                byte[] data = Arrays.copyOf(packet.getData(), packet.getLength());
+                synchronized (this) {
+                    try {
+                        upstream.send(new DatagramPacket(data, data.length, server));
+                    } catch (java.io.IOException ignored) {
+                        // the socket was just rebound; QUIC retransmits
+                    }
+                }
+            }
+        }
+
+        /** Reads the listener's datagrams off one upstream socket and sends them to the client. */
+        private void startUpstreamPump() {
+            DatagramSocket reads = upstream;
+            Thread pump = new Thread(() -> pumpFromServer(reads), "reuse-port-relay-from-server");
+            pump.setDaemon(true);
+            pump.start();
+        }
+
+        private void pumpFromServer(DatagramSocket reads) {
+            byte[] buffer = new byte[65536];
+            while (true) {
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                try {
+                    reads.receive(packet);
+                } catch (java.io.IOException closed) {
+                    return;
+                }
+                byte[] data = Arrays.copyOf(packet.getData(), packet.getLength());
+                synchronized (this) {
+                    if (reads != upstream) {
+                        continue; // rebound meanwhile: this socket's reading ends
+                    }
+                    InetSocketAddress to = client;
+                    if (to == null) {
+                        continue; // nothing from the client yet
+                    }
+                    try {
+                        facing.send(new DatagramPacket(data, data.length, to));
+                    } catch (java.io.IOException ignored) {
+                        // closing
+                    }
+                }
+            }
+        }
+
+        private static InetSocketAddress loopback(int port) {
+            return new InetSocketAddress(InetAddress.getLoopbackAddress(), port);
+        }
+
+        @Override
+        public void close() {
+            facing.close();
+            upstream.close();
         }
     }
 
