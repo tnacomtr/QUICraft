@@ -121,7 +121,7 @@ class UpdaterRuntimeHealthTest {
                 UpdaterFacadeFixtures.testHosts()));
         try {
             UpdaterFacadeFixtures.Output out = new UpdaterFacadeFixtures.Output();
-            rt.dispatch(new String[] {"update"}, true, out::add);
+            rt.dispatch(new String[0], true, out::add);
             assertTrue(rt.awaitIdle(Duration.ofSeconds(30)));
             assertTrue(out.snapshot().stream().anyMatch(l -> l.contains("update finished: NOT_ADMITTED")),
                     () -> "output was " + out.snapshot());

@@ -25,6 +25,8 @@ public final class OwnJarVersion {
      * @return the version recorded in the jar's build metadata
      * @throws IOException when the file is not a readable zip
      * @throws UpdateRejectedException when the metadata is missing, duplicated, oversized or invalid
+     * @throws DevelopmentBuildException when the metadata is a development (SNAPSHOT) build, which the
+     *     parser rejects as an invalid version
      */
     public static UpdateVersion read(Path jar) throws IOException, UpdateRejectedException {
         try (ZipFile zip = new ZipFile(jar.toFile())) {
@@ -33,7 +35,17 @@ public final class OwnJarVersion {
             if (entry == null || entry.isDirectory()) {
                 throw new UpdateRejectedException("build metadata entry missing");
             }
-            return DocumentParser.parseBuild(readCapped(zip, entry)).version();
+            byte[] buildJson = readCapped(zip, entry);
+            try {
+                return DocumentParser.parseBuild(buildJson).version();
+            } catch (UpdateRejectedException e) {
+                // A SNAPSHOT version is the one parse failure with its own reason, so name it here rather
+                // than let the validator turn it into a generic "cannot read the live jar version".
+                if (DevelopmentBuildException.looksLikeDevelopmentBuild(buildJson)) {
+                    throw new DevelopmentBuildException();
+                }
+                throw e;
+            }
         }
     }
 
