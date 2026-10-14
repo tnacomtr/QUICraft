@@ -1,0 +1,1 @@
+{"type":"quicraft.trust","v":1,"epoch":1,"built":"2026-10-01T00:00:00Z","revocationsSeqFloor":0,"manifestSeqFloor":0,"keys":[{"kid":"21fe31dfa154a261","pub":"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a","roles":["release"]},{"kid":"39f713d0a644253f","pub":"3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c","roles":["release","revocation"]}]}
