@@ -65,11 +65,12 @@ Console, RCON, or an operator (Fabric: any player on the server's OP list; Veloc
 
 - Nothing is downloaded or installed automatically. A scheduled check only reports.
 - Velocity has no OPs. Its notify permission is `quicraft.admin.update.notify` (draft).
-- Fabric: implemented. A command source may run it when either it has no entity (the console, RCON, a
-  command block or a datapack function) and holds the admin permission it always needed, or its entity is
-  a player on the server's OP list, at any op level (1 to 4). A level-2 command block or datapack
-  function is therefore still refused, and `reset-state` stays console-only. No permission node and no
-  permissions-mod integration: the OP list is the rule.
+- Fabric: implemented. Allowed: the console and RCON (no entity, admin permission); any player on the
+  server's OP list, at any op level (1 to 4); and, as before, a player holding the admin permission
+  (level 3, or granted by a permissions mod). Command blocks and datapack functions run at level 2 and
+  are refused, and `reset-state` stays console-only. The same rule picks who gets the join notice.
+  `/execute as <player>` is judged by that player, so a command block an operator built can run it as
+  an operator; building one already takes an operator.
 
 ## 4. Keys, freshness, and revocation
 

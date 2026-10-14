@@ -148,9 +148,9 @@ public final class ServerUpdater {
 
     /**
      * The gate for {@code /quicraft update} (docs/updater.md section 3). Allowed when the source has no
-     * entity (the console, RCON, a command block or a datapack function) and holds the admin permission it
-     * always needed, or when its entity is a player on the server's operator list, whatever the op level. A
-     * source with any other entity, or one that cannot answer, is refused. Fail closed.
+     * entity and holds the admin permission (the console and RCON; command blocks and datapack functions run
+     * at level 2 and are refused), or when its entity is a player {@link #isAdmin(ServerPlayer) allowed} on
+     * their own. A source with any other entity, or one that cannot answer, is refused. Fail closed.
      */
     static boolean isAdmin(CommandSourceStack source) {
         try {
@@ -166,12 +166,16 @@ public final class ServerUpdater {
         }
     }
 
-    /** True when {@code player} is on the server's operator list, at any op level. Fail closed. */
+    /**
+     * True when {@code player} is on the server's operator list, at any op level, or holds the admin
+     * permission (level 3, or granted by a permissions mod), as before the OP-list rule. Fail closed.
+     */
     static boolean isAdmin(ServerPlayer player) {
         try {
             Hooks.enter("updater admin check");
             MinecraftServer s = player.level().getServer();
-            return s != null && s.getPlayerList().isOp(player.nameAndId());
+            return s != null && s.getPlayerList().isOp(player.nameAndId())
+                    || player.permissions().hasPermission(Permissions.COMMANDS_ADMIN);
         } catch (Throwable t) {
             Hooks.failed("updater admin check", t);
             return false;
