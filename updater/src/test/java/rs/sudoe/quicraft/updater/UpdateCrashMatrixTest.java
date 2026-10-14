@@ -516,7 +516,11 @@ class UpdateCrashMatrixTest {
         // The next command on the restarted identity, now that no journal is pending.
         byte[] nowLive = Files.readAllBytes(r.live);
         RuntimeIdentity restarted = identity(Arrays.equals(nowLive, r.jar) ? NEW : RUNNING, nowLive);
-        assertFalse(journalOf(r.upd).isPresent(), "no journal is pending for the next command");
+        if (rr.status() == RecoveryStatus.RECOVERY_REQUIRED) {
+            assertTrue(journalOf(r.upd).isPresent(), "recovery-required keeps the journal as evidence");
+        } else {
+            assertFalse(journalOf(r.upd).isPresent(), "no journal is pending for the next command");
+        }
         int stagedBefore = stagingCount(r.upd);
         int backupsBefore = backupCount(r.upd);
         follow = transaction(r, restarted, r.artifact, new StateStore(r.upd), DurabilityOps.system())
@@ -593,24 +597,81 @@ class UpdateCrashMatrixTest {
     }
 
     /**
-     * An older revocations document and an older manifest are served after recovery. The document omits
-     * {@link #PUB_X}, so accepting it would remove a restriction. Nothing is installed and nothing is removed.
+     * Replays older metadata after recovery. The replay runs on a fresh rig that starts admitted and
+     * journal-free and carries the recovered state.json and revoked.json, because a pending journal rejects
+     * the command before any fetch. Every replay must reach the metadata fetch (admission passed and the
+     * check ran), must not reach a download, and must leave floors and restrictions as they were.
      */
-    private static void replayRefused(Rig r, InstallCapability cap) throws Exception {
-        byte[] revokedBefore = Files.readAllBytes(r.upd.resolve("revoked.json"));
-        byte[] liveBefore = Files.readAllBytes(r.live);
-        TransactionFixtures.serveMetadata(r.metadata, PipelineFixtures.revocationsSeq(2,
-                PipelineFixtures.revokedKey(KID_OLD, PUB_OLD)), TransactionFixtures.manifestFor(r.jar, NEW, 41));
-        RuntimeIdentity id = identity(Arrays.equals(liveBefore, r.jar) ? NEW : RUNNING, liveBefore);
-        TransactionResult replay = transaction(r, id, r.artifact, new StateStore(r.upd), DurabilityOps.system())
+    private void replayRefused(Rig r, InstallCapability cap) throws Exception {
+        Rig fresh = release(tmp.resolve("replay-" + cap + "-" + r.root.getFileName()));
+        Files.copy(r.upd.resolve("state.json"), fresh.upd.resolve("state.json"),
+                StandardCopyOption.REPLACE_EXISTING);
+        Files.copy(r.upd.resolve("revoked.json"), fresh.upd.resolve("revoked.json"),
+                StandardCopyOption.REPLACE_EXISTING);
+        assertFalse(journalOf(fresh.upd).isPresent(), "the replay starts journal-free");
+        Snapshot before = new StateStore(fresh.upd).load().orElseThrow();
+        assertTrue(pubs(before.revoked()).contains(PUB_X), "the recovered state keeps the restriction");
+
+        // A: an older revocations document (seq 2 < 3) that omits PUB_X, with the current manifest.
+        TransactionFixtures.serveMetadata(fresh.metadata, PipelineFixtures.revocationsSeq(2,
+                PipelineFixtures.revokedKey(KID_OLD, PUB_OLD)), TransactionFixtures.manifestFor(fresh.jar, NEW));
+        Replayed stale = replay(fresh, cap);
+        assertTrue(stale.fetches > 0, "the stale revocations were fetched: admission passed and the check ran");
+        assertNotInstalled(fresh, stale.result, "stale revocations");
+        assertEquals(0, stale.downloads, "stale revocations never reach a download");
+        assertRestrictionsKept(before, new StateStore(fresh.upd).load().orElseThrow());
+
+        // B: an otherwise eligible newer release (0.9.0 > 0.4.0) with a stale manifest sequence (1 < floor 2),
+        // with the current revocations.
+        byte[] newer = TransactionFixtures.releaseJar("9.0.0");
+        fresh.artifact = new TransactionFixtures.ArtifactFetcher(fresh.metadata, newer);
+        TransactionFixtures.serveMetadata(fresh.metadata, servedRevocations(),
+                TransactionFixtures.manifestFor(newer, "9.0.0", 1));
+        Replayed stalePin = replay(fresh, cap);
+        assertTrue(stalePin.fetches > 0, "the stale manifest was fetched: admission passed and the check ran");
+        assertNotInstalled(fresh, stalePin.result, "a stale manifest sequence");
+        assertEquals(0, stalePin.downloads, "a stale manifest sequence never reaches a download");
+        assertTrue(stalePin.result.messages().toString().contains("manifest sequence is below the floor"),
+                "the refusal is for the sequence: " + stalePin.result.messages());
+        assertRestrictionsKept(before, new StateStore(fresh.upd).load().orElseThrow());
+    }
+
+    /** Counts of one replay: metadata fetches and artifact downloads that reached the fetcher. */
+    private static final class Replayed {
+        int fetches;
+        int downloads;
+        TransactionResult result;
+    }
+
+    private static Replayed replay(Rig fresh, InstallCapability cap) throws Exception {
+        Replayed out = new Replayed();
+        Hooked hooked = new Hooked(fresh.artifact);
+        hooked.beforeFetch = () -> out.fetches++;
+        hooked.afterDownload = () -> out.downloads++;
+        RuntimeIdentity id = identity(RUNNING, OLD);
+        out.result = transaction(fresh, id, hooked, new StateStore(fresh.upd), DurabilityOps.system())
                 .execute(new UpdateRequest(id, cap, NO_OP));
-        assertTrue(replay.outcome() != TransactionOutcome.STAGED_ONLY
-                && replay.outcome() != TransactionOutcome.INSTALLED_RESTART_PENDING, replay.messages().toString());
-        assertArrayEquals(liveBefore, Files.readAllBytes(r.live), "a replayed older release leaves the live jar");
-        assertArrayEquals(revokedBefore, Files.readAllBytes(r.upd.resolve("revoked.json")),
-                "a replayed older revocations document removes nothing");
-        assertTrue(pubs(new StateStore(r.upd).load().orElseThrow().revoked()).contains(PUB_X),
-                "the restriction stays after the replay");
+        return out;
+    }
+
+    private static void assertNotInstalled(Rig fresh, TransactionResult result, String why) throws Exception {
+        assertTrue(result.outcome() != TransactionOutcome.STAGED_ONLY
+                && result.outcome() != TransactionOutcome.INSTALLED_RESTART_PENDING,
+                why + ": " + result.messages());
+        assertArrayEquals(OLD, Files.readAllBytes(fresh.live), why + " leaves the live jar");
+        assertEquals(0, stagingCount(fresh.upd), why + " leaves no staging");
+        assertFalse(journalOf(fresh.upd).isPresent(), why + " leaves no journal");
+    }
+
+    /** Floors and restrictions are unchanged by a refused replay, and nothing goes backwards. */
+    private static void assertRestrictionsKept(Snapshot before, Snapshot after) {
+        assertEquals(before.revoked(), after.revoked(), "revoked keys and blocked artifacts are unchanged");
+        assertEquals(before.state().seqByKid(), after.state().seqByKid(), "per-key floors are unchanged");
+        assertEquals(before.state().revocations(), after.state().revocations(),
+                "the revocations sequence is unchanged");
+        assertEquals(before.state().withdrawn(), after.state().withdrawn(), "withdrawn entries are unchanged");
+        assertEquals(before.state().epoch(), after.state().epoch(), "the trust epoch is unchanged");
+        assertMonotone(before, after);
     }
 
     @TestFactory
