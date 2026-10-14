@@ -15,6 +15,7 @@ import net.fabricmc.loom.api.LoomGradleExtensionAPI
 
 plugins {
     id("quicraft.java-conventions")
+    id("quicraft.updater-trust")
 }
 
 val loom = extensions.getByType<LoomGradleExtensionAPI>()

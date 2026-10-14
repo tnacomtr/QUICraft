@@ -8,6 +8,7 @@ import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 plugins {
     id("quicraft.java-conventions")
     id("com.gradleup.shadow")
+    id("quicraft.updater-trust")
 }
 
 tasks.withType<JavaCompile>().configureEach {
@@ -88,4 +89,11 @@ tasks.named<Test>("test") {
     workingDir = work.get().asFile
     doFirst { work.get().asFile.mkdirs() }
     jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // The updater metadata test reads the outer (shaded) jar, the one the updater swaps.
+    dependsOn(tasks.named("shadowJar"))
+    val shadowArchive = tasks.named<ShadowJar>("shadowJar").flatMap { it.archiveFile }
+    doFirst {
+        systemProperty("quicraft.shadowJar", shadowArchive.get().asFile.absolutePath)
+    }
+    systemProperty("quicraft.expectedVersion", project.version.toString())
 }
