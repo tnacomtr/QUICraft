@@ -735,6 +735,20 @@ Paths are relative to the per-platform updater directory `<updateDir>` (12.14).
   Old floors are lost, so manifests between the jar's `manifestSeqFloor` and the lost floor become
   acceptable again; the downgrade rule still blocks older versions. Alternative: documented manual
   deletion of `state.json` only (never `revoked.json`).
+  Security review of 3.6a (2026-10-14) adds:
+  - When the old `state.json` (or its `.prev`) is still readable, the reset carries its `withdrawn`
+    entries forward, keeping those whose kid is not revoked and whose version is above
+    max(running, on-disk). Without this, a reset would re-admit a withdrawn build served by hosts
+    that replay an older manifest. When `state.json` is unreadable, `withdrawn` starts empty, and
+    that loss is an accepted residual.
+  - When the readable state classifies as case 3 (same epoch, other key set) or case 4 (older
+    epoch) against the running trust file, the reset is refused, so it cannot lift those
+    restrictions.
+  - The reset takes `txn.lock` and refuses while `journal.json` exists, so it never runs inside a
+    transaction (wired with the command in Wave 4).
+  - Admission additionally requires both live-jar hashes to be 128 lowercase hex characters and
+    the trust transition to be case 2 (normal); a running trust file not yet applied to the
+    persisted state refuses until restart.
 
 #### Initialisation
 
