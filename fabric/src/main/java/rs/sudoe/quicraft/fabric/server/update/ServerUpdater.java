@@ -11,6 +11,7 @@ import net.minecraft.server.dedicated.DedicatedServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.permissions.Permissions;
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.world.entity.Entity;
 import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.QuicraftFabric;
@@ -145,12 +146,36 @@ public final class ServerUpdater {
         return ((CommandSourceStackAccessor) (Object) source).quicraft$source() instanceof MinecraftServer;
     }
 
+    /**
+     * The gate for {@code /quicraft update} (docs/updater.md section 3). Allowed when the source has no
+     * entity (the console, RCON, a command block or a datapack function) and holds the admin permission it
+     * always needed, or when its entity is a player on the server's operator list, whatever the op level. A
+     * source with any other entity, or one that cannot answer, is refused. Fail closed.
+     */
     static boolean isAdmin(CommandSourceStack source) {
-        return source.permissions().hasPermission(Permissions.COMMANDS_ADMIN);
+        try {
+            Hooks.enter("updater admin check");
+            Entity entity = source.getEntity();
+            if (entity instanceof ServerPlayer player) {
+                return isAdmin(player);
+            }
+            return entity == null && source.permissions().hasPermission(Permissions.COMMANDS_ADMIN);
+        } catch (Throwable t) {
+            Hooks.failed("updater admin check", t);
+            return false;
+        }
     }
 
+    /** True when {@code player} is on the server's operator list, at any op level. Fail closed. */
     static boolean isAdmin(ServerPlayer player) {
-        return player.permissions().hasPermission(Permissions.COMMANDS_ADMIN);
+        try {
+            Hooks.enter("updater admin check");
+            MinecraftServer s = player.level().getServer();
+            return s != null && s.getPlayerList().isOp(player.nameAndId());
+        } catch (Throwable t) {
+            Hooks.failed("updater admin check", t);
+            return false;
+        }
     }
 
     /** Sends one answer line to the invoker. A failure here never reaches the command or the server. */

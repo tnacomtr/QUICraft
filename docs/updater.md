@@ -52,7 +52,8 @@ manual-only updater instead of this design is not allowed.
 
 ## 3. Commands and permissions (draft, not registered)
 
-Console, or a player with `quicraft.admin.update`, except that `reset-state` is console-only:
+Console, RCON, or an operator (Fabric: any player on the server's OP list; Velocity: the
+`quicraft.admin.update` permission), except that `reset-state` is console-only:
 
 | Command | Effect |
 | --- | --- |
@@ -64,8 +65,11 @@ Console, or a player with `quicraft.admin.update`, except that `reset-state` is 
 
 - Nothing is downloaded or installed automatically. A scheduled check only reports.
 - Velocity has no OPs. Its notify permission is `quicraft.admin.update.notify` (draft).
-- Fabric: operators at permission level 3 or higher, or a permission node if a permissions mod is
-  installed (draft). The exact permission integration is unresolved.
+- Fabric: implemented. A command source may run it when either it has no entity (the console, RCON, a
+  command block or a datapack function) and holds the admin permission it always needed, or its entity is
+  a player on the server's OP list, at any op level (1 to 4). A level-2 command block or datapack
+  function is therefore still refused, and `reset-state` stays console-only. No permission node and no
+  permissions-mod integration: the OP list is the rule.
 
 ## 4. Keys, freshness, and revocation
 
