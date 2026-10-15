@@ -120,16 +120,23 @@ public final class ClientConnector {
         private final T tcp;
         private final FallbackReason fallback;
         private final V3Plan v3Plan;
+        private final String fallbackMessage;
 
         Outcome(QuicByteStream quic, T tcp, FallbackReason fallback) {
-            this(quic, tcp, fallback, null);
+            this(quic, tcp, fallback, null, null);
         }
 
         Outcome(QuicByteStream quic, T tcp, FallbackReason fallback, V3Plan v3Plan) {
+            this(quic, tcp, fallback, v3Plan, null);
+        }
+
+        Outcome(QuicByteStream quic, T tcp, FallbackReason fallback, V3Plan v3Plan,
+                String fallbackMessage) {
             this.quic = quic;
             this.tcp = tcp;
             this.fallback = fallback;
             this.v3Plan = v3Plan;
+            this.fallbackMessage = fallbackMessage;
         }
 
         public QuicByteStream quic() {
@@ -153,17 +160,34 @@ public final class ClientConnector {
          * bookkeeping of 12.15 and 12.16 (docs/protocol.md 12.3, 13.1). Only the {@code connect}
          * overload that takes the logical server name produces one.
          *
-         * <p>{@link V3Plan#activated()} and {@link V3Plan#failed(boolean)} report the end of the
-         * attempt, so the adapter calls one of them once this outcome's QUIC stream has either
+         * <p>{@link V3Plan#activated()} and {@link V3Plan#failed(boolean, String)} report the end of
+         * the attempt, so the adapter calls one of them once this outcome's QUIC stream has either
          * finished its binding exchange or failed.</p>
          *
          * <p>Non-null exactly when this outcome carries a {@code /3} QUIC stream, so a caller that
          * got TCP instead has nothing to report and nothing to bind: the {@code /3} attempt either
-         * never happened (the selection chose {@code /2} or TCP) or already ended in this same
-         * attempt, with the connector recording §6's entry and the re-bind backoff (12.16).</p>
+         * never happened (the selection chose TCP) or already ended in this same attempt, with the
+         * connector recording the failure cache entry and the re-bind backoff (12.16) and the
+         * player-facing message in {@link #fallbackMessage()}.</p>
          */
         public V3Plan v3Plan() {
             return v3Plan;
+        }
+
+        /**
+         * What to log and to show the player about a {@code /3} attempt that failed, or null when
+         * nothing failed (the user's "fall back to TCP at once, and tell the player" decision).
+         *
+         * <p>Two sources, one message: a failure the connector itself handled before the adapter
+         * could drive the exchange, such as a QUIC handshake that timed out or an ALPN failure,
+         * carries it here; a failure the adapter reported through
+         * {@link V3Plan#failed(boolean, String)} carries it on the plan.</p>
+         */
+        public String fallbackMessage() {
+            if (fallbackMessage != null) {
+                return fallbackMessage;
+            }
+            return v3Plan == null ? null : v3Plan.fallbackMessage();
         }
     }
 
@@ -435,7 +459,8 @@ public final class ClientConnector {
                 LOG.log(Level.FINE, "the /3 pre-connect step failed; using the shipped decision",
                         unwrap(error));
                 try {
-                    decided(server, mode, advertisement, joinInputs, platform, result);
+                    fallbackAfterPreconnectFailure(server, mode, advertisement, joinInputs, platform,
+                            result);
                 } catch (Throwable t) {
                     result.completeExceptionally(t);
                 }
@@ -548,6 +573,54 @@ public final class ClientConnector {
     }
 
     /**
+     * What to do when the pre-connect {@code /3} step itself threw, which the user's fail-safe
+     * decision counts as a {@code /3} failure: fall back to TCP at once and tell the player.
+     *
+     * <p>A {@code quicraft/2} advertisement, or none at all, keeps the shipped decision, which is
+     * {@code /2} or TCP. A {@code quicraft/3} advertisement goes straight to TCP, because a
+     * {@code /3} listener speaks {@code /3} only and must never be offered {@code /2} (13.1), with
+     * {@code quic-only} still failing as §4 requires.</p>
+     */
+    private <T> void fallbackAfterPreconnectFailure(InetSocketAddress server, ConnectDecision.Mode mode,
+            Optional<Advertisement> advertisement, String joinInputs, Platform<T> platform,
+            CompletableFuture<Outcome<T>> result) {
+        if (!advertisement.isPresent() || Protocol.ALPN.equals(advertisement.get().alpn())) {
+            decided(server, mode, advertisement, joinInputs, platform, result);
+            return;
+        }
+        if (mode == ConnectDecision.Mode.QUIC_ONLY) {
+            result.completeExceptionally(new IOException(
+                    "QUIC only: the /3 pre-connect step failed and there is no TCP fallback"));
+            return;
+        }
+        tcpOnly(platform, result, fallbackMessage(V3Plan.INTERNAL_ERROR));
+    }
+
+    /** The player-facing message of a {@code /3} fallback (user decision). */
+    private static String fallbackMessage(String reason) {
+        return "QUIC multi-stream failed (" + reason + "), fell back to TCP";
+    }
+
+    /**
+     * A short, human-readable cause for the player, from a failed QUIC attempt's classified reason.
+     * It never carries a certificate, an address or any other detail a player cannot use.
+     */
+    private static String fallbackReason(FallbackReason reason) {
+        switch (reason) {
+            case TIMEOUT_OR_LOST_RACE:
+                return V3Plan.HANDSHAKE_TIMED_OUT;
+            case FINGERPRINT_MISMATCH:
+                return "server certificate did not match the advertisement";
+            case UDP_UNREACHABLE:
+                return "UDP is unreachable";
+            case HANDSHAKE_FAILURE:
+            case OTHER:
+            default:
+                return "handshake failed";
+        }
+    }
+
+    /**
      * The client's routing table for its protocol number, when the advertisement is for
      * {@code /3} (13.1, 13.7). Never guessed: no table means no {@code /3}.
      */
@@ -634,7 +707,7 @@ public final class ClientConnector {
                             endRebindAttemptFailed(server, ad, prepared);
                         }
                     });
-                    tcpOnly(platform, result);
+                    tcpOnly(platform, result, fallbackMessage(fallbackReason(FallbackReason.classify(error))));
                     return;
                 }
                 failures.recordSuccess(target.getAddress(), target.getPort(), ad.fingerprint());
@@ -788,12 +861,21 @@ public final class ClientConnector {
     }
 
     private <T> void tcpOnly(Platform<T> platform, CompletableFuture<Outcome<T>> result) {
+        tcpOnly(platform, result, null);
+    }
+
+    /**
+     * As {@link #tcpOnly(Platform, CompletableFuture)}, carrying the player-facing message of a
+     * {@code /3} fallback the connector handled itself (the user's fail-safe decision).
+     */
+    private <T> void tcpOnly(Platform<T> platform, CompletableFuture<Outcome<T>> result,
+            String fallbackMessage) {
         ConnectionRace.Tcp<T> tcp = platform.tcp();
         CompletableFuture<T> attempt = tcp.connect();
         attempt.whenComplete((connection, error) -> {
             if (error != null) {
                 result.completeExceptionally(new TcpConnectException(unwrap(error)));
-            } else if (!result.complete(new Outcome<T>(null, connection, null))) {
+            } else if (!result.complete(new Outcome<T>(null, connection, null, null, fallbackMessage))) {
                 tcp.close(connection); // cancelled meanwhile
             }
         });
@@ -866,7 +948,8 @@ public final class ClientConnector {
                 return;
             }
             failures.recordFailure(target.getAddress(), target.getPort(), ad.fingerprint());
-            Outcome<T> outcome = new Outcome<T>(null, r.tcp(), r.quicFailure(), null);
+            Outcome<T> outcome = new Outcome<T>(null, r.tcp(), r.quicFailure(), null,
+                    plans == null ? null : fallbackMessage(fallbackReason(r.quicFailure())));
             if (early != null && early.sent()) {
                 // The server may have started a login on the 0-RTT flight. The lost QUIC attempt
                 // sends CONNECTION_CLOSE; give it one TCP round trip to arrive before the TCP login

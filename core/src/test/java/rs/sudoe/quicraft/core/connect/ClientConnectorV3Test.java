@@ -44,9 +44,11 @@ import rs.sudoe.quicraft.core.transport.EarlyFlight;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 
 /**
- * The {@code /3} pre-connect selection and its pin and re-bind bookkeeping, end to end through
- * {@link ClientConnector} (docs/protocol.md 12.3, 12.15, 12.16, 13.1). The routing table comes from
- * the fixtures in {@code core/src/test/resources}.
+ * The {@code /3} pre-connect selection and its pin, re-bind and fallback bookkeeping, end to end
+ * through {@link ClientConnector} (docs/protocol.md 12.3, 12.15, 12.16, 13.1, and the user's
+ * fail-safe decision). A {@code /3} listener speaks {@code /3} only, so a client that cannot do
+ * {@code /3} joins over TCP; {@code /2} is only ever selected for a {@code quicraft/2}
+ * advertisement. The routing table comes from the fixtures in {@code core/src/test/resources}.
  */
 class ClientConnectorV3Test {
     /** The protocol number of the valid routing fixture. */
@@ -284,7 +286,7 @@ class ClientConnectorV3Test {
         ClientConnector connector = f.connector(true, true);
         Outcome<String> first = f.connect(connector, new FakePlatform(), Mode.AUTO);
         // The attempt ends in failure: 12.16's window is now up.
-        assertTrue(first.v3Plan().failed(true));
+        assertTrue(f.rebinds.endAttempt(first.v3Plan().attempt(), false));
 
         FakePlatform second = new FakePlatform();
         Outcome<String> outcome = f.connect(connector, second, Mode.AUTO);
@@ -369,27 +371,28 @@ class ClientConnectorV3Test {
     }
 
     @Test
-    void anOrdinaryPinWithAMissingPrerequisiteUsesV2() throws Exception {
+    void anOrdinaryPinWithAMissingPrerequisiteUsesTcp() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3(Collections.singletonMap(Integer.valueOf(PROTOCOL), "sha256:" + repeat('a')));
         FakePlatform p = new FakePlatform();
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
 
-        assertNotNull(outcome.quic());
-        assertEquals(1, p.v2Dials.get(), "13.1: a /3 listener also accepts /2");
+        assertEquals("tcp", outcome.tcp(), "13.1: a /3 listener speaks /3 only, so this is TCP");
+        assertEquals(0, p.v2Dials.get(), "a /3 listener is never offered /2");
         assertEquals(0, p.v3Dials.get());
-        assertNull(outcome.v3Plan(), "the /2 path is the shipped one");
+        assertNull(outcome.v3Plan(), "nothing failed: the client simply cannot do /3 here");
+        assertNull(outcome.fallbackMessage());
     }
 
     @Test
-    void anOrdinaryPinWithoutALocalRoutingTableUsesV2() throws Exception {
+    void anOrdinaryPinWithoutALocalRoutingTableUsesTcp() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3(Collections.singletonMap(Integer.valueOf(4242), "sha256:" + repeat('a')));
         FakePlatform p = new FakePlatform();
         // 4242 has no resource on the test classpath, so the client has no table for it.
         Outcome<String> outcome = f.connect(f.connector(4242, true, true), p, Mode.AUTO);
-        assertNotNull(outcome.quic());
-        assertEquals(1, p.v2Dials.get());
+        assertEquals("tcp", outcome.tcp());
+        assertEquals(0, p.v2Dials.get());
         assertNull(outcome.v3Plan());
     }
 
@@ -407,7 +410,7 @@ class ClientConnectorV3Test {
     }
 
     @Test
-    void aCorruptPinStoreUsesV2ForAnOrdinaryName(@TempDir Path dir) throws Exception {
+    void aCorruptPinStoreUsesTcpForAnOrdinaryName(@TempDir Path dir) throws Exception {
         Path file = dir.resolve("pins-v2.json");
         Files.write(file, "{not a pin store".getBytes(StandardCharsets.UTF_8));
         PinStore pins = PinStore.load(file);
@@ -417,10 +420,18 @@ class ClientConnectorV3Test {
         FakePlatform p = new FakePlatform();
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
 
-        assertNotNull(outcome.quic());
-        assertEquals(1, p.v2Dials.get(), "12.15: a corrupt store uses /2, and the player is told");
+        assertEquals("tcp", outcome.tcp(), "12.15: a corrupt store uses TCP for a /3 listener");
+        assertEquals(0, p.v2Dials.get(), "a /3 listener is never offered /2");
         assertEquals(0, p.v3Dials.get());
         assertNull(outcome.v3Plan());
+
+        // A /2 listener is unaffected by the store: /2 involves no pin at all.
+        Fixture g = new Fixture(PinStore.load(file), RebindState.load(null));
+        g.advertiseV2();
+        FakePlatform v2 = new FakePlatform();
+        Outcome<String> shipped = g.connect(g.connector(true, true), v2, Mode.AUTO);
+        assertNotNull(shipped.quic());
+        assertEquals(1, v2.v2Dials.get());
     }
 
     @Test
@@ -519,46 +530,53 @@ class ClientConnectorV3Test {
     }
 
     @Test
-    void failureRecordsTheRightKindOfEntryAndOnlyAChangedPinMayRetryOverTcp() throws Exception {
+    void failureRecordsTheRightKindOfEntryAndRetriesForEveryKindBeforeActivation() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
         f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
         V3Plan changed = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
-        assertTrue(changed.failed(true), "12.16: only a changed pin may start a fresh TCP join");
+        assertTrue(changed.failed(false, V3Plan.REBIND_FAILED),
+                "the user's fail-safe decision: a failed re-bind continues over fresh TCP");
+        assertEquals("QUIC multi-stream failed (" + V3Plan.REBIND_FAILED + "), fell back to TCP",
+                changed.fallbackMessage());
         assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
-                "12.14: a failure after a connection is an activation failure");
+                "12.14: the failure is recorded as an activation failure");
         assertTrue(f.failures.allows(f.address(), QUIC_PORT, f.fingerprint),
                 "and it is not also a handshake entry");
 
         Fixture g = Fixture.empty();
         g.advertiseV3();
         V3Plan ordinary = g.connect(g.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
-        assertFalse(ordinary.failed(true), "12.14: an ordinary activation failure never replays over TCP");
-
-        Fixture h = Fixture.empty();
-        h.advertiseV3();
-        V3Plan before = h.connect(h.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
-        before.failed(false);
-        assertFalse(h.failures.isActivationBlocked(h.address(), QUIC_PORT, h.fingerprint, h.clock.get()),
-                "before any connection it is an ordinary §6 entry");
-        assertFalse(h.failures.allows(h.address(), QUIC_PORT, h.fingerprint));
+        assertNull(ordinary.attempt(), "an ordinary pin takes no re-bind attempt");
+        assertTrue(ordinary.failed(false, V3Plan.BINDING_FAILED),
+                "and it still gets the same-attempt TCP retry before activation");
     }
 
     @Test
-    void aFaultInThePreconnectStepStillJoinsOverV2OrTcp() throws Exception {
+    void aFaultInThePreconnectStepFallsBackToTcpWithAMessage() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
         FakePlatform p = new FakePlatform();
         Faults.set(Faults.V3_SELECT);
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
-        assertNotNull(outcome.quic(), "the shipped decision still connects");
-        assertEquals(1, p.v2Dials.get());
-        assertNull(outcome.v3Plan());
+        assertEquals("tcp", outcome.tcp(), "13.1: a /3 listener is never offered /2");
+        assertEquals(0, p.v2Dials.get());
+        assertEquals(0, p.v3Dials.get());
+        assertEquals("QUIC multi-stream failed (internal error), fell back to TCP",
+                outcome.fallbackMessage());
+        assertNull(outcome.v3Plan(), "no /3 connection exists, so there is no plan to drive");
 
-        // With no advertisement the same fault ends in TCP.
+        // A /2 advertisement, or none, keeps the shipped decision: /2 or TCP.
         Fixture g = Fixture.empty();
+        g.advertiseV2();
+        FakePlatform v2 = new FakePlatform();
+        Outcome<String> shipped = g.connect(g.connector(true, true), v2, Mode.AUTO);
+        assertNotNull(shipped.quic());
+        assertEquals(1, v2.v2Dials.get());
+
+        Fixture h = Fixture.empty();
         FakePlatform none = new FakePlatform();
-        Outcome<String> tcp = g.connect(g.connector(true, true), none, Mode.AUTO);
+        Outcome<String> tcp = h.connect(h.connector(true, true), none, Mode.AUTO);
         assertEquals("tcp", tcp.tcp());
         assertEquals(0, none.v3Dials.get());
         assertEquals(0, none.v2Dials.get());
@@ -572,6 +590,8 @@ class ClientConnectorV3Test {
         Faults.set(Faults.V3_DIAL);
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
         assertEquals("tcp", outcome.tcp(), "§5: a failed /3 handshake races and falls back");
+        assertEquals("QUIC multi-stream failed (handshake failed), fell back to TCP",
+                outcome.fallbackMessage());
     }
 
     @Test
@@ -584,10 +604,110 @@ class ClientConnectorV3Test {
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
 
         assertEquals("tcp", outcome.tcp(), "12.16: a failed re-bind continues over fresh TCP");
+        assertEquals("QUIC multi-stream failed (handshake failed), fell back to TCP",
+                outcome.fallbackMessage());
         assertFalse(f.failures.allows(f.address(), QUIC_PORT, f.fingerprint),
                 "§6's entry is recorded");
         assertNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.get()),
                 "and the re-bind backoff is up");
+    }
+
+    /** The user's fail-safe decision: every failure kind before activation retries over fresh TCP. */
+    @Test
+    void everyFailureKindBeforeActivationRetriesOverFreshTcpAndTellsThePlayer() throws Exception {
+        String[] reasons = {
+                V3Plan.BINDING_FAILED,
+                V3Plan.REBIND_FAILED,
+                V3Plan.HANDSHAKE_TIMED_OUT,
+                V3Plan.INTERNAL_ERROR,
+                "exporter error",
+                "activation deadline",
+                "quiescence queue overflow",
+                "the ALPN was not offered",
+        };
+        for (String reason : reasons) {
+            Fixture f = Fixture.empty();
+            f.advertiseV3();
+            f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+            V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
+            assertTrue(plan.failed(false, reason), reason + " must retry over fresh TCP");
+            assertEquals("QUIC multi-stream failed (" + reason + "), fell back to TCP",
+                    plan.fallbackMessage());
+            assertEquals(reason, plan.fallbackReason());
+            assertTrue(plan.isFailed());
+            assertFalse(plan.isActivated());
+            assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
+                    reason + " must record the activation failure so later joins use TCP");
+        }
+    }
+
+    @Test
+    void theDefaultFailureReasonIsTheInternalErrorOne() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
+        assertNull(plan.fallbackMessage(), "nothing failed yet");
+        assertNull(plan.fallbackReason());
+        assertFalse(plan.isFailed());
+
+        assertTrue(plan.failed(false));
+        assertEquals("QUIC multi-stream failed (internal error), fell back to TCP", plan.fallbackMessage());
+        // Reporting twice keeps the first answer and the first reason.
+        assertTrue(plan.failed(false, "something else"));
+        assertEquals(V3Plan.INTERNAL_ERROR, plan.fallbackReason());
+    }
+
+    @Test
+    void aFailureAfterActivationDoesNotRetryInTheSameAttempt() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
+        plan.authenticatedLogin(true);
+        assertTrue(plan.activated().get(FIVE_SECONDS, TimeUnit.SECONDS));
+        assertTrue(plan.isActivated());
+
+        assertFalse(plan.failed(true, "lane ordering failure"),
+                "after activation there is no same-attempt retry; the next join uses TCP");
+        assertFalse(plan.isActivated());
+        assertEquals("QUIC multi-stream failed (lane ordering failure), fell back to TCP",
+                plan.fallbackMessage());
+        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
+                "so the next join goes straight to TCP during the backoff");
+
+        // A second report changes nothing, activated() cannot follow a failure, and the pin stays.
+        assertFalse(plan.failed(true, "later still"));
+        assertFalse(plan.activated().join().booleanValue());
+        assertEquals(f.fingerprint.toString(), f.pins.pin(HOST, LOGICAL_PORT).get().fingerprint());
+    }
+
+    @Test
+    void aFailedQuicHandshakeCarriesThePlayerFacingMessage() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        FakePlatform p = new FakePlatform();
+        p.quic = new CompletableFuture<QuicByteStream>();
+        p.quic.completeExceptionally(new javax.net.ssl.SSLHandshakeException("no"));
+        Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
+
+        assertEquals("tcp", outcome.tcp());
+        assertEquals(FallbackReason.HANDSHAKE_FAILURE, outcome.fallback());
+        assertEquals("QUIC multi-stream failed (handshake failed), fell back to TCP",
+                outcome.fallbackMessage());
+    }
+
+    @Test
+    void aQuicHandshakeThatLosesTheRaceCarriesTheTimeoutMessage() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        FakePlatform p = new FakePlatform();
+        p.quic = new CompletableFuture<QuicByteStream>(); // never completes
+        Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
+
+        assertEquals("tcp", outcome.tcp());
+        assertEquals(FallbackReason.TIMEOUT_OR_LOST_RACE, outcome.fallback());
+        assertEquals("QUIC multi-stream failed (handshake timed out), fell back to TCP",
+                outcome.fallbackMessage());
     }
 
     @Test
