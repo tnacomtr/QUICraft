@@ -196,7 +196,9 @@ lib="$(find "$check/META-INF/native" -type f -name '*netty_quiche42*')"
 if [[ "${SKIP_PATCHES:-0}" != 1 ]]; then
     grep -q quiche_config_set_enable_relaxed_loss_threshold "$lib" \
         || { echo "native has no relaxed loss threshold binding" >&2; exit 1; }
-    grep -q SSL_export_keying_material "$lib" \
+    # The JNI name, not the BoringSSL symbol: the latter is in the statically linked libssl
+    # whatever the patches are, so it would pass an unpatched native.
+    grep -q SSL_export_keying_material_supported "$lib" \
         || { echo "native has no TLS keying material export binding" >&2; exit 1; }
 fi
 info="$out/build-info-$classifier.txt"
