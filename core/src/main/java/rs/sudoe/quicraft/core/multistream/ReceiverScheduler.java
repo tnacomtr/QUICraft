@@ -63,11 +63,13 @@ public final class ReceiverScheduler {
          */
         void decode(Envelope envelope, boolean insideBundle, long now);
     }
+
     /** Applies one already-decoded record or an entire validated bundle, then calls applied(). */
     public interface Handler {
         /** Accepts one decoded scheduling unit; returning does not acknowledge its application. */
         void deliver(Delivery delivery);
     }
+
     /** One record, or a whole bundle. Acknowledge the final sequence, never a member. */
     public static final class Delivery {
         private final List<Envelope> records;
@@ -94,6 +96,7 @@ public final class ReceiverScheduler {
             return records.get(records.size() - 1).sequence();
         }
     }
+
     /** Identity token for a first-byte reservation; never reuse after release/complete. */
     public static final class Partial {
         private final Lane lane;
@@ -167,6 +170,7 @@ public final class ReceiverScheduler {
             throw new OrderingException("scheduler failed");
         }
     }
+
     /** Re-raises an ordering failure as is; any other exception is fatal and latches. */
     private OrderingException escape(RuntimeException ex) {
         if (ex instanceof OrderingException) {
@@ -245,6 +249,7 @@ public final class ReceiverScheduler {
             throw escape(ex);
         }
     }
+
     /** Debits more bytes before retaining another fragment; the first-byte timer is unchanged. */
     public void growPartial(Partial p, long additionalBytes, long now) {
         enter();
@@ -284,6 +289,7 @@ public final class ReceiverScheduler {
     public void offer(Envelope e, long now) {
         offer(e, e.wireBytes(), now);
     }
+
     /** Admits opaque wire bytes only; no bundle classification or decompression is needed. */
     public void offer(Envelope e, long retainedBytes, long now) {
         enter();
@@ -296,6 +302,7 @@ public final class ReceiverScheduler {
             throw escape(ex);
         }
     }
+
     /** Transfers an existing reservation without double-counting its record slot. */
     public void complete(Partial p, Envelope e, long retainedBytes, long now) {
         enter();
@@ -316,6 +323,7 @@ public final class ReceiverScheduler {
             throw escape(ex);
         }
     }
+
     /**
      * Before END every lane is open. After END is admitted, CONTROL is closed and an auxiliary lane
      * stays open only while records up to END's dependency on it are still outstanding: END rides
@@ -378,6 +386,7 @@ public final class ReceiverScheduler {
         }
         return true;
     }
+
     /** Allocation-free mirror of {@link #eligible}: true when the queue has nothing to act on. */
     private boolean blocked(ArrayDeque<Entry> q) {
         long provisional = delivered[0];
@@ -482,6 +491,7 @@ public final class ReceiverScheduler {
             pumping = false;
         }
     }
+
     /**
      * Debits output before allocation, only for the current eligible decode request.
      *
@@ -572,6 +582,7 @@ public final class ReceiverScheduler {
             throw escape(ex);
         }
     }
+
     /** Commits the single outstanding unit after application, then retries eligible heads. */
     public void applied(Lane lane, long sequence, long now) {
         enter();
