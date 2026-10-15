@@ -817,4 +817,54 @@ class LaneSessionTest {
             assertEquals(LaneSession.MAX_UNSENT_PACKETS, rig.serverGame.packetCount() - base);
         }
     }
+
+    // --- Node receive budget (13.12).
+
+    @Test
+    void anExhaustedNodeBudgetWithholdsCreditAndOnlyTheStarvedConnectionTimesOut() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(3L << 20);
+        LaneRig.Config starved = new LaneRig.Config();
+        starved.nodeBudget = node;
+        starved.clientSession = false;
+        AtomicLong clock = new AtomicLong(5_000_000_000L);
+        starved.serverTiming = new LaneSession.Timing(clock::get, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
+        try (LaneRig rigB = LaneRig.start(starved)) {
+            rigB.server.activate(null);
+            // The raw client answers both preambles so the server's two lanes open.
+            LaneLoopback.write(rigB.clientRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 2);
+            QuicStreamChannel four = rigB.net.clientStream();
+            LaneLoopback.write(four, (byte) 2, (byte) 1);
+            // The first byte of a two-byte record length starts the incomplete-record timer.
+            LaneLoopback.write(four, (byte) 0x85);
+            assertTrue(LaneRig.await(() -> snapshotIs(rigB.server, 0, 1) && snapshotIs(rigB.server, 1, 1), 10000),
+                    "the first byte is charged while the node budget is still free");
+            assertFalse(rigB.serverGame.closed.isDone());
+
+            // Another connection of the same node takes almost the whole budget and keeps it.
+            LaneRig.Config holder = new LaneRig.Config();
+            holder.nodeBudget = node;
+            try (LaneRig rigA = LaneRig.start(holder)) {
+                rigA.activateBoth();
+                rigA.clientGame.autoApply = false; // the record stays charged and undelivered
+                rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 2_000_000));
+                assertTrue(LaneRig.await(() -> node.reserved() > 2_000_000L, 30000),
+                        "the holder charged the node budget: " + node.reserved());
+                // The rest of the record arrives, but the node budget cannot carry it: the lane
+                // stops reading instead of stealing the holder's reservation.
+                LaneLoopback.write(four, (byte) 0x01);
+                sleep(500);
+                assertTrue(snapshotIs(rigB.server, 1, 1),
+                        "credit withheld, only the first byte stays charged: " + LaneRig.snapshot(rigB.server)[1]);
+                assertFalse(rigB.serverGame.closed.isDone(), "withheld credit is not a close by itself");
+                // The existing incomplete-record deadline then ends the starved connection with 0x11.
+                clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + 1_000_000_000L);
+                closedWith(rigB.serverGame, 0x11, false);
+                sawClose(rigB.net.clientSawClose, 0x11);
+                assertFalse(rigA.clientGame.closed.isDone(), "the holder is never evicted");
+                assertFalse(rigA.serverGame.closed.isDone());
+            }
+        }
+    }
+
 }

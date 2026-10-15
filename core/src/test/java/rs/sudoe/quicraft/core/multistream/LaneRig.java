@@ -239,6 +239,11 @@ final class LaneRig implements AutoCloseable {
         RoutingTable clientTable = TABLE;
         LaneSession.Timing serverTiming = LaneSession.Timing.DEFAULT;
         LaneSession.Timing clientTiming = LaneSession.Timing.DEFAULT;
+        /** The node receive budget of 13.12 both sessions of this rig share. */
+        ReceiveBudget nodeBudget = ReceiveBudget.unlimited();
+        /** Build the session without a game so a test can call bindGame itself, before or after activate. */
+        boolean deferServerGame;
+        boolean deferClientGame;
     }
 
     final LaneLoopback net;
@@ -314,7 +319,8 @@ final class LaneRig implements AutoCloseable {
             if (config.serverSession) {
                 serverConnection.eventLoop().submit(() -> {
                     server = new LaneSession(serverConnection, LaneSession.Role.SERVER, serverControl,
-                            config.serverTable, serverGame, config.serverTiming);
+                            config.serverTable, config.deferServerGame ? null : serverGame,
+                            config.nodeBudget, config.serverTiming);
                     serverGame.session = server;
                     serverSessionRef = server;
                     for (QuicStreamChannel s : serverEarly) {
@@ -325,7 +331,8 @@ final class LaneRig implements AutoCloseable {
             if (config.clientSession) {
                 net.clientConnection.eventLoop().submit(() -> {
                     client = new LaneSession(net.clientConnection, LaneSession.Role.CLIENT, clientControl,
-                            config.clientTable, clientGame, config.clientTiming);
+                            config.clientTable, config.deferClientGame ? null : clientGame,
+                            config.nodeBudget, config.clientTiming);
                     clientGame.session = client;
                     clientSessionRef = client;
                     for (QuicStreamChannel s : clientEarly) {

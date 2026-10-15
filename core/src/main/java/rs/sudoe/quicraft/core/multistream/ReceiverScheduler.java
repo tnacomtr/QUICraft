@@ -23,6 +23,14 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * preserving compression and protocol-state transitions. Game-specific stricter limits and
  * validation of routing/packet contents remain the adapter's responsibility.</p>
  *
+ * <p>Node budget (13.12): every byte this scheduler retains is also reserved against a shared
+ * {@link ReceiveBudget}, in addition to the per-connection ceilings above. A refused node
+ * reservation is never satisfied by evicting someone else's data: when the bytes have not
+ * arrived yet the owner withholds the credit that would carry them (see
+ * {@link #nodeCreditAvailable(long)}), and when they already arrived and can never fit, that one
+ * connection fails with {@code 0x11}. {@link #releaseAll()} gives every charge back when the
+ * connection closes.</p>
+ *
  * <p>Pump priority: CONTROL is examined first, then REALTIME, then WORLD, and one decode or
  * delivery is outstanding at a time. A continuously busy CONTROL lane can therefore starve an
  * auxiliary lane; such starvation is bounded only by the 10 s blocked-head timer.</p>
@@ -133,6 +141,7 @@ public final class ReceiverScheduler {
 
     private final Decoder decoder;
     private final Handler handler;
+    private final ReceiveBudget node;
     private final List<ArrayDeque<Entry>> queues = new ArrayList<ArrayDeque<Entry>>();
     private final Map<Partial, Boolean> partials = new IdentityHashMap<Partial, Boolean>();
     private final long[] received = new long[3];
@@ -158,11 +167,21 @@ public final class ReceiverScheduler {
 
     /** Creates an empty receiving direction with separate decoding and application callbacks. */
     public ReceiverScheduler(Decoder decoder, Handler handler) {
+        this(decoder, handler, ReceiveBudget.unlimited());
+    }
+
+    /**
+     * As {@link #ReceiverScheduler(Decoder, Handler)} with the node budget of 13.12 every retained
+     * byte is additionally reserved against; {@link ReceiveBudget#unlimited()} for an owner that
+     * enforces no node budget.
+     */
+    public ReceiverScheduler(Decoder decoder, Handler handler, ReceiveBudget node) {
         if (decoder == null || handler == null) {
             throw new IllegalArgumentException("decoder/handler");
         }
         this.decoder = decoder;
         this.handler = handler;
+        this.node = node == null ? ReceiveBudget.unlimited() : node;
         for (int i = 0; i < 3; i++) {
             queues.add(new ArrayDeque<Entry>());
         }
@@ -239,6 +258,73 @@ public final class ReceiverScheduler {
         }
     }
 
+    /**
+     * Reserves retained bytes against the shared node budget (13.12), before the per-connection
+     * accounting moves. A refusal is fatal for this connection only: the bytes have already
+     * arrived or are already granted and cannot be evicted, so {@code 0x11} closes it while every
+     * other connection keeps its reservation.
+     */
+    private void debitNode(long size) {
+        if (size > 0 && !node.tryReserve(size)) {
+            throw new OrderingException("node receive budget exhausted (13.12)");
+        }
+    }
+
+    /** Gives retained bytes back to the node budget once they are gone. */
+    private void creditNode(long size) {
+        if (size > 0) {
+            node.release(size);
+        }
+    }
+
+    /**
+     * Query only, 13.12 node budget: true when the node could still carry {@code additionalBytes}.
+     * The owner withholds QUIC receive credit ("the lane stops reading") exactly as it does for
+     * the per-connection budget, instead of starting bytes it could never charge. The probe
+     * reserves and immediately releases, so a concurrent connection may win the race and the
+     * later real reservation then follows the fatal {@code 0x11} path; never another connection's
+     * data.
+     */
+    public boolean nodeCreditAvailable(long additionalBytes) {
+        if (additionalBytes <= 0) {
+            return true;
+        }
+        if (!node.tryReserve(additionalBytes)) {
+            return false;
+        }
+        node.release(additionalBytes);
+        return true;
+    }
+
+    /**
+     * Releases every retained charge back to the node budget and drops all state. The owner calls
+     * this exactly once when the connection closes: nothing this connection held may stay charged
+     * to a budget other connections share. Not usable afterwards.
+     */
+    public void releaseAll() {
+        long released = 0;
+        for (Partial p : partials.keySet()) {
+            released += p.bytes;
+        }
+        for (ArrayDeque<Entry> q : queues) {
+            for (Entry e : q) {
+                released += e.bytes;
+            }
+        }
+        partials.clear();
+        for (ArrayDeque<Entry> q : queues) {
+            q.clear();
+        }
+        bytes = 0;
+        count = 0;
+        auxiliaryBytes = 0;
+        auxiliaryCount = 0;
+        decoding = null;
+        outstanding = null;
+        ended = true;
+        creditNode(released);
+    }
+
     /** Reserves a record slot and positive retained byte count at the first received byte. */
     public Partial reservePartial(Lane lane, long size, long now) {
         enter();
@@ -248,6 +334,7 @@ public final class ReceiverScheduler {
                 throw new OrderingException("invalid partial");
             }
             budget(lane, size, 1);
+            debitNode(size);
             Partial p = new Partial(lane, size, now);
             partials.put(p, Boolean.TRUE);
             account(lane, size, 1);
@@ -267,6 +354,7 @@ public final class ReceiverScheduler {
                 throw new OrderingException("partial beyond END");
             }
             budget(p.lane, additionalBytes, 0);
+            debitNode(additionalBytes);
             p.bytes += additionalBytes;
             account(p.lane, additionalBytes, 0);
         } catch (RuntimeException ex) {
@@ -282,6 +370,7 @@ public final class ReceiverScheduler {
             requirePartial(p);
             partials.remove(p);
             account(p.lane, -p.bytes, -1);
+            creditNode(p.bytes);
         } catch (RuntimeException ex) {
             throw escape(ex);
         }
@@ -305,6 +394,7 @@ public final class ReceiverScheduler {
             checkDeadlines(now);
             validate(e, retainedBytes);
             budget(e.lane(), retainedBytes, 1);
+            debitNode(retainedBytes);
             enqueue(e, retainedBytes, now);
         } catch (RuntimeException ex) {
             throw escape(ex);
@@ -323,9 +413,13 @@ public final class ReceiverScheduler {
             validate(e, retainedBytes);
             if (retainedBytes > p.bytes) {
                 budget(p.lane, retainedBytes - p.bytes, 0);
+                // The node budget takes the growth before the partial's charge is returned, so the
+                // transfer can never look free to another connection.
+                debitNode(retainedBytes - p.bytes);
             }
             partials.remove(p);
             account(p.lane, -p.bytes, -1);
+            creditNode(p.bytes);
             enqueue(e, retainedBytes, now);
         } catch (RuntimeException ex) {
             throw escape(ex);
@@ -528,6 +622,7 @@ public final class ReceiverScheduler {
                 throw new OrderingException("decoded bundle bounds");
             }
             budget(envelope.lane(), additionalRetainedBytes, 0);
+            debitNode(additionalRetainedBytes);
             decoding.bytes += additionalRetainedBytes;
             decoding.uncompressed = totalUncompressedBytes;
             decoding.decodeReserved = true;
@@ -608,6 +703,7 @@ public final class ReceiverScheduler {
             for (Envelope e : outstanding.records()) {
                 Entry entry = queues.get(lane.ordinal()).remove();
                 account(lane, -entry.bytes, -1);
+                creditNode(entry.bytes);
                 if (e.kind() == Envelope.Kind.END) {
                     ended = true;
                 }

@@ -44,9 +44,15 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * {@code autoRead=false} and ask for more only while the scheduler has budget, so QUIC flow
  * control, not memory, absorbs a flood. A parser buffer is reserved through the scheduler at the
  * first byte of its record and grown to the full record size when the length is known. The
- * transport chunks waiting to be parsed (at most one 16 KiB chunk per stream) are not charged.
+ * transport chunk waiting to be parsed (at most one {@link #READ_CHUNK} chunk per stream) is
+ * charged to the node receive budget while it is held and released when it is consumed (13.12).
  * Every failure closes the whole connection, never one lane: 0x11 for protocol, ordering and
  * resource errors and a lost, reset or finished lane, 0x2 for local faults, 0x0 after END.
+ *
+ * <p>Node budget: when a {@link ReceiveBudget} is given, every retained byte is also reserved
+ * against the node's aggregate budget (13.12). While the node budget cannot carry the next read,
+ * this lane stops reading, exactly like the per-connection budget; when bytes already received can
+ * never be charged, this connection closes with 0x11 and no other connection's data is evicted.
  *
  * <p>Send: records are sequenced at submission, encoded and queued per lane. CONTROL, REALTIME
  * and WORLD each get one write quantum of at most {@link #WRITE_QUANTUM} bytes per round, in that
@@ -122,7 +128,7 @@ public final class LaneSession {
     private final QuicChannel connection;
     private final Role role;
     private final RoutingTable table;
-    private final LaneGame game;
+    private final ReceiveBudget node;
     private final Timing timing;
     private final Direction sendDirection;
     private final Direction receiveDirection;
@@ -135,6 +141,10 @@ public final class LaneSession {
     private final ReceiverScheduler receiver;
     private final QuicStreamChannel controlChannel;
 
+    /** Attached at construction or later with {@link #bindGame}; null until then. */
+    private LaneGame game;
+    /** Set by the first {@link #bindGame} call, from any thread, before the game is attached. */
+    private volatile boolean bound;
     private boolean activated;
     private long activatedAt;
     private boolean closed;
@@ -151,15 +161,28 @@ public final class LaneSession {
     private volatile boolean writable = true;
     private ScheduledFuture<?> tick;
 
-    /** A session with production timing. */
+    /** A session with production timing, no node budget and the game already attached. */
     public LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
                        LaneGame game) {
-        this(connection, role, control, table, game, Timing.DEFAULT);
+        this(connection, role, control, table, game, ReceiveBudget.unlimited(), Timing.DEFAULT);
+    }
+
+    /**
+     * A session that reserves every retained byte against the node's aggregate receive budget
+     * (13.12) and takes its game later with {@link #bindGame(LaneGame)}.
+     *
+     * <p>Until the game is bound nothing is decoded or delivered: stream bytes already accepted
+     * stay buffered under the 13.12 limits, and binding resumes parsing on the connection's event
+     * loop. The game may be bound before or after {@link #activate}.
+     */
+    public LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
+                       ReceiveBudget node) {
+        this(connection, role, control, table, null, node, Timing.DEFAULT);
     }
 
     LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
-                LaneGame game, Timing timing) {
-        if (connection == null || role == null || control == null || table == null || game == null) {
+                LaneGame game, ReceiveBudget node, Timing timing) {
+        if (connection == null || role == null || control == null || table == null) {
             throw new IllegalArgumentException("null argument");
         }
         if (control.streamId() != CONTROL_STREAM_ID || control.type() != QuicStreamType.BIDIRECTIONAL) {
@@ -170,6 +193,8 @@ public final class LaneSession {
         this.controlChannel = control;
         this.table = table;
         this.game = game;
+        this.bound = game != null;
+        this.node = node == null ? ReceiveBudget.unlimited() : node;
         this.timing = timing;
         this.loop = connection.eventLoop();
         this.sendDirection = role == Role.CLIENT ? Direction.SERVERBOUND : Direction.CLIENTBOUND;
@@ -177,7 +202,7 @@ public final class LaneSession {
         for (int i = 0; i < 3; i++) {
             out.add(new ArrayDeque<byte[]>());
         }
-        this.receiver = new ReceiverScheduler(this::onDecode, this::onDeliver);
+        this.receiver = new ReceiverScheduler(this::onDecode, this::onDeliver, this.node);
         connection.pipeline().addFirst(new ConnectionWatch());
     }
 
@@ -416,6 +441,8 @@ public final class LaneSession {
                 s.releaseInbound();
             }
         }
+        // Nothing this connection retained may stay charged to the node budget (13.12).
+        receiver.releaseAll();
         for (ArrayDeque<byte[]> q : out) {
             q.clear();
         }
@@ -428,6 +455,18 @@ public final class LaneSession {
             game.onClosed(code, byPeer, cause);
         } catch (Throwable t) {
             LOG.log(Level.FINE, "game onClosed failed", t);
+        }
+    }
+
+    /**
+     * Charges an unparsed transport chunk to the node budget while it is held (13.12). The bytes
+     * already arrived, so a refusal is the fatal case of 13.12: this connection closes with 0x11
+     * rather than evicting another connection's reservation. The charge goes back when the lane
+     * stream consumes or discards the chunk.
+     */
+    private void chargeChunk(int bytes) {
+        if (bytes > 0 && !node.tryReserve(bytes)) {
+            throw new OrderingException("node receive budget exhausted by an unparsed chunk (13.12)");
         }
     }
 
@@ -584,9 +623,15 @@ public final class LaneSession {
     /**
      * Whether a new record may be started on {@code lane}. An auxiliary record needs room for the
      * largest legal record, so a conformant peer's record can always complete (13.12: never fatal
-     * for a legal record); otherwise reading waits and QUIC flow control pushes back.
+     * for a legal record); otherwise reading waits and QUIC flow control pushes back. The same
+     * amount, plus the chunk about to be read, must fit the shared node budget (13.12): a node
+     * refusal withholds this lane's credit exactly like the per-connection budget, so this
+     * connection never starts bytes it could not charge.
      */
     private boolean credit(Lane lane) {
+        if (!receiver.nodeCreditAvailable(READ_CHUNK + MAX_RECORD_WIRE)) {
+            return false;
+        }
         if (lane == Lane.CONTROL) {
             return receiver.pendingRecords() < ReceiverScheduler.MAX_RECORDS
                     && receiver.pendingBytes() < ReceiverScheduler.SHARED_BYTES + ReceiverScheduler.CONTROL_RESERVE_BYTES;
@@ -929,12 +974,23 @@ public final class LaneSession {
             return decoder.hasPartial() && lengthKnown;
         }
 
+        /**
+         * Releases one chunk that was charged when it arrived and is now consumed or discarded:
+         * gives its bytes back to the node budget and frees it. A chunk's reader index never moves
+         * while it is parsed (the decoder works on a {@code nioBuffer} view), so the amount
+         * released is exactly the amount charged.
+         */
+        void releaseChunk(ByteBuf chunk) {
+            node.release(chunk.readableBytes());
+            chunk.release();
+        }
+
         boolean nextBuffer() {
             if (current != null && current.hasRemaining()) {
                 return true;
             }
             if (currentBuf != null) {
-                currentBuf.release();
+                releaseChunk(currentBuf);
                 currentBuf = null;
                 current = null;
             }
@@ -954,10 +1010,10 @@ public final class LaneSession {
         void releaseInbound() {
             ByteBuf b;
             while ((b = inbound.poll()) != null) {
-                b.release();
+                releaseChunk(b);
             }
             if (currentBuf != null) {
-                currentBuf.release();
+                releaseChunk(currentBuf);
                 currentBuf = null;
                 current = null;
             }
@@ -980,6 +1036,14 @@ public final class LaneSession {
             readPending = false;
             if (closed || !buf.isReadable()) {
                 buf.release();
+                return;
+            }
+            try {
+                // 13.12: the chunk is held, so it is charged to the node budget until consumed.
+                chargeChunk(buf.readableBytes());
+            } catch (Throwable t) {
+                buf.release();
+                failFrom(t);
                 return;
             }
             inbound.add(buf);
