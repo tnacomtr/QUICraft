@@ -818,7 +818,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
     associated with the ticket; it does not prove a fresh certificate was presented. Missing
     ticket provenance requires a full handshake. Reject stale/changed-pin tickets before use.
     Require TLS 1.3 resumption with `psk_dhe_ke` only; disable PSK-only `psk_ke` so resumed
-    connections retain forward secrecy. Rotate ticket keys with the certificate, invalidating
+    connections retain forward secrecy. With the pinned BoringSSL this holds without
+    configuration: it offers and accepts only `psk_dhe_ke`, and there is no knob to change it.
+    It is an invariant to re-check on every BoringSSL bump, not a setting. Rotate ticket keys with the certificate, invalidating
     old tickets; otherwise honest resumed bindings can fail against the new certificate
     fingerprint (an availability failure, not permission to bypass binding).
 18. **12.18 Early data and replay.** `/3` permits only the preamble, Minecraft handshake and
