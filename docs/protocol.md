@@ -693,14 +693,20 @@ single-socket listener: no dispatcher is installed and the connection id length 
     notify the player and use `/2` or TCP on the next attempt, never silently treat corruption
     as first contact. A write failure after activation closes the current connection with
     `0x10`; do not attempt a live transport downgrade.
-16. **12.16 Changed fingerprint.** With an existing authenticated pin, a different advertised
-    fingerprint MUST NOT be silently accepted: discard tickets/tokens/recorded flights for
-    that logical server, notify the player that the identity changed, and use vanilla TCP
-    for this join (or fail in `quic-only`). Leave the pin unchanged. Rotation requires an
-    explicit player action authorizing a new online-bound attempt, with old/new fingerprints
-    displayed; that attempt uses a full handshake, no early data, and replaces the pin only
-    after 12.15. Failed rotation preserves the old pin. No automatic overlap or unsigned
-    rotation message is trusted; deleting a pin requires explicit confirmation too.
+16. **12.16 Changed fingerprint.** With an existing authenticated pin (online mode, 12.15), a
+    different advertised fingerprint F' MUST NOT be trusted from the ping. The client
+    discards tickets, tokens and recorded flights for that logical server, tells the player
+    the fingerprint changed (a notice naming old and new fingerprints, not a prompt), and
+    makes ONE automatic re-binding attempt: full handshake, no early data, `/3`, the
+    binding exchange of 12.4-12.12 with `F = F'` in `T`. The pin is replaced only after
+    SERVER_SWITCH verifies (12.15); the old pin stays until then. Any failure (binding,
+    exporter unavailable, timeout, write failure) closes with `0x10`, leaves the pin
+    unchanged, records §6's failure-cache entry, and the join continues over vanilla TCP
+    for that attempt (or fails in `quic-only`). At most one automatic re-binding attempt per
+    logical server per failure-cache backoff window. If the server now runs offline mode
+    (no `S`, no binding possible), do not re-bind or replace the pin: use TCP and notify the
+    player. Deleting a pin still requires explicit player confirmation. Offline-mode pins
+    (Phase 9 TOFU) are out of scope here and keep an explicit-action rotation.
 
 ### Resumption, offline mode and threat model
 
@@ -918,8 +924,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 1. Approve `/3`, the configuration-stage four-proof/switch exchange after OFFER, and the
    conservative exporter gate even for offline multi-stream tests?
-2. Approve changed-pin TCP fallback plus explicit player-authorized online re-binding for
-   rotation, rather than automatic trust replacement?
+2. Approve changed-pin handling as: online mode re-binds automatically through channel
+   binding (pin replaced only after a passing check, player notified), failure falls back to
+   TCP with the pin unchanged?
 3. Approve the three fixed lanes, conservative full CONTROL fences, and exact-byte JSON
    routing digests as the first reviewable design?
 4. Approve the proposed memory/packet limits and 10-second fail-closed deadlines for
