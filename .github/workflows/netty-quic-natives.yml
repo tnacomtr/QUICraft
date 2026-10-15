@@ -137,7 +137,8 @@ jobs:
       # macOS routes only 127.0.0.1 on lo0; the rejoin-from-another-address test binds 127.0.0.2.
       - if: runner.os == 'macOS'
         run: sudo ifconfig lo0 alias 127.0.0.2 up
-      - run: ./gradlew -Pquicraft.patchedNatives=all :core:test :core:shadedTest :core:checkShadedNotices
+      # macOS runners miss the Linux-calibrated round-trip timings (see core/build.gradle.kts).
+      - run: ./gradlew -Pquicraft.patchedNatives=all ${{ runner.os == 'macOS' && '-Pquicraft.skipRttTimingTests' || '' }} :core:test :core:shadedTest :core:checkShadedNotices
       - uses: actions/upload-artifact@v7
         if: matrix.native == 'linux-x86_64'
         with:

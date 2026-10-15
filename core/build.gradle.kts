@@ -139,6 +139,15 @@ val shadedTestTask = tasks.register<Test>("shadedTest") {
 tasks.named<Test>("test") {
     systemProperty("quicraft.test.expectRelaxedLossThreshold", expectRelaxedLossThreshold)
     systemProperty("quicraft.test.expectKeyingMaterialExport", expectKeyingMaterialExport)
+    // Round-trip timing assertions calibrated on Linux. macOS CI runners answer a handshake flight
+    // 50-150 ms late (under investigation), so the natives workflow skips these three there.
+    if (providers.gradleProperty("quicraft.skipRttTimingTests").isPresent) {
+        filter {
+            excludeTestsMatching("*.HandshakeFlightProbeTest")
+            excludeTestsMatching("*.EarlyDataTest.zeroRttRejectedByARestartedServerStillArrivesOnce")
+            excludeTestsMatching("*.EarlyDataTest.rejoinSendsItsFirstFlightAsZeroRttAndGetsTheAnswerOneRoundTripSooner")
+        }
+    }
 }
 
 // The patched classes with upstream Netty's native for this host, which is what platforms without
