@@ -548,7 +548,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 | `netty/0002-complete-connect-after-handshake-send` | Completes a client connect as soon as the handshake does (§5), in a task on the connection's event loop. |
 | `netty/0003-server-reads-accepted-early-data` | A server that accepted 0-RTT reads early stream data before the handshake completes: the connection is active during early data, and after the send that decrypts a buffered 0-RTT packet it processes the readable streams. Java only, so it works with upstream natives too. `SslHandshakeCompletionEvent` still marks the completed handshake. |
 | `netty/0004` | TLS keying material exporter accessor and capability probe, with JNI `SSL_export_keying_material` (12.2). Netty-only patch; the patched native is available only on linux-x86_64. |
-| `netty/0005-max-flow-control-windows` | `QuicCodecBuilder.maxConnectionWindow(long)` and `maxStreamWindow(long)` with JNI `quiche_config_set_max_connection_window` / `quiche_config_set_max_stream_window`, so the maxima of quiche's flow-control auto-tuning can be pinned as 13.13 requires. Unset, quiche keeps its defaults. |
+| `netty/0005-max-flow-control-windows` | `QuicCodecBuilder.maxConnectionWindow(long)` and `maxStreamWindow(long)` with JNI `quiche_config_set_max_connection_window` / `quiche_config_set_max_stream_window`, and the capability probe `Quic.isMaxFlowControlWindowsSupported()`, so the maxima of quiche's flow-control auto-tuning can be pinned. A maximum equal to the initial window disables growth for it (quiche clamps every window to its maximum). The setters alone do not satisfy 13.13: the values `/3` configures must still keep growth within 13.12's budgets, and `/3` stays off until they do. Unset, quiche keeps its defaults. Netty-only patch; the quicraft5 native has been built locally for linux-x86_64 only. |
 | `quiche/0002-backport-fc9fe129-handshake-close` | Upstream quiche fc9fe129 (2026-09-25), unchanged. Without it, an application close sent after the client's handshake completed but before HANDSHAKE_DONE (the window netty/0002 opens) never goes out, and the send loop spins forever. |
 
 - `natives/build-linux.sh` runs Netty's own Maven build unchanged in Docker, on AlmaLinux 8 with
@@ -561,6 +561,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
   `Quic.isRelaxedLossThresholdSupported()` then returns false, and core leaves quiche's default
   in place after one INFO line. The exporter probe also returns false with upstream
   natives, disabling `/3` under 12.3 rather than attempting the unbound exporter JNI call.
+  `Quic.isMaxFlowControlWindowsSupported()` likewise returns false, the maximum-window setters
+  throw `UnsupportedOperationException`, and `QuicSupport.hasMaxFlowControlWindows()` is false,
+  so `/3` is not offered.
   `testUpstreamNative` checks this combination on every build.
   `.github/workflows/netty-quic-natives.yml` builds all five platforms, but has not run yet.
 - **glibc.** The Linux native built on AlmaLinux 8 needs glibc 2.28 (`statx`), where upstream's

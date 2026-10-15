@@ -8,8 +8,11 @@ section 13.13 needs before /3 may be enabled.
 
 quiche grows each stream's and the connection's receive window automatically, by default up to
 16 MiB per stream and 24 MiB per connection. Section 13.13 pins those maxima to 4 MiB and
-17 MiB so that transport auto-tuning can never advertise credit beyond the receive budgets of
-section 13.12. Netty sets the initial limits but has no setter for the maxima. This patch adds:
+17 MiB and requires growth to be disabled unless it obeys the receive budgets of section 13.12.
+Netty sets the initial limits but has no setter for the maxima. This patch adds the setters
+only. quiche clamps every window to its maximum (flowcontrol.rs set_window), so a maximum equal
+to the initial window disables growth for that window. Which values /3 uses, and how they meet
+13.13's budget rule, is decided where /3 configures its codec, not here. This patch adds:
 
 - JNI: Quiche.quiche_config_set_max_connection_window(config, bytes) and
   Quiche.quiche_config_set_max_stream_window(config, bytes), which call the quiche C functions

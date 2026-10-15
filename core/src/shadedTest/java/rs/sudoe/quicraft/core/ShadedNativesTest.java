@@ -54,4 +54,15 @@ class ShadedNativesTest {
         assertNotNull(expected, "run through Gradle");
         assertEquals(Boolean.parseBoolean(expected), QuicSupport.hasKeyingMaterialExport());
     }
+
+    /**
+     * Same for the maximum flow-control windows (natives/patches/netty/0005), which ship in the
+     * same patched native as the exporter, so they share its expectation.
+     */
+    @Test
+    void maxFlowControlWindowsMatchTheNativeBuiltForThisPlatform() {
+        String expected = System.getProperty("quicraft.test.expectKeyingMaterialExport");
+        assertNotNull(expected, "run through Gradle");
+        assertEquals(Boolean.parseBoolean(expected), QuicSupport.hasMaxFlowControlWindows());
+    }
 }

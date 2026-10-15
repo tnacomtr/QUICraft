@@ -36,6 +36,7 @@ class NativeFeaturesTest {
         identity = ServerIdentity.generate();
     }
 
+    /** One patched native carries the relaxed threshold and the maximum windows, so one expectation covers both. */
     private static boolean expected() {
         String value = System.getProperty("quicraft.test.expectRelaxedLossThreshold");
         assertNotNull(value, "run through Gradle, which says whether this host has a patched native");
