@@ -49,17 +49,17 @@ final class RebindBloom {
         return newlySet;
     }
 
-    /** Replaces the filter with exactly {@link #BYTES} bytes read from its file. */
-    void read(byte[] content) {
-        if (content.length != BYTES) {
+    /** Replaces the filter with the {@link #BYTES} bytes at {@code offset} in {@code source}. */
+    void read(byte[] source, int offset) {
+        if (source.length - offset < BYTES || offset < 0) {
             throw new IllegalArgumentException("bloom filter is not " + BYTES + " bytes");
         }
-        System.arraycopy(content, 0, bits, 0, BYTES);
+        System.arraycopy(source, offset, bits, 0, BYTES);
     }
 
-    /** A copy of the filter, for an atomic write. */
-    byte[] copy() {
-        return bits.clone();
+    /** Copies the filter into {@code target} at {@code offset}, for an atomic write. */
+    void copyTo(byte[] target, int offset) {
+        System.arraycopy(bits, 0, target, offset, BYTES);
     }
 
     private static int[] indexes(PinKey key, String fingerprint) {

@@ -15,7 +15,7 @@
  * reads {@code isUsable()} before trusting a pin, and falls back to TCP whenever it is false. A
  * missing file is an empty, usable state; a corrupt or unreadable one, or a failed write, disables
  * the state for the object's lifetime and is never treated as first contact and never overwritten.
- * {@link rs.sudoe.quicraft.core.pin.RebindState} keeps two files as one unit, so either half
- * present without the other is equally unreliable and fails closed too.
+ * {@link rs.sudoe.quicraft.core.pin.RebindState} keeps its state and its Bloom bitmap in one
+ * checksummed file, so a damaged or half-written one is corruption too.
  */
 package rs.sudoe.quicraft.core.pin;

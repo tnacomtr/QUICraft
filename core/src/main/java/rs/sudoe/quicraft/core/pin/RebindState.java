@@ -2,10 +2,12 @@
 package rs.sudoe.quicraft.core.pin;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -16,9 +18,16 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * The client's changed-pin re-bind state (docs/protocol.md 12.16), persisted as
- * {@code <configDir>/quicraft/rebind-v1.json} plus the {@code <configDir>/quicraft/rebind-bloom-v1.bin}
- * filter of 12.16.
+ * The client's changed-pin re-bind state (docs/protocol.md 12.16), persisted as the single file
+ * {@code <configDir>/quicraft/rebind-v1.bin}.
+ *
+ * <p>The file is binary and self-checking, so a half-written or damaged one is never read as a
+ * valid state: the magic {@code QCRB}, the format version, the length of the UTF-8 JSON detailed
+ * state, that JSON, the 1 MiB Bloom bitmap of 12.16, and a SHA-256 over everything before it. The
+ * whole thing is replaced atomically, so either the old or the new state is on disk. A missing file
+ * is an empty, usable state (a first run); a wrong magic, an unknown format version, an impossible
+ * or mismatching length, a bad checksum, an unreadable file or malformed JSON is corruption, which
+ * fails closed and is never overwritten.</p>
  *
  * <p>It answers two questions for the connect path, and does no I/O on the network itself:</p>
  *
@@ -45,15 +54,9 @@ import java.util.logging.Logger;
  *
  * <p><b>Fail closed.</b> When the state cannot be read or written, everything is refused:
  * {@link #shouldNotify(String, int, String)} returns false and {@link #allowsAttempt(String, int, long)}
- * returns false, so the client uses TCP, never repeats a notice and never resets a backoff window.</p>
- *
- * <p>The two files are one unit. Both missing is an empty, usable state (a first run). If exactly
- * one of them exists, what is left cannot say which notices were already shown, so the state is
- * unreliable: it fails closed on load and neither file is ever written. Both present is loaded.
- * They cannot be replaced in one transaction, so every persist writes them in the same order, the
- * filter ({@code rebind-bloom-v1.bin}) first and the detailed state ({@code rebind-v1.json}) second,
- * each atomically through a temporary file and a rename. A failure in either disables the state, so
- * whatever the failed call changed in memory is never read again.</p>
+ * returns false, so the client uses TCP, never repeats a notice and never resets a backoff window.
+ * A failed write disables the state, so whatever the failed call changed in memory is never read
+ * again.</p>
  *
  * <p>Thread-safe: every method is synchronized. The time a window starts from is the injected
  * {@code clock}; {@code allowsAttempt}'s {@code now} must be read from that same clock, which is
@@ -72,8 +75,16 @@ public final class RebindState {
     /** Section 6's longest backoff: one hour. */
     static final long MAX_BACKOFF_MILLIS = 3_600_000L;
 
-    /** The schema version of the re-bind state file. */
+    /** The JSON schema version of the detailed state. */
     static final int SCHEMA_VERSION = 1;
+    /** The magic of the state file: QUICraft re-bind state. */
+    private static final byte[] MAGIC = {'Q', 'C', 'R', 'B'};
+    /** The format version of the state file. */
+    private static final int FORMAT_VERSION = 1;
+    /** Magic, format version and the JSON length, before the JSON. */
+    private static final int HEADER_BYTES = MAGIC.length + 4 + 4;
+    /** The SHA-256 after the bitmap. */
+    private static final int DIGEST_BYTES = 32;
     private static final int MAX_FAILURES = 32;
     /** Above the largest re-bind state 4096 servers with 16 notices each can make (about 10 MiB). */
     private static final long MAX_FILE_BYTES = 24L << 20;
@@ -115,7 +126,6 @@ public final class RebindState {
     }
 
     private final Path file;
-    private final Path bloomFile;
     private final LongSupplier clock;
     private final int maxEntries;
     private final int maxFingerprintsPerServer;
@@ -126,33 +136,31 @@ public final class RebindState {
     private int noticeCount;
     private boolean disabled;
 
-    private RebindState(Path file, Path bloomFile, LongSupplier clock, int maxEntries,
+    private RebindState(Path file, LongSupplier clock, int maxEntries,
                         int maxFingerprintsPerServer, int maxFingerprintsTotal) {
         if (maxEntries < 1 || maxFingerprintsPerServer < 1
                 || maxFingerprintsTotal < maxFingerprintsPerServer) {
             throw new IllegalArgumentException("re-bind state limits are not usable");
         }
         this.file = file;
-        this.bloomFile = bloomFile;
         this.clock = clock;
         this.maxEntries = maxEntries;
         this.maxFingerprintsPerServer = maxFingerprintsPerServer;
         this.maxFingerprintsTotal = maxFingerprintsTotal;
     }
 
-    /** Loads the re-bind state; both files missing is an empty, usable one. */
-    public static RebindState load(Path file, Path bloomFile) {
-        return load(file, bloomFile, System::currentTimeMillis);
+    /** Loads the re-bind state; a missing file is an empty, usable one. */
+    public static RebindState load(Path file) {
+        return load(file, System::currentTimeMillis);
     }
 
     /**
      * Loads the re-bind state, reading the current time from {@code clock}.
      *
-     * @param file the backoff and notice history file, or null for memory only
-     * @param bloomFile the bloom filter file, or null for memory only
+     * @param file the state file, or null for a state that is never persisted
      */
-    static RebindState load(Path file, Path bloomFile, LongSupplier clock) {
-        return load(file, bloomFile, clock, MAX_ENTRIES, MAX_FINGERPRINTS_PER_SERVER, MAX_FINGERPRINTS_TOTAL);
+    static RebindState load(Path file, LongSupplier clock) {
+        return load(file, clock, MAX_ENTRIES, MAX_FINGERPRINTS_PER_SERVER, MAX_FINGERPRINTS_TOTAL);
     }
 
     /**
@@ -160,9 +168,9 @@ public final class RebindState {
      * docs/protocol.md 12.16 ({@link #MAX_ENTRIES}, {@link #MAX_FINGERPRINTS_PER_SERVER},
      * {@link #MAX_FINGERPRINTS_TOTAL}); tests inject smaller ones to exercise the eviction paths.
      */
-    static RebindState load(Path file, Path bloomFile, LongSupplier clock, int maxEntries,
+    static RebindState load(Path file, LongSupplier clock, int maxEntries,
                             int maxFingerprintsPerServer, int maxFingerprintsTotal) {
-        RebindState state = new RebindState(file, bloomFile, clock, maxEntries,
+        RebindState state = new RebindState(file, clock, maxEntries,
                 maxFingerprintsPerServer, maxFingerprintsTotal);
         try {
             state.read();
@@ -329,33 +337,45 @@ public final class RebindState {
     }
 
     /**
-     * Reads the state. The two files are one unit: both missing is empty and usable, exactly one
-     * present is unreliable and fails closed, both present is loaded. Only a file that is really not
-     * there counts as missing; a file the process may not read, or a directory in its place, is
-     * unreadable state and fails closed like any other read failure.
+     * Reads the state file. Only a file that is really not there is an empty state; every other
+     * failure (permissions, a directory in its place, a damaged container) is corruption.
      */
     private void read() throws IOException {
-        boolean jsonPresent = false;
-        if (file != null) {
-            try {
-                readJson(new String(StateFile.read(file, MAX_FILE_BYTES), StandardCharsets.UTF_8));
-                jsonPresent = true;
-            } catch (NoSuchFileException e) {
-                // Not there at all.
+        if (file == null) {
+            return;
+        }
+        byte[] content;
+        try {
+            content = StateFile.read(file, MAX_FILE_BYTES);
+        } catch (NoSuchFileException e) {
+            return;
+        }
+        if (content.length < HEADER_BYTES + RebindBloom.BYTES + DIGEST_BYTES) {
+            throw new IOException("re-bind state is too short");
+        }
+        for (int i = 0; i < MAGIC.length; i++) {
+            if (content[i] != MAGIC[i]) {
+                throw new IOException("re-bind state has the wrong magic");
             }
         }
-        boolean bloomPresent = false;
-        if (bloomFile != null) {
-            try {
-                bloom.read(StateFile.read(bloomFile, RebindBloom.BYTES));
-                bloomPresent = true;
-            } catch (NoSuchFileException e) {
-                // Not there at all.
-            }
+        ByteBuffer header = ByteBuffer.wrap(content);
+        header.position(MAGIC.length);
+        int format = header.getInt();
+        if (format != FORMAT_VERSION) {
+            throw new IOException("unsupported re-bind state format version " + format);
         }
-        if (file != null && bloomFile != null && jsonPresent != bloomPresent) {
-            throw new IOException("only one of the two re-bind state files exists");
+        int jsonLength = header.getInt();
+        long expected = (long) HEADER_BYTES + jsonLength + RebindBloom.BYTES;
+        if (jsonLength < 0 || expected != content.length - DIGEST_BYTES) {
+            throw new IOException("re-bind state does not match its declared length");
         }
+        byte[] stored = new byte[DIGEST_BYTES];
+        System.arraycopy(content, content.length - DIGEST_BYTES, stored, 0, DIGEST_BYTES);
+        if (!MessageDigest.isEqual(sha256(content, content.length - DIGEST_BYTES), stored)) {
+            throw new IOException("re-bind state failed its checksum");
+        }
+        readJson(new String(content, HEADER_BYTES, jsonLength, StandardCharsets.UTF_8));
+        bloom.read(content, HEADER_BYTES + jsonLength);
     }
 
     private void readJson(String content) {
@@ -463,20 +483,16 @@ public final class RebindState {
     }
 
     /**
-     * Persists the whole state, the filter first and the detailed state second, so the invariant
-     * "both files exist or neither exists" holds. A failure in either half leaves the state
-     * disabled rather than half written.
+     * Persists the whole state as one atomically replaced file: the JSON detailed state and the
+     * Bloom bitmap travel together, so a crash leaves either the old or the new state, never a
+     * mixture. A failure disables the state.
      */
     private boolean persist() {
-        return writeBloom() && write();
-    }
-
-    private boolean write() {
         if (file == null) {
             return true;
         }
         try {
-            StateFile.write(file, encode().getBytes(StandardCharsets.UTF_8));
+            StateFile.write(file, encode());
             return true;
         } catch (IOException | RuntimeException e) {
             LOG.log(Level.INFO, "QUICraft could not write its re-bind state and disables it ({0})",
@@ -485,21 +501,36 @@ public final class RebindState {
         }
     }
 
-    private boolean writeBloom() {
-        if (bloomFile == null) {
-            return true;
-        }
+    /**
+     * The whole state file: magic, format version, JSON length, the JSON, the 1 MiB bitmap and a
+     * SHA-256 over everything before it.
+     */
+    private byte[] encode() {
+        byte[] json = encodeJson().getBytes(StandardCharsets.UTF_8);
+        byte[] content = new byte[HEADER_BYTES + json.length + RebindBloom.BYTES + DIGEST_BYTES];
+        ByteBuffer buffer = ByteBuffer.wrap(content);
+        buffer.put(MAGIC);
+        buffer.putInt(FORMAT_VERSION);
+        buffer.putInt(json.length);
+        buffer.put(json);
+        bloom.copyTo(content, HEADER_BYTES + json.length);
+        byte[] digest = sha256(content, content.length - DIGEST_BYTES);
+        System.arraycopy(digest, 0, content, content.length - DIGEST_BYTES, DIGEST_BYTES);
+        return content;
+    }
+
+    /** The first {@code length} bytes of {@code content} hashed with SHA-256. */
+    private static byte[] sha256(byte[] content, int length) {
         try {
-            StateFile.write(bloomFile, bloom.copy());
-            return true;
-        } catch (IOException | RuntimeException e) {
-            LOG.log(Level.INFO, "QUICraft could not write its notice filter and disables it ({0})",
-                    String.valueOf(e));
-            return false;
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update(content, 0, length);
+            return digest.digest();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is required by every Java platform", e);
         }
     }
 
-    private String encode() {
+    private String encodeJson() {
         StringBuilder sb = new StringBuilder(1024 + 256 * entries.size());
         sb.append("{\"version\":").append(SCHEMA_VERSION).append(",\"servers\":[");
         boolean first = true;
