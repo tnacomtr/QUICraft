@@ -97,6 +97,7 @@ class RebindStateTest {
         Path file = dir.resolve("rebind-v1.json");
         Path bloom = dir.resolve("rebind-bloom-v1.bin");
         Files.write(file, servers(RebindState.MAX_ENTRIES).getBytes(StandardCharsets.UTF_8));
+        writeEmptyBloom(bloom);
         AtomicLong now = new AtomicLong(BASE);
         RebindState state = RebindState.load(file, bloom, now::get);
         assertEquals(RebindState.MAX_ENTRIES, state.size());
@@ -115,6 +116,7 @@ class RebindStateTest {
         Path file = dir.resolve("rebind-v1.json");
         Path bloom = dir.resolve("rebind-bloom-v1.bin");
         Files.write(file, servers(RebindState.MAX_ENTRIES).getBytes(StandardCharsets.UTF_8));
+        writeEmptyBloom(bloom);
         AtomicLong now = new AtomicLong(BASE);
         RebindState state = RebindState.load(file, bloom, now::get);
         for (int i = 0; i < RebindState.MAX_ENTRIES; i++) {
@@ -200,41 +202,50 @@ class RebindStateTest {
     void unreadableOrUnwritableStateFailsClosed(@TempDir Path dir) throws IOException {
         AtomicLong now = new AtomicLong(BASE);
 
-        Path corruptFile = dir.resolve("corrupt").resolve("rebind-v1.json");
-        Files.createDirectories(corruptFile.getParent());
+        Path corruptDirectory = dir.resolve("corrupt");
+        Files.createDirectories(corruptDirectory);
+        Path corruptFile = corruptDirectory.resolve("rebind-v1.json");
         byte[] garbage = "{\"version\":1,\"servers\":[".getBytes(StandardCharsets.UTF_8);
         Files.write(corruptFile, garbage);
-        RebindState corrupt = RebindState.load(corruptFile,
-                dir.resolve("corrupt").resolve("rebind-bloom-v1.bin"), now::get);
+        Path corruptBloom = corruptDirectory.resolve("rebind-bloom-v1.bin");
+        writeEmptyBloom(corruptBloom);
+        RebindState corrupt = RebindState.load(corruptFile, corruptBloom, now::get);
         assertFalse(corrupt.isUsable());
         assertFalse(corrupt.allowsAttempt("mc.example.com", 25565, now.get()));
         assertFalse(corrupt.recordAttemptFailure("mc.example.com", 25565));
         assertFalse(corrupt.shouldNotify("mc.example.com", 25565, FP_A));
         assertArrayEquals(garbage, Files.readAllBytes(corruptFile), "the corrupt file was not touched");
-        assertFalse(Files.exists(dir.resolve("corrupt").resolve("rebind-bloom-v1.bin")),
-                "a disabled state writes nothing");
+        assertEquals(RebindBloom.BYTES, Files.size(corruptBloom), "neither half is touched");
 
-        Path shortBloom = dir.resolve("short-bloom").resolve("rebind-bloom-v1.bin");
-        Files.createDirectories(shortBloom.getParent());
+        Path shortDirectory = dir.resolve("short-bloom");
+        Files.createDirectories(shortDirectory);
+        Path shortBloom = shortDirectory.resolve("rebind-bloom-v1.bin");
         byte[] shortContent = new byte[1024];
         Files.write(shortBloom, shortContent);
-        RebindState truncated = RebindState.load(dir.resolve("short-bloom").resolve("rebind-v1.json"),
-                shortBloom, now::get);
+        Files.write(shortDirectory.resolve("rebind-v1.json"),
+                "{\"version\":1,\"servers\":[]}".getBytes(StandardCharsets.UTF_8));
+        RebindState truncated = RebindState.load(shortDirectory.resolve("rebind-v1.json"), shortBloom, now::get);
         assertFalse(truncated.isUsable(), "a filter of the wrong size is corrupt");
         assertFalse(truncated.allowsAttempt("mc.example.com", 25565, now.get()));
         assertArrayEquals(shortContent, Files.readAllBytes(shortBloom));
 
         Path notADirectory = dir.resolve("blocked");
         Files.write(notADirectory, new byte[0]);
+        Path blockedBloom = dir.resolve("blocked-bloom.bin");
         RebindState unwritable = RebindState.load(notADirectory.resolve("rebind-v1.json"),
-                dir.resolve("blocked-bloom.bin"), now::get);
+                blockedBloom, now::get);
         assertTrue(unwritable.isUsable(), "the files are missing, not corrupt");
         assertTrue(unwritable.allowsAttempt("mc.example.com", 25565, now.get()));
         assertFalse(unwritable.recordAttemptFailure("mc.example.com", 25565), "the write fails");
         assertFalse(unwritable.isUsable());
         assertFalse(unwritable.allowsAttempt("mc.example.com", 25565, now.get()));
         assertFalse(unwritable.shouldNotify("mc.example.com", 25565, FP_A));
-        assertFalse(Files.exists(dir.resolve("blocked-bloom.bin")));
+        assertFalse(Files.exists(notADirectory.resolve("rebind-v1.json")), "the failed half was not written");
+        assertEquals(RebindBloom.BYTES, Files.size(blockedBloom),
+                "the filter is written first, so the state is left with exactly one half");
+        RebindState half = RebindState.load(notADirectory.resolve("rebind-v1.json"), blockedBloom, now::get);
+        assertFalse(half.isUsable(), "one half alone is unreliable");
+        assertFalse(half.shouldNotify("mc.example.com", 25565, FP_B), "and it is never repaired by guessing");
     }
 
     @Test
@@ -250,6 +261,77 @@ class RebindStateTest {
         assertFalse(state.shouldNotify("mc.example.com", 25565, FP_A), "no notice without a durable mark");
         assertFalse(state.isUsable());
         assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()));
+    }
+
+    @Test
+    void oneOfTheTwoStateFilesMissingFailsClosed(@TempDir Path dir) throws IOException {
+        AtomicLong now = new AtomicLong(BASE);
+
+        Path jsonDirectory = dir.resolve("json-only");
+        Files.createDirectories(jsonDirectory);
+        Path jsonOnly = jsonDirectory.resolve("rebind-v1.json");
+        byte[] json = "{\"version\":1,\"servers\":[]}".getBytes(StandardCharsets.UTF_8);
+        Files.write(jsonOnly, json);
+        RebindState withoutFilter = RebindState.load(jsonOnly,
+                jsonDirectory.resolve("rebind-bloom-v1.bin"), now::get);
+        assertFalse(withoutFilter.isUsable(), "the filter half is missing");
+        assertFalse(withoutFilter.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertFalse(withoutFilter.recordAttemptFailure("mc.example.com", 25565));
+        assertFalse(withoutFilter.shouldNotify("mc.example.com", 25565, FP_A));
+        assertArrayEquals(json, Files.readAllBytes(jsonOnly), "the remaining half was not touched");
+        assertFalse(Files.exists(jsonDirectory.resolve("rebind-bloom-v1.bin")),
+                "the missing half was not created");
+
+        Path bloomDirectory = dir.resolve("bloom-only");
+        Files.createDirectories(bloomDirectory);
+        Path bloomOnly = bloomDirectory.resolve("rebind-bloom-v1.bin");
+        writeEmptyBloom(bloomOnly);
+        RebindState withoutJson = RebindState.load(bloomDirectory.resolve("rebind-v1.json"), bloomOnly, now::get);
+        assertFalse(withoutJson.isUsable(), "the detailed half is missing");
+        assertFalse(withoutJson.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertFalse(withoutJson.recordAttemptFailure("mc.example.com", 25565));
+        assertFalse(withoutJson.shouldNotify("mc.example.com", 25565, FP_A));
+        assertEquals(RebindBloom.BYTES, Files.size(bloomOnly), "the remaining half was not touched");
+        assertFalse(Files.exists(bloomDirectory.resolve("rebind-v1.json")),
+                "the missing half was not created");
+    }
+
+    @Test
+    void smallLimitsEvictTheLeastRecentlyUsedHistoryAndTheBloomStillSuppresses(@TempDir Path dir)
+            throws IOException {
+        Path file = dir.resolve("rebind-v1.json");
+        Path bloomFile = dir.resolve("rebind-bloom-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, bloomFile, now::get, 2, 4, 4);
+        assertTrue(state.isUsable());
+        for (int i = 0; i < 4; i++) {
+            assertTrue(state.shouldNotify("a.example.com", 25565, fingerprint(i)), "notice " + i);
+        }
+        assertTrue(state.shouldNotify("a.example.com", 25565, fingerprint(4)), "the per-server cap evicts fp0");
+        assertFalse(state.shouldNotify("a.example.com", 25565, fingerprint(0)), "the filter still knows fp0");
+
+        assertTrue(state.shouldNotify("b.example.com", 25565, fingerprint(10)), "the total cap evicts a's oldest");
+        assertFalse(state.shouldNotify("a.example.com", 25565, fingerprint(1)), "the filter still knows fp1");
+        String json = new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+        int[] kept = {2, 3, 4, 10};
+        for (int index : kept) {
+            assertTrue(json.contains("fingerprint\":\"" + fingerprint(index)), "kept " + index);
+        }
+        assertFalse(json.contains("fingerprint\":\"" + fingerprint(0)), "evicted fp0");
+        assertFalse(json.contains("fingerprint\":\"" + fingerprint(1)), "evicted fp1");
+
+        // The server cap is injected too: two servers fill it, and only an ended attempt frees a slot.
+        assertTrue(state.beginAttempt("a.example.com", 25565));
+        assertTrue(state.beginAttempt("b.example.com", 25565));
+        assertFalse(state.allowsAttempt("c.example.com", 25565, now.get()), "two entries, both active");
+        state.endAttempt("a.example.com", 25565);
+        assertTrue(state.beginAttempt("c.example.com", 25565), "the ended attempt may be evicted");
+        assertEquals(2, state.size());
+    }
+
+    /** The filter half of a state fixture: a real client always has both files. */
+    private static void writeEmptyBloom(Path bloomFile) throws IOException {
+        Files.write(bloomFile, new byte[RebindBloom.BYTES]);
     }
 
     /** A re-bind state file holding {@code count} servers, each inside a window that never ends. */

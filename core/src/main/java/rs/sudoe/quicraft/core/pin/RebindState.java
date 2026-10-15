@@ -44,11 +44,15 @@ import java.util.logging.Logger;
  *
  * <p><b>Fail closed.</b> When the state cannot be read or written, everything is refused:
  * {@link #shouldNotify(String, int, String)} returns false and {@link #allowsAttempt(String, int, long)}
- * returns false, so the client uses TCP, never repeats a notice and never resets a backoff window.
- * A <em>missing</em> state is an empty, usable one. The two files cannot be replaced in one
- * transaction; each is written atomically (temporary file and rename), the filter first, and a
- * failure in either disables the state, so whatever the failed call changed in memory is never read
- * again.</p>
+ * returns false, so the client uses TCP, never repeats a notice and never resets a backoff window.</p>
+ *
+ * <p>The two files are one unit. Both missing is an empty, usable state (a first run). If exactly
+ * one of them exists, what is left cannot say which notices were already shown, so the state is
+ * unreliable: it fails closed on load and neither file is ever written. Both present is loaded.
+ * They cannot be replaced in one transaction, so every persist writes them in the same order, the
+ * filter ({@code rebind-bloom-v1.bin}) first and the detailed state ({@code rebind-v1.json}) second,
+ * each atomically through a temporary file and a rename. A failure in either disables the state, so
+ * whatever the failed call changed in memory is never read again.</p>
  *
  * <p>Thread-safe: every method is synchronized. The time a window starts from is the injected
  * {@code clock}; {@code allowsAttempt}'s {@code now} must be read from that same clock, which is
@@ -112,19 +116,30 @@ public final class RebindState {
     private final Path file;
     private final Path bloomFile;
     private final LongSupplier clock;
+    private final int maxEntries;
+    private final int maxFingerprintsPerServer;
+    private final int maxFingerprintsTotal;
     /** Least recently used first, so one eviction order serves capacity and the file. */
     private final LinkedHashMap<String, Entry> entries = new LinkedHashMap<>();
     private final RebindBloom bloom = new RebindBloom();
     private int noticeCount;
     private boolean disabled;
 
-    private RebindState(Path file, Path bloomFile, LongSupplier clock) {
+    private RebindState(Path file, Path bloomFile, LongSupplier clock, int maxEntries,
+                        int maxFingerprintsPerServer, int maxFingerprintsTotal) {
+        if (maxEntries < 1 || maxFingerprintsPerServer < 1
+                || maxFingerprintsTotal < maxFingerprintsPerServer) {
+            throw new IllegalArgumentException("re-bind state limits are not usable");
+        }
         this.file = file;
         this.bloomFile = bloomFile;
         this.clock = clock;
+        this.maxEntries = maxEntries;
+        this.maxFingerprintsPerServer = maxFingerprintsPerServer;
+        this.maxFingerprintsTotal = maxFingerprintsTotal;
     }
 
-    /** Loads the re-bind state; missing files are an empty, usable one. */
+    /** Loads the re-bind state; both files missing is an empty, usable one. */
     public static RebindState load(Path file, Path bloomFile) {
         return load(file, bloomFile, System::currentTimeMillis);
     }
@@ -136,7 +151,18 @@ public final class RebindState {
      * @param bloomFile the bloom filter file, or null for memory only
      */
     static RebindState load(Path file, Path bloomFile, LongSupplier clock) {
-        RebindState state = new RebindState(file, bloomFile, clock);
+        return load(file, bloomFile, clock, MAX_ENTRIES, MAX_FINGERPRINTS_PER_SERVER, MAX_FINGERPRINTS_TOTAL);
+    }
+
+    /**
+     * Loads the re-bind state with explicit limits. The public entry points use the caps of
+     * docs/protocol.md 12.16 ({@link #MAX_ENTRIES}, {@link #MAX_FINGERPRINTS_PER_SERVER},
+     * {@link #MAX_FINGERPRINTS_TOTAL}); tests inject smaller ones to exercise the eviction paths.
+     */
+    static RebindState load(Path file, Path bloomFile, LongSupplier clock, int maxEntries,
+                            int maxFingerprintsPerServer, int maxFingerprintsTotal) {
+        RebindState state = new RebindState(file, bloomFile, clock, maxEntries,
+                maxFingerprintsPerServer, maxFingerprintsTotal);
         try {
             state.read();
         } catch (IOException | RuntimeException e) {
@@ -226,7 +252,7 @@ public final class RebindState {
         entry.failures = Math.min(entry.failures + 1, MAX_FAILURES);
         long backoff = Math.min(INITIAL_BACKOFF_MILLIS << Math.min(entry.failures - 1, 20), MAX_BACKOFF_MILLIS);
         entry.blockedUntil = clock.getAsLong() + backoff;
-        if (!write()) {
+        if (!persist()) {
             disabled = true;
             return false;
         }
@@ -247,7 +273,7 @@ public final class RebindState {
             return;
         }
         noticeCount -= removed.notices.size();
-        if (!write()) {
+        if (!persist()) {
             disabled = true;
         }
     }
@@ -289,9 +315,7 @@ public final class RebindState {
         entry.notices.add(new Notice(fingerprint, Instant.ofEpochMilli(clock.getAsLong())));
         noticeCount++;
         trimNotices(entry);
-        boolean bloomWritten = writeBloom();
-        boolean stateWritten = write();
-        if (!bloomWritten || !stateWritten) {
+        if (!persist()) {
             disabled = true;
             return false;
         }
@@ -303,14 +327,30 @@ public final class RebindState {
         return entries.size();
     }
 
+    /**
+     * Reads the state. The two files are one unit: both missing is empty and usable, exactly one
+     * present is unreliable and fails closed, both present is loaded.
+     */
     private void read() throws IOException {
-        if (file != null && Files.isRegularFile(file)) {
-            String content = new String(StateFile.read(file, MAX_FILE_BYTES), StandardCharsets.UTF_8);
-            readJson(content);
+        boolean jsonPresent = file != null && isUsableFile(file);
+        boolean bloomPresent = bloomFile != null && isUsableFile(bloomFile);
+        if (file != null && bloomFile != null && jsonPresent != bloomPresent) {
+            throw new IOException("only one of the two re-bind state files exists");
         }
-        if (bloomFile != null && Files.isRegularFile(bloomFile)) {
+        if (jsonPresent) {
+            readJson(new String(StateFile.read(file, MAX_FILE_BYTES), StandardCharsets.UTF_8));
+        }
+        if (bloomPresent) {
             bloom.read(StateFile.read(bloomFile, RebindBloom.BYTES));
         }
+    }
+
+    /** Whether {@code path} is a regular file; a directory or device in its place is unreadable. */
+    private static boolean isUsableFile(Path path) throws IOException {
+        if (Files.exists(path) && !Files.isRegularFile(path)) {
+            throw new IOException("re-bind state is not a regular file: " + path);
+        }
+        return Files.isRegularFile(path);
     }
 
     private void readJson(String content) {
@@ -320,8 +360,8 @@ public final class RebindState {
             throw new IllegalArgumentException("unsupported re-bind state version " + version);
         }
         List<Object> servers = StrictJson.array(root.get("servers"), "servers");
-        if (servers.size() > MAX_ENTRIES) {
-            throw new IllegalArgumentException("re-bind state holds more than " + MAX_ENTRIES + " servers");
+        if (servers.size() > maxEntries) {
+            throw new IllegalArgumentException("re-bind state holds more than " + maxEntries + " servers");
         }
         for (Object element : servers) {
             Map<String, Object> fields = StrictJson.object(element, "server");
@@ -331,7 +371,7 @@ public final class RebindState {
             entry.failures = StrictJson.integer(fields.get("failures"), "failures", 0, MAX_FAILURES);
             entry.blockedUntil = StrictJson.instant(fields.get("blockedUntil"), "blockedUntil").toEpochMilli();
             List<Object> notices = StrictJson.array(fields.get("notices"), "notices");
-            if (notices.size() > MAX_FINGERPRINTS_PER_SERVER) {
+            if (notices.size() > maxFingerprintsPerServer) {
                 throw new IllegalArgumentException("re-bind state has too many notices for one server");
             }
             for (Object noticeElement : notices) {
@@ -345,8 +385,8 @@ public final class RebindState {
                 throw new IllegalArgumentException("re-bind state repeats a server");
             }
         }
-        if (noticeCount > MAX_FINGERPRINTS_TOTAL) {
-            throw new IllegalArgumentException("re-bind state holds more than " + MAX_FINGERPRINTS_TOTAL + " notices");
+        if (noticeCount > maxFingerprintsTotal) {
+            throw new IllegalArgumentException("re-bind state holds more than " + maxFingerprintsTotal + " notices");
         }
     }
 
@@ -371,7 +411,7 @@ public final class RebindState {
 
     /** Evicts the least recently used entry that is not an active attempt, when there is no room. */
     private boolean makeRoom() {
-        if (entries.size() < MAX_ENTRIES) {
+        if (entries.size() < maxEntries) {
             return true;
         }
         String victim = null;
@@ -397,11 +437,11 @@ public final class RebindState {
 
     /** Keeps {@code entry} inside the per-server cap and the total cap, evicting oldest first. */
     private void trimNotices(Entry entry) {
-        while (entry.notices.size() > MAX_FINGERPRINTS_PER_SERVER) {
+        while (entry.notices.size() > maxFingerprintsPerServer) {
             entry.notices.remove(0);
             noticeCount--;
         }
-        while (noticeCount > MAX_FINGERPRINTS_TOTAL) {
+        while (noticeCount > maxFingerprintsTotal) {
             Entry oldest = null;
             for (Entry candidate : entries.values()) {
                 if (!candidate.notices.isEmpty()) {
@@ -415,6 +455,15 @@ public final class RebindState {
             oldest.notices.remove(0);
             noticeCount--;
         }
+    }
+
+    /**
+     * Persists the whole state, the filter first and the detailed state second, so the invariant
+     * "both files exist or neither exists" holds. A failure in either half leaves the state
+     * disabled rather than half written.
+     */
+    private boolean persist() {
+        return writeBloom() && write();
     }
 
     private boolean write() {
