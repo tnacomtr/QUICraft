@@ -143,3 +143,8 @@ jobs:
         with:
           name: netty-quic-repo-all
           path: natives/build/out/repo/
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: core-test-results-${{ matrix.native }}
+          path: core/build/test-results/
