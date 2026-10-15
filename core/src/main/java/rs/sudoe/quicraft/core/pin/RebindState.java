@@ -351,16 +351,17 @@ public final class RebindState {
     }
 
     /**
-     * Records that the server was reached, which clears its backoff window (section 6). Its notice
-     * history goes with it; the bloom filter still suppresses the tuples that were noticed.
+     * Records that the server was reached, which clears its backoff window (section 6).
      *
-     * <p>An entry with a live attempt is not removed, only cleared: its active token stays, so the
-     * invariant that an active attempt's state is never evicted holds and the single-attempt
-     * guarantee cannot be broken by a success landing in the middle of one (a second
-     * {@link #tryBeginAttempt(String, int, long)} stays refused, and
-     * {@link #endAttempt(Attempt, boolean)} still matches the token that started it). A success
-     * outside an attempt, and a successful end through {@link #endAttempt(Attempt, boolean)}, do
-     * remove the entry.</p>
+     * <p>With no live attempt the entry is removed, and its detailed notice history goes with it; the
+     * monotone bloom filter still suppresses every tuple that was noticed, so 12.16's at-most-once rule
+     * holds. With a live attempt the entry is kept and only its window is cleared (failures back to
+     * zero), which keeps both the notice history and the active token: the invariant that a live
+     * attempt's state is never evicted holds, the single-attempt guarantee cannot be broken by a
+     * success landing in the middle of one (a second {@link #tryBeginAttempt(String, int, long)} stays
+     * refused, and {@link #endAttempt(Attempt, boolean)} still matches the token that started it), and
+     * the history stays more detailed than the filter alone. A successful end through
+     * {@link #endAttempt(Attempt, boolean)} removes the entry like the first case.</p>
      */
     public synchronized void recordSuccess(String host, int port) {
         PinKey key = PinKey.of(host, port);
