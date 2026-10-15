@@ -638,13 +638,19 @@ single-socket listener: no dispatcher is installed and the connection id length 
    encryption), before processing configuration. Apply offline handling in 12.16/12.19;
    do not infer authentication merely from possession of `S`.
    **Handshake confirmation without a native signal.** The pinned Netty reports TLS handshake
-   completion, not RFC 9001 §4.1.2 confirmation (receipt of HANDSHAKE_DONE). `/3` never uses
-   0-RTT (13.1), and a server MUST NOT process 1-RTT packets before its handshake is complete
-   (RFC 9001 §5.7). The client's Login Start travels in 1-RTT, so any server reply to it
-   proves the server's handshake is complete, which for a server is confirmation. Binding
-   begins only in configuration, after such replies. An implementation MAY therefore use
-   handshake completion plus this ordering as the confirmation gate, with no native patch, and
-   MUST test that the client never starts binding before the server's reply to Login Start.
+   completion, not RFC 9001 §4.1.2 confirmation (receipt of HANDSHAKE_DONE). `/3` allows
+   0-RTT under 12.18, so a server reply to Login Start (which may be early data, answered
+   in 0.5-RTT) proves nothing. The gate is instead: a client reads server stream data only
+   after its own handshake has completed, so every packet it sends after reading server
+   data is 1-RTT, never early data; a server MUST NOT process 1-RTT packets before its
+   handshake is complete (RFC 9001 §5.7). The server enters configuration only after
+   processing such a packet (Encryption Response in online mode; Login Acknowledged under
+   the offline test flag), so any configuration-stage server message proves the server's
+   handshake is complete, which for a server is confirmation. Binding begins only in
+   configuration. The server additionally refuses to start binding (`0x10`) unless it has
+   seen its own TLS handshake completion. An implementation MAY use handshake completion
+   plus this ordering as the confirmation gate, with no native patch, and MUST test, with
+   0-RTT accepted, that neither side starts binding before the server's handshake completes.
    `F` is SHA-256 of the actual leaf certificate DER
    (or the original ticket-associated certificate on resumption); `R` is the routing
    resource digest in 13.7. Both peers calculate these locally and reject differing inputs.
@@ -1091,8 +1097,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
     digest selecting fresh TCP without `/2` or `0x10`, restart-persisted fingerprint-independent
     backoff, notice deduplication/eviction, the join-time TCP retry (close before fresh TCP, log and
     chat message, failure-cache entry) for every pre-activation failure kind, no retry after
-    activation, and the client never starting binding before the server's reply to Login
-    Start (12.7).
+    activation, and, with 0-RTT accepted on `/3`, neither side starting binding before the
+    server's TLS handshake completes (12.7).
     Run a 50,000-concurrent-QUIC-connection node benchmark before enablement, recording
     configured node budget, admission reservations/refusals, retained and native memory,
     peak pending bytes/records, CONTROL progress, latency and throughput under auxiliary
