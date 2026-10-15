@@ -286,7 +286,7 @@ public final class RebindState {
                 fail(entry, now);
                 changed = true;
             }
-            if (entry.active != null || entry.blockedUntil > now) {
+            if (entry.active != null || windowAt(entry.blockedUntil, now) > now) {
                 if (changed && !persist()) {
                     disabled = true;
                 }
@@ -505,7 +505,9 @@ public final class RebindState {
                     StrictJson.integer(fields.get("port"), "port", 1, 65535));
             Entry entry = new Entry(key.host(), key.port());
             entry.failures = StrictJson.integer(fields.get("failures"), "failures", 0, MAX_FAILURES);
-            entry.blockedUntil = StrictJson.instant(fields.get("blockedUntil"), "blockedUntil").toEpochMilli();
+            entry.blockedUntil = windowAt(
+                    StrictJson.instant(fields.get("blockedUntil"), "blockedUntil").toEpochMilli(),
+                    clock.getAsLong());
             List<Object> notices = StrictJson.array(fields.get("notices"), "notices");
             if (notices.size() > maxFingerprintsPerServer) {
                 throw new IllegalArgumentException("re-bind state has too many notices for one server");
@@ -589,6 +591,16 @@ public final class RebindState {
     /** Section 6's window for {@code failures} consecutive failures: one minute doubling to one hour. */
     private static long backoff(int failures) {
         return Math.min(INITIAL_BACKOFF_MILLIS << Math.min(failures - 1, 20), MAX_BACKOFF_MILLIS);
+    }
+
+    /**
+     * A window clamped to at most the maximum backoff from {@code now}. A stored window is only ever
+     * set from a clock reading plus a backoff, so a value further out than that can only come from a
+     * clock that moved forward and then back; clamping it keeps a server from being blocked for longer
+     * than the schedule allows.
+     */
+    private static long windowAt(long blockedUntil, long now) {
+        return Math.min(blockedUntil, now + MAX_BACKOFF_MILLIS);
     }
 
     /**

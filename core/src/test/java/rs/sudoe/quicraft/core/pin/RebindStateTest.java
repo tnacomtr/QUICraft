@@ -120,6 +120,18 @@ class RebindStateTest {
     }
 
     @Test
+    void aStoredWindowFarInTheFutureIsClampedToTheMaximumBackoff(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        Files.write(file, stateFile(servers(1, FUTURE)));
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertNull(state.tryBeginAttempt("s0.example.com", 25565, now.get()), "inside its window");
+        now.addAndGet(TimeUnit.HOURS.toMillis(1));
+        assertNotNull(state.tryBeginAttempt("s0.example.com", 25565, now.get()),
+                "a clock that moved forward and back cannot block longer than one hour");
+    }
+
+    @Test
     void backoffIsKeyedLikeAPinAndIgnoresTheFingerprint(@TempDir Path dir) {
         Path file = dir.resolve("rebind-v1.bin");
         AtomicLong now = new AtomicLong(BASE);
