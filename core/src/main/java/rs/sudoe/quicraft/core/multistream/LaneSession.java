@@ -320,6 +320,15 @@ public final class LaneSession {
         return new long[] {receiver.pendingRecords(), receiver.pendingBytes(), unsentPackets, unsentBytes};
     }
 
+    /** The stream channel of a lane, or null before it exists; call on the loop. */
+    QuicStreamChannel channelFor(Lane lane) {
+        if (lane == Lane.CONTROL) {
+            return controlChannel;
+        }
+        LaneStream s = streams[lane.ordinal()];
+        return s == null ? null : s.channel;
+    }
+
     io.netty.channel.EventLoop eventLoop() {
         return loop;
     }
