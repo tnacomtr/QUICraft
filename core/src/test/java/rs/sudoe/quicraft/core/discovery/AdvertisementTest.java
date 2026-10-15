@@ -7,10 +7,13 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
@@ -112,6 +115,150 @@ class AdvertisementTest {
         for (String bad : new String[] {"{\"a\":01}", "{\"a\":1.}", "{\"a\":\"\u0001\"}", "{'a':1}", "{\"a\":1,}", "tru"}) {
             assertThrows(IllegalArgumentException.class, () -> Json.parse(bad), bad);
         }
+    }
+
+    @Test
+    void acceptsQuicraft3AndKeepsTheV1Fields() {
+        Advertisement ad = extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/3\",\"fp\":\"" + fp + "\"}")
+                .orElseThrow(() -> new AssertionError("quicraft/3 must parse"));
+        assertEquals(1, ad.version());
+        assertEquals(25565, ad.port());
+        assertEquals("quicraft/3", ad.alpn());
+        assertEquals(fp, ad.fingerprint());
+        assertTrue(ad.routing().isEmpty());
+        assertEquals(Optional.empty(), ad.routingDigest(775));
+        assertTrue(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}").isPresent());
+        assertFalse(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/4\",\"fp\":\"" + fp + "\"}").isPresent());
+    }
+
+    @Test
+    void routingMemberRoundTripsThroughJson() {
+        Map<Integer, String> routing = new LinkedHashMap<>();
+        routing.put(775, digest('a'));
+        routing.put(0, digest('b'));
+        Advertisement ad = Advertisement.of(Protocol.ALPN_V3, 25565, fp, routing);
+        // Keys ascend by protocol number, so the encoding is deterministic.
+        assertEquals("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/3\",\"fp\":\"" + fp + "\",\"routing\":{"
+                + "\"0\":\"" + digest('b') + "\",\"775\":\"" + digest('a') + "\"}}", ad.toJson());
+        assertEquals(Optional.of(digest('a')), ad.routingDigest(775));
+        assertEquals(Optional.of(digest('b')), ad.routingDigest(0));
+        assertEquals(Optional.empty(), ad.routingDigest(776));
+
+        String status = ad.insertInto(VANILLA);
+        assertEquals(Optional.of(ad), Advertisement.extract(status));
+        Advertisement reparsed = Advertisement.extract(status).orElseThrow(AssertionError::new);
+        assertEquals(ad.toJson(), reparsed.toJson());
+        assertEquals(ad.hashCode(), reparsed.hashCode());
+        // A hand-written status response with the same member parses to the same value too.
+        assertEquals(ad, extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/3\",\"fp\":\"" + fp
+                + "\",\"routing\":{\"775\":\"" + digest('a') + "\",\"0\":\"" + digest('b') + "\"}}")
+                .orElseThrow(AssertionError::new));
+    }
+
+    @Test
+    void malformedRoutingIsIgnoredAndTheRestStillParses() {
+        for (String routing : new String[] {
+            "[]", "\"x\"", "null", "5",
+            "{\"+5\":\"" + digest('a') + "\"}",
+            "{\"05\":\"" + digest('a') + "\"}",
+            "{\"5 \":\"" + digest('a') + "\"}",
+            "{\"abc\":\"" + digest('a') + "\"}",
+            "{\"2147483648\":\"" + digest('a') + "\"}",
+            "{\"5\":\"SHA256:" + hex('a') + "\"}",
+            "{\"5\":\"sha256:" + hex('A') + "\"}",
+            "{\"5\":\"sha256:short\"}",
+            "{\"5\":\"sha256:" + hex('a') + "0\"}",
+            "{\"5\":\"md5:" + hex('a') + "\"}",
+            "{\"5\":123}", "{\"5\":null}", "{\"5\":[\"" + digest('a') + "\"]}",
+            "{\"5\":\"" + digest('a') + "\",\"6\":\"bad\"}",
+        }) {
+            Optional<Advertisement> parsed = extract(withRouting("quicraft/2", routing));
+            assertTrue(parsed.isPresent(), "routing: " + routing);
+            assertEquals("quicraft/2", parsed.get().alpn(), "routing: " + routing);
+            assertEquals(Collections.emptyMap(), parsed.get().routing(), "routing: " + routing);
+        }
+    }
+
+    @Test
+    void boundsTheRoutingMember() {
+        Optional<Advertisement> atLimit = extract(withRouting("quicraft/3", routingJson(Advertisement.MAX_ROUTING_ENTRIES)));
+        assertTrue(atLimit.isPresent());
+        assertEquals(Advertisement.MAX_ROUTING_ENTRIES, atLimit.get().routing().size());
+        assertEquals(Optional.of(digest('a')), atLimit.get().routingDigest(Advertisement.MAX_ROUTING_ENTRIES - 1));
+
+        Optional<Advertisement> overLimit = extract(withRouting("quicraft/2",
+                routingJson(Advertisement.MAX_ROUTING_ENTRIES + 1)));
+        assertTrue(overLimit.isPresent());
+        assertTrue(overLimit.get().routing().isEmpty());
+    }
+
+    @Test
+    void keepsTheResponseCapWithRouting() {
+        Map<Integer, String> routing = new LinkedHashMap<>();
+        for (int i = 0; i < Advertisement.MAX_ROUTING_ENTRIES; i++) {
+            routing.put(i, digest('a'));
+        }
+        Advertisement ad = Advertisement.of(Protocol.ALPN_V3, 25565, fp, routing);
+        int memberLength = ad.insertInto("{\"a\":1}").length() - "{\"a\":1}".length();
+        String fits = padded(Advertisement.STATUS_MAX_LENGTH - memberLength);
+        String tooBig = padded(Advertisement.STATUS_MAX_LENGTH - memberLength + 1);
+        assertEquals(Advertisement.STATUS_MAX_LENGTH, ad.insertInto(fits).length());
+        assertSame(tooBig, ad.insertInto(tooBig));
+    }
+
+    @Test
+    void refusesToEncodeAnInvalidAdvertisement() {
+        Map<Integer, String> tooMany = new LinkedHashMap<>();
+        for (int i = 0; i <= Advertisement.MAX_ROUTING_ENTRIES; i++) {
+            tooMany.put(i, digest('a'));
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> Advertisement.of(Protocol.ALPN_V3, 25565, fp, tooMany));
+        assertThrows(IllegalArgumentException.class,
+                () -> Advertisement.of(Protocol.ALPN_V3, 25565, fp, Collections.singletonMap(775, "sha256:xyz")));
+        assertThrows(IllegalArgumentException.class,
+                () -> Advertisement.of(Protocol.ALPN_V3, 25565, fp, Collections.singletonMap(-1, digest('a'))));
+        assertThrows(IllegalArgumentException.class,
+                () -> Advertisement.of(Protocol.ALPN_V3, 25565, fp, Collections.singletonMap(775, null)));
+        assertThrows(IllegalArgumentException.class,
+                () -> Advertisement.of("quicraft/4", 25565, fp, Collections.emptyMap()));
+        assertThrows(IllegalArgumentException.class,
+                () -> Advertisement.of(Protocol.ALPN_V3, 0, fp, Collections.emptyMap()));
+        assertThrows(IllegalArgumentException.class,
+                () -> Advertisement.of(Protocol.ALPN_V3, 65536, fp, Collections.emptyMap()));
+        assertEquals(Collections.emptyMap(),
+                Advertisement.of(Protocol.ALPN_V3, 25565, fp, null).routing());
+    }
+
+    /** A status response whose advertisement has the given ALPN and raw routing member value. */
+    private static String withRouting(String alpn, String routingJson) {
+        return "{\"v\":1,\"port\":25565,\"alpn\":\"" + alpn + "\",\"fp\":\"" + fp + "\",\"routing\":"
+                + routingJson + "}";
+    }
+
+    /** A routing object with {@code entries} entries, keyed {@code 0..entries-1}. */
+    private static String routingJson(int entries) {
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < entries; i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append('"').append(i).append("\":\"").append(digest('a')).append('"');
+        }
+        return sb.append('}').toString();
+    }
+
+    /** 64 copies of {@code c}, the hex body of a digest. */
+    private static String hex(char c) {
+        StringBuilder sb = new StringBuilder(64);
+        for (int i = 0; i < 64; i++) {
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    private static String digest(char c) {
+        return "sha256:" + hex(c);
     }
 
     private static Optional<Advertisement> extract(String member) {
