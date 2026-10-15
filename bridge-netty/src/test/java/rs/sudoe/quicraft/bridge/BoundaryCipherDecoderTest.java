@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.function.Consumer;
@@ -363,6 +364,38 @@ class BoundaryCipherDecoderTest {
         assertEquals(0, sink.taken.refCnt());
         ch.finishAndReleaseAll();
         alloc.assertAllReleased("whole input");
+    }
+
+    @Test
+    void anAdoptedReadOnlyInputIsNeverCompacted() throws Exception {
+        Random r = new Random(13);
+        byte[] f1 = frame(r, 300);
+        byte[] f2 = frame(r, 300);
+        byte[] plain = new byte[f1.length + f2.length];
+        System.arraycopy(f1, 0, plain, 0, f1.length);
+        System.arraycopy(f2, 0, plain, f1.length, f2.length);
+        byte[] enc = encryptCipher().update(plain);
+        int cut = f1.length + 150;
+
+        TrackingAllocator alloc = new TrackingAllocator(false);
+        BoundaryCipherDecoder dec = BoundaryCipherDecoder.forSharedSecret(SECRET);
+        Sink sink = new Sink();
+        EmbeddedChannel ch = channel(alloc, dec, sink);
+        ByteBuf parent = buf(alloc, Arrays.copyOf(enc, cut));
+        parent.retain();
+        ch.writeInbound(parent.asReadOnly());
+        assertEquals(1, sink.got.size(), "the complete frame came out");
+        byte[] after = new byte[cut];
+        parent.getBytes(0, after);
+        assertArrayEquals(Arrays.copyOf(enc, cut), after, "the shared input was not rewritten");
+
+        ch.writeInbound(buf(alloc, Arrays.copyOfRange(enc, cut, enc.length)));
+        assertTrue(parent.release(), "the decoder gave its reference back");
+        assertEquals(2, sink.got.size());
+        assertArrayEquals(f1, sink.got.get(0));
+        assertArrayEquals(f2, sink.got.get(1));
+        ch.finishAndReleaseAll();
+        alloc.assertAllReleased("read-only input");
     }
 
     @Test

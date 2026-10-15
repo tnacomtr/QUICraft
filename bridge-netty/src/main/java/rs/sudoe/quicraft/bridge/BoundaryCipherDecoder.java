@@ -123,8 +123,10 @@ public final class BoundaryCipherDecoder extends ChannelInboundHandlerAdapter {
         // Inside the read loop the remainder is handed out now (the loop finishes after the
         // in-flight fireChannelRead returns); outside it finishStop() already produced it.
         if (inLoop) {
-            ByteBuf r = detach(cumulation);
+            // Clear the field first: detach() releases its argument when it fails.
+            ByteBuf rest = cumulation;
             cumulation = null;
+            ByteBuf r = detach(rest);
             taken = r;
             return r;
         }
@@ -298,7 +300,8 @@ public final class BoundaryCipherDecoder extends ChannelInboundHandlerAdapter {
             if (!cumulation.isReadable()) {
                 cumulation.release();
                 cumulation = null;
-            } else {
+            } else if (cumulationOwned) {
+                // Only compact a buffer we own: an adopted input may be read-only or shared.
                 cumulation.discardSomeReadBytes();
             }
         }
