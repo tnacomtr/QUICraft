@@ -60,6 +60,7 @@ public final class ReceiverScheduler {
     private long outstandingSince;
     private boolean pumping, ended, controlEnded;
     private boolean receivingBundle;
+    private long bundleStarted;
     private int bundleMembers;
     private long bundleUncompressed;
 
@@ -152,7 +153,7 @@ public final class ReceiverScheduler {
         received[e.lane().ordinal()] = e.sequence();
         if (e.kind() == Envelope.Kind.END) controlEnded = true;
         if (e.bundle() == Envelope.Bundle.OPEN) {
-            receivingBundle = true; bundleMembers = 0; bundleUncompressed = 0;
+            receivingBundle = true; bundleStarted = now; bundleMembers = 0; bundleUncompressed = 0;
         } else if (e.bundle() == Envelope.Bundle.MEMBER) {
             bundleMembers++; bundleUncompressed += uncompressed;
         } else if (e.bundle() == Envelope.Bundle.CLOSE) receivingBundle = false;
@@ -217,6 +218,8 @@ public final class ReceiverScheduler {
         outstanding = null; markHeads(now); pump(now);
     }
     public void checkDeadlines(long now) {
+        if (receivingBundle && now - bundleStarted >= TIMEOUT_NANOS)
+            throw new OrderingException("missing bundle close timeout");
         if (outstanding != null && now - outstandingSince >= TIMEOUT_NANOS)
             throw new OrderingException("unapplied handler timeout");
         for (Partial p : partials.keySet())

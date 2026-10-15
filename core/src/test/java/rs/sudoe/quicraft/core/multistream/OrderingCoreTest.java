@@ -221,7 +221,6 @@ class OrderingCoreTest {
         Harness h = new Harness();
         h.scheduler.offer(marked(1,Envelope.Bundle.OPEN),0);
         for (int i=0;i<4096;i++) {
-            // Partial reservation is needed to fit a bundle this large in the general cap?
             // The stricter 1024 queue limit wins before the 4096 bundle ceiling.
             if (i==1023) {
                 final int seq=i+2;
@@ -313,6 +312,15 @@ class OrderingCoreTest {
         h.drain(T-1);
         h.scheduler.checkDeadlines(2*T-2);
         fails(() -> h.scheduler.checkDeadlines(2*T-1));
+    }
+
+    @Test void missingBundleCloseDeadlineStartsAtOpenEvenBehindAnotherHead() {
+        Harness h = new Harness();
+        h.scheduler.offer(e(C,1,0,0,0),0);
+        h.scheduler.offer(marked(2,Envelope.Bundle.OPEN),1);
+        h.scheduler.applied(C,1,T-2);
+        h.scheduler.checkDeadlines(T);
+        fails(() -> h.scheduler.checkDeadlines(T+1));
     }
 
     @Test void duplicateSkipAndWrongOwnLaneDependencyAreErrors() {
