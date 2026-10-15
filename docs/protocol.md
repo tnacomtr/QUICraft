@@ -729,8 +729,15 @@ single-socket listener: no dispatcher is installed and the connection id length 
     not a prompt, at most once per logical server/new fingerprint), and
     makes ONE automatic re-binding attempt: full handshake, no early data, `/3`, the
     binding exchange of 12.4-12.12 with `F = F'` in `T`. The pin is replaced only after
-    SERVER_SWITCH verifies (12.15); the old pin stays until then. Any failure (binding,
-    exporter unavailable, timeout, write failure) closes with `0x10`, leaves the pin
+    SERVER_SWITCH verifies (12.15); the old pin stays until then. **Pre-connect precedence:**
+    the re-bind needs `/3`, so if a 12.3 prerequisite is missing before any QUIC connection
+    is created (no exporter capability, no supported routing table, or an absent, unknown or
+    mismatched advertised routing digest under 13.1), the client neither selects `/2` nor
+    trusts F': it leaves the pin unchanged, records §6's failure-cache entry and re-bind
+    backoff, and joins over fresh vanilla TCP directly (`quic-only` fails). This overrides
+    12.3/13.1's `/2` selection for a changed pin only; `0x10` is sent only when a `/3`
+    connection exists. Any failure after connection creation (binding,
+    exporter error, timeout, write failure) closes with `0x10`, leaves the pin
     unchanged, records §6's failure-cache entry, and invokes the **changed-pin re-bind TCP
     retry**, the sole exception to 12.14's no-automatic-replay rule: close the failed QUIC
     connection first with `0x10`, then start a fresh vanilla TCP join with a new Login Start
@@ -1034,8 +1041,11 @@ single-socket listener: no dispatcher is installed and the connection id length 
     exhaustion. Verify out-of-u32 protocol rejection, exporter exceptions/wrong lengths,
     PSK-only resumption rejection, ticket-key/certificate rotation, inert binding payloads
     outside `/3` and Velocity's bidirectional stripping. Test failed re-bind close-before-
-    fresh-TCP ordering, new Login Start/session join, bounded OFFER wait, unchanged pin/cache
-    on failure, success-only cache discard, restart-persisted fingerprint-independent
+    fresh-TCP ordering, new Login Start/session join, bounded OFFER wait, unchanged pin and
+    retained (unused) tickets/tokens/recorded flights on failure, failure-cache and re-bind
+    backoff updated on failure (asserted separately), success-only discard of tickets/tokens/
+    flights, changed fingerprint with unavailable exporter or missing/mismatched routing
+    digest selecting fresh TCP without `/2` or `0x10`, restart-persisted fingerprint-independent
     backoff, notice deduplication/eviction and ordinary-failure no-replay behavior.
     Run a 50,000-concurrent-QUIC-connection node benchmark before enablement, recording
     configured node budget, admission reservations/refusals, retained and native memory,
