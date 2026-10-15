@@ -164,6 +164,12 @@ public final class PinStore {
      * keeping the time it was first bound; a new name is refused with {@link RecordResult#FULL} once
      * the store holds {@link #MAX_PINS} pins, and the caller uses TCP for it.
      *
+     * <p><b>Only the post-SERVER_SWITCH online-mode path of docs/protocol.md 12.15 may call this</b>,
+     * once the binding exchange has proved the connection that just completed is the one the pin is
+     * for. The silent v1 fingerprint observations of section 6 are a different thing entirely and
+     * must never be passed in: an authenticated pin means only "the last endpoint at this name that
+     * completed an authenticated login", and 12.15 forbids promoting an observation into it.</p>
+     *
      * @param fingerprint the advertised fingerprint, lowercase {@code sha256:<64 hex>}
      * @throws IllegalArgumentException when the host, port or fingerprint is not in its canonical form
      */
