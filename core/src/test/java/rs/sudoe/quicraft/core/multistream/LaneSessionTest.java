@@ -1001,4 +1001,43 @@ class LaneSessionTest {
             assertThrows(IllegalStateException.class, () -> rig.client.bindGame(rig.clientGame));
         }
     }
+
+    // --- Bundles (13.15).
+
+    @Test
+    void aBundleBeyondTheSenderBoundsConsumesNoSequence() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activateBoth();
+            roundTrip(rig);
+            // A member frame the record codec rejects: no sequence may be handed out for any part.
+            List<SentPacket> rejected = rig.client.sendBundle(
+                    new OutboundPacket(LaneRig.frame(LaneRig.BUNDLE_OPEN, "open")),
+                    Arrays.asList(new OutboundPacket(new byte[0])),
+                    new OutboundPacket(LaneRig.frame(LaneRig.BUNDLE_CLOSE, "close")));
+            closedWith(rig.clientGame, 0x11, false);
+            closedWith(rig.serverGame, 0x11, true);
+            for (SentPacket packet : rejected) {
+                assertFalse(packet.isAssigned(), "an unemittable bundle consumes no sequence");
+            }        }
+    }
+
+    @Test
+    void aBundleOverTheMemberBoundIsRejectedBeforeSequencing() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activateBoth();
+            roundTrip(rig);
+            List<OutboundPacket> members = new ArrayList<>();
+            for (int i = 0; i <= SenderSequencer.MAX_BUNDLE_MEMBERS; i++) {
+                members.add(new OutboundPacket(LaneRig.frame(LaneRig.MOVE, "m" + i)));
+            }
+            List<SentPacket> rejected = rig.client.sendBundle(
+                    new OutboundPacket(LaneRig.frame(LaneRig.BUNDLE_OPEN, "open")), members,
+                    new OutboundPacket(LaneRig.frame(LaneRig.BUNDLE_CLOSE, "close")));
+            closedWith(rig.clientGame, 0x11, false);
+            closedWith(rig.serverGame, 0x11, true);
+            for (SentPacket packet : rejected) {
+                assertFalse(packet.isAssigned(), "an oversize bundle consumes no sequence");
+            }
+        }
+    }
 }

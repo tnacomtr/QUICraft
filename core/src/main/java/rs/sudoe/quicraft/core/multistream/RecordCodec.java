@@ -300,7 +300,11 @@ public final class RecordCodec {
         return new Record(kind, sequence, depControl, depRealtime, depWorld, body);
     }
 
-    private static void validateBody(int kind, byte[] body, boolean controlStream)
+    /**
+     * Validates one record body against 13.4. Package-private so a sender can validate a whole
+     * bundle before it assigns any sequence (LaneSession.checkBundle).
+     */
+    static void validateBody(int kind, byte[] body, boolean controlStream)
             throws MultistreamProtocolException {
         if (kind == KIND_GAME) {
             if (body.length < 1) {

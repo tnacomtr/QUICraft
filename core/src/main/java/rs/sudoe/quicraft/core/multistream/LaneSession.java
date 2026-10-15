@@ -350,9 +350,10 @@ public final class LaneSession {
 
     /**
      * Submits one vanilla bundle (13.15): opening delimiter, members, closing delimiter, all on
-     * CONTROL with nothing else assigned between them. A bundle beyond 1022 members, 8 MiB or the
-     * unsent-queue cap closes the connection with 0x11 instead of being emitted. Returns the
-     * handles in wire order.
+     * CONTROL with nothing else assigned between them. The whole bundle is validated before the
+     * sequencer assigns anything, so a bundle beyond 1022 members, 8 MiB, the record bounds or the
+     * unsent-queue cap consumes no sequence and closes the connection with 0x11 instead of being
+     * emitted. Returns the handles in wire order, at most one per legally possible record.
      */
     public List<SentPacket> sendBundle(final OutboundPacket open, final List<OutboundPacket> members,
                                        final OutboundPacket close) {
@@ -361,7 +362,8 @@ public final class LaneSession {
         }
         final List<OutboundPacket> copy = new ArrayList<OutboundPacket>(members);
         final List<SentPacket> handles = new ArrayList<SentPacket>();
-        for (int i = 0; i < copy.size() + 2; i++) {
+        int handleCount = Math.min(copy.size(), SenderSequencer.MAX_BUNDLE_MEMBERS) + 2;
+        for (int i = 0; i < handleCount; i++) {
             handles.add(new SentPacket());
         }
         run(() -> doSendBundle(open, copy, close, handles));
@@ -832,6 +834,10 @@ public final class LaneSession {
         for (OutboundPacket m : members) {
             bytes += m.frame().length;
         }
+        // 13.15: the whole bundle, both delimiters included, is validated before the sequencer is
+        // touched, so a bundle that cannot be emitted consumes no sequence and leaves no buffered
+        // bundle behind. A sender that would exceed any bound closes with 0x11 instead.
+        checkBundle(open, members, close);
         reserveQueue(members.size() + 2L, bytes);
         long t = now();
         sender.beginBundle(t);
@@ -848,6 +854,42 @@ public final class LaneSession {
         }
         drain();
         armTick();
+    }
+
+    /** The 13.15 sender bounds of one whole bundle, checked before any sequence is assigned. */
+    private void checkBundle(OutboundPacket open, List<OutboundPacket> members, OutboundPacket close) {
+        if (members.size() > SenderSequencer.MAX_BUNDLE_MEMBERS) {
+            throw new OrderingException("bundle over the 1022-member bound (13.15)");
+        }
+        checkBundlePart(open);
+        checkBundlePart(close);
+        long uncompressed = (long) open.uncompressedBytes() + close.uncompressedBytes();
+        for (OutboundPacket m : members) {
+            if (m.changesStateCompressionOrActivation()) {
+                throw new OrderingException("bundle member changes state, compression or activation (13.15)");
+            }
+            checkBundlePart(m);
+            uncompressed += m.uncompressedBytes();
+        }
+        if (uncompressed > 8L * 1024 * 1024) {
+            throw new OrderingException("bundle over its 8 MiB uncompressed bound (13.15)");
+        }
+    }
+
+    /** One bundle part must carry a valid GAME body and a sane uncompressed size (13.4, 13.15). */
+    private void checkBundlePart(OutboundPacket part) {
+        if (part.uncompressedBytes() < 0) {
+            throw new OrderingException("bundle part with a negative uncompressed size");
+        }
+        byte[] frame = part.frame();
+        if (frame == null || frame.length > RecordCodec.MAX_BODY_LENGTH) {
+            throw new OrderingException("bundle part frame over the record bound (13.4)");
+        }
+        try {
+            RecordCodec.validateBody(RecordCodec.KIND_GAME, frame, true);
+        } catch (MultistreamProtocolException e) {
+            throw new OrderingException("bundle part is not a GAME body: " + e.getMessage(), e);
+        }
     }
 
     private void doEnd() {
