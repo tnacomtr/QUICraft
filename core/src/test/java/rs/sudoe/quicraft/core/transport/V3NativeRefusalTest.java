@@ -1,13 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.transport;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.QuicSupport;
@@ -66,5 +75,63 @@ class V3NativeRefusalTest {
             assertNotNull(stream, "the fallback listener must speak /2");
             stream.close();
         }
+    }
+
+    /**
+     * The one INFO line of task 5 is per JVM, not per bind: two listeners asked for {@code /3} on a
+     * native without the window caps must log it exactly once. The patched run asserts the other
+     * side of the same flag: no line at all.
+     */
+    @Test
+    void enablingThreeOnANativeWithoutTheWindowCapsLogsOneInfoLine() throws Exception {
+        // This test owns the one-time line; a sibling that bound a /3 listener may have consumed it.
+        warningFlag().set(false);
+        List<String> lines = Collections.synchronizedList(new ArrayList<String>());
+        Logger logger = Logger.getLogger("QUICraft");
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                lines.add(record.getMessage());
+            }
+
+            @Override
+            public void flush() { }
+
+            @Override
+            public void close() { }
+        };
+        handler.setLevel(Level.ALL);
+        logger.addHandler(handler);
+        try {
+            try (QuicServer first = QuicServer.bind(Loopback.anyLocal(), identity, TransportConfig.DEFAULT,
+                    stream -> { }, protocol -> TABLE)) {
+                assertNotNull(first);
+            }
+            try (QuicServer second = QuicServer.bind(Loopback.anyLocal(), identity, TransportConfig.DEFAULT,
+                    stream -> { }, protocol -> TABLE)) {
+                assertNotNull(second);
+            }
+        } finally {
+            logger.removeHandler(handler);
+        }
+
+        int matching = 0;
+        for (String line : lines) {
+            if (line != null && line.contains("cannot cap quiche's flow-control windows")) {
+                matching++;
+            }
+        }
+        if (QuicSupport.hasMaxFlowControlWindows()) {
+            assertEquals(0, matching, "the patched native enables /3 without a warning");
+        } else {
+            assertEquals(1, matching, "one INFO line per JVM across the two binds");
+        }
+    }
+
+    /** The listener's one-time warning flag, so this test can own it. */
+    private static AtomicBoolean warningFlag() throws Exception {
+        java.lang.reflect.Field field = QuicServer.class.getDeclaredField("V3_NATIVE_WARNING");
+        field.setAccessible(true);
+        return (AtomicBoolean) field.get(null);
     }
 }

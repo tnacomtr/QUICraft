@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -28,6 +30,10 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -274,9 +280,13 @@ class V3ConnectionTest {
     @Test
     void anUnknownEarlyTokenWaitsForTheHandshake() throws Exception {
         requireV3();
+        // Keep the client from abandoning the 0-RTT connection before the server's handshake ends,
+        // so the wait path (not the §8 retry) is what this test observes.
+        QuicClient.setGraceFloorForTests(2_000);
         List<Boolean> handshakeAtAccept = Collections.synchronizedList(new ArrayList<Boolean>());
-        try (QuicServer server = bindServer(connection -> handshakeAtAccept.add(connection.handshakeComplete()))) {
-            InetSocketAddress address = server.localAddress();
+        try (QuicServer server = bindServer(connection -> handshakeAtAccept.add(connection.handshakeComplete()));
+                DelayRelay relay = new DelayRelay(server.localAddress(), 30)) {
+            InetSocketAddress address = relay.address();
             primeV3Join(address);
 
             // Replace the token the priming join earned with one the server never issued.
@@ -288,10 +298,168 @@ class V3ConnectionTest {
             assertTrue(early.sent(), () -> "no 0-RTT: " + QuicClient.lastEarlyOutcome());
             stream.close();
 
-            assertTrue(await(() -> !handshakeAtAccept.isEmpty(), 5_000), "the stream is delivered");
+            assertTrue(await(() -> handshakeAtAccept.size() >= 2, 5_000), "the stream is delivered");
             assertTrue(handshakeAtAccept.get(handshakeAtAccept.size() - 1),
                     "an unknown token must wait for the handshake (12.18, docs/protocol.md §8)");
         }
+    }
+
+    @Test
+    void enablingThreeKeepsTheCallersConfiguration() throws Exception {
+        requireV3();
+        TransportConfig custom = TransportConfig.builder()
+                .maxOpen(7)
+                .maxOpenPerIp(3)
+                .maxTrackedIps(100)
+                .globalAttemptsPerSecond(11)
+                .perIpAttemptsPerSecond(5)
+                .retryThresholdPerSecond(4)
+                .ingressInitialsPerSecond(13)
+                .ingressInitialsPerIpPerSecond(6)
+                .retryMode(TransportConfig.RetryMode.NEVER)
+                .maxIdleTimeout(5, TimeUnit.SECONDS)
+                .congestionControl(TransportConfig.CongestionControl.RENO)
+                .initialCongestionWindowPackets(12)
+                .earlyData(false)
+                .sessionResumption(false)
+                .build();
+
+        // The /3 copy preserves every value and only turns the multistream limits on.
+        TransportConfig copy = custom.withMultistream();
+        assertTrue(copy.isMultistream());
+        assertFalse(custom.isMultistream());
+        assertEquals(custom.maxIdleTimeoutMillis, copy.maxIdleTimeoutMillis);
+        assertEquals(custom.initialMaxData, copy.initialMaxData);
+        assertEquals(custom.initialMaxStreamData, copy.initialMaxStreamData);
+        assertEquals(custom.congestionControl, copy.congestionControl);
+        assertEquals(custom.initialCongestionWindowPackets, copy.initialCongestionWindowPackets);
+        assertEquals(custom.earlyData, copy.earlyData);
+        assertEquals(custom.sessionResumption, copy.sessionResumption);
+        assertEquals(custom.relaxedLossThreshold, copy.relaxedLossThreshold);
+        assertEquals(custom.globalAttemptsPerSecond, copy.globalAttemptsPerSecond);
+        assertEquals(custom.perIpAttemptsPerSecond, copy.perIpAttemptsPerSecond);
+        assertEquals(custom.retryThresholdPerSecond, copy.retryThresholdPerSecond);
+        assertEquals(custom.maxOpen, copy.maxOpen);
+        assertEquals(custom.maxOpenPerIp, copy.maxOpenPerIp);
+        assertEquals(custom.maxTrackedIps, copy.maxTrackedIps);
+        assertEquals(custom.ingressInitialsPerSecond, copy.ingressInitialsPerSecond);
+        assertEquals(custom.ingressInitialsPerIpPerSecond, copy.ingressInitialsPerIpPerSecond);
+        assertEquals(custom.retryMode, copy.retryMode);
+
+        // A /3 listener keeps it too.
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity, custom, stream -> { },
+                protocol -> TABLE)) {
+            TransportConfig effective = server.effectiveConfigForTests();
+            assertTrue(effective.isMultistream());
+            assertEquals(7, effective.maxOpen());
+            assertEquals(3, effective.maxOpenPerIp());
+            assertEquals(100, effective.maxTrackedIps());
+            assertEquals(TransportConfig.RetryMode.NEVER, effective.retryMode());
+            assertEquals(5000, effective.maxIdleTimeoutMillis);
+            assertEquals(TransportConfig.CongestionControl.RENO, effective.congestionControl());
+            assertFalse(effective.earlyData);
+            assertFalse(effective.sessionResumption);
+        }
+
+        // And a /3 dial: earlyData=false means no 0-RTT even with the material cached.
+        try (QuicServer server = bindServer(connection -> { })) {
+            InetSocketAddress address = server.localAddress();
+            primeV3Join(address);
+            EarlyFlight early = new EarlyFlight("inputs");
+            V3Connection connection = QuicClient.connectV3(address, identity.fingerprint(), TABLE, custom,
+                    early, false).get(10, TimeUnit.SECONDS);
+            assertFalse(early.sent(), "the dial's own earlyData=false must be honoured");
+            connection.close();
+        }
+    }
+
+    @Test
+    void aUsedEarlyTokenWaitsForTheHandshake() throws Exception {
+        requireV3();
+        // Keep the client from abandoning the replay's 0-RTT connection before the server's handshake
+        // ends, so the wait path is what this test observes.
+        QuicClient.setGraceFloorForTests(2_000);
+        List<Boolean> handshakeAtAccept = Collections.synchronizedList(new ArrayList<Boolean>());
+        try (QuicServer server = bindServer(connection -> handshakeAtAccept.add(connection.handshakeComplete()));
+                DelayRelay relay = new DelayRelay(server.localAddress(), 30)) {
+            InetSocketAddress address = relay.address();
+            primeV3Join(address);
+            List<Object> key = EarlyCache.server(address, identity.fingerprint(), Protocol.ALPN_V3);
+            byte[] token = EarlyCache.INSTANCE.takeToken(key);
+            assertNotNull(token, "the priming join must have stored a /3 early token");
+
+            // First use: a 0-RTT dial redeems it, so the server delivers the stream early.
+            EarlyCache.INSTANCE.putToken(key, token);
+            EarlyFlight first = new EarlyFlight("inputs");
+            V3Connection firstConnection = QuicClient.connectV3(address, identity.fingerprint(), TABLE, first)
+                    .get(10, TimeUnit.SECONDS);
+            assertTrue(first.sent(), () -> "no 0-RTT: " + QuicClient.lastEarlyOutcome());
+            assertTrue(await(() -> handshakeAtAccept.size() >= 2, 5_000), "the first use is accepted");
+            assertFalse(handshakeAtAccept.get(handshakeAtAccept.size() - 1), "a redeemed token delivers early");
+            firstConnection.close();
+
+            // Replay of the same token: the server already consumed it, so this stream waits.
+            int before = handshakeAtAccept.size();
+            EarlyCache.INSTANCE.putToken(key, token);
+            EarlyFlight replay = new EarlyFlight("inputs");
+            V3Connection replayed = QuicClient.connectV3(address, identity.fingerprint(), TABLE, replay)
+                    .get(10, TimeUnit.SECONDS);
+            assertTrue(replay.sent(), () -> "no 0-RTT: " + QuicClient.lastEarlyOutcome());
+            assertTrue(await(() -> handshakeAtAccept.size() > before, 5_000), "the replay is delivered");
+            assertTrue(handshakeAtAccept.get(handshakeAtAccept.size() - 1),
+                    "a used token must wait for the handshake (docs/protocol.md §8)");
+            replayed.close();
+        }
+    }
+
+    @Test
+    void aServerRefusesToActivateBeforeItsOwnHandshakeCompletes() throws Exception {
+        requireV3();
+        List<String> warnings = Collections.synchronizedList(new ArrayList<String>());
+        AtomicReference<V3Connection> early = new AtomicReference<V3Connection>();
+        Logger logger = Logger.getLogger("QUICraft");
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                warnings.add(record.getMessage());
+            }
+
+            @Override
+            public void flush() { }
+
+            @Override
+            public void close() { }
+        };
+        handler.setLevel(Level.ALL);
+        logger.addHandler(handler);
+        try (QuicServer server = bindServer(connection -> {
+            if (connection.handshakeComplete()) {
+                return; // the priming join (and any retry) is delivered after the handshake
+            }
+            early.compareAndSet(null, connection);
+            connection.detachForActivation(leftover -> { });
+            connection.activate(new Game(), 4242, null); // too early on this 0-RTT connection (12.7)
+        }); DelayRelay relay = new DelayRelay(server.localAddress(), 30)) {
+            primeV3Join(relay.address());
+            EarlyFlight earlyFlight = new EarlyFlight("inputs");
+            QuicClient.connectV3(relay.address(), identity.fingerprint(), TABLE, earlyFlight)
+                    .get(10, TimeUnit.SECONDS);
+            assertTrue(earlyFlight.sent(), () -> "no 0-RTT: " + QuicClient.lastEarlyOutcome());
+            assertNotNull(early.get(), "the resumed dial must be delivered early, before the handshake");
+            assertTrue(await(() -> !early.get().isOpen(), 5_000),
+                    "12.7: activation before the server's own handshake closes the connection");
+        } finally {
+            logger.removeHandler(handler);
+        }
+
+        assertNull(early.get().session(), "no session may be created before the server's handshake (12.7)");
+        boolean warned = false;
+        for (String line : warnings) {
+            if (line != null && line.contains("handshake is not complete")) {
+                warned = true;
+            }
+        }
+        assertTrue(warned, "the refusal is the 12.7 handshake guard, which fails closed with 0x10");
     }
 
     // --- Helpers.
