@@ -17,13 +17,68 @@ section 13.12. Netty sets the initial limits but has no setter for the maxima. T
 - QuicCodecBuilder.maxConnectionWindow(long) and maxStreamWindow(long): positive values, copied
   by the builder's copy constructor and passed through QuicheConfig. Left unset, quiche keeps its
   own defaults, so existing callers behave exactly as before.
+- Quic.isMaxFlowControlWindowsSupported(): probes the two bindings once, like
+  isRelaxedLossThresholdSupported() from 0001. Both builder setters throw
+  UnsupportedOperationException when it is false, so a caller on an upstream native library
+  fails at configuration time instead of with an UnsatisfiedLinkError when a connection starts.
 
 Nothing else changes, and the native jar gains no dependency.
 
 Applied by natives/build-netty-quic.sh with `git apply`, which ignores this text.
 
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java
+index 1d726f9..976071a 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java
+@@ -14,7 +14,8 @@
+  * under the License.
+  *
+  * Modified by the QUICraft project:
+- * adds isRelaxedLossThresholdSupported() and isKeyingMaterialExportSupported().
++ * adds isRelaxedLossThresholdSupported(), isKeyingMaterialExportSupported() and
++ * isMaxFlowControlWindowsSupported().
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -155,6 +156,36 @@ public final class Quic {
+         }
+     }
+ 
++    /**
++     * Returns {@code true} if the loaded native library can set quiche's maximum flow-control
++     * windows (see {@link QuicCodecBuilder#maxConnectionWindow(long)} and
++     * {@link QuicCodecBuilder#maxStreamWindow(long)}). A native library built without those
++     * bindings returns {@code false}.
++     *
++     * @return {@code true} if supported, {@code false} otherwise.
++     */
++    public static boolean isMaxFlowControlWindowsSupported() {
++        return isAvailable() && MaxFlowControlWindowsSupport.SUPPORTED;
++    }
++
++    private static final class MaxFlowControlWindowsSupport {
++        static final boolean SUPPORTED = probe();
++
++        private static boolean probe() {
++            long config = Quiche.quiche_config_new(Quiche.QUICHE_PROTOCOL_VERSION);
++            try {
++                // quiche's own defaults, so the probe changes nothing even if the config were reused.
++                Quiche.quiche_config_set_max_connection_window(config, 24L * 1024 * 1024);
++                Quiche.quiche_config_set_max_stream_window(config, 16L * 1024 * 1024);
++                return true;
++            } catch (UnsatisfiedLinkError e) {
++                return false;
++            } finally {
++                Quiche.quiche_config_free(config);
++            }
++        }
++    }
++
+     static Map.Entry<ChannelOption<?>, Object>[] toOptionsArray(Map<ChannelOption<?>, Object> opts) {
+         return new HashMap<>(opts).entrySet().toArray(EMPTY_OPTION_ARRAY);
+     }
 diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicCodecBuilder.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicCodecBuilder.java
-index e2760d5..5aeb9a3 100644
+index e2760d5..43ce3cb 100644
 --- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicCodecBuilder.java
 +++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicCodecBuilder.java
 @@ -14,7 +14,7 @@
@@ -53,7 +108,7 @@ index e2760d5..5aeb9a3 100644
          this.localConnIdLength = builder.localConnIdLength;
          this.sslEngineProvider = builder.sslEngineProvider;
          this.flushStrategy = builder.flushStrategy;
-@@ -154,6 +158,32 @@ public abstract class QuicCodecBuilder<B extends QuicCodecBuilder<B>> {
+@@ -154,6 +158,42 @@ public abstract class QuicCodecBuilder<B extends QuicCodecBuilder<B>> {
          return self();
      }
  
@@ -64,8 +119,13 @@ index e2760d5..5aeb9a3 100644
 +     *
 +     * @param bytes the maximum connection window in bytes
 +     * @return the instance itself.
++     * @throws UnsupportedOperationException if {@link Quic#isMaxFlowControlWindowsSupported()} is {@code false}.
 +     */
 +    public final B maxConnectionWindow(long bytes) {
++        if (!Quic.isMaxFlowControlWindowsSupported()) {
++            throw new UnsupportedOperationException(
++                    "the loaded QUIC native library has no maximum flow-control window bindings");
++        }
 +        this.maxConnectionWindow = checkPositive(bytes, "bytes");
 +        return self();
 +    }
@@ -77,8 +137,13 @@ index e2760d5..5aeb9a3 100644
 +     *
 +     * @param bytes the maximum stream window in bytes
 +     * @return the instance itself.
++     * @throws UnsupportedOperationException if {@link Quic#isMaxFlowControlWindowsSupported()} is {@code false}.
 +     */
 +    public final B maxStreamWindow(long bytes) {
++        if (!Quic.isMaxFlowControlWindowsSupported()) {
++            throw new UnsupportedOperationException(
++                    "the loaded QUIC native library has no maximum flow-control window bindings");
++        }
 +        this.maxStreamWindow = checkPositive(bytes, "bytes");
 +        return self();
 +    }
@@ -86,7 +151,7 @@ index e2760d5..5aeb9a3 100644
      /**
       * Set if <a href="https://tools.ietf.org/html/draft-thomson-quic-bit-grease-00">greasing</a> should be enabled
       * or not.
-@@ -518,7 +548,7 @@ public abstract class QuicCodecBuilder<B extends QuicCodecBuilder<B>> {
+@@ -518,7 +558,7 @@ public abstract class QuicCodecBuilder<B extends QuicCodecBuilder<B>> {
                  ackDelayExponent, maxAckDelay, disableActiveMigration, enableHystart,
                  enableRelaxedLossThreshold, discoverPmtu,
                  congestionControlAlgorithm, initialCongestionWindowPackets, recvQueueLen, sendQueueLen,
