@@ -178,10 +178,30 @@ class AdvertisementTest {
     }
 
     @Test
+    void routingKeysFollowTheDocumentedNumberFormat() {
+        // 13.1: no sign, no leading zero except "0", at most 10 digits, fits a signed 32-bit int.
+        for (String key : new String[] {"0", "1", "775", "2147483647"}) {
+            Optional<Advertisement> parsed = extractForSelection(
+                    withRouting("quicraft/3", "{\"" + key + "\":\"" + digest('a') + "\"}"));
+            assertTrue(parsed.isPresent(), "key: " + key);
+            assertEquals(1, parsed.get().routing().size(), "key: " + key);
+        }
+        for (String key : new String[] {"+5", "-5", "007", "05", "5 ", " 5", "5.0", "0x5",
+                "2147483648", "99999999999"}) {
+            Optional<Advertisement> parsed = extractForSelection(
+                    withRouting("quicraft/3", "{\"" + key + "\":\"" + digest('a') + "\"}"));
+            assertTrue(parsed.isPresent(), "key: " + key);
+            assertTrue(parsed.get().routing().isEmpty(), "key: " + key);
+        }
+    }
+
+    @Test
     void malformedRoutingIsIgnoredAndTheRestStillParses() {
         for (String routing : new String[] {
             "[]", "\"x\"", "null", "5",
             "{\"+5\":\"" + digest('a') + "\"}",
+            "{\"-5\":\"" + digest('a') + "\"}",
+            "{\"007\":\"" + digest('a') + "\"}",
             "{\"05\":\"" + digest('a') + "\"}",
             "{\"5 \":\"" + digest('a') + "\"}",
             "{\"abc\":\"" + digest('a') + "\"}",

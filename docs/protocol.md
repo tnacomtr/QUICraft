@@ -834,6 +834,13 @@ single-socket listener: no dispatcher is installed and the connection id length 
    alters the TCP listener. No feature is inferred from a plugin payload on `/2`.
    Add optional advertisement field `routing` containing an object mapping decimal unsigned
    protocol-number strings to lowercase `sha256:` hex routing-resource digests (13.7).
+   `routing` holds at most 64 entries. Each key is a decimal unsigned protocol number with no
+   sign and no leading zero except `"0"`, at most 10 digits, fitting a signed 32-bit int; each
+   value is exactly `sha256:` followed by 64 lowercase hex digits. Any malformed entry, and more
+   than 64 entries, discards the whole member (all-or-nothing), never the rest of the
+   advertisement; a client treats a discarded member as absent, which can only select `/2` or
+   TCP. A server whose response would exceed §1's cap with the member omits the routing object
+   first and still advertises.
    Vanilla ignores it; obey §1's response-size cap. Before connecting, clients require a
    matching digest for their protocol to select `/3`; absent/unknown/mismatched entries
    select `/2` if supported by that listener, otherwise TCP (a changed pin instead uses
