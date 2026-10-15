@@ -126,6 +126,10 @@ public final class Advertisement {
      * order, so the encoding of a given advertisement is deterministic.
      */
     public String toJson() {
+        return toJson(routing);
+    }
+
+    private String toJson(Map<Integer, String> routing) {
         StringBuilder sb = new StringBuilder();
         sb.append("{\"v\":").append(version).append(",\"port\":").append(port)
                 .append(",\"alpn\":").append(Json.quote(alpn))
@@ -149,7 +153,10 @@ public final class Advertisement {
     /**
      * Returns {@code statusJson} with this advertisement added as a top-level member. Returns
      * the input unchanged if it is not a JSON object, already has the member, or would exceed
-     * {@link #STATUS_MAX_LENGTH} (13.1: a routing member obeys the same cap). Never throws.
+     * {@link #STATUS_MAX_LENGTH} even without the routing member. A response that overflows only
+     * because of routing is retried once with the routing member dropped: routing is optional and
+     * only a {@code /3} selection needs it, so that still advertises a valid listener (13.1, §1).
+     * Never throws.
      */
     public String insertInto(String statusJson) {
         try {
@@ -158,13 +165,28 @@ public final class Advertisement {
                 return statusJson;
             }
             int close = statusJson.lastIndexOf('}');
-            String member = Json.quote(Protocol.ADVERTISEMENT_KEY) + ":" + toJson();
             String separator = ((Map<?, ?>) parsed).isEmpty() ? "" : ",";
-            String result = statusJson.substring(0, close) + separator + member + statusJson.substring(close);
-            return result.length() <= STATUS_MAX_LENGTH ? result : statusJson;
+            String result = splice(statusJson, close, separator, toJson());
+            if (result.length() <= STATUS_MAX_LENGTH) {
+                return result;
+            }
+            if (!routing.isEmpty()) {
+                String withoutRouting = splice(statusJson, close, separator,
+                        toJson(Collections.<Integer, String>emptyMap()));
+                if (withoutRouting.length() <= STATUS_MAX_LENGTH) {
+                    return withoutRouting;
+                }
+            }
+            return statusJson;
         } catch (RuntimeException e) {
             return statusJson;
         }
+    }
+
+    /** {@code statusJson} with the advertisement member built from {@code memberJson} spliced in. */
+    private static String splice(String statusJson, int close, String separator, String memberJson) {
+        String member = Json.quote(Protocol.ADVERTISEMENT_KEY) + ":" + memberJson;
+        return statusJson.substring(0, close) + separator + member + statusJson.substring(close);
     }
 
     /**

@@ -216,17 +216,36 @@ class AdvertisementTest {
     }
 
     @Test
-    void keepsTheResponseCapWithRouting() {
+    void keepsTheResponseCapAndDropsRoutingBeforeLeavingTheResponseUnchanged() {
+        Advertisement full = routingAdvertisement();
+        Advertisement trimmed = Advertisement.of(Protocol.ALPN_V3, 25565, fp, Collections.<Integer, String>emptyMap());
+        int fullLength = full.insertInto("{\"a\":1}").length() - "{\"a\":1}".length();
+        int trimmedLength = trimmed.insertInto("{\"a\":1}").length() - "{\"a\":1}".length();
+        assertTrue(fullLength > trimmedLength);
+
+        // Room for the whole member: it is inserted with its routing.
+        String roomy = padded(Advertisement.STATUS_MAX_LENGTH - fullLength);
+        String roomyResult = full.insertInto(roomy);
+        assertEquals(Advertisement.STATUS_MAX_LENGTH, roomyResult.length());
+        assertEquals(Optional.of(full), Advertisement.extractForSelection(roomyResult));
+
+        // Only room without routing: one retry drops routing instead of inserting nothing.
+        String tight = padded(Advertisement.STATUS_MAX_LENGTH - trimmedLength);
+        String tightResult = full.insertInto(tight);
+        assertEquals(Advertisement.STATUS_MAX_LENGTH, tightResult.length());
+        assertEquals(Optional.of(trimmed), Advertisement.extractForSelection(tightResult));
+
+        // Room for neither: the response is left exactly as it was.
+        String tooBig = padded(Advertisement.STATUS_MAX_LENGTH - trimmedLength + 1);
+        assertSame(tooBig, full.insertInto(tooBig));
+    }
+
+    private static Advertisement routingAdvertisement() {
         Map<Integer, String> routing = new LinkedHashMap<>();
         for (int i = 0; i < Advertisement.MAX_ROUTING_ENTRIES; i++) {
             routing.put(i, digest('a'));
         }
-        Advertisement ad = Advertisement.of(Protocol.ALPN_V3, 25565, fp, routing);
-        int memberLength = ad.insertInto("{\"a\":1}").length() - "{\"a\":1}".length();
-        String fits = padded(Advertisement.STATUS_MAX_LENGTH - memberLength);
-        String tooBig = padded(Advertisement.STATUS_MAX_LENGTH - memberLength + 1);
-        assertEquals(Advertisement.STATUS_MAX_LENGTH, ad.insertInto(fits).length());
-        assertSame(tooBig, ad.insertInto(tooBig));
+        return Advertisement.of(Protocol.ALPN_V3, 25565, fp, routing);
     }
 
     @Test
