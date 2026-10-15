@@ -746,6 +746,14 @@ class LaneSessionTest {
                 TimeUnit.MILLISECONDS.toNanos(400), TimeUnit.MILLISECONDS.toNanos(20));
         try (LaneRig rig = LaneRig.start(config)) {
             rig.client.activate(null);
+            // A raw server opens both of its directions, so no open deadline keeps the tick alive.
+            LaneLoopback.write(rig.serverRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 1);
+            QuicChannel serverConnection = rig.net.serverConnection.get(10, TimeUnit.SECONDS);
+            LaneLoopback.write(serverConnection.createStream(
+                    io.netty.handler.codec.quic.QuicStreamType.BIDIRECTIONAL,
+                    new io.netty.channel.ChannelInboundHandlerAdapter()).get(10, TimeUnit.SECONDS),
+                    (byte) 2, (byte) 2);
+            sleep(500);
             rig.client.holdWrites(Lane.CONTROL);
             rig.client.end();
             sleep(700);
