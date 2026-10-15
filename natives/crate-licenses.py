@@ -95,11 +95,11 @@ def main():
     ap.add_argument("--report", required=True)
     args = ap.parse_args()
 
-    with open(args.metadata) as f:
+    with open(args.metadata, encoding="utf-8") as f:
         packages = {(p["name"], p["version"]): p for p in json.load(f)["packages"]}
 
     def read(path):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return sorted({crate_key(line) for line in f if line.strip()})
 
     linked = read(args.linked)
@@ -140,7 +140,7 @@ def main():
                 problems.append("%s %s: no licence file in the crate" % (name, version))
             inventory.append("%s %s | %s | elected: %s" % (name, version, expr, verdict))
 
-    with open(os.path.join(args.dest, "INVENTORY.txt"), "w") as f:
+    with open(os.path.join(args.dest, "INVENTORY.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write("Rust crates statically linked into QUICraft's netty-codec-native-quic build\n")
         f.write("(quiche features: ffi qlog custom-client-dcid; all targets).\n")
         f.write("Each crate's licence files are in the directory of the same name.\n")
@@ -149,7 +149,7 @@ def main():
         for line in inventory:
             f.write(line + "\n")
 
-    with open(args.report, "w") as f:
+    with open(args.report, "w", encoding="utf-8", newline="\n") as f:
         f.write("| Kind | Crate | Version | Licence | Elected |\n| --- | --- | --- | --- | --- |\n")
         for row in rows:
             f.write("| %s | %s | %s | %s | %s |\n" % row)
