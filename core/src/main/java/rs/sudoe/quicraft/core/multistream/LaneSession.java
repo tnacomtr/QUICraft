@@ -429,6 +429,37 @@ public final class LaneSession {
                 r != null && r.decoder.hasPartial() ? 1 : 0};
     }
 
+    /** Test hook: the sender's last-assigned sequences per lane; call on the loop. */
+    long[] assignedSequences() {
+        return sender.assigned();
+    }
+
+    /**
+     * Test hook: the pinned Netty's {@code QUICHE_ERR_STREAM_STOPPED}, or {@link Integer#MIN_VALUE}
+     * when the probe cannot resolve it.
+     */
+    static int stopSendingErrCode() {
+        return STOPPED_SENDING;
+    }
+
+    /**
+     * The pinned Netty's {@code streamCapacity(long)} accessor for a connection class, or null when
+     * it is not there. See {@link #peerStoppedReading}.
+     */
+    static java.lang.reflect.Method findStreamCapacity(Class<?> connectionClass) {
+        Class<?> type = connectionClass;
+        while (type != null) {
+            try {
+                java.lang.reflect.Method method = type.getDeclaredMethod("streamCapacity", long.class);
+                method.setAccessible(true);
+                return method;
+            } catch (NoSuchMethodException next) {
+                type = type.getSuperclass();
+            }
+        }
+        return null;
+    }
+
     /** The stream channel of a lane, or null before it exists; call on the loop. */
     QuicStreamChannel channelFor(Lane lane) {
         if (lane == Lane.CONTROL) {
@@ -1245,17 +1276,7 @@ public final class LaneSession {
     private java.lang.reflect.Method streamCapacity() {
         if (!streamCapacityLookedUp) {
             streamCapacityLookedUp = true;
-            Class<?> type = connection.getClass();
-            while (type != null) {
-                try {
-                    java.lang.reflect.Method m = type.getDeclaredMethod("streamCapacity", long.class);
-                    m.setAccessible(true);
-                    streamCapacityMethod = m;
-                    break;
-                } catch (NoSuchMethodException next) {
-                    type = type.getSuperclass();
-                }
-            }
+            streamCapacityMethod = findStreamCapacity(connection.getClass());
             if (streamCapacityMethod == null) {
                 LOG.log(Level.FINE, "the pinned Netty exposes no stream send capacity; a STOP_SENDING "
                         + "is then still noticed by the first write on the lane");

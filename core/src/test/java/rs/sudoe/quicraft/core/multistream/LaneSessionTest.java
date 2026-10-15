@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.multistream;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1220,6 +1221,7 @@ class LaneSessionTest {
         try (LaneRig rig = LaneRig.start()) {
             rig.activateBoth();
             roundTrip(rig);
+            long[] before = LaneRig.assigned(rig.client);
             // A member frame the record codec rejects: no sequence may be handed out for any part.
             List<SentPacket> rejected = rig.client.sendBundle(
                     new OutboundPacket(LaneRig.frame(LaneRig.BUNDLE_OPEN, "open")),
@@ -1227,9 +1229,25 @@ class LaneSessionTest {
                     new OutboundPacket(LaneRig.frame(LaneRig.BUNDLE_CLOSE, "close")));
             closedWith(rig.clientGame, 0x11, false);
             closedWith(rig.serverGame, 0x11, true);
+            assertArrayEquals(before, LaneRig.assigned(rig.client),
+                    "a rejected bundle leaves the sequencer where it was");
             for (SentPacket packet : rejected) {
                 assertFalse(packet.isAssigned(), "an unemittable bundle consumes no sequence");
-            }        }
+            }
+        }
+    }
+
+    @Test
+    void theStopSendingProbeResolvesAgainstThePinnedNetty() throws Exception {
+        assertTrue(LaneSession.stopSendingErrCode() != Integer.MIN_VALUE,
+                "the pinned Netty must expose QUICHE_ERR_STREAM_STOPPED");
+        assertTrue(LaneSession.stopSendingErrCode() < 0,
+                "QUICHE_ERR_STREAM_STOPPED is a negative quiche error: " + LaneSession.stopSendingErrCode());
+        Class<?> implementation = Class.forName(
+                io.netty.handler.codec.quic.QuicStreamChannel.class.getName()
+                        .replace("QuicStreamChannel", "QuicheQuicChannel"));
+        assertNotNull(LaneSession.findStreamCapacity(implementation),
+                "the pinned Netty must expose the stream send capacity of " + implementation.getName());
     }
 
     @Test

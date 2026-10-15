@@ -383,6 +383,11 @@ final class LaneRig implements AutoCloseable {
         return session.eventLoop().submit(session::snapshot).get(10, TimeUnit.SECONDS);
     }
 
+    /** The sender's last-assigned sequences per lane, from the session's event loop. */
+    static long[] assigned(LaneSession session) throws Exception {
+        return session.eventLoop().submit(session::assignedSequences).get(10, TimeUnit.SECONDS);
+    }
+
     @Override
     public void close() {
         net.close();

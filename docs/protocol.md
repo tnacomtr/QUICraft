@@ -982,7 +982,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
     These are ceilings, not eager allocations. Each listener/node MUST also enforce a
     configured aggregate pending-bytes budget across connections, counting all retained
     buffers/decoded data above, including the unparsed transport chunks held before a
-    record claims them. Reserve each admitted connection's initial receive-credit
+    record claims them. The read chunk a lane has taken but not parsed, at most one
+    `READ_CHUNK` per lane, counts toward that node budget and not toward the per-connection
+    ceilings above. Reserve each admitted connection's initial receive-credit
     exposure against that budget, and refuse new QUIC admissions when the reservation
     cannot fit (leave TCP untouched). Debit further credit/allocations before granting
     them; release reservations only when credit exposure or retained bytes are gone.
