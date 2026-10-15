@@ -14,6 +14,13 @@ import java.util.Optional;
  * to CONTROL, never an inferred category (13.6). {@link #digest()} is SHA-256 over the exact bytes
  * of the resource the table was parsed from, whitespace included, with no normalization (13.7);
  * both peers must ship the identical resource.
+ *
+ * <p>Entries keep the order they have in the resource, at every step from the parsed JSON to
+ * {@link #routes()}.
+ *
+ * <p>Deferred: 13.7 also requires ordering tests for every non-control entry. Those tests belong to
+ * the barrier unit of 13.9 to 13.11, which does not exist yet, so this table ships without them and
+ * no ordering test is written here; they land with that unit.
  */
 public final class RoutingTable {
     private final int protocolNumber;

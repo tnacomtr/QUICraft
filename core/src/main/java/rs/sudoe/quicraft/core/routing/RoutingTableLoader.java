@@ -13,8 +13,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -30,7 +30,9 @@ import rs.sudoe.quicraft.core.discovery.Json;
  * spec's synthetic schema example; it is not a mapping for any released Minecraft version.
  *
  * <p>The validator rejects, with the rule it broke in the message: an unsupported {@code schema}; a
- * duplicate route; an unknown field at either level; an unknown state, lane, direction or dependency;
+ * duplicate route; a repeated JSON member name in any object (13.7, so a duplicate is never
+ * silently last-wins); a {@code protocol} other than the number {@link #loadResource(int)} was
+ * asked for; an unknown field at either level; an unknown state, lane, direction or dependency;
  * a missing or wrongly typed field; a {@code default} other than {@code control}; a packet id that is
  * not a nonnegative integer no larger than {@link Integer#MAX_VALUE} (one Minecraft VarInt); a
  * dependency that does not match the lane (13.7: {@code fence} for CONTROL, {@code lane} otherwise);
@@ -38,8 +40,8 @@ import rs.sudoe.quicraft.core.discovery.Json;
  * (13.5); and input that is not valid UTF-8.
  *
  * <p>JSON parsing uses the strict parser core already ships for status responses
- * ({@link rs.sudoe.quicraft.core.discovery.Json}); no dependency is added. That parser bounds the
- * decoded text at 1 MiB, which no in-tree table comes close to.
+ * ({@link rs.sudoe.quicraft.core.discovery.Json#parseRejectingDuplicateKeys(String)}); no dependency
+ * is added. That parser bounds the decoded text at 1 MiB, which no in-tree table comes close to.
  */
 public final class RoutingTableLoader {
     /** The only supported resource schema (13.7). */
@@ -74,11 +76,21 @@ public final class RoutingTableLoader {
     /**
      * Loads and validates the table for {@code protocolNumber} from the classpath.
      *
+     * <p>13.7 stores one resource per protocol number, so the resource's own {@code protocol} field
+     * must equal {@code protocolNumber}; a mismatch is rejected rather than used.
+     *
      * @throws IOException if the resource is missing or unreadable
      * @throws RoutingTableException if the resource is invalid
      */
     public static RoutingTable loadResource(int protocolNumber) throws IOException {
-        return loadResource(resourcePath(protocolNumber), Collections.<RouteKey>emptySet());
+        RoutingTable table = loadResource(resourcePath(protocolNumber),
+                Collections.<RouteKey>emptySet());
+        if (table.protocolNumber() != protocolNumber) {
+            throw new RoutingTableException("13.7: " + resourcePath(protocolNumber)
+                    + " declares protocol " + table.protocolNumber() + ", not the requested "
+                    + protocolNumber);
+        }
+        return table;
     }
 
     /**
@@ -164,7 +176,7 @@ public final class RoutingTableLoader {
                     + describe(routesValue));
         }
 
-        Map<RouteKey, Route> routes = new HashMap<>();
+        Map<RouteKey, Route> routes = new LinkedHashMap<>();
         int index = 0;
         for (Object entry : (List<?>) routesValue) {
             String where = "routes[" + index + "]";
@@ -300,7 +312,7 @@ public final class RoutingTableLoader {
             throw new RoutingTableException("13.7: the resource is not valid UTF-8");
         }
         try {
-            return Json.parse(text);
+            return Json.parseRejectingDuplicateKeys(text);
         } catch (IllegalArgumentException e) {
             throw new RoutingTableException("13.7: malformed JSON: " + e.getMessage(), e);
         }

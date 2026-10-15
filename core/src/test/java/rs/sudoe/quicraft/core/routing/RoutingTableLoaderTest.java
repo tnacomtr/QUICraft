@@ -106,6 +106,26 @@ class RoutingTableLoaderTest {
                 "rs/sudoe/quicraft/core/routing/protocol-1.json", Collections.<RouteKey>emptySet()));
     }
 
+    @Test
+    void rejectsAResourceWhoseProtocolDoesNotMatchTheRequestedNumber() throws IOException {
+        // 13.7: one resource per protocol number. The test fixture named protocol-763.json declares
+        // protocol 764, so loading it as 763 must fail rather than return a table for 764.
+        RoutingTableException e = assertThrows(RoutingTableException.class,
+                () -> RoutingTableLoader.loadResource(763));
+        assertTrue(e.getMessage().contains("13.7"), e.getMessage());
+        assertTrue(e.getMessage().contains("declares protocol 764"), e.getMessage());
+        assertTrue(e.getMessage().contains("requested 763"), e.getMessage());
+
+        // The same fixture passes validation when no number is requested, so only the name/number
+        // mismatch rejects it.
+        assertEquals(764, RoutingTableLoader.loadResource(
+                RoutingTableLoader.resourcePath(763), Collections.<RouteKey>emptySet())
+                .protocolNumber());
+
+        // The shipped resource declares the number it is named for, so it still loads.
+        assertEquals(12345, RoutingTableLoader.loadResource(12345).protocolNumber());
+    }
+
     // ------------------------------------------------------------------------- schema and shape
 
     @Test
@@ -163,6 +183,23 @@ class RoutingTableLoaderTest {
         String duplicate = EXAMPLE.replace(WORLD_ENTRY, WORLD_ENTRY + "," + entry(
                 "play", Direction.CLIENTBOUND, 12, Lane.CONTROL));
         assertTrue(reject(duplicate).getMessage().contains("duplicate"));
+    }
+
+    @Test
+    void rejectsDuplicateRootField() {
+        // 13.7: reject duplicates. Last-wins would leave a valid schema here (1), so only a parser
+        // that rejects the repeated member name catches this.
+        String duplicate = EXAMPLE.replace("\"schema\":1,", "\"schema\":9,\"schema\":1,");
+        assertTrue(reject(duplicate).getMessage().contains("duplicate member name"));
+    }
+
+    @Test
+    void rejectsDuplicateEntryField() {
+        // 13.7: reject duplicates at every object level. Last-wins would make this a valid CONTROL
+        // entry, so the rejection is the repeated member name, not the lane.
+        String duplicate = EXAMPLE.replace(CONTROL_ENTRY, CONTROL_ENTRY.replace(
+                "\"lane\":\"control\"", "\"lane\":\"world\",\"lane\":\"control\""));
+        assertTrue(reject(duplicate).getMessage().contains("duplicate member name"));
     }
 
     @Test

@@ -13,6 +13,11 @@ import java.util.Map;
  * become {@code Map<String, Object>}, arrays {@code List<Object>}, numbers
  * {@link BigDecimal}, and JSON null {@link #NULL}.
  *
+ * <p>{@link #parse(String)} keeps the last value of a repeated member name (RFC 8259 leaves that
+ * undefined, and a status response only ever reads a member it expects). Callers that must reject
+ * duplicates, like {@code core.routing} for routing resources (docs/protocol.md 13.7), use
+ * {@link #parseRejectingDuplicateKeys(String)}.
+ *
  * <p>Public so {@code core.routing} can reuse it for routing resources (docs/protocol.md 13.7)
  * instead of adding a JSON dependency or a second parser.
  */
@@ -28,17 +33,33 @@ public final class Json {
     static final int MAX_LENGTH = 1 << 20;
 
     private final String s;
+    private final boolean rejectDuplicateKeys;
     private int pos;
 
-    private Json(String s) {
+    private Json(String s, boolean rejectDuplicateKeys) {
         this.s = s;
+        this.rejectDuplicateKeys = rejectDuplicateKeys;
     }
 
+    /** Parses {@code text}, letting the last of repeated member names win. */
     public static Object parse(String text) {
+        return parse(text, false);
+    }
+
+    /**
+     * Parses {@code text} like {@link #parse(String)}, but throws
+     * {@link IllegalArgumentException} when any object, at any level, repeats a member name.
+     * docs/protocol.md 13.7 requires routing resources to be rejected on duplicates.
+     */
+    public static Object parseRejectingDuplicateKeys(String text) {
+        return parse(text, true);
+    }
+
+    private static Object parse(String text, boolean rejectDuplicateKeys) {
         if (text == null || text.length() > MAX_LENGTH) {
             throw new IllegalArgumentException("missing or oversized JSON");
         }
-        Json json = new Json(text);
+        Json json = new Json(text, rejectDuplicateKeys);
         json.ws();
         Object value = json.value(0);
         json.ws();
@@ -94,6 +115,9 @@ public final class Json {
             ws();
             expect(':');
             ws();
+            if (rejectDuplicateKeys && map.containsKey(key)) {
+                throw error("duplicate member name " + quote(key));
+            }
             map.put(key, value(depth + 1));
             ws();
             char c = next();

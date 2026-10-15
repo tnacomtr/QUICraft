@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -89,6 +90,47 @@ class RoutingTableTest {
         assertThrows(UnsupportedOperationException.class, () -> routes.put(
                 new RouteKey(763, ProtocolState.PLAY, Direction.CLIENTBOUND, 40),
                 new Route(Lane.WORLD, Dependency.LANE)));
+    }
+
+    @Test
+    void routesKeepResourceOrder() {
+        RoutingTable table = table();
+        List<RouteKey> keys = new ArrayList<>(table.routes().keySet());
+        assertEquals(Arrays.asList(
+                new RouteKey(763, ProtocolState.PLAY, Direction.CLIENTBOUND, 10),
+                new RouteKey(763, ProtocolState.PLAY, Direction.CLIENTBOUND, 11),
+                new RouteKey(763, ProtocolState.PLAY, Direction.SERVERBOUND, 26)), keys);
+
+        List<Lane> lanes = new ArrayList<>();
+        for (Route route : table.routes().values()) {
+            lanes.add(route.lane());
+        }
+        assertEquals(Arrays.asList(Lane.CONTROL, Lane.REALTIME, Lane.WORLD), lanes);
+    }
+
+    @Test
+    void routesKeepResourceOrderForManyEntries() {
+        // Descending packet ids: a hash-ordered map would essentially never reproduce this order,
+        // so this catches a regression from resource order to hash order.
+        StringBuilder json = new StringBuilder(
+                "{\"schema\":1,\"protocol\":763,\"default\":\"control\",\"routes\":[");
+        List<Integer> expected = new ArrayList<>();
+        for (int id = 40; id > 30; id--) {
+            if (!expected.isEmpty()) {
+                json.append(',');
+            }
+            json.append("{\"state\":\"play\",\"direction\":\"clientbound\",\"packet_id\":")
+                    .append(id)
+                    .append(",\"lane\":\"realtime\",\"dependency\":\"lane\"}");
+            expected.add(id);
+        }
+        json.append("]}");
+
+        List<Integer> actual = new ArrayList<>();
+        for (RouteKey key : RoutingTableLoader.parse(json.toString()).routes().keySet()) {
+            actual.add(key.packetId());
+        }
+        assertEquals(expected, actual);
     }
 
     @Test
