@@ -9,11 +9,14 @@ import java.util.Map;
 
 /**
  * Strict RFC 8259 parser for status responses. The input comes from untrusted servers, so depth
- * and length are bounded and every malformed input throws {@link IllegalArgumentException}.
- * Objects become {@code Map<String, Object>}, arrays {@code List<Object>}, numbers
+ * and length are bounded and every malformed input throws {@link IllegalArgumentException}. Objects
+ * become {@code Map<String, Object>}, arrays {@code List<Object>}, numbers
  * {@link BigDecimal}, and JSON null {@link #NULL}.
+ *
+ * <p>Public so {@code core.routing} can reuse it for routing resources (docs/protocol.md 13.7)
+ * instead of adding a JSON dependency or a second parser.
  */
-final class Json {
+public final class Json {
     static final Object NULL = new Object() {
         @Override
         public String toString() {
@@ -31,7 +34,7 @@ final class Json {
         this.s = s;
     }
 
-    static Object parse(String text) {
+    public static Object parse(String text) {
         if (text == null || text.length() > MAX_LENGTH) {
             throw new IllegalArgumentException("missing or oversized JSON");
         }
