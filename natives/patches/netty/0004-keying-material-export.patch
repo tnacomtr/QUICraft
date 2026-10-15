@@ -1,0 +1,352 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+(This header only. The diff below changes Netty files, which stay under Netty's Apache-2.0
+licence. Each changed file carries a "Modified by the QUICraft project" note.)
+
+QUICraft patch for Netty netty-4.2.19.Final (commit 64cc10f38ea5f5bd7eae48507817c66680d0afdc),
+on top of 0001-0003: the TLS exporter that docs/protocol.md section 12.2 and 12.7 need.
+
+Netty exposes no TLS exporter, so an application cannot derive a value that both ends of a QUIC
+connection compute and a third party without the TLS secrets cannot. This patch binds BoringSSL's
+SSL_export_keying_material, which is the RFC 8446 section 7.5 normal exporter (RFC 5705 before
+TLS 1.3):
+
+- JNI: BoringSSL.SSL_export_keying_material(ssl, label, context, length) calls
+  SSL_export_keying_material with use_context = 1, so an empty context is a zero-length context
+  and never an absent one, and with the label as the US-ASCII bytes the caller passes. It returns
+  the exported bytes, or null when BoringSSL fails, which is also what happens before the
+  handshake has completed. The native buffer is wiped before it is freed. The export is never the
+  early exporter: RFC 8446 supplies the context explicitly on the normal one.
+- BoringSSL.SSL_export_keying_material_supported() is a capability probe that exists only so Quic
+  can ask whether the binding is there: the export itself needs an established TLS session to
+  answer at all, so it cannot be probed directly. On upstream Netty's native (the other four
+  platforms, section 11) both methods stay unbound and calling them throws UnsatisfiedLinkError.
+- Quic.isKeyingMaterialExportSupported(): false when the classes are paired with a native without
+  the binding, so an unpatched native degrades to a false capability probe instead of a crash.
+- QuicChannel.exportKeyingMaterial(String label, byte[] context, int length): the accessor. A
+  default method that throws UnsupportedOperationException, so no other QuicChannel implementation
+  (or module) has to change. QuicheQuicChannel overrides it: it requires the channel's own event
+  loop (anything else throws IllegalStateException) and returns null before the handshake has
+  completed, when the channel is closed, or when the native export fails, so no caller can mistake
+  a missing value for an empty one. The export runs under the connection's monitor
+  (QuicheQuicConnection.exportKeyingMaterial), which is the SSL object that quiche owns and frees
+  with the connection, in free() and in the finalizer.
+
+Nothing else changes: the option is reached only by code that calls the new accessor, and the
+native jar gains no dependency.
+
+Applied by natives/build-netty-quic.sh with `git apply`, which ignores this text.
+
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/BoringSSL.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/BoringSSL.java
+index 809de27..d1f2d7f 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/BoringSSL.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/BoringSSL.java
+@@ -12,6 +12,9 @@
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  * License for the specific language governing permissions and limitations
+  * under the License.
++ *
++ * Modified by the QUICraft project:
++ * adds SSL_export_keying_material and its capability probe.
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -130,6 +133,36 @@ final class BoringSSL {
+ 
+     static native void SSL_cleanup(long ssl);
+ 
++    /**
++     * Exports {@code length} bytes of keying material for {@code label} from the TLS session of
++     * {@code ssl} (RFC 8446 section 7.5, the normal exporter), with {@code context} supplied
++     * explicitly: an empty context is a zero-length context, never an absent one. See
++     * {@link QuicChannel#exportKeyingMaterial(String, byte[], int)}.
++     *
++     * @param ssl       the native SSL session of the connection.
++     * @param label     the exporter label, US-ASCII.
++     * @param context   the exporter context, or {@code null} for an empty one.
++     * @param length    the number of bytes to export.
++     * @return          the exported bytes, or {@code null} if the native call failed, for example
++     *                  before the handshake has completed.
++     */
++    @Nullable
++    static byte[] exportKeyingMaterial(long ssl, String label, byte @Nullable [] context, int length) {
++        return SSL_export_keying_material(ssl, label.getBytes(StandardCharsets.US_ASCII), context, length);
++    }
++
++    @Nullable
++    private static native byte[] SSL_export_keying_material(
++            long ssl, byte[] label, byte @Nullable [] context, int length);
++
++    /**
++     * Returns {@code true} on a native library that has the binding above, which can then be
++     * called; upstream Netty's native leaves the method unbound, so calling it throws
++     * {@link UnsatisfiedLinkError}. Probing the export itself is not an option: it needs an
++     * established TLS session.
++     */
++    static native boolean SSL_export_keying_material_supported();
++
+     static native long EVP_PKEY_parse(byte[] bytes, String pass);
+     static native void EVP_PKEY_free(long key);
+ 
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java
+index df53efc..1d726f9 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/Quic.java
+@@ -14,7 +14,7 @@
+  * under the License.
+  *
+  * Modified by the QUICraft project:
+- * adds isRelaxedLossThresholdSupported().
++ * adds isRelaxedLossThresholdSupported() and isKeyingMaterialExportSupported().
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -129,6 +129,32 @@ public final class Quic {
+         }
+     }
+ 
++    /**
++     * Returns {@code true} if the loaded native library can export TLS keying material with
++     * BoringSSL's {@code SSL_export_keying_material}, i.e. if
++     * {@link QuicChannel#exportKeyingMaterial(String, byte[], int)} works. A native library built
++     * without that binding returns {@code false}, and callers must not select anything that depends
++     * on the exporter.
++     *
++     * @return {@code true} if supported, {@code false} otherwise.
++     */
++    public static boolean isKeyingMaterialExportSupported() {
++        return isAvailable() && KeyingMaterialExportSupport.SUPPORTED;
++    }
++
++    private static final class KeyingMaterialExportSupport {
++        static final boolean SUPPORTED = probe();
++
++        private static boolean probe() {
++            try {
++                // Not the export itself: it needs an established TLS session to answer at all.
++                return BoringSSL.SSL_export_keying_material_supported();
++            } catch (UnsatisfiedLinkError e) {
++                return false;
++            }
++        }
++    }
++
+     static Map.Entry<ChannelOption<?>, Object>[] toOptionsArray(Map<ChannelOption<?>, Object> opts) {
+         return new HashMap<>(opts).entrySet().toArray(EMPTY_OPTION_ARRAY);
+     }
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicChannel.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicChannel.java
+index 845a919..c76ba3f 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicChannel.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicChannel.java
+@@ -12,6 +12,9 @@
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  * License for the specific language governing permissions and limitations
+  * under the License.
++ *
++ * Modified by the QUICraft project:
++ * adds exportKeyingMaterial(String, byte[], int).
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -182,6 +185,31 @@ public interface QuicChannel extends Channel {
+     @Nullable
+     QuicTransportParameters peerTransportParameters();
+ 
++    /**
++     * Exports TLS keying material for {@code label} from this connection's TLS session, as
++     * specified in RFC 8446 section 7.5: the normal exporter, never the early one, with
++     * {@code context} supplied explicitly even when it is empty. A QUICraft addition; see
++     * {@link Quic#isKeyingMaterialExportSupported()}. Both ends of a connection that run the same
++     * QUICraft build get the same bytes for the same label and context, which no third party
++     * without the TLS secrets can compute.
++     *
++     * <p>The export must run on this channel's event loop ({@link #eventLoop()}). It returns
++     * {@code null} if the handshake has not completed yet, the channel is closed, or the native
++     * export failed, so a caller must treat {@code null} as an error, never as an empty value.
++     *
++     * @param label     the exporter label, US-ASCII.
++     * @param context   the exporter context, or {@code null} for an empty context.
++     * @param length    the number of bytes to export, greater than zero.
++     * @return          the exported bytes, or {@code null}.
++     * @throws IllegalStateException if not called on this channel's event loop.
++     * @throws UnsupportedOperationException if this channel has no TLS exporter.
++     */
++    @Nullable
++    default byte[] exportKeyingMaterial(String label, byte @Nullable [] context, int length) {
++        throw new UnsupportedOperationException(
++                "TLS keying material export is not supported by " + getClass().getName());
++    }
++
+     /**
+      * Returns the local {@link QuicConnectionAddress}. This address might change over the life-time of the
+      * channel.
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java
+index 9affefc..dbae052 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicChannel.java
+@@ -15,7 +15,8 @@
+  *
+  * Modified by the QUICraft project:
+  * completes a client connect as soon as connectionSend(...) finishes the handshake;
+- * a server that accepted 0-RTT reads early stream data before the handshake completes.
++ * a server that accepted 0-RTT reads early stream data before the handshake completes;
++ * exports TLS keying material from the connection's SSL session.
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -2242,4 +2243,21 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
+     public QuicTransportParameters peerTransportParameters() {
+         return connection.peerParameters();
+     }
++
++    @Override
++    @Nullable
++    public byte[] exportKeyingMaterial(String label, byte @Nullable [] context, int length) {
++        if (label == null) {
++            throw new NullPointerException("label");
++        }
++        if (length <= 0) {
++            throw new IllegalArgumentException("length must be positive: " + length);
++        }
++        if (!eventLoop().inEventLoop()) {
++            throw new IllegalStateException(
++                    "exportKeyingMaterial(...) must be called from the channel's event loop");
++        }
++        QuicheQuicConnection connection = this.connection;
++        return connection == null ? null : connection.exportKeyingMaterial(label, context, length);
++    }
+ }
+diff --git a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicConnection.java b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicConnection.java
+index c51fb1b..6ddb95a 100644
+--- a/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicConnection.java
++++ b/codec-classes-quic/src/main/java/io/netty/handler/codec/quic/QuicheQuicConnection.java
+@@ -12,6 +12,9 @@
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  * License for the specific language governing permissions and limitations
+  * under the License.
++ *
++ * Modified by the QUICraft project:
++ * adds the TLS keying material export of the connection's SSL session.
+  */
+ package io.netty.handler.codec.quic;
+ 
+@@ -181,6 +184,24 @@ final class QuicheQuicConnection {
+         return engine;
+     }
+ 
++    /**
++     * Exports TLS keying material from this connection's SSL session with BoringSSL's
++     * {@code SSL_export_keying_material} (RFC 8446 section 7.5, the normal exporter), with the
++     * context supplied explicitly. Returns {@code null} before the handshake has completed and once
++     * {@link #free()} ran: the SSL object belongs to the quiche connection and is freed with it.
++     * The caller must be on the connection's event loop; the monitor keeps a finalizer that frees
++     * this connection from racing with the call.
++     */
++    @Nullable
++    byte[] exportKeyingMaterial(String label, byte @Nullable [] context, int length) {
++        synchronized (this) {
++            if (connection == -1 || !Quiche.quiche_conn_is_established(connection)) {
++                return null;
++            }
++            return BoringSSL.exportKeyingMaterial(ssl, label, context, length);
++        }
++    }
++
+     long address() {
+         assert connection != -1;
+         return connection;
+diff --git a/codec-native-quic/src/main/c/netty_quic_boringssl.c b/codec-native-quic/src/main/c/netty_quic_boringssl.c
+index ecdaa38..9c99bb9 100644
+--- a/codec-native-quic/src/main/c/netty_quic_boringssl.c
++++ b/codec-native-quic/src/main/c/netty_quic_boringssl.c
+@@ -12,6 +12,9 @@
+  * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+  * License for the specific language governing permissions and limitations
+  * under the License.
++ *
++ * Modified by the QUICraft project:
++ * adds SSL_export_keying_material and its capability probe.
+  */
+ #include <jni.h>
+ #include <stdint.h>
+@@ -1327,6 +1330,72 @@ void netty_boringssl_SSL_cleanup(JNIEnv* env, jclass clazz, jlong ssl) {
+     }
+ }
+ 
++// Exists so the JNI binding for the TLS exporter can be probed without a connection: calling
++// SSL_export_keying_material needs an SSL with a completed handshake, which a capability probe has
++// none of. A native library built without this patch leaves both methods unbound.
++jboolean netty_boringssl_SSL_export_keying_material_supported(JNIEnv* env, jclass clazz) {
++    return JNI_TRUE;
++}
++
++// BoringSSL's SSL_export_keying_material for RFC 8446 section 7.5 (the normal exporter) and
++// RFC 5705, with the context always supplied: use_context is 1, so an empty context is a
++// zero-length context and never an absent one. Returns the exported bytes, or NULL if the export
++// failed, e.g. before the handshake has completed.
++//
++// empty_context stands in for a context of length 0, so BoringSSL never gets a NULL pointer for a
++// context it was told to use.
++static const uint8_t empty_context = 0;
++
++jobject netty_boringssl_SSL_export_keying_material(JNIEnv* env, jclass clazz, jlong ssl, jbyteArray label, jbyteArray context, jint length) {
++    jsize labelLen;
++    jsize contextLen = 0;
++    jbyte* labelBytes;
++    jbyte* contextBytes = NULL;
++    uint8_t* out;
++    jobject result = NULL;
++
++    if (ssl == 0 || label == NULL || length <= 0) {
++        return NULL;
++    }
++    labelLen = (*env)->GetArrayLength(env, label);
++    labelBytes = (*env)->GetByteArrayElements(env, label, NULL);
++    if (labelBytes == NULL) {
++        return NULL;
++    }
++    if (context != NULL) {
++        contextLen = (*env)->GetArrayLength(env, context);
++        if (contextLen > 0) {
++            contextBytes = (*env)->GetByteArrayElements(env, context, NULL);
++            if (contextBytes == NULL) {
++                goto done;
++            }
++        }
++    }
++    out = malloc((size_t) length);
++    if (out == NULL) {
++        goto done;
++    }
++    if (SSL_export_keying_material((const SSL*) ssl, out, (size_t) length, (const char*) labelBytes,
++                                   (size_t) labelLen,
++                                   contextBytes != NULL ? (const uint8_t*) contextBytes : &empty_context,
++                                   (size_t) contextLen, 1) == 1) {
++        jbyteArray exported = (*env)->NewByteArray(env, length);
++        if (exported != NULL) {
++            (*env)->SetByteArrayRegion(env, exported, 0, length, (const jbyte*) out);
++            result = exported;
++        }
++    }
++    OPENSSL_cleanse(out, (size_t) length);
++    free(out);
++
++done:
++    if (contextBytes != NULL) {
++        (*env)->ReleaseByteArrayElements(env, context, contextBytes, JNI_ABORT);
++    }
++    (*env)->ReleaseByteArrayElements(env, label, labelBytes, JNI_ABORT);
++    return result;
++}
++
+ int netty_boringssl_password_callback(char *buf, int bufsiz, int verify, void *cb) {
+     char *password = (char *) cb;
+     if (password == NULL) {
+@@ -1541,6 +1610,8 @@ static const JNINativeMethod fixed_method_table[] = {
+   { "SSL_free", "(J)V", (void *) netty_boringssl_SSL_free },
+   { "SSL_getTask", "(J)Ljava/lang/Runnable;", (void *) netty_boringssl_SSL_getTask },
+   { "SSL_cleanup", "(J)V", (void *) netty_boringssl_SSL_cleanup },
++  { "SSL_export_keying_material_supported", "()Z", (void *) netty_boringssl_SSL_export_keying_material_supported },
++  { "SSL_export_keying_material", "(J[B[BI)[B", (void *) netty_boringssl_SSL_export_keying_material },
+   { "EVP_PKEY_parse", "([BLjava/lang/String;)J", (void *) netty_boringssl_EVP_PKEY_parse },
+   { "EVP_PKEY_free", "(J)V", (void *) netty_boringssl_EVP_PKEY_free },
+   { "CRYPTO_BUFFER_stack_new", "(J[[B)J", (void *) netty_boringssl_CRYPTO_BUFFER_stack_new },
