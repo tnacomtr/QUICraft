@@ -17,6 +17,8 @@ import rs.sudoe.quicraft.core.QuicSupport;
 class MultistreamTransportConfigTest {
     @Test
     void theMultistreamVariantCarriesTheSpecifiedLimitsAndLeavesTheDefaultAlone() {
+        // Without the patched native /3 is refused (see the refusal test), so there is no variant.
+        org.junit.jupiter.api.Assumptions.assumeTrue(QuicSupport.hasMaxFlowControlWindows());
         assertFalse(TransportConfig.DEFAULT.isMultistream());
         assertEquals(8L << 20, TransportConfig.DEFAULT.initialMaxStreamData);
         assertEquals(16L << 20, TransportConfig.DEFAULT.initialMaxData);
@@ -34,6 +36,7 @@ class MultistreamTransportConfigTest {
     @Test
     void theServerAllowsStreamsZeroAndFourAndTheClientAllowsTheServersStreamOneOnly() throws Exception {
         assertTrue(QuicSupport.isAvailable(), () -> "QUIC native unavailable: " + QuicSupport.unavailabilityCause());
+        org.junit.jupiter.api.Assumptions.assumeTrue(QuicSupport.hasMaxFlowControlWindows());
         LaneLoopback.Options options = new LaneLoopback.Options();
         try (LaneLoopback net = LaneLoopback.open(options)) {
             QuicStreamChannel zero = net.clientStream();
