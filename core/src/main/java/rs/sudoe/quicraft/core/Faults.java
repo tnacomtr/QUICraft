@@ -25,6 +25,25 @@ public final class Faults {
     /** Scheduling a server connection's handshake deadline fails (docs/protocol.md §9). */
     public static final String HANDSHAKE_DEADLINE = "handshake deadline";
 
+    /**
+     * The pre-connect {@code /3} selection fails: the pin and re-bind state read, the routing
+     * table lookup and the selection rules of 12.3, 13.1 and 12.16. The connect path must carry
+     * on with {@code /2} or TCP in the same attempt.
+     */
+    public static final String V3_SELECT = "v3 select";
+    /** The {@code /3} QUIC dial fails (12.3); the attempt races or falls back under §5. */
+    public static final String V3_DIAL = "v3 dial";
+    /** The server's side of a {@code /3} connection fails while it accepts or activates it (13.1, 13.3). */
+    public static final String V3_ACCEPT = "v3 accept";
+    /** The TLS exporter value of 12.7 cannot be obtained; that is a fatal {@code 0x10}. */
+    public static final String BINDING_EXPORTER = "binding exporter";
+    /** One binding step of 12.9 fails; that is a fatal {@code 0x10}. */
+    public static final String BINDING_STEP = "binding step";
+    /** Activating a lane of 13.3 fails after the binding exchange; that is a fatal {@code 0x10}. */
+    public static final String LANE_ACTIVATE = "lane activate";
+    /** Persisting an authenticated pin of 12.15 fails; that is a fatal {@code 0x10}. */
+    public static final String PIN_WRITE = "pin write";
+
     private static volatile Set<String> stages = Collections.emptySet();
 
     private Faults() {}
