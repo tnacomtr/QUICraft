@@ -66,7 +66,7 @@ uses Netty 4.2, the same generation as 26.x, which fits the shared 26.x + 1.21.1
 | Dependency | Version | Notes |
 | --- | --- | --- |
 | Netty (incl. `netty-codec-classes-quic`, `netty-codec-native-quic`) | 4.2.19.Final | BoringSSL `d03dbc3e` (2026-05-12, after the Apache-2.0 relicense), quiche `be47c501`; QUIC classes are Java 8 bytecode; natives for linux-x86_64, linux-aarch_64, osx-x86_64, osx-aarch_64, windows-x86_64 |
-| QUICraft's Netty QUIC build (`rs.sudoe.quicraft.netty:*`) | 4.2.19.Final-quicraft4 | The Netty, quiche and BoringSSL revisions above, plus six patches in `natives/patches/` (including Netty-only `netty/0004`, TLS keying material exporter via JNI `SSL_export_keying_material`) and `natives/quiche-Cargo.lock` (docs/protocol.md §11). Classes on every platform; patched native on linux-x86_64 only (glibc ≥ 2.28; upstream's needs 2.16), upstream natives elsewhere |
+| QUICraft's Netty QUIC build (`rs.sudoe.quicraft.netty:*`) | 4.2.19.Final-quicraft5 | The Netty, quiche and BoringSSL revisions above, plus seven patches in `natives/patches/` (including Netty-only `netty/0004`, TLS keying material exporter via JNI `SSL_export_keying_material`, and `netty/0005`, setters for quiche's maximum flow-control windows, docs/protocol.md §13.13) and `natives/quiche-Cargo.lock` (docs/protocol.md §11). Classes on every platform; patched native on linux-x86_64 only, quicraft5 built locally so far (glibc ≥ 2.28; upstream's needs 2.16), upstream natives elsewhere |
 | Gradle | 9.8.1 | wrapper checksum-pinned |
 | Fabric Loom | 1.18.3 | build-logic; both plugin IDs from one jar |
 | Fabric Loader | 0.19.5 | compile; the mod requires ≥ 0.19.5 |

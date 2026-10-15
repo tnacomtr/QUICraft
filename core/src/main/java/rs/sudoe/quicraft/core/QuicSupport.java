@@ -15,6 +15,7 @@ public final class QuicSupport {
     private static volatile Boolean available;
     private static volatile Boolean relaxedLossThreshold;
     private static volatile Boolean keyingMaterialExport;
+    private static volatile Boolean maxFlowControlWindows;
 
     private QuicSupport() {}
 
@@ -94,6 +95,38 @@ public final class QuicSupport {
                     + " channel binding is unavailable");
         } catch (Throwable t) {
             LOG.log(Level.INFO, "QUIC native without the TLS keying material exporter: {0}", String.valueOf(t));
+        }
+        return false;
+    }
+
+    /**
+     * True if the loaded native can cap quiche's flow-control auto-tuning, which only QUICraft's
+     * patched build of Netty's QUIC native can (natives/patches/netty/0005, docs/protocol.md
+     * §13.13). With an upstream native, logs once at INFO and returns false: single-stream QUIC
+     * still works, but multi-stream (/3) must not be offered.
+     */
+    public static boolean hasMaxFlowControlWindows() {
+        Boolean result = maxFlowControlWindows;
+        if (result == null) {
+            synchronized (QuicSupport.class) {
+                result = maxFlowControlWindows;
+                if (result == null) {
+                    result = isAvailable() && probeMaxFlowControlWindows();
+                    maxFlowControlWindows = result;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static boolean probeMaxFlowControlWindows() {
+        try {
+            if (Quic.isMaxFlowControlWindowsSupported()) {
+                return true;
+            }
+            LOG.log(Level.INFO, "QUIC native without maximum flow-control windows; multi-stream is unavailable");
+        } catch (Throwable t) {
+            LOG.log(Level.INFO, "QUIC native without maximum flow-control windows: {0}", String.valueOf(t));
         }
         return false;
     }
