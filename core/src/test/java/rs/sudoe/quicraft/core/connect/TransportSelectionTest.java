@@ -4,13 +4,16 @@ package rs.sudoe.quicraft.core.connect;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
@@ -180,6 +183,33 @@ class TransportSelectionTest {
         assertEquals(first.hashCode(), TransportSelection.select(inputs).hashCode());
         assertEquals("V3: " + first.reason(), first.toString());
         assertNotEquals(first, TransportSelection.select(TransportSelection.Inputs.builder().build()));
+    }
+
+    @Test
+    void rejectsAnInvalidLocalRoutingDigestEarly() {
+        for (String bad : new String[] {"xyz", LOCAL.toUpperCase(Locale.ROOT), LOCAL.substring(1),
+                LOCAL + "0", "sha256:" + LOCAL, hex('g'), ""}) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> TransportSelection.Inputs.builder()
+                            .localRoutingDigestHex(bad).clientProtocolNumber(PROTOCOL).build(),
+                    "digest: " + bad);
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> TransportSelection.Inputs.builder().localRoutingDigestHex(Optional.of("short")));
+        // null and empty stay "no local table", and the comparison with the advertisement is exact.
+        assertEquals(Optional.empty(), TransportSelection.Inputs.builder()
+                .localRoutingDigestHex((String) null).build().localRoutingDigestHex());
+        assertEquals(Optional.empty(), TransportSelection.Inputs.builder()
+                .localRoutingDigestHex(Optional.<String>empty()).build().localRoutingDigestHex());
+        assertEquals(Optional.of(LOCAL), TransportSelection.Inputs.builder()
+                .localRoutingDigestHex(LOCAL).build().localRoutingDigestHex());
+        assertEquals(Transport.V3, TransportSelection.select(TransportSelection.Inputs.builder()
+                .advertisement(v3()).multistreamEnabled(true).exporterCapable(true)
+                .clientProtocolNumber(PROTOCOL).localRoutingDigestHex(LOCAL).build()).transport());
+        // One differing character is a mismatch (13.1), never a match.
+        assertEquals(Transport.V2, TransportSelection.select(TransportSelection.Inputs.builder()
+                .advertisement(v3()).multistreamEnabled(true).exporterCapable(true)
+                .clientProtocolNumber(PROTOCOL).localRoutingDigestHex(OTHER).build()).transport());
     }
 
     /** An advertisement for a {@code quicraft/2} listener, with no routing member. */

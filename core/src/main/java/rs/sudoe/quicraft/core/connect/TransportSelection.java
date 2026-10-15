@@ -53,6 +53,9 @@ public final class TransportSelection {
     /** Prefix of a routing digest on the wire (13.1, 13.7). */
     private static final String DIGEST_PREFIX = "sha256:";
 
+    /** Length of the lowercase hex body of a locally computed routing digest (13.7). */
+    private static final int LOCAL_DIGEST_HEX_LENGTH = 64;
+
     /**
      * 12.15: a corrupt pin store disables {@code /3} until repaired, and the player is told. The
      * caller can surface this reason whatever transport was picked.
@@ -164,7 +167,8 @@ public final class TransportSelection {
          * The routing digest R of the client's table for {@link #clientProtocolNumber()}, as
          * lowercase hex without the {@code sha256:} prefix ({@code RoutingTable.digestHex()}), or
          * empty when the client has no table for that protocol number. Empty means {@code /3} is
-         * impossible here (12.3, 13.1).
+         * impossible here (12.3, 13.1). The builder rejects any other value, so the comparison with
+         * the advertised digest stays exact.
          */
         public Optional<String> localRoutingDigestHex() {
             return localRoutingDigestHex;
@@ -223,15 +227,52 @@ public final class TransportSelection {
                 return this;
             }
 
+            /**
+             * Sets the local routing digest, as {@code RoutingTable.digestHex()} returns it:
+             * {@code null} or empty means the client has no table for its protocol number (12.3,
+             * 13.1).
+             *
+             * @throws IllegalArgumentException if {@code localRoutingDigestHex} is not 64 lowercase
+             *     hex digits or {@code null}
+             */
             public Builder localRoutingDigestHex(String localRoutingDigestHex) {
-                this.localRoutingDigestHex = Optional.ofNullable(localRoutingDigestHex);
+                this.localRoutingDigestHex = Optional.ofNullable(validLocalDigest(localRoutingDigestHex));
                 return this;
             }
 
+            /**
+             * Sets the local routing digest from an optional value; empty means the client has no
+             * table for its protocol number (12.3, 13.1).
+             *
+             * @throws IllegalArgumentException if the present value is not 64 lowercase hex digits
+             */
             public Builder localRoutingDigestHex(Optional<String> localRoutingDigestHex) {
-                this.localRoutingDigestHex = Objects.requireNonNull(localRoutingDigestHex,
-                        "localRoutingDigestHex");
+                Objects.requireNonNull(localRoutingDigestHex, "localRoutingDigestHex");
+                this.localRoutingDigestHex = localRoutingDigestHex.map(Builder::validLocalDigest);
                 return this;
+            }
+
+            /**
+             * {@code digest} unchanged when it is 64 lowercase hex digits or {@code null}, so a
+             * caller cannot pass a value the advertised digest could never equal.
+             */
+            private static String validLocalDigest(String digest) {
+                if (digest == null) {
+                    return null;
+                }
+                if (digest.length() != LOCAL_DIGEST_HEX_LENGTH) {
+                    throw new IllegalArgumentException("the local routing digest must be "
+                            + LOCAL_DIGEST_HEX_LENGTH + " lowercase hex digits, got "
+                            + digest.length() + " characters: " + digest);
+                }
+                for (int i = 0; i < digest.length(); i++) {
+                    char c = digest.charAt(i);
+                    if ((c < '0' || c > '9') && (c < 'a' || c > 'f')) {
+                        throw new IllegalArgumentException(
+                                "the local routing digest must be lowercase hex digits: " + digest);
+                    }
+                }
+                return digest;
             }
 
             public Inputs build() {
