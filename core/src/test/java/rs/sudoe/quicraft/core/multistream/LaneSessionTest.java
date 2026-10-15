@@ -248,6 +248,60 @@ class LaneSessionTest {
         }
     }
 
+    @Test
+    void controlBytesReadBeforeActivationAreParsedAsTheStartOfTheRecordStream() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, "leftover"));
+            rig.server.activate(java.nio.ByteBuffer.wrap(record));
+            rig.client.activate(null);
+            assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() == 1, 10000));
+            assertEquals("leftover", rig.serverGame.labels().get(0));
+            assertFalse(rig.serverGame.closed.isDone());
+        }
+    }
+
+    @Test
+    void anIncompleteRecordIsChargedAtItsFirstByteAndTimesOutWith0x11() throws Exception {
+        AtomicLong clock = new AtomicLong(5_000_000_000L);
+        LaneRig.Config config = new LaneRig.Config();
+        config.clientSession = false;
+        config.serverTiming = new LaneSession.Timing(clock::get, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.server.activate(null);
+            QuicStreamChannel one = rig.clientRawStreams.poll(10, TimeUnit.SECONDS);
+            LaneLoopback.write(one, (byte) 2, (byte) 2);
+            QuicStreamChannel four = rig.net.clientStream();
+            LaneLoopback.write(four, (byte) 2, (byte) 1);
+            sleep(300);
+            assertEquals(0, LaneRig.snapshot(rig.server)[0]);
+            // First byte of a two-byte record_length (133): one slot and one byte are charged.
+            LaneLoopback.write(four, (byte) 0x85);
+            assertTrue(LaneRig.await(() -> {
+                try {
+                    return LaneRig.snapshot(rig.server)[0] == 1;
+                } catch (Exception e) {
+                    return false;
+                }
+            }, 10000));
+            assertEquals(1, LaneRig.snapshot(rig.server)[1]);
+            // The length completes: the whole parser buffer (2 prefix bytes + 133) is charged.
+            LaneLoopback.write(four, (byte) 0x01);
+            assertTrue(LaneRig.await(() -> {
+                try {
+                    return LaneRig.snapshot(rig.server)[1] == 135;
+                } catch (Exception e) {
+                    return false;
+                }
+            }, 10000));
+            assertEquals(1, LaneRig.snapshot(rig.server)[0]);
+            assertFalse(rig.serverGame.closed.isDone());
+            clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + 1_000_000_000L);
+            closedWith(rig.serverGame, 0x11, false);
+            sawClose(rig.net.clientSawClose, 0x11);
+        }
+    }
+
     // --- Ordering over real streams (13.9-13.11).
 
     @Test
