@@ -596,7 +596,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
 3. **12.3 Gate before negotiation.** Both peers MUST have a true exporter capability probe
    and a supported routing table before advertising/offering `/3`, even for the offline
    test profile. A peer without either uses `/2`, retains Minecraft's cipher in online
-   mode, and uses one stream. No native at all retains §11's TCP-only behavior. An exporter
+   mode, and uses one stream (except a client facing a changed pin, which uses fresh TCP
+   under 12.16). No native at all retains §11's TCP-only behavior. An exporter
    error after `/3` selection is fatal, not permission to continue cipher-off or to silently
    renegotiate that connection. A false capability probe is an ordinary compatibility
    condition, logged once at INFO, not a binding failure.
@@ -835,7 +836,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
    protocol-number strings to lowercase `sha256:` hex routing-resource digests (13.7).
    Vanilla ignores it; obey §1's response-size cap. Before connecting, clients require a
    matching digest for their protocol to select `/3`; absent/unknown/mismatched entries
-   select `/2` if supported by that listener, otherwise TCP. Never guess a routing table.
+   select `/2` if supported by that listener, otherwise TCP (a changed pin instead uses
+   fresh TCP, 12.16). Never guess a routing table.
    A `/3` advertisement's listener MUST also accept `/2` for this compatibility selection.
    OFFER's digest comparison remains authoritative even after an advertisement match.
 2. **13.2 Preamble.** Under `/3` only, stream 0 begins in each direction with exactly
