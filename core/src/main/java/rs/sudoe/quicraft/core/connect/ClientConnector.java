@@ -524,9 +524,31 @@ public final class ClientConnector {
             // TCP for new names until the player explicitly deletes a pin." So a new name with a
             // full store is TCP, not /2, even though /2 itself needs no pin.
             tcpReason = "the pin store is full and has no pin for this name (12.16)";
+        } else if (handshakeBackoff(server, advertisement, mode)) {
+            // §6: a UDP-blocked or frontend-proxied /3 server costs at most one head start per
+            // backoff window, exactly as the shipped decision treats a /2 server.
+            tcpReason = "the section 6 backoff for this address, port and fingerprint is still active";
         }
         return new Prepared(selection, pinState, attempt, tcpReason,
                 table.isPresent() ? table.get().digest() : null);
+    }
+
+    /**
+     * Whether §6's failure cache is still backing off from this exact address, QUIC port and
+     * fingerprint, which makes the {@code /3} attempt use TCP without spending a head start.
+     *
+     * <p>{@code quic-only} is the debug setting that ignores the cache, exactly as the shipped
+     * decision does (§4), so the check does not apply there.</p>
+     */
+    private boolean handshakeBackoff(InetSocketAddress server, Optional<Advertisement> advertisement,
+            ConnectDecision.Mode mode) {
+        if (mode == ConnectDecision.Mode.QUIC_ONLY || !advertisement.isPresent()
+                || !Protocol.ALPN_V3.equals(advertisement.get().alpn())) {
+            return false;
+        }
+        InetSocketAddress target = quicTarget(server, advertisement.get());
+        return !failures.allows(target.getAddress(), target.getPort(),
+                advertisement.get().fingerprint());
     }
 
     /**
@@ -656,6 +678,13 @@ public final class ClientConnector {
             String joinInputs, Platform<T> platform, CompletableFuture<Outcome<T>> result) {
         EarlyFlight early = joinInputs == null ? null : new EarlyFlight(joinInputs);
         if (prepared.tcpReason != null) {
+            if (mode == ConnectDecision.Mode.QUIC_ONLY) {
+                // §4: quic-only never downgrades silently, so the blocker is the failure. The
+                // shipped path treats a TCP decision the same way.
+                result.completeExceptionally(new IOException("QUIC only: " + prepared.tcpReason
+                        + ", and quic-only has no TCP fallback (protocol §4)"));
+                return;
+            }
             // 12.14 and 12.16: this attempt uses TCP. The reason names the rule, never a secret.
             LOG.log(Level.FINE, "QUICraft /3 uses TCP here: {0}", prepared.tcpReason);
             tcpOnly(platform, result);

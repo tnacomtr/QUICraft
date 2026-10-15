@@ -611,6 +611,60 @@ class ClientConnectorV3Test {
     }
 
     @Test
+    void aBackedOffServerCostsNoHeadStart() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        // §6 recorded a failure for this exact address, port and fingerprint.
+        f.failures.recordFailure(f.address(), QUIC_PORT, f.fingerprint);
+        FakePlatform p = new FakePlatform();
+        Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
+
+        assertEquals("tcp", outcome.tcp(), "§6: one head start per backoff window, then TCP");
+        assertEquals(0, p.v3Dials.get());
+        assertEquals(0, p.v2Dials.get());
+        assertNull(outcome.v3Plan());
+    }
+
+    @Test
+    void aBackedOffServerStillDialsInQuicOnlyMode() throws Exception {
+        // §4's debug setting ignores §6's backoff, exactly as the shipped decision does.
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        f.failures.recordFailure(f.address(), QUIC_PORT, f.fingerprint);
+        FakePlatform p = new FakePlatform();
+        Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.QUIC_ONLY);
+
+        assertNotNull(outcome.quic());
+        assertEquals(1, p.v3Dials.get());
+    }
+
+    @Test
+    void aBackoffInQuicOnlyModeFailsInsteadOfSilentlyUsingTcp() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        f.failures.recordActivationFailure(f.address(), QUIC_PORT, f.fingerprint);
+        FakePlatform p = new FakePlatform();
+        assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> f.connect(f.connector(true, true), p, Mode.QUIC_ONLY));
+        assertEquals(0, p.v3Dials.get());
+        assertEquals(0, p.v2Dials.get());
+    }
+
+    @Test
+    void aFullPinStoreInQuicOnlyModeFailsInsteadOfSilentlyUsingTcp() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        for (int i = 0; i < PinStore.MAX_PINS; i++) {
+            f.pins.recordPin("server" + i + ".example", 25565, fingerprint('e').toString());
+        }
+        FakePlatform p = new FakePlatform();
+        assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> f.connect(f.connector(true, true), p, Mode.QUIC_ONLY));
+        assertEquals(0, p.v3Dials.get());
+        assertEquals(0, p.v2Dials.get());
+    }
+
+    @Test
     void aWorkerThatRefusesTasksStillYieldsATcpOutcome() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
