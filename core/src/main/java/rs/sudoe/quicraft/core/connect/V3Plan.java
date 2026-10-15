@@ -157,23 +157,30 @@ public final class V3Plan {
             return CompletableFuture.completedFuture(Boolean.valueOf(!pinWriteFailed && !failureReported));
         }
         activationReported = true;
-        return CompletableFuture.supplyAsync(new Supplier<Boolean>() {
-            @Override
-            public Boolean get() {
-                boolean recorded = writePin();
-                pinWriteFailed = !recorded;
-                if (recorded) {
-                    // 12.14: only a later successful activation clears the activation-failure state.
-                    clearActivationFailure();
-                    endAttempt(true);
-                } else {
-                    // 12.15: a write failure after activation is itself an activation failure.
-                    recordActivationFailure();
-                    endAttempt(false);
+        try {
+            return CompletableFuture.supplyAsync(new Supplier<Boolean>() {
+                @Override
+                public Boolean get() {
+                    boolean recorded = writePin();
+                    pinWriteFailed = !recorded;
+                    if (recorded) {
+                        // 12.14: only a later successful activation clears the activation-failure state.
+                        clearActivationFailure();
+                        endAttempt(true);
+                    } else {
+                        // 12.15: a write failure after activation is itself an activation failure.
+                        recordActivationFailure();
+                        endAttempt(false);
+                    }
+                    return Boolean.valueOf(recorded);
                 }
-                return Boolean.valueOf(recorded);
-            }
-        }, worker);
+            }, worker);
+        } catch (Throwable t) {
+            // A worker that refuses the task means the pin was not written, so this is 12.15's write
+            // failure: answer false (the caller closes 0x10) instead of throwing at the event loop.
+            pinWriteFailed = true;
+            return CompletableFuture.completedFuture(Boolean.FALSE);
+        }
     }
 
     /**
@@ -209,13 +216,19 @@ public final class V3Plan {
         failureReported = true;
         this.reason = reason == null ? INTERNAL_ERROR : reason;
         retryFreshTcp = !afterActivation;
-        worker.execute(new Runnable() {
-            @Override
-            public void run() {
-                recordActivationFailure();
-                endAttempt(false);
-            }
-        });
+        try {
+            worker.execute(new Runnable() {
+                @Override
+                public void run() {
+                    recordActivationFailure();
+                    endAttempt(false);
+                }
+            });
+        } catch (Throwable ignored) {
+            // A worker that refuses the task must not hide the retry decision: the caller still has
+            // to close the QUIC connection and fall back to TCP, and the failure cache entry is
+            // best effort (it would otherwise leave the join unfinished).
+        }
         return retryFreshTcp;
     }
 
