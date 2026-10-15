@@ -367,6 +367,13 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     @Override
     public void write(ByteBuffer data) {
+        if (activated) {
+            // 12.11/12.12: after the switch, stream 0 carries records, not Minecraft bytes. The game
+            // must send through the session, so a stray write is dropped rather than corrupting the
+            // record stream.
+            LOG.log(Level.FINE, "dropping a stream-0 write after /3 activation");
+            return;
+        }
         gameWrote = true;
         if (role == LaneSession.Role.CLIENT) {
             clientWrite(data);
