@@ -345,10 +345,16 @@ public final class TransportSelection {
             return decide(inputs, Transport.TCP, "there is no advertisement for this server (protocol §1)");
         }
         Advertisement ad = advertisement.get();
-        if (!Protocol.ALPN_V3.equals(ad.alpn())) {
+        if (Protocol.ALPN_V3.equals(ad.alpn())) {
+            return selectV3(inputs, ad);
+        }
+        if (Protocol.ALPN.equals(ad.alpn())) {
             return selectV2(inputs);
         }
-        return selectV3(inputs, ad);
+        // Unreachable through extract, extractForSelection and of, which all reject an unknown ALPN.
+        // It stays explicit so no ALPN other than quicraft/2 can ever be treated as /2 (13.1).
+        return decide(inputs, Transport.TCP,
+                "the advertisement names an ALPN this client does not offer (13.1)");
     }
 
     /**
