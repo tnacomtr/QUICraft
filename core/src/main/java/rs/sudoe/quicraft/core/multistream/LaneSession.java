@@ -1207,6 +1207,10 @@ public final class LaneSession {
                 }
                 receiver.retry(t);
             }
+            if (firstRecordByteBlocked(t)) {
+                fail(CLOSE_ORDERING, "the first bytes of a record were blocked for too long (13.12)", null);
+                return;
+            }
             receiver.checkDeadlines(t);
             sender.checkDeadlines(t);
             if (activated && peerStoppedReading()) {
@@ -1287,6 +1291,23 @@ public final class LaneSession {
                 session.tick();
             }
         }
+    }
+
+    /**
+     * 13.12: a lane that has held bytes of a record it could not admit for {@link
+     * ReceiverScheduler#TIMEOUT_NANOS} closes the connection with 0x11, exactly like an incomplete
+     * record whose first byte was parsed. The deadline starts when the lane first waited, so a
+     * node-budget refusal before the first prefix byte is not a way to wait forever.
+     */
+    private boolean firstRecordByteBlocked(long now) {
+        for (Lane lane : Lane.values()) {
+            LaneStream s = streams[lane.ordinal()];
+            if (s != null && s.waitingSince != 0
+                    && now - s.waitingSince >= ReceiverScheduler.TIMEOUT_NANOS) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

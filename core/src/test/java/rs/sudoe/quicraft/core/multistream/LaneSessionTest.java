@@ -1186,6 +1186,43 @@ class LaneSessionTest {
     }
 
     @Test
+    void waitForANodeGrantThatNeverComesClosesWith0x11AtTheDeadline() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(6L << 20);
+        AtomicLong clock = new AtomicLong(5_000_000_000L);
+        LaneRig.Config starved = new LaneRig.Config();
+        starved.nodeBudget = node;
+        starved.clientSession = false;
+        starved.serverTiming = new LaneSession.Timing(clock::get, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
+        try (LaneRig rigB = LaneRig.start(starved)) {
+            QuicStreamChannel four = openRawServerLanes(rigB);
+
+            // Another connection of the same node holds space, so the record grant cannot be taken.
+            LaneRig.Config holder = new LaneRig.Config();
+            holder.nodeBudget = node;
+            try (LaneRig rigA = LaneRig.start(holder)) {
+                rigA.activateBoth();
+                rigA.clientGame.autoApply = false;
+                for (int i = 0; i < 3; i++) {
+                    rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 1_500_000));
+                }
+                assertTrue(LaneRig.await(() -> node.available() < (6L << 20) - 4_000_000L, 30000),
+                        "the holder charged the node budget: " + node.available());
+                // The starved lane never gets to parse its first prefix byte; 13.12's deadline still
+                // has to end it, because the bytes are already buffered.
+                LaneLoopback.write(four, RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.MOVE, 200)));
+                sleep(500);
+                assertTrue(snapshotIs(rigB.server, 0, 0), "no record is admitted while the grant is refused");
+                assertFalse(rigB.serverGame.closed.isDone(), "waiting is not a close by itself");
+                clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + 1_000_000_000L);
+                closedWith(rigB.serverGame, 0x11, false);
+                sawClose(rigB.net.clientSawClose, 0x11);
+                assertFalse(rigA.clientGame.closed.isDone(), "the holder is never evicted");
+            }
+        }
+    }
+
+    @Test
     void aRecordWhoseGrantWasTakenBeforeTheNodeFilledUpIsStillAdmitted() throws Exception {
         ReceiveBudget node = ReceiveBudget.bounded(6L << 20);
         LaneRig rigB = LaneRig.start(rawServerConfig(node));
