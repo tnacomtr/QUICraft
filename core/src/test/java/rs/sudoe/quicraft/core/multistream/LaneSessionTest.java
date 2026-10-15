@@ -920,6 +920,49 @@ class LaneSessionTest {
     }
 
     @Test
+    void anOldOwnerThatClosesStreamZeroWhileBeingRemovedStillEndsThroughTheControlPath() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activateBoth();
+            roundTrip(rig);
+            // The old single-stream owner survives the takeover in this test, then closes stream 0
+            // from its own handlerRemoved as an old owner would. That close must become the lane END
+            // fence (0x0 at the peer), never a bare FIN or a reset (0x11).
+            ClosingOwner owner = new ClosingOwner();
+            rig.clientControl.pipeline().addLast(owner);
+            rig.clientControl.pipeline().remove(owner);
+            assertTrue(LaneRig.await(() -> owner.removed, 10000),
+                    "the owner closed stream 0 while it was removed");
+            closedWith(rig.serverGame, 0x0, false);
+            closedWith(rig.clientGame, 0x0, true);
+        }
+    }
+
+    /** The old single-stream owner: it closes stream 0 while the takeover removes it. */
+    private static final class ClosingOwner extends ChannelInboundHandlerAdapter {
+        volatile boolean removed;
+
+        @Override
+        public void handlerRemoved(ChannelHandlerContext ctx) {
+            removed = true;
+            ctx.close();
+        }
+    }
+
+    @Test
+    void anOldOwnerThatClosesStreamZeroInItsRemovalCallbackEndsWithEndNotFin() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            ClosingOwner owner = new ClosingOwner();
+            rig.clientControl.pipeline().addLast(owner);
+            // The takeover removes the owner while activating, and its handlerRemoved closes stream
+            // 0: the lane must still end with END (0x0 at the peer), never a bare FIN (0x11).
+            rig.activateBoth();
+            assertTrue(LaneRig.await(() -> owner.removed, 10000), "the takeover removed the old owner");
+            closedWith(rig.serverGame, 0x0, false);
+            closedWith(rig.clientGame, 0x0, true);
+        }
+    }
+
+    @Test
     void anUnexpectedFinOnAnyLaneClosesBothSidesWith0x11() throws Exception {
         for (Lane lane : Lane.values()) {
             try (LaneRig rig = LaneRig.start()) {

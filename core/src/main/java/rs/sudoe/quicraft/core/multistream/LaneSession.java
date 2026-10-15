@@ -5,6 +5,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
 import io.netty.channel.FixedRecvByteBufAllocator;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
 import io.netty.handler.codec.quic.QuicChannel;
@@ -562,6 +564,7 @@ public final class LaneSession {
         control.opened = true;
         streams[Lane.CONTROL.ordinal()] = control;
         controlChannel.pipeline().addFirst(control);
+        controlChannel.pipeline().addFirst(new ControlCloseGuard());
         takeOverStreamZero(control);
         if (leftover != null) {
             // 13.12: the leftover is a read chunk like any other, charged to the node budget while
@@ -626,15 +629,52 @@ public final class LaneSession {
      * longer read bytes, answer a peer FIN or drive a bare FIN of their own, and the lane END/close
      * path (see {@link #end}) is the only close left. The session's own lane handler stays first;
      * a peer FIN that the lane handler does not forward no longer reaches them either.
+     *
+     * <p>{@link ControlCloseGuard} stays at the head of the pipeline: a close from an old owner,
+     * including one closing stream 0 from its own {@code handlerRemoved}, becomes the lane close.
+     *
+     * <p>What this cannot cover: {@code QuicStreamChannel.shutdownOutput()} writes its FIN straight
+     * to the transport, outside the pipeline, so no handler can intercept it. The old owner (the
+     * bridge in U4) must therefore hand its stream-0 close over to this session, calling
+     * {@link #end} or {@link #abort}, and never its own FIN path, once it hears of the activation.
      */
     private void takeOverStreamZero(LaneStream mine) {
         io.netty.channel.ChannelPipeline pipeline = controlChannel.pipeline();
         for (String name : new ArrayList<String>(pipeline.names())) {
             io.netty.channel.ChannelHandler handler = pipeline.get(name);
-            if (handler != null && handler != mine) {
+            if (handler != null && handler != mine && !(handler instanceof ControlCloseGuard)) {
                 LOG.log(Level.FINE, "13.14: stream-0 takeover removes the handler {0}", name);
                 pipeline.remove(handler);
             }
+        }
+    }
+
+    /** The stream-0 close of 13.14: END as a full fence, never a bare FIN or a reset. */
+    private void closeStreamZero() {
+        LOG.log(Level.FINE, "13.14: stream 0 was closed, closing through the END path instead");
+        run(this::doEnd);
+    }
+
+    /**
+     * Turns a close (or disconnect) of stream 0 into the lane close path. It sits at the head of
+     * stream 0's pipeline, so every outbound close from a handler installed before activation,
+     * removed or not, passes through it before it can reach the transport.
+     */
+    private final class ControlCloseGuard extends ChannelOutboundHandlerAdapter {
+        @Override
+        public void close(ChannelHandlerContext ctx, ChannelPromise promise) {
+            if (promise.setUncancellable()) {
+                promise.setSuccess();
+            }
+            closeStreamZero();
+        }
+
+        @Override
+        public void disconnect(ChannelHandlerContext ctx, ChannelPromise promise) {
+            if (promise.setUncancellable()) {
+                promise.setSuccess();
+            }
+            closeStreamZero();
         }
     }
 
@@ -1414,7 +1454,10 @@ public final class LaneSession {
 
         @Override
         public void channelInactive(ChannelHandlerContext ctx) {
-            if (!closed && !endReceived) {
+            // A lane that closes while its connection is already gone is not an extra protocol
+            // violation: the connection's own close, whether a clean 0x0 or a reset, is what the
+            // game is told about.
+            if (!closed && !endReceived && connection.isActive()) {
                 fail(CLOSE_ORDERING, "the " + lane + " lane closed (13.14)", null);
             }
         }
