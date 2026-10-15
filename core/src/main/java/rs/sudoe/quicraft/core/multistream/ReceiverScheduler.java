@@ -19,10 +19,9 @@ public final class ReceiverScheduler {
     public static final long CONTROL_RESERVE_BYTES = 1024 * 1024;
     public static final long TIMEOUT_NANOS = 10000000000L;
 
-    /** Handoff, not a commit: decode/validate the whole unit before invoking game logic,
-     * debit retained output via retainDecoded(), then acknowledge only after application.
-     * The owner applies stricter game-specific packet/bundle limits and closes on failure.
-     */
+    /** Decodes only an eligible record, reserving output before allocation and reporting decoded(). */
+    public interface Decoder { void decode(Envelope envelope, boolean insideBundle, long now); }
+    /** Applies one already-decoded record or an entire validated bundle, then calls applied(). */
     public interface Handler { void deliver(Delivery delivery); }
     /** One record, or a whole bundle. Acknowledge the final sequence, never a member. */
     public static final class Delivery {
@@ -31,6 +30,7 @@ public final class ReceiverScheduler {
             this.records = Collections.unmodifiableList(records);
         }
         public List<Envelope> records() { return records; }
+        public boolean isBundle() { return records.get(0).bundle() == Envelope.Bundle.OPEN; }
         public Lane lane() { return records.get(0).lane(); }
         public long sequence() { return records.get(records.size() - 1).sequence(); }
     }
@@ -45,14 +45,22 @@ public final class ReceiverScheduler {
     }
     private static final class Entry {
         final Envelope envelope;
+        Envelope decoded;
         long bytes;
         int uncompressed;
+        boolean decodeReserved;
         long headSince;
         boolean head;
-        Entry(Envelope envelope, long bytes, int uncompressed) {
-            this.envelope = envelope; this.bytes = bytes; this.uncompressed = uncompressed;
+        Entry(Envelope envelope, long bytes) {
+            this.envelope = envelope; this.bytes = bytes;
+            if (envelope.kind() == Envelope.Kind.END) decoded = envelope;
         }
     }
+    private static final class Candidate {
+        Entry decode;
+        Delivery delivery;
+    }
+    private final Decoder decoder;
     private final Handler handler;
     private final List<ArrayDeque<Entry>> queues = new ArrayList<ArrayDeque<Entry>>();
     private final Map<Partial, Boolean> partials = new IdentityHashMap<Partial, Boolean>();
@@ -61,6 +69,8 @@ public final class ReceiverScheduler {
     private int count, auxiliaryCount;
     private long bytes, auxiliaryBytes;
     private Delivery outstanding;
+    private Entry decoding;
+    private long decodingSince;
     private long outstandingSince;
     private long pumpNow;
     private boolean pumping, ended, controlEnded;
@@ -69,8 +79,9 @@ public final class ReceiverScheduler {
     private int bundleMembers;
     private long bundleUncompressed;
 
-    public ReceiverScheduler(Handler handler) {
-        if (handler == null) throw new IllegalArgumentException("handler");
+    public ReceiverScheduler(Decoder decoder, Handler handler) {
+        if (decoder == null || handler == null) throw new IllegalArgumentException("decoder/handler");
+        this.decoder = decoder;
         this.handler = handler;
         for (int i = 0; i < 3; i++) queues.add(new ArrayDeque<Entry>());
     }
@@ -116,56 +127,37 @@ public final class ReceiverScheduler {
         if (!partials.containsKey(p)) throw new OrderingException("unknown partial");
     }
     public void offer(Envelope e, long now) {
-        offer(e, e.wireBytes(), e.bodyLength(), now);
+        offer(e, e.wireBytes(), now);
     }
-    /** retainedBytes includes wire/parser buffers plus retained decoded output, not just body bytes.
-     * uncompressedBytes is supplied by the boundary-aware bundle decoder (no speculative decoding).
-     */
-    public void offer(Envelope e, long retainedBytes, int uncompressedBytes, long now) {
+    /** Admits opaque wire bytes only; no bundle classification or decompression is needed. */
+    public void offer(Envelope e, long retainedBytes, long now) {
         checkDeadlines(now);
-        validate(e, retainedBytes, uncompressedBytes);
+        validate(e, retainedBytes);
         budget(e.lane(), retainedBytes, 1);
-        enqueue(e, retainedBytes, uncompressedBytes, now);
+        enqueue(e, retainedBytes, now);
     }
     /** Transfers an existing reservation without double-counting its record slot. */
-    public void complete(Partial p, Envelope e, long retainedBytes, int uncompressedBytes, long now) {
+    public void complete(Partial p, Envelope e, long retainedBytes, long now) {
         checkDeadlines(now); requirePartial(p);
         if (p.lane != e.lane()) throw new OrderingException("partial lane mismatch");
-        validate(e, retainedBytes, uncompressedBytes);
+        validate(e, retainedBytes);
         if (retainedBytes > p.bytes) budget(p.lane, retainedBytes - p.bytes, 0);
         partials.remove(p); account(p.lane, -p.bytes, -1);
-        enqueue(e, retainedBytes, uncompressedBytes, now);
+        enqueue(e, retainedBytes, now);
     }
-    private void validate(Envelope e, long retained, int uncompressed) {
+    private void validate(Envelope e, long retained) {
         int i = e.lane().ordinal();
         if (ended || controlEnded || received[i] == -1L
                 || e.sequence() != received[i] + 1
                 || e.dependency(e.lane()) != e.sequence() - 1)
             throw new OrderingException("sequence/own dependency violation");
-        if (retained < e.wireBytes() || uncompressed < 0 || uncompressed > 8 * 1024 * 1024)
-            throw new OrderingException("retained/decompressed size");
-        if (i == 0) {
-            Envelope.Bundle b = e.bundle();
-            if ((!receivingBundle && (b == Envelope.Bundle.MEMBER || b == Envelope.Bundle.CLOSE))
-                    || (receivingBundle && b != Envelope.Bundle.MEMBER && b != Envelope.Bundle.CLOSE))
-                throw new OrderingException("bundle delimiter order");
-            if ((b == Envelope.Bundle.MEMBER && bundleMembers == SenderSequencer.MAX_BUNDLE_MEMBERS)
-                    || ((b == Envelope.Bundle.MEMBER || b == Envelope.Bundle.CLOSE)
-                    && bundleUncompressed + uncompressed > 8L * 1024 * 1024))
-                throw new OrderingException("bundle bounds");
-        }
+        if (retained < e.wireBytes()) throw new OrderingException("retained wire size");
     }
-    private void enqueue(Envelope e, long retained, int uncompressed, long now) {
+    private void enqueue(Envelope e, long retained, long now) {
         received[e.lane().ordinal()] = e.sequence();
         if (e.kind() == Envelope.Kind.END) controlEnded = true;
-        if (e.bundle() == Envelope.Bundle.OPEN) {
-            receivingBundle = true; bundleStarted = now; bundleMembers = 0;
-            bundleUncompressed = uncompressed;
-        } else if (e.bundle() == Envelope.Bundle.MEMBER) {
-            bundleMembers++; bundleUncompressed += uncompressed;
-        } else if (e.bundle() == Envelope.Bundle.CLOSE) receivingBundle = false;
         account(e.lane(), retained, 1);
-        queues.get(e.lane().ordinal()).add(new Entry(e, retained, uncompressed));
+        queues.get(e.lane().ordinal()).add(new Entry(e, retained));
         markHeads(now); pump(now);
     }
     private void markHeads(long now) {
@@ -181,16 +173,26 @@ public final class ReceiverScheduler {
         }
         return true;
     }
-    private Delivery eligible(ArrayDeque<Entry> q) {
+    private Candidate eligible(ArrayDeque<Entry> q) {
         if (q.isEmpty()) return null;
+        Candidate candidate = new Candidate();
         List<Envelope> unit = new ArrayList<Envelope>();
         long provisional = delivered[0];
-        boolean bundle = q.peek().envelope.bundle() == Envelope.Bundle.OPEN;
+        boolean bundle = false;
         for (Entry entry : q) {
-            Envelope e = entry.envelope;
-            if (!ready(e, provisional)) return null;
+            if (!ready(entry.envelope, provisional)) return null;
+            if (entry.decoded == null) {
+                candidate.decode = entry;
+                return candidate;
+            }
+            Envelope e = entry.decoded;
+            if (bundle && e.kind() == Envelope.Kind.END) throw new OrderingException("END inside bundle");
+            if (unit.isEmpty()) bundle = e.bundle() == Envelope.Bundle.OPEN;
             unit.add(e);
-            if (!bundle || e.bundle() == Envelope.Bundle.CLOSE) return new Delivery(unit);
+            if (!bundle || e.bundle() == Envelope.Bundle.CLOSE) {
+                candidate.delivery = new Delivery(unit);
+                return candidate;
+            }
             provisional = e.sequence();
         }
         return null;
@@ -201,44 +203,83 @@ public final class ReceiverScheduler {
         if (pumping || ended) return;
         pumping = true;
         try {
-            while (outstanding == null && !ended) {
-                Delivery next = null;
+            while (outstanding == null && decoding == null && !ended) {
+                Candidate next = null;
                 for (ArrayDeque<Entry> q : queues) {
                     next = eligible(q);
                     if (next != null) break;
                 }
                 if (next == null) break;
-                outstanding = next; outstandingSince = pumpNow;
-                handler.deliver(next);
-                if (outstanding != null) break;
+                if (next.decode != null) {
+                    decoding = next.decode;
+                    decodingSince = pumpNow;
+                    decoder.decode(decoding.envelope,
+                            receivingBundle && decoding.envelope.lane() == Lane.CONTROL, pumpNow);
+                } else {
+                    outstanding = next.delivery;
+                    outstandingSince = pumpNow;
+                    handler.deliver(outstanding);
+                }
             }
         } finally { pumping = false; }
     }
-    /** Debit before allocating decoding output, only for an eligible outstanding record.
-     * additionalRetainedBytes counts allocations still retained alongside the original bytes;
-     * totalUncompressedBytes replaces the earlier size estimate, and obeys the packet/bundle cap.
-     * All debits are released on applied(), never on callback return.
+    /** Debits output before allocation, only for the current eligible decode request.
+     * All retained bytes stay charged until applied(), including staged bundle members.
      */
-    public void retainDecoded(Envelope envelope, long additionalRetainedBytes,
+    public void reserveDecoded(Envelope envelope, long additionalRetainedBytes,
                               int totalUncompressedBytes, long now) {
         checkDeadlines(now);
-        if (outstanding == null || !outstanding.records().contains(envelope)
+        if (decoding == null || decoding.envelope != envelope
                 || totalUncompressedBytes < 0 || totalUncompressedBytes > 8 * 1024 * 1024)
             throw new OrderingException("ineligible/oversized decode");
-        Entry target = null;
-        long bundleSize = 0;
-        boolean bundle = outstanding.records().size() > 1;
-        for (Entry entry : queues.get(envelope.lane().ordinal())) {
-            if (!outstanding.records().contains(entry.envelope)) break;
-            if (entry.envelope == envelope) target = entry;
-            if (bundle)
-                bundleSize += entry.envelope == envelope ? totalUncompressedBytes : entry.uncompressed;
-        }
-        if (target == null || (bundle && bundleSize > 8L * 1024 * 1024))
+        if (receivingBundle && envelope.lane() == Lane.CONTROL
+                && bundleUncompressed + totalUncompressedBytes > 8L * 1024 * 1024)
             throw new OrderingException("decoded bundle bounds");
         budget(envelope.lane(), additionalRetainedBytes, 0);
-        target.bytes += additionalRetainedBytes; target.uncompressed = totalUncompressedBytes;
+        decoding.bytes += additionalRetainedBytes;
+        decoding.uncompressed = totalUncompressedBytes;
+        decoding.decodeReserved = true;
         account(envelope.lane(), additionalRetainedBytes, 0);
+    }
+
+    /** Reports packet classification only after eligible, budgeted decoding has completed.
+     * State/compression/activation changes are invalid in a bundle. NONE denotes an ordinary
+     * packet outside a bundle; the adapter reports MEMBER for ordinary packets inside one.
+     */
+    public void decoded(Envelope envelope, Envelope.Bundle classification,
+                        boolean changesStateCompressionOrActivation, Object body, long now) {
+        checkDeadlines(now);
+        if (decoding == null || decoding.envelope != envelope || !decoding.decodeReserved
+                || classification == null) throw new OrderingException("unexpected decode result");
+        boolean control = envelope.lane() == Lane.CONTROL;
+        if (!control && (classification != Envelope.Bundle.NONE || changesStateCompressionOrActivation))
+            throw new OrderingException("wrong lane for bundle/state change");
+        if (control) {
+            if (receivingBundle) {
+                if (changesStateCompressionOrActivation || (classification != Envelope.Bundle.MEMBER
+                        && classification != Envelope.Bundle.CLOSE))
+                    throw new OrderingException("invalid member or nested bundle");
+                if (classification == Envelope.Bundle.MEMBER
+                        && bundleMembers == SenderSequencer.MAX_BUNDLE_MEMBERS)
+                    throw new OrderingException("bundle member count");
+                bundleUncompressed += decoding.uncompressed;
+                if (classification == Envelope.Bundle.MEMBER) bundleMembers++;
+                else receivingBundle = false;
+            } else if (classification == Envelope.Bundle.OPEN) {
+                if (changesStateCompressionOrActivation) throw new OrderingException("state-changing delimiter");
+                receivingBundle = true;
+                bundleStarted = now;
+                bundleMembers = 0;
+                bundleUncompressed = decoding.uncompressed;
+            } else if (classification != Envelope.Bundle.NONE) {
+                throw new OrderingException("unexpected bundle member/delimiter");
+            }
+        }
+        decoding.decoded = new Envelope(envelope.lane(), envelope.kind(), envelope.sequence(),
+                envelope.dependencies(), envelope.bodyLength(), body, classification,
+                changesStateCompressionOrActivation);
+        decoding = null;
+        pump(now);
     }
     public void applied(Lane lane, long sequence, long now) {
         checkDeadlines(now);
@@ -253,6 +294,8 @@ public final class ReceiverScheduler {
         outstanding = null; markHeads(now); pump(now);
     }
     public void checkDeadlines(long now) {
+        if (decoding != null && now - decodingSince >= TIMEOUT_NANOS)
+            throw new OrderingException("uncompleted decode timeout");
         if (receivingBundle && now - bundleStarted >= TIMEOUT_NANOS)
             throw new OrderingException("missing bundle close timeout");
         if (outstanding != null && now - outstandingSince >= TIMEOUT_NANOS)
@@ -263,6 +306,7 @@ public final class ReceiverScheduler {
             Entry head = q.peek();
             if (head != null && eligible(q) == null
                     && (outstanding == null || outstanding.lane() != head.envelope.lane())
+                    && (decoding == null || decoding.envelope.lane() != head.envelope.lane())
                     && now - head.headSince >= TIMEOUT_NANOS)
                 throw new OrderingException("blocked head/bundle timeout");
         }

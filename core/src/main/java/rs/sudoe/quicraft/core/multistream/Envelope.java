@@ -3,7 +3,12 @@ package rs.sudoe.quicraft.core.multistream;
 
 import rs.sudoe.quicraft.core.routing.Lane;
 
-/** Undecoded record. Sequence/dependency longs represent unsigned wire u64 values. */
+/**
+ * Record header with an opaque body. Sequence/dependency longs are unsigned wire u64 values.
+ *
+ * <p>Bundle/state metadata is local, not part of the wire header. The sender may attach it;
+ * the receiver ignores it at admission and obtains it only from its eligible decoder.</p>
+ */
 public final class Envelope {
     public enum Kind { GAME, END }
     public enum Bundle { NONE, OPEN, MEMBER, CLOSE }
@@ -15,6 +20,12 @@ public final class Envelope {
     private final Object body;
     private final Bundle bundle;
     private final boolean stateChange;
+
+    /** Creates an undecoded wire envelope without requiring packet classification. */
+    public Envelope(Lane lane, Kind kind, long sequence, long[] dependencies,
+                    int bodyLength, Object body) {
+        this(lane, kind, sequence, dependencies, bodyLength, body, Bundle.NONE, false);
+    }
 
     public Envelope(Lane lane, Kind kind, long sequence, long[] dependencies,
                     int bodyLength, Object body, Bundle bundle, boolean stateChange) {

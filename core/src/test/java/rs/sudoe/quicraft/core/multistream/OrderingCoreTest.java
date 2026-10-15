@@ -7,6 +7,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.Random;
 import rs.sudoe.quicraft.core.routing.Lane;
 import static org.junit.jupiter.api.Assertions.*;
@@ -24,7 +26,17 @@ class OrderingCoreTest {
     private static final class Harness {
         final List<ReceiverScheduler.Delivery> calls = new ArrayList<ReceiverScheduler.Delivery>();
         final List<Envelope> delivered = new ArrayList<Envelope>();
-        final ReceiverScheduler scheduler = new ReceiverScheduler(this::onDelivery);
+        final Map<Envelope,Integer> decodedSizes = new IdentityHashMap<Envelope,Integer>();
+        final ReceiverScheduler scheduler = new ReceiverScheduler(this::onDecode,this::onDelivery);
+        private void onDecode(Envelope e, boolean insideBundle, long now) {
+            int size = decodedSizes.containsKey(e) ? decodedSizes.get(e) : e.bodyLength();
+            scheduler.reserveDecoded(e,0,size,now);
+            scheduler.decoded(e,e.bundle(),e.stateChange(),e.body(),now);
+        }
+        void offerSized(Envelope e, long retained, int uncompressed, long now) {
+            decodedSizes.put(e,uncompressed);
+            scheduler.offer(e,retained,now);
+        }
         private void onDelivery(ReceiverScheduler.Delivery d) {
             assertDeliveryDependencies(d,scheduler.delivered());
             calls.add(d);
@@ -246,12 +258,13 @@ class OrderingCoreTest {
             h.scheduler.offer(marked(i+2,Envelope.Bundle.MEMBER),0);
         }
         Harness bytes = new Harness(); bytes.scheduler.offer(marked(1,Envelope.Bundle.OPEN),0);
-        bytes.scheduler.offer(marked(2,Envelope.Bundle.MEMBER),34,8*1024*1024,0);
-        fails(() -> bytes.scheduler.offer(marked(3,Envelope.Bundle.MEMBER),34,1,0));
+        bytes.offerSized(marked(2,Envelope.Bundle.MEMBER),34,8*1024*1024,0);
+        fails(() -> bytes.offerSized(marked(3,Envelope.Bundle.MEMBER),34,1,0));
         Harness invalid = new Harness();
         fails(() -> invalid.scheduler.offer(marked(1,Envelope.Bundle.CLOSE),0));
-        invalid.scheduler.offer(marked(1,Envelope.Bundle.OPEN),0);
-        fails(() -> invalid.scheduler.offer(e(C,2,1,0,0),0));
+        Harness interrupted = new Harness();
+        interrupted.scheduler.offer(marked(1,Envelope.Bundle.OPEN),0);
+        fails(() -> interrupted.scheduler.offer(e(C,2,1,0,0),0));
         fails(() -> markedStateChange());
     }
     private static Envelope marked(long seq, Envelope.Bundle b) {
@@ -291,13 +304,14 @@ class OrderingCoreTest {
         Harness h = new Harness();
         ReceiverScheduler.Partial p = h.scheduler.reservePartial(R,1,0);
         h.scheduler.growPartial(p,33,1);
-        h.scheduler.complete(p,e(R,1,1,0,0),100,66,2);
+        h.scheduler.complete(p,e(R,1,1,0,0),100,2);
         assertEquals(1,h.scheduler.pendingRecords()); assertEquals(100,h.scheduler.pendingBytes());
         fails(() -> h.scheduler.releasePartial(p,2));
         h.offer(e(C,1,0,0,0));
         assertEquals(0,h.scheduler.pendingBytes());
-        fails(() -> h.scheduler.offer(e(W,1,0,0,0),34,8*1024*1024+1,0));
-        h.scheduler.offer(e(W,1,0,0,0),34+8*1024*1024,8*1024*1024,0);
+        Harness tooLarge = new Harness();
+        fails(() -> tooLarge.offerSized(e(W,1,0,0,0),34,8*1024*1024+1,0));
+        h.offerSized(e(W,1,0,0,0),34+8*1024*1024,8*1024*1024,0);
         h.drain(0); assertEquals(0,h.scheduler.pendingBytes());
     }
 
@@ -330,13 +344,13 @@ class OrderingCoreTest {
         fails(() -> h.scheduler.checkDeadlines(2*T-1));
     }
 
-    @Test void missingBundleCloseDeadlineStartsAtOpenEvenBehindAnotherHead() {
+    @Test void missingBundleCloseDeadlineStartsWhenOpenIsDecoded() {
         Harness h = new Harness();
         h.scheduler.offer(e(C,1,0,0,0),0);
         h.scheduler.offer(marked(2,Envelope.Bundle.OPEN),1);
         h.scheduler.applied(C,1,T-2);
-        h.scheduler.checkDeadlines(T);
-        fails(() -> h.scheduler.checkDeadlines(T+1));
+        h.scheduler.checkDeadlines(2*T-3);
+        fails(() -> h.scheduler.checkDeadlines(2*T-2));
     }
 
     @Test void duplicateSkipAndWrongOwnLaneDependencyAreErrors() {
@@ -371,14 +385,17 @@ class OrderingCoreTest {
             h.scheduler.offer(end,0);
             Envelope later = e(lane,lane == C ? 2 : 1,lane == C ? 1 : 0,0,0);
             fails(() -> h.scheduler.offer(later,0));
-            fails(() -> h.scheduler.complete(p,later,34,0,0));
+            fails(() -> h.scheduler.complete(p,later,34,0));
             fails(() -> h.scheduler.reservePartial(lane,1,0));
         }
     }
 
     @Test void synchronousAcknowledgementsDoNotRecurseThroughHandlerStack() {
         ReceiverScheduler[] ref=new ReceiverScheduler[1]; int[] depth={0}, max={0};
-        ref[0]=new ReceiverScheduler(d -> {
+        ref[0]=new ReceiverScheduler((e,inside,now) -> {
+            ref[0].reserveDecoded(e,0,0,now);
+            ref[0].decoded(e,Envelope.Bundle.NONE,false,null,now);
+        },d -> {
             assertDeliveryDependencies(d,ref[0].delivered());
             depth[0]++; max[0]=Math.max(max[0],depth[0]);
             ref[0].applied(d.lane(),d.sequence(),0); depth[0]--;
@@ -391,33 +408,39 @@ class OrderingCoreTest {
     @Test void decodedOutputMustBeEligibleAndRemainsBudgetedUntilApplied() {
         Harness h = new Harness(); Envelope a=e(R,1,1,0,0);
         h.scheduler.offer(a,0);
-        fails(() -> h.scheduler.retainDecoded(a,1,1,0));
-        h.offer(e(C,1,0,0,0));
-        // offer() drained a too, so test the outstanding phase in a separate harness.
-        Harness outstanding = new Harness(); Envelope b=e(R,1,0,0,0);
-        outstanding.scheduler.offer(b,0);
-        outstanding.scheduler.retainDecoded(b,8*1024*1024,8*1024*1024,0);
-        assertEquals(34+8L*1024*1024,outstanding.scheduler.pendingBytes());
-        fails(() -> outstanding.scheduler.retainDecoded(b,1,8*1024*1024+1,0));
-        fails(() -> outstanding.scheduler.retainDecoded(b,16L*1024*1024,1,0));
-        assertEquals(34+8L*1024*1024,outstanding.scheduler.pendingBytes());
-        outstanding.drain(0); assertEquals(0,outstanding.scheduler.pendingBytes());
+        fails(() -> h.scheduler.reserveDecoded(a,1,1,0));
+        ReceiverScheduler[] ref = new ReceiverScheduler[1];
+        List<ReceiverScheduler.Delivery> calls = new ArrayList<ReceiverScheduler.Delivery>();
+        ref[0] = new ReceiverScheduler((e,inside,now) -> {
+            ref[0].reserveDecoded(e,8*1024*1024,8*1024*1024,now);
+            fails(() -> ref[0].reserveDecoded(e,1,8*1024*1024+1,now));
+            fails(() -> ref[0].reserveDecoded(e,16L*1024*1024,1,now));
+            ref[0].decoded(e,Envelope.Bundle.NONE,false,null,now);
+        },d -> {
+            assertDeliveryDependencies(d,ref[0].delivered());
+            calls.add(d);
+        });
+        ref[0].offer(e(R,1,0,0,0),0);
+        assertEquals(34+8L*1024*1024,ref[0].pendingBytes());
+        ref[0].applied(R,calls.get(0).sequence(),0);
+        assertEquals(0,ref[0].pendingBytes());
     }
 
     @Test void decodedBundleMembersShareTheEightMiBCap() {
         Harness h = new Harness();
         Envelope a=marked(2,Envelope.Bundle.MEMBER), b=marked(3,Envelope.Bundle.MEMBER);
         h.scheduler.offer(marked(1,Envelope.Bundle.OPEN),0);
-        h.scheduler.offer(a,0); h.scheduler.offer(b,0);
-        h.scheduler.offer(marked(4,Envelope.Bundle.CLOSE),0);
-        h.scheduler.retainDecoded(a,8*1024*1024,8*1024*1024,0);
-        fails(() -> h.scheduler.retainDecoded(b,1,1,0));
+        h.offerSized(a,34,8*1024*1024,0);
+        fails(() -> h.offerSized(b,34,1,0));
         assertArrayEquals(new long[3],h.scheduler.delivered());
     }
 
     @Test void inlineApplicationUsesItsSuppliedTimeForTheNextHandlerDeadline() {
         ReceiverScheduler[] ref = new ReceiverScheduler[1];
-        ref[0] = new ReceiverScheduler(d -> {
+        ref[0] = new ReceiverScheduler((e,inside,now) -> {
+            ref[0].reserveDecoded(e,0,0,now);
+            ref[0].decoded(e,Envelope.Bundle.NONE,false,null,now);
+        },d -> {
             assertDeliveryDependencies(d,ref[0].delivered());
             if (d.lane() == C) ref[0].applied(C,1,T-1);
         });
@@ -464,7 +487,7 @@ class OrderingCoreTest {
         Harness h = new Harness();
         ReceiverScheduler.Partial p=h.scheduler.reservePartial(C,34,0);
         for (int i=1;i<1024;i++) h.scheduler.reservePartial(C,1,0);
-        h.scheduler.complete(p,e(C,1,0,0,0),34,0,0);
+        h.scheduler.complete(p,e(C,1,0,0,0),34,0);
         assertEquals(1024,h.scheduler.pendingRecords());
         h.drain(0); assertEquals(1023,h.scheduler.pendingRecords());
     }
@@ -489,10 +512,8 @@ class OrderingCoreTest {
         fails(() -> s.endBundle(1,null,0,null,0));
         assertArrayEquals(new long[3],s.assigned());
         Harness h=new Harness();
-        h.scheduler.offer(marked(1,Envelope.Bundle.OPEN),34,1,0);
-        h.scheduler.offer(marked(2,Envelope.Bundle.MEMBER),34,8*1024*1024-1,0);
-        fails(() -> h.scheduler.offer(marked(3,Envelope.Bundle.CLOSE),34,1,0));
-        h.scheduler.offer(marked(3,Envelope.Bundle.CLOSE),34,0,0);
-        assertEquals(3,h.calls.get(0).records().size());
+        h.offerSized(marked(1,Envelope.Bundle.OPEN),34,1,0);
+        h.offerSized(marked(2,Envelope.Bundle.MEMBER),34,8*1024*1024-1,0);
+        fails(() -> h.offerSized(marked(3,Envelope.Bundle.CLOSE),34,1,0));
     }
 }
