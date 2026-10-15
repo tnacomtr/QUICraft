@@ -458,6 +458,58 @@ class RebindStateTest {
         assertEquals(2, state.size());
     }
 
+    @Test
+    void anActiveAttemptsNoticesAreNeverTrimmed(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get, 1, 2, 2);
+        assertTrue(state.shouldNotify("a.example.com", 25565, fingerprint(0)));
+        assertTrue(state.shouldNotify("a.example.com", 25565, fingerprint(1)));
+        RebindState.Attempt attempt = state.tryBeginAttempt("a.example.com", 25565, now.get());
+        assertNotNull(attempt);
+
+        assertFalse(state.shouldNotify("a.example.com", 25565, fingerprint(2)),
+                "the history is full and an active attempt's notices may not be trimmed");
+        String json = jsonOf(Files.readAllBytes(file));
+        assertTrue(json.contains("fingerprint\":\"" + fingerprint(0)), "the oldest notice is still there");
+        assertTrue(json.contains("fingerprint\":\"" + fingerprint(1)));
+        assertFalse(json.contains("fingerprint\":\"" + fingerprint(2)), "no notice was recorded");
+        assertFalse(state.shouldNotify("a.example.com", 25565, fingerprint(2)),
+                "and the refused tuple stays unmarked");
+
+        assertTrue(state.endAttempt(attempt, false));
+        assertTrue(state.shouldNotify("a.example.com", 25565, fingerprint(2)), "once the attempt has ended");
+        String trimmed = jsonOf(Files.readAllBytes(file));
+        assertFalse(trimmed.contains("fingerprint\":\"" + fingerprint(0)), "the oldest notice was trimmed");
+        assertTrue(trimmed.contains("fingerprint\":\"" + fingerprint(2)));
+    }
+
+    @Test
+    void aNoticeIsRefusedWhenOnlyAnActiveAttemptCouldGiveRoom(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get, 3, 2, 2);
+        assertTrue(state.shouldNotify("a.example.com", 25565, fingerprint(0)));
+        assertTrue(state.shouldNotify("b.example.com", 25565, fingerprint(1)));
+        RebindState.Attempt a = state.tryBeginAttempt("a.example.com", 25565, now.get());
+        assertNotNull(a);
+        RebindState.Attempt b = state.tryBeginAttempt("b.example.com", 25565, now.get());
+        assertNotNull(b);
+        byte[] before = Files.readAllBytes(file);
+
+        assertFalse(state.shouldNotify("c.example.com", 25565, fingerprint(2)),
+                "the total cap can only be met by trimming an active attempt");
+        assertArrayEquals(before, Files.readAllBytes(file), "a refused notice changes nothing");
+
+        assertTrue(state.endAttempt(a, false));
+        assertTrue(state.shouldNotify("c.example.com", 25565, fingerprint(2)),
+                "the ended attempt's oldest notice may give room");
+        String json = jsonOf(Files.readAllBytes(file));
+        assertFalse(json.contains("fingerprint\":\"" + fingerprint(0)), "a's only notice was trimmed");
+        assertTrue(json.contains("fingerprint\":\"" + fingerprint(1)), "b's notice stays");
+        assertTrue(json.contains("fingerprint\":\"" + fingerprint(2)), "c's notice was recorded");
+    }
+
     /** A re-bind state fixture with {@code count} servers, each inside {@code blockedUntil}. */
     private static String servers(int count, String blockedUntil) {
         StringBuilder sb = new StringBuilder(count * 140 + 64);

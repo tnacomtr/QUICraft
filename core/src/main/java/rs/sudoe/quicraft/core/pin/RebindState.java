@@ -372,6 +372,10 @@ public final class RebindState {
             // Marked before, though its detailed history entry has been evicted or cleared.
             return false;
         }
+        if (!noticeFits(entry)) {
+            // The caps cannot be met without trimming an active attempt's notices: no notice.
+            return false;
+        }
         if (entry == null) {
             if (!makeRoom()) {
                 // No room for this server's history at all: say nothing rather than risk a repeat.
@@ -481,6 +485,31 @@ public final class RebindState {
     }
 
     /**
+     * Whether one more notice for {@code entry} fits the caps, assuming the oldest notice of any
+     * non-active entry may be evicted and none of an active attempt may be. A null {@code entry} is a
+     * server that has no state yet.
+     */
+    private boolean noticeFits(Entry entry) {
+        if (entry != null && entry.active != null && entry.notices.size() >= maxFingerprintsPerServer) {
+            return false;
+        }
+        if (noticeCount + 1 <= maxFingerprintsTotal) {
+            return true;
+        }
+        return evictableNoticeExists();
+    }
+
+    /** Whether some entry may give up a notice: any entry that is not an active attempt. */
+    private boolean evictableNoticeExists() {
+        for (Entry candidate : entries.values()) {
+            if (candidate.active == null && !candidate.notices.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * The entry for {@code mapKey}, created and made room for when it is missing. Only mutating calls
      * use this; a query never inserts.
      *
@@ -526,16 +555,20 @@ public final class RebindState {
         entries.put(mapKey, entry);
     }
 
-    /** Keeps {@code entry} inside the per-server cap and the total cap, evicting oldest first. */
+    /**
+     * Keeps {@code entry} inside the per-server cap and the total cap, evicting oldest first. An
+     * active attempt's notices are never trimmed, so the caller must have checked
+     * {@link #noticeFits(Entry)} first.
+     */
     private void trimNotices(Entry entry) {
-        while (entry.notices.size() > maxFingerprintsPerServer) {
+        while (entry.active == null && entry.notices.size() > maxFingerprintsPerServer) {
             entry.notices.remove(0);
             noticeCount--;
         }
         while (noticeCount > maxFingerprintsTotal) {
             Entry oldest = null;
             for (Entry candidate : entries.values()) {
-                if (!candidate.notices.isEmpty()) {
+                if (candidate.active == null && !candidate.notices.isEmpty()) {
                     oldest = candidate;
                     break;
                 }
