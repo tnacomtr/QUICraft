@@ -85,6 +85,41 @@ class RebindStateTest {
     }
 
     @Test
+    void aStaleAttemptIsTreatedAsAFailedOne(@TempDir Path dir) {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        RebindState.Attempt attempt = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(attempt);
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), "still live");
+
+        now.addAndGet(RebindState.STALE_ATTEMPT_MILLIS);
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()),
+                "stale: it counts as a failure, whose window starts now");
+        now.addAndGet(MINUTE - 1);
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()),
+                "inside the window the failure earned");
+        now.addAndGet(1);
+        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), "and open again");
+        assertFalse(state.endAttempt(attempt, false), "the stale token was already released");
+    }
+
+    @Test
+    void aStaleAttemptsStateMayBeEvicted(@TempDir Path dir) {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get, 2, 4, 4);
+        assertNotNull(state.tryBeginAttempt("a.example.com", 25565, now.get()));
+        assertNotNull(state.tryBeginAttempt("b.example.com", 25565, now.get()));
+        assertNull(state.tryBeginAttempt("c.example.com", 25565, now.get()), "both entries have live attempts");
+
+        now.addAndGet(RebindState.STALE_ATTEMPT_MILLIS);
+        assertNotNull(state.tryBeginAttempt("c.example.com", 25565, now.get()),
+                "both attempts are stale now, so their state may be evicted");
+        assertEquals(2, state.size());
+    }
+
+    @Test
     void backoffIsKeyedLikeAPinAndIgnoresTheFingerprint(@TempDir Path dir) {
         Path file = dir.resolve("rebind-v1.bin");
         AtomicLong now = new AtomicLong(BASE);

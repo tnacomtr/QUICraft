@@ -80,6 +80,12 @@ public final class RebindState {
     public static final int MAX_FINGERPRINTS_PER_SERVER = 16;
     /** The most fingerprints remembered in detail in total; docs/protocol.md 12.16. */
     public static final int MAX_FINGERPRINTS_TOTAL = 65536;
+    /**
+     * How long an attempt may stay active before it counts as abandoned: comfortably above 12.16's
+     * ten second activation deadline, so a live attempt is never mistaken for a dead one, and short
+     * enough that a caller that went away cannot hold a server's state forever.
+     */
+    public static final long STALE_ATTEMPT_MILLIS = 30_000L;
 
     /** Section 6's first backoff: one minute. */
     static final long INITIAL_BACKOFF_MILLIS = 60_000L;
@@ -139,15 +145,18 @@ public final class RebindState {
     /**
      * One re-binding attempt: the token {@link #tryBeginAttempt(String, int, long)} returns and
      * {@link #endAttempt(Attempt, boolean)} accepts. Its identity is what makes a late end a no-op,
-     * so only the caller that started an attempt can finish it, and a query can never end one.
+     * so only the caller that started an attempt can finish it, and a query can never end one. It
+     * also carries the time it started, which is how an abandoned attempt is recognised as stale.
      */
     public static final class Attempt {
         private final String host;
         private final int port;
+        final long startedAt;
 
-        private Attempt(String host, int port) {
+        private Attempt(String host, int port, long startedAt) {
             this.host = host;
             this.port = port;
+            this.startedAt = startedAt;
         }
 
         /** The normalized logical host this attempt belongs to. */
@@ -251,18 +260,29 @@ public final class RebindState {
         String mapKey = PinKey.mapKey(key);
         Entry entry = entries.get(mapKey);
         if (entry == null) {
-            if (!makeRoom()) {
+            if (!makeRoom(now)) {
                 return null;
             }
             entry = new Entry(key.host(), key.port());
             entries.put(mapKey, entry);
         } else {
+            boolean changed = false;
+            if (entry.active != null && !live(entry, now)) {
+                // A stale attempt is treated as a failed one: it is released here and its window is
+                // advanced, so the decision below sees the failure rather than a live attempt.
+                entry.active = null;
+                fail(entry, now);
+                changed = true;
+            }
             if (entry.active != null || entry.blockedUntil > now) {
+                if (changed && !persist()) {
+                    disabled = true;
+                }
                 return null;
             }
             touch(mapKey, entry);
         }
-        Attempt attempt = new Attempt(key.host(), key.port());
+        Attempt attempt = new Attempt(key.host(), key.port(), now);
         entry.active = attempt;
         // The window a failure would set, stored before the attempt starts: a crash or a game exit
         // mid-attempt must not allow an immediate re-bind on the next launch.
@@ -373,6 +393,7 @@ public final class RebindState {
             return false;
         }
         String mapKey = PinKey.mapKey(key);
+        long now = clock.getAsLong();
         Entry entry = entries.get(mapKey);
         if (entry != null && entry.hasNotice(fingerprint)) {
             return false;
@@ -381,12 +402,12 @@ public final class RebindState {
             // Marked before, though its detailed history entry has been evicted or cleared.
             return false;
         }
-        if (!noticeFits(entry)) {
-            // The caps cannot be met without trimming an active attempt's notices: no notice.
+        if (!noticeFits(entry, now)) {
+            // The caps cannot be met without trimming a live attempt's notices: no notice.
             return false;
         }
         if (entry == null) {
-            if (!makeRoom()) {
+            if (!makeRoom(now)) {
                 // No room for this server's history at all: say nothing rather than risk a repeat.
                 return false;
             }
@@ -399,9 +420,9 @@ public final class RebindState {
             // Unreachable after contains said the bits were not all set; fail closed all the same.
             return false;
         }
-        entry.notices.add(new Notice(fingerprint, Instant.ofEpochMilli(clock.getAsLong())));
+        entry.notices.add(new Notice(fingerprint, Instant.ofEpochMilli(now)));
         noticeCount++;
-        trimNotices(entry);
+        trimNotices(entry, now);
         if (!persist()) {
             disabled = true;
             return false;
@@ -495,37 +516,37 @@ public final class RebindState {
 
     /**
      * Whether one more notice for {@code entry} fits the caps, assuming the oldest notice of any
-     * non-active entry may be evicted and none of an active attempt may be. A null {@code entry} is a
-     * server that has no state yet.
+     * entry without a live attempt may be evicted and none of a live one may be. A null {@code entry}
+     * is a server that has no state yet.
      */
-    private boolean noticeFits(Entry entry) {
-        if (entry != null && entry.active != null && entry.notices.size() >= maxFingerprintsPerServer) {
+    private boolean noticeFits(Entry entry, long now) {
+        if (entry != null && live(entry, now) && entry.notices.size() >= maxFingerprintsPerServer) {
             return false;
         }
         if (noticeCount + 1 <= maxFingerprintsTotal) {
             return true;
         }
-        return evictableNoticeExists();
+        return evictableNoticeExists(now);
     }
 
-    /** Whether some entry may give up a notice: any entry that is not an active attempt. */
-    private boolean evictableNoticeExists() {
+    /** Whether some entry may give up a notice: any entry without a live attempt. */
+    private boolean evictableNoticeExists(long now) {
         for (Entry candidate : entries.values()) {
-            if (candidate.active == null && !candidate.notices.isEmpty()) {
+            if (!live(candidate, now) && !candidate.notices.isEmpty()) {
                 return true;
             }
         }
         return false;
     }
 
-    /** Evicts the least recently used entry that is not an active attempt, when there is no room. */
-    private boolean makeRoom() {
+    /** Evicts the least recently used entry that is not a live attempt, when there is no room. */
+    private boolean makeRoom(long now) {
         if (entries.size() < maxEntries) {
             return true;
         }
         String victim = null;
         for (Map.Entry<String, Entry> candidate : entries.entrySet()) {
-            if (candidate.getValue().active == null) {
+            if (!live(candidate.getValue(), now)) {
                 victim = candidate.getKey();
                 break;
             }
@@ -559,19 +580,29 @@ public final class RebindState {
     }
 
     /**
-     * Keeps {@code entry} inside the per-server cap and the total cap, evicting oldest first. An
-     * active attempt's notices are never trimmed, so the caller must have checked
-     * {@link #noticeFits(Entry)} first.
+     * Whether {@code entry} holds a live attempt: one that started less than
+     * {@link #STALE_ATTEMPT_MILLIS} before {@code now}. A stale attempt is treated as one that ended
+     * in failure, so its state is evictable and its notices may be trimmed like an ended attempt's; a
+     * caller that went away cannot keep a server's state alive forever.
      */
-    private void trimNotices(Entry entry) {
-        while (entry.active == null && entry.notices.size() > maxFingerprintsPerServer) {
+    private static boolean live(Entry entry, long now) {
+        return entry.active != null && now - entry.active.startedAt < STALE_ATTEMPT_MILLIS;
+    }
+
+    /**
+     * Keeps {@code entry} inside the per-server cap and the total cap, evicting oldest first. A live
+     * attempt's notices are never trimmed, so the caller must have checked {@link #noticeFits(Entry,
+     * long)} first.
+     */
+    private void trimNotices(Entry entry, long now) {
+        while (!live(entry, now) && entry.notices.size() > maxFingerprintsPerServer) {
             entry.notices.remove(0);
             noticeCount--;
         }
         while (noticeCount > maxFingerprintsTotal) {
             Entry oldest = null;
             for (Entry candidate : entries.values()) {
-                if (candidate.active == null && !candidate.notices.isEmpty()) {
+                if (!live(candidate, now) && !candidate.notices.isEmpty()) {
                     oldest = candidate;
                     break;
                 }
