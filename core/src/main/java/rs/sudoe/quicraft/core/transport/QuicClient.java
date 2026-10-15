@@ -7,6 +7,7 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelInitializer;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.quic.QuicChannel;
@@ -34,6 +35,10 @@ import java.util.logging.Logger;
 import javax.net.ssl.SSLEngine;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
+import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
+import rs.sudoe.quicraft.core.multistream.PreambleV2;
+import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.tls.FingerprintTrustManager;
 import rs.sudoe.quicraft.core.tls.FingerprintTrustManager.FingerprintMismatchException;
@@ -135,18 +140,108 @@ public final class QuicClient {
         return result;
     }
 
-    /** A client TLS context and its trust manager, for one fingerprint. */
+    /**
+     * Dialing {@code /3} where the loaded native cannot support it (13.13). Distinct so a caller
+     * can fall back to {@code /2} or TCP (12.3) without mistaking it for an ordinary connect
+     * failure.
+     */
+    public static final class V3UnavailableException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+
+        V3UnavailableException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * Dials a {@code quicraft/3} connection (docs/protocol.md 13.1): the ALPN is
+     * {@link Protocol#ALPN_V3}, the 13.13 transport parameters are in force, stream 0 begins with
+     * a {@link rs.sudoe.quicraft.core.multistream.PreambleV2} preamble, and the result is a
+     * {@link V3Connection}. {@code table} is this client's routing table for its protocol number
+     * (13.7); it is never guessed.
+     *
+     * <p>0-RTT works exactly as for {@code /2} (user decision 2026-10-16, 12.18): with an
+     * {@link EarlyFlight} whose join inputs were recorded on an earlier {@code /3} join, the
+     * {@code /3}-partitioned early token and recorded flight go out as early data (12.17).
+     *
+     * <p>Fails fast with {@link V3UnavailableException} on a native that cannot cap quiche's
+     * flow-control windows, so the caller can fall back (12.3, 13.13).
+     */
+    public static CompletableFuture<V3Connection> connectV3(InetSocketAddress remote, Fingerprint fingerprint,
+            RoutingTable table, EarlyFlight early) {
+        return connectV3(remote, fingerprint, table, early, false);
+    }
+
+    /**
+     * As {@link #connectV3(InetSocketAddress, Fingerprint, RoutingTable, EarlyFlight)}, with
+     * {@code bypassResumption} forcing a full handshake while leaving any stored ticket untouched
+     * (12.16's changed-pin re-bind).
+     */
+    public static CompletableFuture<V3Connection> connectV3(InetSocketAddress remote, Fingerprint fingerprint,
+            RoutingTable table, EarlyFlight early, boolean bypassResumption) {
+        if (table == null) {
+            throw new NullPointerException("table");
+        }
+        if (!QuicSupport.hasMaxFlowControlWindows()) {
+            CompletableFuture<V3Connection> unavailable = new CompletableFuture<V3Connection>();
+            unavailable.completeExceptionally(new V3UnavailableException(
+                    "/3 needs QUICraft's patched native that caps quiche's flow-control windows (12.3, 13.13);"
+                            + " fall back to /2 or TCP"));
+            return unavailable;
+        }
+        TransportConfig config = TransportConfig.multistream();
+        return connectV3(codec -> new Bootstrap().group(group()).channel(NioDatagramChannel.class).handler(codec)
+                .bind(0), remote, fingerprint, table, config, early, bypassResumption);
+    }
+
+    private static CompletableFuture<V3Connection> connectV3(UdpFactory udpFactory, InetSocketAddress remote,
+            Fingerprint fingerprint, RoutingTable table, TransportConfig config, EarlyFlight early,
+            boolean bypassResumption) {
+        CompletableFuture<V3Connection> result = new CompletableFuture<V3Connection>();
+        try {
+            // bypassResumption: a context cached nowhere, so the stored tickets stay untouched and
+            // the next ordinary dial still resumes (12.16).
+            Tls tls = bypassResumption ? new Tls(fingerprint, config.earlyData, Protocol.ALPN_V3)
+                    : tls(fingerprint, config, Protocol.ALPN_V3);
+            V3Dial dial = new V3Dial(fingerprint, config, table, tls);
+            String peerHost = remote.getAddress().getHostAddress();
+            int peerPort = remote.getPort();
+            ChannelHandler codec = Codecs.apply(new QuicClientCodecBuilder(), config, false)
+                    .sslEngineProvider(q -> {
+                        QuicSslEngine e = dial.tls.get().context.newEngine(q.alloc(), peerHost, peerPort);
+                        dial.engine.set(e);
+                        return e;
+                    })
+                    .build();
+            udpFactory.open(codec).addListener((ChannelFuture opened) -> {
+                if (!opened.isSuccess()) {
+                    opened.channel().close();
+                    result.completeExceptionally(opened.cause());
+                    return;
+                }
+                V3Attempt attempt = new V3Attempt(opened.channel(), remote,
+                        EarlyCache.server(remote, fingerprint, Protocol.ALPN_V3),
+                        config.earlyData && config.sessionResumption ? early : null, result, dial);
+                attempt.start();
+            });
+        } catch (Throwable t) {
+            result.completeExceptionally(t);
+        }
+        return result;
+    }
+
+    /** A client TLS context and its trust manager, for one fingerprint and one ALPN. */
     private static final class Tls {
         final QuicSslContext context;
         final FingerprintTrustManager trust;
 
-        Tls(Fingerprint fingerprint, boolean earlyData) {
+        Tls(Fingerprint fingerprint, boolean earlyData, String alpn) {
             trust = new FingerprintTrustManager(fingerprint);
             context = QuicSslContextBuilder.forClient()
                     .trustManager(trust)
                     // Trust is by fingerprint only; names mean nothing (docs/protocol.md §7).
                     .endpointIdentificationAlgorithm(null)
-                    .applicationProtocols(Protocol.ALPN)
+                    .applicationProtocols(alpn)
                     .earlyData(earlyData)
                     .build();
         }
@@ -189,14 +284,18 @@ public final class QuicClient {
     };
 
     private static Tls tls(Fingerprint fingerprint, TransportConfig config) {
+        return tls(fingerprint, config, Protocol.ALPN);
+    }
+
+    private static Tls tls(Fingerprint fingerprint, TransportConfig config, String alpn) {
         if (!config.sessionResumption) {
-            return new Tls(fingerprint, config.earlyData);
+            return new Tls(fingerprint, config.earlyData, alpn);
         }
-        List<Object> key = Arrays.<Object>asList(fingerprint, config.earlyData);
+        List<Object> key = Arrays.<Object>asList(fingerprint, config.earlyData, alpn);
         synchronized (CONTEXTS) {
             Tls tls = CONTEXTS.get(key);
             if (tls == null) {
-                tls = new Tls(fingerprint, config.earlyData);
+                tls = new Tls(fingerprint, config.earlyData, alpn);
                 CONTEXTS.put(key, tls);
             }
             return tls;
@@ -204,17 +303,22 @@ public final class QuicClient {
     }
 
     /**
-     * A new context for {@code fingerprint}, replacing the cached one: it holds no session
-     * ticket, so the next handshake is a full one. It is cached, so the ticket that handshake
-     * returns is kept. Replacing drops the tickets of every server with this fingerprint, not only
-     * the one that was abandoned (the JDK-style session cache is not per host here).
+     * A new context for {@code fingerprint} and {@code alpn}, replacing the cached one: it holds no
+     * session ticket, so the next handshake is a full one. It is cached, so the ticket that
+     * handshake returns is kept. Replacing drops the tickets of every server with this fingerprint
+     * and ALPN, not only the one that was abandoned (the JDK-style session cache is not per host
+     * here).
      */
     private static Tls freshTls(Fingerprint fingerprint, TransportConfig config) {
+        return freshTls(fingerprint, config, Protocol.ALPN);
+    }
+
+    private static Tls freshTls(Fingerprint fingerprint, TransportConfig config, String alpn) {
         if (!config.sessionResumption) {
-            return new Tls(fingerprint, config.earlyData);
+            return new Tls(fingerprint, config.earlyData, alpn);
         }
-        List<Object> key = Arrays.<Object>asList(fingerprint, config.earlyData);
-        Tls tls = new Tls(fingerprint, config.earlyData);
+        List<Object> key = Arrays.<Object>asList(fingerprint, config.earlyData, alpn);
+        Tls tls = new Tls(fingerprint, config.earlyData, alpn);
         synchronized (CONTEXTS) {
             CONTEXTS.put(key, tls);
         }
@@ -557,6 +661,320 @@ public final class QuicClient {
          * CONNECTION_CLOSE first (docs/protocol.md §8, "TCP wins after 0-RTT went out"). quiche
          * sends one only if the client has received a packet from the server; otherwise the
          * server's confirmation deadline ends that login.
+         */
+        private void abandon() {
+            QuicChannel connection = quic.get();
+            if (connection == null || early == null || !early.sent() || !connection.isOpen()) {
+                udp.close();
+                return;
+            }
+            connection.eventLoop().execute(() -> connection
+                    .close(true, Protocol.CLOSE_NORMAL, io.netty.buffer.Unpooled.EMPTY_BUFFER)
+                    // Let the close datagram leave before the socket goes.
+                    .addListener(closed -> udp.eventLoop().schedule(() -> udp.close(), 50,
+                            java.util.concurrent.TimeUnit.MILLISECONDS)));
+        }
+    }
+
+    /** One /3 attempt's TLS context and routing table, swapped on an abandoned-0-RTT retry. */
+    private static final class V3Dial {
+        final Fingerprint fingerprint;
+        final TransportConfig config;
+        final RoutingTable table;
+        final AtomicReference<Tls> tls;
+        final AtomicReference<SSLEngine> engine = new AtomicReference<SSLEngine>();
+
+        V3Dial(Fingerprint fingerprint, TransportConfig config, RoutingTable table, Tls tls) {
+            this.fingerprint = fingerprint;
+            this.config = config;
+            this.table = table;
+            this.tls = new AtomicReference<Tls>(tls);
+        }
+
+        FingerprintMismatchException mismatch() {
+            return tls.get().trust.mismatch(engine.get());
+        }
+    }
+
+    /** One /3 connect attempt over its own UDP channel; the {@link Attempt} of {@code /2} in /3 terms. */
+    private static final class V3Attempt {
+        private final Channel udp;
+        private final InetSocketAddress remote;
+        private final List<Object> server;
+        private final EarlyFlight early;
+        private final CompletableFuture<V3Connection> result;
+        private final V3Dial dial;
+        private final AtomicReference<QuicChannel> quic = new AtomicReference<QuicChannel>();
+        /** The stream the game will get, once it exists (set on the event loop). */
+        private volatile V3ConnectionImpl v3;
+        /** Set when 0-RTT data is on its way; completes with its connection, or null if that failed. */
+        private volatile CompletableFuture<V3ConnectionImpl> earlyStream;
+        /** Set when the connection that sent 0-RTT data is abandoned (docs/protocol.md §8). */
+        private volatile QuicChannel abandoned;
+        /** Set for the one retry after an abandoned connection: a full handshake, no 0-RTT. */
+        private volatile boolean retrying;
+        /** Nanos at which the first connect started; the handshake time is measured from it. */
+        private volatile long connectStart;
+
+        V3Attempt(Channel udp, InetSocketAddress remote, List<Object> server, EarlyFlight early,
+                CompletableFuture<V3Connection> result, V3Dial dial) {
+            this.udp = udp;
+            this.remote = remote;
+            this.server = server;
+            this.early = early;
+            lastEarly = early == null ? "not requested" : "no early-data event";
+            this.result = result;
+            this.dial = dial;
+        }
+
+        void start() {
+            result.whenComplete((stream, error) -> {
+                if (result.isCancelled() || error != null) {
+                    abandon();
+                }
+            });
+            if (result.isDone()) {
+                return; // cancelled while the socket opened
+            }
+            connectStart = System.nanoTime();
+            connect();
+        }
+
+        private void connect() {
+            Future<QuicChannel> connecting = QuicChannel.newBootstrap(udp)
+                    .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MILLIS)
+                    .handler(new ChannelInboundHandlerAdapter() {
+                        @Override
+                        public void handlerAdded(ChannelHandlerContext ctx) {
+                            quic.set((QuicChannel) ctx.channel());
+                        }
+
+                        @Override
+                        public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+                            if (evt instanceof SslEarlyDataReadyEvent) {
+                                sendEarly((QuicChannel) ctx.channel());
+                            }
+                            ctx.fireUserEventTriggered(evt);
+                        }
+                    })
+                    .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
+                        @Override
+                        protected void initChannel(QuicStreamChannel stream) {
+                            if (stream.isLocalCreated()) {
+                                return; // stream 0 is created with its own handler below
+                            }
+                            // A server-created stream: only stream 1 (WORLD) is allowed (13.3).
+                            V3ConnectionImpl current = v3;
+                            if (current == null || stream.streamId() != 1) {
+                                Codecs.closeLater(stream.parent(), true,
+                                        MultistreamProtocolException.CLOSE_ORDERING);
+                                return;
+                            }
+                            current.acceptPeerStream(stream);
+                        }
+                    })
+                    .remoteAddress(remote)
+                    .connect();
+            connecting.addListener(f -> {
+                if (!f.isSuccess()) {
+                    Throwable cause = f.cause();
+                    FingerprintMismatchException wrongCertificate = dial.mismatch();
+                    if (wrongCertificate != null) {
+                        wrongCertificate.addSuppressed(cause);
+                        cause = wrongCertificate;
+                    }
+                    result.completeExceptionally(cause);
+                    return;
+                }
+                long handshake = System.nanoTime() - connectStart;
+                QuicChannel connection = (QuicChannel) f.getNow();
+                // The abandoned connection shares the socket with the retry: it must not close it.
+                connection.closeFuture().addListener(closed -> {
+                    if (connection != abandoned) {
+                        udp.close();
+                    }
+                });
+                if (result.isDone()) {
+                    Codecs.closeLater(connection, true, Protocol.CLOSE_NORMAL);
+                    return;
+                }
+                CompletableFuture<V3ConnectionImpl> sent = earlyStream;
+                if (sent == null) {
+                    openStream(connection);
+                } else {
+                    sent.whenComplete((stream, error) -> connection.eventLoop().execute(() -> {
+                        if (stream == null) {
+                            openStream(connection);
+                        } else {
+                            awaitPreamble(connection, stream, handshake);
+                        }
+                    }));
+                }
+            });
+        }
+
+        /**
+         * The handshake completed with 0-RTT data out. The connection goes to the game as soon as
+         * the server's preamble is read. If it is still missing after a grace period, the 0-RTT was
+         * rejected (or lost): the connection is abandoned and the attempt retried, without the game
+         * seeing it (docs/protocol.md §8, "Rejected 0-RTT"). On the connection's event loop.
+         */
+        private void awaitPreamble(QuicChannel connection, V3ConnectionImpl stream, long handshakeNanos) {
+            if (stream.preambleRead() || !connection.isOpen()) {
+                deliver(stream);
+                return;
+            }
+            long grace = Math.max(Math.max(MIN_GRACE_NANOS, testGraceFloorNanos),
+                    Math.min(MAX_GRACE_NANOS, handshakeNanos / 4));
+            boolean[] settled = new boolean[1]; // event loop only
+            ScheduledFuture<?> timer = connection.eventLoop().schedule(() -> {
+                if (settled[0]) {
+                    return;
+                }
+                settled[0] = true;
+                if (stream.preambleRead() || !connection.isOpen() || result.isDone()) {
+                    deliver(stream);
+                } else {
+                    abandonEarly(connection);
+                }
+            }, grace, TimeUnit.NANOSECONDS);
+            stream.whenPreambleRead(() -> {
+                if (settled[0]) {
+                    return;
+                }
+                settled[0] = true;
+                timer.cancel(false);
+                // After the read that completed the preamble has finished with its data.
+                connection.eventLoop().execute(() -> deliver(stream));
+            });
+        }
+
+        private void deliver(V3ConnectionImpl stream) {
+            if (!result.complete(stream)) {
+                stream.close(); // cancelled meanwhile
+            }
+        }
+
+        /**
+         * Closes the connection that sent 0-RTT data with {@code 0x4} and connects again over the
+         * same socket: a full handshake with a context that holds no session for this server. Its
+         * failure is the attempt's failure. Only one retry.
+         */
+        private void abandonEarly(QuicChannel connection) {
+            try {
+                abandoned = connection;
+                retrying = true;
+                lastEarly = "sent, then abandoned: no server preamble within the grace period";
+                earlyStream = null;
+                dial.tls.set(freshTls(dial.fingerprint, dial.config, Protocol.ALPN_V3));
+                Codecs.closeLater(connection, true, Protocol.CLOSE_EARLY_ABANDONED);
+                connect();
+            } catch (Throwable t) {
+                // Fails the attempt as usual: the race falls back to TCP (docs/protocol.md §5).
+                result.completeExceptionally(t);
+            }
+        }
+
+        /**
+         * The TLS session allows early data (a resumed session): sends the v2 preamble with this
+         * server's {@code /3} early token and the recorded first flight as 0-RTT data, if both are
+         * there (docs/protocol.md §8, 12.17). Any failure leaves the attempt as it would be without
+         * 0-RTT.
+         */
+        private void sendEarly(QuicChannel connection) {
+            if (early == null || retrying || result.isDone() || earlyStream != null) {
+                lastEarly = early == null ? "not requested" : retrying ? "retrying" : result.isDone()
+                        ? "attempt already done" : "already sent";
+                return;
+            }
+            byte[] flight;
+            byte[] token;
+            try {
+                Faults.check(Faults.EARLY_SEND);
+                EarlyCache cache = EarlyCache.INSTANCE;
+                flight = cache.flight(server, early.joinInputs());
+                if (flight == null || !cache.hasToken(server)) {
+                    lastEarly = flight == null ? "no recorded flight" : "no early token";
+                    return;
+                }
+                token = cache.takeToken(server);
+                if (token == null) {
+                    lastEarly = "no early token";
+                    return;
+                }
+            } catch (Throwable t) {
+                lastEarly = "skipped: " + t;
+                LOG.log(Level.FINE, "0-RTT skipped", t);
+                return;
+            }
+            CompletableFuture<V3ConnectionImpl> sent = new CompletableFuture<V3ConnectionImpl>();
+            earlyStream = sent;
+            // Netty fires this event inside its own send; a stream written from here would only go
+            // out with the next flight, a round trip later. A task runs right after that send.
+            connection.eventLoop().execute(() -> connection.createStream(QuicStreamType.BIDIRECTIONAL,
+                    new ChannelInboundHandlerAdapter()).addListener(s -> {
+                        if (!s.isSuccess()) {
+                            LOG.log(Level.FINE, "0-RTT stream failed", s.cause());
+                            sent.complete(null);
+                            return;
+                        }
+                        try {
+                            QuicStreamChannel channel = (QuicStreamChannel) s.getNow();
+                            NettyQuicByteStream raw = new NettyQuicByteStream(channel);
+                            byte[] preamble = PreambleV2.encode(token);
+                            ByteBuffer out = ByteBuffer.allocate(preamble.length + flight.length);
+                            out.put(preamble).put(flight).flip();
+                            V3ConnectionImpl stream = V3ConnectionImpl.client(connection, channel, raw,
+                                    EarlyCache.INSTANCE, server, early.joinInputs(), flight, dial.table, false);
+                            v3 = stream;
+                            stream.start();
+                            raw.write(out);
+                            raw.flush();
+                            early.markSent();
+                            lastEarly = "sent";
+                            sent.complete(stream);
+                            try {
+                                Faults.check(Faults.EARLY_ABANDON);
+                            } catch (Throwable t) {
+                                result.completeExceptionally(t);
+                            }
+                        } catch (Throwable t) {
+                            LOG.log(Level.FINE, "0-RTT send failed", t);
+                            Codecs.closeLater(connection, true, Protocol.CLOSE_INTERNAL_ERROR);
+                            sent.complete(null);
+                        }
+                    }));
+        }
+
+        private void openStream(QuicChannel connection) {
+            connection.createStream(QuicStreamType.BIDIRECTIONAL, new ChannelInboundHandlerAdapter())
+                    .addListener(s -> {
+                        if (!s.isSuccess()) {
+                            Codecs.closeLater(connection, true, Protocol.CLOSE_INTERNAL_ERROR);
+                            result.completeExceptionally(s.cause());
+                            return;
+                        }
+                        QuicStreamChannel channel = (QuicStreamChannel) s.getNow();
+                        NettyQuicByteStream raw = new NettyQuicByteStream(channel);
+                        // The connect future is done, so this connection's handshake is complete.
+                        V3ConnectionImpl stream = V3ConnectionImpl.client(connection, channel, raw,
+                                EarlyCache.INSTANCE, server, early == null ? null : early.joinInputs(), null,
+                                dial.table, true);
+                        v3 = stream;
+                        stream.start();
+                        raw.write(ByteBuffer.wrap(PreambleV2.encode(null)));
+                        raw.flush();
+                        if (!result.complete(stream)) {
+                            stream.close(); // cancelled meanwhile
+                        }
+                    });
+        }
+
+        /**
+         * The attempt failed or lost the race. Usually closing the socket is enough: that
+         * force-closes the QUIC channel and fails the connect. After 0-RTT data the server may have
+         * started a login on it, so it gets a CONNECTION_CLOSE first (docs/protocol.md §8, "TCP wins
+         * after 0-RTT went out").
          */
         private void abandon() {
             QuicChannel connection = quic.get();
