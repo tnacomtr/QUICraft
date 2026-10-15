@@ -44,7 +44,11 @@ public abstract class ReceiveBudget {
         }
     };
 
-    private ReceiveBudget() {}
+    /**
+     * Abstract: construct with {@link #unlimited()} or {@link #bounded(long)}. Package-private so a
+     * test can supply a budget that records or deviates from the accounting.
+     */
+    ReceiveBudget() {}
 
     /** The budget that admits every reservation; {@link #reserved()} stays zero. */
     public static ReceiveBudget unlimited() {

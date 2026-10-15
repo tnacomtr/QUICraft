@@ -500,13 +500,23 @@ public final class LaneSession {
             tick.cancel(false);
             tick = null;
         }
+        // 13.12: every release must run even if one of them fails. A throw here would skip the
+        // rest, leaking this connection's node reservations to a budget every other connection
+        // shares, so each is guarded on its own.
         for (LaneStream s : streams) {
             if (s != null) {
-                s.releaseInbound();
+                try {
+                    s.releaseInbound();
+                } catch (Throwable t) {
+                    LOG.log(Level.FINE, "releasing a lane's chunks failed", t);
+                }
             }
         }
-        // Nothing this connection retained may stay charged to the node budget (13.12).
-        receiver.releaseAll();
+        try {
+            receiver.releaseAll();
+        } catch (Throwable t) {
+            LOG.log(Level.FINE, "releasing the receive budgets failed", t);
+        }
         for (ArrayDeque<byte[]> q : out) {
             q.clear();
         }
@@ -555,6 +565,16 @@ public final class LaneSession {
         controlChannel.pipeline().addFirst(control);
         takeOverStreamZero(control);
         if (leftover != null) {
+            // 13.12: the leftover is a read chunk like any other, charged to the node budget while
+            // it is held and released when it is consumed. If the node cannot carry bytes that
+            // already arrived, this one connection closes; another connection's data is never
+            // evicted.
+            try {
+                chargeChunk(leftover.readableBytes());
+            } catch (Throwable t) {
+                leftover.release();
+                throw t;
+            }
             control.inbound.add(leftover);
         }
         Lane mine = role == Role.CLIENT ? Lane.REALTIME : Lane.WORLD;

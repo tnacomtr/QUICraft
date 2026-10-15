@@ -304,6 +304,73 @@ class LaneSessionTest {
     }
 
     @Test
+    void theActivationLeftoverIsChargedAndReleasedWithTheNodeBudget() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(3L << 20);
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        config.clientSession = false;
+        try (LaneRig rig = LaneRig.start(config)) {
+            // One byte of a two-byte record length: it stays buffered as an incomplete record.
+            rig.activate(rig.server, java.nio.ByteBuffer.wrap(new byte[] {(byte) 0x85}));
+            assertTrue(LaneRig.await(() -> {
+                try {
+                    return LaneRig.snapshot(rig.server)[0] == 1;
+                } catch (Exception e) {
+                    return false;
+                }
+            }, 10000), "the leftover starts an incomplete record");
+            // The leftover chunk was consumed and released, and the record it started is still
+            // charged. Releasing bytes that were never charged would leave the counter short.
+            assertTrue(LaneRig.await(() -> node.reserved() == 1, 10000),
+                    "exactly the held parser buffer stays reserved: " + node.reserved());
+        }
+        assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
+                "closing releases every charge: " + node.reserved());
+    }
+
+    @Test
+    void theSessionStillClosesWhenReleasingItsNodeBudgetFails() throws Exception {
+        // A budget whose releases always fail, as broken or exhausted accounting would. The
+        // failure lands inside shutdown, which must still finish and tell the game that the
+        // connection ended instead of letting the exception escape.
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = new FailingReleaseBudget(ReceiveBudget.bounded(3L << 20));
+        config.clientSession = false;
+        LaneRig rig = LaneRig.start(config);
+        try {
+            rig.activate(rig.server, java.nio.ByteBuffer.wrap(new byte[] {(byte) 0x85}));
+            assertTrue(LaneRig.await(() -> rig.serverGame.closed.isDone(), 10000),
+                    "a failing release must not swallow the close notification");
+        } finally {
+            rig.close();
+        }
+    }
+
+    /** Delegates every reservation but throws on every release, as a broken budget would. */
+    private static final class FailingReleaseBudget extends ReceiveBudget {
+        private final ReceiveBudget delegate;
+
+        FailingReleaseBudget(ReceiveBudget delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public boolean tryReserve(long bytes) {
+            return delegate.tryReserve(bytes);
+        }
+
+        @Override
+        public void release(long bytes) {
+            throw new IllegalStateException("release " + bytes + " fails");
+        }
+
+        @Override
+        public long reserved() {
+            return delegate.reserved();
+        }
+    }
+
+    @Test
     void anIncompleteRecordIsChargedAtItsFirstByteAndTimesOutWith0x11() throws Exception {
         AtomicLong clock = new AtomicLong(5_000_000_000L);
         LaneRig.Config config = new LaneRig.Config();
