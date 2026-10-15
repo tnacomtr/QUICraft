@@ -34,6 +34,8 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Protocol;
+import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 /**
@@ -192,7 +194,21 @@ public final class QuicServer implements Closeable {
     /** Binds {@code address} and runs QUIC on core's own thread, one UDP socket. */
     public static QuicServer bind(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
             StreamAcceptor acceptor) throws Exception {
-        return bind(address, 1, identity, config, acceptor);
+        return bind(address, identity, config, acceptor, null);
+    }
+
+    /**
+     * As {@link #bind(InetSocketAddress, ServerIdentity, TransportConfig, StreamAcceptor)}, for a
+     * {@code /3} listener (13.1): the QUIC ALPN is {@link Protocol#ALPN_V3} and the 13.13
+     * transport parameters are in force. {@code v3} null is exactly the {@code /2} listener above;
+     * there is no dual listener, so a {@code /2}-only client fails the ALPN and falls back (13.1).
+     *
+     * <p>On a native that cannot cap quiche's flow-control windows this logs one INFO line and
+     * binds the plain {@code /2} listener instead (12.3, 13.13).
+     */
+    public static QuicServer bind(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
+            StreamAcceptor acceptor, V3Listener v3) throws Exception {
+        return bind(address, 1, identity, config, acceptor, v3);
     }
 
     /**
@@ -214,6 +230,16 @@ public final class QuicServer implements Closeable {
      */
     public static QuicServer bind(InetSocketAddress address, int socketCount, ServerIdentity identity,
             TransportConfig config, StreamAcceptor acceptor) throws Exception {
+        return bind(address, socketCount, identity, config, acceptor, null);
+    }
+
+    /** As the {@code socketCount} bind above, for a {@code /3} listener (13.1) or a {@code /2} one. */
+    public static QuicServer bind(InetSocketAddress address, int socketCount, ServerIdentity identity,
+            TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested) throws Exception {
+        V3Listener v3 = enableV3(v3Requested);
+        if (v3 != null) {
+            config = TransportConfig.multistream();
+        }
         int count = socketCount;
         if (count > MAX_UDP_SOCKETS) {
             if (SOCKET_COUNT_WARNING.compareAndSet(false, true)) {
@@ -228,7 +254,7 @@ public final class QuicServer implements Closeable {
             count = 1;
         }
         if (count <= 1) {
-            Shared shared = new Shared(1, identity, config, acceptor);
+            Shared shared = new Shared(1, identity, config, acceptor, v3);
             EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
             try {
                 Channel channel = new Bootstrap().group(group).channel(NioDatagramChannel.class)
@@ -251,9 +277,9 @@ public final class QuicServer implements Closeable {
         ChannelOption<Boolean> reusePort = ReusePort.OPTION;
         if (reusePort == null || !ReusePort.SUPPORTED) {
             LOG.info("SO_REUSEPORT is unavailable here; binding one UDP socket instead of " + count);
-            return bind(address, identity, config, acceptor);
+            return bind(address, identity, config, acceptor, v3);
         }
-        Shared shared = new Shared(count, identity, config, acceptor);
+        Shared shared = new Shared(count, identity, config, acceptor, v3);
         SocketDispatcher dispatcher = new SocketDispatcher(shared, count);
         EventLoopGroup group = Codecs.newGroup("quicraft-server", count);
         List<Channel> channels = new ArrayList<>(count);
@@ -291,7 +317,14 @@ public final class QuicServer implements Closeable {
     public static QuicServer bind(HostLoop loop, HostDatagramSocket socket, ServerIdentity identity,
             TransportConfig config, StreamAcceptor acceptor) throws Exception {
         return bind(java.util.Collections.singletonList(loop), java.util.Collections.singletonList(socket),
-                identity, config, acceptor);
+                identity, config, acceptor, null);
+    }
+
+    /** Hosted, for a {@code /3} listener (13.1) or a {@code /2} one; see the two binds above. */
+    public static QuicServer bind(HostLoop loop, HostDatagramSocket socket, ServerIdentity identity,
+            TransportConfig config, StreamAcceptor acceptor, V3Listener v3) throws Exception {
+        return bind(java.util.Collections.singletonList(loop), java.util.Collections.singletonList(socket),
+                identity, config, acceptor, v3);
     }
 
     /**
@@ -304,11 +337,21 @@ public final class QuicServer implements Closeable {
      */
     public static QuicServer bind(List<HostLoop> loops, List<HostDatagramSocket> sockets, ServerIdentity identity,
             TransportConfig config, StreamAcceptor acceptor) throws Exception {
+        return bind(loops, sockets, identity, config, acceptor, null);
+    }
+
+    /** As the hosted bind above, for a {@code /3} listener (13.1) or a {@code /2} one. */
+    public static QuicServer bind(List<HostLoop> loops, List<HostDatagramSocket> sockets, ServerIdentity identity,
+            TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested) throws Exception {
+        V3Listener v3 = enableV3(v3Requested);
+        if (v3 != null) {
+            config = TransportConfig.multistream();
+        }
         if (sockets.isEmpty() || loops.size() != sockets.size()) {
             throw new IllegalArgumentException("one loop per socket and at least one socket are required, got "
                     + loops.size() + " loops and " + sockets.size() + " sockets");
         }
-        Shared shared = new Shared(sockets.size(), identity, config, acceptor);
+        Shared shared = new Shared(sockets.size(), identity, config, acceptor, v3);
         SocketDispatcher dispatcher = sockets.size() > 1 ? new SocketDispatcher(shared, sockets.size()) : null;
         List<Channel> channels = new ArrayList<>(sockets.size());
         boolean inLoop = false;
@@ -372,6 +415,29 @@ public final class QuicServer implements Closeable {
                 config.maxOpenPerIp, config.retryThresholdPerSecond, config.maxTrackedIps);
     }
 
+    /** Set once so a native without the 13.13 window caps logs one INFO line, not one per bind. */
+    private static final java.util.concurrent.atomic.AtomicBoolean V3_NATIVE_WARNING =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Whether this listener can run {@code /3} (13.13): the loaded native must cap quiche's
+     * flow-control windows. Without it {@code v3} null is returned, so the bind falls back to the
+     * plain {@code /2} listener, one INFO line logged per JVM (12.3), never a half-enabled one.
+     */
+    private static V3Listener enableV3(V3Listener v3) {
+        if (v3 == null) {
+            return null;
+        }
+        if (QuicSupport.hasMaxFlowControlWindows()) {
+            return v3;
+        }
+        if (V3_NATIVE_WARNING.compareAndSet(false, true)) {
+            LOG.info("QUIC native cannot cap quiche's flow-control windows; /3 is unavailable and this"
+                    + " listener runs as a plain /2 listener (12.3, 13.13)");
+        }
+        return null;
+    }
+
     /** Deadline for a connection passed early to complete its handshake. Tests shorten it. */
     static volatile long confirmMillis = 10_000;
 
@@ -390,6 +456,8 @@ public final class QuicServer implements Closeable {
     private static final class Shared {
         final TransportConfig config;
         final StreamAcceptor acceptor;
+        /** Null for a {@code /2} listener; non-null enables the {@code /3} listener (13.1). */
+        final V3Listener v3;
         final Unconfirmed unconfirmed = new Unconfirmed();
         final java.util.concurrent.atomic.AtomicLong retries = new java.util.concurrent.atomic.AtomicLong();
         /** Token-less attempts and open-connection leases; synchronized, safe from every loop. */
@@ -414,10 +482,11 @@ public final class QuicServer implements Closeable {
          */
         final AtomicIntegerArray droppedMalformed;
 
-        Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor)
+        Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor, V3Listener v3)
                 throws Exception {
             this.config = config;
             this.acceptor = acceptor;
+            this.v3 = v3;
             this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.droppedForwards = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.droppedMalformed = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
@@ -440,7 +509,8 @@ public final class QuicServer implements Closeable {
             this.tokenHandler = new AdmissionTokenHandler(admission, validated, config.retryMode, retries);
             this.ssl = QuicSslContextBuilder
                     .forServer(identity.privateKey(), null, identity.certificate())
-                    .applicationProtocols(Protocol.ALPN)
+                    // A /3 listener is /3-only: a /2 client fails the ALPN and falls back to TCP.
+                    .applicationProtocols(v3 != null ? Protocol.ALPN_V3 : Protocol.ALPN)
                     .earlyData(config.earlyData)
                     .build();
         }
@@ -841,7 +911,7 @@ public final class QuicServer implements Closeable {
                         }
                         connection.pipeline().addLast(admitted,
                                 new Connection(shared.acceptor, shared.tokens, shared.config.earlyData,
-                                        shared.unconfirmed));
+                                        shared.unconfirmed, shared.v3));
                     }
                 })
                 .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
@@ -854,6 +924,16 @@ public final class QuicServer implements Closeable {
                         if (connection == null || stream.type() != QuicStreamType.BIDIRECTIONAL
                                 || stream.isLocalCreated()) {
                             Codecs.closeLater(stream.parent(), true, Protocol.CLOSE_PROTOCOL_VIOLATION);
+                            return;
+                        }
+                        if (shared.v3 != null) {
+                            // /3 (13.3): stream 0 is CONTROL, the client's stream 4 is REALTIME, and
+                            // any other stream is fatal 0x11.
+                            if (stream.streamId() == 0) {
+                                connection.offerV3(stream);
+                            } else {
+                                connection.acceptV3(stream);
+                            }
                             return;
                         }
                         connection.offer(new NettyQuicByteStream(stream));
@@ -1057,16 +1137,23 @@ public final class QuicServer implements Closeable {
         private final EarlyTokens tokens;
         private final boolean earlyData;
         private final Unconfirmed unconfirmed;
+        /** Non-null enables the {@code /3} stream map of 13.3 on this connection (13.1). */
+        private final V3Listener v3;
         private final List<ServerStream> waiting = new ArrayList<>(1);
+        private final List<V3ConnectionImpl> waitingV3 = new ArrayList<>(1);
+        /** The /3 connection of stream 0, if one was offered. */
+        private V3ConnectionImpl v3Connection;
         private ChannelHandlerContext ctx;
         private boolean handshakeDone;
         private java.util.concurrent.ScheduledFuture<?> confirmDeadline;
 
-        Connection(StreamAcceptor acceptor, EarlyTokens tokens, boolean earlyData, Unconfirmed unconfirmed) {
+        Connection(StreamAcceptor acceptor, EarlyTokens tokens, boolean earlyData, Unconfirmed unconfirmed,
+                V3Listener v3) {
             this.acceptor = acceptor;
             this.tokens = tokens;
             this.earlyData = earlyData;
             this.unconfirmed = unconfirmed;
+            this.v3 = v3;
         }
 
         @Override
@@ -1077,6 +1164,32 @@ public final class QuicServer implements Closeable {
         /** Called on the connection's event loop. The stream reads the client's preamble first. */
         void offer(NettyQuicByteStream stream) {
             new ServerStream(stream, this::onPreamble).start();
+        }
+
+        /**
+         * The {@code /3} stream 0 (13.2, 13.3): its v2 preamble is read first, and the connection
+         * is delivered like a {@code /2} stream once the handshake completed or the token redeemed.
+         * Called from the stream handler's {@code initChannel}, on the event loop.
+         */
+        void offerV3(QuicStreamChannel control) {
+            V3ConnectionImpl connection = V3ConnectionImpl.server((QuicChannel) ctx.channel(), control,
+                    new NettyQuicByteStream(control), v3, this::onPreambleV3, handshakeDone);
+            v3Connection = connection;
+            connection.start();
+        }
+
+        /**
+         * A client stream other than stream 0: exactly stream 4 is allowed, and only after this
+         * server's activation (13.3). Called from the stream handler's {@code initChannel}.
+         */
+        void acceptV3(QuicStreamChannel stream) {
+            V3ConnectionImpl connection = v3Connection;
+            if (connection == null) {
+                // No stream 0 on this connection: nothing may carry lane traffic.
+                Codecs.closeLater(stream.parent(), true, MultistreamProtocolException.CLOSE_ORDERING);
+                return;
+            }
+            connection.acceptPeerStream(stream);
         }
 
         private void onPreamble(ServerStream stream, byte[] token) {
@@ -1109,6 +1222,56 @@ public final class QuicServer implements Closeable {
             }
         }
 
+        /** The {@code /3} counterpart of {@link #onPreamble}, with the same token and handshake rules. */
+        private void onPreambleV3(V3ConnectionImpl connection, byte[] token) {
+            boolean redeemed = false;
+            if (token != null) {
+                try {
+                    rs.sudoe.quicraft.core.Faults.check(rs.sudoe.quicraft.core.Faults.EARLY_TOKEN_REDEEM);
+                    redeemed = tokens.redeem(token);
+                } catch (Throwable t) {
+                    LOG.log(Level.FINE, "early token check failed; the stream waits for the handshake", t);
+                }
+            }
+            if (handshakeDone) {
+                deliverV3(connection);
+            } else if (redeemed && earlyData) {
+                QuicChannel early = (QuicChannel) ctx.channel();
+                Unconfirmed.Entry entry = unconfirmed.add(early, connection.remoteAddress());
+                connection.readEarlyName(name -> entry.name = name);
+                deliverV3(connection);
+                if (confirmDeadline == null) {
+                    QuicChannel channel = early;
+                    confirmDeadline = ctx.executor().schedule(() -> {
+                        if (!handshakeDone) {
+                            Codecs.closeLater(channel, true, Protocol.CLOSE_EARLY_UNCONFIRMED);
+                        }
+                    }, confirmMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+                }
+            } else {
+                waitingV3.add(connection);
+            }
+        }
+
+        /** The {@code /3} counterpart of {@link #deliver}: the v2 preamble, then the acceptor, then the gate. */
+        private void deliverV3(V3ConnectionImpl connection) {
+            byte[] next = null;
+            try {
+                rs.sudoe.quicraft.core.Faults.check(rs.sudoe.quicraft.core.Faults.EARLY_TOKEN_ISSUE);
+                next = earlyData ? tokens.issue() : null;
+            } catch (Throwable t) {
+                LOG.log(Level.FINE, "issuing an early token failed; none this time", t);
+            }
+            try {
+                connection.writePreamble(next);
+                acceptor.accept(connection);
+                connection.openGate();
+            } catch (Throwable t) {
+                LOG.log(Level.WARNING, "QUIC stream acceptor failed; closing the connection", t);
+                connection.close();
+            }
+        }
+
         @Override
         public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
             if (evt instanceof QuicConnectionCloseEvent) {
@@ -1129,6 +1292,10 @@ public final class QuicServer implements Closeable {
                         deliver(stream);
                     }
                     waiting.clear();
+                    for (V3ConnectionImpl connection : waitingV3) {
+                        deliverV3(connection);
+                    }
+                    waitingV3.clear();
                 } else {
                     ctx.close();
                 }
