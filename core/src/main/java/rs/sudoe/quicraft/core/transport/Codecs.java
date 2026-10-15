@@ -38,6 +38,20 @@ final class Codecs {
             maxStreams = server ? TransportConfig.MULTISTREAM_SERVER_MAX_STREAMS_BIDI
                     : TransportConfig.MULTISTREAM_CLIENT_MAX_STREAMS_BIDI;
         }
+        if (config.multistream) {
+            if (!QuicSupport.hasMaxFlowControlWindows()) {
+                throw new IllegalStateException("/3 needs the patched native that caps flow-control windows");
+            }
+            if (server) {
+                // Equal to the initial serverbound windows: quiche clamps every window to its
+                // maximum, so auto-growth is off and the exposure is the credit the node reserved.
+                builder.maxConnectionWindow(TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA);
+                builder.maxStreamWindow(TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA);
+            } else {
+                builder.maxConnectionWindow(TransportConfig.MULTISTREAM_MAX_CONNECTION_WINDOW);
+                builder.maxStreamWindow(TransportConfig.MULTISTREAM_MAX_STREAM_WINDOW);
+            }
+        }
         B configured = builder
                 .maxIdleTimeout(config.maxIdleTimeoutMillis, TimeUnit.MILLISECONDS)
                 .initialMaxData(maxData)

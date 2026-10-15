@@ -51,4 +51,36 @@ class MultistreamTransportConfigTest {
                     "a second server stream exceeds initial_max_streams_bidi=1");
         }
     }
+
+    private static Object field(Object target, String name) throws Exception {
+        Class<?> type = target.getClass();
+        while (type != null) {
+            try {
+                java.lang.reflect.Field f = type.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(target);
+            } catch (NoSuchFieldException next) {
+                type = type.getSuperclass();
+            }
+        }
+        throw new NoSuchFieldException(name);
+    }
+
+    @Test
+    void theWindowMaximaReachTheCodecBuildersOrMultistreamIsRefused() throws Exception {
+        boolean expected = Boolean.parseBoolean(System.getProperty("quicraft.test.expectKeyingMaterialExport"));
+        assertEquals(expected, QuicSupport.hasMaxFlowControlWindows());
+        if (!expected) {
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, TransportConfig::multistream);
+            return;
+        }
+        TransportConfig config = TransportConfig.multistream();
+        Object server = Codecs.apply(new io.netty.handler.codec.quic.QuicServerCodecBuilder(), config, true);
+        // The server's maxima equal its initial serverbound windows: quiche's auto-growth is off.
+        assertEquals(256L << 10, field(server, "maxConnectionWindow"));
+        assertEquals(8L << 10, field(server, "maxStreamWindow"));
+        Object client = Codecs.apply(new io.netty.handler.codec.quic.QuicClientCodecBuilder(), config, false);
+        assertEquals(17L << 20, field(client, "maxConnectionWindow"));
+        assertEquals(4L << 20, field(client, "maxStreamWindow"));
+    }
 }

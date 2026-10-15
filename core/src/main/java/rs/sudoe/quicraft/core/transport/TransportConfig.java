@@ -40,12 +40,12 @@ public final class TransportConfig {
     /** /3: the client lets the server open stream 1. */
     public static final int MULTISTREAM_CLIENT_MAX_STREAMS_BIDI = 1;
     /**
-     * /3 (13.13): the largest auto-tuned stream window quiche may grow to. Not applied yet: it needs
-     * QuicCodecBuilder.maxStreamWindow from the patched Netty (quicraft5); the integration step
-     * calls it with this value, and /3 must not be enabled before then.
+     * /3 (13.13): the largest auto-tuned stream window quiche may grow to at the client. The server
+     * pins both maxima to its initial serverbound windows. Applied by Codecs, which refuses /3
+     * when the native cannot set them.
      */
     public static final long MULTISTREAM_MAX_STREAM_WINDOW = 4L << 20;
-    /** /3 (13.13): the largest auto-tuned connection window; applied with the one above. */
+    /** /3 (13.13): the largest auto-tuned connection window at the client. */
     public static final long MULTISTREAM_MAX_CONNECTION_WINDOW = 17L << 20;
 
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -128,6 +128,9 @@ public final class TransportConfig {
      * flow-control limits and stream counts only; the /2 default is unchanged.
      */
     public static TransportConfig multistream() {
+        if (!rs.sudoe.quicraft.core.QuicSupport.hasMaxFlowControlWindows()) {
+            throw new IllegalStateException("/3 needs the patched native that caps flow-control windows");
+        }
         return builder().multistream(true).build();
     }
 
