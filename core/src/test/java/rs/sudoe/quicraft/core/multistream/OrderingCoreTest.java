@@ -356,4 +356,31 @@ class OrderingCoreTest {
         ref[0].offer(e(C,1,0,0,0),0);
         assertEquals(1,max[0]); assertArrayEquals(new long[]{1,960,0},ref[0].delivered());
     }
+
+    @Test void decodedOutputMustBeEligibleAndRemainsBudgetedUntilApplied() {
+        Harness h = new Harness(); Envelope a=e(R,1,1,0,0);
+        h.scheduler.offer(a,0);
+        fails(() -> h.scheduler.retainDecoded(a,1,1,0));
+        h.offer(e(C,1,0,0,0));
+        // offer() drained a too, so test the outstanding phase in a separate harness.
+        Harness outstanding = new Harness(); Envelope b=e(R,1,0,0,0);
+        outstanding.scheduler.offer(b,0);
+        outstanding.scheduler.retainDecoded(b,8*1024*1024,8*1024*1024,0);
+        assertEquals(34+8L*1024*1024,outstanding.scheduler.pendingBytes());
+        fails(() -> outstanding.scheduler.retainDecoded(b,1,8*1024*1024+1,0));
+        fails(() -> outstanding.scheduler.retainDecoded(b,16L*1024*1024,1,0));
+        assertEquals(34+8L*1024*1024,outstanding.scheduler.pendingBytes());
+        outstanding.drain(0); assertEquals(0,outstanding.scheduler.pendingBytes());
+    }
+
+    @Test void decodedBundleMembersShareTheEightMiBCap() {
+        Harness h = new Harness();
+        Envelope a=marked(2,Envelope.Bundle.MEMBER), b=marked(3,Envelope.Bundle.MEMBER);
+        h.scheduler.offer(marked(1,Envelope.Bundle.OPEN),0);
+        h.scheduler.offer(a,0); h.scheduler.offer(b,0);
+        h.scheduler.offer(marked(4,Envelope.Bundle.CLOSE),0);
+        h.scheduler.retainDecoded(a,8*1024*1024,8*1024*1024,0);
+        fails(() -> h.scheduler.retainDecoded(b,1,1,0));
+        assertArrayEquals(new long[3],h.scheduler.delivered());
+    }
 }

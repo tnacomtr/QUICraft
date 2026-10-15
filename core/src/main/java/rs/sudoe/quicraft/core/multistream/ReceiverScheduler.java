@@ -41,8 +41,8 @@ public final class ReceiverScheduler {
     }
     private static final class Entry {
         final Envelope envelope;
-        final long bytes;
-        final int uncompressed;
+        long bytes;
+        int uncompressed;
         long headSince;
         boolean head;
         Entry(Envelope envelope, long bytes, int uncompressed) {
@@ -204,6 +204,32 @@ public final class ReceiverScheduler {
                 if (outstanding != null) break;
             }
         } finally { pumping = false; }
+    }
+    /** Debit before allocating decoding output, only for an eligible outstanding record.
+     * additionalRetainedBytes counts allocations still retained alongside the original bytes;
+     * totalUncompressedBytes replaces the earlier size estimate, and obeys the packet/bundle cap.
+     * All debits are released on applied(), never on callback return.
+     */
+    public void retainDecoded(Envelope envelope, long additionalRetainedBytes,
+                              int totalUncompressedBytes, long now) {
+        checkDeadlines(now);
+        if (outstanding == null || !outstanding.records().contains(envelope)
+                || totalUncompressedBytes < 0 || totalUncompressedBytes > 8 * 1024 * 1024)
+            throw new OrderingException("ineligible/oversized decode");
+        Entry target = null;
+        long bundleSize = 0;
+        boolean bundle = outstanding.records().size() > 1;
+        for (Entry entry : queues.get(envelope.lane().ordinal())) {
+            if (!outstanding.records().contains(entry.envelope)) break;
+            if (entry.envelope == envelope) target = entry;
+            if (entry.envelope.bundle() == Envelope.Bundle.MEMBER)
+                bundleSize += entry.envelope == envelope ? totalUncompressedBytes : entry.uncompressed;
+        }
+        if (target == null || (bundle && bundleSize > 8L * 1024 * 1024))
+            throw new OrderingException("decoded bundle bounds");
+        budget(envelope.lane(), additionalRetainedBytes, 0);
+        target.bytes += additionalRetainedBytes; target.uncompressed = totalUncompressedBytes;
+        account(envelope.lane(), additionalRetainedBytes, 0);
     }
     public void applied(Lane lane, long sequence, long now) {
         checkDeadlines(now);
