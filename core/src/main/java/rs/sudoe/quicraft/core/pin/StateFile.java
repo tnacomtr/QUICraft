@@ -4,8 +4,10 @@ package rs.sudoe.quicraft.core.pin;
 import java.io.IOException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -55,11 +57,17 @@ final class StateFile {
     /**
      * The content of {@code file}, at most {@code maxBytes} long.
      *
-     * @throws IOException when the file cannot be read or is larger than {@code maxBytes}
+     * @throws NoSuchFileException when the file is not there, the only failure a caller that treats
+     *     a missing state as empty may swallow
+     * @throws IOException when the path is not a regular file (a directory, say), cannot be read
+     *     (permissions, I/O) or is larger than {@code maxBytes}
      */
     static byte[] read(Path file, long maxBytes) throws IOException {
-        long size = Files.size(file);
-        if (size > maxBytes) {
+        BasicFileAttributes attributes = Files.readAttributes(file, BasicFileAttributes.class);
+        if (!attributes.isRegularFile()) {
+            throw new IOException("state file is not a regular file: " + file);
+        }
+        if (attributes.size() > maxBytes) {
             throw new IOException("state file is larger than " + maxBytes + " bytes: " + file);
         }
         return Files.readAllBytes(file);

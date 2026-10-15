@@ -329,6 +329,40 @@ class RebindStateTest {
         assertEquals(2, state.size());
     }
 
+    @Test
+    void unreadableExistingStateFailsClosed(@TempDir Path dir) throws IOException {
+        AtomicLong now = new AtomicLong(BASE);
+        Assumptions.assumeTrue(dir.getFileSystem().supportedFileAttributeViews().contains("posix"));
+        byte[] json = "{\"version\":1,\"servers\":[]}".getBytes(StandardCharsets.UTF_8);
+
+        Path unreadableDirectory = Files.createDirectories(dir.resolve("unreadable"));
+        Path unreadableJson = unreadableDirectory.resolve("rebind-v1.json");
+        Path bloomFile = unreadableDirectory.resolve("rebind-bloom-v1.bin");
+        Files.write(unreadableJson, json);
+        writeEmptyBloom(bloomFile);
+        Files.setPosixFilePermissions(unreadableJson, PosixFilePermissions.fromString("---------"));
+        try {
+            Assumptions.assumeFalse(Files.isReadable(unreadableJson), "the process ignores the file mode (root)");
+            RebindState unreadable = RebindState.load(unreadableJson, bloomFile, now::get);
+            assertFalse(unreadable.isUsable(), "a file the process may not read fails closed");
+            assertFalse(unreadable.allowsAttempt("mc.example.com", 25565, now.get()));
+            assertFalse(unreadable.shouldNotify("mc.example.com", 25565, FP_A));
+        } finally {
+            Files.setPosixFilePermissions(unreadableJson, PosixFilePermissions.fromString("rw-------"));
+        }
+        assertArrayEquals(json, Files.readAllBytes(unreadableJson), "the unreadable file was left alone");
+        assertEquals(RebindBloom.BYTES, Files.size(bloomFile), "and so was the filter");
+
+        Path asDirectoryDirectory = Files.createDirectories(dir.resolve("directory-state"));
+        Path asDirectory = Files.createDirectories(asDirectoryDirectory.resolve("rebind-v1.json"));
+        RebindState directoryState = RebindState.load(asDirectory,
+                asDirectoryDirectory.resolve("rebind-bloom-v1.bin"), now::get);
+        assertFalse(directoryState.isUsable(), "a directory is unreadable state, not a missing file");
+        assertFalse(directoryState.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertFalse(directoryState.shouldNotify("mc.example.com", 25565, FP_A));
+        assertTrue(Files.isDirectory(asDirectory), "the directory was not touched");
+    }
+
     /** The filter half of a state fixture: a real client always has both files. */
     private static void writeEmptyBloom(Path bloomFile) throws IOException {
         Files.write(bloomFile, new byte[RebindBloom.BYTES]);

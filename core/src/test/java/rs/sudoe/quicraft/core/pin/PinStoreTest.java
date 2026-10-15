@@ -220,6 +220,51 @@ class PinStoreTest {
         assertEquals(1, store.size());
     }
 
+    @Test
+    void unreadableExistingStateIsNotAnEmptyStore(@TempDir Path dir) throws IOException {
+        AtomicLong now = new AtomicLong(BASE);
+        Assumptions.assumeTrue(dir.getFileSystem().supportedFileAttributeViews().contains("posix"));
+        byte[] valid = pins(1).getBytes(StandardCharsets.UTF_8);
+
+        Path quicraft = Files.createDirectories(dir.resolve("quicraft"));
+        Path locked = quicraft.resolve("pins-v2.json");
+        Files.write(locked, valid);
+        Files.setPosixFilePermissions(locked, PosixFilePermissions.fromString("---------"));
+        try {
+            Assumptions.assumeFalse(Files.isReadable(locked), "the process ignores the file mode (root)");
+            PinStore unreadableFile = PinStore.load(locked, now::get);
+            assertFalse(unreadableFile.isUsable(), "a file the process may not read is not an empty store");
+            assertEquals(PinStore.RecordResult.DISABLED, unreadableFile.recordPin("new.example.com", 25565, FP_A));
+        } finally {
+            Files.setPosixFilePermissions(locked, PosixFilePermissions.fromString("rw-------"));
+        }
+        assertArrayEquals(valid, Files.readAllBytes(locked), "the unreadable file was left alone");
+
+        Path lockedDirectory = Files.createDirectories(dir.resolve("locked-directory"));
+        Path insideLocked = lockedDirectory.resolve("pins-v2.json");
+        Files.write(insideLocked, valid);
+        Files.setPosixFilePermissions(lockedDirectory, PosixFilePermissions.fromString("---------"));
+        try {
+            Assumptions.assumeFalse(Files.isReadable(insideLocked), "the process ignores the directory mode (root)");
+            PinStore unreadableDirectory = PinStore.load(insideLocked, now::get);
+            assertFalse(unreadableDirectory.isUsable(), "a file the process cannot even stat is not missing");
+        } finally {
+            Files.setPosixFilePermissions(lockedDirectory, PosixFilePermissions.fromString("rwx------"));
+        }
+        assertArrayEquals(valid, Files.readAllBytes(insideLocked), "the unreachable file was left alone");
+    }
+
+    @Test
+    void aDirectoryWhereTheFileBelongsDisablesTheStore(@TempDir Path dir) throws IOException {
+        Path asDirectory = Files.createDirectories(dir.resolve("pins-v2.json"));
+        PinStore store = PinStore.load(asDirectory, new AtomicLong(BASE)::get);
+        assertFalse(store.isUsable(), "a directory is unreadable state, not a missing file");
+        assertEquals(PinStore.RecordResult.DISABLED, store.recordPin("mc.example.com", 25565, FP_A));
+        assertFalse(store.pin("mc.example.com", 25565).isPresent());
+        assertTrue(Files.isDirectory(asDirectory), "the directory was not touched");
+        assertFalse(store.deletePin("mc.example.com", 25565));
+    }
+
     private static String entry(String host, int port, String fingerprint) {
         return "{\"host\":\"" + host + "\",\"port\":" + port + ",\"fingerprint\":\"" + fingerprint + "\""
                 + ",\"firstBound\":\"2000-01-01T00:00:00Z\",\"lastBound\":\"2000-01-01T00:00:00Z\"}";

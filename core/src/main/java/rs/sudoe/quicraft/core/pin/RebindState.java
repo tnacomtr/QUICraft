@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.pin;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -329,28 +330,32 @@ public final class RebindState {
 
     /**
      * Reads the state. The two files are one unit: both missing is empty and usable, exactly one
-     * present is unreliable and fails closed, both present is loaded.
+     * present is unreliable and fails closed, both present is loaded. Only a file that is really not
+     * there counts as missing; a file the process may not read, or a directory in its place, is
+     * unreadable state and fails closed like any other read failure.
      */
     private void read() throws IOException {
-        boolean jsonPresent = file != null && isUsableFile(file);
-        boolean bloomPresent = bloomFile != null && isUsableFile(bloomFile);
+        boolean jsonPresent = false;
+        if (file != null) {
+            try {
+                readJson(new String(StateFile.read(file, MAX_FILE_BYTES), StandardCharsets.UTF_8));
+                jsonPresent = true;
+            } catch (NoSuchFileException e) {
+                // Not there at all.
+            }
+        }
+        boolean bloomPresent = false;
+        if (bloomFile != null) {
+            try {
+                bloom.read(StateFile.read(bloomFile, RebindBloom.BYTES));
+                bloomPresent = true;
+            } catch (NoSuchFileException e) {
+                // Not there at all.
+            }
+        }
         if (file != null && bloomFile != null && jsonPresent != bloomPresent) {
             throw new IOException("only one of the two re-bind state files exists");
         }
-        if (jsonPresent) {
-            readJson(new String(StateFile.read(file, MAX_FILE_BYTES), StandardCharsets.UTF_8));
-        }
-        if (bloomPresent) {
-            bloom.read(StateFile.read(bloomFile, RebindBloom.BYTES));
-        }
-    }
-
-    /** Whether {@code path} is a regular file; a directory or device in its place is unreadable. */
-    private static boolean isUsableFile(Path path) throws IOException {
-        if (Files.exists(path) && !Files.isRegularFile(path)) {
-            throw new IOException("re-bind state is not a regular file: " + path);
-        }
-        return Files.isRegularFile(path);
     }
 
     private void readJson(String content) {

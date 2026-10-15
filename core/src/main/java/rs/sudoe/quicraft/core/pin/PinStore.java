@@ -3,7 +3,7 @@ package rs.sudoe.quicraft.core.pin;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -129,11 +129,13 @@ public final class PinStore {
      */
     static PinStore load(Path file, LongSupplier clock) {
         PinStore store = new PinStore(file, clock);
-        if (file == null || !Files.isRegularFile(file)) {
+        if (file == null) {
             return store;
         }
         try {
             store.read(new String(StateFile.read(file, MAX_FILE_BYTES), StandardCharsets.UTF_8));
+        } catch (NoSuchFileException e) {
+            // Only a file that is really not there is an empty store, docs/protocol.md 12.15.
         } catch (IOException | RuntimeException e) {
             LOG.log(Level.INFO, "QUICraft pin store is unreadable and stays disabled, not empty ({0})",
                     String.valueOf(e));
