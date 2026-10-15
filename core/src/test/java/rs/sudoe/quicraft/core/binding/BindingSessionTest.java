@@ -5,9 +5,12 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -105,7 +108,7 @@ class BindingSessionTest {
                 byte[] fingerprint, byte[] routing, long offerWaitNanos, FakeAdapter adapter) {
             this.adapter = adapter;
             this.session = new BindingSession(role, exporter, sharedSecret, mode, protocol, fingerprint,
-                    routing, clock::get, offerWaitNanos, adapter, null);
+                    routing, clock::get, offerWaitNanos, adapter, null, null);
             adapter.session = this.session;
         }
 
@@ -508,7 +511,7 @@ class BindingSessionTest {
             long entered = System.nanoTime();
             BindingSession session = new BindingSession(Role.CLIENT, BindingTestData.exporter(E), S,
                     BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime,
-                    TimeUnit.MILLISECONDS.toNanos(50), adapter, scheduler);
+                    TimeUnit.MILLISECONDS.toNanos(50), adapter, scheduler, null);
             session.onConfigurationEntered(entered);
 
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
@@ -522,6 +525,81 @@ class BindingSessionTest {
         } finally {
             scheduler.shutdownNow();
         }
+    }
+
+    @Test
+    void theSelfTickOnlyRunsOnTheSessionsEventLoop() throws Exception {
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        try {
+            // A scheduler that is not the connection's event loop must not touch the session.
+            FakeAdapter elsewhere = new FakeAdapter();
+            BindingSession offLoop = new BindingSession(Role.CLIENT, BindingTestData.exporter(E), S,
+                    BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime,
+                    TimeUnit.MILLISECONDS.toNanos(20), elsewhere, scheduler, () -> false);
+            offLoop.onConfigurationEntered(System.nanoTime());
+            Thread.sleep(400);
+            assertEquals(-1, elsewhere.failCode,
+                    "a self-tick off the event loop must leave the session alone");
+            assertFalse(offLoop.isSettled());
+
+            // The same, on the event loop: the deadline fires.
+            FakeAdapter onLoop = new FakeAdapter();
+            BindingSession session = new BindingSession(Role.CLIENT, BindingTestData.exporter(E), S,
+                    BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime,
+                    TimeUnit.MILLISECONDS.toNanos(20), onLoop, scheduler, () -> true);
+            session.onConfigurationEntered(System.nanoTime());
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (onLoop.failCode < 0 && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertEquals(Protocol.CLOSE_BINDING_FAILURE, onLoop.failCode);
+        } finally {
+            scheduler.shutdownNow();
+        }
+    }
+
+    @Test
+    void theSessionDropsItsOwnCopyOfTheSharedSecretOnceTheMachineHasItsOwn() throws Exception {
+        Endpoint client = client();
+        Endpoint server = server();
+        link(client, server);
+        assertNotNull(secretOf(client.session), "the session holds its copy before the exchange starts");
+
+        client.session.onConfigurationEntered(ENTERED);
+        server.session.onConfigurationEntered(ENTERED);
+        assertNull(secretOf(client.session), "12.6: the session drops S once the machine is built");
+        assertNull(secretOf(server.session));
+
+        // The machine derived from its own copy, so the exchange still completes.
+        pump(client, server);
+        assertTrue(client.session.isActivated());
+        assertTrue(server.session.isActivated());
+    }
+
+    @Test
+    void closeEndsTheSessionSilentlyAndWipesIt() throws Exception {
+        Endpoint endpoint = server();
+        endpoint.session.onConfigurationEntered(ENTERED);
+        assertTrue(endpoint.session.isQuiescent());
+
+        endpoint.session.close();
+        endpoint.session.close(); // idempotent
+
+        assertTrue(endpoint.session.isSettled(), "a closed session is over");
+        assertFalse(endpoint.session.isActivated());
+        assertFalse(endpoint.session.isQuiescent());
+        assertEquals(Arrays.asList(), endpoint.session.releaseQueued());
+        assertNull(secretOf(endpoint.session), "and its copy of S is gone");
+        assertEquals(-1, endpoint.adapter.failCode,
+                "a dead channel needs no 0x10: nothing is reported");
+        assertDoesNotThrow(() -> endpoint.session.onPayload(new byte[103]));
+    }
+
+    /** Reads the session's private copy of {@code S}, so a wipe is asserted and not assumed. */
+    private static byte[] secretOf(BindingSession session) throws Exception {
+        Field field = BindingSession.class.getDeclaredField("sharedSecret");
+        field.setAccessible(true);
+        return (byte[]) field.get(session);
     }
 
     @Test
@@ -573,28 +651,28 @@ class BindingSessionTest {
     void constructorRejectsLocalMisuse() {
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, 2, BindingTestData.PROTOCOL_NUMBER, F, R,
-                System::nanoTime, OFFER_WAIT, new FakeAdapter(), null));
+                System::nanoTime, OFFER_WAIT, new FakeAdapter(), null, null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE, -1, F, R,
-                System::nanoTime, OFFER_WAIT, new FakeAdapter(), null));
+                System::nanoTime, OFFER_WAIT, new FakeAdapter(), null, null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE,
                 BindingTestData.PROTOCOL_NUMBER, new byte[31], R, System::nanoTime, OFFER_WAIT,
-                new FakeAdapter(), null));
+                new FakeAdapter(), null, null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE,
                 BindingTestData.PROTOCOL_NUMBER, F, new byte[31], System::nanoTime, OFFER_WAIT,
-                new FakeAdapter(), null));
+                new FakeAdapter(), null, null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), null, BindingTestData.MODE_ONLINE,
                 BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, OFFER_WAIT,
-                new FakeAdapter(), null));
+                new FakeAdapter(), null, null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE,
-                BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, -1, new FakeAdapter(), null));
+                BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, -1, new FakeAdapter(), null, null));
         assertThrows(NullPointerException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE,
-                BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, OFFER_WAIT, null, null));
+                BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, OFFER_WAIT, null, null, null));
     }
 
     @Test

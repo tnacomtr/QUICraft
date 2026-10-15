@@ -101,6 +101,16 @@ public final class ClientConnector {
         /** The platform's TCP connection, without the game protocol on it yet. */
         ConnectionRace.Tcp<T> tcp();
 
+        /**
+         * The connection's own event loop, which is a {@link ScheduledExecutorService}. The head
+         * start of §5 and the status-query timeout run on it, and a
+         * {@link rs.sudoe.quicraft.core.binding.BindingSession} built with it schedules its own
+         * 12.14 deadline checks there.
+         *
+         * <p>It must be the one thread that runs every other method of the session and of the
+         * connection's pipeline: 12.10 requires the cipher cutover, the quiescence queue and the
+         * deadlines to be evaluated on it, so a session must never be ticked from another thread.</p>
+         */
         ScheduledExecutorService scheduler();
     }
 
@@ -318,9 +328,11 @@ public final class ClientConnector {
      * re-bind and failure files, so their calls must not interleave: the connector serializes them
      * here rather than trusting every caller to hand in a single-threaded executor.
      *
-     * <p>A delegate that refuses the task is reported to the caller as before, after the queue is
-     * dropped: every caller of this executor already treats a rejection as "the work did not happen"
-     * and carries on with TCP.</p>
+     * <p>A delegate that refuses a task is reported to the caller whose task started that run, after
+     * that one command is removed from the queue: a command another caller queued behind it stays,
+     * and the next {@code execute} restarts the drain for it. A delegate that silently discards
+     * tasks without throwing is not supported, because nothing could tell the difference from work
+     * that is still queued.</p>
      */
     private static final class SerialExecutor implements Executor {
         private final Executor delegate;
@@ -353,8 +365,10 @@ public final class ClientConnector {
                 });
             } catch (Throwable t) {
                 synchronized (this) {
+                    // Drop only this call's own command and let the next execute restart the drain,
+                    // so a command another caller queued is not lost with it.
+                    queue.remove(command);
                     running = false;
-                    queue.clear();
                 }
                 throw t;
             }

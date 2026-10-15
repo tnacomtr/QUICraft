@@ -7,6 +7,7 @@ import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
@@ -73,7 +74,8 @@ public final class BindingSession implements BindingDriver {
     private final Role role;
     private final ExporterSource exporter;
     private final Callbacks callbacks;
-    private final byte[] sharedSecret;
+    /** Wiped and dropped once the machine has its own copy, and on every way this session ends. */
+    private byte[] sharedSecret;
     private final int mode;
     private final int protocol;
     private final byte[] fingerprint;
@@ -82,6 +84,8 @@ public final class BindingSession implements BindingDriver {
     private final long offerWaitNanos;
     /** Optional: a scheduler the session ticks itself with, so deadlines do not need the adapter. */
     private final ScheduledExecutorService scheduler;
+    /** Optional: whether the caller is on the connection's event loop, for the self-tick check. */
+    private final BooleanSupplier inEventLoop;
 
     private final List<Object> queued = new ArrayList<Object>();
     private long queuedBytes;
@@ -112,12 +116,20 @@ public final class BindingSession implements BindingDriver {
      * @param callbacks what the adapter does for this session
      * @param scheduler an optional scheduler the session ticks itself with, so 12.14's deadlines
      *     fire even when the adapter never calls {@link #tick(long)}; null means the adapter must
-     *     tick. The session cancels its own task when it settles
+     *     tick. <b>It must be the connection's own event loop</b>, the one thread that runs every
+     *     other method here (12.10), normally the {@code Platform.scheduler()} of
+     *     {@link rs.sudoe.quicraft.core.connect.ClientConnector.Platform}. The session cancels its
+     *     own task when it settles
+     * @param inEventLoop an optional check of whether the current thread is that event loop, used by
+     *     the self-tick before it touches the session; null means the caller asserts the requirement
+     *     by passing the right scheduler. A self-tick that finds itself off the event loop does
+     *     nothing, because touching the session from another thread would be worse than a late
+     *     deadline
      * @throws IllegalArgumentException for local misuse, which is a wiring bug and not a wire event
      */
     public BindingSession(Role role, ExporterSource exporter, byte[] sharedSecret, int mode, int protocol,
             byte[] advertisedFingerprint, byte[] routingDigest, LongSupplier clock, long offerWaitNanos,
-            Callbacks callbacks, ScheduledExecutorService scheduler) {
+            Callbacks callbacks, ScheduledExecutorService scheduler, BooleanSupplier inEventLoop) {
         this.role = Objects.requireNonNull(role, "role");
         this.exporter = Objects.requireNonNull(exporter, "exporter");
         this.callbacks = Objects.requireNonNull(callbacks, "callbacks");
@@ -146,6 +158,7 @@ public final class BindingSession implements BindingDriver {
         this.routing = routingDigest.clone();
         this.offerWaitNanos = offerWaitNanos;
         this.scheduler = scheduler;
+        this.inEventLoop = inEventLoop;
     }
 
     /** Whether the exchange finished with activation (12.9). */
@@ -203,6 +216,10 @@ public final class BindingSession implements BindingDriver {
             }
         } catch (Throwable t) {
             fail("binding start", t);
+        } finally {
+            // 12.6: the machine derived its key from a private copy, so this session's copy of S is
+            // dropped as soon as the exchange has started, whatever happened.
+            wipeSecret();
         }
     }
 
@@ -303,6 +320,12 @@ public final class BindingSession implements BindingDriver {
                 @Override
                 public void run() {
                     try {
+                        if (inEventLoop != null && !inEventLoop.getAsBoolean()) {
+                            // The scheduler is not the connection's event loop, so touching the
+                            // session from here would break 12.10 worse than a late deadline does.
+                            // The adapter's own tick() calls still work.
+                            return;
+                        }
                         tick(clock.getAsLong());
                     } catch (Throwable ignored) {
                         // tick() never throws; a scheduler thread must not die on it either.
@@ -319,6 +342,42 @@ public final class BindingSession implements BindingDriver {
             ticker.cancel(false);
             ticker = null;
         }
+    }
+
+    /**
+     * Drops this session's own copy of Minecraft's shared secret (12.6). Best effort, like every
+     * wipe here: the JVM may have copied the material, but nothing of this session's may survive the
+     * exchange.
+     */
+    private void wipeSecret() {
+        HkdfSha256.wipe(sharedSecret);
+        sharedSecret = null;
+    }
+
+    /**
+     * Ends this session without reporting anything, for a connection that is already gone: the
+     * adapter closed the channel, so there is nobody left to close it with {@code 0x10} (12.14). It
+     * stops the self-tick, drops the quiescence queue, wipes the machine's tags and this session's
+     * copy of {@code S}, and leaves the session settled, so every later call is a no-op. Idempotent,
+     * and never throws.
+     */
+    public void close() {
+        if (!settled) {
+            settled = true;
+            activated = false;
+            quiescent = false;
+            queued.clear();
+            queuedBytes = 0;
+            try {
+                if (machine != null) {
+                    machine.abort();
+                }
+            } catch (Throwable ignored) {
+                // Wiping the machine's tags is best effort.
+            }
+        }
+        stopTicker();
+        wipeSecret();
     }
 
     /** Sends one message and applies the cutover the boundary it crosses requires. */
@@ -366,6 +425,7 @@ public final class BindingSession implements BindingDriver {
         activated = true;
         settled = true;
         stopTicker();
+        wipeSecret();
     }
 
     /**
@@ -383,6 +443,7 @@ public final class BindingSession implements BindingDriver {
         queued.clear();
         queuedBytes = 0;
         stopTicker();
+        wipeSecret();
         try {
             if (machine != null) {
                 machine.abort();
