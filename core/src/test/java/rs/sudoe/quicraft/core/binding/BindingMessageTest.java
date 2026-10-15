@@ -98,6 +98,28 @@ class BindingMessageTest {
                 () -> BindingMessage.of(BindingKind.OFFER, 1, 775, F, R, new byte[31]));
     }
 
+    /**
+     * Regression for §12.8: {@code protocol_number} is an unsigned u32, so a negative value is out
+     * of range and MUST be rejected before encoding rather than wrapped into four bytes that mean
+     * another protocol. Every message-building entry point goes through {@link BindingMessage#of}.
+     */
+    @Test
+    void rejectsANegativeProtocolNumberInsteadOfWrappingIt() {
+        for (int protocolNumber : new int[] {-1, Integer.MIN_VALUE, -775}) {
+            assertThrows(IllegalArgumentException.class, () -> BindingMessage.of(BindingKind.OFFER,
+                    BindingTestData.MODE_ONLINE, protocolNumber, F, R, new byte[32]),
+                    "protocol number " + protocolNumber + " must be rejected");
+            assertThrows(IllegalArgumentException.class, () -> BindingMessage.offer(
+                    BindingTestData.MODE_ONLINE, protocolNumber, F, R),
+                    "protocol number " + protocolNumber + " must be rejected");
+        }
+        // The largest representable protocol number is still legal: it is the u32 range's upper
+        // half, and only values outside 0..4294967295 are out of range.
+        assertEquals(Integer.MAX_VALUE, BindingMessage.offer(1, Integer.MAX_VALUE, F, R)
+                .protocolNumber());
+        assertEquals(0, BindingMessage.offer(1, 0, F, R).protocolNumber());
+    }
+
     @Test
     void toStringRevealsNoTagOrDigestBytes() {
         byte[] tag = BindingTestData.hex(BindingTestData.E_HEX);

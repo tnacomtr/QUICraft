@@ -65,7 +65,7 @@ public final class BindingStateMachine {
 
     private BindingStateMachine(Role role, byte[] exporterValue, byte[] minecraftSecret,
                                 int mode, int protocolNumber, byte[] fingerprint, byte[] routing) {
-        validateArguments(minecraftSecret, mode, fingerprint, routing);
+        validateArguments(minecraftSecret, mode, protocolNumber, fingerprint, routing);
         if (exporterValue == null || exporterValue.length != EXPORTER_LENGTH) {
             throw new IllegalArgumentException("exporter value must be exactly 32 raw bytes");
         }
@@ -111,7 +111,7 @@ public final class BindingStateMachine {
             throw new IllegalArgumentException("exporter is required");
         }
         // Local misuse stays an exception; only the exporter itself can fail at run time.
-        validateArguments(minecraftSecret, mode, fingerprint, routing);
+        validateArguments(minecraftSecret, mode, protocolNumber, fingerprint, routing);
         byte[] exporterValue = export(exporter);
         if (exporterValue == null) {
             return BindingMachineResult.failed(BindingFailure.EXPORTER_ERROR);
@@ -124,12 +124,19 @@ public final class BindingStateMachine {
      * Resolves the exporter value into a private copy this machine owns, or null for an exporter
      * error: a source that throws, returns null or returns another length (docs/protocol.md §12.3,
      * §12.14). Only the copy is ever wiped, so the source keeps ownership of its own array.
+     *
+     * <p>{@link Throwable} is caught, not just {@link RuntimeException}: the exporter is reached
+     * through the patched native's JNI binding, so a missing or mismatched native library surfaces
+     * as {@link UnsatisfiedLinkError} or another {@link LinkageError}. §12.8 requires exactly that:
+     * catch exporter errors, native exceptions included, and close {@code /3} with {@code 0x10},
+     * never letting an exception bypass fail-closed handling. An error is therefore an ordinary
+     * {@link BindingFailure#EXPORTER_ERROR} here, and never escapes the machine factories.
      */
     private static byte[] export(ExporterSource exporter) {
         byte[] returned;
         try {
             returned = exporter.export();
-        } catch (RuntimeException ignored) {
+        } catch (Throwable ignored) {
             return null;
         }
         // Check the length before copying, so a rejected value never leaves an unwiped copy.
@@ -139,10 +146,16 @@ public final class BindingStateMachine {
         return returned.clone();
     }
 
-    private static void validateArguments(byte[] minecraftSecret, int mode,
+    private static void validateArguments(byte[] minecraftSecret, int mode, int protocolNumber,
                                           byte[] fingerprint, byte[] routing) {
         if (mode != MODE_OFFLINE && mode != MODE_ONLINE) {
             throw new IllegalArgumentException("mode must be 0 (offline) or 1 (online)");
+        }
+        if (protocolNumber < 0) {
+            // §12.8: protocol_number is an unsigned u32, so a negative value can only be a caller
+            // that truncated or wrapped it; reject it before any tag is derived from it.
+            throw new IllegalArgumentException("protocol number must be in unsigned 32-bit range, got "
+                    + protocolNumber);
         }
         checkDigest(fingerprint, "fingerprint");
         checkDigest(routing, "routing");

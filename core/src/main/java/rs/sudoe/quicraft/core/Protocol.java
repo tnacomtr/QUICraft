@@ -33,6 +33,23 @@ public final class Protocol {
      * server drops anything it started from it.
      */
     public static final int CLOSE_EARLY_ABANDONED = 0x4;
+    /**
+     * A binding or activation failure on {@code quicraft/3}: a validation or exporter error, a
+     * deadline, a premature close or a quiescence queue overflow. The whole QUIC connection is
+     * closed with this code and the failure is never repaired in place (docs/protocol.md 12.8,
+     * 12.10, 12.14).
+     */
+    public static final int CLOSE_BINDING_FAILURE = 0x10;
+    /**
+     * An ordering or resource failure on {@code quicraft/3}: a stream used before activation, a
+     * blocked record head or incomplete record past its deadline, a limit violation or a parser
+     * error. The whole QUIC connection is closed with this code; no packet is skipped and no
+     * barrier is released on timeout (docs/protocol.md 13.3, 13.12, 13.14, 13.15).
+     *
+     * <p>The same numeric value as
+     * {@link rs.sudoe.quicraft.core.multistream.MultistreamProtocolException#CLOSE_ORDERING}.
+     */
+    public static final int CLOSE_ORDERING_FAILURE = 0x11;
 
     private Protocol() {}
 }
