@@ -868,6 +868,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
    SERVER_SWITCH, under 13.12's bounds, without delivery. The server MUST treat any
    stream-4 frame before its own activation (CLIENT_SWITCH validated and SERVER_SWITCH
    queued) as fatal `0x11`, not buffer it. Stream 4 cannot legitimately precede that point.
+   Adapter note: the server's activation must take effect on the connection's event loop
+   before, or in the same task as, the flush of SERVER_SWITCH. Activating from another thread
+   only queues it, and the client's stream 4 can then arrive first, which is fatal.
 
 ### Records, control and routing data
 
@@ -969,7 +972,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
     a predecessor. Also cap unsent application queues at 1024 packets or 16 MiB and apply
     backpressure; an unpausable producer over the cap disconnects. A head record blocked on
     a dependency, incomplete record, or unapplied handler for 10 seconds disconnects with
-    `0x11` (ordering/resource failure). Cycles, impossible references, limit violations and
+    `0x11` (ordering/resource failure). A lane that holds the auxiliary budget while its head waits for a
+    predecessor on the other auxiliary lane (cross-lane starvation) is resolved by this same
+    10 second blocked-head disconnect. Cycles, impossible references, limit violations and
     parser/ordering errors use the same code; do not skip packets or release a barrier on
     timeout. Start the incomplete-record timer at its first byte and the blocked-head timer
     when it becomes head; progress on other lanes does not restart either deadline. This
@@ -999,9 +1004,17 @@ single-socket listener: no dispatcher is installed and the connection id length 
     well as retained bytes and both reservations; if record count is not yet known, reserve
     for the maximum number of minimum-size records that credit can carry, or withhold it.
     Never extend credit for a record exceeding 13.4's cap; no legal record exceeds 4 MiB.
-    Pin quiche's maximum auto-tuned stream window to 4 MiB and connection window to
-    17 MiB, with automatic growth disabled unless it obeys these same application/node
-    budgets and reservations. Smaller initial serverbound windows MUST remain effective;
+    Pin quiche's maximum auto-tuned windows. Server: connection window 256 KiB and stream
+    window 8 KiB, equal to the initial serverbound windows, so automatic growth is off and the
+    exposure is exactly the initial credit the node reserved. Client: stream window 4 MiB and
+    connection window 12 MiB, three streams times the stream maximum, since only three streams
+    can hold quiche-unread data. The client's aggregate exposure is therefore the application-held
+    data (the 17 MiB budget of 13.12) plus quiche-unread data bounded by 12 MiB; the initial
+    clientbound MAX_DATA credit is not debited from the receiver budget. Automatic growth beyond
+    these pins is not allowed. Because the server windows are pinned, a serverbound record
+    streams at about 8 KiB per round trip per stream: a serverbound record larger than roughly
+    8 KiB x (10 s / RTT) hits the 10 second incomplete-record timer (about 800 KB at a 100 ms
+    RTT). Vanilla serverbound packets are far smaller. Smaller initial serverbound windows MUST remain effective;
     transport auto-tuning may not silently override them. If the pinned Netty exposes no
     setters for these maximum windows/growth controls, patch it before enabling `/3`;
     initial limits alone are insufficient. Account for already granted credit when

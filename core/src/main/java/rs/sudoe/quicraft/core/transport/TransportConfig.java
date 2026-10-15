@@ -26,6 +26,28 @@ public final class TransportConfig {
         NEVER
     }
 
+    /**
+     * /3 (docs/protocol.md 13.13): the client advertises this much connection credit, i.e. what the
+     * server may send (clientbound).
+     */
+    public static final long MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA = 16L << 20;
+    /** /3: the server advertises this much connection credit, i.e. what the client may send (serverbound). */
+    public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = 256L << 10;
+    /** /3: both bidirectional per-stream initial limits, at both ends. */
+    public static final long MULTISTREAM_INITIAL_MAX_STREAM_DATA = 8L << 10;
+    /** /3: the server lets the client open streams 0 and 4. */
+    public static final int MULTISTREAM_SERVER_MAX_STREAMS_BIDI = 2;
+    /** /3: the client lets the server open stream 1. */
+    public static final int MULTISTREAM_CLIENT_MAX_STREAMS_BIDI = 1;
+    /**
+     * /3 (13.13): the largest auto-tuned stream window quiche may grow to at the client. The server
+     * pins both maxima to its initial serverbound windows. Applied by Codecs, which refuses /3
+     * when the native cannot set them.
+     */
+    public static final long MULTISTREAM_MAX_STREAM_WINDOW = 4L << 20;
+    /** /3 (13.13): the largest auto-tuned connection window at the client: three streams times the stream maximum. */
+    public static final long MULTISTREAM_MAX_CONNECTION_WINDOW = 12L << 20;
+
     private static final Logger LOG = Logger.getLogger("QUICraft");
     private static final int MAX_LIMIT = 10_000_000;
 
@@ -58,6 +80,7 @@ public final class TransportConfig {
     final boolean earlyData;
     final boolean sessionResumption;
     final boolean relaxedLossThreshold;
+    final boolean multistream;
     final int globalAttemptsPerSecond;
     final int perIpAttemptsPerSecond;
     final int retryThresholdPerSecond;
@@ -77,6 +100,7 @@ public final class TransportConfig {
         this.earlyData = b.earlyData;
         this.sessionResumption = b.sessionResumption;
         this.relaxedLossThreshold = b.relaxedLossThreshold;
+        this.multistream = b.multistream;
         this.globalAttemptsPerSecond = positiveOr(b.globalAttemptsPerSecond, DEFAULT_GLOBAL_ATTEMPTS);
         this.perIpAttemptsPerSecond = positiveOr(b.perIpAttemptsPerSecond, DEFAULT_PER_IP_ATTEMPTS);
         // ConnectionAdmission rejects a Retry threshold above the global budget.
@@ -97,6 +121,22 @@ public final class TransportConfig {
 
     public static Builder builder() {
         return new Builder();
+    }
+
+    /**
+     * The /3 transport parameters of docs/protocol.md 13.13 on top of the /2 defaults. Affects the
+     * flow-control limits and stream counts only; the /2 default is unchanged.
+     */
+    public static TransportConfig multistream() {
+        if (!rs.sudoe.quicraft.core.QuicSupport.hasMaxFlowControlWindows()) {
+            throw new IllegalStateException("/3 needs the patched native that caps flow-control windows");
+        }
+        return builder().multistream(true).build();
+    }
+
+    /** True for the /3 limits of {@link #multistream()}. */
+    public boolean isMultistream() {
+        return multistream;
     }
 
     public CongestionControl congestionControl() {
@@ -244,6 +284,7 @@ public final class TransportConfig {
         private boolean earlyData = true;
         private boolean sessionResumption = true;
         private boolean relaxedLossThreshold = true;
+        private boolean multistream;
         private int globalAttemptsPerSecond = DEFAULT_GLOBAL_ATTEMPTS;
         private int perIpAttemptsPerSecond = DEFAULT_PER_IP_ATTEMPTS;
         private int retryThresholdPerSecond = DEFAULT_RETRY_THRESHOLD;
@@ -297,6 +338,16 @@ public final class TransportConfig {
         /** Sender-side only; the peer never sees it (docs/protocol.md §9). */
         public Builder relaxedLossThreshold(boolean enabled) {
             this.relaxedLossThreshold = enabled;
+            return this;
+        }
+
+        /**
+         * /3 limits (13.13): initial_max_data 16 MiB at the client and 256 KiB at the server, bidi
+         * per-stream limits of 8 KiB, 2 bidi streams at the server and 1 at the client, no uni
+         * streams. Replaces initialMaxData and initialMaxStreamData.
+         */
+        public Builder multistream(boolean enabled) {
+            this.multistream = enabled;
             return this;
         }
 
