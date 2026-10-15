@@ -69,6 +69,22 @@ class RebindStateTest {
     }
 
     @Test
+    void anAttemptThatNeverEndedStillHoldsItsProvisionalWindow(@TempDir Path dir) {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), "the attempt starts");
+
+        // As if the game exited or crashed before the attempt ended: the provisional window outlives it.
+        RebindState reloaded = RebindState.load(file, now::get);
+        assertNull(reloaded.tryBeginAttempt("mc.example.com", 25565, now.get()), "the window is on disk");
+        now.addAndGet(MINUTE - 1);
+        assertNull(reloaded.tryBeginAttempt("mc.example.com", 25565, now.get()), "and holds");
+        now.addAndGet(1);
+        assertNotNull(reloaded.tryBeginAttempt("mc.example.com", 25565, now.get()), "until it passes");
+    }
+
+    @Test
     void backoffIsKeyedLikeAPinAndIgnoresTheFingerprint(@TempDir Path dir) {
         Path file = dir.resolve("rebind-v1.bin");
         AtomicLong now = new AtomicLong(BASE);
@@ -121,10 +137,16 @@ class RebindStateTest {
         now.addAndGet(MINUTE - 1);
         assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), "the schedule started over");
         now.addAndGet(1);
-        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
+        RebindState.Attempt reopened = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(reopened);
 
         RebindState reloaded = RebindState.load(file, now::get);
-        assertNotNull(reloaded.tryBeginAttempt("mc.example.com", 25565, now.get()));
+        assertNull(reloaded.tryBeginAttempt("mc.example.com", 25565, now.get()),
+                "the open attempt's provisional window is what is on disk");
+        assertTrue(state.endAttempt(reopened, true), "a second success clears it again");
+        RebindState afterBoth = RebindState.load(file, now::get);
+        assertNotNull(afterBoth.tryBeginAttempt("mc.example.com", 25565, now.get()),
+                "and the reloaded state has no window");
     }
 
     @Test
@@ -438,10 +460,11 @@ class RebindStateTest {
         Path file = notADirectory.resolve("rebind-v1.bin");
         RebindState state = RebindState.load(file, now::get);
         assertTrue(state.isUsable(), "the file is missing, not corrupt");
-        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
-        assertFalse(state.shouldNotify("mc.example.com", 25565, FP_A), "the write fails");
-        assertFalse(state.isUsable());
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()),
+                "its provisional window cannot be stored, so no attempt");
+        assertFalse(state.isUsable(), "which fails closed");
         assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
+        assertFalse(state.shouldNotify("mc.example.com", 25565, FP_A));
         assertFalse(Files.exists(file));
     }
 

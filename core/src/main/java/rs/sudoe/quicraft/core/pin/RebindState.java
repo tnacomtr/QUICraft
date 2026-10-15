@@ -233,6 +233,12 @@ public final class RebindState {
      * fit (docs/protocol.md 12.16). When it returns a token the attempt is active, its state is
      * protected from eviction, and the caller must end it with {@link #endAttempt(Attempt, boolean)}.
      *
+     * <p>The window a failure would set is stored before the token is returned, so a game exit or a
+     * crash in the middle of an attempt cannot allow an immediate re-bind on the next launch, and
+     * {@link #endAttempt(Attempt, boolean)} either advances it (a failure) or clears it (a success).
+     * If that write fails the state is disabled and this returns null: fail closed, the caller uses
+     * TCP.</p>
+     *
      * @return the attempt token, or null while the state is disabled, the server is inside its
      *     window, an attempt for it is already active, or there is no evictable entry to hold a new
      *     server's state, in which case the caller uses TCP without a re-bind
@@ -244,13 +250,10 @@ public final class RebindState {
         }
         String mapKey = PinKey.mapKey(key);
         Entry entry = entries.get(mapKey);
-        boolean evicted = false;
         if (entry == null) {
-            int before = entries.size();
             if (!makeRoom()) {
                 return null;
             }
-            evicted = entries.size() < before;
             entry = new Entry(key.host(), key.port());
             entries.put(mapKey, entry);
         } else {
@@ -261,7 +264,10 @@ public final class RebindState {
         }
         Attempt attempt = new Attempt(key.host(), key.port());
         entry.active = attempt;
-        if (evicted && !persist()) {
+        // The window a failure would set, stored before the attempt starts: a crash or a game exit
+        // mid-attempt must not allow an immediate re-bind on the next launch.
+        entry.blockedUntil = now + backoff(entry.failures + 1);
+        if (!persist()) {
             disabled = true;
             return null;
         }
