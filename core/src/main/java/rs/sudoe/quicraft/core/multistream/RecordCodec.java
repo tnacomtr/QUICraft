@@ -137,25 +137,27 @@ public final class RecordCodec {
     // --- Incremental decoding.
 
     /**
-     * A caller-supplied admission hook (13.12). Before the decoder allocates a record body it
-     * calls {@link #reserve(int)} with the exact body size derived from the validated length
-     * prefix (13.4: {@code record_length} minus the 33-byte fixed header). Returning false
-     * refuses the record; the decoder then throws {@code 0x11}. The caller keeps its own
-     * connection-wide budget (1024 records / 16 MiB in 13.12) and uses this to refuse rather
-     * than evict: a predecessor larger than the remaining budget disconnects.
+     * A caller-supplied admission hook (13.12). Before the decoder allocates a record it calls
+     * {@link #reserve(int)} with the record's full wire size: the {@code record_length} VarInt
+     * prefix bytes plus {@code record_length} (13.4: the 33-byte fixed header plus the body).
+     * This is the whole amount the record occupies in the receive buffer, so the caller charges
+     * it once and never adds the prefix separately. Returning false refuses the record; the
+     * decoder then throws {@code 0x11}. The caller keeps its own connection-wide budget
+     * (1024 records / 16 MiB in 13.12) and uses this to refuse rather than evict: a predecessor
+     * larger than the remaining budget disconnects.
      */
     @FunctionalInterface
-    public interface BodyBudget {
+    public interface WireBudget {
         /**
-         * @param bodyBytes the record body length in bytes ({@code record_length} - 33), known
-         *     from the validated length prefix before any body allocation.
+         * @param wireBytes the record's wire size in bytes (length prefix + {@code record_length}),
+         *     known from the validated length prefix before any allocation.
          * @return true to admit the record, false to refuse it.
          */
-        boolean reserve(int bodyBytes) throws MultistreamProtocolException;
+        boolean reserve(int wireBytes) throws MultistreamProtocolException;
     }
 
     /** Admits every record: the default when the caller has no budget to enforce. */
-    public static final BodyBudget ADMIT_ALL = bodyBytes -> true;
+    public static final WireBudget ADMIT_ALL = wireBytes -> true;
 
     /**
      * The pull record decoder. {@link #next(ByteBuffer)} consumes bytes from the caller's buffer
@@ -164,7 +166,7 @@ public final class RecordCodec {
      * one record per call, so a caller driving a shared budget (13.12) always sees each record's
      * admission decision before the next one is considered.
      *
-     * <p>Before allocating a body it calls the {@link BodyBudget} with the validated body size;
+     * <p>Before allocating a record it calls the {@link WireBudget} with the record's wire size;
      * a refusal throws {@link MultistreamProtocolException} with {@code 0x11} and nothing is
      * returned (never evict). The current partial record's consumed wire bytes are exposed by
      * {@link #partialWireBytes()} / {@link #hasPartial()}, and {@link #partialStarted()} lets the
@@ -172,7 +174,7 @@ public final class RecordCodec {
      */
     public static final class Decoder {
         private final boolean controlStream;
-        private final BodyBudget budget;
+        private final WireBudget budget;
         private final VarInt.Reader length = new VarInt.Reader(CLOSE_CODE, "13.4");
         private int recordLength = -1;
         private byte[] frame;
@@ -182,10 +184,10 @@ public final class RecordCodec {
         /**
          * @param controlStream whether this direction is on the CONTROL stream (stream 0):
          *     only there is an END record legal.
-         * @param budget the per-record admission hook (13.12); see {@link BodyBudget}.
+         * @param budget the per-record admission hook (13.12); see {@link WireBudget}.
          *     {@link #ADMIT_ALL} when the caller enforces no budget.
          */
-        public Decoder(boolean controlStream, BodyBudget budget) {
+        public Decoder(boolean controlStream, WireBudget budget) {
             this.controlStream = controlStream;
             this.budget = budget == null ? ADMIT_ALL : budget;
         }
@@ -218,10 +220,10 @@ public final class RecordCodec {
                     throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
                             "record_length " + recordLength + " > " + MAX_RECORD_LENGTH);
                 }
-                int bodyBytes = recordLength - HEADER_LENGTH;
-                if (!budget.reserve(bodyBytes)) {
+                int wireBytes = lengthPrefixBytes + recordLength;
+                if (!budget.reserve(wireBytes)) {
                     throw new MultistreamProtocolException(CLOSE_CODE, "13.12",
-                            "record body of " + bodyBytes + " bytes refused by the receive budget");
+                            "record of " + wireBytes + " wire bytes refused by the receive budget");
                 }
                 frame = new byte[recordLength];
                 filled = 0;

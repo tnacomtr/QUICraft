@@ -55,7 +55,7 @@ class RecordCodecTest {
         return new RecordCodec.Decoder(control, RecordCodec.ADMIT_ALL);
     }
 
-    private static RecordCodec.Decoder decoder(boolean control, RecordCodec.BodyBudget budget) {
+    private static RecordCodec.Decoder decoder(boolean control, RecordCodec.WireBudget budget) {
         return new RecordCodec.Decoder(control, budget);
     }
 
@@ -299,14 +299,15 @@ class RecordCodecTest {
     }
 
     @Test
-    void refusesRecordBeforeAllocatingBodyWhenBudgetDeclines() throws Exception {
-        // Only the length prefix is fed: the record_length VarInt 0x26 = 38 declares a body of
-        // 38 - 33 = 5 bytes. The hook must be called with that exact size from the prefix alone,
-        // before any body bytes arrive or are allocated, and a refusal must throw 0x11.
+    void refusesRecordBeforeAllocatingWhenBudgetDeclines() throws Exception {
+        // Only the length prefix is fed: the one-byte record_length VarInt 0x26 = 38 declares a
+        // record of 1 + 38 = 39 wire bytes. The hook must be called with that exact wire size
+        // from the prefix alone, before any further bytes arrive or are allocated, and a refusal
+        // must throw 0x11.
         int[] seen = new int[] {-1};
         int[] calls = new int[] {0};
-        RecordCodec.BodyBudget budget = bodyBytes -> {
-            seen[0] = bodyBytes;
+        RecordCodec.WireBudget budget = wireBytes -> {
+            seen[0] = wireBytes;
             calls[0]++;
             return false;
         };
@@ -316,10 +317,32 @@ class RecordCodecTest {
                 () -> refusing.next(ByteBuffer.wrap(new byte[] {0x26})));
         assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
         assertEquals(1, calls[0]);
-        assertEquals(GAME_FRAME.length, seen[0]);
+        assertEquals(GAME_GOLDEN.length, seen[0]);
         assertTrue(e.getMessage().contains("13.12"), e.getMessage());
         // A record the budget admits still decodes; the hook saw the same size.
         assertNotNull(d.next(ByteBuffer.wrap(GAME_GOLDEN)));
+    }
+
+    @Test
+    void budgetIsChargedTheWholeWireRecordNotOnlyTheBody() throws Exception {
+        // END has an empty body but occupies 1 + 33 = 34 wire bytes. A budget with 33 bytes left
+        // would admit it if only the body (0) or only record_length (33) were charged; charging
+        // the whole wire record refuses it, and exactly 34 bytes admits it.
+        int[] seen = {-1};
+        RecordCodec.Decoder tight = decoder(true, wireBytes -> {
+            seen[0] = wireBytes;
+            return wireBytes <= END_GOLDEN.length - 1;
+        });
+        MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
+                () -> tight.next(ByteBuffer.wrap(END_GOLDEN)));
+        assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
+        assertEquals(34, seen[0]);
+        assertEquals(END_GOLDEN.length, seen[0]);
+
+        RecordCodec.Decoder exact = decoder(true, wireBytes -> wireBytes <= END_GOLDEN.length);
+        RecordCodec.Record end = exact.next(ByteBuffer.wrap(END_GOLDEN));
+        assertNotNull(end);
+        assertEquals(RecordCodec.KIND_END, end.kind());
     }
 
     @Test
@@ -331,7 +354,7 @@ class RecordCodecTest {
         ByteBuffer in = ByteBuffer.wrap(out.toByteArray());
         int[] remaining = {2};
         int[] asked = {0};
-        RecordCodec.BodyBudget budget = bodyBytes -> {
+        RecordCodec.WireBudget budget = wireBytes -> {
             asked[0]++;
             return remaining[0]-- > 0;
         };
