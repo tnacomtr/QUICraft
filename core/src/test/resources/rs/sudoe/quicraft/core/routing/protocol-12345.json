@@ -1,0 +1,1 @@
+{"schema":1,"protocol":12345,"default":"control","routes":[{"state":"play","direction":"clientbound","packet_id":10,"lane":"control","dependency":"fence"},{"state":"play","direction":"clientbound","packet_id":11,"lane":"realtime","dependency":"lane"},{"state":"play","direction":"clientbound","packet_id":12,"lane":"world","dependency":"lane"}]}

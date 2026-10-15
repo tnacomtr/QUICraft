@@ -1,0 +1,1 @@
+{"schema":1,"protocol":9001,"default":"control","routes":[{"state":"play","direction":"clientbound","packet_id":10,"lane":"control","dependency":"fence"}]}
