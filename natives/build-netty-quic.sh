@@ -140,7 +140,13 @@ retry=()
 for prefix in aether.connector.http aether.transport.http; do
     retry+=("-D$prefix.retryHandler.count=8" "-D$prefix.retryHandler.serviceUnavailable=429,500,502,503,504")
 done
-(cd "$netty" && ./mvnw -B -ntp -Dmaven.repo.local="$m2" "${retry[@]}" -pl codec-classes-quic,codec-native-quic \
+# Windows checks Netty out with LF endings so its licence files match the other platforms byte for
+# byte; Netty's checkstyle wants the platform's CRLF there, so skip that style check on Windows only.
+style=()
+if [[ "$os" == windows ]]; then
+    style+=("-Dcheckstyle.skip=true")
+fi
+(cd "$netty" && ./mvnw -B -ntp -Dmaven.repo.local="$m2" "${retry[@]}" ${style[@]+"${style[@]}"} -pl codec-classes-quic,codec-native-quic \
     -DskipTests package)
 
 if [[ ! -d "$boring_cache" && -d "$native/target/boringssl" ]]; then
