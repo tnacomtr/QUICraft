@@ -73,7 +73,11 @@ jobs:
         with:
           distribution: temurin
           java-version: 11
+      # Netty's native project builds with the v143 toolset (MSVC 14.44); BoringSSL is built from this
+      # environment, so pin it to the same toolset or the newer STL leaves __std_rotate unresolved.
       - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: '14.44'
       - uses: microsoft/setup-msbuild@v2
       - name: Toolchain (pinned Rust, as in natives/Dockerfile)
         run: |
