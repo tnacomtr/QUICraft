@@ -435,6 +435,62 @@ class OrderingCoreTest {
         fails(() -> h.scheduler.offer(end, 0));
     }
 
+    @Test void throwingDecoderLatchesTheSchedulerAsFailed() {
+        ReceiverScheduler scheduler = new ReceiverScheduler((e, inside, now) -> {
+            throw new IllegalStateException("decoder bug");
+        }, d -> { });
+        OrderingException thrown = assertThrows(OrderingException.class,
+                () -> scheduler.offer(e(C, 1, 0, 0, 0), 0));
+        assertEquals(0x11, thrown.closeCode());
+        assertTrue(thrown.getCause() instanceof IllegalStateException);
+        assertLatched(scheduler);
+    }
+
+    @Test void throwingHandlerLatchesTheSchedulerAsFailed() {
+        ReceiverScheduler[] ref = new ReceiverScheduler[1];
+        ref[0] = new ReceiverScheduler((e, inside, now) -> {
+            ref[0].reserveDecoded(e, 0, 0, now);
+            ref[0].decoded(e, Envelope.Bundle.NONE, false, null, now);
+        }, d -> {
+            throw new IllegalStateException("handler bug");
+        });
+        OrderingException thrown = assertThrows(OrderingException.class,
+                () -> ref[0].offer(e(C, 1, 0, 0, 0), 0));
+        assertTrue(thrown.getCause() instanceof IllegalStateException);
+        assertLatched(ref[0]);
+    }
+
+    @Test void orderingExceptionEscapingAHandlerAlsoLatches() {
+        ReceiverScheduler[] ref = new ReceiverScheduler[1];
+        ref[0] = new ReceiverScheduler((e, inside, now) -> {
+            ref[0].reserveDecoded(e, 0, 0, now);
+            ref[0].decoded(e, Envelope.Bundle.NONE, false, null, now);
+        }, d -> ref[0].applied(R, 1, 0));
+        fails(() -> ref[0].offer(e(C, 1, 0, 0, 0), 0));
+        assertLatched(ref[0]);
+    }
+
+    private static void assertLatched(ReceiverScheduler scheduler) {
+        OrderingException later = assertThrows(OrderingException.class,
+                () -> scheduler.offer(e(R, 1, 0, 0, 0), 0));
+        assertEquals("scheduler failed", later.getMessage());
+        assertEquals(0x11, later.closeCode());
+        assertThrows(OrderingException.class, () -> scheduler.checkDeadlines(0));
+        assertThrows(OrderingException.class, () -> scheduler.applied(C, 1, 0));
+        assertThrows(OrderingException.class, () -> scheduler.reservePartial(R, 1, 0));
+    }
+
+    @Test void blockedHeadStillTimesOutAfterManyDeadlineChecks() {
+        Harness h = new Harness();
+        for (int i = 1; i <= 500; i++) {
+            h.scheduler.offer(e(R, i, 1, i - 1, 0), 0);
+        }
+        for (int i = 0; i < 1000; i++) {
+            h.scheduler.checkDeadlines(T - 1);
+        }
+        fails(() -> h.scheduler.checkDeadlines(T));
+    }
+
     @Test void synchronousAcknowledgementsDoNotRecurseThroughHandlerStack() {
         ReceiverScheduler[] ref=new ReceiverScheduler[1]; int[] depth={0}, max={0};
         ref[0]=new ReceiverScheduler((e,inside,now) -> {

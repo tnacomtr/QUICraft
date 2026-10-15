@@ -129,6 +129,7 @@ public final class ReceiverScheduler {
     private long outstandingSince;
     private long pumpNow;
     private boolean pumping;
+    private boolean failed;
     private boolean ended;
     /** The admitted END, kept so auxiliary records it depends on can still arrive. */
     private Envelope endAdmitted;
@@ -147,6 +148,26 @@ public final class ReceiverScheduler {
         for (int i = 0; i < 3; i++) {
             queues.add(new ArrayDeque<Entry>());
         }
+    }
+
+    private void enter() {
+        if (failed) {
+            throw new OrderingException("scheduler failed");
+        }
+    }
+    /** Re-raises an ordering failure as is; any other exception is fatal and latches. */
+    private OrderingException escape(RuntimeException ex) {
+        if (ex instanceof OrderingException) {
+            return (OrderingException) ex;
+        }
+        return fatal(ex);
+    }
+    private OrderingException fatal(RuntimeException ex) {
+        failed = true;
+        if (ex instanceof OrderingException) {
+            return (OrderingException) ex;
+        }
+        return new OrderingException("unexpected failure: " + ex, ex);
     }
 
     /** Returns a snapshot of the committed contiguous watermarks in lane order. */
@@ -194,34 +215,49 @@ public final class ReceiverScheduler {
 
     /** Reserves a record slot and positive retained byte count at the first received byte. */
     public Partial reservePartial(Lane lane, long size, long now) {
-        checkDeadlines(now);
-        if (ended || lane == null || size <= 0 || !laneOpen(lane)) {
-            throw new OrderingException("invalid partial");
+        enter();
+        try {
+            checkDeadlines(now);
+            if (ended || lane == null || size <= 0 || !laneOpen(lane)) {
+                throw new OrderingException("invalid partial");
+            }
+            budget(lane, size, 1);
+            Partial p = new Partial(lane, size, now);
+            partials.put(p, Boolean.TRUE);
+            account(lane, size, 1);
+            return p;
+        } catch (RuntimeException ex) {
+            throw escape(ex);
         }
-        budget(lane, size, 1);
-        Partial p = new Partial(lane, size, now);
-        partials.put(p, Boolean.TRUE);
-        account(lane, size, 1);
-        return p;
     }
     /** Debits more bytes before retaining another fragment; the first-byte timer is unchanged. */
     public void growPartial(Partial p, long additionalBytes, long now) {
-        checkDeadlines(now);
-        requirePartial(p);
-        if (!laneOpen(p.lane)) {
-            throw new OrderingException("partial beyond END");
+        enter();
+        try {
+            checkDeadlines(now);
+            requirePartial(p);
+            if (!laneOpen(p.lane)) {
+                throw new OrderingException("partial beyond END");
+            }
+            budget(p.lane, additionalBytes, 0);
+            p.bytes += additionalBytes;
+            account(p.lane, additionalBytes, 0);
+        } catch (RuntimeException ex) {
+            throw escape(ex);
         }
-        budget(p.lane, additionalBytes, 0);
-        p.bytes += additionalBytes;
-        account(p.lane, additionalBytes, 0);
     }
 
     /** Releases a parser reservation whose bytes have been discarded by the owner. */
     public void releasePartial(Partial p, long now) {
-        checkDeadlines(now);
-        requirePartial(p);
-        partials.remove(p);
-        account(p.lane, -p.bytes, -1);
+        enter();
+        try {
+            checkDeadlines(now);
+            requirePartial(p);
+            partials.remove(p);
+            account(p.lane, -p.bytes, -1);
+        } catch (RuntimeException ex) {
+            throw escape(ex);
+        }
     }
     private void requirePartial(Partial p) {
         if (!partials.containsKey(p)) {
@@ -235,25 +271,35 @@ public final class ReceiverScheduler {
     }
     /** Admits opaque wire bytes only; no bundle classification or decompression is needed. */
     public void offer(Envelope e, long retainedBytes, long now) {
-        checkDeadlines(now);
-        validate(e, retainedBytes);
-        budget(e.lane(), retainedBytes, 1);
-        enqueue(e, retainedBytes, now);
+        enter();
+        try {
+            checkDeadlines(now);
+            validate(e, retainedBytes);
+            budget(e.lane(), retainedBytes, 1);
+            enqueue(e, retainedBytes, now);
+        } catch (RuntimeException ex) {
+            throw escape(ex);
+        }
     }
     /** Transfers an existing reservation without double-counting its record slot. */
     public void complete(Partial p, Envelope e, long retainedBytes, long now) {
-        checkDeadlines(now);
-        requirePartial(p);
-        if (p.lane != e.lane()) {
-            throw new OrderingException("partial lane mismatch");
+        enter();
+        try {
+            checkDeadlines(now);
+            requirePartial(p);
+            if (p.lane != e.lane()) {
+                throw new OrderingException("partial lane mismatch");
+            }
+            validate(e, retainedBytes);
+            if (retainedBytes > p.bytes) {
+                budget(p.lane, retainedBytes - p.bytes, 0);
+            }
+            partials.remove(p);
+            account(p.lane, -p.bytes, -1);
+            enqueue(e, retainedBytes, now);
+        } catch (RuntimeException ex) {
+            throw escape(ex);
         }
-        validate(e, retainedBytes);
-        if (retainedBytes > p.bytes) {
-            budget(p.lane, retainedBytes - p.bytes, 0);
-        }
-        partials.remove(p);
-        account(p.lane, -p.bytes, -1);
-        enqueue(e, retainedBytes, now);
     }
     /**
      * Before END every lane is open. After END is admitted, CONTROL is closed and an auxiliary lane
@@ -317,12 +363,39 @@ public final class ReceiverScheduler {
         }
         return true;
     }
+    /** Allocation-free mirror of {@link #eligible}: true when the queue has nothing to act on. */
+    private boolean blocked(ArrayDeque<Entry> q) {
+        long provisional = delivered[0];
+        boolean bundle = false;
+        boolean first = true;
+        for (Entry entry : q) {
+            if (!ready(entry.envelope, provisional)) {
+                return true;
+            }
+            if (entry.decoded == null) {
+                return false;
+            }
+            Envelope e = entry.decoded;
+            if (bundle && e.kind() == Envelope.Kind.END) {
+                throw new OrderingException("END inside bundle");
+            }
+            if (first) {
+                first = false;
+                bundle = e.bundle() == Envelope.Bundle.OPEN;
+            }
+            if (!bundle || e.bundle() == Envelope.Bundle.CLOSE) {
+                return false;
+            }
+            provisional = e.sequence();
+        }
+        return true;
+    }
     private Candidate eligible(ArrayDeque<Entry> q) {
         if (q.isEmpty()) {
             return null;
         }
-        Candidate candidate = new Candidate();
-        List<Envelope> unit = new ArrayList<Envelope>();
+        Candidate candidate;
+        List<Envelope> unit = null;
         long provisional = delivered[0];
         boolean bundle = false;
         for (Entry entry : q) {
@@ -330,6 +403,7 @@ public final class ReceiverScheduler {
                 return null;
             }
             if (entry.decoded == null) {
+                candidate = new Candidate();
                 candidate.decode = entry;
                 return candidate;
             }
@@ -337,11 +411,13 @@ public final class ReceiverScheduler {
             if (bundle && e.kind() == Envelope.Kind.END) {
                 throw new OrderingException("END inside bundle");
             }
-            if (unit.isEmpty()) {
+            if (unit == null) {
+                unit = new ArrayList<Envelope>();
                 bundle = e.bundle() == Envelope.Bundle.OPEN;
             }
             unit.add(e);
             if (!bundle || e.bundle() == Envelope.Bundle.CLOSE) {
+                candidate = new Candidate();
                 candidate.delivery = new Delivery(unit);
                 return candidate;
             }
@@ -371,12 +447,20 @@ public final class ReceiverScheduler {
                 if (next.decode != null) {
                     decoding = next.decode;
                     decodingSince = pumpNow;
-                    decoder.decode(decoding.envelope,
-                            receivingBundle && decoding.envelope.lane() == Lane.CONTROL, pumpNow);
+                    try {
+                        decoder.decode(decoding.envelope,
+                                receivingBundle && decoding.envelope.lane() == Lane.CONTROL, pumpNow);
+                    } catch (RuntimeException ex) {
+                        throw fatal(ex);
+                    }
                 } else {
                     outstanding = next.delivery;
                     outstandingSince = pumpNow;
-                    handler.deliver(outstanding);
+                    try {
+                        handler.deliver(outstanding);
+                    } catch (RuntimeException ex) {
+                        throw fatal(ex);
+                    }
                 }
             }
         } finally {
@@ -393,20 +477,25 @@ public final class ReceiverScheduler {
      */
     public void reserveDecoded(Envelope envelope, long additionalRetainedBytes,
                               int totalUncompressedBytes, long now) {
-        checkDeadlines(now);
-        if (decoding == null || decoding.envelope != envelope
-                || totalUncompressedBytes < 0 || totalUncompressedBytes > 8 * 1024 * 1024) {
-            throw new OrderingException("ineligible/oversized decode");
+        enter();
+        try {
+            checkDeadlines(now);
+            if (decoding == null || decoding.envelope != envelope
+                    || totalUncompressedBytes < 0 || totalUncompressedBytes > 8 * 1024 * 1024) {
+                throw new OrderingException("ineligible/oversized decode");
+            }
+            if (receivingBundle && envelope.lane() == Lane.CONTROL
+                    && bundleUncompressed + totalUncompressedBytes > 8L * 1024 * 1024) {
+                throw new OrderingException("decoded bundle bounds");
+            }
+            budget(envelope.lane(), additionalRetainedBytes, 0);
+            decoding.bytes += additionalRetainedBytes;
+            decoding.uncompressed = totalUncompressedBytes;
+            decoding.decodeReserved = true;
+            account(envelope.lane(), additionalRetainedBytes, 0);
+        } catch (RuntimeException ex) {
+            throw escape(ex);
         }
-        if (receivingBundle && envelope.lane() == Lane.CONTROL
-                && bundleUncompressed + totalUncompressedBytes > 8L * 1024 * 1024) {
-            throw new OrderingException("decoded bundle bounds");
-        }
-        budget(envelope.lane(), additionalRetainedBytes, 0);
-        decoding.bytes += additionalRetainedBytes;
-        decoding.uncompressed = totalUncompressedBytes;
-        decoding.decodeReserved = true;
-        account(envelope.lane(), additionalRetainedBytes, 0);
     }
 
     /**
@@ -420,92 +509,107 @@ public final class ReceiverScheduler {
      */
     public void decoded(Envelope envelope, Envelope.Bundle classification,
                         boolean changesStateCompressionOrActivation, Object body, long now) {
-        checkDeadlines(now);
-        if (decoding == null || decoding.envelope != envelope || !decoding.decodeReserved
-                || classification == null) {
-            throw new OrderingException("unexpected decode result");
-        }
-        boolean control = envelope.lane() == Lane.CONTROL;
-        if (!control && (classification != Envelope.Bundle.NONE || changesStateCompressionOrActivation)) {
-            throw new OrderingException("wrong lane for bundle/state change");
-        }
-        if (control) {
-            if (receivingBundle) {
-                if (changesStateCompressionOrActivation || (classification != Envelope.Bundle.MEMBER
-                        && classification != Envelope.Bundle.CLOSE)) {
-                    throw new OrderingException("invalid member or nested bundle");
-                }
-                if (classification == Envelope.Bundle.MEMBER
-                        && bundleMembers == SenderSequencer.MAX_BUNDLE_MEMBERS) {
-                    throw new OrderingException("bundle member count");
-                }
-                bundleUncompressed += decoding.uncompressed;
-                if (classification == Envelope.Bundle.MEMBER) {
-                    bundleMembers++;
-                } else {
-                    receivingBundle = false;
-                }
-            } else if (classification == Envelope.Bundle.OPEN) {
-                if (changesStateCompressionOrActivation) {
-                    throw new OrderingException("state-changing delimiter");
-                }
-                receivingBundle = true;
-                bundleStarted = now;
-                bundleMembers = 0;
-                bundleUncompressed = decoding.uncompressed;
-            } else if (classification != Envelope.Bundle.NONE) {
-                throw new OrderingException("unexpected bundle member/delimiter");
+        enter();
+        try {
+            checkDeadlines(now);
+            if (decoding == null || decoding.envelope != envelope || !decoding.decodeReserved
+                    || classification == null) {
+                throw new OrderingException("unexpected decode result");
             }
+            boolean control = envelope.lane() == Lane.CONTROL;
+            if (!control && (classification != Envelope.Bundle.NONE || changesStateCompressionOrActivation)) {
+                throw new OrderingException("wrong lane for bundle/state change");
+            }
+            if (control) {
+                if (receivingBundle) {
+                    if (changesStateCompressionOrActivation || (classification != Envelope.Bundle.MEMBER
+                            && classification != Envelope.Bundle.CLOSE)) {
+                        throw new OrderingException("invalid member or nested bundle");
+                    }
+                    if (classification == Envelope.Bundle.MEMBER
+                            && bundleMembers == SenderSequencer.MAX_BUNDLE_MEMBERS) {
+                        throw new OrderingException("bundle member count");
+                    }
+                    bundleUncompressed += decoding.uncompressed;
+                    if (classification == Envelope.Bundle.MEMBER) {
+                        bundleMembers++;
+                    } else {
+                        receivingBundle = false;
+                    }
+                } else if (classification == Envelope.Bundle.OPEN) {
+                    if (changesStateCompressionOrActivation) {
+                        throw new OrderingException("state-changing delimiter");
+                    }
+                    receivingBundle = true;
+                    bundleStarted = now;
+                    bundleMembers = 0;
+                    bundleUncompressed = decoding.uncompressed;
+                } else if (classification != Envelope.Bundle.NONE) {
+                    throw new OrderingException("unexpected bundle member/delimiter");
+                }
+            }
+            decoding.decoded = new Envelope(envelope.lane(), envelope.kind(), envelope.sequence(),
+                    envelope.dependencies(), envelope.bodyLength(), body, classification,
+                    changesStateCompressionOrActivation);
+            decoding = null;
+            pump(now);
+        } catch (RuntimeException ex) {
+            throw escape(ex);
         }
-        decoding.decoded = new Envelope(envelope.lane(), envelope.kind(), envelope.sequence(),
-                envelope.dependencies(), envelope.bodyLength(), body, classification,
-                changesStateCompressionOrActivation);
-        decoding = null;
-        pump(now);
     }
     /** Commits the single outstanding unit after application, then retries eligible heads. */
     public void applied(Lane lane, long sequence, long now) {
-        checkDeadlines(now);
-        if (outstanding == null || lane != outstanding.lane() || sequence != outstanding.sequence()) {
-            throw new OrderingException("unexpected handler acknowledgement");
-        }
-        for (Envelope e : outstanding.records()) {
-            Entry entry = queues.get(lane.ordinal()).remove();
-            account(lane, -entry.bytes, -1);
-            if (e.kind() == Envelope.Kind.END) {
-                ended = true;
+        enter();
+        try {
+            checkDeadlines(now);
+            if (outstanding == null || lane != outstanding.lane() || sequence != outstanding.sequence()) {
+                throw new OrderingException("unexpected handler acknowledgement");
             }
+            for (Envelope e : outstanding.records()) {
+                Entry entry = queues.get(lane.ordinal()).remove();
+                account(lane, -entry.bytes, -1);
+                if (e.kind() == Envelope.Kind.END) {
+                    ended = true;
+                }
+            }
+            delivered[lane.ordinal()] = sequence;
+            outstanding = null;
+            markHeads(now);
+            pump(now);
+        } catch (RuntimeException ex) {
+            throw escape(ex);
         }
-        delivered[lane.ordinal()] = sequence;
-        outstanding = null;
-        markHeads(now);
-        pump(now);
     }
 
     /** Checks all resource/ordering deadlines without advancing or releasing any watermark. */
     public void checkDeadlines(long now) {
-        if (decoding != null && now - decodingSince >= TIMEOUT_NANOS) {
-            throw new OrderingException("uncompleted decode timeout");
-        }
-        if (receivingBundle && now - bundleStarted >= TIMEOUT_NANOS) {
-            throw new OrderingException("missing bundle close timeout");
-        }
-        if (outstanding != null && now - outstandingSince >= TIMEOUT_NANOS) {
-            throw new OrderingException("unapplied handler timeout");
-        }
-        for (Partial p : partials.keySet()) {
-            if (now - p.started >= TIMEOUT_NANOS) {
-                throw new OrderingException("incomplete record timeout");
+        enter();
+        try {
+            if (decoding != null && now - decodingSince >= TIMEOUT_NANOS) {
+                throw new OrderingException("uncompleted decode timeout");
             }
-        }
-        for (ArrayDeque<Entry> q : queues) {
-            Entry head = q.peek();
-            if (head != null && eligible(q) == null
-                    && (outstanding == null || outstanding.lane() != head.envelope.lane())
-                    && (decoding == null || decoding.envelope.lane() != head.envelope.lane())
-                    && now - head.headSince >= TIMEOUT_NANOS) {
-                throw new OrderingException("blocked head/bundle timeout");
+            if (receivingBundle && now - bundleStarted >= TIMEOUT_NANOS) {
+                throw new OrderingException("missing bundle close timeout");
             }
+            if (outstanding != null && now - outstandingSince >= TIMEOUT_NANOS) {
+                throw new OrderingException("unapplied handler timeout");
+            }
+            for (Partial p : partials.keySet()) {
+                if (now - p.started >= TIMEOUT_NANOS) {
+                    throw new OrderingException("incomplete record timeout");
+                }
+            }
+            for (ArrayDeque<Entry> q : queues) {
+                Entry head = q.peek();
+                if (head != null && now - head.headSince >= TIMEOUT_NANOS
+                        && (outstanding == null || outstanding.lane() != head.envelope.lane())
+                        && (decoding == null || decoding.envelope.lane() != head.envelope.lane())
+                        && blocked(q)) {
+                    throw new OrderingException("blocked head/bundle timeout");
+                }
+            }
+        } catch (RuntimeException ex) {
+            throw escape(ex);
         }
     }
 }
