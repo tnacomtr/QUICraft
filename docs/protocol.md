@@ -537,9 +537,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
 ### QUICraft's Netty QUIC build
 
 `core` doesn't use Maven Central's `netty-codec-classes-quic`. It uses QUICraft's build,
-`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft3` from
+`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft4` from
 `natives/`. That is Netty `netty-4.2.19.Final` (64cc10f3), quiche `be47c501` and BoringSSL
-`d03dbc3e`, the same revisions as upstream 4.2.19, plus five patches:
+`d03dbc3e`, the same revisions as upstream 4.2.19, plus six patches:
 
 | Patch | What it does |
 | --- | --- |
@@ -547,6 +547,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 | `netty/0001-relaxed-loss-threshold` | `QuicCodecBuilder.relaxedLossThreshold(boolean)`, its JNI binding, and `Quic.isRelaxedLossThresholdSupported()`, which probes the loaded native. |
 | `netty/0002-complete-connect-after-handshake-send` | Completes a client connect as soon as the handshake does (§5), in a task on the connection's event loop. |
 | `netty/0003-server-reads-accepted-early-data` | A server that accepted 0-RTT reads early stream data before the handshake completes: the connection is active during early data, and after the send that decrypts a buffered 0-RTT packet it processes the readable streams. Java only, so it works with upstream natives too. `SslHandshakeCompletionEvent` still marks the completed handshake. |
+| `netty/0004` | TLS keying material exporter accessor and capability probe, with JNI `SSL_export_keying_material` (12.2). Netty-only patch; the patched native is available only on linux-x86_64. |
 | `quiche/0002-backport-fc9fe129-handshake-close` | Upstream quiche fc9fe129 (2026-09-25), unchanged. Without it, an application close sent after the client's handshake completed but before HANDSHAKE_DONE (the window netty/0002 opens) never goes out, and the send loop spins forever. |
 
 - `natives/build-linux.sh` runs Netty's own Maven build unchanged in Docker, on AlmaLinux 8 with
@@ -557,7 +558,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
   linux-x86_64 only, and the other four platforms use upstream Netty's native. A patched class
   with an upstream native still works: the extra JNI method is simply unbound.
   `Quic.isRelaxedLossThresholdSupported()` then returns false, and core leaves quiche's default
-  in place after one INFO line. `testUpstreamNative` checks this combination on every build.
+  in place after one INFO line. The exporter probe also returns false with upstream
+  natives, disabling `/3` under 12.3 rather than attempting the unbound exporter JNI call.
+  `testUpstreamNative` checks this combination on every build.
   `.github/workflows/netty-quic-natives.yml` builds all five platforms, but has not run yet.
 - **glibc.** The Linux native built on AlmaLinux 8 needs glibc 2.28 (`statx`), where upstream's
   needs 2.16. On an older system it fails to load, and the endpoint runs TCP-only (above).
@@ -577,15 +580,15 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 1. **12.1 Compatibility.** Sections 12 and 13 describe only the proposed `quicraft/3`
    ALPN. They MUST NOT change shipped `quicraft/2` (v1), its preamble version 1,
-   encryption, 0-RTT, stream counts, or TCP. No implementation or enablement is authorized
-   by this draft. Initially only reviewed 26.x Fabric client/dedicated-server adapters may
+   encryption, 0-RTT, stream counts, or TCP. Guarded implementation is authorized only
+   behind a disabled-by-default flag; security review is required before enablement or
+   release. Initially only reviewed 26.x Fabric client/dedicated-server adapters may
    enable it; Velocity remains single-stream until Phase 7.
 2. **12.2 Exporter availability.** Upstream Netty QUIC exposes no TLS exporter. The required
-   new Netty-only `natives/patches/netty/0004` patch must bind BoringSSL's
-   `SSL_export_keying_material` through JNI and `BoringSSL.java`, expose an accessor on
-   `QuicheQuicChannel` restricted to that channel's event loop, and provide
-   `Quic.isKeyingMaterialExportSupported()`. Its build version must become `quicraft4`.
-   This is a prerequisite, not a claim that §11's quicraft3 implements it. Only linux-x86_64
+   Netty-only `natives/patches/netty/0004` patch binds BoringSSL's
+   `SSL_export_keying_material` through JNI and `BoringSSL.java`, exposes an accessor on
+   `QuicheQuicChannel` restricted to that channel's event loop, and provides
+   `Quic.isKeyingMaterialExportSupported()` in §11's `quicraft4` build. Only linux-x86_64
    currently has a patched native; linux-aarch_64, osx-x86_64, osx-aarch_64 and
    windows-x86_64 use upstream natives. Ship and test patched natives for all five platforms
    before enabling this feature on all five; enable a platform only after its own native
@@ -593,7 +596,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
 3. **12.3 Gate before negotiation.** Both peers MUST have a true exporter capability probe
    and a supported routing table before advertising/offering `/3`, even for the offline
    test profile. A peer without either uses `/2`, retains Minecraft's cipher in online
-   mode, and uses one stream. No native at all retains §11's TCP-only behavior. An exporter
+   mode, and uses one stream (except a client facing a changed pin, which uses fresh TCP
+   under 12.16). No native at all retains §11's TCP-only behavior. An exporter
    error after `/3` selection is fatal, not permission to continue cipher-off or to silently
    renegotiate that connection. A false capability probe is an ordinary compatibility
    condition, logged once at INFO, not a binding failure.
@@ -621,7 +625,14 @@ single-socket listener: no dispatcher is installed and the connection id length 
    length = 32)` using the RFC 8446 §7.5 normal exporter, with context explicitly supplied
    (JNI `use_context = 1`, context length 0), never the early exporter. Define
    `T = SHA256("quicraft/3 binding v2" || u32(protocol_number) || u8(mode) || F || R)`.
-   `mode = 1` means online, `0` offline; `F` is SHA-256 of the actual leaf certificate DER
+   `mode = 1` requires Hello's `shouldAuthenticate=true`, successful client `joinServer`
+   and successful server `hasJoined`; `mode = 0` requires no Minecraft encryption at all.
+   Encrypted-but-unauthenticated login MUST never offer `/3` or MUST close it with `0x10`.
+   The client aborts `/3` at the first login packet showing authentication is absent
+   (including Hello with `shouldAuthenticate=false`, or Login Success without authenticated
+   encryption), before processing configuration. Apply offline handling in 12.16/12.19;
+   do not infer authentication merely from possession of `S`.
+   `F` is SHA-256 of the actual leaf certificate DER
    (or the original ticket-associated certificate on resumption); `R` is the routing
    resource digest in 13.7. Both peers calculate these locally and reject differing inputs.
 8. **12.8 Plugin-message format.** Use configuration Custom Payload packets on channel
@@ -632,6 +643,13 @@ single-socket listener: no dispatcher is installed and the connection id length 
    3 CLIENT_SWITCH, 4 SERVER_SWITCH. OFFER has an all-zero tag; every other online tag is
    `HMAC-SHA256(K, "quicraft binding v2 message" || u8(kind) || T || E)`.
    Distinct kinds provide direction and phase separation. No bare tag is a valid packet.
+   `protocol_number` MUST be in unsigned 32-bit range (0..4294967295); reject values outside
+   that range before encoding, never truncate or wrap. The transport MUST catch exporter
+   errors (including native exceptions) and wrong-length values (anything other than 32
+   bytes) and close `/3` with `0x10`, never allow an exception to bypass fail-closed handling.
+   Outside `/3`, `quicraft:binding` payloads MUST trigger no binding, pin, cipher, framing
+   or transport action. Velocity (Phase 7) MUST strip this channel in both directions,
+   including backend forwarding, so an unrelated endpoint cannot drive a binding exchange.
 9. **12.9 Validation.** Accept exactly OFFER, CLIENT_PROOF, SERVER_PROOF, CLIENT_SWITCH,
    SERVER_SWITCH, in that order, one each, in the specified direction and configuration
    state. Client responds only to a matching OFFER; server sends SERVER_PROOF only after
@@ -667,6 +685,12 @@ single-socket listener: no dispatcher is installed and the connection id length 
     remain untouched until the cipher/parser transition; split reads must produce the same
     result. Pending encrypted writes remain encrypted, and queued ordinary packets are
     encoded anew as records after activation. Do not reset or reuse CFB8 on another stream.
+    Install the boundary-aware decoder on the client before it sends CLIENT_SWITCH and
+    on the server before it sends OFFER: vanilla's cipher decoder decrypts the entire
+    readable buffer and is not safe at this boundary. In 12.11/12.12 remove only the
+    cipher handlers, not vanilla's authenticated-encryption state. `Connection.isEncrypted()`
+    (or that version's equivalent) MUST remain true after online cutover so profile keys,
+    chat signing and tab-list behavior remain vanilla.
 
 ### Failure, pins and rotation
 
@@ -680,27 +704,74 @@ single-socket listener: no dispatcher is installed and the connection id length 
     to one warning per minute per listener; client logs once per failed attempt. Logs contain
     no secrets, exporter values, tags or payload dumps. Do not retry cipher-off, continue
     half-switched, or automatically replay the authenticated login over TCP. A subsequent
-    player-initiated join may use TCP under §6, with vanilla encryption. Pre-login racing
-    and compatibility fallback remain §5 behavior.
+    player-initiated join may use TCP under §6, with vanilla encryption. The sole named
+    exception is the **changed-pin re-bind TCP retry** in 12.16; it is not available to an
+    ordinary activation failure. This preserves TCP join availability without an unsafe
+    live downgrade: ordinary failures disconnect this attempt, never prevent the next TCP
+    join. Pre-login racing and compatibility fallback remain §5 behavior.
 15. **12.15 Pin persistence.** Only the client, after valid SERVER_SWITCH in online mode,
     records an authenticated pin. Store in its config directory `quicraft/pins-v2.json`,
     schema version 1: entries contain normalized logical host (lowercase IDNA ASCII, or
     canonical literal IP), original logical TCP port, lowercase `sha256:` hex fingerprint,
     first-bound and last-bound UTC timestamps. Do not key pins by SRV target or transient
     resolved IP. Write via temporary file and atomic replacement with owner-only permissions
-    where supported. v1 silent observations MUST NOT be promoted to authenticated pins.
+    where supported. An authenticated pin means only "the last endpoint at this name that
+    completed an authenticated login", not proven server identity (12.20). v1 silent
+    observations MUST NOT be promoted to authenticated pins.
     A corrupt/unreadable existing pin file or failed write disables `/3` until repaired;
     notify the player and use `/2` or TCP on the next attempt, never silently treat corruption
     as first contact. A write failure after activation closes the current connection with
-    `0x10`; do not attempt a live transport downgrade.
-16. **12.16 Changed fingerprint.** With an existing authenticated pin, a different advertised
-    fingerprint MUST NOT be silently accepted: discard tickets/tokens/recorded flights for
-    that logical server, notify the player that the identity changed, and use vanilla TCP
-    for this join (or fail in `quic-only`). Leave the pin unchanged. Rotation requires an
-    explicit player action authorizing a new online-bound attempt, with old/new fingerprints
-    displayed; that attempt uses a full handshake, no early data, and replaces the pin only
-    after 12.15. Failed rotation preserves the old pin. No automatic overlap or unsigned
-    rotation message is trusted; deleting a pin requires explicit confirmation too.
+    `0x10`; do not attempt a live transport downgrade. Only a changed-pin re-bind may then
+    use 12.16's fresh TCP retry, after closing QUIC.
+16. **12.16 Changed fingerprint.** With an existing authenticated pin (online mode, 12.15), a
+    different advertised fingerprint F' MUST NOT be trusted from the ping. The client
+    bypasses (but retains) tickets, tokens and recorded flights for that logical server,
+    tells the player the fingerprint changed (a notice naming old and new fingerprints,
+    not a prompt, at most once per logical server/new fingerprint), and
+    makes ONE automatic re-binding attempt: full handshake, no early data, `/3`, the
+    binding exchange of 12.4-12.12 with `F = F'` in `T`. The pin is replaced only after
+    SERVER_SWITCH verifies (12.15); the old pin stays until then. **Pre-connect precedence:**
+    the re-bind needs `/3`, so if a 12.3 prerequisite is missing before any QUIC connection
+    is created (no exporter capability, no supported routing table, or an absent, unknown or
+    mismatched advertised routing digest under 13.1), the client neither selects `/2` nor
+    trusts F': it leaves the pin unchanged, records §6's failure-cache entry and re-bind
+    backoff, and joins over fresh vanilla TCP directly (`quic-only` fails). This overrides
+    12.3/13.1's `/2` selection for a changed pin only; `0x10` is sent only when a `/3`
+    connection exists. Any failure after connection creation (binding,
+    exporter error, timeout, write failure) closes with `0x10`, leaves the pin
+    unchanged, records §6's failure-cache entry, and invokes the **changed-pin re-bind TCP
+    retry**, the sole exception to 12.14's no-automatic-replay rule: close the failed QUIC
+    connection first with `0x10`, then start a fresh vanilla TCP join with a new Login Start
+    and a new Mojang session join (when online). Never transfer old login state or `S`.
+    This exception applies only to this re-bind attempt, never ordinary activation failures;
+    `quic-only` instead fails. Wait for OFFER at most twice the measured QUIC handshake RTT,
+    clamped to 500 ms..3 s, from entering configuration (use the transport's measured RTT
+    at handshake confirmation); this replaces 12.14's 10-second
+    missing-OFFER wait for re-binding only. The total activation deadline remains 10 seconds.
+    At most one automatic attempt per persisted re-bind backoff window: use §6's exponential
+    schedule but key it exactly like the pin (normalized logical host, logical port),
+    ignoring fingerprint so rotating fingerprints cannot reset it. During backoff use TCP.
+    Replace the pin and discard the logical server's old tickets/tokens/recorded flights
+    only after binding and atomic pin persistence succeed; failure retains them unused.
+    Persist re-bind backoff and notice-deduplication state across restarts. Bound pins and
+    backoff to 4096 logical-server entries each, and detailed notices to 16 fingerprints
+    per server (65536 total). Never automatically evict pins: when the pin store is full,
+    use TCP for new names until the player explicitly deletes a pin. For backoff and
+    detailed notices, evict least-recently-used entries when full. Never evict an active
+    attempt's state; if no entry can be evicted, use TCP without a re-bind. To preserve
+    at-most-once notices after detailed-history eviction, also persist a fixed 1 MiB
+    monotone Bloom filter of (normalized logical host, logical port, new fingerprint).
+    Before showing a notice, atomically mark that tuple in the filter; if already marked,
+    suppress it. Never automatically clear filter bits; false positives may suppress a
+    notice but cannot repeat one. If this state cannot be read/written reliably, suppress
+    notices and use TCP, rather than risk repeated prompts or reset backoff. Include the
+    filter and detailed state in the atomic persistence discipline of 12.15.
+    If login now lacks authentication (including encrypted-but-unauthenticated login),
+    abort `/3` as in 12.7, keep the old pin and use the same fresh TCP retry, with any notice
+    subject to the same deduplication;
+    no mode-0 exchange is allowed for this re-bind. Deleting a pin still requires explicit
+    player confirmation. Offline-mode pins
+    (Phase 9 TOFU) are out of scope here and keep an explicit-action rotation.
 
 ### Resumption, offline mode and threat model
 
@@ -711,6 +782,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
     of that Minecraft secret on the same resumed TLS connection, anchored to the certificate
     associated with the ticket; it does not prove a fresh certificate was presented. Missing
     ticket provenance requires a full handshake. Reject stale/changed-pin tickets before use.
+    Require TLS 1.3 resumption with `psk_dhe_ke` only; disable PSK-only `psk_ke` so resumed
+    connections retain forward secrecy. Rotate ticket keys with the certificate, invalidating
+    old tickets; otherwise honest resumed bindings can fail against the new certificate
+    fingerprint (an availability failure, not permission to bypass binding).
 18. **12.18 Early data and replay.** `/3` permits only the preamble, Minecraft handshake and
     Login Start as early bytes, with §8's single-use tokens, duplicate removal, confirmation
     deadline and abandoned-login handling unchanged. No binding payload, encryption response,
@@ -720,7 +795,11 @@ single-socket listener: no dispatcher is installed and the connection id length 
     successful binding as permission to skip the next check.
 19. **12.19 Offline mode.** Offline login has no Mojang-authenticated `S`: do not derive `K`,
     claim binding, or create/update authenticated pins. Minecraft's cipher is already off,
-    exactly as vanilla; no cipher is being dropped. For explicit offline `/3` testing,
+    exactly as vanilla; no cipher is being dropped. Mode 0 is legal only if no Minecraft
+    encryption occurred at all; encrypted-but-unauthenticated sessions fail with `0x10`,
+    never mode 0. The client no-authentication abort in 12.7 applies in production; the
+    explicit offline test flag alone may allow an unencrypted login to reach this exchange,
+    and never overrides 12.16's existing-pin handling. For explicit offline `/3` testing,
     use the same five-message exchange with mode 0 and all-zero tags, still enforcing TLS
     confirmation, metadata, state, deadlines and byte boundaries. It negotiates framing only,
     not identity. Never accept mode 0 for a connection authenticated in online mode, or as a
@@ -735,6 +814,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
     endpoints/session services, or stolen Minecraft/TLS secrets. Offline first contact remains
     vulnerable to active MITM. No WebPKI validation, per-stream CFB8, exporter-derived Minecraft
     secret, TCP-first authentication or live TCP-to-QUIC handover is introduced.
+    Binding authenticates the Minecraft login's co-location with this TLS endpoint, not
+    ownership of the logical server name. Pins have only 12.15's last-authenticated-endpoint
+    meaning. A cluster with per-node certificates may therefore show repeated fingerprint
+    notices as nodes alternate; those notices are informational only, not identity verdicts.
 
 ## 13. Multi-stream (Phase 5)
 
@@ -744,10 +827,19 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 1. **13.1 Version selection.** Keep the advertisement object version `v:1`; a capable,
    explicitly enabled server advertises `alpn:"quicraft/3"`. Such a listener accepts both
-   `/3` and `/2`; a capable client offers the advertised ALPN only. Existing clients that
+   `/3` and `/2`; a capable client offers the advertised ALPN only, except for the explicit
+   pre-connect `/2` compatibility selection below. Existing clients that
    do not recognize `/3` use TCP; new clients seeing `/2` use unchanged v1. A failed `/3`
    handshake races/falls back under §5, never sends a v2 preamble to a `/2` peer, and never
    alters the TCP listener. No feature is inferred from a plugin payload on `/2`.
+   Add optional advertisement field `routing` containing an object mapping decimal unsigned
+   protocol-number strings to lowercase `sha256:` hex routing-resource digests (13.7).
+   Vanilla ignores it; obey §1's response-size cap. Before connecting, clients require a
+   matching digest for their protocol to select `/3`; absent/unknown/mismatched entries
+   select `/2` if supported by that listener, otherwise TCP (a changed pin instead uses
+   fresh TCP, 12.16). Never guess a routing table.
+   A `/3` advertisement's listener MUST also accept `/2` for this compatibility selection.
+   OFFER's digest comparison remains authoritative even after an advertisement match.
 2. **13.2 Preamble.** Under `/3` only, stream 0 begins in each direction with exactly
    `VarInt(length) || u8(version=2) || u8(token_length) || token`; token length is 0 or 16,
    length exactly 2 or 18. Retain §8's token semantics. Unknown version/length is `0x1`.
@@ -761,9 +853,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
    streams for `/3` only. No unidirectional streams, datagrams, replacement streams or other
    ids are permitted. WORLD and REALTIME each start in each direction with
    `u8(version=2) || u8(type)` where type is 1 REALTIME or 2 WORLD; CONTROL has no second
-   preamble. A receiver may buffer early auxiliary bytes until its own activation, under
-   13.12's bounds, but must not deliver them before it validates SERVER_SWITCH (client) or
-   CLIENT_SWITCH and queues SERVER_SWITCH (server).
+   preamble. Only the client may buffer early stream-1 bytes until it validates
+   SERVER_SWITCH, under 13.12's bounds, without delivery. The server MUST treat any
+   stream-4 frame before its own activation (CLIENT_SWITCH validated and SERVER_SWITCH
+   queued) as fatal `0x11`, not buffer it. Stream 4 cannot legitimately precede that point.
 
 ### Records, control and routing data
 
@@ -773,7 +866,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
    includes the 33-byte fixed header. Kind 0 is one GAME packet; body is exactly one
    Minecraft VarInt-length frame including packet id and the negotiated compression wrapper,
    without CFB8. Kind 1 is END, CONTROL only, with empty body. Reject unknown kinds,
-   trailing bytes, invalid inner lengths or a record longer than 8 MiB + 33 bytes.
+   trailing bytes, invalid inner lengths or `record_length > 33 + 3 + 2097151`
+   (2097187 bytes): 33 header bytes plus at most a three-byte Minecraft length prefix
+   and 2097151 bytes of framed packet content. Validate this before allocating the body.
    Sequence starts at 1 independently per stream and direction and increments by exactly
    one per record, including END; zero dependencies mean no predecessor. No integer wraps.
 5. **13.5 CONTROL semantics.** State transitions (including Finish Configuration and
@@ -789,8 +884,11 @@ single-socket listener: no dispatcher is installed and the connection id length 
    Minecraft protocol number, protocol state, direction and numeric packet id. Missing entries
    default to CONTROL, never an inferred category. The receiver checks the selected lane
    against the same table after dependencies permit decoding; wrong-lane packets disconnect.
-   Unknown protocol numbers disable `/3` before connecting; unequal table digests discovered
-   in OFFER fail activation under 12.14 before entering play, not a guessed routing table.
+   Unknown protocol numbers disable `/3` before connecting. Check advertised digests under
+   13.1 before choosing `/3`; unequal digests in OFFER still fail activation under 12.14
+   before entering play, never use a guessed routing table. A post-login routing mismatch
+   therefore disconnects only when a previously matching advertisement was stale (including
+   a changed or falsified advertisement), not as normal compatibility negotiation.
    Runtime packet-id remappers/modded registries require an explicitly
    matching reviewed table or stay `/2`.
 7. **13.7 Data resource.** Store routing as UTF-8 JSON data, one resource per protocol number,
@@ -851,7 +949,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
     Cap each decompressed packet at 8 MiB or the game's stricter limit. Count parser buffers,
     staged bundles and decompression output in these budgets, not just complete envelopes.
     Reserve a further 1 MiB receive budget for CONTROL so blocked auxiliary queues cannot
-    prevent reading small control predecessors; aggregate cap is 17 MiB. A predecessor
+    prevent reading small control predecessors; aggregate cap is 17 MiB. Within the 1024
+    pending-record cap, reserve 64 slots exclusively for CONTROL (at most 960 auxiliary
+    records, including partial/pre-activation records). A predecessor
     larger than the remaining budget disconnects rather than evicting buffered data.
     Stop granting auxiliary credit
     before exceeding its budget; if data already received cannot fit, close, never evict
@@ -863,16 +963,38 @@ single-socket listener: no dispatcher is installed and the connection id length 
     timeout. Start the incomplete-record timer at its first byte and the blocked-head timer
     when it becomes head; progress on other lanes does not restart either deadline. This
     deliberately favors disconnect over an undetected game desync.
+    These are ceilings, not eager allocations. Each listener/node MUST also enforce a
+    configured aggregate pending-bytes budget across connections, counting all retained
+    buffers/decoded data above. Reserve each admitted connection's initial receive-credit
+    exposure against that budget, and refuse new QUIC admissions when the reservation
+    cannot fit (leave TCP untouched). Debit further credit/allocations before granting
+    them; release reservations only when credit exposure or retained bytes are gone.
+    No allocation or advertised receive credit may overcommit this node budget. Record
+    the configured budget and admission behavior in the 13.17 scale benchmark.
 
 ### Flow control, resets, bundles and compression
 
-13. **13.13 Transport limits.** `/3` sets `initial_max_data=16 MiB`, both bidi per-stream
-    limits to 4 MiB, `initial_max_streams_bidi=2` at the server (client streams 0 and 4),
+13. **13.13 Transport limits.** For clientbound traffic `/3` sets `initial_max_data=16 MiB`
+    and both bidi per-stream initial limits to 8 KiB (grow up to 4 MiB only against budgets).
+    For serverbound traffic use small windows: the server advertises
+    `initial_max_data=256 KiB` and both bidi per-stream initial limits of 8 KiB.
+    These windows may grow only against the budgets below, including while
+    receiving a legal record larger than its initial window. Set
+    `initial_max_streams_bidi=2` at the server (client streams 0 and 4),
     `=1` at the client (server stream 1), and both uni limits to 0. Never increase MAX_STREAMS;
     grow MAX_DATA/MAX_STREAM_DATA only against uncommitted bounded receive budget, reserving
-    CONTROL capacity as in 13.12, and reclaim that budget after delivery. In particular,
-    extend credit for a partial record larger than the initial 4 MiB window when it fits
-    the remaining budget; do not wait for complete-record delivery to extend that window.
+    both CONTROL byte capacity and its 64 record slots as in 13.12, and reclaim that budget
+    after delivery. When granting auxiliary credit, account for outstanding credit as
+    well as retained bytes and both reservations; if record count is not yet known, reserve
+    for the maximum number of minimum-size records that credit can carry, or withhold it.
+    Never extend credit for a record exceeding 13.4's cap; no legal record exceeds 4 MiB.
+    Pin quiche's maximum auto-tuned stream window to 4 MiB and connection window to
+    17 MiB, with automatic growth disabled unless it obeys these same application/node
+    budgets and reservations. Smaller initial serverbound windows MUST remain effective;
+    transport auto-tuning may not silently override them. If the pinned Netty exposes no
+    setters for these maximum windows/growth controls, patch it before enabling `/3`;
+    initial limits alone are insufficient. Account for already granted credit when
+    tightening limits; never promise credit that cannot be honored within the budgets.
     All other §9 values remain unchanged. Prioritize available
     CONTROL writes, then round-robin REALTIME and WORLD in at most 64 KiB write quanta;
     priority must not starve a WORLD predecessor needed by CONTROL. Measure memory and
@@ -894,7 +1016,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
     closing delimiter using provisional watermarks for their internal predecessor checks;
     external dependencies must already satisfy the committed watermarks. It commits those
     watermarks only after delivering the whole validated bundle atomically to the game's
-    bundle handler. No other lane may depend on a provisional watermark. Reserve/validate
+    bundle handler. Auxiliary records may reference sequences of staged CONTROL members
+    as required by 13.9, but may not satisfy those dependencies using provisional
+    watermarks; only committed delivery releases them. Reserve/validate
     the complete bundle against queue bounds before scheduling it; never interleave an
     activation, compression change or state transition with a bundle. Such a member makes
     the bundle invalid rather than changing decoder state partway through it.
@@ -910,7 +1034,26 @@ single-socket listener: no dispatcher is installed and the connection id length 
     rotation and corrupt storage; full/resumed/accepted and rejected early-data sessions;
     offline/online confusion; v1/new-client/new-server/TCP compatibility; resets on every
     stream; exhausted credit/buffers; delayed spawn/chunk/fences, bundles and compression
-    changes. Run full-play desync assertions under every testkit netem profile. Phase 5
+    changes. Include post-cutover profile-key/chat-signature validation and tab-list parity
+    against vanilla with `isEncrypted()` still true; encrypted-but-unauthenticated aborts
+    before configuration; pre-activation stream-4 rejection; boundary/max-length records;
+    advertised digest mismatch before connect and stale-advertisement OFFER rejection;
+    staged-bundle auxiliary dependencies released only on commit; and CONTROL byte/slot
+    reservations under auxiliary floods, including quiche auto-tuning and node-budget
+    exhaustion. Verify out-of-u32 protocol rejection, exporter exceptions/wrong lengths,
+    PSK-only resumption rejection, ticket-key/certificate rotation, inert binding payloads
+    outside `/3` and Velocity's bidirectional stripping. Test failed re-bind close-before-
+    fresh-TCP ordering, new Login Start/session join, bounded OFFER wait, unchanged pin and
+    retained (unused) tickets/tokens/recorded flights on failure, failure-cache and re-bind
+    backoff updated on failure (asserted separately), success-only discard of tickets/tokens/
+    flights, changed fingerprint with unavailable exporter or missing/mismatched routing
+    digest selecting fresh TCP without `/2` or `0x10`, restart-persisted fingerprint-independent
+    backoff, notice deduplication/eviction and ordinary-failure no-replay behavior.
+    Run a 50,000-concurrent-QUIC-connection node benchmark before enablement, recording
+    configured node budget, admission reservations/refusals, retained and native memory,
+    peak pending bytes/records, CONTROL progress, latency and throughput under auxiliary
+    pressure; show the budgets hold without relying on TCP for the target QUIC population.
+    Run full-play desync assertions under every testkit netem profile. Phase 5
     requires measured loss improvement over TCP AND single-stream and security review;
     this draft makes no performance or completed-review claim.
 
@@ -918,8 +1061,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 1. Approve `/3`, the configuration-stage four-proof/switch exchange after OFFER, and the
    conservative exporter gate even for offline multi-stream tests?
-2. Approve changed-pin TCP fallback plus explicit player-authorized online re-binding for
-   rotation, rather than automatic trust replacement?
+2. Approve changed-pin handling as: online mode re-binds automatically through channel
+   binding (pin replaced only after a passing check, player notified), failure falls back to
+   TCP with the pin unchanged?
 3. Approve the three fixed lanes, conservative full CONTROL fences, and exact-byte JSON
    routing digests as the first reviewable design?
 4. Approve the proposed memory/packet limits and 10-second fail-closed deadlines for

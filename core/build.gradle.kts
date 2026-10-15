@@ -50,6 +50,9 @@ val hostClassifier: String = run {
 /** Tests assert the relaxed loss threshold is available exactly when this host runs a patched native. */
 val expectRelaxedLossThreshold = hostClassifier in patchedNatives
 
+/** Same for the TLS exporter (natives/patches/netty/0004-keying-material-export.patch). */
+val expectKeyingMaterialExport = hostClassifier in patchedNatives
+
 val patchedRepo = rootProject.layout.projectDirectory.dir("natives/build/out/repo")
 
 val quicNatives = configurations.create("quicNatives") {
@@ -130,10 +133,12 @@ val shadedTestTask = tasks.register<Test>("shadedTest") {
     classpath = shadedTest.runtimeClasspath
     useJUnitPlatform()
     systemProperty("quicraft.test.expectRelaxedLossThreshold", expectRelaxedLossThreshold)
+    systemProperty("quicraft.test.expectKeyingMaterialExport", expectKeyingMaterialExport)
 }
 
 tasks.named<Test>("test") {
     systemProperty("quicraft.test.expectRelaxedLossThreshold", expectRelaxedLossThreshold)
+    systemProperty("quicraft.test.expectKeyingMaterialExport", expectKeyingMaterialExport)
 }
 
 // The patched classes with upstream Netty's native for this host, which is what platforms without
@@ -154,8 +159,10 @@ if (hostClassifier in nativeClassifiers) {
         classpath = test.runtimeClasspath.minus(quicNatives) + upstreamHostNative
         useJUnitPlatform()
         systemProperty("quicraft.test.expectRelaxedLossThreshold", false)
+        systemProperty("quicraft.test.expectKeyingMaterialExport", false)
         filter {
             includeTestsMatching("rs.sudoe.quicraft.core.transport.NativeFeaturesTest")
+            includeTestsMatching("rs.sudoe.quicraft.core.transport.TlsExporterTest")
             includeTestsMatching("rs.sudoe.quicraft.core.transport.QuicLoopbackTest")
         }
     }

@@ -43,4 +43,15 @@ class ShadedNativesTest {
         assertNotNull(expected, "run through Gradle");
         assertEquals(Boolean.parseBoolean(expected), QuicSupport.hasRelaxedLossThreshold());
     }
+
+    /**
+     * Same for the TLS exporter (natives/patches/netty/0004): the binding of the shaded jar is what
+     * channel binding needs, and this is the only run that proves the relocated names resolve.
+     */
+    @Test
+    void keyingMaterialExportMatchesTheNativeBuiltForThisPlatform() {
+        String expected = System.getProperty("quicraft.test.expectKeyingMaterialExport");
+        assertNotNull(expected, "run through Gradle");
+        assertEquals(Boolean.parseBoolean(expected), QuicSupport.hasKeyingMaterialExport());
+    }
 }
