@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.IOException;
 import java.net.ConnectException;
@@ -22,6 +23,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -245,12 +247,29 @@ class ClientConnectorTest {
         p.tcp = new CompletableFuture<>();
         CompletableFuture<ClientConnector.Outcome<String>> attempt = connector(ads, FailureCache.load(null))
                 .connect(SERVER, Mode.AUTO, p);
-        Thread.sleep(ClientConnector.HEAD_START_MILLIS + 100); // TCP has started too
+        // TCP starts on the platform's scheduler after the head start. A loaded CI runner can run
+        // that task late, so wait for it rather than sleeping a fixed head start and hoping.
+        await("TCP to start after the head start", () -> p.tcpAttempts.get() == 1);
         assertEquals(1, p.tcpAttempts.get());
         assertTrue(attempt.cancel(false));
         assertTrue(p.quic.isCancelled(), "the QUIC attempt is cancelled");
         p.tcp.complete("late");
         assertEquals(java.util.Collections.singletonList("late"), p.tcpClosed);
+    }
+
+    /**
+     * Waits for {@code condition}, at most five seconds. Polling, not a fixed sleep: the race's head
+     * start timer and the status query timeout both run on a scheduler that a busy machine may serve
+     * late, and a fixed sleep would then assert too early.
+     */
+    private static void await(String what, BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() >= deadline) {
+                fail("timed out after 5 s waiting for " + what);
+            }
+            Thread.sleep(10);
+        }
     }
 
     @Test
