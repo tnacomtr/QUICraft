@@ -11,7 +11,9 @@ import rs.sudoe.quicraft.core.tls.Fingerprint;
 
 /**
  * The client's 0-RTT state, in memory only (docs/protocol.md §8): the latest early token per
- * server (IP, QUIC port, fingerprint), and the recorded first flight per server and join inputs.
+ * server (IP, QUIC port, fingerprint, ALPN), and the recorded first flight per server and join
+ * inputs. The ALPN is part of the key so {@code /2} tokens and flights are never offered on a
+ * {@code /3} dial or the other way round (12.17).
  */
 final class EarlyCache {
     static final EarlyCache INSTANCE = new EarlyCache();
@@ -20,8 +22,14 @@ final class EarlyCache {
     private final Map<List<Object>, byte[]> tokens = lru();
     private final Map<List<Object>, byte[]> flights = lru();
 
+    /** The {@code /2} partition. */
     static List<Object> server(InetSocketAddress remote, Fingerprint fingerprint) {
-        return Arrays.<Object>asList(remote.getAddress().getHostAddress(), remote.getPort(), fingerprint);
+        return server(remote, fingerprint, rs.sudoe.quicraft.core.Protocol.ALPN);
+    }
+
+    /** The key of one ALPN's partition for a server (12.17). */
+    static List<Object> server(InetSocketAddress remote, Fingerprint fingerprint, String alpn) {
+        return Arrays.<Object>asList(remote.getAddress().getHostAddress(), remote.getPort(), fingerprint, alpn);
     }
 
     synchronized void putToken(List<Object> server, byte[] token) {
