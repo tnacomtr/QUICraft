@@ -252,6 +252,26 @@ class V3ConnectionTest {
     }
 
     @Test
+    void aBypassResumptionDialIsAFullHandshakeAndKeepsTheStoredTicket() throws Exception {
+        requireV3();
+        try (QuicServer server = bindServer(connection -> { })) {
+            InetSocketAddress address = server.localAddress();
+            primeV3Join(address);
+            assertTrue(QuicClient.hasSessionTicket(address, identity.fingerprint()),
+                    "the priming join must have a resumable /3 ticket");
+
+            // bypassResumption: a full handshake, so no early data even though the material is there.
+            EarlyFlight early = new EarlyFlight("inputs");
+            V3Connection connection = QuicClient.connectV3(address, identity.fingerprint(), TABLE, early, true)
+                    .get(10, TimeUnit.SECONDS);
+            assertFalse(early.sent(), "12.16's re-bind is a full handshake, never 0-RTT");
+            assertTrue(QuicClient.hasSessionTicket(address, identity.fingerprint()),
+                    "12.16: a bypassing dial leaves the stored ticket untouched");
+            connection.close();
+        }
+    }
+
+    @Test
     void anUnknownEarlyTokenWaitsForTheHandshake() throws Exception {
         requireV3();
         List<Boolean> handshakeAtAccept = Collections.synchronizedList(new ArrayList<Boolean>());
