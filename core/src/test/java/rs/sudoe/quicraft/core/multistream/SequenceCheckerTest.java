@@ -50,7 +50,7 @@ class SequenceCheckerTest {
         checker.check(-1L);
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
                 () -> checker.check(0));
-        assertEquals(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION, e.closeCode());
+        assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
     }
 
     @Test
@@ -58,6 +58,6 @@ class SequenceCheckerTest {
         SequenceChecker checker = new SequenceChecker();
         MultistreamProtocolException e =
                 assertThrows(MultistreamProtocolException.class, () -> checker.check(5));
-        assertEquals(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION, e.closeCode());
+        assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
     }
 }

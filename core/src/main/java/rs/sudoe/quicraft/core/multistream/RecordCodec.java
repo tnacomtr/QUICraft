@@ -28,7 +28,7 @@ public final class RecordCodec {
     /** 33 header bytes plus at most a three-byte length prefix and 2097151 content bytes. */
     public static final int MAX_RECORD_LENGTH = HEADER_LENGTH + MAX_BODY_LENGTH;
 
-    private static final int CLOSE_CODE = MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION;
+    private static final int CLOSE_CODE = MultistreamProtocolException.CLOSE_ORDERING; // 13.12: parser errors use 0x11
     private static final byte[] NO_BODY = new byte[0];
 
     private RecordCodec() {}

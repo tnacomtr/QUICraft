@@ -8,15 +8,15 @@ import java.nio.ByteBuffer;
  * where type is 1 REALTIME (stream 4) or 2 WORLD (stream 1). CONTROL has no second preamble.
  * The type is a plain int; this package does not depend on {@code core.routing}.
  *
- * <p>13.2 names {@code 0x1} for an unknown version or length; 13.3 names {@code 0x11} only
- * for a stream-4 frame before the server's activation, which is a caller-side check, not a
- * malformed preamble. A malformed auxiliary preamble therefore closes with {@code 0x1}.
+ * <p>A malformed auxiliary preamble is a parser error on an activated multi-stream lane, so it
+ * closes with {@code 0x11} like every other parser/ordering error (13.12). Stream 0's own
+ * preamble keeps 13.2's {@code 0x1}.
  */
 public final class AuxPreamble {
     public static final int VERSION = 2;
     public static final int TYPE_REALTIME = 1;
     public static final int TYPE_WORLD = 2;
-    public static final int CLOSE_CODE = MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION;
+    public static final int CLOSE_CODE = MultistreamProtocolException.CLOSE_ORDERING;
     /** 13.3: a REALTIME frame before the server's activation is fatal with this code. */
     public static final int CLOSE_STREAM_MISUSE = MultistreamProtocolException.CLOSE_ORDERING;
 

@@ -171,7 +171,7 @@ class RecordCodecTest {
         RecordCodec.Decoder d = new RecordCodec.Decoder(true, Integer.MAX_VALUE);
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
                 () -> d.feed(ByteBuffer.wrap(new byte[] {(byte) 0xA4, (byte) 0x80, (byte) 0x80, 0x01})));
-        assertEquals(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION, e.closeCode());
+        assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
         assertTrue(e.getMessage().contains("> 2097187"), e.getMessage());
     }
 
@@ -228,7 +228,7 @@ class RecordCodecTest {
         RecordCodec.Decoder d = new RecordCodec.Decoder(true, 100);
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
                 () -> d.feed(ByteBuffer.wrap(new byte[] {(byte) 0xC8, 0x01, 0x00})));
-        assertEquals(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION, e.closeCode());
+        assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
         assertTrue(e.getMessage().contains("buffered-bytes"), e.getMessage());
     }
 
@@ -296,6 +296,6 @@ class RecordCodecTest {
     private static void assertClose(byte[] bytes, RecordCodec.Decoder decoder) {
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
                 () -> decoder.feed(ByteBuffer.wrap(bytes)));
-        assertEquals(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION, e.closeCode());
+        assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
     }
 }

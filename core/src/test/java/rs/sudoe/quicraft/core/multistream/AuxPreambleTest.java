@@ -74,6 +74,6 @@ class AuxPreambleTest {
         MultistreamProtocolException e =
                 assertThrows(MultistreamProtocolException.class, () -> parser.feed(ByteBuffer.wrap(bytes)));
         assertEquals(AuxPreamble.CLOSE_CODE, e.closeCode());
-        assertEquals(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION, e.closeCode());
+        assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
     }
 }

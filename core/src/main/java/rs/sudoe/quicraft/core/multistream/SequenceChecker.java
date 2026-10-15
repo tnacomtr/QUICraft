@@ -25,15 +25,15 @@ public final class SequenceChecker {
 
     public void check(long sequence) throws MultistreamProtocolException {
         if (exhausted) {
-            throw new MultistreamProtocolException(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION,
+            throw new MultistreamProtocolException(MultistreamProtocolException.CLOSE_ORDERING,
                     "13.4", "record after the maximum sequence (no wrap)");
         }
         if (sequence == 0) {
-            throw new MultistreamProtocolException(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION,
+            throw new MultistreamProtocolException(MultistreamProtocolException.CLOSE_ORDERING,
                     "13.4", "record sequence 0");
         }
         if (Long.compareUnsigned(sequence, expected) != 0) {
-            throw new MultistreamProtocolException(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION,
+            throw new MultistreamProtocolException(MultistreamProtocolException.CLOSE_ORDERING,
                     "13.4", "expected sequence " + Long.toUnsignedString(expected) + ", got "
                             + Long.toUnsignedString(sequence));
         }
