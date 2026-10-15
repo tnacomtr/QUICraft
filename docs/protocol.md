@@ -868,6 +868,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
    SERVER_SWITCH, under 13.12's bounds, without delivery. The server MUST treat any
    stream-4 frame before its own activation (CLIENT_SWITCH validated and SERVER_SWITCH
    queued) as fatal `0x11`, not buffer it. Stream 4 cannot legitimately precede that point.
+   Adapter note: the server's activation must take effect on the connection's event loop
+   before, or in the same task as, the flush of SERVER_SWITCH. Activating from another thread
+   only queues it, and the client's stream 4 can then arrive first, which is fatal.
 
 ### Records, control and routing data
 
