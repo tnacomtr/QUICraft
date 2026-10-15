@@ -68,6 +68,14 @@ class PinKeyTest {
     }
 
     @Test
+    void followsIdna2003WhereUts46CouldDiffer() {
+        // java.net.IDN is IDNA2003: nameprep maps the sharp s to ss and folds the final sigma, so two
+        // spellings that UTS 46 could keep apart share one key here, and one name never splits in two.
+        assertEquals("strasse.example", PinKey.normalizeHost("straße.example"));
+        assertEquals(PinKey.normalizeHost("σ.example"), PinKey.normalizeHost("ς.example"));
+    }
+
+    @Test
     void normalizationIsIdempotent() {
         List<String> hosts = new ArrayList<>();
         hosts.add("MC.Example.COM.");

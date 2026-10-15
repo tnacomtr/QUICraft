@@ -69,6 +69,9 @@ import java.util.logging.Logger;
  * notice and never resets a backoff window. A failed write disables the state, so whatever the failed
  * call changed in memory is never read again.</p>
  *
+ * <p>There is no cross-process lock: two clients sharing one config directory writing this state are
+ * last-writer-wins, each write being atomic ({@link StateFile}).</p>
+ *
  * <p>Thread-safe: every method is synchronized. The time a window starts from is the injected
  * {@code clock}; the {@code now} of {@link #tryBeginAttempt(String, int, long)} must be read from
  * that same clock.</p>

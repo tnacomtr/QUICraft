@@ -20,7 +20,8 @@ import java.security.NoSuchAlgorithmException;
  *
  * <p>Bits are never cleared: a false positive can suppress a notice, but a tuple that was marked once
  * can never be reported as unseen again, which is what makes "at most once" survive eviction and
- * restarts. The class does not persist itself; its owner writes {@link #copy()} atomically.</p>
+ * restarts. The class does not persist itself; its owner copies it out with
+ * {@link #copyTo(byte[], int)} and into a loaded state with {@link #read(byte[], int)}.</p>
  */
 final class RebindBloom {
     /** 1 MiB, docs/protocol.md 12.16. */

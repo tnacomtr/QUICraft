@@ -40,6 +40,9 @@ import java.util.logging.Logger;
  * allowed. Deleting requires the player's explicit confirmation and is therefore
  * {@link #deletePin(String, int)}, never automatic.</p>
  *
+ * <p>There is no cross-process lock: two clients sharing one config directory writing this file are
+ * last-writer-wins, each write being atomic ({@link StateFile}).</p>
+ *
  * <p>Writes go through a temporary file in the same directory and an atomic replacement, with
  * owner-only permissions where the file system supports them ({@link StateFile}). The file is JSON,
  * schema version 1, timestamps in UTC ISO-8601. Thread-safe: every method is synchronized.</p>

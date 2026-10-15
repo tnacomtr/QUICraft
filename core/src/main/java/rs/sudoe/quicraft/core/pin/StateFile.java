@@ -37,6 +37,13 @@ import rs.sudoe.quicraft.core.Faults;
  * fail closed, the file is not read again in this process and is never overwritten, and the state on
  * disk is the new one rather than a mixture.</p>
  *
+ * <p><b>One writer.</b> There is no cross-process lock: two clients sharing one config directory are
+ * last-writer-wins. Each write is atomic, so a reader always sees one complete state or the other,
+ * never a mixture, and the state that survives is the one the later writer stored. The sweep of
+ * temporary leftovers at load ({@link #deleteStaleTemporaries}) can also delete a concurrent writer's
+ * temporary file, which costs that writer the one write in progress and never the state already on
+ * disk.</p>
+ *
  * <p>A caller that gets an {@link IOException} (or a {@link RuntimeException} from the fault
  * injection of {@link #FAULT_FORCE} and {@link #FAULT_MOVE}) must treat the state as unusable: it
  * either left the old content in place (a failure before the rename, or a rename that failed) or the

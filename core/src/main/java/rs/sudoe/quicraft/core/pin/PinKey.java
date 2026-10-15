@@ -27,6 +27,14 @@ import java.util.Locale;
  * identifier ({@code fe80::1%eth0} names a local interface, not a server), a malformed literal, an
  * empty label or a label longer than 63 characters. A host is never resolved here, so normalization
  * never touches the network and never depends on DNS.</p>
+ *
+ * <p>{@link IDN} implements IDNA2003, not UTS&nbsp;46 (IDNA2008 plus its compatibility mapping).
+ * Where the two differ, this class follows IDNA2003: a label containing a sharp s ({@code ß}) or a
+ * final sigma ({@code ς}) is case folded and compatibility mapped before the punycode conversion, so
+ * {@code straße.example} becomes {@code strasse.example} and the two Greek sigmas share one key,
+ * where UTS 46 with non-transitional processing could keep them apart. The direction is safe for
+ * pinning: it can merge two spellings of one name into one pin, which is what a lookup by the name
+ * the player typed needs, and it never splits one name into two keys.</p>
  */
 public final class PinKey {
     private static final int MAX_HOST_LENGTH = 253;
