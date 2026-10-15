@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import rs.sudoe.quicraft.core.Faults;
 
 /** The persisted authenticated pin store (docs/protocol.md 12.15). */
 class PinStoreTest {
@@ -265,9 +266,56 @@ class PinStoreTest {
         assertFalse(store.deletePin("mc.example.com", 25565));
     }
 
+    @Test
+    void aFailedFlushOrMoveDisablesTheStoreAndKeepsTheOldFile(@TempDir Path dir) throws IOException {
+        Path quicraft = Files.createDirectories(dir.resolve("quicraft"));
+        Path file = quicraft.resolve("pins-v2.json");
+        AtomicLong now = new AtomicLong(BASE);
+        PinStore store = PinStore.load(file, now::get);
+        assertEquals(PinStore.RecordResult.RECORDED, store.recordPin("mc.example.com", 25565, FP_A));
+        byte[] before = Files.readAllBytes(file);
+
+        Faults.set(StateFile.FAULT_FORCE);
+        try {
+            assertEquals(PinStore.RecordResult.DISABLED, store.recordPin("flushed.example.com", 25565, FP_A));
+        } finally {
+            Faults.set();
+        }
+        assertFalse(store.isUsable(), "a failed flush disables the store");
+        assertArrayEquals(before, Files.readAllBytes(file), "the old pins file is intact");
+        assertFalse(store.deletePin("mc.example.com", 25565), "and the store keeps refusing writes");
+        assertEquals(Collections.singletonList("pins-v2.json"), names(quicraft), "no temporary file is left behind");
+
+        Path moved = dir.resolve("move").resolve("pins-v2.json");
+        PinStore moving = PinStore.load(moved, now::get);
+        assertEquals(PinStore.RecordResult.RECORDED, moving.recordPin("mc.example.com", 25565, FP_B));
+        byte[] beforeMove = Files.readAllBytes(moved);
+        Faults.set(StateFile.FAULT_MOVE);
+        try {
+            assertEquals(PinStore.RecordResult.DISABLED, moving.recordPin("other.example.com", 25565, FP_A));
+        } finally {
+            Faults.set();
+        }
+        assertFalse(moving.isUsable(), "a failed rename disables the store");
+        assertArrayEquals(beforeMove, Files.readAllBytes(moved), "the old pins file is intact");
+        assertEquals(Collections.singletonList("pins-v2.json"), names(moved.getParent()));
+    }
+
     private static String entry(String host, int port, String fingerprint) {
         return "{\"host\":\"" + host + "\",\"port\":" + port + ",\"fingerprint\":\"" + fingerprint + "\""
                 + ",\"firstBound\":\"2000-01-01T00:00:00Z\",\"lastBound\":\"2000-01-01T00:00:00Z\"}";
+    }
+
+    /** The file names in {@code directory}, sorted. */
+    private static List<String> names(Path directory) throws IOException {
+        List<String> names = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
+            for (Path path : stream) {
+                names.add(path.getFileName().toString());
+            }
+        }
+        Collections.sort(names);
+        return names;
     }
 
     /** A pins file holding {@code count} pins, as an older run of the client would have written it. */

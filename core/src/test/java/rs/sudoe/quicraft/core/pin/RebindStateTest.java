@@ -9,13 +9,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -23,6 +27,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import rs.sudoe.quicraft.core.Faults;
 
 /** The changed-pin re-bind backoff and notice deduplication state (docs/protocol.md 12.16). */
 class RebindStateTest {
@@ -347,6 +352,42 @@ class RebindStateTest {
         assertEquals(2, state.size());
     }
 
+    @Test
+    void aFailedFlushOrMoveFailsClosedAndKeepsTheOldFile(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertTrue(state.shouldNotify("mc.example.com", 25565, FP_A));
+        byte[] before = Files.readAllBytes(file);
+
+        Faults.set(StateFile.FAULT_FORCE);
+        try {
+            assertFalse(state.shouldNotify("mc.example.com", 25565, FP_B), "a failed flush shows no notice");
+        } finally {
+            Faults.set();
+        }
+        assertFalse(state.isUsable(), "a failed flush fails closed");
+        assertArrayEquals(before, Files.readAllBytes(file), "the old state file is intact");
+        assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertFalse(state.recordAttemptFailure("mc.example.com", 25565));
+        assertEquals(Collections.singletonList("rebind-v1.bin"), names(dir));
+
+        Path movedDirectory = Files.createDirectories(dir.resolve("move"));
+        Path moved = movedDirectory.resolve("rebind-v1.bin");
+        RebindState moving = RebindState.load(moved, now::get);
+        assertTrue(moving.shouldNotify("mc.example.com", 25565, FP_A));
+        byte[] beforeMove = Files.readAllBytes(moved);
+        Faults.set(StateFile.FAULT_MOVE);
+        try {
+            assertFalse(moving.shouldNotify("mc.example.com", 25565, FP_B), "a failed rename shows no notice");
+        } finally {
+            Faults.set();
+        }
+        assertFalse(moving.isUsable(), "a failed rename fails closed");
+        assertArrayEquals(beforeMove, Files.readAllBytes(moved), "the old state file is intact");
+        assertEquals(Collections.singletonList("rebind-v1.bin"), names(movedDirectory));
+    }
+
     /** A re-bind state file holding {@code count} servers, each inside a window that never ends. */
     private static String servers(int count) {
         StringBuilder sb = new StringBuilder(count * 140 + 64);
@@ -363,6 +404,18 @@ class RebindStateTest {
 
     private static byte[] stateFile(String json) {
         return stateFile(json.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** The file names in {@code directory}, sorted. */
+    private static List<String> names(Path directory) throws IOException {
+        List<String> names = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
+            for (Path path : stream) {
+                names.add(path.getFileName().toString());
+            }
+        }
+        Collections.sort(names);
+        return names;
     }
 
     private static byte[] stateFile(byte[] json) {
