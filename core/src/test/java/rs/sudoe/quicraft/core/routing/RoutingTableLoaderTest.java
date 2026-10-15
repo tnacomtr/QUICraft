@@ -536,8 +536,18 @@ class RoutingTableLoaderTest {
         RoutingTableException e = assertThrows(RoutingTableException.class,
                 () -> RoutingTableLoader.parse(over));
         assertTrue(e.getMessage().contains("larger than"), e.getMessage());
-        assertThrows(RoutingTableException.class,
-                () -> RoutingTableLoader.parseMandatoryControlSet(over, 12345, "test"));
+
+        byte[] set = "{\"schema\":1,\"protocol\":12345,\"mandatory_control\":[]}"
+                .getBytes(StandardCharsets.UTF_8);
+        byte[] setAtLimit = new byte[RoutingTableLoader.MAX_RESOURCE_BYTES];
+        java.util.Arrays.fill(setAtLimit, (byte) ' ');
+        System.arraycopy(set, 0, setAtLimit, 0, set.length);
+        assertTrue(RoutingTableLoader.parseMandatoryControlSet(setAtLimit, 12345, "test").isEmpty());
+        byte[] setOver = java.util.Arrays.copyOf(setAtLimit, setAtLimit.length + 1);
+        setOver[setOver.length - 1] = ' ';
+        RoutingTableException setError = assertThrows(RoutingTableException.class,
+                () -> RoutingTableLoader.parseMandatoryControlSet(setOver, 12345, "test"));
+        assertTrue(setError.getMessage().contains("larger than"), setError.getMessage());
     }
 
     @Test
