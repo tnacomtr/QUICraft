@@ -301,6 +301,26 @@ class PinStoreTest {
         assertEquals(Collections.singletonList("pins-v2.json"), names(moved.getParent()));
     }
 
+    @Test
+    void loadSweepsItsOwnTemporaryLeftovers(@TempDir Path dir) throws IOException {
+        Path quicraft = Files.createDirectories(dir.resolve("quicraft"));
+        Path file = quicraft.resolve("pins-v2.json");
+        Path leftover = quicraft.resolve("pins-v2.json1234567890.tmp");
+        Files.write(leftover, "{stale".getBytes(StandardCharsets.UTF_8));
+        Path notOurs = quicraft.resolve("pins-v2.json.tmp");
+        Files.write(notOurs, "keep".getBytes(StandardCharsets.UTF_8));
+        Path otherFile = quicraft.resolve("rebind-v1.bin");
+        Files.write(otherFile, "keep".getBytes(StandardCharsets.UTF_8));
+
+        PinStore store = PinStore.load(file, new AtomicLong(BASE)::get);
+        assertTrue(store.isUsable());
+        assertFalse(Files.exists(leftover), "our own leftover was removed");
+        assertTrue(Files.exists(notOurs), "a name we never create is left alone");
+        assertTrue(Files.exists(otherFile), "another file in the directory is left alone");
+        assertEquals(PinStore.RecordResult.RECORDED, store.recordPin("mc.example.com", 25565, FP_A));
+        assertEquals(Arrays.asList("pins-v2.json", "pins-v2.json.tmp", "rebind-v1.bin"), names(quicraft));
+    }
+
     private static String entry(String host, int port, String fingerprint) {
         return "{\"host\":\"" + host + "\",\"port\":" + port + ",\"fingerprint\":\"" + fingerprint + "\""
                 + ",\"firstBound\":\"2000-01-01T00:00:00Z\",\"lastBound\":\"2000-01-01T00:00:00Z\"}";

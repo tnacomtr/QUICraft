@@ -456,6 +456,7 @@ public final class RebindState {
         if (file == null) {
             return;
         }
+        StateFile.deleteStaleTemporaries(file);
         byte[] content;
         try {
             content = StateFile.read(file, MAX_FILE_BYTES);

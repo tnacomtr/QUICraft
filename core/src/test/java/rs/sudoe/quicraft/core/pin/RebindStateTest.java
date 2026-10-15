@@ -652,6 +652,19 @@ class RebindStateTest {
         assertTrue(json.contains("fingerprint\":\"" + fingerprint(2)), "c's notice was recorded");
     }
 
+    @Test
+    void loadSweepsItsOwnTemporaryLeftovers(@TempDir Path dir) throws IOException {
+        Path leftover = dir.resolve("rebind-v1.bin123.tmp");
+        Files.write(leftover, new byte[3]);
+        Path notOurs = dir.resolve("rebind-v1.bin.tmp");
+        Files.write(notOurs, new byte[3]);
+
+        RebindState state = RebindState.load(dir.resolve("rebind-v1.bin"), new AtomicLong(BASE)::get);
+        assertTrue(state.isUsable());
+        assertFalse(Files.exists(leftover), "our own leftover was removed");
+        assertTrue(Files.exists(notOurs), "a name we never create is left alone");
+    }
+
     /** A re-bind state fixture with {@code count} servers, each inside {@code blockedUntil}. */
     private static String servers(int count, String blockedUntil) {
         StringBuilder sb = new StringBuilder(count * 140 + 64);

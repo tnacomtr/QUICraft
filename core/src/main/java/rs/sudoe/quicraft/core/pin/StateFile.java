@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.pin;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
@@ -15,6 +16,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Pattern;
 import rs.sudoe.quicraft.core.Faults;
 
 /**
@@ -120,8 +122,35 @@ final class StateFile {
         }
     }
 
+    /**
+     * Deletes leftovers of {@code file} that this class's own {@link #write} could have created and
+     * failed to rename away, in that file's directory. Only names matching exactly the temporary
+     * pattern it creates, {@code <name><digits>.tmp}, are considered, so nothing else in the directory
+     * is touched, and the sweep is best effort: a leftover that cannot be removed does not fail the
+     * load, and a concurrent writer's temporary file is simply deleted with it (see the class comment
+     * on cross-process locking).
+     */
+    static void deleteStaleTemporaries(Path file) {
+        Path target = file.toAbsolutePath();
+        Path directory = target.getParent();
+        if (directory == null) {
+            return;
+        }
+        Pattern pattern = Pattern.compile(
+                Pattern.quote(temporaryPrefix(target.getFileName().toString())) + "[0-9]+\\.tmp");
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
+            for (Path candidate : stream) {
+                if (pattern.matcher(candidate.getFileName().toString()).matches()) {
+                    Files.deleteIfExists(candidate);
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            // Not worth failing the load for: the state itself is unaffected either way.
+        }
+    }
+
     private static Path createTemporary(Path directory, String name) throws IOException {
-        String prefix = name.length() < 3 ? "state-" + name : name;
+        String prefix = temporaryPrefix(name);
         if (directory.getFileSystem().supportedFileAttributeViews().contains("posix")) {
             FileAttribute<Set<PosixFilePermission>> attributes =
                     PosixFilePermissions.asFileAttribute(OWNER_ONLY);
@@ -132,5 +161,10 @@ final class StateFile {
             }
         }
         return Files.createTempFile(directory, prefix, ".tmp");
+    }
+
+    /** The prefix {@link #createTemporary} uses; {@code createTempFile} needs at least three. */
+    private static String temporaryPrefix(String name) {
+        return name.length() < 3 ? "state-" + name : name;
     }
 }

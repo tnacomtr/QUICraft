@@ -138,6 +138,7 @@ public final class PinStore {
         if (file == null) {
             return store;
         }
+        StateFile.deleteStaleTemporaries(file);
         try {
             store.read(new String(StateFile.read(file, MAX_FILE_BYTES), StandardCharsets.UTF_8));
         } catch (NoSuchFileException e) {
