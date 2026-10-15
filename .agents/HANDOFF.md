@@ -1,7 +1,12 @@
-# Handoff: after 0.1.0-alpha.1 (2026-10-15)
+# Handoff: after 0.1.0-alpha.2 (2026-10-15)
 
-0.1.0-alpha.1 is published (pre-releases on GitHub and git.sudoe.rs, jars plus signed updater metadata). main and
-feat/phase4-alpha are on the development version 0.1.0-alpha.2-SNAPSHOT.
+0.1.0-alpha.2 is published (pre-releases on GitHub and git.sudoe.rs, jars plus signed updater metadata seq 2). It
+carries the 0-RTT delivery fix. main and feat/phase4-alpha are on 0.1.0-alpha.3-SNAPSHOT (668d2dc), CI green.
+
+## Updater, tested live
+- On the cloud test server, alpha.1 updated itself to alpha.2 with `quicraft update check` + `quicraft update`
+  (INSTALLED_RESTART_PENDING, atomic swap under the old file name); after a restart it runs alpha.2 and the jar's
+  sha256 matches the release asset.
 
 ## History rewrite (2026-10-14, owner's request)
 - AI attribution trailers were stripped from every commit on main, feat and both tags, then force-pushed to both
@@ -26,7 +31,15 @@ feat/phase4-alpha are on the development version 0.1.0-alpha.2-SNAPSHOT.
   "waits up to G". Regression test: EarlyDataTest.aZeroRttConnectionReachesTheGameWhenThePreambleArrives...
 
 ## Open follow-ups
-- Re-sign a seq 2 release manifest before 2026-11-13T19:52:53Z (same entries; the owner signs).
+- The release manifest (seq 2) expires 2026-11-14T10:18:29Z: publish seq 3 (re-sign or a new release) before
+  then; the owner signs. Revocations seq 1 expire 2027-10-14.
 - updater.md blocker 6 (withdrawal), macOS FileChannel.force semantics, Velocity builds other than 4.2.0-30.
 - The owner should revoke the Forgejo token pasted in chat and delete ~/.config/quicraft/forgejo-token.
 - Quarantined branches agent/phase4-retry-tests and agent/phase4-cwnd-tests: never merge or delete.
+
+## Test servers and the UDP finding
+- sudoe.rs (Fabric 1.21.11) and cloud.teamshiftenergy.com (Fabric 1.21.11, systemd unit `minecraft`, /opt/minecraft,
+  online mode, RCON off) both run QUICraft.
+- Both hosts sit at Realtox Media behind RCS Technologies (AS203446). Routes entering through RCS drop UDP 25565
+  (also 19132, 27015); 25564, 25566 and 443 pass. Routes entering through LWLcom pass. The client falls back to TCP
+  as designed. Not a QUICraft bug; the owner may raise it with Realtox.
