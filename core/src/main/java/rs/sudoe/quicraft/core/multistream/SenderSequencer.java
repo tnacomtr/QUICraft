@@ -64,9 +64,16 @@ public final class SenderSequencer {
     }
     /** Assigns delimiters and members atomically, only after the closing delimiter exists. */
     public List<Envelope> endBundle(int openBytes, Object open, int closeBytes, Object close, long now) {
+        return endBundle(openBytes, openBytes, open, closeBytes, closeBytes, close, now);
+    }
+    /** Explicit uncompressed delimiter sizes when compression changes their framed wire sizes. */
+    public List<Envelope> endBundle(int openUncompressed, int openBytes, Object open,
+                                    int closeUncompressed, int closeBytes, Object close, long now) {
         checkDeadlines(now);
         if (members == null || openBytes < 0 || closeBytes < 0 || openBytes > 2097154
-                || closeBytes > 2097154) throw new OrderingException("invalid bundle close");
+                || closeBytes > 2097154 || openUncompressed < 0 || closeUncompressed < 0
+                || bundleBytes + openUncompressed + closeUncompressed > 8L * 1024 * 1024)
+            throw new OrderingException("invalid bundle close/total size");
         long count = members.size() + 2L;
         if (Long.compareUnsigned(assigned[0], -1L - count) > 0)
             throw new OrderingException("bundle sequence overflow");

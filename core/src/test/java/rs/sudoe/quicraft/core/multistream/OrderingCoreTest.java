@@ -383,4 +383,77 @@ class OrderingCoreTest {
         fails(() -> h.scheduler.retainDecoded(b,1,1,0));
         assertArrayEquals(new long[3],h.scheduler.delivered());
     }
+
+    @Test void inlineApplicationUsesItsSuppliedTimeForTheNextHandlerDeadline() {
+        ReceiverScheduler[] ref = new ReceiverScheduler[1];
+        ref[0] = new ReceiverScheduler(d -> {
+            if (d.lane() == C) ref[0].applied(C,1,T-1);
+        });
+        ref[0].offer(e(R,1,1,0,0),0);
+        ref[0].offer(e(C,1,0,0,0),0);
+        ref[0].checkDeadlines(T);
+        ref[0].checkDeadlines(2*T-2);
+        fails(() -> ref[0].checkDeadlines(2*T-1));
+    }
+
+    @Test void destroySixAlsoWaitsForWithheldWorldPredecessor() {
+        Harness h = new Harness();
+        for (int i=1;i<=4;i++) h.offer(e(C,i,i-1,0,0));
+        for (int i=1;i<=8;i++) h.offer(e(R,i,4,i-1,0));
+        for (int i=1;i<=6;i++) h.offer(e(W,i,4,0,i-1));
+        h.offer(e(C,5,4,8,6));
+        h.offer(e(R,9,5,8,0));
+        h.offer(e(C,6,5,9,7));
+        assertEquals(5,h.scheduler.delivered()[0]);
+        h.offer(e(W,7,5,0,6));
+        assertArrayEquals(new long[]{6,9,7},h.scheduler.delivered());
+    }
+
+    @Test void maximal1024RecordBundleFitsAndItsSlotsReleaseOnlyAtCommit() {
+        Harness h = new Harness();
+        h.scheduler.offer(marked(1,Envelope.Bundle.OPEN),0);
+        for (int seq=2;seq<1024;seq++) h.scheduler.offer(marked(seq,Envelope.Bundle.MEMBER),0);
+        h.scheduler.offer(marked(1024,Envelope.Bundle.CLOSE),0);
+        assertEquals(1024,h.calls.get(0).records().size());
+        assertEquals(1024,h.scheduler.pendingRecords());
+        fails(() -> h.scheduler.reservePartial(C,1,0));
+        h.drain(0); assertEquals(0,h.scheduler.pendingRecords());
+        assertEquals(1024,h.scheduler.delivered()[0]);
+    }
+
+    @Test void completingPartialAtFullRecordBudgetDoesNotNeedAnExtraSlot() {
+        Harness h = new Harness();
+        ReceiverScheduler.Partial p=h.scheduler.reservePartial(C,34,0);
+        for (int i=1;i<1024;i++) h.scheduler.reservePartial(C,1,0);
+        h.scheduler.complete(p,e(C,1,0,0,0),34,0,0);
+        assertEquals(1024,h.scheduler.pendingRecords());
+        h.drain(0); assertEquals(1023,h.scheduler.pendingRecords());
+    }
+
+    @Test void envelopeLengthEndAndDefensiveDependencyValidation() {
+        long[] deps={0,0,0};
+        Envelope a=new Envelope(C,Envelope.Kind.GAME,1,deps,2097154,null,Envelope.Bundle.NONE,false);
+        deps[0]=1;
+        assertEquals(0,a.dependency(C));
+        a.dependencies()[0]=2; assertEquals(0,a.dependency(C));
+        assertEquals(2097191,a.wireBytes());
+        fails(() -> new Envelope(C,Envelope.Kind.GAME,1,new long[3],2097155,null,Envelope.Bundle.NONE,false));
+        fails(() -> new Envelope(R,Envelope.Kind.END,1,new long[3],0,null,Envelope.Bundle.NONE,false));
+        fails(() -> new Envelope(C,Envelope.Kind.END,1,new long[3],1,null,Envelope.Bundle.NONE,false));
+        fails(() -> new Envelope(C,Envelope.Kind.GAME,0,new long[3],0,null,Envelope.Bundle.NONE,false));
+        fails(() -> new Envelope(C,Envelope.Kind.GAME,1,new long[2],0,null,Envelope.Bundle.NONE,false));
+    }
+
+    @Test void bundleUncompressedTotalIncludesDelimitersOnSenderAndReceiver() {
+        SenderSequencer s=new SenderSequencer();
+        s.beginBundle(0); s.addBundleMember(8*1024*1024,0,null,false,0);
+        fails(() -> s.endBundle(1,null,0,null,0));
+        assertArrayEquals(new long[3],s.assigned());
+        Harness h=new Harness();
+        h.scheduler.offer(marked(1,Envelope.Bundle.OPEN),34,1,0);
+        h.scheduler.offer(marked(2,Envelope.Bundle.MEMBER),34,8*1024*1024-1,0);
+        fails(() -> h.scheduler.offer(marked(3,Envelope.Bundle.CLOSE),34,1,0));
+        h.scheduler.offer(marked(3,Envelope.Bundle.CLOSE),34,0,0);
+        assertEquals(3,h.calls.get(0).records().size());
+    }
 }

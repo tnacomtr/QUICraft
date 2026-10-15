@@ -19,6 +19,10 @@ public final class ReceiverScheduler {
     public static final long CONTROL_RESERVE_BYTES = 1024 * 1024;
     public static final long TIMEOUT_NANOS = 10000000000L;
 
+    /** Handoff, not a commit: decode/validate the whole unit before invoking game logic,
+     * debit retained output via retainDecoded(), then acknowledge only after application.
+     * The owner applies stricter game-specific packet/bundle limits and closes on failure.
+     */
     public interface Handler { void deliver(Delivery delivery); }
     /** One record, or a whole bundle. Acknowledge the final sequence, never a member. */
     public static final class Delivery {
@@ -58,6 +62,7 @@ public final class ReceiverScheduler {
     private long bytes, auxiliaryBytes;
     private Delivery outstanding;
     private long outstandingSince;
+    private long pumpNow;
     private boolean pumping, ended, controlEnded;
     private boolean receivingBundle;
     private long bundleStarted;
@@ -144,8 +149,9 @@ public final class ReceiverScheduler {
             if ((!receivingBundle && (b == Envelope.Bundle.MEMBER || b == Envelope.Bundle.CLOSE))
                     || (receivingBundle && b != Envelope.Bundle.MEMBER && b != Envelope.Bundle.CLOSE))
                 throw new OrderingException("bundle delimiter order");
-            if (b == Envelope.Bundle.MEMBER && (bundleMembers == 4096
-                    || bundleUncompressed + uncompressed > 8L * 1024 * 1024))
+            if ((b == Envelope.Bundle.MEMBER && bundleMembers == 4096)
+                    || ((b == Envelope.Bundle.MEMBER || b == Envelope.Bundle.CLOSE)
+                    && bundleUncompressed + uncompressed > 8L * 1024 * 1024))
                 throw new OrderingException("bundle bounds");
         }
     }
@@ -153,7 +159,8 @@ public final class ReceiverScheduler {
         received[e.lane().ordinal()] = e.sequence();
         if (e.kind() == Envelope.Kind.END) controlEnded = true;
         if (e.bundle() == Envelope.Bundle.OPEN) {
-            receivingBundle = true; bundleStarted = now; bundleMembers = 0; bundleUncompressed = 0;
+            receivingBundle = true; bundleStarted = now; bundleMembers = 0;
+            bundleUncompressed = uncompressed;
         } else if (e.bundle() == Envelope.Bundle.MEMBER) {
             bundleMembers++; bundleUncompressed += uncompressed;
         } else if (e.bundle() == Envelope.Bundle.CLOSE) receivingBundle = false;
@@ -189,6 +196,8 @@ public final class ReceiverScheduler {
         return null;
     }
     private void pump(long now) {
+        // An inline applied() may advance time while the non-recursive drain is active.
+        pumpNow = now;
         if (pumping || ended) return;
         pumping = true;
         try {
@@ -199,7 +208,7 @@ public final class ReceiverScheduler {
                     if (next != null) break;
                 }
                 if (next == null) break;
-                outstanding = next; outstandingSince = now;
+                outstanding = next; outstandingSince = pumpNow;
                 handler.deliver(next);
                 if (outstanding != null) break;
             }
@@ -222,7 +231,7 @@ public final class ReceiverScheduler {
         for (Entry entry : queues.get(envelope.lane().ordinal())) {
             if (!outstanding.records().contains(entry.envelope)) break;
             if (entry.envelope == envelope) target = entry;
-            if (entry.envelope.bundle() == Envelope.Bundle.MEMBER)
+            if (bundle)
                 bundleSize += entry.envelope == envelope ? totalUncompressedBytes : entry.uncompressed;
         }
         if (target == null || (bundle && bundleSize > 8L * 1024 * 1024))
