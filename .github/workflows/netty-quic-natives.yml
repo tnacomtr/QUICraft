@@ -80,6 +80,8 @@ jobs:
           choco install -y nasm ninja
           rustup toolchain install 1.98.0 --profile minimal
           rustup default 1.98.0
+      - name: Keep Git's coreutils link out of rustc's way (it shadows MSVC link.exe)
+        run: mv /usr/bin/link /usr/bin/link-coreutils
       - run: natives/build-netty-quic.sh natives natives/build/work natives/build/out
         env:
           PYTHON: python

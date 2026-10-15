@@ -135,7 +135,12 @@ cp "$netty/license/quiche-deps/INVENTORY.txt" "$out/licenses/INVENTORY.txt"
 
 # --- Netty's build: classes and this platform's native.
 m2="${MAVEN_REPO_LOCAL:-$work/m2}"
-(cd "$netty" && ./mvnw -B -ntp -Dmaven.repo.local="$m2" -pl codec-classes-quic,codec-native-quic \
+# Maven Central answers 502 now and then; retry those as well as I/O errors (resolver 1.x and 2.x names).
+retry=()
+for prefix in aether.connector.http aether.transport.http; do
+    retry+=("-D$prefix.retryHandler.count=8" "-D$prefix.retryHandler.serviceUnavailable=429,500,502,503,504")
+done
+(cd "$netty" && ./mvnw -B -ntp -Dmaven.repo.local="$m2" "${retry[@]}" -pl codec-classes-quic,codec-native-quic \
     -DskipTests package)
 
 if [[ ! -d "$boring_cache" && -d "$native/target/boringssl" ]]; then
