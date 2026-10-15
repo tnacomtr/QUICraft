@@ -442,6 +442,13 @@ public final class QuicServer implements Closeable {
     static volatile long confirmMillis = 10_000;
 
     /**
+     * Tests only: overrides the bidirectional stream limit a {@code /3} listener advertises to the
+     * client ({@code -1} keeps 13.13's two). It lets a test reach the "other stream" branch of
+     * 13.3, which the two-stream limit otherwise hides behind the QUIC stream count.
+     */
+    static volatile int v3StreamsForTests = -1;
+
+    /**
      * Deadline for every connection to complete its handshake, so spoofed or abandoned handshakes
      * can't hold open-connection slots. Separate from {@link #confirmMillis}. Tests shorten it.
      */
@@ -941,6 +948,9 @@ public final class QuicServer implements Closeable {
                 });
         if (idGenerator != null) {
             builder.connectionIdAddressGenerator(idGenerator);
+        }
+        if (shared.v3 != null && v3StreamsForTests >= 0) {
+            builder.initialMaxStreamsBidirectional(v3StreamsForTests);
         }
         return builder.build();
     }
