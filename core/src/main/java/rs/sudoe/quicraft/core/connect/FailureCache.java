@@ -23,11 +23,30 @@ import rs.sudoe.quicraft.core.tls.Fingerprint;
  * Remembers QUIC failures per (IP, QUIC port, fingerprint) with exponential backoff, persisted
  * across restarts (docs/protocol.md §6): 1 minute, doubling per consecutive failure, at most
  * 1 hour. A success clears the entry. A missing or corrupt file reads as empty. Thread-safe.
+ *
+ * <p><b>Activation failures are a separate state.</b> §12.14 makes an activation failure
+ * ({@code /3} binding or cipher cutover) override a previous handshake success, and clears it only
+ * by a later successful activation for that key. So {@link #recordSuccess(InetAddress, int,
+ * Fingerprint)}, which the connect path calls when the QUIC handshake wins, must not clear it:
+ * the two live in different maps, keyed the same way. {@link #recordActivationFailure(InetAddress,
+ * int, Fingerprint)} sets the activation entry, {@link #isActivationBlocked(InetAddress, int,
+ * Fingerprint, long)} reads it and {@link #clearActivationFailure(InetAddress, int, Fingerprint)}
+ * is what a successful activation calls. Both maps use §6's schedule and both are persisted; a file
+ * written before this state existed loads unchanged, because the activation entries carry their own
+ * key prefix.
  */
 public final class FailureCache {
     static final long INITIAL_BACKOFF_MILLIS = TimeUnit.MINUTES.toMillis(1);
     static final long MAX_BACKOFF_MILLIS = TimeUnit.HOURS.toMillis(1);
     private static final Logger LOG = Logger.getLogger("QUICraft");
+
+    /**
+     * Prefix of an activation-failure key in the properties file. §6's on-disk format is one
+     * {@code key=failures,blockedUntil} property per entry, and this prefix is what tells the two
+     * kinds apart, so a file written before activation failures existed still reads as handshake
+     * failures only.
+     */
+    static final String ACTIVATION_PREFIX = "activation|";
 
     private static final class Entry {
         final int failures;
@@ -42,6 +61,8 @@ public final class FailureCache {
     private final Path file;
     private final LongSupplier clock;
     private final Map<String, Entry> entries = new HashMap<>();
+    /** §12.14's activation failures, keyed exactly like {@link #entries} and never cleared by a handshake success. */
+    private final Map<String, Entry> activationEntries = new HashMap<>();
 
     private FailureCache(Path file, LongSupplier clock) {
         this.file = file;
@@ -66,12 +87,17 @@ public final class FailureCache {
                     // Ignore nonsense rather than trusting it; drop long-expired entries.
                     if (e.failures > 0 && e.blockedUntil - now <= MAX_BACKOFF_MILLIS
                             && now - e.blockedUntil < TimeUnit.DAYS.toMillis(7)) {
-                        cache.entries.put(key, e);
+                        if (key.startsWith(ACTIVATION_PREFIX)) {
+                            cache.activationEntries.put(key.substring(ACTIVATION_PREFIX.length()), e);
+                        } else {
+                            cache.entries.put(key, e);
+                        }
                     }
                 }
             } catch (IOException | RuntimeException e) {
                 LOG.log(Level.INFO, "QUIC failure cache unreadable, starting empty: {0}", String.valueOf(e));
                 cache.entries.clear();
+                cache.activationEntries.clear();
             }
         }
         return cache;
@@ -102,10 +128,48 @@ public final class FailureCache {
         }
     }
 
+    /**
+     * Records a {@code /3} activation failure for this key (docs/protocol.md 12.14), which §6's
+     * backoff schedule then applies to exactly like a handshake failure. It is a state of its own:
+     * {@link #recordSuccess(InetAddress, int, Fingerprint)} does not clear it, because an
+     * activation failure overrides a handshake success, and only a later successful activation does
+     * ({@link #clearActivationFailure(InetAddress, int, Fingerprint)}).
+     */
+    public synchronized void recordActivationFailure(InetAddress address, int port, Fingerprint fingerprint) {
+        String key = key(address, port, fingerprint);
+        Entry previous = activationEntries.get(key);
+        int failures = previous == null ? 1 : Math.min(previous.failures + 1, 32);
+        long backoff = Math.min(INITIAL_BACKOFF_MILLIS << Math.min(failures - 1, 20), MAX_BACKOFF_MILLIS);
+        activationEntries.put(key, new Entry(failures, clock.getAsLong() + backoff));
+        save();
+    }
+
+    /**
+     * Whether a {@code /3} activation is still backing off for this key at {@code now}, which the
+     * caller reads from the same clock this cache was loaded with. While it is blocked the connect
+     * path uses TCP, exactly as §6 does for a handshake failure (12.14).
+     */
+    public synchronized boolean isActivationBlocked(InetAddress address, int port, Fingerprint fingerprint,
+            long now) {
+        Entry e = activationEntries.get(key(address, port, fingerprint));
+        return e != null && now < e.blockedUntil;
+    }
+
+    /**
+     * Clears the activation-failure state for this key, which only a successful activation does
+     * (docs/protocol.md 12.14).
+     */
+    public synchronized void clearActivationFailure(InetAddress address, int port, Fingerprint fingerprint) {
+        if (activationEntries.remove(key(address, port, fingerprint)) != null) {
+            save();
+        }
+    }
+
     /** Forgets every failure, e.g. after the player fixed their firewall. */
     public synchronized void clear() {
-        if (!entries.isEmpty()) {
+        if (!entries.isEmpty() || !activationEntries.isEmpty()) {
             entries.clear();
+            activationEntries.clear();
             save();
         }
     }
@@ -117,6 +181,10 @@ public final class FailureCache {
         Properties p = new Properties();
         for (Map.Entry<String, Entry> e : entries.entrySet()) {
             p.setProperty(e.getKey(), e.getValue().failures + "," + e.getValue().blockedUntil);
+        }
+        for (Map.Entry<String, Entry> e : activationEntries.entrySet()) {
+            p.setProperty(ACTIVATION_PREFIX + e.getKey(),
+                    e.getValue().failures + "," + e.getValue().blockedUntil);
         }
         try {
             Files.createDirectories(file.toAbsolutePath().getParent());
