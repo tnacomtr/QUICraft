@@ -566,6 +566,24 @@ class RebindStateTest {
     }
 
     @Test
+    void recordSuccessOnAStaleAttemptRemovesTheEntry(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        RebindState.Attempt abandoned = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(abandoned);
+        now.addAndGet(RebindState.STALE_ATTEMPT_MILLIS);
+
+        state.recordSuccess("mc.example.com", 25565);
+        String json = jsonOf(Files.readAllBytes(file));
+        assertFalse(json.contains("mc.example.com"), "the stale token went with the entry: " + json);
+        RebindState.Attempt fresh = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(fresh, "the success decides the state, so no failure is charged for the stale attempt");
+        assertFalse(state.endAttempt(abandoned, false), "the abandoned token is gone");
+        assertTrue(state.endAttempt(fresh, true));
+    }
+
+    @Test
     void aFailedFlushAtBeginReturnsNoTokenAndChangesNothing(@TempDir Path dir) throws IOException {
         assertBeginFailsClosed(StateFile.FAULT_FORCE, dir);
     }

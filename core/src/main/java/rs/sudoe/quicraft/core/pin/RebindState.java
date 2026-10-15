@@ -358,12 +358,14 @@ public final class RebindState {
      *
      * <p>With no live attempt the entry is removed, and its detailed notice history goes with it; the
      * monotone bloom filter still suppresses every tuple that was noticed, so 12.16's at-most-once rule
-     * holds. With a live attempt the entry is kept and only its window is cleared (failures back to
-     * zero), which keeps both the notice history and the active token: the invariant that a live
-     * attempt's state is never evicted holds, the single-attempt guarantee cannot be broken by a
-     * success landing in the middle of one (a second {@link #tryBeginAttempt(String, int, long)} stays
-     * refused, and {@link #endAttempt(Attempt, boolean)} still matches the token that started it), and
-     * the history stays more detailed than the filter alone. A successful end through
+     * holds. An attempt that is stale counts as no attempt here, like everywhere else, so a success
+     * after an abandoned attempt removes the entry rather than keeping a token nobody can end. With a
+     * live attempt the entry is kept and only its window is cleared (failures back to zero), which
+     * keeps both the notice history and the active token: the invariant that a live attempt's state is
+     * never evicted holds, the single-attempt guarantee cannot be broken by a success landing in the
+     * middle of one (a second {@link #tryBeginAttempt(String, int, long)} stays refused, and
+     * {@link #endAttempt(Attempt, boolean)} still matches the token that started it), and the history
+     * stays more detailed than the filter alone. A successful end through
      * {@link #endAttempt(Attempt, boolean)} removes the entry like the first case.</p>
      */
     public synchronized void recordSuccess(String host, int port) {
@@ -376,7 +378,7 @@ public final class RebindState {
         if (entry == null) {
             return;
         }
-        if (entry.active != null) {
+        if (live(entry, clock.getAsLong())) {
             entry.failures = 0;
             entry.blockedUntil = 0;
         } else {
