@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.time.Clock;
@@ -19,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -30,6 +32,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.LongSupplier;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -155,8 +158,9 @@ class ClientConnectorV3Test {
 
     /** The pin store, re-bind state and failure cache a test drives, with a controllable clock. */
     static final class Fixture {
-        final AtomicLong clock = new AtomicLong(1_000_000L);
-        final FailureCache failures = FailureCache.load(null, clock::get);
+        /** The clock the connector, the failure cache and the re-bind state all share. */
+        final LongSupplier clock = System::currentTimeMillis;
+        final FailureCache failures = FailureCache.load(null, clock);
         final PinStore pins;
         final RebindState rebinds;
         final AdvertisementCache advertisements = new AdvertisementCache();
@@ -185,7 +189,7 @@ class ClientConnectorV3Test {
         ClientConnector connector(int protocolNumber, boolean multistreamEnabled,
                 boolean exporterCapable) {
             return new ClientConnector(advertisements, failures,
-                    new ClientConnector.V3Support(pins, rebinds, worker, clock::get, protocolNumber,
+                    new ClientConnector.V3Support(pins, rebinds, worker, clock, protocolNumber,
                             multistreamEnabled, exporterCapable));
         }
 
@@ -346,7 +350,7 @@ class ClientConnectorV3Test {
         assertFalse(f.failures.allows(f.address(), QUIC_PORT, f.fingerprint),
                 "§6's failure-cache entry is recorded");
         // And the re-bind backoff is up: a second attempt is refused.
-        assertNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.get()),
+        assertNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.getAsLong()),
                 "12.16's re-bind backoff is recorded too");
     }
 
@@ -500,11 +504,11 @@ class ClientConnectorV3Test {
         Fixture f = Fixture.empty();
         f.advertiseV3();
         f.failures.recordActivationFailure(f.address(), QUIC_PORT, f.fingerprint);
-        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()));
+        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.getAsLong()));
 
         // What the race records on a QUIC handshake win must not clear it (12.14).
         f.failures.recordSuccess(f.address(), QUIC_PORT, f.fingerprint);
-        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()));
+        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.getAsLong()));
 
         FakePlatform p = new FakePlatform();
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
@@ -528,9 +532,9 @@ class ClientConnectorV3Test {
 
         assertEquals(f.fingerprint.toString(), f.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).get().fingerprint(),
                 "12.15: an authenticated activation records the pin");
-        assertFalse(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()));
+        assertFalse(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.getAsLong()));
         // The attempt is over and its state is cleared, so a fresh one is admitted.
-        assertNotNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.get()));
+        assertNotNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.getAsLong()));
     }
 
     @Test
@@ -556,7 +560,7 @@ class ClientConnectorV3Test {
         Faults.set();
         assertEquals(fingerprint('d').toString(), f.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).get().fingerprint(),
                 "the old pin stays until a passing check replaces it");
-        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
+        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.getAsLong()),
                 "a write failure after activation is itself an activation failure");
         // 12.15 with 12.14: the adapter still gets the retry decision for the failure it just saw.
         assertTrue(plan.failed(V3Plan.Phase.JOINING, V3Plan.PIN_WRITE_FAILED));
@@ -574,7 +578,7 @@ class ClientConnectorV3Test {
                 "the user's fail-safe decision: a failed re-bind continues over fresh TCP");
         assertEquals("QUIC multi-stream failed (" + V3Plan.REBIND_FAILED + "), fell back to TCP",
                 changed.fallbackMessage());
-        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
+        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.getAsLong()),
                 "12.14: the failure is recorded as an activation failure");
         assertTrue(f.failures.allows(f.address(), QUIC_PORT, f.fingerprint),
                 "and it is not also a handshake entry");
@@ -669,7 +673,7 @@ class ClientConnectorV3Test {
         assertEquals(PinState.NONE, plan.pinState(), "the name is first contact again");
         assertNull(plan.attempt(), "12.16: so there is no re-bind attempt");
         assertFalse(p.bypassResumption, "and no bypassed resumption either");
-        assertFalse(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
+        assertFalse(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.getAsLong()),
                 "no failure and no backoff are recorded for it");
         assertFalse(f.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).isPresent(),
                 "and the expired pin is gone from the store");
@@ -784,12 +788,12 @@ class ClientConnectorV3Test {
         assertEquals("QUIC multi-stream failed (handshake timed out), fell back to TCP",
                 outcome.fallbackMessage());
         assertFalse(f.failures.allows(f.address(), QUIC_PORT, f.fingerprint), "§6's entry is recorded");
-        assertNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.get()),
+        assertNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.getAsLong()),
                 "and 12.16's re-bind window is up");
     }
 
     @Test
-    void aPreconnectFailureAfterAnAdmittedRebindReleasesTheAttempt(@TempDir Path dir) throws Exception {
+    void aFailedPreconnectStepNeverAdmitsARebind(@TempDir Path dir) throws Exception {
         Path file = dir.resolve("rebind-v1.bin");
         Fixture f = new Fixture(PinStore.load(null), RebindState.load(file));
         f.advertiseV3();
@@ -799,12 +803,9 @@ class ClientConnectorV3Test {
         Faults.set();
 
         assertEquals("tcp", outcome.tcp(), "a failed pre-connect step still joins over TCP");
-        // The plan's fixture keeps its re-bind state in memory, so this one writes a real file to
-        // observe the admitted attempt: tryBeginAttempt only pre-stores the window (failures stays
-        // 0), while endAttempt(false) counts one failure.
-        String state = stateFile(file);
-        assertTrue(state.contains("\"failures\":1"),
-                "the failed pre-connect step must end the attempt it admitted: " + state);
+        assertEquals(0, f.rebinds.activeKeys().size(), "and it holds no attempt");
+        assertFalse(Files.exists(file),
+                "nothing is admitted or written before the step that can fail");
     }
 
     private static String stateFile(Path file) throws Exception {
@@ -830,6 +831,49 @@ class ClientConnectorV3Test {
                 "an abandoned join must not leave the server's re-bind state held: " + state);
     }
 
+
+    @Test
+    void aFailedRaceEndsAnAdmittedRebind() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
+        FakePlatform p = new FakePlatform();
+        p.quic = new CompletableFuture<QuicByteStream>();
+        p.quic.completeExceptionally(new IOException("no QUIC"));
+        p.tcp = new CompletableFuture<String>();
+        p.tcp.completeExceptionally(new ConnectException("no TCP"));
+
+        assertThrows(ExecutionException.class,
+                () -> f.connect(f.connector(true, true), p, Mode.AUTO));
+        assertEquals(0, f.rebinds.activeKeys().size(),
+                "a race that fails outright must not leave the re-bind attempt active");
+    }
+
+
+    @Test
+    void aTcpAnswerForAChangedPinNeverAdmitsAnAttempt() throws Exception {
+        // The activation backoff, the full store and §6's handshake backoff all answer TCP, and with
+        // the attempt admitted only when the plan really dials /3 none of them can leak one.
+        Fixture activation = Fixture.empty();
+        activation.advertiseV3();
+        activation.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
+        activation.failures.recordActivationFailure(activation.address(), QUIC_PORT,
+                activation.fingerprint);
+        assertEquals("tcp",
+                activation.connect(activation.connector(true, true), new FakePlatform(), Mode.AUTO).tcp());
+        assertEquals(0, activation.rebinds.activeKeys().size());
+        assertEquals(0, activation.rebinds.size(), "and nothing is written for it either");
+
+        Fixture backoff = Fixture.empty();
+        backoff.advertiseV3();
+        backoff.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
+        backoff.failures.recordFailure(backoff.address(), QUIC_PORT, backoff.fingerprint);
+        assertEquals("tcp",
+                backoff.connect(backoff.connector(true, true), new FakePlatform(), Mode.AUTO).tcp());
+        assertEquals(0, backoff.rebinds.activeKeys().size());
+        assertEquals(0, backoff.rebinds.size());
+    }
+
     @Test
     void aFaultInTheDialOfAChangedPinEndsTheAttemptAndUsesTcp() throws Exception {
         Fixture f = Fixture.empty();
@@ -844,7 +888,7 @@ class ClientConnectorV3Test {
                 outcome.fallbackMessage());
         assertFalse(f.failures.allows(f.address(), QUIC_PORT, f.fingerprint),
                 "§6's entry is recorded");
-        assertNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.get()),
+        assertNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.getAsLong()),
                 "and the re-bind backoff is up");
     }
 
@@ -872,7 +916,7 @@ class ClientConnectorV3Test {
             assertEquals(reason, plan.fallbackReason());
             assertTrue(plan.isFailed());
             assertFalse(plan.isActivated());
-            assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
+            assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.getAsLong()),
                     reason + " must record the activation failure so later joins use TCP");
         }
     }
@@ -907,7 +951,7 @@ class ClientConnectorV3Test {
         assertFalse(plan.isActivated());
         assertEquals("QUIC multi-stream failed (lane ordering failure), fell back to TCP",
                 plan.fallbackMessage());
-        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
+        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.getAsLong()),
                 "so the next join goes straight to TCP during the backoff");
 
         // A second report changes nothing, activated() cannot follow a failure, and the pin stays.

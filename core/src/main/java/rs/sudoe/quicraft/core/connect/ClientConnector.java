@@ -527,6 +527,11 @@ public final class ClientConnector {
         });
         choice.whenComplete((chosen, error) -> {
             if (result.isDone()) {
+                // The caller gave up before the decision arrived, so nothing will dial: an attempt
+                // the decision admitted must not stay held by a connection that will never exist.
+                if (error == null && chosen != null) {
+                    endRebindAttemptOnWorker(chosen.attempt);
+                }
                 return;
             }
             if (error != null) {
@@ -564,33 +569,39 @@ public final class ClientConnector {
                 && Protocol.ALPN_V3.equals(advertisement.get().alpn())
                 && failures.isActivationBlocked(target.getAddress(), target.getPort(),
                         advertisement.get().fingerprint(), now);
-        RebindState.Attempt attempt = null;
-        if (pinState == TransportSelection.PinState.CHANGED && !activationBlocked) {
-            // 12.16: one automatic re-bind attempt per persisted window, keyed by the logical server
-            // alone, so a rotating fingerprint cannot reset it. Null covers the active window, a
-            // state that cannot be trusted and a state that cannot hold another server.
-            attempt = v3.rebinds().tryBeginAttempt(logicalHost, logicalPort, now);
+        // The selection step of 12.3, 13.1 and 12.16.
+        Faults.check(Faults.V3_SELECT);
+        Optional<RoutingTable> table = routingTable(advertisement);
+        // The selection is a pure function, and whether to admit the one re-bind attempt depends on
+        // its answer, so it runs first with the attempt provisionally allowed and is re-run below
+        // when no attempt is admitted.
+        TransportSelection.Result selection = select(mode, advertisement, pinState, table, true);
+        String tcpReason = null;
+        if (activationBlocked) {
+            tcpReason = "the /3 activation failure for this key is still backing off (12.14)";
+        } else if (pinStoreFullForNewName(pinState, logicalHost, logicalPort, advertisement,
+                activeKeys)) {
+            // 12.16, spec-literal: "Never automatically evict pins: when the pin store is full, use
+            // TCP for new names until the player explicitly deletes a pin." So a new name with a
+            // full store is TCP, not /2, even though /2 itself needs no pin.
+            tcpReason = "the pin store is full and has no pin for this name (12.16)";
+        } else if (handshakeBackoff(server, advertisement, mode)) {
+            // §6: a UDP-blocked or frontend-proxied /3 server costs at most one head start per
+            // backoff window, exactly as the shipped decision treats a /2 server.
+            tcpReason = "the section 6 backoff for this address, port and fingerprint is still active";
         }
-        boolean kept = false;
-        try {
-            // The selection step of 12.3, 13.1 and 12.16. It is checked after the pin and re-bind
-            // reads, so a fault here models a failure with an attempt already admitted, which is the
-            // case that must release it.
-            Faults.check(Faults.V3_SELECT);
-            Optional<RoutingTable> table = routingTable(advertisement);
-            TransportSelection.Result selection = TransportSelection.select(TransportSelection.Inputs.builder()
-                    .setting(mode)
-                    .multistreamEnabled(v3.multistreamEnabled())
-                    .exporterCapable(v3.exporterCapable())
-                    .advertisement(advertisement)
-                    .pinState(pinState)
-                    .rebindAllowed(attempt != null)
-                    .clientProtocolNumber(v3.protocolNumber())
-                    .localRoutingDigestHex(table.isPresent() ? Optional.of(table.get().digestHex())
-                            : Optional.<String>empty())
-                    .build());
-            if (attempt != null && advertisement.isPresent()
-                    && selection.transport() != TransportSelection.Transport.V3
+        RebindState.Attempt attempt = null;
+        if (pinState == TransportSelection.PinState.CHANGED) {
+            if (tcpReason == null && selection.transport() == TransportSelection.Transport.V3) {
+                // 12.16: the one automatic re-bind attempt, admitted only now that this connection
+                // really will dial /3, so no other path can leave it holding the server's state.
+                // Null covers the active window, a state that cannot be trusted and a state that
+                // cannot hold another server, and means fresh TCP.
+                attempt = v3.rebinds().tryBeginAttempt(logicalHost, logicalPort, now);
+                if (attempt == null) {
+                    selection = select(mode, advertisement, pinState, table, false);
+                }
+            } else if (tcpReason == null && advertisement.isPresent()
                     && prerequisiteMissing(selection.missing())) {
                 // 12.16's pre-connect precedence: a changed pin whose /3 prerequisites are missing
                 // leaves the pin alone, records §6's entry and the re-bind backoff, and joins over
@@ -598,37 +609,40 @@ public final class ClientConnector {
                 // exists.
                 failures.recordFailure(target.getAddress(), target.getPort(),
                         advertisement.get().fingerprint());
-                v3.rebinds().endAttempt(attempt, false);
-                attempt = null;
+                advanceRebindWindow(logicalHost, logicalPort, now);
             }
-            String tcpReason = null;
-            if (activationBlocked) {
-                tcpReason = "the /3 activation failure for this key is still backing off (12.14)";
-            } else if (pinStoreFullForNewName(pinState, logicalHost, logicalPort, advertisement,
-                    activeKeys)) {
-                // 12.16, spec-literal: "Never automatically evict pins: when the pin store is full,
-                // use TCP for new names until the player explicitly deletes a pin." So a new name
-                // with a full store is TCP, not /2, even though /2 itself needs no pin.
-                tcpReason = "the pin store is full and has no pin for this name (12.16)";
-            } else if (handshakeBackoff(server, advertisement, mode)) {
-                // §6: a UDP-blocked or frontend-proxied /3 server costs at most one head start per
-                // backoff window, exactly as the shipped decision treats a /2 server.
-                tcpReason = "the section 6 backoff for this address, port and fingerprint is still active";
-            }
-            kept = true;
-            return new Prepared(selection, pinState, attempt, tcpReason,
-                    table.isPresent() ? table.get().digest() : null);
-        } finally {
-            if (attempt != null && !kept) {
-                // A pre-connect failure must not leave the attempt holding the server's re-bind
-                // state: the caller falls back to TCP, and the state would otherwise stay active for
-                // the whole attempt's lifetime.
-                try {
-                    v3.rebinds().endAttempt(attempt, false);
-                } catch (Throwable ignored) {
-                    // Best effort: the state disables itself on a failed write.
-                }
-            }
+        }
+        return new Prepared(selection, pinState, attempt, tcpReason,
+                table.isPresent() ? table.get().digest() : null);
+    }
+
+    /** One run of the selection rules of 12.3, 13.1 and 12.16 over the inputs of one attempt. */
+    private TransportSelection.Result select(ConnectDecision.Mode mode,
+            Optional<Advertisement> advertisement, TransportSelection.PinState pinState,
+            Optional<RoutingTable> table, boolean rebindAllowed) {
+        return TransportSelection.select(TransportSelection.Inputs.builder()
+                .setting(mode)
+                .multistreamEnabled(v3.multistreamEnabled())
+                .exporterCapable(v3.exporterCapable())
+                .advertisement(advertisement)
+                .pinState(pinState)
+                .rebindAllowed(rebindAllowed)
+                .clientProtocolNumber(v3.protocolNumber())
+                .localRoutingDigestHex(table.isPresent() ? Optional.of(table.get().digestHex())
+                        : Optional.<String>empty())
+                .build());
+    }
+
+    /**
+     * Records 12.16's re-bind backoff for a changed pin whose {@code /3} prerequisites are missing,
+     * without dialling: the window a failure would set is stored and released, so the next attempt
+     * waits for it exactly as if this one had run and failed. A window that is already up needs
+     * nothing.
+     */
+    private void advanceRebindWindow(String logicalHost, int logicalPort, long now) {
+        RebindState.Attempt attempt = v3.rebinds().tryBeginAttempt(logicalHost, logicalPort, now);
+        if (attempt != null) {
+            v3.rebinds().endAttempt(attempt, false);
         }
     }
 
@@ -1107,6 +1121,8 @@ public final class ClientConnector {
         });
         race.whenComplete((r, error) -> {
             if (error != null) {
+                // The race itself failed, so no connection exists: an attempt it admitted is over.
+                endRebindAttemptOnWorker(plans);
                 result.completeExceptionally(new TcpConnectException(unwrap(error)));
                 return;
             }
