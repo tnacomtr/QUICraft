@@ -174,7 +174,11 @@ class OrderingCoreTest {
             }
             Harness h = new Harness();
             if (!ordered) {
-                fails(() -> { for (Envelope e : input) h.offer(e); });
+                fails(() -> {
+                    for (Envelope e : input) {
+                        h.offer(e);
+                    }
+                });
                 return;
             }
             totals[1]++;

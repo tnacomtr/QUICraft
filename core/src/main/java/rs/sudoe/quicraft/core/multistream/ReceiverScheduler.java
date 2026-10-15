@@ -108,6 +108,7 @@ public final class ReceiverScheduler {
             this.started = now;
         }
     }
+
     private static final class Entry {
         final Envelope envelope;
         Envelope decoded;
@@ -124,10 +125,12 @@ public final class ReceiverScheduler {
             }
         }
     }
+
     private static final class Candidate {
         Entry decode;
         Delivery delivery;
     }
+
     private final Decoder decoder;
     private final Handler handler;
     private final List<ArrayDeque<Entry>> queues = new ArrayList<ArrayDeque<Entry>>();
@@ -178,6 +181,7 @@ public final class ReceiverScheduler {
         }
         return fatal(ex);
     }
+
     private OrderingException fatal(RuntimeException ex) {
         failed = true;
         if (ex instanceof OrderingException) {
@@ -205,6 +209,7 @@ public final class ReceiverScheduler {
     public boolean ended() {
         return ended;
     }
+
     // The 64 CONTROL slots and the 1 MiB reserve follow 13.12's literal "at most 960 auxiliary
     // records": auxiliary records are capped at 960 regardless of how many CONTROL records are
     // pending, so CONTROL always keeps 64 slots and 1 MiB that auxiliary lanes cannot use.
@@ -216,6 +221,7 @@ public final class ReceiverScheduler {
                 && additionalBytes <= SHARED_BYTES - auxiliaryBytes
                 && additionalBytes <= SHARED_BYTES + CONTROL_RESERVE_BYTES - bytes;
     }
+
     private void budget(Lane lane, long size, int records) {
         if (size < 0 || records < 0 || records > MAX_RECORDS - count
                 || size > SHARED_BYTES + CONTROL_RESERVE_BYTES - bytes
@@ -223,6 +229,7 @@ public final class ReceiverScheduler {
             throw new OrderingException("receive budget exceeded");
         }
     }
+
     private void account(Lane lane, long size, int records) {
         bytes += size;
         count += records;
@@ -279,6 +286,7 @@ public final class ReceiverScheduler {
             throw escape(ex);
         }
     }
+
     private void requirePartial(Partial p) {
         if (!partials.containsKey(p)) {
             throw new OrderingException("unknown partial");
@@ -336,6 +344,7 @@ public final class ReceiverScheduler {
         return lane != Lane.CONTROL
                 && Long.compareUnsigned(received[lane.ordinal()], endAdmitted.dependency(lane)) < 0;
     }
+
     private void validate(Envelope e, long retained) {
         int i = e.lane().ordinal();
         if (ended || received[i] == -1L
@@ -358,6 +367,7 @@ public final class ReceiverScheduler {
             throw new OrderingException("retained wire size");
         }
     }
+
     private void enqueue(Envelope e, long retained, long now) {
         received[e.lane().ordinal()] = e.sequence();
         if (e.kind() == Envelope.Kind.END) {
@@ -368,6 +378,7 @@ public final class ReceiverScheduler {
         markHeads(now);
         pump(now);
     }
+
     private void markHeads(long now) {
         for (ArrayDeque<Entry> q : queues) {
             Entry e = q.peek();
@@ -377,6 +388,7 @@ public final class ReceiverScheduler {
             }
         }
     }
+
     private boolean ready(Envelope e, long provisionalControl) {
         for (Lane lane : Lane.values()) {
             long watermark = lane == Lane.CONTROL ? provisionalControl : delivered[lane.ordinal()];
@@ -387,7 +399,7 @@ public final class ReceiverScheduler {
         return true;
     }
 
-    /** Allocation-free mirror of {@link #eligible}: true when the queue has nothing to act on. */
+    /** Mirror of {@link #eligible} that builds no candidate or list: true when the queue has nothing to act on. */
     private boolean blocked(ArrayDeque<Entry> q) {
         long provisional = delivered[0];
         boolean bundle = false;
@@ -414,6 +426,7 @@ public final class ReceiverScheduler {
         }
         return true;
     }
+
     private Candidate eligible(ArrayDeque<Entry> q) {
         if (q.isEmpty()) {
             return null;
@@ -449,6 +462,7 @@ public final class ReceiverScheduler {
         }
         return null;
     }
+
     private void pump(long now) {
         // An inline applied() may advance time while the non-recursive drain is active.
         pumpNow = now;
