@@ -70,6 +70,11 @@ public interface V3Connection extends QuicByteStream {
      *
      * <p>Runs on the connection's event loop, inline when called there, so a server can activate
      * before, or in the same task as, the flush that sends SERVER_SWITCH (13.3).
+     *
+     * <p>12.7: a server must not start binding before it has seen its own TLS handshake complete
+     * ({@link #handshakeComplete()}). A server-role activation before that fails closed with
+     * {@code 0x10} rather than starting a session, so a caller cannot skip the check by accident;
+     * the client role has no such guard.
      */
     void activate(LaneGame game, ByteBuffer controlLeftover);
 

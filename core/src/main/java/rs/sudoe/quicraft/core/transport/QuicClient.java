@@ -179,8 +179,23 @@ public final class QuicClient {
      */
     public static CompletableFuture<V3Connection> connectV3(InetSocketAddress remote, Fingerprint fingerprint,
             RoutingTable table, EarlyFlight early, boolean bypassResumption) {
+        return connectV3(remote, fingerprint, table, TransportConfig.DEFAULT, early, bypassResumption);
+    }
+
+    /**
+     * As {@link #connectV3(InetSocketAddress, Fingerprint, RoutingTable, EarlyFlight, boolean)}, with
+     * {@code config} as this dial's base: its admission budgets, idle timeout, congestion control,
+     * initial cwnd, {@code earlyData} and {@code sessionResumption} all apply, with the 13.13
+     * multi-stream limits added ({@link TransportConfig#withMultistream()}). {@code earlyData} off
+     * means no 0-RTT for this dial, whatever material is cached.
+     */
+    public static CompletableFuture<V3Connection> connectV3(InetSocketAddress remote, Fingerprint fingerprint,
+            RoutingTable table, TransportConfig config, EarlyFlight early, boolean bypassResumption) {
         if (table == null) {
             throw new NullPointerException("table");
+        }
+        if (config == null) {
+            throw new NullPointerException("config");
         }
         if (!QuicSupport.hasMaxFlowControlWindows()) {
             CompletableFuture<V3Connection> unavailable = new CompletableFuture<V3Connection>();
@@ -189,9 +204,9 @@ public final class QuicClient {
                             + " fall back to /2 or TCP"));
             return unavailable;
         }
-        TransportConfig config = TransportConfig.multistream();
+        TransportConfig effective = config.withMultistream();
         return connectV3(codec -> new Bootstrap().group(group()).channel(NioDatagramChannel.class).handler(codec)
-                .bind(0), remote, fingerprint, table, config, early, bypassResumption);
+                .bind(0), remote, fingerprint, table, effective, early, bypassResumption);
     }
 
     private static CompletableFuture<V3Connection> connectV3(UdpFactory udpFactory, InetSocketAddress remote,
@@ -866,6 +881,9 @@ public final class QuicClient {
                 retrying = true;
                 lastEarly = "sent, then abandoned: no server preamble within the grace period";
                 earlyStream = null;
+                // freshTls replaces the cached context for (fingerprint, /3), so the tickets stored
+                // under this ALPN are dropped: a bypassResumption dial keeps its tickets only until
+                // an abandoned 0-RTT retry replaces the shared context (12.16, 12.17).
                 dial.tls.set(freshTls(dial.fingerprint, dial.config, Protocol.ALPN_V3));
                 Codecs.closeLater(connection, true, Protocol.CLOSE_EARLY_ABANDONED);
                 connect();

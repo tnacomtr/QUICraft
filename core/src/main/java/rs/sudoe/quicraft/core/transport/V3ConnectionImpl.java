@@ -699,6 +699,13 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         if (activated || rawClosed) {
             return;
         }
+        if (role == LaneSession.Role.SERVER && !handshakeComplete) {
+            // 12.7 (user decision 2026-10-16): the server enters configuration only after processing
+            // a 1-RTT packet, so configuration-stage messages prove its own handshake is complete. It
+            // must refuse to start binding (0x10) before that, whatever the game asks.
+            failActivation("the server's own TLS handshake is not complete yet (12.7)");
+            return;
+        }
         doDetach(null); // implicit detach keeps whatever was buffered for the session below
         RoutingTable resolved = table;
         if (resolved == null) {

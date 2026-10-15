@@ -104,6 +104,11 @@ public final class QuicServer implements Closeable {
         return shared.admission.pendingLeases();
     }
 
+    /** Tests only: the transport configuration this listener actually applies. */
+    TransportConfig effectiveConfigForTests() {
+        return shared.config;
+    }
+
     /** Retry packets sent so far, for diagnostics and tests. */
     long retriesSent() {
         return shared.retries.get();
@@ -238,7 +243,7 @@ public final class QuicServer implements Closeable {
             TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested) throws Exception {
         V3Listener v3 = enableV3(v3Requested);
         if (v3 != null) {
-            config = TransportConfig.multistream();
+            config = config.withMultistream();
         }
         int count = socketCount;
         if (count > MAX_UDP_SOCKETS) {
@@ -345,7 +350,7 @@ public final class QuicServer implements Closeable {
             TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested) throws Exception {
         V3Listener v3 = enableV3(v3Requested);
         if (v3 != null) {
-            config = TransportConfig.multistream();
+            config = config.withMultistream();
         }
         if (sockets.isEmpty() || loops.size() != sockets.size()) {
             throw new IllegalArgumentException("one loop per socket and at least one socket are required, got "
