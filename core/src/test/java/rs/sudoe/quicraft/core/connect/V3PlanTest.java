@@ -99,17 +99,23 @@ class V3PlanTest {
         final Fingerprint fingerprint = fingerprint('c');
         final V3Plan plan;
 
-        Plan(Executor worker, PinState pinState, RebindState.Attempt attempt, PinStore pins,
-                RebindState rebinds) {
+        Plan(ConnectDecision.Mode mode, Executor worker, PinState pinState, RebindState.Attempt attempt,
+                PinStore pins, RebindState rebinds) {
             this.pins = pins;
             this.rebinds = rebinds;
-            this.plan = new V3Plan(pinState, attempt, fingerprint, new byte[32], pins, failures,
+            this.plan = new V3Plan(mode, pinState, attempt, fingerprint, new byte[32], pins, failures,
                     rebinds, worker, ADDRESS, QUIC_PORT, HOST, LOGICAL_PORT);
         }
 
         /** A plan for a name with no pin, so it holds no re-bind attempt. */
         static Plan joining(Executor worker) {
-            return new Plan(worker, PinState.NONE, null, PinStore.load(null), RebindState.load(null));
+            return joining(worker, ConnectDecision.Mode.AUTO);
+        }
+
+        /** The same, for a plan whose connection used the given setting, which decides §4's retry. */
+        static Plan joining(Executor worker, ConnectDecision.Mode mode) {
+            return new Plan(mode, worker, PinState.NONE, null, PinStore.load(null),
+                    RebindState.load(null));
         }
 
         /** A plan for a changed pin, holding the one re-bind attempt 12.16 admits. */
@@ -117,7 +123,7 @@ class V3PlanTest {
             PinStore pins = PinStore.load(null);
             RebindState rebinds = RebindState.load(null);
             RebindState.Attempt attempt = rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, 0);
-            return new Plan(worker, PinState.CHANGED, attempt, pins, rebinds);
+            return new Plan(ConnectDecision.Mode.AUTO, worker, PinState.CHANGED, attempt, pins, rebinds);
         }
     }
 
@@ -334,8 +340,13 @@ class V3PlanTest {
         assertTrue(plan.plan.isActivated(), "and once it is answered true, it is");
     }
 
+    /**
+     * Drives {@link ClientConnector.SerialExecutor} directly: two commands are queued, the delegate
+     * refuses the drain the first one starts, and the assertion is that only that caller's command is
+     * dropped, the other survives, and the next {@code execute} restarts the drain for it.
+     */
     @Test
-    void aRefusedDrainKeepsTheCommandsQueuedBehindIt() throws Exception {
+    void serialExecutorDropsOnlyTheRefusedCommandAndRestartsOnTheNextExecute() throws Exception {
         final CountDownLatch started = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AtomicInteger calls = new AtomicInteger();
@@ -351,8 +362,7 @@ class V3PlanTest {
                 command.run();
             }
         };
-        final Executor worker = new ClientConnector.V3Support(PinStore.load(null),
-                RebindState.load(null), delegate, System::currentTimeMillis, 12345, true, true).worker();
+        final Executor worker = new ClientConnector.SerialExecutor(delegate);
         Thread first = new Thread(new Runnable() {
             @Override
             public void run() {
@@ -370,7 +380,7 @@ class V3PlanTest {
         });
         first.start();
         assertTrue(started.await(FIVE_SECONDS, TimeUnit.SECONDS));
-        // This command is queued behind the run that is about to be refused.
+        // This command is queued behind the drain that is about to be refused.
         worker.execute(new Runnable() {
             @Override
             public void run() {

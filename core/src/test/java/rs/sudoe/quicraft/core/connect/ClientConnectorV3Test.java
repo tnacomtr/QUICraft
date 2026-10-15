@@ -19,6 +19,7 @@ import java.time.Duration;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -101,7 +102,7 @@ class ClientConnectorV3Test {
     }
 
     /** A platform whose QUIC and TCP answers the test sets, recording which dial was used. */
-    static final class FakePlatform implements ClientConnector.Platform<String> {
+    static class FakePlatform implements ClientConnector.Platform<String> {
         CompletableFuture<Optional<Advertisement>> status =
                 CompletableFuture.completedFuture(Optional.<Advertisement>empty());
         CompletableFuture<QuicByteStream> quic =
@@ -159,7 +160,7 @@ class ClientConnectorV3Test {
     /** The pin store, re-bind state and failure cache a test drives, with a controllable clock. */
     static final class Fixture {
         /** The clock the connector, the failure cache and the re-bind state all share. */
-        final LongSupplier clock = System::currentTimeMillis;
+        LongSupplier clock = System::currentTimeMillis;
         final FailureCache failures = FailureCache.load(null, clock);
         final PinStore pins;
         final RebindState rebinds;
@@ -435,6 +436,26 @@ class ClientConnectorV3Test {
     }
 
     @Test
+    void theV2AndFailExitsHoldNoAttempt() throws Exception {
+        // The /2 exit: a changed pin never selects /2, so nothing can be admitted for it.
+        Fixture v2 = Fixture.empty();
+        v2.advertiseV2();
+        v2.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
+        assertEquals("tcp", v2.connect(v2.connector(true, true), new FakePlatform(), Mode.AUTO).tcp());
+        assertTrue(v2.rebinds.activeKeys().isEmpty(), "the /2 exit holds no attempt");
+        assertNull(v2.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, v2.clock.getAsLong()),
+                "12.16: a changed pin with a /2-only advertisement only records its backoff");
+
+        // The FAIL exit: quic-only with a missing /3 prerequisite, for a changed pin.
+        Fixture fail = Fixture.empty();
+        fail.advertiseV3();
+        fail.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
+        assertThrows(ExecutionException.class,
+                () -> fail.connect(fail.connector(true, false), new FakePlatform(), Mode.QUIC_ONLY));
+        assertTrue(fail.rebinds.activeKeys().isEmpty(), "the FAIL exit holds no attempt");
+    }
+
+    @Test
     void aV2AdvertisementKeepsTheShippedPath() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV2();
@@ -633,6 +654,22 @@ class ClientConnectorV3Test {
                 outcome.fallbackMessage());
     }
 
+    /** Queues every task until the test releases it, so a test can act while the worker is busy. */
+    static final class QueuedExecutor implements Executor {
+        private final List<Runnable> queued = new ArrayList<Runnable>();
+
+        @Override
+        public synchronized void execute(Runnable command) {
+            queued.add(command);
+        }
+
+        synchronized void runAll() {
+            for (int guard = 0; guard < 64 && !queued.isEmpty(); guard++) {
+                queued.remove(0).run();
+            }
+        }
+    }
+
     /** Runs the first task inline and refuses every later one, like a worker that is shutting down. */
     static final class RejectAfterOneTask implements Executor {
         private int tasks;
@@ -826,11 +863,73 @@ class ClientConnectorV3Test {
         // RebindState.load(null) keeps everything in memory, so this fixture writes a real file to
         // observe the attempt: tryBeginAttempt only pre-stores the window (failures stays 0), while
         // endAttempt(false) counts one failure.
+        assertTrue(f.rebinds.activeKeys().isEmpty(),
+                "an abandoned join must not leave the attempt active");
         String state = stateFile(file);
         assertTrue(state.contains("\"failures\":1"),
                 "an abandoned join must not leave the server's re-bind state held: " + state);
     }
 
+
+    @Test
+    void cancellingWhileThePreparationRunsStillEndsTheAttemptItAdmits() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
+        QueuedExecutor gate = new QueuedExecutor();
+        f.worker = gate;
+        final AtomicInteger clockReads = new AtomicInteger();
+        f.clock = () -> {
+            clockReads.incrementAndGet();
+            return System.currentTimeMillis();
+        };
+        FakePlatform p = new FakePlatform();
+        p.quic = new CompletableFuture<QuicByteStream>();
+
+        CompletableFuture<Outcome<String>> join = f.join(f.connector(true, true), p);
+        assertTrue(join.cancel(false));
+        gate.runAll();
+
+        assertTrue(clockReads.get() > 0,
+                "the preparation must run to completion, cancelled join or not");
+        assertTrue(f.rebinds.activeKeys().isEmpty(),
+                "and the attempt it admitted must be ended, never left held");
+        assertEquals(0, p.v3Dials.get(), "nothing may dial for an abandoned join");
+        assertEquals(0, p.tcpAttempts.get());
+    }
+
+    @Test
+    void quicOnlyNeverRetriesOverTcpAfterABindingFailure() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
+        FakePlatform p = new FakePlatform();
+        Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.QUIC_ONLY);
+
+        assertNotNull(outcome.quic(), "quic-only dials /3");
+        assertFalse(outcome.v3Plan().failed(V3Plan.Phase.JOINING, V3Plan.BINDING_FAILED),
+                "§4: quic-only has no TCP fallback, so a binding failure never authorises one");
+        assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint,
+                f.clock.getAsLong()), "the failure is still recorded");
+        assertTrue(f.rebinds.activeKeys().isEmpty(), "and the attempt is released");
+    }
+
+    @Test
+    void aPlatformThatThrowsWhileSettingUpEndsAnAdmittedRebind() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
+        FakePlatform broken = new FakePlatform() {
+            @Override
+            public ConnectionRace.Tcp<String> tcp() {
+                throw new IllegalStateException("the platform's TCP setup is broken");
+            }
+        };
+        assertThrows(ExecutionException.class,
+                () -> f.connect(f.connector(true, true), broken, Mode.AUTO));
+        assertTrue(f.rebinds.activeKeys().isEmpty(),
+                "a synchronous setup failure must not leave the re-bind attempt active");
+    }
 
     @Test
     void aFailedRaceEndsAnAdmittedRebind() throws Exception {

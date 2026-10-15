@@ -89,6 +89,8 @@ public final class V3Plan {
     private final RebindState.Attempt attempt;
     private final Fingerprint fingerprint;
     private final byte[] routingDigest;
+    /** The player's setting, which decides whether a failure may retry over TCP at all (§4). */
+    private final ConnectDecision.Mode mode;
     private final PinStore pins;
     private final FailureCache failures;
     private final RebindState rebinds;
@@ -112,10 +114,11 @@ public final class V3Plan {
     private static final CompletableFuture<Boolean> NOT_ACTIVATED =
             CompletableFuture.completedFuture(Boolean.FALSE);
 
-    V3Plan(TransportSelection.PinState pinState, RebindState.Attempt attempt, Fingerprint fingerprint,
-            byte[] routingDigest, PinStore pins, FailureCache failures,
+    V3Plan(ConnectDecision.Mode mode, TransportSelection.PinState pinState, RebindState.Attempt attempt,
+            Fingerprint fingerprint, byte[] routingDigest, PinStore pins, FailureCache failures,
             RebindState rebinds, Executor worker, InetAddress address, int port,
             String host, int logicalPort) {
+        this.mode = mode == null ? ConnectDecision.Mode.AUTO : mode;
         this.pinState = pinState;
         this.attempt = attempt;
         this.fingerprint = fingerprint;
@@ -273,15 +276,19 @@ public final class V3Plan {
      *     a tag or a payload; null means {@link #INTERNAL_ERROR}
      * @return whether the caller must close the QUIC connection where applicable and start a fresh
      *     vanilla TCP join in this same attempt: true for the first {@link Phase#JOINING} failure,
-     *     false for a {@link Phase#PLAY} failure and false for every later call, so one connection can
-     *     never start two TCP joins
+     *     false for a {@link Phase#PLAY} failure, false for every later call, so one connection can
+     *     never start two TCP joins, and false in {@code quic-only}, where the player asked for QUIC
+     *     without a TCP fallback (§4) and the failure only closes the connection
      */
     public boolean failed(Phase phase, String reason) {
         boolean retry;
         synchronized (this) {
             // The retry decision belongs to the first report only, so one connection can never start
-            // two TCP joins: a later report returns false whatever phase it names.
-            retry = !failureReported && phase == Phase.JOINING;
+            // two TCP joins: a later report returns false whatever phase it names. §4: quic-only has
+            // no TCP fallback at all, so even a join failure only closes the connection; the failure
+            // is still recorded and the attempt released.
+            retry = !failureReported && phase == Phase.JOINING
+                    && mode != ConnectDecision.Mode.QUIC_ONLY;
             if (!failureReported) {
                 failureReported = true;
                 this.reason = reason == null ? INTERNAL_ERROR : reason;

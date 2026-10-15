@@ -333,8 +333,11 @@ public final class ClientConnector {
      * and the next {@code execute} restarts the drain for it. A delegate that silently discards
      * tasks without throwing is not supported, because nothing could tell the difference from work
      * that is still queued.</p>
+     *
+     * <p>Package-visible so its own tests can drive it directly, with a delegate that refuses a
+     * drain.</p>
      */
-    private static final class SerialExecutor implements Executor {
+    static final class SerialExecutor implements Executor {
         private final Executor delegate;
         private final ArrayDeque<Runnable> queue = new ArrayDeque<Runnable>();
         private boolean running;
@@ -534,11 +537,10 @@ public final class ClientConnector {
             prepared.completeExceptionally(t);
         }
         final CompletableFuture<Prepared> choice = prepared;
-        result.whenComplete((o, e) -> {
-            if (result.isCancelled()) {
-                choice.cancel(false);
-            }
-        });
+        // The preparation is never cancelled: a supplier that is already running would keep going
+        // anyway, and one that has not started yet would be skipped, leaving nothing to end the
+        // attempt it may hold. It runs to completion, and the branch below ends that attempt when the
+        // join was cancelled meanwhile.
         choice.whenComplete((chosen, error) -> {
             if (result.isDone()) {
                 // The caller gave up before the decision arrived, so nothing will dial: an attempt
@@ -563,6 +565,11 @@ public final class ClientConnector {
                 proceed(server, logicalHost, logicalPort, mode, advertisement, chosen, joinInputs,
                         platform, result);
             } catch (Throwable t) {
+                // A platform that throws while the connection is being set up must not leave the
+                // attempt this decision admitted holding the server's re-bind state. There is no
+                // fallback left to try here: the setup itself is what failed, and the platform's own
+                // fail-safe path joins over vanilla TCP.
+                endRebindAttemptOnWorker(chosen.attempt);
                 result.completeExceptionally(t);
             }
         });
@@ -837,7 +844,8 @@ public final class ClientConnector {
                     result);
             return;
         }
-        v3Connect(server, logicalHost, logicalPort, advertisement.get(), early, prepared, platform, result);
+        v3Connect(server, logicalHost, logicalPort, advertisement.get(), early, prepared, platform, mode,
+                result);
     }
 
     /**
@@ -865,7 +873,8 @@ public final class ClientConnector {
                 return;
             }
             failures.recordSuccess(target.getAddress(), target.getPort(), ad.fingerprint());
-            V3Plan plan = plan(logicalHost, logicalPort, ad, prepared, target);
+            V3Plan plan = plan(logicalHost, logicalPort, ad, prepared, target,
+                    ConnectDecision.Mode.QUIC_ONLY);
             if (!result.complete(new Outcome<T>(stream, null, null, plan))) {
                 endRebindAttemptOnWorker(prepared.attempt);
                 stream.close();
@@ -882,9 +891,10 @@ public final class ClientConnector {
      */
     private <T> void v3Connect(final InetSocketAddress server, final String logicalHost, final int logicalPort,
             Advertisement ad, EarlyFlight early, final Prepared prepared, Platform<T> platform,
-            CompletableFuture<Outcome<T>> result) {
+            ConnectDecision.Mode mode, CompletableFuture<Outcome<T>> result) {
         InetSocketAddress target = quicTarget(server, ad);
-        race(server, ad, early, platform, result, planHolder(logicalHost, logicalPort, ad, prepared, target));
+        race(server, ad, early, platform, result,
+                planHolder(logicalHost, logicalPort, ad, prepared, target, mode));
     }
 
     /**
@@ -912,9 +922,9 @@ public final class ClientConnector {
 
     /** Everything {@link #plan} needs, so the race can build a plan in either of its branches. */
     private PlanInput planHolder(String logicalHost, int logicalPort, Advertisement ad, Prepared prepared,
-            InetSocketAddress target) {
+            InetSocketAddress target, ConnectDecision.Mode mode) {
         return new PlanInput(logicalHost, logicalPort, ad, prepared, target,
-                prepared.pinState == TransportSelection.PinState.CHANGED);
+                prepared.pinState == TransportSelection.PinState.CHANGED, mode);
     }
 
     private static final class PlanInput {
@@ -925,15 +935,18 @@ public final class ClientConnector {
         final InetSocketAddress target;
         /** 12.16: a changed-pin re-bind is a full handshake with no early data, always. */
         final boolean bypassResumption;
+        /** The player's setting, which the plan needs to answer a failure correctly (§4). */
+        final ConnectDecision.Mode mode;
 
         PlanInput(String logicalHost, int logicalPort, Advertisement advertisement, Prepared prepared,
-                InetSocketAddress target, boolean bypassResumption) {
+                InetSocketAddress target, boolean bypassResumption, ConnectDecision.Mode mode) {
             this.logicalHost = logicalHost;
             this.logicalPort = logicalPort;
             this.advertisement = advertisement;
             this.prepared = prepared;
             this.target = target;
             this.bypassResumption = bypassResumption;
+            this.mode = mode;
         }
     }
 
@@ -941,14 +954,14 @@ public final class ClientConnector {
     private V3Plan plan(PlanInput plans) {
         return plans == null ? null
                 : plan(plans.logicalHost, plans.logicalPort, plans.advertisement, plans.prepared,
-                        plans.target);
+                        plans.target, plans.mode);
     }
 
     private V3Plan plan(String logicalHost, int logicalPort, Advertisement ad, Prepared prepared,
-            InetSocketAddress target) {
-        return new V3Plan(prepared.pinState, prepared.attempt, ad.fingerprint(), prepared.routingDigest,
-                v3.pins(), failures, v3.rebinds(), v3.worker(), target.getAddress(), target.getPort(),
-                logicalHost, logicalPort);
+            InetSocketAddress target, ConnectDecision.Mode mode) {
+        return new V3Plan(mode, prepared.pinState, prepared.attempt, ad.fingerprint(),
+                prepared.routingDigest, v3.pins(), failures, v3.rebinds(), v3.worker(),
+                target.getAddress(), target.getPort(), logicalHost, logicalPort);
     }
 
     /**
