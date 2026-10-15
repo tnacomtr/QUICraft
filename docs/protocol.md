@@ -972,7 +972,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
     a predecessor. Also cap unsent application queues at 1024 packets or 16 MiB and apply
     backpressure; an unpausable producer over the cap disconnects. A head record blocked on
     a dependency, incomplete record, or unapplied handler for 10 seconds disconnects with
-    `0x11` (ordering/resource failure). Cycles, impossible references, limit violations and
+    `0x11` (ordering/resource failure). A lane that holds the auxiliary budget while its head waits for a
+    predecessor on the other auxiliary lane (cross-lane starvation) is resolved by this same
+    10 second blocked-head disconnect. Cycles, impossible references, limit violations and
     parser/ordering errors use the same code; do not skip packets or release a barrier on
     timeout. Start the incomplete-record timer at its first byte and the blocked-head timer
     when it becomes head; progress on other lanes does not restart either deadline. This
