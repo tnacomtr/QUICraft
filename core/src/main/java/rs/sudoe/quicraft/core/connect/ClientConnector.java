@@ -708,40 +708,16 @@ public final class ClientConnector {
     }
 
     /**
-     * Connects with the {@code quicraft/3} ALPN. An ordinary pin races TCP under §5, exactly as
-     * {@code /2} does (13.1); a changed pin gets 12.16's one automatic re-bind attempt, which does
-     * not race, because its failure closes with {@code 0x10} first and only then starts a fresh
-     * vanilla TCP join.
+     * Connects with the {@code quicraft/3} ALPN. Both pin states race TCP under §5, so the player
+     * never waits for a full QUIC timeout: an ordinary pin exactly as {@code /2} does (13.1), and a
+     * changed pin's one automatic re-bind (12.16) with a full handshake and no early data. If the
+     * {@code /3} handshake wins and the binding later fails, the adapter closes {@code 0x10} and
+     * starts a fresh TCP join through {@link V3Plan#failed(V3Plan.Phase, String)}.
      */
     private <T> void v3Connect(final InetSocketAddress server, final String logicalHost, final int logicalPort,
             Advertisement ad, EarlyFlight early, final Prepared prepared, Platform<T> platform,
             CompletableFuture<Outcome<T>> result) {
-        final InetSocketAddress target = quicTarget(server, ad);
-        if (prepared.pinState == TransportSelection.PinState.CHANGED) {
-            final boolean bypassResumption = true;
-            CompletableFuture<QuicByteStream> attempt = dial(target, ad, early, bypassResumption, platform);
-            result.whenComplete((o, e) -> {
-                if (result.isCancelled()) {
-                    attempt.cancel(false);
-                }
-            });
-            attempt.whenComplete((stream, error) -> {
-                if (error != null) {
-                    // No /3 connection was created, so no 0x10 is sent: §6's entry and the re-bind
-                    // backoff are recorded, and this same attempt joins over fresh vanilla TCP. The
-                    // TCP join comes first, so nothing below can leave it unfinished.
-                    tcpOnly(platform, result, fallbackMessage(fallbackReason(FallbackReason.classify(error))));
-                    endRebindAttemptFailedOnWorker(server, ad, prepared);
-                    return;
-                }
-                failures.recordSuccess(target.getAddress(), target.getPort(), ad.fingerprint());
-                V3Plan plan = plan(logicalHost, logicalPort, ad, prepared, target);
-                if (!result.complete(new Outcome<T>(stream, null, null, plan))) {
-                    stream.close();
-                }
-            });
-            return;
-        }
+        InetSocketAddress target = quicTarget(server, ad);
         race(server, ad, early, platform, result, planHolder(logicalHost, logicalPort, ad, prepared, target));
     }
 
@@ -771,7 +747,8 @@ public final class ClientConnector {
     /** Everything {@link #plan} needs, so the race can build a plan in either of its branches. */
     private PlanInput planHolder(String logicalHost, int logicalPort, Advertisement ad, Prepared prepared,
             InetSocketAddress target) {
-        return new PlanInput(logicalHost, logicalPort, ad, prepared, target);
+        return new PlanInput(logicalHost, logicalPort, ad, prepared, target,
+                prepared.pinState == TransportSelection.PinState.CHANGED);
     }
 
     private static final class PlanInput {
@@ -780,14 +757,17 @@ public final class ClientConnector {
         final Advertisement advertisement;
         final Prepared prepared;
         final InetSocketAddress target;
+        /** 12.16: a changed-pin re-bind is a full handshake with no early data, always. */
+        final boolean bypassResumption;
 
         PlanInput(String logicalHost, int logicalPort, Advertisement advertisement, Prepared prepared,
-                InetSocketAddress target) {
+                InetSocketAddress target, boolean bypassResumption) {
             this.logicalHost = logicalHost;
             this.logicalPort = logicalPort;
             this.advertisement = advertisement;
             this.prepared = prepared;
             this.target = target;
+            this.bypassResumption = bypassResumption;
         }
     }
 
@@ -805,30 +785,25 @@ public final class ClientConnector {
                 logicalHost, logicalPort);
     }
 
-    /** Ends a changed-pin attempt that never got a connection, recording §6's entry (12.16). */
-    private void endRebindAttemptFailed(InetSocketAddress server, Advertisement ad, Prepared prepared) {
-        InetSocketAddress target = quicTarget(server, ad);
-        failures.recordFailure(target.getAddress(), target.getPort(), ad.fingerprint());
-        if (prepared.attempt != null) {
-            v3.rebinds().endAttempt(prepared.attempt, false);
-        }
-    }
-
     /**
-     * The same, on the worker and never on the caller's thread, because
-     * {@link RebindState#endAttempt} writes and fsyncs its state file.
+     * Ends the re-bind attempt this join held, when it held one: 12.16's window advances, so the same
+     * server cannot re-bind again inside it. The failure cache entry is the caller's business, and
+     * the race already records §6's own.
      *
-     * <p>A worker that refuses the task is swallowed on purpose: this is bookkeeping for a failure
-     * the join has already handled, and the player's TCP join must never depend on it.</p>
+     * <p>On the worker, never on the caller's thread, because
+     * {@link RebindState#endAttempt} writes and fsyncs its state file. A worker that refuses the task
+     * is swallowed on purpose: bookkeeping must never stop the join.</p>
      */
-    private void endRebindAttemptFailedOnWorker(final InetSocketAddress server, final Advertisement ad,
-            final Prepared prepared) {
+    private void endRebindAttemptOnWorker(final PlanInput plans) {
+        if (plans == null || plans.prepared.attempt == null) {
+            return;
+        }
         try {
             v3.worker().execute(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        endRebindAttemptFailed(server, ad, prepared);
+                        v3.rebinds().endAttempt(plans.prepared.attempt, false);
                     } catch (Throwable ignored) {
                         // Best effort: the state disables itself on a failed write.
                     }
@@ -965,8 +940,9 @@ public final class ClientConnector {
     /**
      * As {@link #race(InetSocketAddress, Advertisement, EarlyFlight, Platform, CompletableFuture)},
      * with an optional {@code /3} plan: when {@code plans} is non-null the QUIC side of the race is a
-     * {@code quicraft/3} dial (13.1) and the winning outcome carries its {@link V3Plan}. Everything
-     * else, including the head start, the failure cache and the 0-RTT grace period, is unchanged.
+     * {@code quicraft/3} dial (13.1), the winning outcome carries its {@link V3Plan}, and a lost race
+     * or an abandoned join ends the re-bind attempt that dial held (12.16). Everything else,
+     * including the head start, the failure cache and the 0-RTT grace period, is unchanged.
      */
     private <T> void race(InetSocketAddress server, Advertisement ad, EarlyFlight early, Platform<T> platform,
             CompletableFuture<Outcome<T>> result, final PlanInput plans) {
@@ -975,11 +951,13 @@ public final class ClientConnector {
         CompletableFuture<ConnectionRace.Result<T>> race = ConnectionRace.race(
                 plans == null
                         ? () -> platform.connectQuic(target, ad.fingerprint(), early)
-                        : () -> dial(target, ad, early, false, platform),
+                        : () -> dial(target, ad, early, plans.bypassResumption, platform),
                 tcp, HEAD_START_MILLIS, platform.scheduler());
         result.whenComplete((o, e) -> {
             if (result.isCancelled()) {
                 race.cancel(false);
+                // The player gave up: the server's re-bind state must not stay held by this attempt.
+                endRebindAttemptOnWorker(plans);
             }
         });
         race.whenComplete((r, error) -> {
@@ -992,11 +970,15 @@ public final class ClientConnector {
                 // key is a separate state that only a successful activation clears (12.14).
                 failures.recordSuccess(target.getAddress(), target.getPort(), ad.fingerprint());
                 if (!result.complete(new Outcome<T>(r.quic(), null, null, plan(plans)))) {
+                    // The caller gave up between the race and here, so this connection is closed
+                    // unused: a re-bind attempt it held is over too (12.16).
+                    endRebindAttemptOnWorker(plans);
                     r.quic().close();
                 }
                 return;
             }
             failures.recordFailure(target.getAddress(), target.getPort(), ad.fingerprint());
+            endRebindAttemptOnWorker(plans);
             Outcome<T> outcome = new Outcome<T>(null, r.tcp(), r.quicFailure(), null,
                     plans == null ? null : fallbackMessage(fallbackReason(r.quicFailure())));
             if (early != null && early.sent()) {

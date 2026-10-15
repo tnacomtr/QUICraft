@@ -200,6 +200,11 @@ class ClientConnectorV3Test {
                     .get(FIVE_SECONDS, TimeUnit.SECONDS);
         }
 
+        /** The connector's result future, for the tests that cancel or inspect an unfinished join. */
+        CompletableFuture<Outcome<String>> join(ClientConnector connector, FakePlatform platform) {
+            return connector.connect(SERVER, HOST, LOGICAL_PORT, Mode.AUTO, null, platform);
+        }
+
         /** The address and port §6 keys a {@code /3} failure by: the resolved IP and the QUIC port. */
         InetAddress address() {
             return SERVER.getAddress();
@@ -680,6 +685,51 @@ class ClientConnectorV3Test {
                 "a worker that refuses the bookkeeping task must never stop the TCP join");
         assertEquals("QUIC multi-stream failed (handshake failed), fell back to TCP",
                 outcome.fallbackMessage());
+    }
+
+    @Test
+    void aBlackHoledRebindDialFallsBackToTcpAfterTheHeadStart() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        FakePlatform p = new FakePlatform();
+        p.quic = new CompletableFuture<QuicByteStream>(); // a black hole: the dial never completes
+        long start = System.nanoTime();
+        Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
+        long waited = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+        assertEquals("tcp", outcome.tcp(),
+                "§5: the re-bind never makes the player wait for a full QUIC timeout");
+        assertTrue(waited < ClientConnector.HEAD_START_MILLIS + 2000, "waited " + waited + " ms");
+        assertEquals(FallbackReason.TIMEOUT_OR_LOST_RACE, outcome.fallback());
+        assertEquals("QUIC multi-stream failed (handshake timed out), fell back to TCP",
+                outcome.fallbackMessage());
+        assertFalse(f.failures.allows(f.address(), QUIC_PORT, f.fingerprint), "§6's entry is recorded");
+        assertNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.get()),
+                "and 12.16's re-bind window is up");
+    }
+
+    @Test
+    void cancellingTheJoinEndsAnAdmittedRebind(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("rebind-v1.bin");
+        Fixture f = new Fixture(PinStore.load(null), RebindState.load(file));
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        FakePlatform p = new FakePlatform();
+        p.quic = new CompletableFuture<QuicByteStream>(); // still dialling when the player gives up
+        CompletableFuture<Outcome<String>> join = f.join(f.connector(true, true), p);
+
+        assertTrue(join.cancel(false));
+        // RebindState.load(null) keeps everything in memory, so this fixture writes a real file to
+        // observe the attempt: tryBeginAttempt only pre-stores the window (failures stays 0), while
+        // endAttempt(false) counts one failure.
+        String state = stateFile(file);
+        assertTrue(state.contains("\"failures\":1"),
+                "an abandoned join must not leave the server's re-bind state held: " + state);
+    }
+
+    private static String stateFile(Path file) throws Exception {
+        return new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
     }
 
     @Test
