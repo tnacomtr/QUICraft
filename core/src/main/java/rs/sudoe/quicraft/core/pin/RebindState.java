@@ -36,11 +36,12 @@ import java.util.logging.Logger;
  *       attempt for this logical server now? The window is section 6's exponential schedule, one
  *       minute doubling per consecutive failure up to one hour, keyed exactly like a pin: normalized
  *       logical host and logical TCP port, never the fingerprint, so a rotating fingerprint cannot
- *       reset it. {@link #recordAttemptFailure(String, int)} starts or doubles the window and
- *       {@link #recordSuccess(String, int)} clears it. Admission is one call: it checks the window,
- *       capacity and that no attempt for the server is already running, marks the attempt active and
- *       returns the token {@link #endAttempt(Attempt, boolean)} needs, so the same server cannot be
- *       admitted twice.</li>
+ *       reset it. {@link #endAttempt(Attempt, boolean)} applies a failure's window in the same
+ *       synchronized call that releases the attempt, and {@link #recordSuccess(String, int)} clears
+ *       it. Admission is one call: it checks the window, capacity and that no attempt for the server
+ *       is already running, marks the attempt active and returns the token
+ *       {@link #endAttempt(Attempt, boolean)} needs, so the same server cannot be admitted twice and
+ *       no admission can slip between an attempt ending and its window starting.</li>
  *   <li>{@link #shouldNotify(String, int, String)}: may the player be told that this server's
  *       fingerprint changed to this value? True at most once per (server, fingerprint), ever: the
  *       detailed history keeps up to 16 fingerprints per server and
@@ -271,10 +272,13 @@ public final class RebindState {
      * Ends the attempt {@code attempt} started, and nothing else: a token that is not this server's
      * active attempt is ignored, so a late caller cannot clear an attempt that replaced it.
      *
-     * @param success whether the server was reached, which clears this server's window and notice
-     *     history (section 6); on failure the caller records the window with
-     *     {@link #recordAttemptFailure(String, int)}
-     * @return false when the token was not the active attempt, or when a successful end could not be
+     * <p>A failure advances this server's backoff window in the same synchronized call that releases
+     * the attempt, and persists it before returning, so no admission can slip between "the attempt is
+     * over" and "the window is up": at most one automatic attempt per window holds under concurrency.
+     * A success clears the server's entry (section 6).</p>
+     *
+     * @param success whether the server was reached
+     * @return false when the token was not the active attempt, or when the change could not be
      *     persisted, which disables the state
      */
     public synchronized boolean endAttempt(Attempt attempt, boolean success) {
@@ -292,37 +296,15 @@ public final class RebindState {
         }
         entry.active = null;
         if (!success) {
+            fail(entry, clock.getAsLong());
+            if (!persist()) {
+                disabled = true;
+                return false;
+            }
             return true;
         }
         entries.remove(mapKey);
         noticeCount -= entry.notices.size();
-        if (!persist()) {
-            disabled = true;
-            return false;
-        }
-        return true;
-    }
-
-    /**
-     * Records a failed re-binding attempt: the next one is allowed after section 6's window, one
-     * minute doubling per consecutive failure up to one hour, starting at the injected clock's
-     * current time. The connect path calls it after {@link #endAttempt(Attempt, boolean)} with
-     * {@code success} false; an entry recorded without a live attempt is honoured all the same.
-     *
-     * @return false when the state is disabled or there is no room for a new server
-     */
-    public synchronized boolean recordAttemptFailure(String host, int port) {
-        PinKey key = PinKey.of(host, port);
-        if (disabled) {
-            return false;
-        }
-        Entry entry = entryFor(PinKey.mapKey(key), key);
-        if (entry == null) {
-            return false;
-        }
-        entry.failures = Math.min(entry.failures + 1, MAX_FAILURES);
-        long backoff = Math.min(INITIAL_BACKOFF_MILLIS << Math.min(entry.failures - 1, 20), MAX_BACKOFF_MILLIS);
-        entry.blockedUntil = clock.getAsLong() + backoff;
         if (!persist()) {
             disabled = true;
             return false;
@@ -530,26 +512,6 @@ public final class RebindState {
         return false;
     }
 
-    /**
-     * The entry for {@code mapKey}, created and made room for when it is missing. Only mutating calls
-     * use this; a query never inserts.
-     *
-     * @return null when the state is full and no entry may be evicted
-     */
-    private Entry entryFor(String mapKey, PinKey key) {
-        Entry entry = entries.get(mapKey);
-        if (entry != null) {
-            touch(mapKey, entry);
-            return entry;
-        }
-        if (!makeRoom()) {
-            return null;
-        }
-        entry = new Entry(key.host(), key.port());
-        entries.put(mapKey, entry);
-        return entry;
-    }
-
     /** Evicts the least recently used entry that is not an active attempt, when there is no room. */
     private boolean makeRoom() {
         if (entries.size() < maxEntries) {
@@ -574,6 +536,20 @@ public final class RebindState {
     private void touch(String mapKey, Entry entry) {
         entries.remove(mapKey);
         entries.put(mapKey, entry);
+    }
+
+    /**
+     * Applies one failed attempt to {@code entry}: it counts as one more consecutive failure and its
+     * window is set from {@code now} (docs/protocol.md section 6).
+     */
+    private void fail(Entry entry, long now) {
+        entry.failures = Math.min(entry.failures + 1, MAX_FAILURES);
+        entry.blockedUntil = now + backoff(entry.failures);
+    }
+
+    /** Section 6's window for {@code failures} consecutive failures: one minute doubling to one hour. */
+    private static long backoff(int failures) {
+        return Math.min(INITIAL_BACKOFF_MILLIS << Math.min(failures - 1, 20), MAX_BACKOFF_MILLIS);
     }
 
     /**
