@@ -599,9 +599,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
    load, exporter equality, and upstream-native compatibility tests pass.
 3. **12.3 Gate before negotiation.** Both peers MUST have a true exporter capability probe
    and a supported routing table before advertising/offering `/3`, even for the offline
-   test profile. A peer without either uses `/2`, retains Minecraft's cipher in online
-   mode, and uses one stream (except a client facing a changed pin, which uses fresh TCP
-   under 12.16). No native at all retains §11's TCP-only behavior. An exporter
+   test profile. A server without either advertises and listens with `/2` only, retains
+   Minecraft's cipher in online mode, and uses one stream. A client without either that sees a
+   `/3` advertisement uses TCP, because a `/3` listener accepts only `/3` (13.1); it uses `/2`
+   only for a `/2` advertisement. No native at all retains §11's TCP-only behavior. An exporter
    error after `/3` selection is fatal, not permission to continue cipher-off or to silently
    renegotiate that connection. A false capability probe is an ordinary compatibility
    condition, logged once at INFO, not a binding failure.
@@ -636,6 +637,14 @@ single-socket listener: no dispatcher is installed and the connection id length 
    (including Hello with `shouldAuthenticate=false`, or Login Success without authenticated
    encryption), before processing configuration. Apply offline handling in 12.16/12.19;
    do not infer authentication merely from possession of `S`.
+   **Handshake confirmation without a native signal.** The pinned Netty reports TLS handshake
+   completion, not RFC 9001 §4.1.2 confirmation (receipt of HANDSHAKE_DONE). `/3` never uses
+   0-RTT (13.1), and a server MUST NOT process 1-RTT packets before its handshake is complete
+   (RFC 9001 §5.7). The client's Login Start travels in 1-RTT, so any server reply to it
+   proves the server's handshake is complete, which for a server is confirmation. Binding
+   begins only in configuration, after such replies. An implementation MAY therefore use
+   handshake completion plus this ordering as the confirmation gate, with no native patch, and
+   MUST test that the client never starts binding before the server's reply to Login Start.
    `F` is SHA-256 of the actual leaf certificate DER
    (or the original ticket-associated certificate on resumption); `R` is the routing
    resource digest in 13.7. Both peers calculate these locally and reject differing inputs.
@@ -706,13 +715,21 @@ single-socket listener: no dispatcher is installed and the connection id length 
     activation failure overrides a previous handshake success and is cleared only by a
     later successful activation for that key. Server logs a reason code and rate-limits
     to one warning per minute per listener; client logs once per failed attempt. Logs contain
-    no secrets, exporter values, tags or payload dumps. Do not retry cipher-off, continue
-    half-switched, or automatically replay the authenticated login over TCP. A subsequent
-    player-initiated join may use TCP under §6, with vanilla encryption. The sole named
-    exception is the **changed-pin re-bind TCP retry** in 12.16; it is not available to an
-    ordinary activation failure. This preserves TCP join availability without an unsafe
-    live downgrade: ordinary failures disconnect this attempt, never prevent the next TCP
-    join. Pre-login racing and compatibility fallback remain §5 behavior.
+    no secrets, exporter values, tags or payload dumps. Do not retry cipher-off or continue
+    half-switched. **Join-time TCP retry (user decision 2026-10-16).** A failure before
+    activation completes (any of the above, a handshake or ALPN failure, or any exception in
+    QUICraft code) closes QUIC first (with `0x10` where a connection exists) and then starts a
+    fresh vanilla TCP join in the same attempt: a new Login Start and, when online, a new
+    Mojang session join. Never transfer old login state or `S`. `quic-only` fails instead.
+    The client writes "QUIC multi-stream failed (<reason>), fell back to TCP" to its log and
+    shows it in chat once the TCP join reaches play; `<reason>` is a short human-readable
+    cause and never contains secrets. The failure-cache entry above still applies, so later
+    joins go straight to TCP during the backoff. Rationale: the retry only reaches vanilla
+    TCP with Minecraft's own encryption, which an attacker can already force by stripping the
+    advertisement (§7); the security review MUST confirm this. A failure
+    after activation (during play) is not retried: the disconnect screen shows the reason and
+    the next join uses TCP under §6. Pre-login racing and compatibility fallback remain §5
+    behavior.
 15. **12.15 Pin persistence.** Only the client, after valid SERVER_SWITCH in online mode,
     records an authenticated pin. Store in its config directory `quicraft/pins-v2.json`,
     schema version 1: entries contain normalized logical host (lowercase IDNA ASCII, or
@@ -723,10 +740,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
     completed an authenticated login", not proven server identity (12.20). v1 silent
     observations MUST NOT be promoted to authenticated pins.
     A corrupt/unreadable existing pin file or failed write disables `/3` until repaired;
-    notify the player and use `/2` or TCP on the next attempt, never silently treat corruption
-    as first contact. A write failure after activation closes the current connection with
-    `0x10`; do not attempt a live transport downgrade. Only a changed-pin re-bind may then
-    use 12.16's fresh TCP retry, after closing QUIC.
+    notify the player and use `/2` (for a `/2` advertisement) or TCP on the next attempt, never
+    silently treat corruption as first contact. A pin write failure at activation closes the
+    current connection with `0x10`; do not attempt a live transport downgrade. 12.14's
+    join-time TCP retry then applies, after closing QUIC.
 16. **12.16 Changed fingerprint.** With an existing authenticated pin (online mode, 12.15), a
     different advertised fingerprint F' MUST NOT be trusted from the ping. The client
     bypasses (but retains) tickets, tokens and recorded flights for that logical server,
@@ -739,16 +756,13 @@ single-socket listener: no dispatcher is installed and the connection id length 
     is created (no exporter capability, no supported routing table, or an absent, unknown or
     mismatched advertised routing digest under 13.1), the client neither selects `/2` nor
     trusts F': it leaves the pin unchanged, records §6's failure-cache entry and re-bind
-    backoff, and joins over fresh vanilla TCP directly (`quic-only` fails). This overrides
-    12.3/13.1's `/2` selection for a changed pin only; `0x10` is sent only when a `/3`
-    connection exists. Any failure after connection creation (binding,
+    backoff, and joins over fresh vanilla TCP directly (`quic-only` fails), never `/2`;
+    `0x10` is sent only when a `/3` connection exists. Any failure after connection creation (binding,
     exporter error, timeout, write failure) closes with `0x10`, leaves the pin
-    unchanged, records §6's failure-cache entry, and invokes the **changed-pin re-bind TCP
-    retry**, the sole exception to 12.14's no-automatic-replay rule: close the failed QUIC
-    connection first with `0x10`, then start a fresh vanilla TCP join with a new Login Start
-    and a new Mojang session join (when online). Never transfer old login state or `S`.
-    This exception applies only to this re-bind attempt, never ordinary activation failures;
-    `quic-only` instead fails. Wait for OFFER at most twice the measured QUIC handshake RTT,
+    unchanged, records §6's failure-cache entry, and uses 12.14's join-time TCP retry:
+    close the failed QUIC connection first with `0x10`, then start a fresh vanilla TCP join
+    with a new Login Start and a new Mojang session join (when online). Never transfer old
+    login state or `S`. `quic-only` instead fails. Wait for OFFER at most twice the measured QUIC handshake RTT,
     clamped to 500 ms..3 s, from entering configuration (use the transport's measured RTT
     at handshake confirmation); this replaces 12.14's 10-second
     missing-OFFER wait for re-binding only. The total activation deadline remains 10 seconds.
@@ -830,10 +844,13 @@ single-socket listener: no dispatcher is installed and the connection id length 
 ### Negotiation and stream map
 
 1. **13.1 Version selection.** Keep the advertisement object version `v:1`; a capable,
-   explicitly enabled server advertises `alpn:"quicraft/3"`. Such a listener accepts both
-   `/3` and `/2`; a capable client offers the advertised ALPN only, except for the explicit
-   pre-connect `/2` compatibility selection below. Existing clients that
-   do not recognize `/3` use TCP; new clients seeing `/2` use unchanged v1. A failed `/3`
+   explicitly enabled server advertises `alpn:"quicraft/3"`. **Such a listener accepts only
+   `/3`** (user decision 2026-10-16): quiche applies one set of transport parameters per
+   listener, and `/2`'s MUST stay unchanged (12.1), so there is no dual `/2`+`/3` listener. A
+   server with `/3` disabled keeps the shipped `/2` listener unchanged. A client offers the
+   advertised ALPN only. Existing clients that do not recognize `/3`, and new clients that
+   cannot do `/3`, use TCP; new clients seeing `/2` use unchanged v1. `/2` is expected to be
+   deprecated once `/3` covers every platform native, supported game version and Velocity. A failed `/3`
    handshake races/falls back under §5, never sends a v2 preamble to a `/2` peer, and never
    alters the TCP listener. No feature is inferred from a plugin payload on `/2`.
    Add optional advertisement field `routing` containing an object mapping decimal unsigned
@@ -842,14 +859,11 @@ single-socket listener: no dispatcher is installed and the connection id length 
    sign and no leading zero except `"0"`, at most 10 digits, fitting a signed 32-bit int; each
    value is exactly `sha256:` followed by 64 lowercase hex digits. Any malformed entry, and more
    than 64 entries, discards the whole member (all-or-nothing), never the rest of the
-   advertisement; a client treats a discarded member as absent, which can only select `/2` or
-   TCP. A server whose response would exceed §1's cap with the member omits the routing object
+   advertisement; a client treats a discarded member as absent, which can only select TCP. A server whose response would exceed §1's cap with the member omits the routing object
    first and still advertises.
    Vanilla ignores it; obey §1's response-size cap. Before connecting, clients require a
    matching digest for their protocol to select `/3`; absent/unknown/mismatched entries
-   select `/2` if supported by that listener, otherwise TCP (a changed pin instead uses
-   fresh TCP, 12.16). Never guess a routing table.
-   A `/3` advertisement's listener MUST also accept `/2` for this compatibility selection.
+   select TCP (a changed pin likewise uses fresh TCP, 12.16). Never guess a routing table.
    OFFER's digest comparison remains authoritative even after an advertisement match.
 2. **13.2 Preamble.** Under `/3` only, stream 0 begins in each direction with exactly
    `VarInt(length) || u8(version=2) || u8(token_length) || token`; token length is 0 or 16,
@@ -904,7 +918,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
    therefore disconnects only when a previously matching advertisement was stale (including
    a changed or falsified advertisement), not as normal compatibility negotiation.
    Runtime packet-id remappers/modded registries require an explicitly
-   matching reviewed table or stay `/2`.
+   matching reviewed table or advertise `/2` only.
 7. **13.7 Data resource.** Store routing as UTF-8 JSON data, one resource per protocol number,
    with `schema:1`, `protocol:<number>`, `default:"control"`, and `routes` entries containing
    `state`, `direction` (`clientbound`/`serverbound`), `packet_id` (nonnegative integer),
@@ -1075,7 +1089,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
     backoff updated on failure (asserted separately), success-only discard of tickets/tokens/
     flights, changed fingerprint with unavailable exporter or missing/mismatched routing
     digest selecting fresh TCP without `/2` or `0x10`, restart-persisted fingerprint-independent
-    backoff, notice deduplication/eviction and ordinary-failure no-replay behavior.
+    backoff, notice deduplication/eviction, the join-time TCP retry (close before fresh TCP, log and
+    chat message, failure-cache entry) for every pre-activation failure kind, no retry after
+    activation, and the client never starting binding before the server's reply to Login
+    Start (12.7).
     Run a 50,000-concurrent-QUIC-connection node benchmark before enablement, recording
     configured node budget, admission reservations/refusals, retained and native memory,
     peak pending bytes/records, CONTROL progress, latency and throughput under auxiliary
