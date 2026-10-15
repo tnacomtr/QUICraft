@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
@@ -20,6 +21,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -142,6 +144,13 @@ class ClientConnectorV3Test {
         final RebindState rebinds;
         final AdvertisementCache advertisements = new AdvertisementCache();
         final Fingerprint fingerprint = fingerprint('c');
+        /** Runs every task inline, so a test observes the worker's state calls synchronously. */
+        Executor worker = new Executor() {
+            @Override
+            public void execute(Runnable command) {
+                command.run();
+            }
+        };
 
         Fixture(PinStore pins, RebindState rebinds) {
             this.pins = pins;
@@ -158,13 +167,6 @@ class ClientConnectorV3Test {
 
         ClientConnector connector(int protocolNumber, boolean multistreamEnabled,
                 boolean exporterCapable) {
-            // Runnable::run is the worker: the tests observe the state calls synchronously.
-            Executor worker = new Executor() {
-                @Override
-                public void execute(Runnable command) {
-                    command.run();
-                }
-            };
             return new ClientConnector(advertisements, failures,
                     new ClientConnector.V3Support(pins, rebinds, worker, clock::get, protocolNumber,
                             multistreamEnabled, exporterCapable));
@@ -590,6 +592,38 @@ class ClientConnectorV3Test {
         Faults.set(Faults.V3_DIAL);
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
         assertEquals("tcp", outcome.tcp(), "§5: a failed /3 handshake races and falls back");
+        assertEquals("QUIC multi-stream failed (handshake failed), fell back to TCP",
+                outcome.fallbackMessage());
+    }
+
+    /** Runs the first task inline and refuses every later one, like a worker that is shutting down. */
+    static final class RejectAfterOneTask implements Executor {
+        private int tasks;
+
+        @Override
+        public void execute(Runnable command) {
+            if (tasks++ == 0) {
+                command.run();
+                return;
+            }
+            throw new RejectedExecutionException("the worker is shutting down");
+        }
+    }
+
+    @Test
+    void aWorkerThatRefusesTasksStillYieldsATcpOutcome() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        // The pre-connect step needs the first task; the failure bookkeeping is the second.
+        f.worker = new RejectAfterOneTask();
+        FakePlatform p = new FakePlatform();
+        p.quic = new CompletableFuture<QuicByteStream>();
+        p.quic.completeExceptionally(new IOException("the dial failed"));
+        Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
+
+        assertEquals("tcp", outcome.tcp(),
+                "a worker that refuses the bookkeeping task must never stop the TCP join");
         assertEquals("QUIC multi-stream failed (handshake failed), fell back to TCP",
                 outcome.fallbackMessage());
     }

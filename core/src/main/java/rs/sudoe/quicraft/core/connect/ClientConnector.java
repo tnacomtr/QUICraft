@@ -699,15 +699,10 @@ public final class ClientConnector {
             attempt.whenComplete((stream, error) -> {
                 if (error != null) {
                     // No /3 connection was created, so no 0x10 is sent: §6's entry and the re-bind
-                    // backoff are recorded, and this same attempt joins over fresh vanilla TCP.
-                    // Both writes happen on the worker, never on whatever thread completed the dial.
-                    v3.worker().execute(new Runnable() {
-                        @Override
-                        public void run() {
-                            endRebindAttemptFailed(server, ad, prepared);
-                        }
-                    });
+                    // backoff are recorded, and this same attempt joins over fresh vanilla TCP. The
+                    // TCP join comes first, so nothing below can leave it unfinished.
                     tcpOnly(platform, result, fallbackMessage(fallbackReason(FallbackReason.classify(error))));
+                    endRebindAttemptFailedOnWorker(server, ad, prepared);
                     return;
                 }
                 failures.recordSuccess(target.getAddress(), target.getPort(), ad.fingerprint());
@@ -787,6 +782,31 @@ public final class ClientConnector {
         failures.recordFailure(target.getAddress(), target.getPort(), ad.fingerprint());
         if (prepared.attempt != null) {
             v3.rebinds().endAttempt(prepared.attempt, false);
+        }
+    }
+
+    /**
+     * The same, on the worker and never on the caller's thread, because
+     * {@link RebindState#endAttempt} writes and fsyncs its state file.
+     *
+     * <p>A worker that refuses the task is swallowed on purpose: this is bookkeeping for a failure
+     * the join has already handled, and the player's TCP join must never depend on it.</p>
+     */
+    private void endRebindAttemptFailedOnWorker(final InetSocketAddress server, final Advertisement ad,
+            final Prepared prepared) {
+        try {
+            v3.worker().execute(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        endRebindAttemptFailed(server, ad, prepared);
+                    } catch (Throwable ignored) {
+                        // Best effort: the state disables itself on a failed write.
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
+            // A worker that is shutting down must not stop the join.
         }
     }
 
