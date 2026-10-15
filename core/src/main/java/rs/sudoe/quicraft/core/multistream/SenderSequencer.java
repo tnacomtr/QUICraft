@@ -8,6 +8,7 @@ import rs.sudoe.quicraft.core.routing.Lane;
 
 /** One sending direction, called serially at the original game ordering point. */
 public final class SenderSequencer {
+    public static final int MAX_BUNDLE_MEMBERS = 1022;
     public static final long TIMEOUT_NANOS = 10000000000L;
     private final long[] assigned = new long[3];
     private List<Member> members;
@@ -57,7 +58,7 @@ public final class SenderSequencer {
                                 boolean changesStateCompressionOrActivation, long now) {
         checkDeadlines(now);
         if (members == null || changesStateCompressionOrActivation || uncompressedBytes < 0
-                || bodyLength < 0 || bodyLength > 2097154 || members.size() == 4096
+                || bodyLength < 0 || bodyLength > 2097154 || members.size() == MAX_BUNDLE_MEMBERS
                 || bundleBytes + uncompressedBytes > 8L * 1024 * 1024)
             throw new OrderingException("invalid/oversized bundle");
         members.add(new Member(bodyLength, body)); bundleBytes += uncompressedBytes;

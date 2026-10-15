@@ -149,7 +149,7 @@ public final class ReceiverScheduler {
             if ((!receivingBundle && (b == Envelope.Bundle.MEMBER || b == Envelope.Bundle.CLOSE))
                     || (receivingBundle && b != Envelope.Bundle.MEMBER && b != Envelope.Bundle.CLOSE))
                 throw new OrderingException("bundle delimiter order");
-            if ((b == Envelope.Bundle.MEMBER && bundleMembers == 4096)
+            if ((b == Envelope.Bundle.MEMBER && bundleMembers == SenderSequencer.MAX_BUNDLE_MEMBERS)
                     || ((b == Envelope.Bundle.MEMBER || b == Envelope.Bundle.CLOSE)
                     && bundleUncompressed + uncompressed > 8L * 1024 * 1024))
                 throw new OrderingException("bundle bounds");

@@ -206,9 +206,9 @@ class OrderingCoreTest {
 
     @Test void senderBundleCapsAndIllegalInterleaving() {
         SenderSequencer s = new SenderSequencer(); s.beginBundle(0);
-        for (int i=0;i<4096;i++) s.addBundleMember(2048,0,null,false,0);
+        for (int i=0;i<1022;i++) s.addBundleMember(2048,0,null,false,0);
         fails(() -> s.addBundleMember(0,0,null,false,0));
-        assertEquals(4098,s.endBundle(0,null,0,null,0).size());
+        assertEquals(1024,s.endBundle(0,null,0,null,0).size());
         s.beginBundle(0); s.addBundleMember(8*1024*1024,0,null,false,0);
         fails(() -> s.addBundleMember(1,0,null,false,0));
         fails(() -> s.addBundleMember(0,0,null,true,0));
@@ -220,9 +220,9 @@ class OrderingCoreTest {
     @Test void receiverBundleCapsAndMalformedMarkers() {
         Harness h = new Harness();
         h.scheduler.offer(marked(1,Envelope.Bundle.OPEN),0);
-        for (int i=0;i<4096;i++) {
-            // The stricter 1024 queue limit wins before the 4096 bundle ceiling.
-            if (i==1023) {
+        for (int i=0;i<1023;i++) {
+            // Leave space for both delimiters within the 1024-record ceiling.
+            if (i==1022) {
                 final int seq=i+2;
                 fails(() -> h.scheduler.offer(marked(seq,Envelope.Bundle.MEMBER),0));
                 break;
@@ -419,6 +419,13 @@ class OrderingCoreTest {
         fails(() -> h.scheduler.reservePartial(C,1,0));
         h.drain(0); assertEquals(0,h.scheduler.pendingRecords());
         assertEquals(1024,h.scheduler.delivered()[0]);
+    }
+
+    @Test void receiverRejects1023rdMemberEvenBeforeTheClosingDelimiter() {
+        Harness h = new Harness();
+        h.scheduler.offer(marked(1,Envelope.Bundle.OPEN),0);
+        for (int seq=2;seq<=1023;seq++) h.scheduler.offer(marked(seq,Envelope.Bundle.MEMBER),0);
+        fails(() -> h.scheduler.offer(marked(1024,Envelope.Bundle.MEMBER),0));
     }
 
     @Test void completingPartialAtFullRecordBudgetDoesNotNeedAnExtraSlot() {
