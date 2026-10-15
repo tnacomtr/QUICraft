@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -22,6 +23,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -104,6 +106,7 @@ class ClientConnectorV3Test {
         CompletableFuture<String> tcp = CompletableFuture.completedFuture("tcp");
         final AtomicInteger v2Dials = new AtomicInteger();
         final AtomicInteger v3Dials = new AtomicInteger();
+        final AtomicInteger tcpAttempts = new AtomicInteger();
         volatile TransportSelection.Transport dialAlpn;
         volatile boolean bypassResumption;
 
@@ -135,6 +138,7 @@ class ClientConnectorV3Test {
             return new ConnectionRace.Tcp<String>() {
                 @Override
                 public CompletableFuture<String> connect() {
+                    tcpAttempts.incrementAndGet();
                     return tcp;
                 }
 
@@ -672,6 +676,22 @@ class ClientConnectorV3Test {
         assertEquals(0, rebinds.size(), "12.15: its re-bind state is forgotten too");
         assertNotNull(rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, System.currentTimeMillis()),
                 "so its stale backoff window cannot hold the next attempt back");
+    }
+
+    @Test
+    void quicOnlyNeverFallsBackToTcpOnTheV3Path() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        FakePlatform p = new FakePlatform();
+        IOException failure = new IOException("the /3 dial failed");
+        p.quic = new CompletableFuture<QuicByteStream>();
+        p.quic.completeExceptionally(failure);
+
+        ExecutionException thrown = assertThrows(ExecutionException.class,
+                () -> f.connect(f.connector(true, true), p, Mode.QUIC_ONLY));
+        assertSame(failure, thrown.getCause(), "quic-only shows the /3 error, as the /2 path does");
+        assertEquals(1, p.v3Dials.get());
+        assertEquals(0, p.tcpAttempts.get(), "and it never opens TCP");
     }
 
     @Test

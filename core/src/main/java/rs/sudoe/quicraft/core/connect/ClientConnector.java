@@ -772,6 +772,7 @@ public final class ClientConnector {
             String joinInputs, Platform<T> platform, CompletableFuture<Outcome<T>> result) {
         EarlyFlight early = joinInputs == null ? null : new EarlyFlight(joinInputs);
         if (prepared.tcpReason != null) {
+            endRebindAttemptOnWorker(prepared.attempt);
             if (mode == ConnectDecision.Mode.QUIC_ONLY) {
                 // §4: quic-only never downgrades silently, so the blocker is the failure. The
                 // shipped path treats a TCP decision the same way.
@@ -786,19 +787,62 @@ public final class ClientConnector {
         }
         TransportSelection.Transport transport = prepared.selection.transport();
         if (transport == TransportSelection.Transport.FAIL) {
+            endRebindAttemptOnWorker(prepared.attempt);
             result.completeExceptionally(new IOException(prepared.selection.reason()));
             return;
         }
         if (transport == TransportSelection.Transport.TCP || !advertisement.isPresent()) {
+            endRebindAttemptOnWorker(prepared.attempt);
             tcpOnly(platform, result);
             return;
         }
         if (transport == TransportSelection.Transport.V2) {
-            // The shipped decision, unchanged: racing, the failure cache and 0-RTT (12.1).
+            // The shipped decision, unchanged: racing, the failure cache and 0-RTT (12.1). A changed
+            // pin never selects /2, so this ends an attempt only if one was somehow admitted.
+            endRebindAttemptOnWorker(prepared.attempt);
             decided(server, mode, advertisement, joinInputs, platform, result);
             return;
         }
+        if (mode == ConnectDecision.Mode.QUIC_ONLY) {
+            // §4: quic-only means QUIC without a TCP fallback, for /3 exactly as for /2.
+            v3QuicOnly(server, logicalHost, logicalPort, advertisement.get(), early, prepared, platform,
+                    result);
+            return;
+        }
         v3Connect(server, logicalHost, logicalPort, advertisement.get(), early, prepared, platform, result);
+    }
+
+    /**
+     * A {@code /3} dial with no TCP fallback, which is what {@code quic-only} asks for (§4): the
+     * caller sees the QUIC error, exactly as {@link #quicOnly} reports a {@code /2} one, and TCP is
+     * never opened. A changed pin still gets 12.16's full handshake, and the attempt it held is
+     * ended whenever this dial does not hand a connection to the adapter.
+     */
+    private <T> void v3QuicOnly(final InetSocketAddress server, final String logicalHost,
+            final int logicalPort, Advertisement ad, EarlyFlight early, final Prepared prepared,
+            Platform<T> platform, CompletableFuture<Outcome<T>> result) {
+        final InetSocketAddress target = quicTarget(server, ad);
+        CompletableFuture<QuicByteStream> attempt = dial(target, ad, early,
+                prepared.pinState == TransportSelection.PinState.CHANGED, platform);
+        result.whenComplete((o, e) -> {
+            if (result.isCancelled()) {
+                attempt.cancel(false);
+                endRebindAttemptOnWorker(prepared.attempt);
+            }
+        });
+        attempt.whenComplete((stream, error) -> {
+            if (error != null) {
+                endRebindAttemptOnWorker(prepared.attempt);
+                result.completeExceptionally(unwrap(error));
+                return;
+            }
+            failures.recordSuccess(target.getAddress(), target.getPort(), ad.fingerprint());
+            V3Plan plan = plan(logicalHost, logicalPort, ad, prepared, target);
+            if (!result.complete(new Outcome<T>(stream, null, null, plan))) {
+                endRebindAttemptOnWorker(prepared.attempt);
+                stream.close();
+            }
+        });
     }
 
     /**
@@ -888,8 +932,8 @@ public final class ClientConnector {
      * {@link RebindState#endAttempt} writes and fsyncs its state file. A worker that refuses the task
      * is swallowed on purpose: bookkeeping must never stop the join.</p>
      */
-    private void endRebindAttemptOnWorker(final PlanInput plans) {
-        if (plans == null || plans.prepared.attempt == null) {
+    private void endRebindAttemptOnWorker(final RebindState.Attempt attempt) {
+        if (attempt == null) {
             return;
         }
         try {
@@ -897,7 +941,7 @@ public final class ClientConnector {
                 @Override
                 public void run() {
                     try {
-                        v3.rebinds().endAttempt(plans.prepared.attempt, false);
+                        v3.rebinds().endAttempt(attempt, false);
                     } catch (Throwable ignored) {
                         // Best effort: the state disables itself on a failed write.
                     }
@@ -905,6 +949,13 @@ public final class ClientConnector {
             });
         } catch (Throwable ignored) {
             // A worker that is shutting down must not stop the join.
+        }
+    }
+
+    /** The same, for the paths that carry a plan holder rather than an attempt. */
+    private void endRebindAttemptOnWorker(PlanInput plans) {
+        if (plans != null) {
+            endRebindAttemptOnWorker(plans.prepared.attempt);
         }
     }
 
