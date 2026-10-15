@@ -130,7 +130,8 @@ public final class ReceiverScheduler {
     private long pumpNow;
     private boolean pumping;
     private boolean ended;
-    private boolean controlEnded;
+    /** The admitted END, kept so auxiliary records it depends on can still arrive. */
+    private Envelope endAdmitted;
     private boolean receivingBundle;
     private long bundleStarted;
     private int bundleMembers;
@@ -194,7 +195,7 @@ public final class ReceiverScheduler {
     /** Reserves a record slot and positive retained byte count at the first received byte. */
     public Partial reservePartial(Lane lane, long size, long now) {
         checkDeadlines(now);
-        if (controlEnded || ended || lane == null || size <= 0) {
+        if (ended || lane == null || size <= 0 || !laneOpen(lane)) {
             throw new OrderingException("invalid partial");
         }
         budget(lane, size, 1);
@@ -207,6 +208,9 @@ public final class ReceiverScheduler {
     public void growPartial(Partial p, long additionalBytes, long now) {
         checkDeadlines(now);
         requirePartial(p);
+        if (!laneOpen(p.lane)) {
+            throw new OrderingException("partial beyond END");
+        }
         budget(p.lane, additionalBytes, 0);
         p.bytes += additionalBytes;
         account(p.lane, additionalBytes, 0);
@@ -251,12 +255,35 @@ public final class ReceiverScheduler {
         account(p.lane, -p.bytes, -1);
         enqueue(e, retainedBytes, now);
     }
+    /**
+     * Before END every lane is open. After END is admitted, CONTROL is closed and an auxiliary lane
+     * stays open only while records up to END's dependency on it are still outstanding: END rides
+     * CONTROL and may overtake them (13.14).
+     */
+    private boolean laneOpen(Lane lane) {
+        if (endAdmitted == null) {
+            return true;
+        }
+        return lane != Lane.CONTROL
+                && Long.compareUnsigned(received[lane.ordinal()], endAdmitted.dependency(lane)) < 0;
+    }
     private void validate(Envelope e, long retained) {
         int i = e.lane().ordinal();
-        if (ended || controlEnded || received[i] == -1L
+        if (ended || received[i] == -1L
                 || e.sequence() != received[i] + 1
                 || e.dependency(e.lane()) != e.sequence() - 1) {
             throw new OrderingException("sequence/own dependency violation");
+        }
+        if (endAdmitted != null && !laneOpen(e.lane())) {
+            throw new OrderingException("record beyond END");
+        }
+        if (e.kind() == Envelope.Kind.END) {
+            for (Lane lane : Lane.values()) {
+                if (lane != Lane.CONTROL
+                        && Long.compareUnsigned(received[lane.ordinal()], e.dependency(lane)) > 0) {
+                    throw new OrderingException("record already beyond END");
+                }
+            }
         }
         if (retained < e.wireBytes()) {
             throw new OrderingException("retained wire size");
@@ -265,7 +292,7 @@ public final class ReceiverScheduler {
     private void enqueue(Envelope e, long retained, long now) {
         received[e.lane().ordinal()] = e.sequence();
         if (e.kind() == Envelope.Kind.END) {
-            controlEnded = true;
+            endAdmitted = e;
         }
         account(e.lane(), retained, 1);
         queues.get(e.lane().ordinal()).add(new Entry(e, retained));

@@ -367,8 +367,9 @@ class OrderingCoreTest {
     @Test void endIsAControlFullFenceAndTerminalOnlyOnApplication() {
         SenderSequencer s=new SenderSequencer();
         Envelope world=s.assign(W,0,null,null,0), end=s.end(0);
-        Harness h=new Harness(); h.scheduler.offer(world,0);
-        h.scheduler.offer(end,0);
+        Harness h=new Harness(); h.scheduler.offer(end,0);
+        assertTrue(h.calls.isEmpty());
+        h.scheduler.offer(world,0);
         assertEquals(1,h.calls.size());
         ReceiverScheduler.Delivery d=h.calls.remove(0);
         h.scheduler.applied(d.lane(),d.sequence(),0);
@@ -388,6 +389,50 @@ class OrderingCoreTest {
             fails(() -> h.scheduler.complete(p,later,34,0));
             fails(() -> h.scheduler.reservePartial(lane,1,0));
         }
+    }
+
+    @Test void endOvertakingAuxiliaryRecordsStillAcceptsThemAndCompletes() {
+        SenderSequencer s = new SenderSequencer();
+        Envelope move = s.assign(R, 0, null, null, 0);
+        Envelope end = s.end(0);
+        assertEquals(1, end.dependency(R));
+        Harness viaOffer = new Harness();
+        viaOffer.scheduler.offer(end, 0);
+        viaOffer.scheduler.offer(move, 0);
+        viaOffer.drain(0);
+        assertTrue(viaOffer.scheduler.ended());
+        assertArrayEquals(new long[]{1, 1, 0}, viaOffer.scheduler.delivered());
+        Harness viaPartial = new Harness();
+        viaPartial.scheduler.offer(end, 0);
+        ReceiverScheduler.Partial p = viaPartial.scheduler.reservePartial(R, 1, 0);
+        viaPartial.scheduler.growPartial(p, 32, 0);
+        viaPartial.scheduler.complete(p, move, move.wireBytes(), 0);
+        viaPartial.drain(0);
+        assertTrue(viaPartial.scheduler.ended());
+        assertEquals(0, viaPartial.scheduler.pendingRecords());
+    }
+
+    @Test void auxiliaryRecordBeyondEndDependencyIsRejectedAfterEnd() {
+        SenderSequencer s = new SenderSequencer();
+        Envelope move = s.assign(R, 0, null, null, 0);
+        Envelope end = s.end(0);
+        Harness h = new Harness();
+        h.scheduler.offer(end, 0);
+        h.scheduler.offer(move, 0);
+        Envelope extra = e(R, 2, 0, 1, 0);
+        fails(() -> h.scheduler.offer(extra, 0));
+        fails(() -> h.scheduler.reservePartial(R, 1, 0));
+        fails(() -> h.scheduler.offer(e(C, 2, 1, 0, 0), 0));
+        fails(() -> h.scheduler.reservePartial(C, 1, 0));
+    }
+
+    @Test void endIsRejectedWhenAuxiliaryRecordsAlreadyExceedItsDependency() {
+        Harness h = new Harness();
+        h.scheduler.offer(e(R, 1, 0, 0, 0), 0);
+        h.scheduler.offer(e(R, 2, 0, 1, 0), 0);
+        Envelope end = new Envelope(C, Envelope.Kind.END, 1, new long[]{0, 1, 0}, 0, null,
+                Envelope.Bundle.NONE, false);
+        fails(() -> h.scheduler.offer(end, 0));
     }
 
     @Test void synchronousAcknowledgementsDoNotRecurseThroughHandlerStack() {
