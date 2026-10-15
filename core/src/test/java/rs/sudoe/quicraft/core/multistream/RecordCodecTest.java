@@ -3,6 +3,9 @@ package rs.sudoe.quicraft.core.multistream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -27,8 +30,6 @@ import org.junit.jupiter.api.Test;
  * zero dependencies, empty body}.
  */
 class RecordCodecTest {
-    private static final int MAX_BUFFER = 4 * 1024 * 1024;
-
     private static final byte[] GAME_GOLDEN = {
         0x26, // record_length 38
         0x00, // kind GAME
@@ -51,7 +52,11 @@ class RecordCodecTest {
     private static final byte[] GAME_FRAME = {0x04, 0x00, 0x01, 0x02, 0x03};
 
     private static RecordCodec.Decoder decoder(boolean control) {
-        return new RecordCodec.Decoder(control, MAX_BUFFER);
+        return new RecordCodec.Decoder(control, RecordCodec.ADMIT_ALL);
+    }
+
+    private static RecordCodec.Decoder decoder(boolean control, RecordCodec.BodyBudget budget) {
+        return new RecordCodec.Decoder(control, budget);
     }
 
     @Test
@@ -152,6 +157,57 @@ class RecordCodecTest {
         assertEquals(1, d.feed(ByteBuffer.wrap(GAME_GOLDEN, 3, GAME_GOLDEN.length - 3)).size());
     }
 
+    // --- Pull decoding (next): one record per call, consumed counts and partial accounting.
+
+    @Test
+    void nextReturnsOneRecordPerCallWithCorrectConsumedCounts() throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(GAME_GOLDEN, 0, GAME_GOLDEN.length);
+        out.write(END_GOLDEN, 0, END_GOLDEN.length);
+        out.write(GAME_GOLDEN, 0, GAME_GOLDEN.length);
+        byte[] all = out.toByteArray();
+        ByteBuffer in = ByteBuffer.wrap(all);
+        RecordCodec.Decoder d = decoder(true);
+
+        RecordCodec.Record first = d.next(in);
+        assertEquals(RecordCodec.KIND_GAME, first.kind());
+        assertEquals(GAME_GOLDEN.length, in.position(), "one record consumed, no lookahead");
+
+        RecordCodec.Record second = d.next(in);
+        assertEquals(RecordCodec.KIND_END, second.kind());
+        assertEquals(GAME_GOLDEN.length + END_GOLDEN.length, in.position());
+
+        RecordCodec.Record third = d.next(in);
+        assertEquals(RecordCodec.KIND_GAME, third.kind());
+        assertEquals(all.length, in.position());
+
+        assertNull(d.next(in), "no record left");
+        assertFalse(d.hasPartial());
+        assertEquals(0, d.partialWireBytes());
+    }
+
+    @Test
+    void partialWireBytesCountsIncompleteLengthPrefixAndHeader() throws Exception {
+        // VarInt(166) = A6 01, a two-byte prefix; body is 166 - 33 = 133 bytes.
+        RecordCodec.Decoder d = decoder(true);
+        assertNull(d.next(ByteBuffer.wrap(new byte[] {(byte) 0xA6})));
+        assertEquals(1, d.partialWireBytes(), "one prefix byte consumed");
+        assertTrue(d.hasPartial());
+        assertTrue(d.partialStarted(), "timer starts at the first byte");
+        assertNull(d.next(ByteBuffer.wrap(new byte[] {0x01})));
+        assertEquals(2, d.partialWireBytes(), "prefix complete, body still missing");
+        assertTrue(d.hasPartial());
+
+        // Once body bytes arrive they count too: prefix (1) + 4 header bytes.
+        RecordCodec.Decoder g = decoder(true);
+        assertNull(g.next(ByteBuffer.wrap(GAME_GOLDEN, 0, 5)));
+        assertEquals(5, g.partialWireBytes());
+        assertTrue(g.hasPartial());
+        assertEquals(1, g.feed(ByteBuffer.wrap(GAME_GOLDEN, 5, GAME_GOLDEN.length - 5)).size());
+        assertFalse(g.hasPartial());
+        assertEquals(0, g.partialWireBytes());
+    }
+
     // --- Rejections.
 
     @Test
@@ -168,9 +224,9 @@ class RecordCodecTest {
     @Test
     void rejectsRecordLengthAboveMaximumBeforeAllocating() {
         // VarInt(2097188) = A4 80 80 01; the decoder must reject it from the prefix alone.
-        RecordCodec.Decoder d = new RecordCodec.Decoder(true, Integer.MAX_VALUE);
+        RecordCodec.Decoder d = new RecordCodec.Decoder(true, RecordCodec.ADMIT_ALL);
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
-                () -> d.feed(ByteBuffer.wrap(new byte[] {(byte) 0xA4, (byte) 0x80, (byte) 0x80, 0x01})));
+                () -> d.next(ByteBuffer.wrap(new byte[] {(byte) 0xA4, (byte) 0x80, (byte) 0x80, 0x01})));
         assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
         assertTrue(e.getMessage().contains("> 2097187"), e.getMessage());
     }
@@ -196,15 +252,35 @@ class RecordCodecTest {
 
     @Test
     void rejectsGameInnerLengthPrefixOverThreeBytes() {
+        // 12.5/13.4 cap the inner Minecraft length at three bytes: a fourth continuation byte
+        // is fatal even though Minecraft's own reader would keep going.
         assertClose(raw(RecordCodec.KIND_GAME, 1,
-                new byte[] {(byte) 0x80, (byte) 0x80, (byte) 0x80, 0x01}), decoder(true));
+                new byte[] {(byte) 0x80, (byte) 0x80, (byte) 0x80, (byte) 0x80, 0x01}), decoder(true));
     }
 
     @Test
-    void rejectsGameNonMinimalInnerLength() {
-        // 0x84 0x00 is 4 encoded in two bytes.
-        assertClose(raw(RecordCodec.KIND_GAME, 1,
-                new byte[] {(byte) 0x84, 0x00, 0x00, 0x00, 0x00, 0x00}), decoder(true));
+    void acceptsGameNonMinimalInnerLengthWithinThreeBytes() throws Exception {
+        // 42 needs one byte minimally (0x2A). Minecraft's own packet-length encoding accepts
+        // non-minimal forms, so 12.5 keeps that and 13.4 only caps the prefix at three bytes.
+        // 0xAA 0x00: 0xAA = continuation + 0b0101010 = 42, then 0x00 ends. Value = 42.
+        assertGameFrameLength(42, new byte[] {(byte) 0xAA, 0x00});
+        // Three-byte form of 42: 0xAA (42) + 0x80 (continuation, 0 bits) + 0x00 (end).
+        assertGameFrameLength(42, new byte[] {(byte) 0xAA, (byte) 0x80, 0x00});
+    }
+
+    /** A GAME record whose inner prefix is {@code prefix} and whose content is {@code length} bytes. */
+    private static void assertGameFrameLength(int length, byte[] prefix) throws Exception {
+        byte[] frame = new byte[prefix.length + length];
+        System.arraycopy(prefix, 0, frame, 0, prefix.length);
+        for (int i = prefix.length; i < frame.length; i++) {
+            frame[i] = (byte) i;
+        }
+        RecordCodec.Decoder d = decoder(true);
+        RecordCodec.Record record = d.next(ByteBuffer.wrap(RecordCodec.encodeGame(1, 0, 0, 0, frame)));
+        assertNotNull(record);
+        assertEquals(length, record.gameFrameLength());
+        assertEquals(length, record.gameContent().length);
+        assertEquals(prefix.length, record.bodyLength() - length);
     }
 
     @Test
@@ -223,13 +299,49 @@ class RecordCodecTest {
     }
 
     @Test
-    void rejectsPartialRecordOverBufferedLimit() {
-        // VarInt(200) = C8 01, kind GAME, but only the length prefix is fed: 2 + 200 > 100.
-        RecordCodec.Decoder d = new RecordCodec.Decoder(true, 100);
+    void refusesRecordBeforeAllocatingBodyWhenBudgetDeclines() throws Exception {
+        // Only the length prefix is fed: the record_length VarInt 0x26 = 38 declares a body of
+        // 38 - 33 = 5 bytes. The hook must be called with that exact size from the prefix alone,
+        // before any body bytes arrive or are allocated, and a refusal must throw 0x11.
+        int[] seen = new int[] {-1};
+        int[] calls = new int[] {0};
+        RecordCodec.BodyBudget budget = bodyBytes -> {
+            seen[0] = bodyBytes;
+            calls[0]++;
+            return false;
+        };
+        RecordCodec.Decoder d = decoder(true);
+        RecordCodec.Decoder refusing = decoder(true, budget);
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
-                () -> d.feed(ByteBuffer.wrap(new byte[] {(byte) 0xC8, 0x01, 0x00})));
+                () -> refusing.next(ByteBuffer.wrap(new byte[] {0x26})));
         assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
-        assertTrue(e.getMessage().contains("buffered-bytes"), e.getMessage());
+        assertEquals(1, calls[0]);
+        assertEquals(GAME_FRAME.length, seen[0]);
+        assertTrue(e.getMessage().contains("13.12"), e.getMessage());
+        // A record the budget admits still decodes; the hook saw the same size.
+        assertNotNull(d.next(ByteBuffer.wrap(GAME_GOLDEN)));
+    }
+
+    @Test
+    void aggregateBudgetRefusesThirdOfThreeRecords() throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(GAME_GOLDEN, 0, GAME_GOLDEN.length);
+        out.write(GAME_GOLDEN, 0, GAME_GOLDEN.length);
+        out.write(GAME_GOLDEN, 0, GAME_GOLDEN.length);
+        ByteBuffer in = ByteBuffer.wrap(out.toByteArray());
+        int[] remaining = {2};
+        int[] asked = {0};
+        RecordCodec.BodyBudget budget = bodyBytes -> {
+            asked[0]++;
+            return remaining[0]-- > 0;
+        };
+        RecordCodec.Decoder d = decoder(true, budget);
+        assertNotNull(d.next(in));
+        assertNotNull(d.next(in));
+        MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
+                () -> d.next(in));
+        assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
+        assertEquals(3, asked[0]); // the third record's size was offered, then refused
     }
 
     @Test
@@ -264,7 +376,7 @@ class RecordCodecTest {
         byte[] encoded = RecordCodec.encodeGame(1, 0, 0, 0, frame);
         // VarInt(2097187) is four bytes (A3 80 80 01), then the record itself.
         assertEquals(4 + RecordCodec.MAX_RECORD_LENGTH, encoded.length);
-        RecordCodec.Decoder d = new RecordCodec.Decoder(true, MAX_BUFFER);
+        RecordCodec.Decoder d = new RecordCodec.Decoder(true, RecordCodec.ADMIT_ALL);
         List<RecordCodec.Record> records = d.feed(ByteBuffer.wrap(encoded));
         assertEquals(1, records.size());
         assertEquals(RecordCodec.MAX_BODY_LENGTH, records.get(0).bodyLength());

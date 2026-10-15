@@ -46,18 +46,35 @@ final class VarInt {
 
     /**
      * Incremental reader: feed one unsigned byte at a time, across as many reads as it takes.
-     * Rejects a sixth byte, an overflowing or otherwise non-canonical encoding.
+     * Rejects a sixth byte and an overflowing encoding. The strict mode (default) additionally
+     * rejects a non-minimal encoding; the lenient mode accepts it.
+     *
+     * <p>12.5 requires minimally encoded VarInts for the new wire fields (the record length and
+     * the stream preambles), so those use the strict mode. Minecraft's own packet lengths keep
+     * Minecraft's VarInt encoding, which accepts non-minimal encodings within the byte cap, so
+     * the inner GAME frame length uses the lenient mode (13.4's three-byte cap still applies).
      */
     static final class Reader {
         private final int closeCode;
         private final String rule;
+        private final boolean minimal;
         private int value;
         private int count;
         private boolean done;
 
+        /** Strict reader: a non-minimal encoding is rejected (12.5). */
         Reader(int closeCode, String rule) {
+            this(closeCode, rule, true);
+        }
+
+        /**
+         * @param minimal true to reject a non-minimal encoding (12.5 fields), false to accept it
+         *     (Minecraft's own packet-length encoding).
+         */
+        Reader(int closeCode, String rule, boolean minimal) {
             this.closeCode = closeCode;
             this.rule = rule;
+            this.minimal = minimal;
         }
 
         /** Returns true once the value is complete; then {@link #value()} is valid. */
@@ -75,7 +92,7 @@ final class VarInt {
             }
             value |= (unsignedByte & 0x7F) << (7 * (count - 1));
             if ((unsignedByte & 0x80) == 0) {
-                if (count > 1 && unsignedByte == 0) {
+                if (minimal && count > 1 && unsignedByte == 0) {
                     throw new MultistreamProtocolException(closeCode, rule, "non-minimal VarInt");
                 }
                 done = true;

@@ -137,14 +137,42 @@ public final class RecordCodec {
     // --- Incremental decoding.
 
     /**
-     * The incremental record decoder. Feed arbitrary chunks; it returns zero or more complete
-     * records and keeps a partial one. It rejects a partial record whose declared length would
-     * make the buffered bytes exceed {@code maxBufferedBytes} before allocating its body, so
-     * the caller's memory budget (13.12 counts partial records) is enforced.
+     * A caller-supplied admission hook (13.12). Before the decoder allocates a record body it
+     * calls {@link #reserve(int)} with the exact body size derived from the validated length
+     * prefix (13.4: {@code record_length} minus the 33-byte fixed header). Returning false
+     * refuses the record; the decoder then throws {@code 0x11}. The caller keeps its own
+     * connection-wide budget (1024 records / 16 MiB in 13.12) and uses this to refuse rather
+     * than evict: a predecessor larger than the remaining budget disconnects.
+     */
+    @FunctionalInterface
+    public interface BodyBudget {
+        /**
+         * @param bodyBytes the record body length in bytes ({@code record_length} - 33), known
+         *     from the validated length prefix before any body allocation.
+         * @return true to admit the record, false to refuse it.
+         */
+        boolean reserve(int bodyBytes) throws MultistreamProtocolException;
+    }
+
+    /** Admits every record: the default when the caller has no budget to enforce. */
+    public static final BodyBudget ADMIT_ALL = bodyBytes -> true;
+
+    /**
+     * The pull record decoder. {@link #next(ByteBuffer)} consumes bytes from the caller's buffer
+     * (advancing its position; the consumed count is the position delta) and returns at most one
+     * complete record per call, or null when more bytes are needed. It never decodes more than
+     * one record per call, so a caller driving a shared budget (13.12) always sees each record's
+     * admission decision before the next one is considered.
+     *
+     * <p>Before allocating a body it calls the {@link BodyBudget} with the validated body size;
+     * a refusal throws {@link MultistreamProtocolException} with {@code 0x11} and nothing is
+     * returned (never evict). The current partial record's consumed wire bytes are exposed by
+     * {@link #partialWireBytes()} / {@link #hasPartial()}, and {@link #partialStarted()} lets the
+     * caller start the incomplete-record timer (13.12) at the record's first byte.
      */
     public static final class Decoder {
         private final boolean controlStream;
-        private final int maxBufferedBytes;
+        private final BodyBudget budget;
         private final VarInt.Reader length = new VarInt.Reader(CLOSE_CODE, "13.4");
         private int recordLength = -1;
         private byte[] frame;
@@ -154,59 +182,99 @@ public final class RecordCodec {
         /**
          * @param controlStream whether this direction is on the CONTROL stream (stream 0):
          *     only there is an END record legal.
-         * @param maxBufferedBytes the most bytes a single partial record may retain
-         *     (length prefix included); a larger declared record is rejected before its body
-         *     is allocated.
+         * @param budget the per-record admission hook (13.12); see {@link BodyBudget}.
+         *     {@link #ADMIT_ALL} when the caller enforces no budget.
          */
-        public Decoder(boolean controlStream, int maxBufferedBytes) {
+        public Decoder(boolean controlStream, BodyBudget budget) {
             this.controlStream = controlStream;
-            this.maxBufferedBytes = maxBufferedBytes;
+            this.budget = budget == null ? ADMIT_ALL : budget;
         }
 
+        /** Convenience for callers that enforce no per-record budget. */
+        public Decoder(boolean controlStream) {
+            this(controlStream, ADMIT_ALL);
+        }
+
+        /**
+         * Consumes bytes from {@code in} and returns one complete record, or null if the buffer
+         * is exhausted before a whole record arrives. Only one record is ever returned per call.
+         * The consumed byte count is the buffer position delta.
+         */
+        public Record next(ByteBuffer in) throws MultistreamProtocolException {
+            if (recordLength < 0) {
+                while (!length.done()) {
+                    if (!in.hasRemaining()) {
+                        return null;
+                    }
+                    length.feed(in.get() & 0xff);
+                    lengthPrefixBytes++;
+                }
+                recordLength = length.value();
+                if (recordLength < HEADER_LENGTH) {
+                    throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
+                            "record_length " + recordLength + " < 33");
+                }
+                if (recordLength > MAX_RECORD_LENGTH) {
+                    throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
+                            "record_length " + recordLength + " > " + MAX_RECORD_LENGTH);
+                }
+                int bodyBytes = recordLength - HEADER_LENGTH;
+                if (!budget.reserve(bodyBytes)) {
+                    throw new MultistreamProtocolException(CLOSE_CODE, "13.12",
+                            "record body of " + bodyBytes + " bytes refused by the receive budget");
+                }
+                frame = new byte[recordLength];
+                filled = 0;
+            }
+            int n = Math.min(recordLength - filled, in.remaining());
+            in.get(frame, filled, n);
+            filled += n;
+            if (filled < recordLength) {
+                return null;
+            }
+            Record record = decode(frame, recordLength, controlStream);
+            reset();
+            return record;
+        }
+
+        /** Bytes of the current incomplete record consumed so far (length prefix and header). */
+        public int partialWireBytes() {
+            return lengthPrefixBytes + filled;
+        }
+
+        /** Whether an incomplete record is in progress (some bytes consumed, none returned). */
+        public boolean hasPartial() {
+            return partialWireBytes() > 0;
+        }
+
+        /**
+         * True from the first consumed byte of an incomplete record until it completes. The
+         * caller starts 13.12's ten-second incomplete-record timer on the first true.
+         */
+        public boolean partialStarted() {
+            return partialWireBytes() > 0;
+        }
+
+        private void reset() {
+            recordLength = -1;
+            frame = null;
+            filled = 0;
+            lengthPrefixBytes = 0;
+            length.reset();
+        }
+
+        /**
+         * Test helper only: loops {@link #next(ByteBuffer)} until the buffer is exhausted. A
+         * production caller must use {@code next()} so it sees one record at a time against its
+         * shared budget.
+         */
         public List<Record> feed(ByteBuffer data) throws MultistreamProtocolException {
             List<Record> records = new ArrayList<>();
-            while (true) {
-                if (recordLength < 0) {
-                    while (!length.done()) {
-                        if (!data.hasRemaining()) {
-                            return records;
-                        }
-                        length.feed(data.get() & 0xff);
-                        lengthPrefixBytes++;
-                    }
-                    recordLength = length.value();
-                    if (recordLength < HEADER_LENGTH) {
-                        throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
-                                "record_length " + recordLength + " < 33");
-                    }
-                    if (recordLength > MAX_RECORD_LENGTH) {
-                        throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
-                                "record_length " + recordLength + " > " + MAX_RECORD_LENGTH);
-                    }
-                    if ((long) lengthPrefixBytes + recordLength > maxBufferedBytes) {
-                        throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
-                                "record of " + recordLength + " bytes exceeds the buffered-bytes limit "
-                                        + maxBufferedBytes);
-                    }
-                    frame = new byte[recordLength];
-                    filled = 0;
-                }
-                int n = Math.min(recordLength - filled, data.remaining());
-                data.get(frame, filled, n);
-                filled += n;
-                if (filled < recordLength) {
-                    return records;
-                }
-                records.add(decode(frame, recordLength, controlStream));
-                recordLength = -1;
-                frame = null;
-                filled = 0;
-                lengthPrefixBytes = 0;
-                length.reset();
-                if (!data.hasRemaining()) {
-                    return records;
-                }
+            Record record;
+            while ((record = next(data)) != null) {
+                records.add(record);
             }
+            return records;
         }
     }
 
@@ -265,9 +333,14 @@ public final class RecordCodec {
         }
     }
 
-    /** The inner Minecraft VarInt value; at most three bytes, minimally encoded, nonnegative. */
+    /**
+     * The inner Minecraft VarInt value; at most three bytes (13.4). It uses Minecraft's own
+     * encoding, which accepts non-minimal encodings within the cap (12.5 keeps Minecraft's
+     * packet lengths unchanged), so the reader is lenient here; 13.4 still caps it at three
+     * bytes and the value must be nonnegative.
+     */
     private static int readInnerLength(byte[] body) throws MultistreamProtocolException {
-        VarInt.Reader reader = new VarInt.Reader(CLOSE_CODE, "13.4");
+        VarInt.Reader reader = new VarInt.Reader(CLOSE_CODE, "13.4", false);
         int i = 0;
         while (!reader.done()) {
             if (i >= MAX_INNER_VARINT_BYTES) {

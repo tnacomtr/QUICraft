@@ -54,7 +54,7 @@ class SequenceCheckerTest {
     }
 
     @Test
-    void closeCodeIsProtocolViolation() {
+    void closeCodeIsOrderingFailure() {
         SequenceChecker checker = new SequenceChecker();
         MultistreamProtocolException e =
                 assertThrows(MultistreamProtocolException.class, () -> checker.check(5));
