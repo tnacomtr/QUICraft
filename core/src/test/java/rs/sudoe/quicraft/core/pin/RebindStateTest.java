@@ -566,6 +566,42 @@ class RebindStateTest {
     }
 
     @Test
+    void aFailedFlushAtBeginReturnsNoTokenAndChangesNothing(@TempDir Path dir) throws IOException {
+        assertBeginFailsClosed(StateFile.FAULT_FORCE, dir);
+    }
+
+    @Test
+    void aFailedMoveAtBeginReturnsNoTokenAndChangesNothing(@TempDir Path dir) throws IOException {
+        assertBeginFailsClosed(StateFile.FAULT_MOVE, dir);
+    }
+
+    /**
+     * The provisional window a fresh attempt writes is the only reason {@code tryBeginAttempt} touches
+     * the disk, so failing that write must refuse the attempt, disable the state and leave the file
+     * exactly as it was.
+     */
+    private static void assertBeginFailsClosed(String stage, Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertTrue(state.shouldNotify("other.example.com", 25565, FP_A), "so the file has content to keep");
+        byte[] before = Files.readAllBytes(file);
+
+        Faults.set(stage);
+        try {
+            assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()),
+                    stage + ": no token without a durable window");
+        } finally {
+            Faults.set();
+        }
+        assertFalse(state.isUsable(), stage + ": the failed write disables the state");
+        assertArrayEquals(before, Files.readAllBytes(file), stage + ": the file on disk is untouched");
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), stage);
+        assertNull(state.tryBeginAttempt("other.example.com", 25565, now.get()), stage);
+        assertEquals(Collections.singletonList("rebind-v1.bin"), names(dir), stage + ": no temporary is left");
+    }
+
+    @Test
     void smallLimitsEvictTheLeastRecentlyUsedHistoryAndTheBitmapStillSuppresses(@TempDir Path dir)
             throws IOException {
         Path file = dir.resolve("rebind-v1.bin");
