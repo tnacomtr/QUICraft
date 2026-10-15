@@ -56,6 +56,12 @@ import java.util.logging.Logger;
  * re-bind. A query never changes anything: no insertion, no eviction, no ordering. Entries are
  * persisted in least-recently-used order, so the order survives a restart.</p>
  *
+ * <p>Reordering on its own is not a write: a call that only touches an entry leaves the file as it
+ * was, so the on-disk order can lag the in-memory one until the next call that persists. That is safe
+ * because the order is only a capacity hint: it decides which entry a restart evicts first, never
+ * what an entry holds. Every server's backoff window and notice history on disk are exactly what the
+ * last write stored, and an eviction is always persisted by the call that performed it.</p>
+ *
  * <p><b>Fail closed.</b> When the state cannot be read or written, everything is refused:
  * {@link #shouldNotify(String, int, String)} returns false and
  * {@link #tryBeginAttempt(String, int, long)} returns null, so the client uses TCP, never repeats a
