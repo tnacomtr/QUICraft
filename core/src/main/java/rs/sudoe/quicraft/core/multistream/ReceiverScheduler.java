@@ -411,15 +411,19 @@ public final class ReceiverScheduler {
                 throw new OrderingException("partial lane mismatch");
             }
             validate(e, retainedBytes);
+            // 13.12: the entry carries exactly its own charge. The partial's reservation moves to
+            // the entry (plus any growth, minus any surplus the parser had charged), so the entry
+            // is charged for as long as it is queued and applied() credits the same amount back.
             if (retainedBytes > p.bytes) {
                 budget(p.lane, retainedBytes - p.bytes, 0);
-                // The node budget takes the growth before the partial's charge is returned, so the
-                // transfer can never look free to another connection.
+                // The node budget takes the growth before the entry is queued, so the transfer can
+                // never look free to another connection.
                 debitNode(retainedBytes - p.bytes);
+            } else if (retainedBytes < p.bytes) {
+                creditNode(p.bytes - retainedBytes);
             }
             partials.remove(p);
             account(p.lane, -p.bytes, -1);
-            creditNode(p.bytes);
             enqueue(e, retainedBytes, now);
         } catch (RuntimeException ex) {
             throw escape(ex);

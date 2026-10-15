@@ -277,6 +277,33 @@ class LaneSessionTest {
     }
 
     @Test
+    void aQueuedRecordCarriesItsNodeChargeUntilTheGameAppliesIt() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(3L << 20);
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.activateBoth();
+            rig.clientGame.autoApply = false;
+            sleep(300);
+            long baseline = node.reserved();
+            byte[] frame = LaneRig.frame(LaneRig.BLOCK, "held");
+            int wireBytes = RecordCodec.HEADER_LENGTH + frame.length + 1;
+            rig.server.send(PLAY, LaneRig.BLOCK, frame);
+            assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() == 1, 10000));
+            sleep(300);
+            // The transport chunk is gone; what remains is the queued record's own charge.
+            assertTrue(node.reserved() >= baseline + wireBytes,
+                    "the queued record stays charged: " + node.reserved() + " against " + baseline);
+            assertFalse(rig.clientGame.closed.isDone(),
+                    "a delivered record must not underflow the budget: " + rig.clientGame.closed.getNow(null));
+            rig.clientGame.apply(rig.clientGame.deliveries.get(0));
+            assertTrue(LaneRig.await(() -> node.reserved() <= baseline, 10000),
+                    "applying releases the record charge: " + node.reserved());
+            assertFalse(rig.clientGame.closed.isDone());
+        }
+    }
+
+    @Test
     void anIncompleteRecordIsChargedAtItsFirstByteAndTimesOutWith0x11() throws Exception {
         AtomicLong clock = new AtomicLong(5_000_000_000L);
         LaneRig.Config config = new LaneRig.Config();
