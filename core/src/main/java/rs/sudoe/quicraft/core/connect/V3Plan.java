@@ -98,13 +98,19 @@ public final class V3Plan {
     private final String host;
     private final int logicalPort;
 
-    private volatile boolean activationReported;
-    private volatile boolean pinWriteFailed;
+    /**
+     * True when this activation must not be treated as passed: the binding did not complete, the
+     * pin could not be written, or the worker refused the work (12.15).
+     */
+    private volatile boolean activationFailed;
     private volatile boolean failureReported;
     private volatile boolean failureStateWritten;
     private volatile String reason;
     /** The first {@link #activated(BindingSession)} future, so every caller sees the same answer. */
     private CompletableFuture<Boolean> activation;
+    /** What {@link #isActivated()} answers before the first {@link #activated(BindingSession)}. */
+    private static final CompletableFuture<Boolean> NOT_ACTIVATED =
+            CompletableFuture.completedFuture(Boolean.FALSE);
 
     V3Plan(TransportSelection.PinState pinState, RebindState.Attempt attempt, Fingerprint fingerprint,
             byte[] routingDigest, PinStore pins, FailureCache failures,
@@ -193,7 +199,6 @@ public final class V3Plan {
             if (failureReported) {
                 return CompletableFuture.completedFuture(Boolean.FALSE);
             }
-            activationReported = true;
             CompletableFuture<Boolean> submitted;
             try {
                 submitted = CompletableFuture.supplyAsync(new Supplier<Boolean>() {
@@ -204,8 +209,10 @@ public final class V3Plan {
                 }, worker);
             } catch (Throwable t) {
                 // A worker that refuses the task means the pin was not written, which is 12.15's
-                // write failure: answer false (the caller closes 0x10) instead of throwing here.
-                pinWriteFailed = true;
+                // write failure: record the failure state through the one path that does, and answer
+                // false (the caller closes 0x10) instead of throwing here.
+                activationFailed = true;
+                writeFailureStateOnce();
                 submitted = CompletableFuture.completedFuture(Boolean.FALSE);
             }
             activation = submitted;
@@ -218,11 +225,11 @@ public final class V3Plan {
         if (!bindingPassed) {
             // No proven activation: no pin, no state change. The adapter reports a binding that did
             // not complete through failed(Phase, String) instead.
-            pinWriteFailed = true;
+            activationFailed = true;
             return Boolean.FALSE;
         }
         boolean recorded = !online || writePin();
-        pinWriteFailed = !recorded;
+        activationFailed = !recorded;
         if (!recorded) {
             // 12.15: a write failure after activation is itself an activation failure, recorded once
             // so the adapter's later failed(...) cannot count it twice.
@@ -341,9 +348,19 @@ public final class V3Plan {
         return failureReported;
     }
 
-    /** Whether this plan already reported a successful activation through {@link #activated(BindingSession)}. */
+    /**
+     * Whether this plan reported a successful activation through {@link #activated(BindingSession)}:
+     * true only once that call's future has completed true, so a caller that has not been answered
+     * yet, or was answered false, is never told the activation passed.
+     */
     public boolean isActivated() {
-        return activationReported && !failureReported && !pinWriteFailed;
+        return Boolean.TRUE.equals(activationFuture().getNow(Boolean.FALSE)) && !failureReported;
+    }
+
+    private CompletableFuture<Boolean> activationFuture() {
+        synchronized (this) {
+            return activation == null ? NOT_ACTIVATED : activation;
+        }
     }
 
     /** 12.15: only the post-SERVER_SWITCH online-mode path writes a pin. */

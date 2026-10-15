@@ -13,6 +13,9 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -275,6 +278,124 @@ class V3PlanTest {
                     "the worker's state writes must never interleave or overtake each other");
         } finally {
             pool.shutdownNow();
+        }
+    }
+
+    /** Queues every task until the test releases it, so a test can act while the worker is busy. */
+    static final class QueuedExecutor implements Executor {
+        private final List<Runnable> queued = new ArrayList<Runnable>();
+
+        @Override
+        public synchronized void execute(Runnable command) {
+            queued.add(command);
+        }
+
+        synchronized void runAll() {
+            for (int guard = 0; guard < 64 && !queued.isEmpty(); guard++) {
+                queued.remove(0).run();
+            }
+        }
+    }
+
+    /** Refuses the first task and runs every later one, like a worker that is still shutting down. */
+    static final class RejectFirstExecutor implements Executor {
+        private int tasks;
+
+        @Override
+        public void execute(Runnable command) {
+            if (tasks++ == 0) {
+                throw new RejectedExecutionException("the worker is shutting down");
+            }
+            command.run();
+        }
+    }
+
+    @Test
+    void activatedRecordsTheFailureStateWhenTheWorkerRefusesTheTask() throws Exception {
+        Plan plan = Plan.joining(new RejectFirstExecutor());
+        // The pin write is refused, so 12.15's write failure must be recorded by activated() itself.
+        assertFalse(plan.plan.activated(BindingTestSessions.activatedClient(BindingStateMachine.MODE_ONLINE))
+                .get(FIVE_SECONDS, TimeUnit.SECONDS).booleanValue());
+        assertTrue(plan.failures.isActivationBlocked(ADDRESS, QUIC_PORT, plan.fingerprint, plan.clock.get()),
+                "12.15's write failure is recorded even when the worker refuses the pin write");
+    }
+
+    @Test
+    void isActivatedWaitsForTheActivationFuture() throws Exception {
+        QueuedExecutor gate = new QueuedExecutor();
+        Plan plan = Plan.joining(gate);
+        CompletableFuture<Boolean> pending = plan.plan.activated(
+                BindingTestSessions.activatedClient(BindingStateMachine.MODE_ONLINE));
+
+        assertFalse(pending.isDone());
+        assertFalse(plan.plan.isActivated(), "an unanswered activation is not an activation");
+        gate.runAll();
+        assertTrue(pending.get(FIVE_SECONDS, TimeUnit.SECONDS).booleanValue());
+        assertTrue(plan.plan.isActivated(), "and once it is answered true, it is");
+    }
+
+    @Test
+    void aRefusedDrainKeepsTheCommandsQueuedBehindIt() throws Exception {
+        final CountDownLatch started = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final AtomicInteger calls = new AtomicInteger();
+        final List<String> log = Collections.synchronizedList(new ArrayList<String>());
+        Executor delegate = new Executor() {
+            @Override
+            public void execute(Runnable command) {
+                if (calls.incrementAndGet() == 1) {
+                    started.countDown();
+                    await(release);
+                    throw new RejectedExecutionException("the worker is shutting down");
+                }
+                command.run();
+            }
+        };
+        final Executor worker = new ClientConnector.V3Support(PinStore.load(null),
+                RebindState.load(null), delegate, System::currentTimeMillis, 12345, true, true).worker();
+        Thread first = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    worker.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            log.add("first");
+                        }
+                    });
+                } catch (RejectedExecutionException expected) {
+                    // The refusal is the point of this test.
+                }
+            }
+        });
+        first.start();
+        assertTrue(started.await(FIVE_SECONDS, TimeUnit.SECONDS));
+        // This command is queued behind the run that is about to be refused.
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                log.add("second");
+            }
+        });
+        release.countDown();
+        first.join(TimeUnit.SECONDS.toMillis(FIVE_SECONDS));
+
+        assertEquals(Arrays.asList(), log, "the refused command is dropped, the queued one is not");
+        worker.execute(new Runnable() {
+            @Override
+            public void run() {
+                log.add("third");
+            }
+        });
+        assertEquals(Arrays.asList("second", "third"), log,
+                "the next execute restarts the drain for the command that stayed queued");
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            latch.await(FIVE_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
