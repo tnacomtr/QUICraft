@@ -10,6 +10,11 @@ public final class OrderingException extends RuntimeException {
         super(message);
     }
 
+    /** Creates a terminal failure caused by an unexpected exception from an adapter callback. */
+    public OrderingException(String message, Throwable cause) {
+        super(message, cause);
+    }
+
     /** Returns the connection-level application close code required by 13.12. */
     public int closeCode() {
         return 0x11;
