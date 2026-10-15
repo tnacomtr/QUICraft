@@ -23,10 +23,13 @@ public final class BindingKeys {
     private BindingKeys() {
     }
 
-    /** Derives the 32-byte binding key {@code K} from Minecraft's shared secret {@code S}. */
+    /**
+     * Derives the 32-byte binding key {@code K} from Minecraft's shared secret {@code S}, which must
+     * be exactly 16 raw bytes.
+     */
     public static byte[] derive(byte[] minecraftSecret) {
-        if (minecraftSecret == null) {
-            throw new IllegalArgumentException("minecraft secret is required in online mode");
+        if (minecraftSecret == null || minecraftSecret.length != 16) {
+            throw new IllegalArgumentException("minecraft secret must be exactly 16 raw bytes");
         }
         byte[] salt = HkdfSha256.sha256(SALT_LABEL);
         try {

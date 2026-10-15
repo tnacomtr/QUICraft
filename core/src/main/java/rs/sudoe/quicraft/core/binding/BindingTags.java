@@ -26,6 +26,9 @@ public final class BindingTags {
 
     /** Computes the 32-byte tag for {@code kind} under key {@code K}, transcript {@code T} and exporter {@code E}. */
     public static byte[] tag(byte[] key, BindingKind kind, byte[] transcript, byte[] exporter) {
+        if (kind == null) {
+            throw new IllegalArgumentException("kind is required");
+        }
         checkLength(key, 32, "key");
         checkLength(transcript, 32, "transcript");
         checkLength(exporter, 32, "exporter");

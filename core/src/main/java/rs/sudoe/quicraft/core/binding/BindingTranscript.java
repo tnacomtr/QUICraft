@@ -22,8 +22,9 @@ public final class BindingTranscript {
     private BindingTranscript() {
     }
 
-    /** Computes {@code T} for the given inputs. */
+    /** Computes {@code T} for the given inputs. {@code mode} is 1 for online and 0 for offline. */
     public static byte[] compute(int protocolNumber, int mode, byte[] fingerprint, byte[] routing) {
+        checkMode(mode);
         checkDigest(fingerprint, "fingerprint");
         checkDigest(routing, "routing");
         try {
@@ -45,6 +46,12 @@ public final class BindingTranscript {
     private static void checkDigest(byte[] value, String name) {
         if (value == null || value.length != 32) {
             throw new IllegalArgumentException(name + " must be 32 raw bytes");
+        }
+    }
+
+    private static void checkMode(int mode) {
+        if (mode != 0 && mode != 1) {
+            throw new IllegalArgumentException("mode must be 0 (offline) or 1 (online)");
         }
     }
 }
