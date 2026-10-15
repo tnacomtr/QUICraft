@@ -21,7 +21,8 @@ import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 /**
- * The relaxed loss threshold from QUICraft's patched native (natives/patches/). Gradle sets
+ * The relaxed loss threshold and the maximum flow-control windows from QUICraft's patched native
+ * (natives/patches/). Gradle sets
  * {@code quicraft.test.expectRelaxedLossThreshold}: true on a host whose native is the patched
  * build, false in {@code testUpstreamNative} (patched classes, upstream Netty native). Both runs
  * must connect; only the patched one may report the option.
@@ -53,6 +54,23 @@ class NativeFeaturesTest {
             builder.relaxedLossThreshold(true);
         } else {
             assertThrows(UnsupportedOperationException.class, () -> builder.relaxedLossThreshold(true));
+        }
+    }
+
+    @Test
+    void maxFlowControlWindowsAreAvailableExactlyWithThePatchedNative() {
+        assertEquals(expected(), QuicSupport.hasMaxFlowControlWindows());
+    }
+
+    @Test
+    void builderTakesTheMaximumWindowsOnlyWhenTheNativeHasThem() {
+        QuicServerCodecBuilder builder = new QuicServerCodecBuilder();
+        if (expected()) {
+            builder.maxConnectionWindow(17L << 20).maxStreamWindow(4L << 20);
+            assertThrows(IllegalArgumentException.class, () -> builder.maxStreamWindow(0));
+        } else {
+            assertThrows(UnsupportedOperationException.class, () -> builder.maxConnectionWindow(17L << 20));
+            assertThrows(UnsupportedOperationException.class, () -> builder.maxStreamWindow(4L << 20));
         }
     }
 
