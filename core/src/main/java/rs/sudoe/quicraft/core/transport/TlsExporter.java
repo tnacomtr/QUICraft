@@ -67,12 +67,16 @@ public final class TlsExporter {
     /**
      * The Netty stream the connection lives on, or {@code null} when {@code stream} is not a
      * QUICraft stream. The game holds a {@link PreambleStream} (a {@link ClientStream} or a
-     * {@link ServerStream}), which carries the {@link NettyQuicByteStream} in
-     * {@link PreambleStream#rawStream()}: the stream a caller sees is never the Netty one itself.
+     * {@link ServerStream}) for {@code /2}, or a {@link V3Connection} for {@code /3}; each carries
+     * the {@link NettyQuicByteStream} of its stream 0 underneath it, because the stream a caller
+     * sees is never the Netty one itself.
      */
     private static NettyQuicByteStream nettyStream(QuicByteStream stream) {
         if (stream instanceof PreambleStream) {
             return ((PreambleStream) stream).rawStream();
+        }
+        if (stream instanceof V3ConnectionImpl) {
+            return ((V3ConnectionImpl) stream).rawStream();
         }
         return stream instanceof NettyQuicByteStream ? (NettyQuicByteStream) stream : null;
     }

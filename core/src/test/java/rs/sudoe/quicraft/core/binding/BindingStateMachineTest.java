@@ -149,6 +149,54 @@ class BindingStateMachineTest {
         assertEquals(BindingFailure.EXPORTER_ERROR, offline.failure());
     }
 
+    /**
+     * Regression for §12.8: the exporter is reached through the patched native's JNI binding, so a
+     * missing native library raises an {@link UnsatisfiedLinkError} (a {@link LinkageError}), not a
+     * {@link RuntimeException}. It must still be the typed {@link BindingFailure#EXPORTER_ERROR},
+     * because §12.8 forbids an exception bypassing fail-closed handling, and the caller has to be
+     * able to close {@code /3} with {@code 0x10} instead of crashing the connection thread.
+     */
+    @Test
+    void aNativeExporterErrorIsATypedFailureAndNotAnException() {
+        ExporterSource noNative = () -> {
+            throw new UnsatisfiedLinkError("no netty_quiche42 in java.library.path");
+        };
+        BindingMachineResult client = BindingStateMachine.client(noNative, S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        assertTrue(client.isFailed());
+        assertEquals(BindingFailure.EXPORTER_ERROR, client.failure());
+        assertNull(client.machine());
+
+        BindingMachineResult server = BindingStateMachine.server(noNative, S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        assertTrue(server.isFailed());
+        assertEquals(BindingFailure.EXPORTER_ERROR, server.failure());
+
+        ExporterSource linkage = () -> {
+            throw new NoClassDefFoundError("rs/sudoe/quicraft/shaded/io/netty/handler/codec/quic/BoringSSL");
+        };
+        assertEquals(BindingFailure.EXPORTER_ERROR, BindingStateMachine.client(linkage, S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R).failure());
+    }
+
+    /**
+     * Regression for §12.8: {@code protocol_number} is an unsigned u32 and is rejected outside
+     * {@code 0..4294967295} before encoding, never truncated or wrapped. A Java {@code int} can only
+     * spell an out-of-range value as a negative one.
+     */
+    @Test
+    void rejectsANegativeProtocolNumber() {
+        assertThrows(IllegalArgumentException.class, () -> BindingStateMachine.client(
+                BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE, -1, F, R));
+        assertThrows(IllegalArgumentException.class, () -> BindingStateMachine.server(
+                BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE, Integer.MIN_VALUE, F, R));
+        assertThrows(IllegalArgumentException.class, () -> BindingStateMachine.client(
+                BindingTestData.exporter(E), null, BindingTestData.MODE_OFFLINE, -775, F, R));
+        // The upper half of the u32 range is representable and stays legal.
+        assertNotNull(BindingStateMachine.client(BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, Integer.MAX_VALUE, F, R).machine());
+    }
+
     @Test
     void aSuccessfulBuildCarriesOnlyTheMachine() {
         BindingMachineResult result = BindingStateMachine.client(BindingTestData.exporter(E), S,

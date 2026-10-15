@@ -24,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -704,6 +705,123 @@ class RebindStateTest {
         assertFalse(json.contains("fingerprint\":\"" + fingerprint(0)), "a's only notice was trimmed");
         assertTrue(json.contains("fingerprint\":\"" + fingerprint(1)), "b's notice stays");
         assertTrue(json.contains("fingerprint\":\"" + fingerprint(2)), "c's notice was recorded");
+    }
+
+    @Test
+    void forgettingAnExpiredPinsStateRemovesItsBackoffAndHistoryButNotItsBloomBits(@TempDir Path dir)
+            throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        RebindState.Attempt failed = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(failed);
+        assertTrue(state.endAttempt(failed, false), "a backoff window is stored");
+        assertTrue(state.shouldNotify("mc.example.com", 25565, FP_A), "and a detailed notice");
+        assertTrue(state.shouldNotify("other.example.com", 25565, FP_B));
+        assertEquals(2, state.size());
+        byte[] beforeBitmap = bitmapOf(Files.readAllBytes(file));
+
+        assertEquals(1, state.forgetExpiredPins(Collections.singleton(PinKey.of("mc.example.com", 25565))),
+                "the expired pin's server is forgotten");
+        assertEquals(1, state.size(), "and no other server's state is touched");
+        String json = jsonOf(Files.readAllBytes(file));
+        assertFalse(json.contains("mc.example.com"), "its backoff and its notice went: " + json);
+        assertTrue(json.contains("other.example.com"), "the other server's state stays");
+        assertArrayEquals(beforeBitmap, bitmapOf(Files.readAllBytes(file)), "no Bloom bit is cleared");
+
+        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()),
+                "first contact again: no re-bind backoff is left");
+        assertFalse(state.shouldNotify("mc.example.com", 25565, FP_A),
+                "but the bitmap still knows the notice that was shown");
+        assertTrue(state.shouldNotify("mc.example.com", 25565, FP_B), "an unseen tuple is new");
+
+        RebindState reloaded = RebindState.load(file, now::get);
+        assertFalse(reloaded.shouldNotify("mc.example.com", 25565, FP_A),
+                "and it survives a restart");
+    }
+
+    @Test
+    void forgettingKeepsTheStateOfAnAttemptNobodyEnded(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        RebindState.Attempt attempt = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(attempt);
+        // Older than STALE_ATTEMPT_MILLIS, which is how the rest of this class decides that an
+        // attempt nobody ended may be evicted or replaced; an expiry still leaves it alone, because
+        // its token was never ended.
+        now.addAndGet(RebindState.STALE_ATTEMPT_MILLIS);
+        byte[] before = Files.readAllBytes(file);
+
+        assertEquals(0, state.forgetExpiredPins(Collections.singleton(PinKey.of("mc.example.com", 25565))),
+                "the state of an attempt nobody ended is kept");
+        assertEquals(1, state.size());
+        assertArrayEquals(before, Files.readAllBytes(file), "and nothing was written");
+        assertTrue(state.endAttempt(attempt, false), "its token still matches, so its state was kept");
+    }
+
+    @Test
+    void activeKeysAreTheAttemptsThatWereNotEnded(@TempDir Path dir) {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertTrue(state.activeKeys().isEmpty(), "nothing is running");
+
+        RebindState.Attempt first = state.tryBeginAttempt("a.example.com", 25565, now.get());
+        RebindState.Attempt second = state.tryBeginAttempt("b.example.com", 25566, now.get());
+        assertNotNull(first);
+        assertNotNull(second);
+        Set<PinKey> both = state.activeKeys();
+        assertEquals(2, both.size());
+        assertTrue(both.contains(PinKey.of("a.example.com", 25565)));
+        assertTrue(both.contains(PinKey.of("b.example.com", 25566)));
+        both.clear();
+        assertEquals(2, state.activeKeys().size(), "the set is a snapshot, not the state's own");
+
+        assertTrue(state.endAttempt(first, true), "a success ends the first attempt");
+        assertEquals(Collections.singleton(PinKey.of("b.example.com", 25566)), state.activeKeys());
+        now.addAndGet(RebindState.STALE_ATTEMPT_MILLIS);
+        assertEquals(Collections.singleton(PinKey.of("b.example.com", 25566)), state.activeKeys(),
+                "an attempt nobody ended is still the attempt for its server, stale or not");
+        assertTrue(state.endAttempt(second, false));
+        assertTrue(state.activeKeys().isEmpty(), "an ended attempt is not active");
+    }
+
+    @Test
+    void forgettingNothingWritesNothing(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertTrue(state.shouldNotify("other.example.com", 25565, FP_A));
+        byte[] before = Files.readAllBytes(file);
+
+        assertEquals(0, state.forgetExpiredPins(Collections.<PinKey>emptySet()));
+        assertEquals(0, state.forgetExpiredPins(Collections.singleton(PinKey.of("unknown.example.com", 25565))),
+                "a server with no state is nothing to forget");
+        assertEquals(1, state.size());
+        assertArrayEquals(before, Files.readAllBytes(file), "nothing to forget writes nothing");
+    }
+
+    @Test
+    void aFailedWriteWhileForgettingExpiredPinsFailsClosed(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertTrue(state.shouldNotify("mc.example.com", 25565, FP_A));
+        byte[] before = Files.readAllBytes(file);
+
+        Faults.set(StateFile.FAULT_FORCE);
+        try {
+            assertEquals(1, state.forgetExpiredPins(Collections.singleton(PinKey.of("mc.example.com", 25565))),
+                    "the entry was forgotten in memory");
+        } finally {
+            Faults.set();
+        }
+        assertFalse(state.isUsable(), "a failed write fails closed");
+        assertArrayEquals(before, Files.readAllBytes(file), "the old state file is intact");
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
+        assertFalse(state.shouldNotify("mc.example.com", 25565, FP_B));
+        assertEquals(Collections.singletonList("rebind-v1.bin"), names(dir));
     }
 
     @Test

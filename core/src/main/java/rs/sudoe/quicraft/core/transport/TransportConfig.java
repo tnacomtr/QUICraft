@@ -119,6 +119,45 @@ public final class TransportConfig {
         return value >= 1 && value <= MAX_LIMIT ? value : fallback;
     }
 
+    /** Every value of {@code other}, with {@code multistream} chosen by the caller. */
+    private TransportConfig(TransportConfig other, boolean multistream) {
+        this.maxIdleTimeoutMillis = other.maxIdleTimeoutMillis;
+        this.initialMaxData = other.initialMaxData;
+        this.initialMaxStreamData = other.initialMaxStreamData;
+        this.congestionControl = other.congestionControl;
+        this.initialCongestionWindowPackets = other.initialCongestionWindowPackets;
+        this.earlyData = other.earlyData;
+        this.sessionResumption = other.sessionResumption;
+        this.relaxedLossThreshold = other.relaxedLossThreshold;
+        this.multistream = multistream;
+        this.globalAttemptsPerSecond = other.globalAttemptsPerSecond;
+        this.perIpAttemptsPerSecond = other.perIpAttemptsPerSecond;
+        this.retryThresholdPerSecond = other.retryThresholdPerSecond;
+        this.maxOpen = other.maxOpen;
+        this.maxOpenPerIp = other.maxOpenPerIp;
+        this.maxTrackedIps = other.maxTrackedIps;
+        this.ingressInitialsPerSecond = other.ingressInitialsPerSecond;
+        this.ingressInitialsPerIpPerSecond = other.ingressInitialsPerIpPerSecond;
+        this.retryMode = other.retryMode;
+    }
+
+    /**
+     * A copy of this configuration with the {@code /3} limits of 13.13 in place
+     * ({@link #isMultistream()} true). Every other value is the caller's, unchanged: the admission
+     * budgets ({@code maxOpen}, {@code maxOpenPerIp}, {@code maxTrackedIps}, the attempt, Retry and
+     * ingress budgets, the Retry mode), the idle timeout, congestion control, initial congestion
+     * window, {@code earlyData} and {@code sessionResumption}.
+     *
+     * <p>The {@code /3} entry points (the listener binds and the client dial) use this, never
+     * {@link #multistream()}, so enabling {@code /3} cannot silently discard what the caller
+     * configured. {@link Codecs#apply} still refuses a multistream config on a native without the
+     * window caps, and the {@code /3} entry points check {@link
+     * rs.sudoe.quicraft.core.QuicSupport#hasMaxFlowControlWindows()} first (12.3, 13.13).
+     */
+    TransportConfig withMultistream() {
+        return new TransportConfig(this, true);
+    }
+
     public static Builder builder() {
         return new Builder();
     }

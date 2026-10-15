@@ -20,18 +20,20 @@ import rs.sudoe.quicraft.core.discovery.Advertisement;
  *   <li>{@code tcp-only} returns {@link Transport#TCP} always (§4).
  *   <li>No advertisement, or one this build cannot parse, returns {@code TCP} (§1).
  *   <li>An advertised {@code quicraft/2} returns {@link Transport#V2}, the unchanged v1 behaviour
- *       (12.1, 13.1).
+ *       (12.1, 13.1). {@code V2} is returned for a {@code quicraft/2} advertisement and for nothing
+ *       else.
  *   <li>An advertised {@code quicraft/3} returns {@link Transport#V3} only when the client's
  *       multistream flag is enabled, the TLS exporter capability probe succeeded, the client has a
  *       routing table for its protocol number and the advertisement's digest for that number equals
- *       the local one; otherwise it returns {@code V2}, because a {@code /3} listener also accepts
- *       {@code /2} (12.3, 13.1). The routing digest is never guessed (13.1).
+ *       the local one; otherwise it returns {@code TCP} (12.3, 13.1). A {@code /3} listener speaks
+ *       {@code /3} only, so it is never offered {@code /2}: the client either speaks {@code /3} or
+ *       joins over TCP.
  *   <li>A changed pin never trusts the advertised fingerprint: it returns {@code V3} only when
  *       every {@code /3} prerequisite holds and the re-bind backoff allows an attempt now, and
- *       {@code TCP} otherwise, never {@code V2} (12.16).
- *   <li>An unusable pin store never returns {@code V3}: it returns {@code V2} where the listener
- *       supports {@code /2} and {@code TCP} otherwise, with a reason naming the corrupt store so
- *       the caller can tell the player (12.15).
+ *       {@code TCP} otherwise (12.16).
+ *   <li>An unusable pin store never returns {@code V3}: it returns {@code V2} for a
+ *       {@code quicraft/2} advertisement and {@code TCP} for a {@code quicraft/3} one, with a reason
+ *       naming the corrupt store so the caller can tell the player (12.15).
  *   <li>{@code quic-only} turns a {@code TCP} result into {@link Transport#FAIL}, the "no TCP
  *       fallback" setting of §4, except that {@code tcp-only} still returns {@code TCP}.
  * </ul>
@@ -73,7 +75,10 @@ public final class TransportSelection {
     public enum Transport {
         /** {@code quicraft/3}: QUIC with the 12/13 binding and multi-stream protocol. */
         V3,
-        /** {@code quicraft/2}: QUIC with the shipped v1 stream format. */
+        /**
+         * {@code quicraft/2}: QUIC with the shipped v1 stream format. Only a {@code quicraft/2}
+         * advertisement selects this (13.1); a {@code /3} listener never accepts {@code /2}.
+         */
         V2,
         /** Vanilla TCP. */
         TCP,
@@ -423,13 +428,13 @@ public final class TransportSelection {
     }
 
     /**
-     * An advertised {@code quicraft/3} listener accepts both {@code /3} and {@code /2} (13.1), so
-     * every prerequisite that fails falls back to {@code /2} for an ordinary pin and to fresh TCP
-     * for a changed one (12.16's pre-connect precedence).
+     * An advertised {@code quicraft/3} listener speaks {@code /3} only (13.1), so every prerequisite
+     * that fails returns {@code TCP}, never {@code /2}: this client either does {@code /3} or joins
+     * over vanilla TCP. A changed pin is the same answer for the same reason (12.16).
      */
     private static Result selectV3(Inputs inputs, Advertisement ad) {
         if (inputs.pinState() == PinState.STORE_UNUSABLE) {
-            return decide(inputs, Transport.V2, PIN_STORE_UNUSABLE + ", using /2",
+            return decide(inputs, Transport.TCP, PIN_STORE_UNUSABLE + ", using TCP",
                     Missing.PIN_STORE_UNUSABLE);
         }
         Missing missing = missingPrerequisite(inputs, ad);
@@ -446,8 +451,8 @@ public final class TransportSelection {
                     + "advertised fingerprint F' (12.16)", Missing.NONE);
         }
         if (missing != Missing.NONE) {
-            return decide(inputs, Transport.V2, "quicraft/3 is advertised, but " + describe(missing, inputs)
-                    + "; using /2, which a /3 listener also accepts (13.1)", missing);
+            return decide(inputs, Transport.TCP, "quicraft/3 is advertised, but " + describe(missing, inputs)
+                    + "; a /3 listener does not accept /2, so this uses TCP (13.1)", missing);
         }
         return decide(inputs, Transport.V3, "quicraft/3 is advertised and the routing digest for "
                 + "protocol " + inputs.clientProtocolNumber() + " matches the local one (13.1)",

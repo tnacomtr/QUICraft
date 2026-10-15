@@ -174,6 +174,7 @@ if (hostClassifier in nativeClassifiers) {
             includeTestsMatching("rs.sudoe.quicraft.core.transport.TlsExporterTest")
             includeTestsMatching("rs.sudoe.quicraft.core.transport.QuicLoopbackTest")
             includeTestsMatching("rs.sudoe.quicraft.core.transport.MultistreamTransportConfigTest")
+            includeTestsMatching("rs.sudoe.quicraft.core.transport.V3NativeRefusalTest")
         }
     }
     tasks.check {

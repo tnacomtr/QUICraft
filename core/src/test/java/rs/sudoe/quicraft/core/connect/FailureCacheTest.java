@@ -109,4 +109,92 @@ class FailureCacheTest {
         }
         assertEquals(FallbackReason.OTHER, FallbackReason.fromCode(99));
     }
+
+    /**
+     * 12.14: an activation failure overrides a previous handshake success and is cleared only by a
+     * later successful activation for that key, so the handshake-level {@code recordSuccess} must
+     * not touch it.
+     */
+    @Test
+    void aHandshakeSuccessDoesNotClearAnActivationFailure() {
+        AtomicLong now = new AtomicLong(1_000_000);
+        FailureCache cache = FailureCache.load(null, now::get);
+        assertFalse(cache.isActivationBlocked(ip, 25565, fp, now.get()), "nothing recorded yet");
+
+        cache.recordActivationFailure(ip, 25565, fp);
+        assertTrue(cache.isActivationBlocked(ip, 25565, fp, now.get()));
+
+        cache.recordSuccess(ip, 25565, fp);
+        assertTrue(cache.isActivationBlocked(ip, 25565, fp, now.get()),
+                "a handshake win does not clear an activation failure");
+        assertTrue(cache.allows(ip, 25565, fp), "the handshake entry itself is cleared");
+
+        // Only a later successful activation clears it.
+        cache.clearActivationFailure(ip, 25565, fp);
+        assertFalse(cache.isActivationBlocked(ip, 25565, fp, now.get()));
+    }
+
+    @Test
+    void activationFailuresFollowSectionSixsScheduleAndTheirOwnKeys() throws Exception {
+        AtomicLong now = new AtomicLong(0);
+        FailureCache cache = FailureCache.load(null, now::get);
+        cache.recordActivationFailure(ip, 25565, fp);
+        now.addAndGet(MIN - 1);
+        assertTrue(cache.isActivationBlocked(ip, 25565, fp, now.get()), "still blocked just before 1 min");
+        now.addAndGet(1);
+        assertFalse(cache.isActivationBlocked(ip, 25565, fp, now.get()), "allowed again after 1 min");
+
+        // A second consecutive activation failure doubles the window, like §6.
+        cache.recordActivationFailure(ip, 25565, fp);
+        now.addAndGet(MIN * 2 - 1);
+        assertTrue(cache.isActivationBlocked(ip, 25565, fp, now.get()));
+        now.addAndGet(1);
+        assertFalse(cache.isActivationBlocked(ip, 25565, fp, now.get()));
+
+        // Independent keys, like the handshake entries.
+        assertFalse(cache.isActivationBlocked(ip, 25566, fp, now.get()), "other port");
+        assertFalse(cache.isActivationBlocked(InetAddress.getByName("192.0.2.11"), 25565, fp, now.get()),
+                "other address");
+        assertFalse(cache.isActivationBlocked(ip, 25565, ServerIdentity.generate().fingerprint(), now.get()),
+                "rotated certificate");
+    }
+
+    /**
+     * The activation state is persisted next to the handshake entries, and a file written before it
+     * existed (handshake entries only) still loads: adding the state must not break the old format.
+     */
+    @Test
+    void activationFailuresSurviveARestartAndTheOldFormatStillLoads(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("quic-failures.properties");
+        AtomicLong now = new AtomicLong(5_000_000);
+        FailureCache cache = FailureCache.load(file, now::get);
+        cache.recordFailure(ip, 25565, fp);
+        cache.recordActivationFailure(ip, 25566, fp);
+
+        FailureCache reloaded = FailureCache.load(file, now::get);
+        assertFalse(reloaded.allows(ip, 25565, fp), "the handshake entry survives");
+        assertTrue(reloaded.isActivationBlocked(ip, 25566, fp, now.get()),
+                "the activation entry survives");
+        assertTrue(reloaded.allows(ip, 25566, fp), "and it is not also a handshake entry");
+
+        // A file written before activation failures existed: one plain property, no prefix.
+        Path old = dir.resolve("old.properties");
+        String key = FailureCache.key(ip, 25565, fp).replace(":", "\\:");
+        Files.write(old, (key + "=2," + (now.get() + MIN) + "\n").getBytes(StandardCharsets.ISO_8859_1));
+        FailureCache fromOld = FailureCache.load(old, now::get);
+        assertFalse(fromOld.allows(ip, 25565, fp), "the old handshake entry is still read");
+        assertFalse(fromOld.isActivationBlocked(ip, 25565, fp, now.get()),
+                "and it is not mistaken for an activation failure");
+    }
+
+    @Test
+    void forgettingFailuresClearsBothStates() {
+        AtomicLong now = new AtomicLong(0);
+        FailureCache cache = FailureCache.load(null, now::get);
+        cache.recordFailure(ip, 25565, fp);
+        cache.recordActivationFailure(ip, 25565, fp);
+        cache.clear();
+        assertTrue(cache.allows(ip, 25565, fp));
+        assertFalse(cache.isActivationBlocked(ip, 25565, fp, now.get()));
+    }
 }
