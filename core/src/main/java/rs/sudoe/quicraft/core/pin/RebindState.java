@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -57,6 +58,14 @@ import java.util.logging.Logger;
  * re-bind. A query never changes anything: no insertion, no eviction, no ordering. Entries are
  * persisted in least-recently-used order, so the order survives a restart.</p>
  *
+ * <p><b>Pin expiry.</b> When a pin expires, 12.15 expires its re-bind backoff and its detailed notice
+ * history with it, and they live in this state's file: the caller passes the keys
+ * {@link PinStore#purgeExpired(Set)} returned to {@link #forgetExpiredPins(Set)}, which removes those
+ * entries and persists this file atomically, so the two files change one after the other and each
+ * change is complete. The Bloom filter bits are never cleared there: a tuple that was noticed before
+ * the pin expired is still never noticed twice, which is what keeps 12.16's at-most-once rule true
+ * across an expiry. An entry with a live attempt is kept, like everywhere else here.</p>
+ *
  * <p>Reordering on its own is not a write: a call that only touches an entry leaves the file as it
  * was, so the on-disk order can lag the in-memory one until the next call that persists. That is safe
  * because the order is only a capacity hint: it decides which entry a restart evicts first, never
@@ -77,12 +86,13 @@ import java.util.logging.Logger;
  * that same clock.</p>
  *
  * <p><b>Calling it.</b> Every mutating call ({@link #tryBeginAttempt(String, int, long)},
- * {@link #endAttempt(Attempt, boolean)}, {@link #recordSuccess(String, int)} and
- * {@link #shouldNotify(String, int, String)}) writes the whole state file synchronously, with an
- * fsync of the file and of its directory. Never call them on the Netty event loop or the render
- * thread: hand the work to a worker. A null from {@link #tryBeginAttempt(String, int, long)} covers
- * all four refusals (the state is disabled, the server is inside its window, an attempt for it is
- * already running, or no entry may be evicted for it) and the caller uses TCP without a re-bind in
+ * {@link #endAttempt(Attempt, boolean)}, {@link #recordSuccess(String, int)},
+ * {@link #forgetExpiredPins(Set)} and {@link #shouldNotify(String, int, String)}) writes the whole
+ * state file synchronously, with an fsync of the file and of its directory. Never call them on the
+ * Netty event loop or the render thread: hand the work to a worker. A null from
+ * {@link #tryBeginAttempt(String, int, long)} covers all four refusals (the state is disabled, the
+ * server is inside its window, an attempt for it is already running, or no entry may be evicted for
+ * it) and the caller uses TCP without a re-bind in
  * every one of them; {@link #isUsable()} is what tells the four apart for the player-facing "pins
  * are disabled" notice. After a successful re-bind, record the pin first and end the attempt second
  * ({@code recordPin(...)} then {@link #endAttempt(Attempt, boolean)} with {@code success} true), so
@@ -388,6 +398,51 @@ public final class RebindState {
         if (!persist()) {
             disabled = true;
         }
+    }
+
+    /**
+     * Forgets the re-bind state of logical servers whose pin has expired (docs/protocol.md 12.15):
+     * their backoff window and their detailed notice history go, in one atomic write of this state's
+     * own file, so the next join of such a server is first contact with no re-bind backoff and no
+     * changed-fingerprint notice. The caller passes the keys {@link PinStore#purgeExpired(Set)}
+     * returned, after that call, so the pin file and this one change one after the other.
+     *
+     * <p>The Bloom filter bits are not cleared, which is the point: a tuple that was noticed before
+     * the pin expired is still never noticed twice, so 12.16's at-most-once rule holds across an
+     * expiry. An entry with a live attempt is kept, like everywhere else in this class: an attempt
+     * that is running keeps its state, and only {@link #endAttempt(Attempt, boolean)} decides its
+     * outcome.</p>
+     *
+     * <p>Nothing is written when there is nothing to forget. A failed write disables the state and
+     * leaves the old file in place, exactly like every other write here; the entries were removed in
+     * memory and are never read again, and the caller has {@link #isUsable()} false and uses TCP.</p>
+     *
+     * @param expiredKeys the logical servers whose pin expired; empty when there is none
+     * @return how many entries were forgotten, zero when there was nothing to forget
+     */
+    public synchronized int forgetExpiredPins(Set<PinKey> expiredKeys) {
+        if (disabled || expiredKeys == null || expiredKeys.isEmpty()) {
+            return 0;
+        }
+        long now = clock.getAsLong();
+        int removed = 0;
+        for (PinKey key : expiredKeys) {
+            String mapKey = PinKey.mapKey(key);
+            Entry entry = entries.get(mapKey);
+            if (entry == null || live(entry, now)) {
+                continue;
+            }
+            entries.remove(mapKey);
+            noticeCount -= entry.notices.size();
+            removed++;
+        }
+        if (removed == 0) {
+            return 0;
+        }
+        if (!persist()) {
+            disabled = true;
+        }
+        return removed;
     }
 
     /**

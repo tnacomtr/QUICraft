@@ -5,12 +5,17 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
-import java.util.function.LongSupplier;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -34,11 +39,25 @@ import java.util.logging.Logger;
  * store. When {@link #isUsable()} is false the caller must not read an empty
  * {@link #pin(String, int)} result as "no pin was ever recorded".</p>
  *
- * <p><b>Capacity.</b> At most {@link #MAX_PINS} pins; a pin is never evicted automatically. When the
- * store is full, recording a name it does not know returns {@link RecordResult#FULL} and the caller
- * uses TCP for that name until the player deletes a pin; updating a name it already knows is always
- * allowed. Deleting requires the player's explicit confirmation and is therefore
- * {@link #deletePin(String, int)}, never automatic.</p>
+ * <p><b>Capacity and expiry.</b> At most {@link #MAX_PINS} pins, and a pin only ever goes through
+ * {@link #deletePin(String, int)}, which the player must confirm, or through expiry. A pin expires
+ * when its last-bound time is more than {@link #PIN_TTL_MILLIS} before the store's clock, or when
+ * that time is in the future: a clock moved backwards never revives or extends a pin
+ * (docs/protocol.md 12.15). Expired pins are removed before every lookup and before every store-full
+ * decision, in one atomic write, and an expired name is first contact again: the next join runs the
+ * normal binding exchange, with no changed-fingerprint notice and no re-bind backoff. When the store
+ * is full after that, recording a name it does not know returns {@link RecordResult#FULL} and the
+ * caller uses TCP for that name until a pin expires or the player deletes one; updating a name it
+ * already knows is always allowed.</p>
+ *
+ * <p><b>Expiry and a running attempt.</b> A pin is never expired while an attempt for its logical
+ * server is running (12.15). The caller passes the keys of its attempts in flight, and expiry skips
+ * them: {@link #pin(String, int, Set)} and {@link #recordPin(String, int, String, Set)} for a lookup
+ * or a decision, {@link #purgeExpired(Set)} on its own to expire pins without deciding anything. The
+ * shorter overloads pass an empty set, so a caller with an attempt running must use the longer ones.
+ * {@link #purgeExpired(Set)} returns the keys it removed, which are exactly the keys whose re-bind
+ * state {@link RebindState#forgetExpiredPins(Set)} must forget in the same breath (12.15, 12.16):
+ * the two live in two files, so each removal is its own atomic write, the pin file's first.</p>
  *
  * <p>There is no cross-process lock: two clients sharing one config directory writing this file are
  * last-writer-wins, each write being atomic ({@link StateFile}).</p>
@@ -49,13 +68,20 @@ import java.util.logging.Logger;
  *
  * <p><b>Calling it.</b> {@link #recordPin(String, int, String)} and {@link #deletePin(String, int)}
  * write the whole file synchronously, with an fsync of the file and of its directory: never call
- * them on the Netty event loop or the render thread, hand the work to a worker. A caller that gets
- * {@link RecordResult#DISABLED} should tell the player that pinning is off and use {@code /2} or TCP;
- * {@link #isUsable()} is the same fact for code that only reads.</p>
+ * them on the Netty event loop or the render thread, hand the work to a worker. A lookup writes too
+ * when it removes expired pins, so {@link #pin(String, int)} belongs on the same worker: only a
+ * lookup that finds nothing to expire reads. A caller that gets {@link RecordResult#DISABLED} should
+ * tell the player that pinning is off and use {@code /2} or TCP; {@link #isUsable()} is the same fact
+ * for code that only reads.</p>
  */
 public final class PinStore {
     /** The most pins the store holds; docs/protocol.md 12.16. */
     public static final int MAX_PINS = 4096;
+    /**
+     * How long a pin survives without a new binding: 30 days after its last-bound time, after which
+     * the pin has expired (docs/protocol.md 12.15). A last-bound time in the future has expired too.
+     */
+    public static final long PIN_TTL_MILLIS = Duration.ofDays(30).toMillis();
     /** The schema version of the pins file. */
     static final int SCHEMA_VERSION = 1;
     /** Four MiB is far above the largest pins file 4096 pins can make (about 1.8 MiB). */
@@ -117,27 +143,32 @@ public final class PinStore {
     }
 
     private final Path file;
-    private final LongSupplier clock;
+    private final Clock clock;
     private final Map<String, Pin> pins = new LinkedHashMap<>();
     private boolean disabled;
 
-    private PinStore(Path file, LongSupplier clock) {
+    private PinStore(Path file, Clock clock) {
         this.file = file;
         this.clock = clock;
     }
 
-    /** Loads the pins the client has recorded; a missing file is an empty, usable store. */
+    /**
+     * Loads the pins the client has recorded, deciding expiry from the system UTC clock; a missing
+     * file is an empty, usable store. Use {@link #load(Path, Clock)} to inject a clock.
+     */
     public static PinStore load(Path file) {
-        return load(file, System::currentTimeMillis);
+        return load(file, Clock.systemUTC());
     }
 
     /**
-     * Loads the pins the client has recorded, reading the current time from {@code clock}.
+     * Loads the pins the client has recorded, deciding expiry from {@code clock}, which must be a
+     * wall clock: the timestamps in the file are UTC instants, not monotonic readings.
      *
      * @param file the pins file, or null for a store that is never persisted
+     * @param clock the clock every expiry decision of this store is made from
      */
-    static PinStore load(Path file, LongSupplier clock) {
-        PinStore store = new PinStore(file, clock);
+    public static PinStore load(Path file, Clock clock) {
+        PinStore store = new PinStore(file, Objects.requireNonNull(clock, "clock"));
         if (file == null) {
             return store;
         }
@@ -162,17 +193,39 @@ public final class PinStore {
 
     /**
      * The pin for {@code host} and {@code port}, normalized the same way {@link #recordPin} stores
-     * it, or an empty result when there is none. Meaningless as "no pin" while {@link #isUsable()}
-     * is false.
+     * it, or an empty result when there is none. Pins that expired at the store's clock are removed
+     * first, so this may write the file (docs/protocol.md 12.15). Meaningless as "no pin" while
+     * {@link #isUsable()} is false.
+     *
+     * <p>A caller with an attempt running for any server must use
+     * {@link #pin(String, int, Set)} instead, so that attempt's pin is not expired under it.</p>
      */
     public synchronized Optional<Pin> pin(String host, int port) {
-        return Optional.ofNullable(pins.get(PinKey.mapKey(PinKey.of(host, port))));
+        return pin(host, port, Collections.<PinKey>emptySet());
+    }
+
+    /**
+     * The pin for {@code host} and {@code port}, after removing the pins that expired at the store's
+     * clock, except those in {@code activeKeys} (docs/protocol.md 12.15).
+     *
+     * @param activeKeys the logical servers an attempt is running for, whose pins are never expired
+     *     here; empty when the caller has no attempt running
+     */
+    public synchronized Optional<Pin> pin(String host, int port, Set<PinKey> activeKeys) {
+        PinKey key = PinKey.of(host, port);
+        purgeExpired(activeKeys);
+        return Optional.ofNullable(pins.get(PinKey.mapKey(key)));
     }
 
     /**
      * Records an authenticated pin after a valid SERVER_SWITCH. An existing name is always updated,
      * keeping the time it was first bound; a new name is refused with {@link RecordResult#FULL} once
      * the store holds {@link #MAX_PINS} pins, and the caller uses TCP for it.
+     *
+     * <p>Pins that expired at the store's clock are removed first (12.15), so a name whose pin has
+     * expired is recorded as a new one: it is {@link RecordResult#FULL} only if the store is still
+     * full after those removals. A caller with an attempt running for any server must use
+     * {@link #recordPin(String, int, String, Set)} instead.</p>
      *
      * <p><b>Only the post-SERVER_SWITCH online-mode path of docs/protocol.md 12.15 may call this</b>,
      * once the binding exchange has proved the connection that just completed is the one the pin is
@@ -184,8 +237,24 @@ public final class PinStore {
      * @throws IllegalArgumentException when the host, port or fingerprint is not in its canonical form
      */
     public synchronized RecordResult recordPin(String host, int port, String fingerprint) {
+        return recordPin(host, port, fingerprint, Collections.<PinKey>emptySet());
+    }
+
+    /**
+     * The same, after removing the pins that expired at the store's clock, except those in
+     * {@code activeKeys} (docs/protocol.md 12.15).
+     *
+     * @param activeKeys the logical servers an attempt is running for, whose pins are never expired
+     *     here; empty when the caller has no attempt running
+     */
+    public synchronized RecordResult recordPin(String host, int port, String fingerprint,
+                                               Set<PinKey> activeKeys) {
         PinKey key = PinKey.of(host, port);
         String canonical = Fingerprints.check(fingerprint);
+        if (disabled) {
+            return RecordResult.DISABLED;
+        }
+        purgeExpired(activeKeys);
         if (disabled) {
             return RecordResult.DISABLED;
         }
@@ -194,7 +263,7 @@ public final class PinStore {
         if (existing == null && pins.size() >= MAX_PINS) {
             return RecordResult.FULL;
         }
-        Instant now = Instant.ofEpochMilli(clock.getAsLong());
+        Instant now = clock.instant();
         Pin updated = existing == null
                 ? new Pin(key.host(), key.port(), canonical, now, now)
                 : new Pin(key.host(), key.port(), canonical, existing.firstBound, now);
@@ -207,6 +276,66 @@ public final class PinStore {
         pins.clear();
         pins.putAll(next);
         return existing == null ? RecordResult.RECORDED : RecordResult.UPDATED;
+    }
+
+    /**
+     * Removes the pins that expired at the store's clock, in one atomic write, and returns their
+     * keys (docs/protocol.md 12.15). A pin has expired when its last-bound time is more than
+     * {@link #PIN_TTL_MILLIS} before that clock, or is in the future; a pin whose server is in
+     * {@code activeKeys} is never expired, because an attempt for it is running.
+     *
+     * <p>The caller passes the returned keys to {@link RebindState#forgetExpiredPins(Set)}: 12.15
+     * expires a pin's re-bind backoff and detailed notices with the pin itself, and those live in
+     * the re-bind state's own file. The Bloom filter bits stay, so a notice that was shown is still
+     * never shown twice.</p>
+     *
+     * <p>Nothing is written when no pin has expired. A failed write disables the store, leaves the
+     * old file in place and removes nothing, so the returned set is empty, exactly like every other
+     * failed write here; the caller then has {@link #isUsable()} false and uses {@code /2} or TCP.</p>
+     *
+     * @param activeKeys the logical servers an attempt is running for; empty when there is none
+     * @return the keys of the pins that were removed, empty when there was nothing to remove
+     */
+    public synchronized Set<PinKey> purgeExpired(Set<PinKey> activeKeys) {
+        Objects.requireNonNull(activeKeys, "activeKeys");
+        if (disabled) {
+            return Collections.emptySet();
+        }
+        long now = clock.millis();
+        Set<String> active = new LinkedHashSet<>();
+        for (PinKey key : activeKeys) {
+            active.add(PinKey.mapKey(key));
+        }
+        Map<String, Pin> next = new LinkedHashMap<>(pins);
+        Set<PinKey> expired = new LinkedHashSet<>();
+        for (Map.Entry<String, Pin> candidate : pins.entrySet()) {
+            Pin pin = candidate.getValue();
+            if (isExpired(pin, now) && !active.contains(candidate.getKey())) {
+                next.remove(candidate.getKey());
+                expired.add(PinKey.of(pin.host(), pin.port()));
+            }
+        }
+        if (expired.isEmpty()) {
+            return Collections.emptySet();
+        }
+        if (!write(next)) {
+            disabled = true;
+            return Collections.emptySet();
+        }
+        pins.clear();
+        pins.putAll(next);
+        return expired;
+    }
+
+    /**
+     * Whether {@code pin} has expired at {@code now}: more than {@link #PIN_TTL_MILLIS} since it was
+     * last bound, or a last-bound time in the future. A clock that moved backwards never revives a
+     * pin, and never extends one either: the future timestamp it left behind has already expired
+     * (docs/protocol.md 12.15).
+     */
+    private static boolean isExpired(Pin pin, long now) {
+        long age = now - pin.lastBound.toEpochMilli();
+        return age > PIN_TTL_MILLIS || age < 0;
     }
 
     /**
