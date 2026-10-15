@@ -1010,8 +1010,11 @@ single-socket listener: no dispatcher is installed and the connection id length 
     delimiter) as one CONTROL-fenced scheduling unit, keeping its actual packets as separate
     sequential GAME records, all on CONTROL, with no other game record assigned between
     them. Buffer before assigning routes, at most 4096 members or 8 MiB total uncompressed
-    bytes, further limited by the game's own cap; missing closing delimiter for 10 seconds
-    or excess bounds disconnects. Do not split members onto auxiliary lanes or deliver a
+    bytes, further limited by the game's own cap and by 13.12's pending-record cap: the
+    whole bundle, both delimiters included, must fit in 1024 records, so at most 1022
+    members. A sender that would exceed any of these bounds closes with `0x11` instead of
+    emitting the bundle; missing closing delimiter for 10 seconds or excess bounds at the
+    receiver disconnects. Do not split members onto auxiliary lanes or deliver a
     partial bundle to game logic. Receiver stages contiguous CONTROL members through the
     closing delimiter using provisional watermarks for their internal predecessor checks;
     external dependencies must already satisfy the committed watermarks. It commits those
