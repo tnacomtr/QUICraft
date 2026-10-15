@@ -25,14 +25,26 @@ final class Codecs {
         if (QuicSupport.hasRelaxedLossThreshold()) {
             builder.relaxedLossThreshold(config.relaxedLossThreshold);
         }
+        long maxData = config.initialMaxData;
+        long maxStreamData = config.initialMaxStreamData;
+        // v1: exactly one client-opened bidirectional stream; the server opens none.
+        int maxStreams = server ? 1 : 0;
+        if (config.multistream) {
+            // /3 (13.13): small serverbound windows, a 16 MiB clientbound one, streams 0 and 4 from
+            // the client and stream 1 from the server.
+            maxData = server ? TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA
+                    : TransportConfig.MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA;
+            maxStreamData = TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA;
+            maxStreams = server ? TransportConfig.MULTISTREAM_SERVER_MAX_STREAMS_BIDI
+                    : TransportConfig.MULTISTREAM_CLIENT_MAX_STREAMS_BIDI;
+        }
         B configured = builder
                 .maxIdleTimeout(config.maxIdleTimeoutMillis, TimeUnit.MILLISECONDS)
-                .initialMaxData(config.initialMaxData)
-                .initialMaxStreamDataBidirectionalLocal(config.initialMaxStreamData)
-                .initialMaxStreamDataBidirectionalRemote(config.initialMaxStreamData)
+                .initialMaxData(maxData)
+                .initialMaxStreamDataBidirectionalLocal(maxStreamData)
+                .initialMaxStreamDataBidirectionalRemote(maxStreamData)
                 .initialMaxStreamDataUnidirectional(0)
-                // v1: exactly one client-opened bidirectional stream; the server opens none.
-                .initialMaxStreamsBidirectional(server ? 1 : 0)
+                .initialMaxStreamsBidirectional(maxStreams)
                 .initialMaxStreamsUnidirectional(0)
                 .activeMigration(false)
                 .localConnectionIdLength(LOCAL_CONNECTION_ID_LENGTH)
