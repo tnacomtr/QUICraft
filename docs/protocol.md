@@ -745,6 +745,16 @@ single-socket listener: no dispatcher is installed and the connection id length 
     where supported. An authenticated pin means only "the last endpoint at this name that
     completed an authenticated login", not proven server identity (12.20). v1 silent
     observations MUST NOT be promoted to authenticated pins.
+    **Pin expiry (user decision 2026-10-16).** An authenticated pin whose last-bound timestamp
+    is more than **30 days** old expires. Before any pin lookup or store-full decision the
+    client removes expired pins, with their re-bind backoff and detailed-notice entries,
+    in one atomic write (12.16's Bloom filter bits stay). An expired pin is first contact:
+    the next join runs the normal binding exchange, with no changed-fingerprint notice and
+    no re-bind backoff. This is safe because every `/3` join runs the full binding check
+    whether or not a pin exists (12.18); a pin only adds change notices and re-bind rate
+    limits, never permission to skip binding. A wall clock moved backwards never revives or
+    extends a pin; a last-bound time in the future counts as expired. Never expire a pin
+    during an active attempt for that logical server.
     A corrupt/unreadable existing pin file or failed write disables `/3` until repaired;
     notify the player and use `/2` (for a `/2` advertisement) or TCP on the next attempt, never
     silently treat corruption as first contact. A pin write failure at activation closes the
@@ -779,8 +789,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
     only after binding and atomic pin persistence succeed; failure retains them unused.
     Persist re-bind backoff and notice-deduplication state across restarts. Bound pins and
     backoff to 4096 logical-server entries each, and detailed notices to 16 fingerprints
-    per server (65536 total). Never automatically evict pins: when the pin store is full,
-    use TCP for new names until the player explicitly deletes a pin. For backoff and
+    per server (65536 total). Apart from 30-day expiry (12.15), never automatically evict
+    pins: when the pin store is full after removing expired pins, use TCP for new names
+    until a pin expires or the player explicitly deletes one. For backoff and
     detailed notices, evict least-recently-used entries when full. Never evict an active
     attempt's state; if no entry can be evicted, use TCP without a re-bind. To preserve
     at-most-once notices after detailed-history eviction, also persist a fixed 1 MiB
@@ -793,8 +804,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
     If login now lacks authentication (including encrypted-but-unauthenticated login),
     abort `/3` as in 12.7, keep the old pin and use the same fresh TCP retry, with any notice
     subject to the same deduplication;
-    no mode-0 exchange is allowed for this re-bind. Deleting a pin still requires explicit
-    player confirmation. Offline-mode pins
+    no mode-0 exchange is allowed for this re-bind. Deleting a pin before it expires still
+    requires explicit player confirmation. Offline-mode pins
     (Phase 9 TOFU) are out of scope here and keep an explicit-action rotation.
 
 ### Resumption, offline mode and threat model
