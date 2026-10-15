@@ -1011,7 +1011,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
     can hold quiche-unread data. The client's aggregate exposure is therefore the application-held
     data (the 17 MiB budget of 13.12) plus quiche-unread data bounded by 12 MiB; the initial
     clientbound MAX_DATA credit is not debited from the receiver budget. Automatic growth beyond
-    these pins is not allowed. Smaller initial serverbound windows MUST remain effective;
+    these pins is not allowed. Because the server windows are pinned, a serverbound record
+    streams at about 8 KiB per round trip per stream: a serverbound record larger than roughly
+    8 KiB x (10 s / RTT) hits the 10 second incomplete-record timer (about 800 KB at a 100 ms
+    RTT). Vanilla serverbound packets are far smaller. Smaller initial serverbound windows MUST remain effective;
     transport auto-tuning may not silently override them. If the pinned Netty exposes no
     setters for these maximum windows/growth controls, patch it before enabling `/3`;
     initial limits alone are insufficient. Account for already granted credit when
