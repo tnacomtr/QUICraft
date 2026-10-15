@@ -98,7 +98,7 @@ public final class ReceiverScheduler {
     }
     public Partial reservePartial(Lane lane, long size, long now) {
         checkDeadlines(now);
-        if (ended || lane == null || size <= 0) throw new OrderingException("invalid partial");
+        if (controlEnded || ended || lane == null || size <= 0) throw new OrderingException("invalid partial");
         budget(lane, size, 1);
         Partial p = new Partial(lane, size, now);
         partials.put(p, Boolean.TRUE); account(lane, size, 1);
@@ -138,7 +138,7 @@ public final class ReceiverScheduler {
     }
     private void validate(Envelope e, long retained, int uncompressed) {
         int i = e.lane().ordinal();
-        if (ended || (i == 0 && controlEnded) || received[i] == -1L
+        if (ended || controlEnded || received[i] == -1L
                 || e.sequence() != received[i] + 1
                 || e.dependency(e.lane()) != e.sequence() - 1)
             throw new OrderingException("sequence/own dependency violation");

@@ -337,13 +337,27 @@ class OrderingCoreTest {
     @Test void endIsAControlFullFenceAndTerminalOnlyOnApplication() {
         SenderSequencer s=new SenderSequencer();
         Envelope world=s.assign(W,0,null,null,0), end=s.end(0);
-        Harness h=new Harness(); h.scheduler.offer(end,0);
-        assertTrue(h.calls.isEmpty()); h.scheduler.offer(world,0);
+        Harness h=new Harness(); h.scheduler.offer(world,0);
+        h.scheduler.offer(end,0);
+        assertEquals(1,h.calls.size());
         ReceiverScheduler.Delivery d=h.calls.remove(0);
         h.scheduler.applied(d.lane(),d.sequence(),0);
         assertFalse(h.scheduler.ended());
         h.drain(0); assertTrue(h.scheduler.ended());
         fails(() -> h.scheduler.offer(e(R,1,0,0,0),0));
+    }
+
+    @Test void enqueuedEndRejectsFurtherRecordsOnEveryLaneAndPartialCompletion() {
+        for (Lane lane : Lane.values()) {
+            Harness h = new Harness();
+            ReceiverScheduler.Partial p = h.scheduler.reservePartial(lane,34,0);
+            Envelope end = new Envelope(C,Envelope.Kind.END,1,new long[3],0,null,Envelope.Bundle.NONE,false);
+            h.scheduler.offer(end,0);
+            Envelope later = e(lane,lane == C ? 2 : 1,lane == C ? 1 : 0,0,0);
+            fails(() -> h.scheduler.offer(later,0));
+            fails(() -> h.scheduler.complete(p,later,34,0,0));
+            fails(() -> h.scheduler.reservePartial(lane,1,0));
+        }
     }
 
     @Test void synchronousAcknowledgementsDoNotRecurseThroughHandlerStack() {
