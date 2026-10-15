@@ -28,7 +28,7 @@ class MultistreamTransportConfigTest {
         assertEquals(2, TransportConfig.MULTISTREAM_SERVER_MAX_STREAMS_BIDI);
         assertEquals(1, TransportConfig.MULTISTREAM_CLIENT_MAX_STREAMS_BIDI);
         assertEquals(4L << 20, TransportConfig.MULTISTREAM_MAX_STREAM_WINDOW);
-        assertEquals(17L << 20, TransportConfig.MULTISTREAM_MAX_CONNECTION_WINDOW);
+        assertEquals(12L << 20, TransportConfig.MULTISTREAM_MAX_CONNECTION_WINDOW);
     }
 
     @Test
@@ -80,7 +80,7 @@ class MultistreamTransportConfigTest {
         assertEquals(256L << 10, field(server, "maxConnectionWindow"));
         assertEquals(8L << 10, field(server, "maxStreamWindow"));
         Object client = Codecs.apply(new io.netty.handler.codec.quic.QuicClientCodecBuilder(), config, false);
-        assertEquals(17L << 20, field(client, "maxConnectionWindow"));
+        assertEquals(12L << 20, field(client, "maxConnectionWindow"));
         assertEquals(4L << 20, field(client, "maxStreamWindow"));
     }
 }

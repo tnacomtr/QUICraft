@@ -45,8 +45,8 @@ public final class TransportConfig {
      * when the native cannot set them.
      */
     public static final long MULTISTREAM_MAX_STREAM_WINDOW = 4L << 20;
-    /** /3 (13.13): the largest auto-tuned connection window at the client. */
-    public static final long MULTISTREAM_MAX_CONNECTION_WINDOW = 17L << 20;
+    /** /3 (13.13): the largest auto-tuned connection window at the client: three streams times the stream maximum. */
+    public static final long MULTISTREAM_MAX_CONNECTION_WINDOW = 12L << 20;
 
     private static final Logger LOG = Logger.getLogger("QUICraft");
     private static final int MAX_LIMIT = 10_000_000;

@@ -1002,9 +1002,14 @@ single-socket listener: no dispatcher is installed and the connection id length 
     well as retained bytes and both reservations; if record count is not yet known, reserve
     for the maximum number of minimum-size records that credit can carry, or withhold it.
     Never extend credit for a record exceeding 13.4's cap; no legal record exceeds 4 MiB.
-    Pin quiche's maximum auto-tuned stream window to 4 MiB and connection window to
-    17 MiB, with automatic growth disabled unless it obeys these same application/node
-    budgets and reservations. Smaller initial serverbound windows MUST remain effective;
+    Pin quiche's maximum auto-tuned windows. Server: connection window 256 KiB and stream
+    window 8 KiB, equal to the initial serverbound windows, so automatic growth is off and the
+    exposure is exactly the initial credit the node reserved. Client: stream window 4 MiB and
+    connection window 12 MiB, three streams times the stream maximum, since only three streams
+    can hold quiche-unread data. The client's aggregate exposure is therefore the application-held
+    data (the 17 MiB budget of 13.12) plus quiche-unread data bounded by 12 MiB; the initial
+    clientbound MAX_DATA credit is not debited from the receiver budget. Automatic growth beyond
+    these pins is not allowed. Smaller initial serverbound windows MUST remain effective;
     transport auto-tuning may not silently override them. If the pinned Netty exposes no
     setters for these maximum windows/growth controls, patch it before enabling `/3`;
     initial limits alone are insufficient. Account for already granted credit when
