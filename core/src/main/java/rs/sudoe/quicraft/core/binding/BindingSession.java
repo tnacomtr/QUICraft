@@ -4,6 +4,8 @@ package rs.sudoe.quicraft.core.binding;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 import rs.sudoe.quicraft.core.Faults;
@@ -44,7 +46,8 @@ import rs.sudoe.quicraft.core.binding.BindingStateMachine.Role;
  * <p>Deadlines: 10 seconds total from entering configuration to activation, and, on the client,
  * the {@code offerWaitNanos} the constructor was given for a missing OFFER (12.14; a changed-pin
  * re-bind passes 12.16's bounded wait, twice the measured handshake RTT clamped to 500 ms..3 s).
- * Both are checked by {@link #tick(long)}, so the adapter must tick.</p>
+ * Both are checked by {@link #tick(long)}. A session built with a scheduler ticks itself, so its
+ * deadlines fire even when the adapter never calls {@code tick}; without one the adapter must tick.</p>
  *
  * <p>Not thread-safe: every method runs on the connection's event loop, which is also what 12.10
  * requires for the cutover. Nothing here logs, and no failure reason carries a secret, an exporter
@@ -57,6 +60,12 @@ public final class BindingSession implements BindingDriver {
     public static final int MAX_QUEUED_PACKETS = 256;
     /** 12.10: at most 8 MiB of queued ordinary packets per endpoint. */
     public static final long MAX_QUEUED_BYTES = 8L << 20;
+    /**
+     * How often a session that was given a scheduler checks its own deadlines (12.14). Fine enough
+     * for a ten second deadline and a re-bind's sub-second offer wait, and cheap enough to leave
+     * running for the exchange's lifetime.
+     */
+    static final long SELF_TICK_MILLIS = 100;
 
     /** The only accepted digest length for F and R, docs/protocol.md 12.7. */
     private static final int DIGEST_LENGTH = 32;
@@ -71,6 +80,8 @@ public final class BindingSession implements BindingDriver {
     private final byte[] routing;
     private final LongSupplier clock;
     private final long offerWaitNanos;
+    /** Optional: a scheduler the session ticks itself with, so deadlines do not need the adapter. */
+    private final ScheduledExecutorService scheduler;
 
     private final List<Object> queued = new ArrayList<Object>();
     private long queuedBytes;
@@ -82,12 +93,14 @@ public final class BindingSession implements BindingDriver {
     private boolean quiescent;
     private boolean settled;
     private boolean activated;
+    private ScheduledFuture<?> ticker;
 
     /**
      * @param role which endpoint this session is
      * @param exporter the TLS exporter value of 12.7, resolved when the exchange starts
-     * @param sharedSecret Minecraft's 16-byte {@code S} in online mode; ignored in offline mode,
-     *     and the caller keeps ownership of the array (12.6)
+     * @param sharedSecret Minecraft's 16-byte {@code S} in online mode; ignored in offline mode.
+     *     The session keeps a private copy (12.6), so the caller may wipe its own array as soon as
+     *     this returns
      * @param mode {@link BindingStateMachine#MODE_ONLINE} or
      *     {@link BindingStateMachine#MODE_OFFLINE} (12.7, 12.19)
      * @param protocol the Minecraft protocol number both peers must agree on (12.8)
@@ -97,11 +110,14 @@ public final class BindingSession implements BindingDriver {
      * @param offerWaitNanos the client's bounded wait for OFFER (12.16); 0 or less means no
      *     separate OFFER wait, so only the 10 second deadline applies
      * @param callbacks what the adapter does for this session
+     * @param scheduler an optional scheduler the session ticks itself with, so 12.14's deadlines
+     *     fire even when the adapter never calls {@link #tick(long)}; null means the adapter must
+     *     tick. The session cancels its own task when it settles
      * @throws IllegalArgumentException for local misuse, which is a wiring bug and not a wire event
      */
     public BindingSession(Role role, ExporterSource exporter, byte[] sharedSecret, int mode, int protocol,
             byte[] advertisedFingerprint, byte[] routingDigest, LongSupplier clock, long offerWaitNanos,
-            Callbacks callbacks) {
+            Callbacks callbacks, ScheduledExecutorService scheduler) {
         this.role = Objects.requireNonNull(role, "role");
         this.exporter = Objects.requireNonNull(exporter, "exporter");
         this.callbacks = Objects.requireNonNull(callbacks, "callbacks");
@@ -123,12 +139,13 @@ public final class BindingSession implements BindingDriver {
         if (offerWaitNanos < 0) {
             throw new IllegalArgumentException("offerWaitNanos must not be negative");
         }
-        this.sharedSecret = sharedSecret;
+        this.sharedSecret = sharedSecret == null ? null : sharedSecret.clone();
         this.mode = mode;
         this.protocol = protocol;
         this.fingerprint = advertisedFingerprint.clone();
         this.routing = routingDigest.clone();
         this.offerWaitNanos = offerWaitNanos;
+        this.scheduler = scheduler;
     }
 
     /** Whether the exchange finished with activation (12.9). */
@@ -165,6 +182,7 @@ public final class BindingSession implements BindingDriver {
         }
         entered = true;
         enteredAtNanos = nowNanos;
+        startTicker();
         try {
             BindingMachineResult built = role == Role.SERVER
                     ? BindingStateMachine.server(faultCheckedExporter(), sharedSecret, mode, protocol,
@@ -221,7 +239,7 @@ public final class BindingSession implements BindingDriver {
     }
 
     @Override
-    public boolean queueOrdinary(Object packet, int bytes) {
+    public QueueResult queueOrdinary(Object packet, int bytes) {
         if (packet == null) {
             throw new IllegalArgumentException("packet is required");
         }
@@ -229,16 +247,16 @@ public final class BindingSession implements BindingDriver {
             throw new IllegalArgumentException("bytes must not be negative");
         }
         if (settled || !quiescent) {
-            return false;
+            return QueueResult.SEND_NOW;
         }
         if (queued.size() + 1 > MAX_QUEUED_PACKETS || queuedBytes + bytes > MAX_QUEUED_BYTES) {
             // 12.10: overflow disconnects; the packets are dropped with the connection.
             fail("binding: quiescence queue overflow");
-            return false;
+            return QueueResult.DROPPED_FAILED;
         }
         queued.add(packet);
         queuedBytes += bytes;
-        return true;
+        return QueueResult.QUEUED;
     }
 
     @Override
@@ -268,6 +286,38 @@ public final class BindingSession implements BindingDriver {
             }
         } catch (Throwable t) {
             fail("binding tick", t);
+        }
+    }
+
+    /**
+     * Starts the session's own deadline checks when it was given a scheduler, so 12.14's timers fire
+     * even if the adapter never ticks. A scheduler that refuses the task leaves the adapter's own
+     * {@link #tick(long)} calls in charge.
+     */
+    private void startTicker() {
+        if (scheduler == null) {
+            return;
+        }
+        try {
+            ticker = scheduler.scheduleWithFixedDelay(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        tick(clock.getAsLong());
+                    } catch (Throwable ignored) {
+                        // tick() never throws; a scheduler thread must not die on it either.
+                    }
+                }
+            }, SELF_TICK_MILLIS, SELF_TICK_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (Throwable ignored) {
+            // No self-ticking; the adapter's tick() calls still work.
+        }
+    }
+
+    private void stopTicker() {
+        if (ticker != null) {
+            ticker.cancel(false);
+            ticker = null;
         }
     }
 
@@ -315,6 +365,7 @@ public final class BindingSession implements BindingDriver {
         quiescent = false;
         activated = true;
         settled = true;
+        stopTicker();
     }
 
     /**
@@ -331,10 +382,20 @@ public final class BindingSession implements BindingDriver {
         quiescent = false;
         queued.clear();
         queuedBytes = 0;
-        if (machine != null) {
-            machine.abort();
+        stopTicker();
+        try {
+            if (machine != null) {
+                machine.abort();
+            }
+        } catch (Throwable ignored) {
+            // Wiping the machine's tags is best effort: the connection is closing either way.
         }
-        callbacks.fail(Protocol.CLOSE_BINDING_FAILURE, reason);
+        try {
+            callbacks.fail(Protocol.CLOSE_BINDING_FAILURE, reason);
+        } catch (Throwable ignored) {
+            // A callback that throws must not leave the session unsettled or escape into the event
+            // loop: the session is already settled, and 12.14's answer is the close it just asked for.
+        }
     }
 
     /**

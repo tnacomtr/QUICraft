@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core.binding;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -12,12 +13,15 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
+import rs.sudoe.quicraft.core.binding.BindingDriver.QueueResult;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine.Role;
 
 /**
@@ -43,7 +47,7 @@ class BindingSessionTest {
     }
 
     /** The adapter's side: it records what the session asked for and queues payloads to the peer. */
-    static final class FakeAdapter implements BindingDriver.Callbacks {
+    static class FakeAdapter implements BindingDriver.Callbacks {
         final List<String> events = new ArrayList<String>();
         final List<byte[]> sent = new ArrayList<byte[]>();
         final Deque<byte[]> inbound = new ArrayDeque<byte[]>();
@@ -88,13 +92,20 @@ class BindingSessionTest {
     /** A session and its adapter, with a controllable nanosecond clock. */
     static final class Endpoint {
         final AtomicLong clock = new AtomicLong(ENTERED);
-        final FakeAdapter adapter = new FakeAdapter();
+        final FakeAdapter adapter;
         final BindingSession session;
 
         Endpoint(Role role, ExporterSource exporter, byte[] sharedSecret, int mode, int protocol,
                 byte[] fingerprint, byte[] routing, long offerWaitNanos) {
+            this(role, exporter, sharedSecret, mode, protocol, fingerprint, routing, offerWaitNanos,
+                    new FakeAdapter());
+        }
+
+        Endpoint(Role role, ExporterSource exporter, byte[] sharedSecret, int mode, int protocol,
+                byte[] fingerprint, byte[] routing, long offerWaitNanos, FakeAdapter adapter) {
+            this.adapter = adapter;
             this.session = new BindingSession(role, exporter, sharedSecret, mode, protocol, fingerprint,
-                    routing, clock::get, offerWaitNanos, adapter);
+                    routing, clock::get, offerWaitNanos, adapter, null);
             adapter.session = this.session;
         }
 
@@ -373,9 +384,11 @@ class BindingSessionTest {
         server.session.onConfigurationEntered(ENTERED);
         assertTrue(server.session.isQuiescent(), "12.10: the server queues ordinary packets from OFFER on");
         for (int i = 0; i < BindingSession.MAX_QUEUED_PACKETS; i++) {
-            assertTrue(server.session.queueOrdinary("packet-" + i, 1), "packet " + i + " fits");
+            assertEquals(QueueResult.QUEUED, server.session.queueOrdinary("packet-" + i, 1),
+                    "packet " + i + " fits");
         }
-        assertFalse(server.session.queueOrdinary("one-too-many", 1), "the 257th packet overflows");
+        assertEquals(QueueResult.DROPPED_FAILED, server.session.queueOrdinary("one-too-many", 1),
+                "the 257th packet overflows");
         assertEquals(Protocol.CLOSE_BINDING_FAILURE, server.adapter.failCode);
         assertTrue(server.adapter.failReason.contains("overflow"));
     }
@@ -384,9 +397,10 @@ class BindingSessionTest {
     void theEightMebibyteBoundIsEnforcedToo() {
         Endpoint server = server();
         server.session.onConfigurationEntered(ENTERED);
-        assertTrue(server.session.queueOrdinary("big", (int) BindingSession.MAX_QUEUED_BYTES),
+        assertEquals(QueueResult.QUEUED,
+                server.session.queueOrdinary("big", (int) BindingSession.MAX_QUEUED_BYTES),
                 "exactly 8 MiB is still allowed");
-        assertFalse(server.session.queueOrdinary("one-more", 1));
+        assertEquals(QueueResult.DROPPED_FAILED, server.session.queueOrdinary("one-more", 1));
         assertEquals(Protocol.CLOSE_BINDING_FAILURE, server.adapter.failCode);
     }
 
@@ -394,12 +408,12 @@ class BindingSessionTest {
     void onlyTheQuiescenceWindowQueuesAndReleaseHandsPacketsBackInOrder() {
         Endpoint client = client();
         // Before the client has accepted an OFFER nothing is paused: the caller sends normally.
-        assertFalse(client.session.queueOrdinary("early", 1));
+        assertEquals(QueueResult.SEND_NOW, client.session.queueOrdinary("early", 1));
 
         Endpoint server = server();
         server.session.onConfigurationEntered(ENTERED);
-        assertTrue(server.session.queueOrdinary("a", 1));
-        assertTrue(server.session.queueOrdinary("b", 2));
+        assertEquals(QueueResult.QUEUED, server.session.queueOrdinary("a", 1));
+        assertEquals(QueueResult.QUEUED, server.session.queueOrdinary("b", 2));
         assertEquals(Arrays.asList("a", "b"), server.session.releaseQueued());
         assertEquals(Arrays.asList(), server.session.releaseQueued(), "releasing twice gives nothing");
 
@@ -412,8 +426,102 @@ class BindingSessionTest {
         pump(client2, server2);
         assertTrue(server2.session.isActivated());
         assertFalse(server2.session.isQuiescent());
-        assertFalse(server2.session.queueOrdinary("late", 1));
+        assertEquals(QueueResult.SEND_NOW, server2.session.queueOrdinary("late", 1));
         assertFalse(server2.adapter.failed());
+    }
+
+    @Test
+    void theSessionOwnsItsOwnCopyOfTheSharedSecret() {
+        byte[] secret = S.clone();
+        Endpoint client = new Endpoint(Role.CLIENT, BindingTestData.exporter(E), secret,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R, OFFER_WAIT);
+        Endpoint server = server();
+        link(client, server);
+        // 12.6: the adapter may wipe its own copy of S as soon as the session has one.
+        Arrays.fill(secret, (byte) 0);
+
+        client.session.onConfigurationEntered(ENTERED);
+        server.session.onConfigurationEntered(ENTERED);
+        pump(client, server);
+
+        assertTrue(client.session.isActivated(),
+                "the session must derive its key from its own copy of S, not the caller's array");
+        assertTrue(server.session.isActivated());
+    }
+
+    @Test
+    void aThrowingFailCallbackStillLeavesTheSessionSettled() {
+        FakeAdapter throwing = new FakeAdapter() {
+            @Override
+            public void fail(int code, String reason) {
+                throw new IllegalStateException("the adapter's close blew up");
+            }
+        };
+        Endpoint endpoint = new Endpoint(Role.CLIENT, BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R, OFFER_WAIT, throwing);
+        endpoint.session.onConfigurationEntered(ENTERED);
+        final byte[] tampered = BindingMessage.offer(BindingTestData.MODE_ONLINE,
+                BindingTestData.PROTOCOL_NUMBER, F, R).encode();
+        tampered[102] = 1;
+
+        assertDoesNotThrow(() -> endpoint.session.onPayload(tampered));
+        assertTrue(endpoint.session.isSettled(),
+                "12.14: the session settles even when the adapter's callback throws");
+        assertFalse(endpoint.session.isActivated());
+        assertDoesNotThrow(() -> endpoint.session.onPayload(tampered), "and every later call is a no-op");
+
+        // The quiescence overflow path calls fail() with no outer try/catch, which is where an
+        // unguarded callback would escape into the adapter's event loop.
+        Endpoint server = new Endpoint(Role.SERVER, BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R, 0, throwing);
+        server.session.onConfigurationEntered(ENTERED);
+        for (int i = 0; i < BindingSession.MAX_QUEUED_PACKETS; i++) {
+            assertEquals(QueueResult.QUEUED, server.session.queueOrdinary("packet-" + i, 1));
+        }
+        assertDoesNotThrow(() -> server.session.queueOrdinary("one-too-many", 1));
+        assertTrue(server.session.isSettled());
+    }
+
+    @Test
+    void aThrowingSendCallbackEndsTheSessionWith0x10() {
+        FakeAdapter throwingSend = new FakeAdapter() {
+            @Override
+            public void send(byte[] payload) {
+                throw new IllegalStateException("the write blew up");
+            }
+        };
+        Endpoint server = new Endpoint(Role.SERVER, BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R, 0, throwingSend);
+
+        assertDoesNotThrow(() -> server.session.onConfigurationEntered(ENTERED));
+        assertTrue(server.session.isSettled());
+        assertFalse(server.session.isActivated());
+        assertEquals(Protocol.CLOSE_BINDING_FAILURE, throwingSend.failCode,
+                "a callback that throws still ends the whole connection with 0x10");
+    }
+
+    @Test
+    void aStalledExchangeFailsWithoutManualTicks() throws Exception {
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        try {
+            FakeAdapter adapter = new FakeAdapter();
+            long entered = System.nanoTime();
+            BindingSession session = new BindingSession(Role.CLIENT, BindingTestData.exporter(E), S,
+                    BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime,
+                    TimeUnit.MILLISECONDS.toNanos(50), adapter, scheduler);
+            session.onConfigurationEntered(entered);
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (adapter.failCode < 0 && System.nanoTime() < deadline) {
+                Thread.sleep(10);
+            }
+            assertEquals(Protocol.CLOSE_BINDING_FAILURE, adapter.failCode,
+                    "12.14: a session with a scheduler must fire its own deadline");
+            assertTrue(adapter.failReason.contains("offer wait"), adapter.failReason);
+            assertTrue(session.isSettled());
+        } finally {
+            scheduler.shutdownNow();
+        }
     }
 
     @Test
@@ -465,28 +573,28 @@ class BindingSessionTest {
     void constructorRejectsLocalMisuse() {
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, 2, BindingTestData.PROTOCOL_NUMBER, F, R,
-                System::nanoTime, OFFER_WAIT, new FakeAdapter()));
+                System::nanoTime, OFFER_WAIT, new FakeAdapter(), null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE, -1, F, R,
-                System::nanoTime, OFFER_WAIT, new FakeAdapter()));
+                System::nanoTime, OFFER_WAIT, new FakeAdapter(), null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE,
                 BindingTestData.PROTOCOL_NUMBER, new byte[31], R, System::nanoTime, OFFER_WAIT,
-                new FakeAdapter()));
+                new FakeAdapter(), null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE,
                 BindingTestData.PROTOCOL_NUMBER, F, new byte[31], System::nanoTime, OFFER_WAIT,
-                new FakeAdapter()));
+                new FakeAdapter(), null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), null, BindingTestData.MODE_ONLINE,
                 BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, OFFER_WAIT,
-                new FakeAdapter()));
+                new FakeAdapter(), null));
         assertThrows(IllegalArgumentException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE,
-                BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, -1, new FakeAdapter()));
+                BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, -1, new FakeAdapter(), null));
         assertThrows(NullPointerException.class, () -> new BindingSession(Role.CLIENT,
                 BindingTestData.exporter(E), S, BindingTestData.MODE_ONLINE,
-                BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, OFFER_WAIT, null));
+                BindingTestData.PROTOCOL_NUMBER, F, R, System::nanoTime, OFFER_WAIT, null, null));
     }
 
     @Test

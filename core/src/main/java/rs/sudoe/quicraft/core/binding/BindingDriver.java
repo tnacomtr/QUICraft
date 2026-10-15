@@ -14,12 +14,20 @@ import java.util.List;
  *   <li>Entering the exchange at the right moment (12.4: configuration state, after a successful
  *       online authentication and TLS handshake confirmation) and calling
  *       {@link #onConfigurationEntered(long)} exactly once, from the connection's event loop.</li>
+ *   <li>The 12.7 confirmation gate, which only the adapter can see. The pinned Netty reports TLS
+ *       handshake completion, not RFC 9001 confirmation, and {@code /3} allows 0-RTT, so a server
+ *       MUST NOT start binding until it has seen its own handshake completion: it enters
+ *       configuration only after processing a 1-RTT packet (Encryption Response in online mode,
+ *       Login Acknowledged under the offline test flag) and refuses to start binding with
+ *       {@code 0x10} otherwise. With 0-RTT accepted, neither side may start binding before the
+ *       server's handshake is complete.</li>
  *   <li>Draining earlier outbound writes before the server's OFFER and before the client's
  *       CLIENT_PROOF, and installing the boundary-aware decoder of 12.13 before the client sends
  *       CLIENT_SWITCH and before the server sends OFFER.</li>
  *   <li>Feeding every {@code quicraft:binding} payload to {@link #onPayload(byte[])} and nothing
  *       else: those payloads are never delivered to ordinary plugins (12.8).</li>
- *   <li>Calling {@link #tick(long)} from its event loop while the exchange is running, and
+ *   <li>Calling {@link #tick(long)} from its event loop while the exchange is running, unless the
+ *       session was given a scheduler and ticks itself, and
  *       {@link #queueOrdinary(Object, int)} for every ordinary outbound game packet or state change
  *       while the session says it is pausing them (12.10).</li>
  *   <li>Refusing {@code /3} in the cases this package cannot see: a login that is encrypted but not
@@ -29,9 +37,24 @@ import java.util.List;
  *
  * <p>Every failure inside the session becomes {@link Callbacks#fail(int, String)} with
  * {@code 0x10}, {@link rs.sudoe.quicraft.core.Protocol#CLOSE_BINDING_FAILURE} (12.14). No method
- * here throws for anything a peer can influence.</p>
+ * here throws for anything a peer or a callback can influence: a callback that throws ends the
+ * session with {@code 0x10} instead, because the adapter's only safe answer is to close the
+ * connection (12.14). Only local misuse, such as a null packet, throws.</p>
  */
 public interface BindingDriver {
+    /** What {@link BindingDriver#queueOrdinary(Object, int)} did with an ordinary packet (12.10). */
+    enum QueueResult {
+        /** The session queued it, and hands it back through {@link BindingDriver#releaseQueued()}. */
+        QUEUED,
+        /** The session is not pausing ordinary packets, so the adapter sends it itself. */
+        SEND_NOW,
+        /**
+         * The packet overflowed the quiescence queue, so the session has already reported
+         * {@code 0x10} and the connection is being closed (12.10).
+         */
+        DROPPED_FAILED
+    }
+
     /** What the session asks the adapter to do, always from the connection's event loop. */
     interface Callbacks {
         /**
@@ -58,8 +81,12 @@ public interface BindingDriver {
 
         /**
          * Closes the whole QUIC connection with the application error code, {@code 0x10} for every
-         * binding failure (12.14). Called at most once, and never again after
-         * {@link #activateInbound()} has been reported.
+         * binding failure (12.14). Called at most once, after the first failure.
+         *
+         * <p>It can follow {@link #activateInbound()}: on the server, that callback and
+         * {@link #activateOutbound()} both run when CLIENT_SWITCH verifies, so an outbound cutover
+         * that fails after the inbound one leaves the session no choice but to close the whole
+         * connection (12.11, 12.12, 12.14).</p>
          */
         void fail(int code, String reason);
     }
@@ -85,13 +112,14 @@ public interface BindingDriver {
      * @param packet the packet as the adapter holds it, kept until
      *     {@link #releaseQueued()} hands it back to be encoded as a record
      * @param bytes the packet's wire size, counted against the 8 MiB bound
-     * @return true when the session queued it; false when the session is not pausing ordinary
-     *     packets right now, so the adapter sends it normally, or when this packet overflowed the
-     *     queue, in which case the session has already reported {@code 0x10} through
+     * @return {@link QueueResult#QUEUED} when the session queued it,
+     *     {@link QueueResult#SEND_NOW} when the session is not pausing ordinary packets right now
+     *     and the adapter sends it itself, and {@link QueueResult#DROPPED_FAILED} when it overflowed
+     *     the queue, in which case the session has already reported {@code 0x10} through
      *     {@link Callbacks#fail(int, String)} and the connection is being closed
      * @throws IllegalArgumentException when the packet is null or {@code bytes} is negative
      */
-    boolean queueOrdinary(Object packet, int bytes);
+    QueueResult queueOrdinary(Object packet, int bytes);
 
     /**
      * Hands back everything {@link #queueOrdinary(Object, int)} accepted, in order, and forgets it,
@@ -104,8 +132,10 @@ public interface BindingDriver {
     List<Object> releaseQueued();
 
     /**
-     * Advances the session's timers. The adapter calls this from its event loop while the exchange
-     * is running, whether or not a payload arrived.
+     * Advances the session's timers: the 10 second activation deadline and the client's offer wait
+     * (12.14). The adapter calls this from its event loop while the exchange is running, whether or
+     * not a payload arrived. A session built with a scheduler ticks itself, so an adapter that has
+     * one need not call this at all.
      *
      * @param nowNanos the current value of the monotonic clock the session was built with
      */

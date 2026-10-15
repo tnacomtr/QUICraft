@@ -27,7 +27,7 @@ public final class BindingTestSessions {
     /** A client session in {@code mode} that never entered configuration, so it is not activated. */
     public static BindingSession idleClient(int mode) {
         return new BindingSession(Role.CLIENT, BindingTestData.exporter(E), secret(mode), mode,
-                BindingTestData.PROTOCOL_NUMBER, F, R, () -> ENTERED, 0, new Collector());
+                BindingTestData.PROTOCOL_NUMBER, F, R, () -> ENTERED, 0, new Collector(), null);
     }
 
     private static byte[] secret(int mode) {
@@ -41,9 +41,9 @@ public final class BindingTestSessions {
         clientCollector.peer = serverCollector;
         serverCollector.peer = clientCollector;
         BindingSession client = new BindingSession(Role.CLIENT, BindingTestData.exporter(E), secret(mode),
-                mode, BindingTestData.PROTOCOL_NUMBER, F, R, () -> ENTERED, 0, clientCollector);
+                mode, BindingTestData.PROTOCOL_NUMBER, F, R, () -> ENTERED, 0, clientCollector, null);
         BindingSession server = new BindingSession(Role.SERVER, BindingTestData.exporter(E), secret(mode),
-                mode, BindingTestData.PROTOCOL_NUMBER, F, R, () -> ENTERED, 0, serverCollector);
+                mode, BindingTestData.PROTOCOL_NUMBER, F, R, () -> ENTERED, 0, serverCollector, null);
         client.onConfigurationEntered(ENTERED);
         server.onConfigurationEntered(ENTERED);
         for (int guard = 0; guard < 64; guard++) {
