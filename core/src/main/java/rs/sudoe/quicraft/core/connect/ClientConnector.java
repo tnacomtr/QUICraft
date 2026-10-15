@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.core.connect;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.ArrayDeque;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -252,7 +253,9 @@ public final class ClientConnector {
          * @param pins the client's authenticated pins (12.15); required
          * @param rebinds the client's changed-pin re-bind state (12.16); required
          * @param worker the executor every pin, re-bind and routing lookup runs on, never the
-         *     caller's event loop
+         *     caller's event loop. It is wrapped so its tasks run one at a time, in submission
+         *     order ({@link SerialExecutor}), because those calls read and write the same state
+         *     files
          * @param clock the clock the pin store and the re-bind state were loaded with
          * @param protocolNumber the client's Minecraft protocol number, used to look up the local
          *     routing table and its digest (13.1, 13.7)
@@ -270,7 +273,7 @@ public final class ClientConnector {
             }
             this.pins = pins;
             this.rebinds = rebinds;
-            this.worker = worker;
+            this.worker = new SerialExecutor(worker);
             this.clock = clock;
             this.protocolNumber = protocolNumber;
             this.multistreamEnabled = multistreamEnabled;
@@ -303,6 +306,74 @@ public final class ClientConnector {
 
         public boolean exporterCapable() {
             return exporterCapable;
+        }
+    }
+
+    /**
+     * An executor that runs its tasks one at a time, in submission order, whatever the delegate does.
+     * The {@code /3} plan's state writes and the pre-connect step read and write the same pin,
+     * re-bind and failure files, so their calls must not interleave: the connector serializes them
+     * here rather than trusting every caller to hand in a single-threaded executor.
+     *
+     * <p>A delegate that refuses the task is reported to the caller as before, after the queue is
+     * dropped: every caller of this executor already treats a rejection as "the work did not happen"
+     * and carries on with TCP.</p>
+     */
+    private static final class SerialExecutor implements Executor {
+        private final Executor delegate;
+        private final ArrayDeque<Runnable> queue = new ArrayDeque<Runnable>();
+        private boolean running;
+
+        SerialExecutor(Executor delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void execute(Runnable command) {
+            boolean start;
+            synchronized (this) {
+                queue.add(command);
+                start = !running;
+                if (start) {
+                    running = true;
+                }
+            }
+            if (!start) {
+                return;
+            }
+            try {
+                delegate.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        drain();
+                    }
+                });
+            } catch (Throwable t) {
+                synchronized (this) {
+                    running = false;
+                    queue.clear();
+                }
+                throw t;
+            }
+        }
+
+        private void drain() {
+            while (true) {
+                Runnable task;
+                synchronized (this) {
+                    task = queue.poll();
+                    if (task == null) {
+                        running = false;
+                        return;
+                    }
+                }
+                try {
+                    task.run();
+                } catch (Throwable ignored) {
+                    // Every caller of this executor documents that its task never throws; one that
+                    // does must not stop the queue or lose the tasks behind it.
+                }
+            }
         }
     }
 

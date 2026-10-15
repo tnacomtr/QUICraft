@@ -33,6 +33,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
+import rs.sudoe.quicraft.core.binding.BindingSession;
+import rs.sudoe.quicraft.core.binding.BindingStateMachine;
+import rs.sudoe.quicraft.core.binding.BindingTestSessions;
 import rs.sudoe.quicraft.core.connect.ClientConnector.Outcome;
 import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 import rs.sudoe.quicraft.core.connect.TransportSelection.PinState;
@@ -217,6 +220,16 @@ class ClientConnectorV3Test {
             text.append(digit);
         }
         return Fingerprint.parse(text.toString());
+    }
+
+    /** An online-authenticated client session that completed the exchange (12.7, 12.15). */
+    private static BindingSession onlineSession() {
+        return BindingTestSessions.activatedClient(BindingStateMachine.MODE_ONLINE);
+    }
+
+    /** An offline-mode client session that completed the exchange (12.19). */
+    private static BindingSession offlineSession() {
+        return BindingTestSessions.activatedClient(BindingStateMachine.MODE_OFFLINE);
     }
 
     @Test
@@ -497,8 +510,7 @@ class ClientConnectorV3Test {
         f.failures.clearActivationFailure(f.address(), QUIC_PORT, f.fingerprint);
 
         V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
-        plan.authenticatedLogin(true);
-        assertTrue(plan.activated().get(FIVE_SECONDS, TimeUnit.SECONDS));
+        assertTrue(plan.activated(onlineSession()).get(FIVE_SECONDS, TimeUnit.SECONDS));
 
         assertEquals(f.fingerprint.toString(), f.pins.pin(HOST, LOGICAL_PORT).get().fingerprint(),
                 "12.15: an authenticated activation records the pin");
@@ -512,9 +524,8 @@ class ClientConnectorV3Test {
         Fixture f = Fixture.empty();
         f.advertiseV3();
         V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
-        // 12.19: offline mode never creates or updates an authenticated pin, and the default is
-        // "not authenticated".
-        assertTrue(plan.activated().get(FIVE_SECONDS, TimeUnit.SECONDS));
+        // 12.19: offline mode never creates or updates an authenticated pin.
+        assertTrue(plan.activated(offlineSession()).get(FIVE_SECONDS, TimeUnit.SECONDS));
         assertFalse(f.pins.pin(HOST, LOGICAL_PORT).isPresent());
     }
 
@@ -524,16 +535,19 @@ class ClientConnectorV3Test {
         f.advertiseV3();
         f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
         V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
-        plan.authenticatedLogin(true);
 
         Faults.set(Faults.PIN_WRITE);
-        assertFalse(plan.activated().get(FIVE_SECONDS, TimeUnit.SECONDS),
+        assertFalse(plan.activated(onlineSession()).get(FIVE_SECONDS, TimeUnit.SECONDS),
                 "12.15: a failed pin write must be reported so the caller closes with 0x10");
         Faults.set();
         assertEquals(fingerprint('d').toString(), f.pins.pin(HOST, LOGICAL_PORT).get().fingerprint(),
                 "the old pin stays until a passing check replaces it");
         assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
                 "a write failure after activation is itself an activation failure");
+        // 12.15 with 12.14: the adapter still gets the retry decision for the failure it just saw.
+        assertTrue(plan.failed(V3Plan.Phase.JOINING, V3Plan.PIN_WRITE_FAILED));
+        assertEquals("QUIC multi-stream failed (" + V3Plan.PIN_WRITE_FAILED + "), fell back to TCP",
+                plan.fallbackMessage());
     }
 
     @Test
@@ -542,7 +556,7 @@ class ClientConnectorV3Test {
         f.advertiseV3();
         f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
         V3Plan changed = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
-        assertTrue(changed.failed(false, V3Plan.REBIND_FAILED),
+        assertTrue(changed.failed(V3Plan.Phase.JOINING, V3Plan.REBIND_FAILED),
                 "the user's fail-safe decision: a failed re-bind continues over fresh TCP");
         assertEquals("QUIC multi-stream failed (" + V3Plan.REBIND_FAILED + "), fell back to TCP",
                 changed.fallbackMessage());
@@ -555,7 +569,7 @@ class ClientConnectorV3Test {
         g.advertiseV3();
         V3Plan ordinary = g.connect(g.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
         assertNull(ordinary.attempt(), "an ordinary pin takes no re-bind attempt");
-        assertTrue(ordinary.failed(false, V3Plan.BINDING_FAILED),
+        assertTrue(ordinary.failed(V3Plan.Phase.JOINING, V3Plan.BINDING_FAILED),
                 "and it still gets the same-attempt TCP retry before activation");
     }
 
@@ -768,7 +782,7 @@ class ClientConnectorV3Test {
             f.advertiseV3();
             f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
             V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
-            assertTrue(plan.failed(false, reason), reason + " must retry over fresh TCP");
+            assertTrue(plan.failed(V3Plan.Phase.JOINING, reason), reason + " must retry over fresh TCP");
             assertEquals("QUIC multi-stream failed (" + reason + "), fell back to TCP",
                     plan.fallbackMessage());
             assertEquals(reason, plan.fallbackReason());
@@ -788,10 +802,10 @@ class ClientConnectorV3Test {
         assertNull(plan.fallbackReason());
         assertFalse(plan.isFailed());
 
-        assertTrue(plan.failed(false));
+        assertTrue(plan.failed(V3Plan.Phase.JOINING));
         assertEquals("QUIC multi-stream failed (internal error), fell back to TCP", plan.fallbackMessage());
-        // Reporting twice keeps the first answer and the first reason.
-        assertTrue(plan.failed(false, "something else"));
+        // A second report keeps the first cause and never starts a second TCP join.
+        assertFalse(plan.failed(V3Plan.Phase.JOINING, "something else"));
         assertEquals(V3Plan.INTERNAL_ERROR, plan.fallbackReason());
     }
 
@@ -801,11 +815,10 @@ class ClientConnectorV3Test {
         f.advertiseV3();
         f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
         V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
-        plan.authenticatedLogin(true);
-        assertTrue(plan.activated().get(FIVE_SECONDS, TimeUnit.SECONDS));
+        assertTrue(plan.activated(onlineSession()).get(FIVE_SECONDS, TimeUnit.SECONDS));
         assertTrue(plan.isActivated());
 
-        assertFalse(plan.failed(true, "lane ordering failure"),
+        assertFalse(plan.failed(V3Plan.Phase.PLAY, "lane ordering failure"),
                 "after activation there is no same-attempt retry; the next join uses TCP");
         assertFalse(plan.isActivated());
         assertEquals("QUIC multi-stream failed (lane ordering failure), fell back to TCP",
@@ -814,8 +827,8 @@ class ClientConnectorV3Test {
                 "so the next join goes straight to TCP during the backoff");
 
         // A second report changes nothing, activated() cannot follow a failure, and the pin stays.
-        assertFalse(plan.failed(true, "later still"));
-        assertFalse(plan.activated().join().booleanValue());
+        assertFalse(plan.failed(V3Plan.Phase.JOINING, "later still"));
+        assertFalse(plan.isActivated());
         assertEquals(f.fingerprint.toString(), f.pins.pin(HOST, LOGICAL_PORT).get().fingerprint());
     }
 

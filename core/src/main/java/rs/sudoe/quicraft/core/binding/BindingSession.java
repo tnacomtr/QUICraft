@@ -136,6 +136,15 @@ public final class BindingSession implements BindingDriver {
         return activated;
     }
 
+    /**
+     * The binding mode this session ran in: {@link BindingStateMachine#MODE_ONLINE} when the login
+     * was authenticated (12.7) or {@link BindingStateMachine#MODE_OFFLINE} for the explicit offline
+     * test profile (12.19). Only an online session may write an authenticated pin (12.15).
+     */
+    public int mode() {
+        return mode;
+    }
+
     /** Whether the session is over, activated or failed; every later call is a no-op. */
     public boolean isSettled() {
         return settled;
