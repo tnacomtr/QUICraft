@@ -187,7 +187,7 @@ public final class LaneSession {
     private int unsentPackets;
     private long unsentBytes;
     private volatile boolean writable = true;
-    private ScheduledFuture<?> tick;
+    private LoopTicker ticker;
     private java.lang.reflect.Method streamCapacityMethod;
     private boolean streamCapacityLookedUp;
 
@@ -498,10 +498,7 @@ public final class LaneSession {
 
     private void shutdown() {
         closed = true;
-        if (tick != null) {
-            tick.cancel(false);
-            tick = null;
-        }
+        disarmTick();
         // 13.12: every release must run even if one of them fails. A throw here would skip the
         // rest, leaking this connection's node reservations to a budget every other connection
         // shares, so each is guarded on its own.
@@ -795,7 +792,7 @@ public final class LaneSession {
         // The rest of a record whose length is known, or of a preamble, already holds its charge.
         // A bare, still incomplete length prefix holds almost nothing, so it needs credit again.
         if (!s.fin && !s.readPending && !s.hasUnparsed() && s.channel != null
-                && (s.midRecord() || !s.opened || credit(s.lane))) {
+                && (s.midRecord() || !s.opened || credit(s.lane)) && s.grantRead()) {
             s.readPending = true;
             s.channel.read();
         }
@@ -1046,21 +1043,33 @@ public final class LaneSession {
     }
 
     /**
-     * Arms the periodic tick. While the session is active it runs even with nothing pending, so
-     * the 13.14 STOP_SENDING probe and the receiver's deadlines advance on an idle connection;
-     * otherwise only pending records, peer streams or a written END need it.
+     * Registers this session with its event loop's ticker (13.12/13.14). One timer serves every
+     * activated session of a loop, so 50,000 connections cost 50,000/loopThread wakeups instead of
+     * one timer each. Event loop only; idempotent.
      */
     private void armTick() {
-        if (tick != null || closed) {
+        if (ticker != null || closed || !activated) {
             return;
         }
-        if (activated || receiver.pendingRecords() > 0 || awaitingPeerStreams() || endWrittenAt != 0) {
-            tick = loop.schedule(this::onTick, timing.tickNanos, TimeUnit.NANOSECONDS);
+        ticker = LoopTicker.of(loop);
+        ticker.register(this);
+    }
+
+    /** Removes this session from its loop's ticker; event loop only. */
+    private void disarmTick() {
+        LoopTicker registered = ticker;
+        if (registered != null) {
+            ticker = null;
+            registered.unregister(this);
         }
     }
 
-    private void onTick() {
-        tick = null;
+    /**
+     * One tick of the loop's timer (13.14, 13.12): notice a peer STOP_SENDING on an idle lane,
+     * retry the lanes a full node budget withheld, and advance the receiver's and sender's
+     * deadlines. Runs for every activated session of the loop, whether or not it has work.
+     */
+    void tick() {
         if (closed) {
             return;
         }
@@ -1088,13 +1097,74 @@ public final class LaneSession {
             }
             if (endWrittenAt != 0 && t - endWrittenAt >= timing.endLingerNanos) {
                 closeNormally();
-                return;
             }
         } catch (Throwable e) {
             failFrom(e);
-            return;
         }
-        armTick();
+    }
+
+    /** One periodic tick per event loop over that loop's activated sessions. */
+    private static final class LoopTicker implements Runnable {
+        /** Live tickers by event loop; an entry goes away with its last session. Loop thread only. */
+        private static final java.util.concurrent.ConcurrentHashMap<io.netty.channel.EventLoop, LoopTicker>
+                TICKERS = new java.util.concurrent.ConcurrentHashMap<io.netty.channel.EventLoop, LoopTicker>();
+
+        private final io.netty.channel.EventLoop loop;
+        private final java.util.HashSet<LaneSession> active = new java.util.HashSet<LaneSession>();
+        private long periodNanos = Long.MAX_VALUE;
+        private ScheduledFuture<?> task;
+
+        private LoopTicker(io.netty.channel.EventLoop loop) {
+            this.loop = loop;
+        }
+
+        /** The ticker of {@code loop}, created on first use; call from that loop only. */
+        static LoopTicker of(io.netty.channel.EventLoop loop) {
+            LoopTicker ticker = TICKERS.get(loop);
+            if (ticker == null) {
+                ticker = new LoopTicker(loop);
+                LoopTicker raced = TICKERS.putIfAbsent(loop, ticker);
+                if (raced != null) {
+                    ticker = raced;
+                }
+            }
+            return ticker;
+        }
+
+        /** Adds a session, shortening the shared period when it asks for a faster one. */
+        void register(LaneSession session) {
+            active.add(session);
+            if (session.timing.tickNanos < periodNanos) {
+                periodNanos = session.timing.tickNanos;
+                if (task != null) {
+                    task.cancel(false);
+                    task = null;
+                }
+            }
+            if (task == null) {
+                task = loop.scheduleAtFixedRate(this, periodNanos, periodNanos, TimeUnit.NANOSECONDS);
+            }
+        }
+
+        /** Drops a session; the timer stops and the loop keeps no ticker while nothing is active. */
+        void unregister(LaneSession session) {
+            active.remove(session);
+            if (active.isEmpty()) {
+                if (task != null) {
+                    task.cancel(false);
+                    task = null;
+                }
+                periodNanos = Long.MAX_VALUE;
+                TICKERS.remove(loop, this);
+            }
+        }
+
+        @Override
+        public void run() {
+            for (LaneSession session : new ArrayList<LaneSession>(active)) {
+                session.tick();
+            }
+        }
     }
 
     /**
@@ -1180,6 +1250,8 @@ public final class LaneSession {
         boolean preambleWritten;
         /** The record in progress has announced its length, so its full size is charged. */
         boolean lengthKnown;
+        /** An outstanding node read grant of {@link LaneSession#READ_CHUNK} for the next read. */
+        boolean granted;
 
         LaneStream(Lane lane) {
             this.lane = lane;
@@ -1207,6 +1279,33 @@ public final class LaneSession {
         /** A record in progress whose whole parser buffer is already charged. */
         boolean midRecord() {
             return decoder.hasPartial() && lengthKnown;
+        }
+
+        /**
+         * Takes the node read grant for the next {@code channel.read()} (13.12/13.13). The bytes a
+         * read can deliver are reserved before the read, so no legal record's chunk is ever fatal
+         * at the node level; a refusal withholds the read instead (non-fatal) and is retried by the
+         * tick. The arriving chunk converts the grant into the chunk's charge, and the unused part
+         * goes back.
+         */
+        boolean grantRead() {
+            if (granted) {
+                return true;
+            }
+            if (!node.tryReserve(READ_CHUNK)) {
+                withheldForNode = true;
+                return false;
+            }
+            granted = true;
+            return true;
+        }
+
+        /** Gives an unused read grant back: the lane stopped reading or the session closed. */
+        void releaseGrant() {
+            if (granted) {
+                granted = false;
+                node.release(READ_CHUNK);
+            }
         }
 
         /**
@@ -1243,6 +1342,7 @@ public final class LaneSession {
         }
 
         void releaseInbound() {
+            releaseGrant();
             ByteBuf b;
             while ((b = inbound.poll()) != null) {
                 releaseChunk(b);
@@ -1273,9 +1373,23 @@ public final class LaneSession {
                 buf.release();
                 return;
             }
+            int bytes = buf.readableBytes();
             try {
-                // 13.12: the chunk is held, so it is charged to the node budget until consumed.
-                chargeChunk(buf.readableBytes());
+                if (granted) {
+                    // 13.12: the read was granted in advance, so this chunk's bytes are already
+                    // reserved; only the part the chunk did not use goes back.
+                    granted = false;
+                    if (bytes < READ_CHUNK) {
+                        node.release(READ_CHUNK - bytes);
+                    } else if (bytes > READ_CHUNK) {
+                        chargeChunk(bytes - READ_CHUNK);
+                    }
+                } else {
+                    // A chunk can only arrive without a grant if it was read before this rule, as a
+                    // session's activation leftover does: charge it, and close only if bytes that
+                    // already arrived cannot fit (13.12).
+                    chargeChunk(bytes);
+                }
             } catch (Throwable t) {
                 buf.release();
                 failFrom(t);

@@ -297,7 +297,7 @@ class LaneSessionTest {
             assertFalse(rig.clientGame.closed.isDone(),
                     "a delivered record must not underflow the budget: " + rig.clientGame.closed.getNow(null));
             rig.clientGame.apply(rig.clientGame.deliveries.get(0));
-            assertTrue(LaneRig.await(() -> node.reserved() <= baseline, 10000),
+            assertTrue(LaneRig.await(() -> node.reserved() % LaneSession.READ_CHUNK == 0, 10000),
                     "applying releases the record charge: " + node.reserved());
             assertFalse(rig.clientGame.closed.isDone());
         }
@@ -309,6 +309,8 @@ class LaneSessionTest {
         LaneRig.Config config = new LaneRig.Config();
         config.nodeBudget = node;
         config.clientSession = false;
+        config.serverTiming = new LaneSession.Timing(() -> 5_000_000_000L, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
         try (LaneRig rig = LaneRig.start(config)) {
             // One byte of a two-byte record length: it stays buffered as an incomplete record.
             rig.activate(rig.server, java.nio.ByteBuffer.wrap(new byte[] {(byte) 0x85}));
@@ -319,13 +321,29 @@ class LaneSessionTest {
                     return false;
                 }
             }, 10000), "the leftover starts an incomplete record");
-            // The leftover chunk was consumed and released, and the record it started is still
-            // charged. Releasing bytes that were never charged would leave the counter short.
-            assertTrue(LaneRig.await(() -> node.reserved() == 1, 10000),
-                    "exactly the held parser buffer stays reserved: " + node.reserved());
+            // Every outstanding read grant is a whole READ_CHUNK, so what remains besides them is
+            // the held parser buffer. Releasing bytes that were never charged would swallow it.
+            assertTrue(LaneRig.await(() -> node.reserved() % LaneSession.READ_CHUNK == 1, 10000),
+                    "the held parser buffer stays reserved: " + node.reserved());
         }
         assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
                 "closing releases every charge: " + node.reserved());
+    }
+
+    @Test
+    void anActivatedLaneReservesItsReadGrantBeforeReading() throws Exception {
+        long capacity = 3L << 20;
+        ReceiveBudget node = ReceiveBudget.bounded(capacity);
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        config.clientSession = false;
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.server.activate(null);
+            // 13.12/13.13: the bytes a read can carry are reserved before the read, so no legal
+            // record's chunk can be refused at the node level.
+            assertTrue(LaneRig.await(() -> node.available() <= capacity - LaneSession.READ_CHUNK, 10000),
+                    "the read grant is reserved up front: " + node.available());
+        }
     }
 
     @Test
@@ -1119,7 +1137,9 @@ class LaneSessionTest {
             rig.client.bindGame(rig.clientGame);
             assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() == 1, 10000));
             assertEquals("buffered", rig.clientGame.labels().get(0));
-            assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
+            // Read grants are whole READ_CHUNKs, so an empty remainder means the consumed chunk
+            // and the applied record gave every charge back.
+            assertTrue(LaneRig.await(() -> node.reserved() % LaneSession.READ_CHUNK == 0, 10000),
                     "consumed chunks and applied records release every charge: " + node.reserved());
             assertFalse(rig.clientGame.closed.isDone());
         }
