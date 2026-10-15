@@ -53,6 +53,16 @@ class LaneSessionTest {
                 && rig.serverGame.packetCount() >= server + 2, 10000), "round trip");
     }
 
+    private static void assertPending(LaneSession receiver, int atLeast) throws Exception {
+        assertTrue(LaneRig.await(() -> {
+            try {
+                return LaneRig.snapshot(receiver)[0] >= atLeast;
+            } catch (Exception e) {
+                return false;
+            }
+        }, 10000), "the held-back records reached the receiver and wait in its scheduler");
+    }
+
     private static void sleep(long millis) throws InterruptedException {
         Thread.sleep(millis);
     }
@@ -315,6 +325,7 @@ class LaneSessionTest {
             rig.server.send(PLAY, LaneRig.MOVE, LaneRig.frame(LaneRig.MOVE, "move"));
             rig.server.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "destroy"));
             assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() == base + 1, 10000));
+            assertPending(rig.client, 1);
             sleep(400);
             assertEquals(base + 1, rig.clientGame.packetCount(), "destroy must not overtake the move");
             rig.server.releaseWrites(Lane.REALTIME);
@@ -334,6 +345,8 @@ class LaneSessionTest {
             rig.server.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "spawn"));
             rig.server.send(PLAY, LaneRig.MOVE, LaneRig.frame(LaneRig.MOVE, "move"));
             rig.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "block"));
+            // The move and the block reached the client and wait behind the withheld spawn.
+            assertPending(rig.client, 2);
             sleep(500);
             assertEquals(base, rig.clientGame.packetCount(), "nothing may pass its predecessor");
             rig.server.releaseWrites(Lane.CONTROL);
@@ -353,6 +366,7 @@ class LaneSessionTest {
             rig.client.holdWrites(Lane.WORLD);
             rig.client.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "block"));
             rig.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "unload"));
+            assertPending(rig.server, 1);
             sleep(500);
             assertEquals(base, rig.serverGame.packetCount());
             rig.client.releaseWrites(Lane.WORLD);
@@ -447,20 +461,16 @@ class LaneSessionTest {
             for (int i = 0; i < flood; i++) {
                 rig.client.send(PLAY, LaneRig.MOVE, LaneRig.frame(LaneRig.MOVE, "m" + i));
             }
-            long[] last = {-1};
             assertTrue(LaneRig.await(() -> {
                 try {
-                    long[] now = LaneRig.snapshot(rig.server);
-                    boolean stable = now[0] == last[0] && now[0] > 0;
-                    last[0] = now[0];
-                    return stable;
+                    return LaneRig.snapshot(rig.server)[0] == ReceiverScheduler.MAX_AUXILIARY_RECORDS;
                 } catch (Exception e) {
                     return false;
                 }
-            }, 15000));
+            }, 15000), "the flood fills exactly the auxiliary record budget");
+            sleep(300);
             long[] stalled = LaneRig.snapshot(rig.server);
-            assertTrue(stalled[0] <= ReceiverScheduler.MAX_AUXILIARY_RECORDS, "auxiliary pending " + stalled[0]);
-            assertTrue(stalled[0] >= 900, "the flood fills the auxiliary budget: " + stalled[0]);
+            assertEquals(ReceiverScheduler.MAX_AUXILIARY_RECORDS, stalled[0], "reading stopped at the budget");
             assertEquals(base, rig.serverGame.packetCount());
             rig.client.releaseWrites(Lane.CONTROL);
             assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() == base + 1 + flood, 20000),
@@ -614,6 +624,7 @@ class LaneSessionTest {
             rig.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "spawn"));
             rig.client.send(PLAY, LaneRig.MOVE, LaneRig.frame(LaneRig.MOVE, "move"));
             rig.client.end();
+            assertPending(rig.server, 1);
             sleep(500);
             assertFalse(rig.serverGame.closed.isDone(), "END is a full fence behind the withheld move");
             rig.client.releaseWrites(Lane.REALTIME);
@@ -621,7 +632,9 @@ class LaneSessionTest {
             closedWith(rig.clientGame, 0x0, true);
             assertEquals(Arrays.asList("spawn", "move"), rig.serverGame.labels().subList(base, base + 2));
             // Sends after END are dropped without harm.
-            assertFalse(rig.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "late")).isAssigned());
+            SentPacket late = rig.client.eventLoop().submit(
+                    () -> rig.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "late"))).get();
+            assertFalse(late.isAssigned());
         }
     }
 
