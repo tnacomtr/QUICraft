@@ -187,6 +187,18 @@ class RoutingTableTest {
                 () -> new RouteKey(763, ProtocolState.PLAY, Direction.CLIENTBOUND, -1));
     }
 
+    @Test
+    void negativePacketIdIsARoutingTableException() {
+        // 13.7: a packet id is nonnegative. RouteKey builds every lookup key, so both the key and a
+        // lookup report an invalid packet id with the routing package's own exception type (still an
+        // IllegalArgumentException, which the assertion above pins).
+        assertThrows(RoutingTableException.class,
+                () -> new RouteKey(763, ProtocolState.PLAY, Direction.CLIENTBOUND, -1));
+        RoutingTableException e = assertThrows(RoutingTableException.class,
+                () -> table().laneFor(ProtocolState.PLAY, Direction.CLIENTBOUND, -1));
+        assertTrue(e.getMessage().contains("packet id"), e.getMessage());
+    }
+
     private static String hex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) {

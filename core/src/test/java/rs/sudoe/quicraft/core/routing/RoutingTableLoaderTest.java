@@ -2,11 +2,13 @@
 package rs.sudoe.quicraft.core.routing;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -19,8 +21,9 @@ import org.junit.jupiter.api.Test;
  * The validator of docs/protocol.md 13.6 and 13.7: every rejection rule has a failing input here,
  * plus the golden digest of the shipped example resource.
  *
- * <p>The shipped resource is the spec's synthetic schema example (13.7), reflowed onto one line and
- * without a trailing newline, so digest R covers exactly those bytes. This fixture is also the base
+ * <p>The example resource is the spec's synthetic schema example (13.7), reflowed onto one line and
+ * without a trailing newline, so digest R covers exactly those bytes. It is a test fixture, not a
+ * shipped resource: no released Minecraft version has that mapping. This fixture is also the base
  * of the rejection cases below.
  */
 class RoutingTableLoaderTest {
@@ -325,6 +328,189 @@ class RoutingTableLoaderTest {
         controlEntry.add(new RouteKey(12345, ProtocolState.PLAY, Direction.CLIENTBOUND, 10));
         assertEquals(Lane.CONTROL, RoutingTableLoader.parse(EXAMPLE, controlEntry)
                 .laneFor(ProtocolState.PLAY, Direction.CLIENTBOUND, 10));
+    }
+
+    @Test
+    void negativePacketIdIsARoutingTableException() {
+        // 13.7: a packet id is nonnegative, and the routing package reports an invalid entry with
+        // its own exception type (still an IllegalArgumentException, so callers catching that work).
+        RoutingTableException e = assertThrows(RoutingTableException.class,
+                () -> RoutingTableLoader.parse(
+                        EXAMPLE.replace("\"packet_id\":12", "\"packet_id\":-1")));
+        assertTrue(e.getMessage().contains("out of range"), e.getMessage());
+    }
+
+    // ------------------------------------------------- 13.5 must-use-CONTROL set of a protocol
+
+    @Test
+    void loadResourceEnforcesTheMandatoryControlSetOfThatProtocol() throws IOException {
+        // protocol-9000.json routes packet 11 to REALTIME and 9000's own set (13.5) lists that key,
+        // so loading by protocol number must apply the rule and reject the table.
+        RoutingTableException e = assertThrows(RoutingTableException.class,
+                () -> RoutingTableLoader.loadResource(9000));
+        assertTrue(e.getMessage().contains("13.5"), e.getMessage());
+        assertTrue(e.getMessage().contains("must use CONTROL"), e.getMessage());
+
+        // The same bytes are valid when the caller explicitly passes no mandatory keys, which shows
+        // the rejection came from the protocol's own set and not from the caller.
+        assertEquals(Lane.REALTIME, RoutingTableLoader.loadResource(
+                RoutingTableLoader.resourcePath(9000), Collections.<RouteKey>emptySet())
+                .laneFor(ProtocolState.PLAY, Direction.CLIENTBOUND, 11));
+    }
+
+    @Test
+    void loadResourceRefusesAProtocolWithoutAMandatoryControlSet() {
+        // protocol-9001.json is a valid table, but 13.5's set for 9001 is not on the classpath. An
+        // assumed empty set would silently stop enforcing the rule, so the load must fail instead.
+        RoutingTableException e = assertThrows(RoutingTableException.class,
+                () -> RoutingTableLoader.loadResource(9001));
+        assertTrue(e.getMessage().contains("13.5"), e.getMessage());
+        assertTrue(e.getMessage().contains(RoutingTableLoader.mandatoryControlResourcePath(9001)),
+                e.getMessage());
+    }
+
+    @Test
+    void theMandatoryControlSetIsValidated() {
+        String set = "{\"schema\":1,\"protocol\":12345,\"mandatory_control\":["
+                + "{\"state\":\"play\",\"direction\":\"clientbound\",\"packet_id\":11}]}";
+        assertEquals(Collections.singleton(
+                        new RouteKey(12345, ProtocolState.PLAY, Direction.CLIENTBOUND, 11)),
+                RoutingTableLoader.parseMandatoryControlSet(
+                        set.getBytes(StandardCharsets.UTF_8), 12345, "test"));
+
+        // An explicit empty set is legal, which is what the synthetic example ships; assuming one is
+        // what the loader must never do.
+        assertTrue(RoutingTableLoader.parseMandatoryControlSet(
+                "{\"schema\":1,\"protocol\":12345,\"mandatory_control\":[]}"
+                        .getBytes(StandardCharsets.UTF_8), 12345, "test").isEmpty());
+
+        for (String[] bad : new String[][] {
+            // Another protocol's set must never be applied to this table.
+            {"{\"schema\":1,\"protocol\":763,\"mandatory_control\":[]}", "13.5"},
+            {"{\"schema\":2,\"protocol\":12345,\"mandatory_control\":[]}", "13.5"},
+            {"{\"protocol\":12345,\"mandatory_control\":[]}", "13.5"},
+            {"{\"schema\":1,\"protocol\":12345,\"mandatory_control\":{}}", "13.5"},
+            {"{\"schema\":1,\"protocol\":12345,\"mandatory_control\":[7]}", "13.5"},
+            {"{\"schema\":1,\"protocol\":12345,\"mandatory_control\":[{\"state\":\"play\"}]}", "13.5"},
+            // A key's packet id is 13.7's plain nonnegative integer.
+            {"{\"schema\":1,\"protocol\":12345,\"mandatory_control\":["
+                    + "{\"state\":\"play\",\"direction\":\"clientbound\",\"packet_id\":1e2}]}", "13.7"},
+            {"{\"schema\":1,\"protocol\":12345,\"mandatory_control\":["
+                    + "{\"state\":\"play\",\"direction\":\"clientbound\",\"packet_id\":11},"
+                    + "{\"state\":\"play\",\"direction\":\"clientbound\",\"packet_id\":11}]}", "13.5"},
+            {"{\"schema\":1,\"protocol\":12345,\"mandatory_control\":[],\"extra\":1}", "13.5"},
+        }) {
+            RoutingTableException e = assertThrows(RoutingTableException.class,
+                    () -> RoutingTableLoader.parseMandatoryControlSet(
+                            bad[0].getBytes(StandardCharsets.UTF_8), 12345, "test"), bad[0]);
+            assertTrue(e.getMessage().contains(bad[1]), bad[0] + ": " + e.getMessage());
+        }
+    }
+
+    // ------------------------------------------------------------------- the fixture does not ship
+
+    @Test
+    void theSyntheticExampleIsATestFixtureOnly() {
+        // 13.7's example is synthetic, so a shipped jar must not be able to select it: the file
+        // lives in core/src/test/resources, never in core/src/main/resources.
+        String relative = RoutingTableLoader.resourcePath(12345);
+        for (String mainResources : new String[] {
+            "src/main/resources/", "core/src/main/resources/", "build/resources/main/",
+        }) {
+            assertFalse(new File(mainResources + relative).exists(),
+                    mainResources + relative + " must not be on a production classpath");
+        }
+        assertTrue(new File("src/test/resources/" + relative).exists()
+                        || new File("core/src/test/resources/" + relative).exists(),
+                relative + " must live in test resources");
+    }
+
+    // ---------------------------------------------------------- bounded diagnostics (13.7)
+
+    @Test
+    void hugeExponentsAreRejectedWithAShortMessage() {
+        // packet_id 1e1000000000 has scale -1e9 and 1e-1000000000 has scale +1e9: rendering either
+        // with toPlainString would build a ~1e9-character string. The load must fail fast and the
+        // message must stay short.
+        for (String huge : new String[] {
+            "1e1000000000", "1E1000000000", "-1e1000000000", "1e-1000000000", "1.5e-1000000000",
+        }) {
+            RoutingTableException e = reject(EXAMPLE.replace("\"packet_id\":12",
+                    "\"packet_id\":" + huge));
+            assertTrue(e.getMessage().contains("13.7"), huge + ": " + e.getMessage());
+            assertTrue(e.getMessage().contains("packet_id"), huge + ": " + e.getMessage());
+            assertTrue(e.getMessage().length() <= 160, huge + " made a " + e.getMessage().length()
+                    + "-character message: " + e.getMessage());
+        }
+    }
+
+    @Test
+    void aLongOutOfRangeIntegerIsTruncatedInTheMessage() {
+        StringBuilder digits = new StringBuilder();
+        for (int i = 0; i < 90; i++) {
+            digits.append('9');
+        }
+        RoutingTableException e = reject(EXAMPLE.replace("\"packet_id\":12",
+                "\"packet_id\":" + digits));
+        assertTrue(e.getMessage().contains("out of range"), e.getMessage());
+        assertTrue(e.getMessage().contains("..."), e.getMessage());
+        assertTrue(e.getMessage().length() <= 160, e.getMessage());
+    }
+
+    @Test
+    void aLongUnknownValueIsTruncatedInTheMessage() {
+        StringBuilder lane = new StringBuilder();
+        for (int i = 0; i < 500; i++) {
+            lane.append('x');
+        }
+        RoutingTableException e = reject(EXAMPLE.replace("\"lane\":\"realtime\"",
+                "\"lane\":\"" + lane + "\""));
+        assertTrue(e.getMessage().contains("unknown lane"), e.getMessage());
+        assertTrue(e.getMessage().length() <= 160, e.getMessage());
+    }
+
+    // ------------------------------------------- 13.7 integer fields are plain JSON integers
+
+    @Test
+    void integerFieldsMustBePlainIntegers() {
+        // A BigDecimal would read 1e2 as 100, 1e0 as 1, 1.0 as 1 and -0 as 0, so the lexeme decides.
+        for (String notPlain : new String[] {"1e2", "1E2", "1e0", "1.0", "0.0", "-0"}) {
+            RoutingTableException e = reject(EXAMPLE.replace("\"packet_id\":12",
+                    "\"packet_id\":" + notPlain));
+            assertTrue(e.getMessage().contains("13.7"), notPlain + ": " + e.getMessage());
+            assertTrue(e.getMessage().contains("plain integer"), notPlain + ": " + e.getMessage());
+        }
+        assertTrue(reject(EXAMPLE.replace("\"protocol\":12345", "\"protocol\":1e2"))
+                .getMessage().contains("plain integer"));
+        assertTrue(reject(EXAMPLE.replace("\"schema\":1", "\"schema\":1e0"))
+                .getMessage().contains("plain integer"));
+
+        // The plain spelling of the same value still loads.
+        assertEquals(Lane.WORLD, RoutingTableLoader.parse(
+                EXAMPLE.replace("\"packet_id\":12", "\"packet_id\":100"))
+                .laneFor(ProtocolState.PLAY, Direction.CLIENTBOUND, 100));
+    }
+
+    // ------------------------------- the strict parser's unicode escapes, through the resource
+
+    @Test
+    void acceptsAFourHexDigitUnicodeEscape() {
+        // 13.7: the resource is JSON, so the escape backslash-u 0077 is 'w'.
+        RoutingTable table = RoutingTableLoader.parse(EXAMPLE.replace("\"lane\":\"world\"",
+                "\"lane\":\"\\u0077orld\""));
+        assertEquals(Lane.WORLD, table.laneFor(ProtocolState.PLAY, Direction.CLIENTBOUND, 12));
+    }
+
+    @Test
+    void rejectsUnicodeEscapesThatAreNotFourHexDigits() {
+        // A backslash-u escape is exactly four hex digits. A leading sign is not a hex digit, so
+        // "worl" plus the escape "backslash-u + 064" used to be "world" (Integer.parseInt accepts a
+        // sign); a shorter or non-hex escape is not padded from what follows the quote either.
+        for (String escape : new String[] {"\\u+064", "\\u-064", "\\u12g4", "\\u00"}) {
+            RoutingTableException e = reject(EXAMPLE.replace("\"lane\":\"world\"",
+                    "\"lane\":\"worl" + escape + "\""));
+            assertTrue(e.getMessage().contains("malformed JSON"), escape + ": " + e.getMessage());
+        }
     }
 
     private static String hex(byte[] bytes) {
