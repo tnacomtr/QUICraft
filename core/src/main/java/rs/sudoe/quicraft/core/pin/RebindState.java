@@ -32,12 +32,15 @@ import java.util.logging.Logger;
  * <p>It answers two questions for the connect path, and does no I/O on the network itself:</p>
  *
  * <ul>
- *   <li>{@link #allowsAttempt(String, int, long)}: may the client make its one automatic re-binding
+ *   <li>{@link #tryBeginAttempt(String, int, long)}: may the client make its one automatic re-binding
  *       attempt for this logical server now? The window is section 6's exponential schedule, one
  *       minute doubling per consecutive failure up to one hour, keyed exactly like a pin: normalized
  *       logical host and logical TCP port, never the fingerprint, so a rotating fingerprint cannot
  *       reset it. {@link #recordAttemptFailure(String, int)} starts or doubles the window and
- *       {@link #recordSuccess(String, int)} clears the server's entry.</li>
+ *       {@link #recordSuccess(String, int)} clears it. Admission is one call: it checks the window,
+ *       capacity and that no attempt for the server is already running, marks the attempt active and
+ *       returns the token {@link #endAttempt(Attempt, boolean)} needs, so the same server cannot be
+ *       admitted twice.</li>
  *   <li>{@link #shouldNotify(String, int, String)}: may the player be told that this server's
  *       fingerprint changed to this value? True at most once per (server, fingerprint), ever: the
  *       detailed history keeps up to 16 fingerprints per server and
@@ -45,22 +48,23 @@ import java.util.logging.Logger;
  *       tuple whose history entry has been evicted or whose entry was cleared by a success.</li>
  * </ul>
  *
- * <p>An attempt can be marked with {@link #beginAttempt(String, int)} and
- * {@link #endAttempt(String, int)}: its state is never evicted while it is active. At
- * {@link #MAX_ENTRIES} servers the least recently used entry that is not active is evicted; when
- * every entry is active there is nothing to evict, and {@link #allowsAttempt(String, int, long)}
- * returns false, so the caller uses TCP without a re-bind. Entries are persisted in
- * least-recently-used order, so the order survives a restart.</p>
+ * <p>An attempt is active from {@link #tryBeginAttempt(String, int, long)} to
+ * {@link #endAttempt(Attempt, boolean)}, and its state is never evicted while it is active. At
+ * {@link #MAX_ENTRIES} servers the least recently used entry that is not active is evicted, and only
+ * inside a call that then persists the result; when every entry is active there is nothing to evict,
+ * and {@link #tryBeginAttempt(String, int, long)} returns null, so the caller uses TCP without a
+ * re-bind. A query never changes anything: no insertion, no eviction, no ordering. Entries are
+ * persisted in least-recently-used order, so the order survives a restart.</p>
  *
  * <p><b>Fail closed.</b> When the state cannot be read or written, everything is refused:
- * {@link #shouldNotify(String, int, String)} returns false and {@link #allowsAttempt(String, int, long)}
- * returns false, so the client uses TCP, never repeats a notice and never resets a backoff window.
- * A failed write disables the state, so whatever the failed call changed in memory is never read
- * again.</p>
+ * {@link #shouldNotify(String, int, String)} returns false and
+ * {@link #tryBeginAttempt(String, int, long)} returns null, so the client uses TCP, never repeats a
+ * notice and never resets a backoff window. A failed write disables the state, so whatever the failed
+ * call changed in memory is never read again.</p>
  *
  * <p>Thread-safe: every method is synchronized. The time a window starts from is the injected
- * {@code clock}; {@code allowsAttempt}'s {@code now} must be read from that same clock, which is
- * what the two-argument overload does.</p>
+ * {@code clock}; the {@code now} of {@link #tryBeginAttempt(String, int, long)} must be read from
+ * that same clock.</p>
  */
 public final class RebindState {
     /** The most logical servers that keep re-bind state; docs/protocol.md 12.16. */
@@ -108,7 +112,7 @@ public final class RebindState {
         final List<Notice> notices = new ArrayList<>();
         int failures;
         long blockedUntil;
-        boolean active;
+        Attempt active;
 
         Entry(String host, int port) {
             this.host = host;
@@ -122,6 +126,31 @@ public final class RebindState {
                 }
             }
             return false;
+        }
+    }
+
+    /**
+     * One re-binding attempt: the token {@link #tryBeginAttempt(String, int, long)} returns and
+     * {@link #endAttempt(Attempt, boolean)} accepts. Its identity is what makes a late end a no-op,
+     * so only the caller that started an attempt can finish it, and a query can never end one.
+     */
+    public static final class Attempt {
+        private final String host;
+        private final int port;
+
+        private Attempt(String host, int port) {
+            this.host = host;
+            this.port = port;
+        }
+
+        /** The normalized logical host this attempt belongs to. */
+        public String host() {
+            return host;
+        }
+
+        /** The logical TCP port this attempt belongs to. */
+        public int port() {
+            return port;
         }
     }
 
@@ -190,62 +219,89 @@ public final class RebindState {
     }
 
     /**
-     * Whether the one automatic re-binding attempt for {@code host}:{@code port} may start at
-     * {@code now}, which must come from the same clock this state was loaded with.
+     * Starts the one automatic re-binding attempt for {@code host}:{@code port} at {@code now},
+     * which must come from the same clock this state was loaded with. It checks everything in one
+     * place, so admission cannot be raced or half-taken: the state must be reliable, the server must
+     * not be inside its backoff window, no attempt for it may already be running, and its state must
+     * fit (docs/protocol.md 12.16). When it returns a token the attempt is active, its state is
+     * protected from eviction, and the caller must end it with {@link #endAttempt(Attempt, boolean)}.
      *
-     * @return false during the backoff window, while the state is disabled, and when there is no
-     *     evictable entry to hold a new server's state
+     * @return the attempt token, or null while the state is disabled, the server is inside its
+     *     window, an attempt for it is already active, or there is no evictable entry to hold a new
+     *     server's state, in which case the caller uses TCP without a re-bind
      */
-    public synchronized boolean allowsAttempt(String host, int port, long now) {
+    public synchronized Attempt tryBeginAttempt(String host, int port, long now) {
         PinKey key = PinKey.of(host, port);
+        if (disabled) {
+            return null;
+        }
+        String mapKey = PinKey.mapKey(key);
+        Entry entry = entries.get(mapKey);
+        boolean evicted = false;
+        if (entry == null) {
+            int before = entries.size();
+            if (!makeRoom()) {
+                return null;
+            }
+            evicted = entries.size() < before;
+            entry = new Entry(key.host(), key.port());
+            entries.put(mapKey, entry);
+        } else {
+            if (entry.active != null || entry.blockedUntil > now) {
+                return null;
+            }
+            touch(mapKey, entry);
+        }
+        Attempt attempt = new Attempt(key.host(), key.port());
+        entry.active = attempt;
+        if (evicted && !persist()) {
+            disabled = true;
+            return null;
+        }
+        return attempt;
+    }
+
+    /**
+     * Ends the attempt {@code attempt} started, and nothing else: a token that is not this server's
+     * active attempt is ignored, so a late caller cannot clear an attempt that replaced it.
+     *
+     * @param success whether the server was reached, which clears this server's window and notice
+     *     history (section 6); on failure the caller records the window with
+     *     {@link #recordAttemptFailure(String, int)}
+     * @return false when the token was not the active attempt, or when a successful end could not be
+     *     persisted, which disables the state
+     */
+    public synchronized boolean endAttempt(Attempt attempt, boolean success) {
+        if (attempt == null) {
+            return false;
+        }
+        PinKey key = PinKey.of(attempt.host(), attempt.port());
         if (disabled) {
             return false;
         }
         String mapKey = PinKey.mapKey(key);
         Entry entry = entries.get(mapKey);
-        if (entry == null) {
-            return makeRoom();
-        }
-        touch(mapKey, entry);
-        return entry.blockedUntil <= now;
-    }
-
-    /** {@link #allowsAttempt(String, int, long)} at the injected clock's current time. */
-    public synchronized boolean allowsAttempt(String host, int port) {
-        return allowsAttempt(host, port, clock.getAsLong());
-    }
-
-    /**
-     * Starts a re-binding attempt for {@code host}:{@code port}, protecting its state from eviction
-     * until {@link #endAttempt(String, int)}.
-     *
-     * @return false when the state is disabled or there is no room for a new server
-     */
-    public synchronized boolean beginAttempt(String host, int port) {
-        PinKey key = PinKey.of(host, port);
-        if (disabled) {
+        if (entry == null || entry.active != attempt) {
             return false;
         }
-        Entry entry = entryFor(PinKey.mapKey(key), key);
-        if (entry == null) {
+        entry.active = null;
+        if (!success) {
+            return true;
+        }
+        entries.remove(mapKey);
+        noticeCount -= entry.notices.size();
+        if (!persist()) {
+            disabled = true;
             return false;
         }
-        entry.active = true;
         return true;
-    }
-
-    /** Ends the re-binding attempt, so its state may be evicted again. */
-    public synchronized void endAttempt(String host, int port) {
-        Entry entry = entries.get(PinKey.mapKey(PinKey.of(host, port)));
-        if (entry != null) {
-            entry.active = false;
-        }
     }
 
     /**
      * Records a failed re-binding attempt: the next one is allowed after section 6's window, one
      * minute doubling per consecutive failure up to one hour, starting at the injected clock's
-     * current time.
+     * current time. The connect path calls it after {@link #endAttempt(Attempt, boolean)} with
+     * {@code success} false; an entry recorded without a live attempt is honoured all the same.
      *
      * @return false when the state is disabled or there is no room for a new server
      */
@@ -293,6 +349,11 @@ public final class RebindState {
      * (server, fingerprint): the tuple is marked and persisted before this returns true, and a tuple
      * that was marked before returns false even after its detailed history entry is gone.
      *
+     * <p>A suppressed notice changes nothing at all: the tuple is looked up in the detailed history
+     * and in the bitmap before any insertion, eviction or reordering happens, so a query-like call
+     * that returns false leaves the state exactly as it was. A notice that cannot be recorded inside
+     * the caps without trimming an active attempt's notices is refused the same way.</p>
+     *
      * @param newFingerprint the advertised fingerprint, lowercase {@code sha256:<64 hex>}
      * @return false while the state is disabled or cannot be written, so a notice is never repeated
      */
@@ -305,20 +366,24 @@ public final class RebindState {
         String mapKey = PinKey.mapKey(key);
         Entry entry = entries.get(mapKey);
         if (entry != null && entry.hasNotice(fingerprint)) {
-            touch(mapKey, entry);
+            return false;
+        }
+        if (bloom.contains(key, fingerprint)) {
+            // Marked before, though its detailed history entry has been evicted or cleared.
             return false;
         }
         if (entry == null) {
-            entry = entryFor(mapKey, key);
-            if (entry == null) {
+            if (!makeRoom()) {
                 // No room for this server's history at all: say nothing rather than risk a repeat.
                 return false;
             }
+            entry = new Entry(key.host(), key.port());
+            entries.put(mapKey, entry);
         } else {
             touch(mapKey, entry);
         }
         if (!bloom.add(key, fingerprint)) {
-            // Every bit was already set: this tuple was noticed before, though its history is gone.
+            // Unreachable after contains said the bits were not all set; fail closed all the same.
             return false;
         }
         entry.notices.add(new Notice(fingerprint, Instant.ofEpochMilli(clock.getAsLong())));
@@ -416,7 +481,8 @@ public final class RebindState {
     }
 
     /**
-     * The entry for {@code mapKey}, created and made room for when it is missing.
+     * The entry for {@code mapKey}, created and made room for when it is missing. Only mutating calls
+     * use this; a query never inserts.
      *
      * @return null when the state is full and no entry may be evicted
      */
@@ -441,7 +507,7 @@ public final class RebindState {
         }
         String victim = null;
         for (Map.Entry<String, Entry> candidate : entries.entrySet()) {
-            if (!candidate.getValue().active) {
+            if (candidate.getValue().active == null) {
                 victim = candidate.getKey();
                 break;
             }

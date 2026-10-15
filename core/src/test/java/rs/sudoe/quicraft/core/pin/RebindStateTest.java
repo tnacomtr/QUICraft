@@ -4,6 +4,8 @@ package rs.sudoe.quicraft.core.pin;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -22,7 +24,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
@@ -36,7 +40,10 @@ class RebindStateTest {
     private static final long MINUTE = TimeUnit.MINUTES.toMillis(1);
     private static final String FP_A = fingerprint(1);
     private static final String FP_B = fingerprint(2);
+    /** A backoff window that never ends, so an entry with it is not admissible. */
     private static final String FUTURE = "9999-01-01T00:00:00Z";
+    /** A backoff window that ended long before any test clock, so an entry with it is admissible. */
+    private static final String PAST = "2000-01-01T00:00:00Z";
     /** The state file's header before the JSON: magic (0-3), format version (4-7), JSON length (8-11). */
     private static final int HEADER = 12;
     /** The SHA-256 after the bitmap. */
@@ -47,16 +54,20 @@ class RebindStateTest {
         AtomicLong now = new AtomicLong(BASE);
         RebindState state = RebindState.load(null, now::get);
         assertTrue(state.isUsable());
-        assertTrue(state.allowsAttempt("mc.example.com", 25565, now.get()), "nothing has failed yet");
+        RebindState.Attempt first = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(first, "nothing has failed yet");
+        assertTrue(state.endAttempt(first, false));
+
         long[] minutes = {1, 2, 4, 8, 16, 32, 60, 60};
         for (long expected : minutes) {
             assertTrue(state.recordAttemptFailure("mc.example.com", 25565));
             now.addAndGet(expected * MINUTE - 1);
-            assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()),
+            assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()),
                     "still blocked just before " + expected + " min");
             now.addAndGet(1);
-            assertTrue(state.allowsAttempt("mc.example.com", 25565, now.get()),
-                    "allowed again after " + expected + " min");
+            RebindState.Attempt next = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+            assertNotNull(next, "allowed again after " + expected + " min");
+            assertTrue(state.endAttempt(next, false));
         }
     }
 
@@ -66,21 +77,25 @@ class RebindStateTest {
         AtomicLong now = new AtomicLong(BASE);
         RebindState state = RebindState.load(file, now::get);
         assertTrue(state.recordAttemptFailure("MC.Example.COM.", 25565));
-        assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()), "one key, two spellings");
-        assertTrue(state.allowsAttempt("mc.example.com", 25566, now.get()), "another logical port");
-        assertTrue(state.allowsAttempt("other.example.com", 25565, now.get()), "another logical host");
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), "one key, two spellings");
+        RebindState.Attempt otherPort = state.tryBeginAttempt("mc.example.com", 25566, now.get());
+        assertNotNull(otherPort, "another logical port");
+        assertTrue(state.endAttempt(otherPort, false));
+        RebindState.Attempt otherHost = state.tryBeginAttempt("other.example.com", 25565, now.get());
+        assertNotNull(otherHost, "another logical host");
+        assertTrue(state.endAttempt(otherHost, false));
         // A new advertised fingerprint is a new notice, never a reset of the window: no backoff method
         // is given a fingerprint at all, so a rotating fingerprint cannot clear it.
         assertTrue(state.shouldNotify("mc.example.com", 25565, FP_A));
         assertTrue(state.shouldNotify("mc.example.com", 25565, FP_B));
-        assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
         now.addAndGet(MINUTE - 1);
-        assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
         now.addAndGet(1);
-        assertTrue(state.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
 
         RebindState reloaded = RebindState.load(file, now::get);
-        assertFalse(reloaded.allowsAttempt("mc.example.com", 25565, now.get() - 1), "the window is persisted");
+        assertNull(reloaded.tryBeginAttempt("mc.example.com", 25565, now.get() - 1), "the window is persisted");
         assertFalse(reloaded.shouldNotify("mc.example.com", 25565, FP_A));
         assertFalse(reloaded.shouldNotify("mc.example.com", 25565, FP_B));
     }
@@ -92,55 +107,107 @@ class RebindStateTest {
         RebindState state = RebindState.load(file, now::get);
         assertTrue(state.recordAttemptFailure("mc.example.com", 25565));
         now.addAndGet(MINUTE - 1);
-        assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()), "inside the first window");
-        state.recordSuccess("mc.example.com", 25565);
-        assertTrue(state.allowsAttempt("mc.example.com", 25565, now.get()), "the entry is gone");
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), "inside the first window");
+        now.addAndGet(1);
+        RebindState.Attempt attempt = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(attempt);
+        assertTrue(state.endAttempt(attempt, true), "a successful end clears the server's entry");
+        now.addAndGet(1);
+        RebindState.Attempt afterSuccess = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(afterSuccess, "the window is gone");
+        assertTrue(state.endAttempt(afterSuccess, false));
+
         assertTrue(state.recordAttemptFailure("mc.example.com", 25565));
         now.addAndGet(MINUTE - 1);
-        assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()), "the schedule started over");
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), "the schedule started over");
         now.addAndGet(1);
-        assertTrue(state.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
 
         RebindState reloaded = RebindState.load(file, now::get);
-        assertTrue(reloaded.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNotNull(reloaded.tryBeginAttempt("mc.example.com", 25565, now.get()));
     }
 
     @Test
     void evictsTheLeastRecentlyUsedServerThatIsNotActive(@TempDir Path dir) throws IOException {
         Path file = dir.resolve("rebind-v1.bin");
-        Files.write(file, stateFile(servers(RebindState.MAX_ENTRIES)));
+        Files.write(file, stateFile(serversWithOpenFirst(RebindState.MAX_ENTRIES)));
         AtomicLong now = new AtomicLong(BASE);
         RebindState state = RebindState.load(file, now::get);
         assertEquals(RebindState.MAX_ENTRIES, state.size());
-        assertFalse(state.allowsAttempt("s0.example.com", 25565, now.get()), "inside its window");
-        assertTrue(state.beginAttempt("s0.example.com", 25565));
+        RebindState.Attempt active = state.tryBeginAttempt("s0.example.com", 25565, now.get());
+        assertNotNull(active, "s0's window has passed");
+        assertNull(state.tryBeginAttempt("s0.example.com", 25565, now.get()), "its attempt is running");
 
         assertTrue(state.recordAttemptFailure("new.example.com", 25565), "makes room by evicting");
         assertEquals(RebindState.MAX_ENTRIES, state.size());
-        assertFalse(state.allowsAttempt("s0.example.com", 25565, now.get()), "the active attempt is kept");
-        assertFalse(state.allowsAttempt("new.example.com", 25565, now.get()), "its failure started a window");
-        assertTrue(state.allowsAttempt("s1.example.com", 25565, now.get()), "s1 was the least recent one");
+        assertNull(state.tryBeginAttempt("new.example.com", 25565, now.get()), "its failure started a window");
+        assertNotNull(state.tryBeginAttempt("s1.example.com", 25565, now.get()), "s1 was the least recent one");
+        assertNull(state.tryBeginAttempt("s0.example.com", 25565, now.get()), "the active attempt is kept");
     }
 
     @Test
     void failsWhenEveryEntryIsActiveAndNothingCanBeEvicted(@TempDir Path dir) throws IOException {
         Path file = dir.resolve("rebind-v1.bin");
-        Files.write(file, stateFile(servers(RebindState.MAX_ENTRIES)));
+        Files.write(file, stateFile(servers(RebindState.MAX_ENTRIES, PAST)));
         AtomicLong now = new AtomicLong(BASE);
         RebindState state = RebindState.load(file, now::get);
+        List<RebindState.Attempt> attempts = new ArrayList<>();
         for (int i = 0; i < RebindState.MAX_ENTRIES; i++) {
-            assertTrue(state.beginAttempt("s" + i + ".example.com", 25565));
+            RebindState.Attempt attempt = state.tryBeginAttempt("s" + i + ".example.com", 25565, now.get());
+            assertNotNull(attempt, "server " + i);
+            attempts.add(attempt);
         }
-        assertFalse(state.allowsAttempt("another.example.com", 25565, now.get()), "nothing may be evicted");
-        assertFalse(state.recordAttemptFailure("another.example.com", 25565));
-        assertFalse(state.shouldNotify("another.example.com", 25565, FP_A), "no room to remember a notice");
         assertEquals(RebindState.MAX_ENTRIES, state.size());
+        byte[] before = Files.readAllBytes(file);
+        for (int i = 0; i < 8; i++) {
+            assertNull(state.tryBeginAttempt("another.example.com", 25565, now.get()), "nothing may be evicted");
+            assertFalse(state.recordAttemptFailure("another.example.com", 25565), "nothing may be evicted");
+            assertFalse(state.shouldNotify("another.example.com", 25565, FP_A), "no room to remember a notice");
+        }
+        assertEquals(RebindState.MAX_ENTRIES, state.size(), "queries at capacity evict nothing");
+        assertArrayEquals(before, Files.readAllBytes(file), "queries at capacity write nothing");
+        assertNull(state.tryBeginAttempt("s0.example.com", 25565, now.get()), "its attempt is already running");
 
-        state.endAttempt("s0.example.com", 25565);
+        assertTrue(state.endAttempt(attempts.get(0), false));
         assertTrue(state.recordAttemptFailure("another.example.com", 25565), "the ended attempt may be evicted");
         assertEquals(RebindState.MAX_ENTRIES, state.size());
         String json = jsonOf(Files.readAllBytes(file));
         assertFalse(json.contains("\"host\":\"s0.example.com\""), "the state of the ended attempt is gone");
+        assertTrue(json.contains("\"host\":\"another.example.com\""));
+    }
+
+    @Test
+    void twoConcurrentAdmissionsForOneServerOnlyOneWins(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger granted = new AtomicInteger();
+        List<Thread> threads = new ArrayList<>();
+        for (int i = 0; i < 2; i++) {
+            Thread thread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        start.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    if (state.tryBeginAttempt("mc.example.com", 25565, now.get()) != null) {
+                        granted.incrementAndGet();
+                    }
+                }
+            });
+            thread.start();
+            threads.add(thread);
+        }
+        start.countDown();
+        for (Thread thread : threads) {
+            thread.join();
+        }
+        assertEquals(1, granted.get(), "exactly one admission wins");
+        assertNotNull(state.tryBeginAttempt("other.example.com", 25565, now.get()), "another server is free");
     }
 
     @Test
@@ -198,7 +265,7 @@ class RebindStateTest {
         RebindState state = RebindState.load(file, now::get);
         assertTrue(state.isUsable());
         assertEquals(0, state.size());
-        assertTrue(state.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
         assertTrue(state.shouldNotify("mc.example.com", 25565, FP_A));
         assertTrue(Files.isRegularFile(file));
         byte[] content = Files.readAllBytes(file);
@@ -218,8 +285,8 @@ class RebindStateTest {
         byte[] flippedJson = stateFile(json);
         flippedJson[HEADER + 1] ^= 0x01;
         damaged.put("flipped-json", flippedJson);
-        byte[] truncated = stateFile(json);
-        damaged.put("truncated", Arrays.copyOfRange(truncated, 0, truncated.length - 1));
+        byte[] full = stateFile(json);
+        damaged.put("truncated", Arrays.copyOfRange(full, 0, full.length - 1));
         byte[] wrongMagic = stateFile(json);
         wrongMagic[0] = 'X';
         damaged.put("wrong-magic", wrongMagic);
@@ -237,7 +304,7 @@ class RebindStateTest {
             Files.write(file, content);
             RebindState state = RebindState.load(file, now::get);
             assertFalse(state.isUsable(), entry.getKey());
-            assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()), entry.getKey());
+            assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), entry.getKey());
             assertFalse(state.recordAttemptFailure("mc.example.com", 25565), entry.getKey());
             assertFalse(state.shouldNotify("mc.example.com", 25565, FP_A), entry.getKey());
             assertArrayEquals(content, Files.readAllBytes(file), entry.getKey() + " was not overwritten");
@@ -262,7 +329,7 @@ class RebindStateTest {
             Assumptions.assumeFalse(Files.isReadable(stateFile), "the process ignores the file mode (root)");
             RebindState unreadable = RebindState.load(stateFile, now::get);
             assertFalse(unreadable.isUsable(), "a file the process may not read fails closed");
-            assertFalse(unreadable.allowsAttempt("mc.example.com", 25565, now.get()));
+            assertNull(unreadable.tryBeginAttempt("mc.example.com", 25565, now.get()));
             assertFalse(unreadable.shouldNotify("mc.example.com", 25565, FP_A));
         } finally {
             Files.setPosixFilePermissions(stateFile, PosixFilePermissions.fromString("rw-------"));
@@ -285,7 +352,7 @@ class RebindStateTest {
         Path asDirectory = Files.createDirectories(dir.resolve("directory-state").resolve("rebind-v1.bin"));
         RebindState directoryState = RebindState.load(asDirectory, now::get);
         assertFalse(directoryState.isUsable(), "a directory is unreadable state, not a missing file");
-        assertFalse(directoryState.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNull(directoryState.tryBeginAttempt("mc.example.com", 25565, now.get()));
         assertFalse(directoryState.shouldNotify("mc.example.com", 25565, FP_A));
         assertTrue(Files.isDirectory(asDirectory), "the directory was not touched");
     }
@@ -298,10 +365,10 @@ class RebindStateTest {
         Path file = notADirectory.resolve("rebind-v1.bin");
         RebindState state = RebindState.load(file, now::get);
         assertTrue(state.isUsable(), "the file is missing, not corrupt");
-        assertTrue(state.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
         assertFalse(state.recordAttemptFailure("mc.example.com", 25565), "the write fails");
         assertFalse(state.isUsable());
-        assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
         assertFalse(state.shouldNotify("mc.example.com", 25565, FP_A));
         assertFalse(Files.exists(file));
     }
@@ -317,7 +384,43 @@ class RebindStateTest {
         assertTrue(state.isUsable());
         assertFalse(state.shouldNotify("mc.example.com", 25565, FP_A), "no notice without a durable mark");
         assertFalse(state.isUsable());
-        assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()));
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
+    }
+
+    @Test
+    void aFailedFlushOrMoveFailsClosedAndKeepsTheOldFile(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertTrue(state.shouldNotify("mc.example.com", 25565, FP_A));
+        byte[] before = Files.readAllBytes(file);
+
+        Faults.set(StateFile.FAULT_FORCE);
+        try {
+            assertFalse(state.shouldNotify("mc.example.com", 25565, FP_B), "a failed flush shows no notice");
+        } finally {
+            Faults.set();
+        }
+        assertFalse(state.isUsable(), "a failed flush fails closed");
+        assertArrayEquals(before, Files.readAllBytes(file), "the old state file is intact");
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
+        assertFalse(state.recordAttemptFailure("mc.example.com", 25565));
+        assertEquals(Collections.singletonList("rebind-v1.bin"), names(dir));
+
+        Path movedDirectory = Files.createDirectories(dir.resolve("move"));
+        Path moved = movedDirectory.resolve("rebind-v1.bin");
+        RebindState moving = RebindState.load(moved, now::get);
+        assertTrue(moving.shouldNotify("mc.example.com", 25565, FP_A));
+        byte[] beforeMove = Files.readAllBytes(moved);
+        Faults.set(StateFile.FAULT_MOVE);
+        try {
+            assertFalse(moving.shouldNotify("mc.example.com", 25565, FP_B), "a failed rename shows no notice");
+        } finally {
+            Faults.set();
+        }
+        assertFalse(moving.isUsable(), "a failed rename fails closed");
+        assertArrayEquals(beforeMove, Files.readAllBytes(moved), "the old state file is intact");
+        assertEquals(Collections.singletonList("rebind-v1.bin"), names(movedDirectory));
     }
 
     @Test
@@ -344,78 +447,47 @@ class RebindStateTest {
         assertFalse(json.contains("fingerprint\":\"" + fingerprint(1)), "evicted fp1");
 
         // The server cap is injected too: two servers fill it, and only an ended attempt frees a slot.
-        assertTrue(state.beginAttempt("a.example.com", 25565));
-        assertTrue(state.beginAttempt("b.example.com", 25565));
-        assertFalse(state.allowsAttempt("c.example.com", 25565, now.get()), "two entries, both active");
-        state.endAttempt("a.example.com", 25565);
-        assertTrue(state.beginAttempt("c.example.com", 25565), "the ended attempt may be evicted");
+        RebindState.Attempt first = state.tryBeginAttempt("a.example.com", 25565, now.get());
+        assertNotNull(first);
+        RebindState.Attempt second = state.tryBeginAttempt("b.example.com", 25565, now.get());
+        assertNotNull(second);
+        assertNull(state.tryBeginAttempt("c.example.com", 25565, now.get()), "two entries, both active");
+        assertEquals(2, state.size());
+        assertTrue(state.endAttempt(first, false));
+        assertNotNull(state.tryBeginAttempt("c.example.com", 25565, now.get()), "the ended attempt may be evicted");
         assertEquals(2, state.size());
     }
 
-    @Test
-    void aFailedFlushOrMoveFailsClosedAndKeepsTheOldFile(@TempDir Path dir) throws IOException {
-        Path file = dir.resolve("rebind-v1.bin");
-        AtomicLong now = new AtomicLong(BASE);
-        RebindState state = RebindState.load(file, now::get);
-        assertTrue(state.shouldNotify("mc.example.com", 25565, FP_A));
-        byte[] before = Files.readAllBytes(file);
-
-        Faults.set(StateFile.FAULT_FORCE);
-        try {
-            assertFalse(state.shouldNotify("mc.example.com", 25565, FP_B), "a failed flush shows no notice");
-        } finally {
-            Faults.set();
-        }
-        assertFalse(state.isUsable(), "a failed flush fails closed");
-        assertArrayEquals(before, Files.readAllBytes(file), "the old state file is intact");
-        assertFalse(state.allowsAttempt("mc.example.com", 25565, now.get()));
-        assertFalse(state.recordAttemptFailure("mc.example.com", 25565));
-        assertEquals(Collections.singletonList("rebind-v1.bin"), names(dir));
-
-        Path movedDirectory = Files.createDirectories(dir.resolve("move"));
-        Path moved = movedDirectory.resolve("rebind-v1.bin");
-        RebindState moving = RebindState.load(moved, now::get);
-        assertTrue(moving.shouldNotify("mc.example.com", 25565, FP_A));
-        byte[] beforeMove = Files.readAllBytes(moved);
-        Faults.set(StateFile.FAULT_MOVE);
-        try {
-            assertFalse(moving.shouldNotify("mc.example.com", 25565, FP_B), "a failed rename shows no notice");
-        } finally {
-            Faults.set();
-        }
-        assertFalse(moving.isUsable(), "a failed rename fails closed");
-        assertArrayEquals(beforeMove, Files.readAllBytes(moved), "the old state file is intact");
-        assertEquals(Collections.singletonList("rebind-v1.bin"), names(movedDirectory));
-    }
-
-    /** A re-bind state file holding {@code count} servers, each inside a window that never ends. */
-    private static String servers(int count) {
+    /** A re-bind state fixture with {@code count} servers, each inside {@code blockedUntil}. */
+    private static String servers(int count, String blockedUntil) {
         StringBuilder sb = new StringBuilder(count * 140 + 64);
         sb.append("{\"version\":1,\"servers\":[");
         for (int i = 0; i < count; i++) {
             if (i > 0) {
                 sb.append(',');
             }
-            sb.append("{\"host\":\"s").append(i).append(".example.com\",\"port\":25565,\"failures\":1");
-            sb.append(",\"blockedUntil\":\"").append(FUTURE).append("\",\"notices\":[]}");
+            sb.append(server(i, blockedUntil));
         }
         return sb.append("]}").toString();
     }
 
-    private static byte[] stateFile(String json) {
-        return stateFile(json.getBytes(StandardCharsets.UTF_8));
+    /** The same, but the first (least recently used) server is outside any window. */
+    private static String serversWithOpenFirst(int count) {
+        StringBuilder sb = new StringBuilder(count * 140 + 64);
+        sb.append("{\"version\":1,\"servers\":[").append(server(0, PAST));
+        for (int i = 1; i < count; i++) {
+            sb.append(',').append(server(i, FUTURE));
+        }
+        return sb.append("]}").toString();
     }
 
-    /** The file names in {@code directory}, sorted. */
-    private static List<String> names(Path directory) throws IOException {
-        List<String> names = new ArrayList<>();
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
-            for (Path path : stream) {
-                names.add(path.getFileName().toString());
-            }
-        }
-        Collections.sort(names);
-        return names;
+    private static String server(int index, String blockedUntil) {
+        return "{\"host\":\"s" + index + ".example.com\",\"port\":25565,\"failures\":1"
+                + ",\"blockedUntil\":\"" + blockedUntil + "\",\"notices\":[]}";
+    }
+
+    private static byte[] stateFile(String json) {
+        return stateFile(json.getBytes(StandardCharsets.UTF_8));
     }
 
     private static byte[] stateFile(byte[] json) {
@@ -444,6 +516,18 @@ class RebindStateTest {
     private static byte[] bitmapOf(byte[] content) {
         return Arrays.copyOfRange(content, HEADER + ByteBuffer.wrap(content).getInt(HEADER - 4),
                 content.length - DIGEST);
+    }
+
+    /** The file names in {@code directory}, sorted. */
+    private static List<String> names(Path directory) throws IOException {
+        List<String> names = new ArrayList<>();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
+            for (Path path : stream) {
+                names.add(path.getFileName().toString());
+            }
+        }
+        Collections.sort(names);
+        return names;
     }
 
     private static byte[] sha256(byte[] content, int length) {

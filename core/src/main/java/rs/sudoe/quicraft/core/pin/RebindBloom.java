@@ -31,6 +31,16 @@ final class RebindBloom {
 
     private final byte[] bits = new byte[BYTES];
 
+    /** Whether every one of the tuple's bits is already set, without changing anything. */
+    boolean contains(PinKey key, String fingerprint) {
+        for (int index : indexes(key, fingerprint)) {
+            if ((bits[index >>> 3] & (1 << (index & 7))) == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * Sets the seven bits of {@code key} and {@code fingerprint}.
      *
