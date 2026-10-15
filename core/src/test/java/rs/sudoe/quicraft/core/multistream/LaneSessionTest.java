@@ -720,6 +720,19 @@ class LaneSessionTest {
     }
 
     @Test
+    void aStopSendingOnAnIdleLaneClosesBothSidesWith0x11WithoutAWrite() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activateBoth();
+            roundTrip(rig);
+            // The client stops reading the server's REALTIME lane, and the server never writes on it
+            // again: only the periodic send-capacity probe of 13.14 can notice.
+            channel(rig.client, Lane.REALTIME).shutdownInput(0x43);
+            closedWith(rig.serverGame, 0x11, false);
+            closedWith(rig.clientGame, 0x11, true);
+        }
+    }
+
+    @Test
     void anUnexpectedFinOnAnyLaneClosesBothSidesWith0x11() throws Exception {
         for (Lane lane : Lane.values()) {
             try (LaneRig rig = LaneRig.start()) {

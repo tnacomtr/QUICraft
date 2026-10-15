@@ -64,8 +64,12 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * {@link #isWritable()} before submitting a large one.
  *
  * <p>Call {@link #activate} without delay: the peer's 10 second clock for opening its streams
- * starts at its own activation. A STOP_SENDING from the peer is visible only as a failed write on
- * that lane (Netty fires no event for it), so a lane that never writes does not notice it.
+ * starts at its own activation. A STOP_SENDING from the peer terminates the connection with 0x11
+ * (13.14) and must be noticed on a lane that never writes, so while the session is active the
+ * periodic tick reads each lane's send capacity. The pinned Netty fires no event for STOP_SENDING
+ * and an empty write is a silent no-op in its stream channel, so the send capacity (a negative
+ * quiche stream-stopped result) is the only API-visible state that changes without sending bytes;
+ * see {@link #peerStoppedReading}.
  */
 public final class LaneSession {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -106,6 +110,26 @@ public final class LaneSession {
     private static final int CONTROL_STREAM_ID = 0;
     private static final int REALTIME_STREAM_ID = 4;
     private static final int WORLD_STREAM_ID = 1;
+
+    /**
+     * quiche's {@code QUICHE_ERR_STREAM_STOPPED}, read once from the pinned Netty's package-private
+     * {@code Quiche} class (13.14). {@link Integer#MIN_VALUE} when it cannot be read, which disables
+     * the idle STOP_SENDING probe and leaves detection to the lane's first write.
+     */
+    private static final int STOPPED_SENDING = quicheErrStreamStopped();
+
+    private static int quicheErrStreamStopped() {
+        try {
+            Class<?> quiche = Class.forName(
+                    QuicStreamChannel.class.getName().replace("QuicStreamChannel", "Quiche"));
+            java.lang.reflect.Field field = quiche.getDeclaredField("QUICHE_ERR_STREAM_STOPPED");
+            field.setAccessible(true);
+            return field.getInt(null);
+        } catch (Throwable t) {
+            LOG.log(Level.FINE, "cannot read QUICHE_ERR_STREAM_STOPPED from the pinned Netty", t);
+            return Integer.MIN_VALUE;
+        }
+    }
 
     /** Clocks and periods; tests shorten them, production uses {@link #DEFAULT}. */
     static final class Timing {
@@ -160,6 +184,8 @@ public final class LaneSession {
     private long unsentBytes;
     private volatile boolean writable = true;
     private ScheduledFuture<?> tick;
+    private java.lang.reflect.Method streamCapacityMethod;
+    private boolean streamCapacityLookedUp;
 
     /** A session with production timing, no node budget and the game already attached. */
     public LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
@@ -923,11 +949,16 @@ public final class LaneSession {
         return r == null || w == null || !r.opened || !w.opened;
     }
 
+    /**
+     * Arms the periodic tick. While the session is active it runs even with nothing pending, so
+     * the 13.14 STOP_SENDING probe and the receiver's deadlines advance on an idle connection;
+     * otherwise only pending records, peer streams or a written END need it.
+     */
     private void armTick() {
         if (tick != null || closed) {
             return;
         }
-        if (receiver.pendingRecords() > 0 || awaitingPeerStreams() || endWrittenAt != 0) {
+        if (activated || receiver.pendingRecords() > 0 || awaitingPeerStreams() || endWrittenAt != 0) {
             tick = loop.schedule(this::onTick, timing.tickNanos, TimeUnit.NANOSECONDS);
         }
     }
@@ -941,6 +972,10 @@ public final class LaneSession {
             long t = now();
             receiver.checkDeadlines(t);
             sender.checkDeadlines(t);
+            if (activated && peerStoppedReading()) {
+                fail(CLOSE_ORDERING, "the peer stopped reading a lane (13.14)", null);
+                return;
+            }
             if (awaitingPeerStreams() && t - activatedAt >= timing.openTimeoutNanos) {
                 fail(CLOSE_ORDERING, "an allowed stream did not open in time (13.14)", null);
                 return;
@@ -954,6 +989,63 @@ public final class LaneSession {
             return;
         }
         armTick();
+    }
+
+    /**
+     * True when the peer has sent STOP_SENDING on any lane (13.14). Netty fires no event for it and
+     * an empty write is a no-op in its stream channel, so the only API-visible state that changes
+     * without sending bytes is the lane's send capacity: it becomes quiche's stream-stopped error,
+     * while a healthy lane reports its send window ({@code >= 0}). Reached reflectively because the
+     * pinned Netty keeps it package-private; the class is looked up from the stream channel, so a
+     * relocated Netty resolves the same way. If the lookup ever fails the probe is inert and a
+     * STOP_SENDING is still caught by the first write on that lane.
+     */
+    private boolean peerStoppedReading() {
+        for (Lane lane : Lane.values()) {
+            LaneStream s = streams[lane.ordinal()];
+            if (s != null && s.channel != null && sendStopped(s.channel)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** One lane's send capacity; see {@link #peerStoppedReading} for why this is reflective. */
+    private boolean sendStopped(QuicStreamChannel channel) {
+        java.lang.reflect.Method capacity = streamCapacity();
+        if (capacity == null || STOPPED_SENDING == Integer.MIN_VALUE) {
+            return false;
+        }
+        try {
+            Object value = capacity.invoke(channel.parent(), Long.valueOf(channel.streamId()));
+            return value instanceof Long && ((Long) value).longValue() == STOPPED_SENDING;
+        } catch (Throwable t) {
+            LOG.log(Level.FINE, "cannot read the stream send capacity", t);
+            return false;
+        }
+    }
+
+    /** Resolves the pinned Netty's {@code QuicheQuicChannel.streamCapacity(long)} once, if at all. */
+    private java.lang.reflect.Method streamCapacity() {
+        if (!streamCapacityLookedUp) {
+            streamCapacityLookedUp = true;
+            Class<?> type = connection.getClass();
+            while (type != null) {
+                try {
+                    java.lang.reflect.Method m = type.getDeclaredMethod("streamCapacity", long.class);
+                    m.setAccessible(true);
+                    streamCapacityMethod = m;
+                    break;
+                } catch (NoSuchMethodException next) {
+                    type = type.getSuperclass();
+                }
+            }
+            if (streamCapacityMethod == null) {
+                LOG.log(Level.FINE, "the pinned Netty exposes no stream send capacity; a STOP_SENDING "
+                        + "is then still noticed by the first write on the lane");
+            }
+        }
+        return streamCapacityMethod;
     }
 
     // --- Per-stream handler.
