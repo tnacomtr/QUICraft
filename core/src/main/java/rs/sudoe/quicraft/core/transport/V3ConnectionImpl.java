@@ -136,10 +136,17 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         this.listener = listener;
         this.preambleHandler = preambleHandler;
         this.handshakeComplete = handshakeComplete;
-        if (role == LaneSession.Role.CLIENT && sentEarly != null) {
-            gameWrote = true; // the server may act on the 0-RTT flight
+        if (role == LaneSession.Role.CLIENT) {
+            if (sentEarly != null) {
+                gameWrote = true; // the server may act on the 0-RTT flight
+            } else if (joinInputs != null) {
+                recorder = new FlightRecorder();
+            }
         }
-        connection.pipeline().addLast(new HandshakeWatch());
+        // First in the connection's pipeline: this connection is handed to the game from another
+        // connection handler (QuicServer.Connection), and it must already know the handshake is
+        // complete when the game sees it there (12.7).
+        connection.pipeline().addFirst(new HandshakeWatch());
     }
 
     /** Starts reading the peer's preamble. On the event loop. */
