@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -26,6 +27,7 @@ import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.binding.BindingTestSessions;
 import rs.sudoe.quicraft.core.connect.TransportSelection.PinState;
 import rs.sudoe.quicraft.core.connect.V3Plan.Phase;
+import rs.sudoe.quicraft.core.pin.PinKey;
 import rs.sudoe.quicraft.core.pin.PinStore;
 import rs.sudoe.quicraft.core.pin.RebindState;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
@@ -37,6 +39,12 @@ import rs.sudoe.quicraft.core.tls.Fingerprint;
  * join unfinished instead of falling back to TCP.
  */
 class V3PlanTest {
+
+    /**
+     * 12.15's expiry calls take the keys of the attempts that are running. These tests run at most
+     * one attempt and never need another server's pin protected, so the set is empty.
+     */
+    private static final Set<PinKey> NO_ACTIVE_KEYS = Collections.emptySet();
     private static final InetAddress ADDRESS = address();
     private static final int QUIC_PORT = 25570;
     private static final String HOST = "mc.example.com";
@@ -144,19 +152,19 @@ class V3PlanTest {
         Plan offline = Plan.joining(INLINE);
         BindingSession offlineSession = BindingTestSessions.activatedClient(BindingStateMachine.MODE_OFFLINE);
         assertTrue(offline.plan.activated(offlineSession).get(FIVE_SECONDS, TimeUnit.SECONDS).booleanValue());
-        assertFalse(offline.pins.pin(HOST, LOGICAL_PORT).isPresent(), "offline mode never writes a pin");
+        assertFalse(offline.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).isPresent(), "offline mode never writes a pin");
 
         // A session that never activated is not a passing binding either.
         Plan idle = Plan.joining(INLINE);
         assertFalse(idle.plan.activated(BindingTestSessions.idleClient(BindingStateMachine.MODE_ONLINE))
                 .get(FIVE_SECONDS, TimeUnit.SECONDS).booleanValue());
-        assertFalse(idle.pins.pin(HOST, LOGICAL_PORT).isPresent(), "no pin without activation");
+        assertFalse(idle.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).isPresent(), "no pin without activation");
 
         // The online case does write it.
         Plan online = Plan.joining(INLINE);
         assertTrue(online.plan.activated(BindingTestSessions.activatedClient(BindingStateMachine.MODE_ONLINE))
                 .get(FIVE_SECONDS, TimeUnit.SECONDS).booleanValue());
-        assertEquals(online.fingerprint.toString(), online.pins.pin(HOST, LOGICAL_PORT).get().fingerprint());
+        assertEquals(online.fingerprint.toString(), online.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).get().fingerprint());
     }
 
     @Test
@@ -164,11 +172,11 @@ class V3PlanTest {
         // 12.16/12.19: an offline binding cannot authenticate the endpoint, so it must not replace a
         // changed pin, and the re-bind window stays up.
         Plan plan = Plan.rebinding(INLINE);
-        plan.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        plan.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         assertTrue(plan.plan.activated(BindingTestSessions.activatedClient(BindingStateMachine.MODE_OFFLINE))
                 .get(FIVE_SECONDS, TimeUnit.SECONDS).booleanValue());
 
-        assertEquals(fingerprint('d').toString(), plan.pins.pin(HOST, LOGICAL_PORT).get().fingerprint(),
+        assertEquals(fingerprint('d').toString(), plan.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).get().fingerprint(),
                 "the old pin stays");
         assertNull(plan.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, plan.clock.get()),
                 "and a new re-bind is refused for the window's length");
@@ -177,7 +185,7 @@ class V3PlanTest {
     @Test
     void aPinWriteFailureIsRecordedOnce() throws Exception {
         Plan plan = Plan.rebinding(INLINE);
-        plan.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        plan.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         Faults.set(Faults.PIN_WRITE);
         assertFalse(plan.plan.activated(BindingTestSessions.activatedClient(BindingStateMachine.MODE_ONLINE))
                 .get(FIVE_SECONDS, TimeUnit.SECONDS).booleanValue(),
@@ -211,7 +219,7 @@ class V3PlanTest {
     @Test
     void aFailureAfterActivationDoesNotRetry() throws Exception {
         Plan plan = Plan.rebinding(INLINE);
-        plan.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        plan.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         assertTrue(plan.plan.activated(BindingTestSessions.activatedClient(BindingStateMachine.MODE_ONLINE))
                 .get(FIVE_SECONDS, TimeUnit.SECONDS).booleanValue());
         assertTrue(plan.plan.isActivated());

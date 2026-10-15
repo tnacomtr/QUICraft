@@ -12,12 +12,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.time.Clock;
+import java.time.Duration;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
@@ -41,6 +44,7 @@ import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 import rs.sudoe.quicraft.core.connect.TransportSelection.PinState;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.discovery.AdvertisementCache;
+import rs.sudoe.quicraft.core.pin.PinKey;
 import rs.sudoe.quicraft.core.pin.PinStore;
 import rs.sudoe.quicraft.core.pin.RebindState;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
@@ -56,6 +60,12 @@ import rs.sudoe.quicraft.core.transport.QuicByteStream;
  * advertisement. The routing table comes from the fixtures in {@code core/src/test/resources}.
  */
 class ClientConnectorV3Test {
+
+    /**
+     * 12.15's expiry calls take the keys of the attempts that are running. These tests run at most
+     * one attempt and never need another server's pin protected, so the set is empty.
+     */
+    private static final Set<PinKey> NO_ACTIVE_KEYS = Collections.emptySet();
     /** The protocol number of the valid routing fixture. */
     private static final int PROTOCOL = 12345;
     private static final int QUIC_PORT = 25570;
@@ -270,7 +280,7 @@ class ClientConnectorV3Test {
     void aSamePinSelectsV3WithoutAnAttempt() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, f.fingerprint.toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, f.fingerprint.toString(), NO_ACTIVE_KEYS);
         FakePlatform p = new FakePlatform();
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
 
@@ -284,7 +294,7 @@ class ClientConnectorV3Test {
     void aChangedPinTakesOneRebindAttemptWithAFullHandshake() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         FakePlatform p = new FakePlatform();
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
 
@@ -302,7 +312,7 @@ class ClientConnectorV3Test {
     void aChangedPinInsideItsBackoffUsesTcp() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         ClientConnector connector = f.connector(true, true);
         Outcome<String> first = f.connect(connector, new FakePlatform(), Mode.AUTO);
         // The attempt ends in failure: 12.16's window is now up.
@@ -321,7 +331,7 @@ class ClientConnectorV3Test {
     void aChangedPinWithAMismatchedDigestUsesTcpAndRecordsBothBackoffs() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3(Collections.singletonMap(Integer.valueOf(PROTOCOL), "sha256:" + repeat('a')));
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         FakePlatform p = new FakePlatform();
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
 
@@ -340,7 +350,7 @@ class ClientConnectorV3Test {
     void aChangedPinWithNoAdvertisedDigestUsesTcp() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3(Collections.<Integer, String>emptyMap());
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         FakePlatform p = new FakePlatform();
         assertEquals("tcp", f.connect(f.connector(true, true), p, Mode.AUTO).tcp());
         assertEquals(0, p.v3Dials.get());
@@ -352,7 +362,7 @@ class ClientConnectorV3Test {
     void aChangedPinWithOnlyV2AdvertisedUsesTcp() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV2();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         FakePlatform p = new FakePlatform();
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
 
@@ -367,7 +377,7 @@ class ClientConnectorV3Test {
         for (boolean[] capabilities : new boolean[][] {{false, true}, {true, false}, {false, false}}) {
             Fixture f = Fixture.empty();
             f.advertiseV3();
-            f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+            f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
             FakePlatform p = new FakePlatform();
             Outcome<String> outcome = f.connect(
                     f.connector(capabilities[0], capabilities[1]), p, Mode.AUTO);
@@ -381,7 +391,7 @@ class ClientConnectorV3Test {
     void aChangedPinInQuicOnlyModeFails() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         FakePlatform p = new FakePlatform();
         // A missing prerequisite plus quic-only is FAIL: the caller shows the failure (12.16).
         assertThrows(java.util.concurrent.ExecutionException.class,
@@ -459,10 +469,10 @@ class ClientConnectorV3Test {
         Fixture f = Fixture.empty();
         f.advertiseV3();
         for (int i = 0; i < PinStore.MAX_PINS - 1; i++) {
-            f.pins.recordPin("server" + i + ".example", 25565, fingerprint('e').toString());
+            f.pins.recordPin("server" + i + ".example", 25565, fingerprint('e').toString(), NO_ACTIVE_KEYS);
         }
         assertEquals(PinStore.RecordResult.RECORDED,
-                f.pins.recordPin(HOST, LOGICAL_PORT, f.fingerprint.toString()));
+                f.pins.recordPin(HOST, LOGICAL_PORT, f.fingerprint.toString(), NO_ACTIVE_KEYS));
         assertEquals(PinStore.MAX_PINS, f.pins.size(), "the store is now full");
 
         // A name the store already knows keeps using /3: only new names are restricted.
@@ -503,7 +513,7 @@ class ClientConnectorV3Test {
     void activationRecordsThePinClearsTheFailureAndEndsTheAttempt() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         f.failures.recordActivationFailure(f.address(), QUIC_PORT, f.fingerprint);
         // A blocked activation would keep /3 off, so clear it first: this test is about the end of
         // a successful attempt.
@@ -512,7 +522,7 @@ class ClientConnectorV3Test {
         V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
         assertTrue(plan.activated(onlineSession()).get(FIVE_SECONDS, TimeUnit.SECONDS));
 
-        assertEquals(f.fingerprint.toString(), f.pins.pin(HOST, LOGICAL_PORT).get().fingerprint(),
+        assertEquals(f.fingerprint.toString(), f.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).get().fingerprint(),
                 "12.15: an authenticated activation records the pin");
         assertFalse(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()));
         // The attempt is over and its state is cleared, so a fresh one is admitted.
@@ -526,21 +536,21 @@ class ClientConnectorV3Test {
         V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
         // 12.19: offline mode never creates or updates an authenticated pin.
         assertTrue(plan.activated(offlineSession()).get(FIVE_SECONDS, TimeUnit.SECONDS));
-        assertFalse(f.pins.pin(HOST, LOGICAL_PORT).isPresent());
+        assertFalse(f.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).isPresent());
     }
 
     @Test
     void aFailedPinWriteClosesTheConnectionAndLeavesThePinAlone() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
 
         Faults.set(Faults.PIN_WRITE);
         assertFalse(plan.activated(onlineSession()).get(FIVE_SECONDS, TimeUnit.SECONDS),
                 "12.15: a failed pin write must be reported so the caller closes with 0x10");
         Faults.set();
-        assertEquals(fingerprint('d').toString(), f.pins.pin(HOST, LOGICAL_PORT).get().fingerprint(),
+        assertEquals(fingerprint('d').toString(), f.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).get().fingerprint(),
                 "the old pin stays until a passing check replaces it");
         assertTrue(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
                 "a write failure after activation is itself an activation failure");
@@ -554,7 +564,7 @@ class ClientConnectorV3Test {
     void failureRecordsTheRightKindOfEntryAndRetriesForEveryKindBeforeActivation() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         V3Plan changed = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
         assertTrue(changed.failed(V3Plan.Phase.JOINING, V3Plan.REBIND_FAILED),
                 "the user's fail-safe decision: a failed re-bind continues over fresh TCP");
@@ -630,6 +640,41 @@ class ClientConnectorV3Test {
     }
 
     @Test
+    void anExpiredPinIsFirstContactAgain(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("pins-v2.json");
+        Clock bound = Clock.systemUTC();
+        PinStore.load(file, bound).recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(),
+                NO_ACTIVE_KEYS);
+        // 12.15: a pin expires 30 days after its last binding, so a store 31 days later no longer
+        // knows this name.
+        PinStore pins = PinStore.load(file, Clock.offset(bound, Duration.ofDays(31)));
+
+        RebindState rebinds = RebindState.load(null);
+        RebindState.Attempt stale = rebinds.tryBeginAttempt(HOST, LOGICAL_PORT,
+                System.currentTimeMillis());
+        rebinds.endAttempt(stale, false); // a backoff window and its entry exist for that server
+        assertEquals(1, rebinds.size());
+
+        Fixture f = new Fixture(pins, rebinds);
+        f.advertiseV3();
+        FakePlatform p = new FakePlatform();
+        Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
+
+        assertNotNull(outcome.quic(), "an expired pin is not a changed one: /3 is selected normally");
+        V3Plan plan = outcome.v3Plan();
+        assertEquals(PinState.NONE, plan.pinState(), "the name is first contact again");
+        assertNull(plan.attempt(), "12.16: so there is no re-bind attempt");
+        assertFalse(p.bypassResumption, "and no bypassed resumption either");
+        assertFalse(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint, f.clock.get()),
+                "no failure and no backoff are recorded for it");
+        assertFalse(f.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).isPresent(),
+                "and the expired pin is gone from the store");
+        assertEquals(0, rebinds.size(), "12.15: its re-bind state is forgotten too");
+        assertNotNull(rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, System.currentTimeMillis()),
+                "so its stale backoff window cannot hold the next attempt back");
+    }
+
+    @Test
     void aBackedOffServerCostsNoHeadStart() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
@@ -674,7 +719,7 @@ class ClientConnectorV3Test {
         Fixture f = Fixture.empty();
         f.advertiseV3();
         for (int i = 0; i < PinStore.MAX_PINS; i++) {
-            f.pins.recordPin("server" + i + ".example", 25565, fingerprint('e').toString());
+            f.pins.recordPin("server" + i + ".example", 25565, fingerprint('e').toString(), NO_ACTIVE_KEYS);
         }
         FakePlatform p = new FakePlatform();
         assertThrows(java.util.concurrent.ExecutionException.class,
@@ -687,7 +732,7 @@ class ClientConnectorV3Test {
     void aWorkerThatRefusesTasksStillYieldsATcpOutcome() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         // The pre-connect step needs the first task; the failure bookkeeping is the second.
         f.worker = new RejectAfterOneTask();
         FakePlatform p = new FakePlatform();
@@ -705,7 +750,7 @@ class ClientConnectorV3Test {
     void aBlackHoledRebindDialFallsBackToTcpAfterTheHeadStart() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         FakePlatform p = new FakePlatform();
         p.quic = new CompletableFuture<QuicByteStream>(); // a black hole: the dial never completes
         long start = System.nanoTime();
@@ -728,7 +773,7 @@ class ClientConnectorV3Test {
         Path file = dir.resolve("rebind-v1.bin");
         Fixture f = new Fixture(PinStore.load(null), RebindState.load(file));
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         Faults.set(Faults.V3_SELECT);
         Outcome<String> outcome = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO);
         Faults.set();
@@ -751,7 +796,7 @@ class ClientConnectorV3Test {
         Path file = dir.resolve("rebind-v1.bin");
         Fixture f = new Fixture(PinStore.load(null), RebindState.load(file));
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         FakePlatform p = new FakePlatform();
         p.quic = new CompletableFuture<QuicByteStream>(); // still dialling when the player gives up
         CompletableFuture<Outcome<String>> join = f.join(f.connector(true, true), p);
@@ -769,7 +814,7 @@ class ClientConnectorV3Test {
     void aFaultInTheDialOfAChangedPinEndsTheAttemptAndUsesTcp() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         FakePlatform p = new FakePlatform();
         Faults.set(Faults.V3_DIAL);
         Outcome<String> outcome = f.connect(f.connector(true, true), p, Mode.AUTO);
@@ -799,7 +844,7 @@ class ClientConnectorV3Test {
         for (String reason : reasons) {
             Fixture f = Fixture.empty();
             f.advertiseV3();
-            f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+            f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
             V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
             assertTrue(plan.failed(V3Plan.Phase.JOINING, reason), reason + " must retry over fresh TCP");
             assertEquals("QUIC multi-stream failed (" + reason + "), fell back to TCP",
@@ -832,7 +877,7 @@ class ClientConnectorV3Test {
     void aFailureAfterActivationDoesNotRetryInTheSameAttempt() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();
-        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
         V3Plan plan = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO).v3Plan();
         assertTrue(plan.activated(onlineSession()).get(FIVE_SECONDS, TimeUnit.SECONDS));
         assertTrue(plan.isActivated());
@@ -848,7 +893,7 @@ class ClientConnectorV3Test {
         // A second report changes nothing, activated() cannot follow a failure, and the pin stays.
         assertFalse(plan.failed(V3Plan.Phase.JOINING, "later still"));
         assertFalse(plan.isActivated());
-        assertEquals(f.fingerprint.toString(), f.pins.pin(HOST, LOGICAL_PORT).get().fingerprint());
+        assertEquals(f.fingerprint.toString(), f.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).get().fingerprint());
     }
 
     @Test

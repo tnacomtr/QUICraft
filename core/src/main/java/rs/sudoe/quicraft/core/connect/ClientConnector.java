@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.ArrayDeque;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
@@ -22,6 +23,8 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.discovery.AdvertisementCache;
+import rs.sudoe.quicraft.core.pin.PinExpiry;
+import rs.sudoe.quicraft.core.pin.PinKey;
 import rs.sudoe.quicraft.core.pin.PinStore;
 import rs.sudoe.quicraft.core.pin.RebindState;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
@@ -550,7 +553,12 @@ public final class ClientConnector {
     private Prepared prepare0(InetSocketAddress server, String logicalHost, int logicalPort,
             ConnectDecision.Mode mode, Optional<Advertisement> advertisement) {
         long now = v3.clock().getAsLong();
-        TransportSelection.PinState pinState = pinState(logicalHost, logicalPort, advertisement);
+        // 12.15: expire the pins past their 30 days before anything reads or writes them, so an
+        // expired pin is first contact again. This is the worker, and the purge writes both files.
+        Set<PinKey> activeKeys = v3.rebinds().activeKeys();
+        PinExpiry.purge(v3.pins(), v3.rebinds(), activeKeys);
+        TransportSelection.PinState pinState = pinState(logicalHost, logicalPort, advertisement,
+                activeKeys);
         InetSocketAddress target = advertisement.isPresent() ? quicTarget(server, advertisement.get()) : null;
         boolean activationBlocked = advertisement.isPresent()
                 && Protocol.ALPN_V3.equals(advertisement.get().alpn())
@@ -596,7 +604,8 @@ public final class ClientConnector {
             String tcpReason = null;
             if (activationBlocked) {
                 tcpReason = "the /3 activation failure for this key is still backing off (12.14)";
-            } else if (pinStoreFullForNewName(pinState, logicalHost, logicalPort, advertisement)) {
+            } else if (pinStoreFullForNewName(pinState, logicalHost, logicalPort, advertisement,
+                    activeKeys)) {
                 // 12.16, spec-literal: "Never automatically evict pins: when the pin store is full,
                 // use TCP for new names until the player explicitly deletes a pin." So a new name
                 // with a full store is TCP, not /2, even though /2 itself needs no pin.
@@ -650,12 +659,12 @@ public final class ClientConnector {
      * means TCP for new names, which overrides {@code /2} selection for such a name.</p>
      */
     private boolean pinStoreFullForNewName(TransportSelection.PinState pinState, String logicalHost,
-            int logicalPort, Optional<Advertisement> advertisement) {
+            int logicalPort, Optional<Advertisement> advertisement, Set<PinKey> activeKeys) {
         if (pinState != TransportSelection.PinState.NONE || !advertisement.isPresent()
                 || !Protocol.ALPN_V3.equals(advertisement.get().alpn())) {
             return false;
         }
-        if (v3.pins().pin(logicalHost, logicalPort).isPresent()) {
+        if (v3.pins().pin(logicalHost, logicalPort, activeKeys).isPresent()) {
             return false;
         }
         return v3.pins().size() >= PinStore.MAX_PINS;
@@ -668,14 +677,14 @@ public final class ClientConnector {
      * there is nothing to compare, so the state is {@link TransportSelection.PinState#NONE}.
      */
     private TransportSelection.PinState pinState(String logicalHost, int logicalPort,
-            Optional<Advertisement> advertisement) {
+            Optional<Advertisement> advertisement, Set<PinKey> activeKeys) {
         if (!v3.pins().isUsable()) {
             return TransportSelection.PinState.STORE_UNUSABLE;
         }
         if (!advertisement.isPresent()) {
             return TransportSelection.PinState.NONE;
         }
-        Optional<PinStore.Pin> pin = v3.pins().pin(logicalHost, logicalPort);
+        Optional<PinStore.Pin> pin = v3.pins().pin(logicalHost, logicalPort, activeKeys);
         if (!pin.isPresent()) {
             return TransportSelection.PinState.NONE;
         }

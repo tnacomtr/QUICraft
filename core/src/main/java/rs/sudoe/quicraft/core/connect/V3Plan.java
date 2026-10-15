@@ -2,12 +2,16 @@
 package rs.sudoe.quicraft.core.connect;
 
 import java.net.InetAddress;
+import java.util.Collections;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.function.Supplier;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
+import rs.sudoe.quicraft.core.pin.PinExpiry;
+import rs.sudoe.quicraft.core.pin.PinKey;
 import rs.sudoe.quicraft.core.pin.PinStore;
 import rs.sudoe.quicraft.core.pin.RebindState;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
@@ -349,11 +353,23 @@ public final class V3Plan {
         }
         try {
             Faults.check(Faults.PIN_WRITE);
-            PinStore.RecordResult result = pins.recordPin(host, logicalPort, fingerprint.toString());
+            Set<PinKey> activeKeys = activeKeys();
+            if (rebinds != null) {
+                // 12.15: an expired pin's re-bind state is forgotten before the pin itself is
+                // replaced, exactly as the connect path does before its own lookups.
+                PinExpiry.purge(pins, rebinds, activeKeys);
+            }
+            PinStore.RecordResult result = pins.recordPin(host, logicalPort, fingerprint.toString(),
+                    activeKeys);
             return result == PinStore.RecordResult.RECORDED || result == PinStore.RecordResult.UPDATED;
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** The logical servers an attempt is running for, as 12.15's expiry calls take them. */
+    private Set<PinKey> activeKeys() {
+        return rebinds == null ? Collections.<PinKey>emptySet() : rebinds.activeKeys();
     }
 
     private void clearActivationFailure() {
