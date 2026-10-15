@@ -61,22 +61,22 @@ class TransportSelectionTest {
                         Missing.ONLY_V2_ADVERTISED, "12.16")
                         .advertisement(v2()).pin(PinState.CHANGED).rebind(true)
                         .flag(true).exporter(true).local(LOCAL),
-                // 12.3, 13.1: every missing /3 prerequisite falls back to /2.
-                row("quicraft/3 with the multistream flag off returns V2", Transport.V2,
+                // 12.3, 13.1: a /3 listener speaks /3 only, so every missing prerequisite is TCP.
+                row("quicraft/3 with the multistream flag off returns TCP", Transport.TCP,
                         Missing.MULTISTREAM_FLAG_OFF, "12.1")
                         .advertisement(v3()).exporter(true).local(LOCAL),
-                row("quicraft/3 without the exporter probe returns V2", Transport.V2, Missing.NO_EXPORTER, "12.3")
+                row("quicraft/3 without the exporter probe returns TCP", Transport.TCP, Missing.NO_EXPORTER, "12.3")
                         .advertisement(v3()).flag(true).local(LOCAL),
-                row("quicraft/3 without a local routing table returns V2", Transport.V2,
+                row("quicraft/3 without a local routing table returns TCP", Transport.TCP,
                         Missing.NO_LOCAL_ROUTING_TABLE, "no routing table")
                         .advertisement(v3()).flag(true).exporter(true),
-                row("quicraft/3 without an advertised digest returns V2", Transport.V2,
+                row("quicraft/3 without an advertised digest returns TCP", Transport.TCP,
                         Missing.NO_ADVERTISED_DIGEST, "no routing digest")
                         .advertisement(v3WithoutRouting()).flag(true).exporter(true).local(LOCAL),
-                row("quicraft/3 with a digest for another protocol returns V2", Transport.V2,
+                row("quicraft/3 with a digest for another protocol returns TCP", Transport.TCP,
                         Missing.NO_ADVERTISED_DIGEST, "no routing digest")
                         .advertisement(v3WithDigestFor(776)).flag(true).exporter(true).local(LOCAL),
-                row("quicraft/3 with a mismatched digest returns V2", Transport.V2,
+                row("quicraft/3 with a mismatched digest returns TCP", Transport.TCP,
                         Missing.DIGEST_MISMATCH, "differs from the local one")
                         .advertisement(v3WithDigestFor(PROTOCOL, OTHER)).flag(true).exporter(true).local(LOCAL),
                 row("quicraft/3 with every prerequisite returns V3", Transport.V3, Missing.NONE, "13.1")
@@ -85,7 +85,7 @@ class TransportSelectionTest {
                         Missing.NONE, "13.1")
                         .advertisement(v3()).pin(PinState.SAME).flag(true).exporter(true).local(LOCAL),
                 // 12.15: a corrupt pin store disables /3, whatever else holds.
-                row("quicraft/3 with an unusable pin store returns V2", Transport.V2,
+                row("quicraft/3 with an unusable pin store returns TCP", Transport.TCP,
                         Missing.PIN_STORE_UNUSABLE, "12.15")
                         .advertisement(v3()).pin(PinState.STORE_UNUSABLE)
                         .flag(true).exporter(true).local(LOCAL),
@@ -126,15 +126,15 @@ class TransportSelectionTest {
                 row("quic-only with quicraft/2 and a changed pin fails", Transport.FAIL,
                         Missing.ONLY_V2_ADVERTISED, "quic-only")
                         .setting(Mode.QUIC_ONLY).advertisement(v2()).pin(PinState.CHANGED).rebind(true),
-                row("quic-only with quicraft/3 and the flag off stays V2", Transport.V2,
-                        Missing.MULTISTREAM_FLAG_OFF, "12.1")
+                row("quic-only with quicraft/3 and the flag off fails", Transport.FAIL,
+                        Missing.MULTISTREAM_FLAG_OFF, "quic-only")
                         .setting(Mode.QUIC_ONLY).advertisement(v3()).exporter(true).local(LOCAL),
-                row("quic-only with quicraft/3 and a mismatched digest stays V2", Transport.V2,
-                        Missing.DIGEST_MISMATCH, "differs from the local one")
+                row("quic-only with quicraft/3 and a mismatched digest fails", Transport.FAIL,
+                        Missing.DIGEST_MISMATCH, "quic-only")
                         .setting(Mode.QUIC_ONLY).advertisement(v3WithDigestFor(PROTOCOL, OTHER))
                         .flag(true).exporter(true).local(LOCAL),
-                row("quic-only with quicraft/3 and an unusable pin store stays V2", Transport.V2,
-                        Missing.PIN_STORE_UNUSABLE, "12.15")
+                row("quic-only with quicraft/3 and an unusable pin store fails", Transport.FAIL,
+                        Missing.PIN_STORE_UNUSABLE, "quic-only")
                         .setting(Mode.QUIC_ONLY).advertisement(v3()).pin(PinState.STORE_UNUSABLE)
                         .flag(true).exporter(true).local(LOCAL),
                 row("quic-only with quicraft/3 with every prerequisite stays V3", Transport.V3,
@@ -169,11 +169,12 @@ class TransportSelectionTest {
         assertEquals(Transport.TCP, result.transport());
         assertEquals(Missing.NO_ADVERTISEMENT, result.missing());
         assertTrue(result.reason().contains("no advertisement"));
-        // The builder's default flag is the shipped one, so a /3 advertisement alone cannot pick V3.
+        // The builder's default flag is the shipped one, so a /3 advertisement alone cannot pick V3,
+        // and a /3 listener is never offered /2.
         TransportSelection.Result blocked = TransportSelection.select(TransportSelection.Inputs.builder()
                 .advertisement(v3()).exporterCapable(true).clientProtocolNumber(PROTOCOL)
                 .localRoutingDigestHex(LOCAL).build());
-        assertEquals(Transport.V2, blocked.transport());
+        assertEquals(Transport.TCP, blocked.transport());
         assertEquals(Missing.MULTISTREAM_FLAG_OFF, blocked.missing());
     }
 
@@ -183,7 +184,7 @@ class TransportSelectionTest {
                 .advertisement(v3()).pinState(PinState.STORE_UNUSABLE)
                 .multistreamEnabled(true).exporterCapable(true)
                 .clientProtocolNumber(PROTOCOL).localRoutingDigestHex(LOCAL).build());
-        assertEquals(Transport.V2, result.transport());
+        assertEquals(Transport.TCP, result.transport());
         assertEquals(Missing.PIN_STORE_UNUSABLE, result.missing());
         assertTrue(result.reason().contains("pin store is unusable"), result.reason());
         assertTrue(result.reason().contains("notify the player"), result.reason());
@@ -241,7 +242,7 @@ class TransportSelectionTest {
                 .advertisement(v3()).multistreamEnabled(true).exporterCapable(true)
                 .clientProtocolNumber(PROTOCOL).localRoutingDigestHex(LOCAL).build()).transport());
         // One differing character is a mismatch (13.1), never a match.
-        assertEquals(Transport.V2, TransportSelection.select(TransportSelection.Inputs.builder()
+        assertEquals(Transport.TCP, TransportSelection.select(TransportSelection.Inputs.builder()
                 .advertisement(v3()).multistreamEnabled(true).exporterCapable(true)
                 .clientProtocolNumber(PROTOCOL).localRoutingDigestHex(OTHER).build()).transport());
     }

@@ -22,13 +22,12 @@ import rs.sudoe.quicraft.core.Faults;
  *
  * <p><b>Empty means "no {@code /3} for this protocol number".</b> A missing resource, a resource
  * that is not a valid table, and one that declares another protocol number are all the same answer
- * to the caller: {@link Optional#empty()}, so the selection uses {@code /2} or TCP and never guesses
- * a table (13.1, 13.6). An unusable resource is logged once at INFO, because a build that ships a
- * broken table for a protocol it advertises is worth seeing. Nothing here is ever invented at
- * runtime.
+ * to the caller: {@link Optional#empty()}, so the selection uses TCP and never guesses a table
+ * (13.1, 13.6). An unusable resource is logged once at INFO, because a build that ships a broken
+ * table for a protocol it advertises is worth seeing. Nothing here is ever invented at runtime.
  *
  * <p>No production resource ships yet: the tables are added with the version spread, and until then
- * this returns empty for every protocol number, which can only select {@code /2} or TCP (13.1).
+ * this returns empty for every protocol number, which can only select TCP (13.1).
  *
  * <p>Thread-safe. Results, including an empty one, are cached for the lifetime of the process: a
  * classpath resource cannot change while the process runs, and the selection runs on every connect.
@@ -48,7 +47,7 @@ public final class RoutingRegistry {
      * <p>Never throws for a missing or unusable resource. It does throw what
      * {@link Faults#check(String)} throws when the {@link Faults#V3_SELECT} stage is on, so the
      * pre-connect fault injection of the {@code /3} path reaches the registry too; the caller must
-     * carry on with {@code /2} or TCP in the same attempt.
+     * carry on with TCP in the same attempt.
      */
     public static Optional<RoutingTable> forProtocol(int protocolNumber) {
         Faults.check(Faults.V3_SELECT);
