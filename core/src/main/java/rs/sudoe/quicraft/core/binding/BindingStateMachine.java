@@ -30,6 +30,9 @@ import java.security.MessageDigest;
  * then they are wiped too.
  * This is best effort: the JVM may have copied the material (for example inside a
  * {@code SecretKeySpec} or a {@code Mac}) and Java has no way to erase those copies.</p>
+ *
+ * <p>Not thread-safe. Every call ({@link #start()}, {@link #receive(byte[])}, {@link #abort()})
+ * must run on the one thread that owns the connection, normally its event loop.</p>
  */
 public final class BindingStateMachine {
     /** online mode, docs/protocol.md §12.7. */
@@ -129,14 +132,11 @@ public final class BindingStateMachine {
         } catch (RuntimeException ignored) {
             return null;
         }
-        if (returned == null) {
+        // Check the length before copying, so a rejected value never leaves an unwiped copy.
+        if (returned == null || returned.length != EXPORTER_LENGTH) {
             return null;
         }
-        byte[] copy = returned.clone();
-        if (copy.length != EXPORTER_LENGTH) {
-            return null;
-        }
-        return copy;
+        return returned.clone();
     }
 
     private static void validateArguments(byte[] minecraftSecret, int mode,

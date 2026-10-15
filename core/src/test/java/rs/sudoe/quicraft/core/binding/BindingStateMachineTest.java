@@ -163,8 +163,23 @@ class BindingStateMachineTest {
     void abortWipesTagsSettlesAndIsIdempotent() throws Exception {
         BindingStateMachine server = onlineServer();
         assertFalse(server.isSettled());
+        byte[][] before = tagsOf(server).clone();
+        int nonZero = 0;
+        for (byte[] tag : before) {
+            for (byte b : tag) {
+                nonZero |= b;
+            }
+        }
+        assertTrue(nonZero != 0, "an online machine must hold nonzero tags before abort");
         server.abort();
         server.abort();
+        for (int i = 0; i < before.length; i++) {
+            if (before[i] != null) {
+                for (byte b : before[i]) {
+                    assertEquals(0, b, "precomputed tag " + i + " must be zeroed, not just dropped");
+                }
+            }
+        }
 
         assertTrue(server.isSettled());
         assertFalse(server.isActivated());
