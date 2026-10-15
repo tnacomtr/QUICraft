@@ -280,20 +280,13 @@ public final class ReceiverScheduler {
     /**
      * Query only, 13.12 node budget: true when the node could still carry {@code additionalBytes}.
      * The owner withholds QUIC receive credit ("the lane stops reading") exactly as it does for
-     * the per-connection budget, instead of starting bytes it could never charge. The probe
-     * reserves and immediately releases, so a concurrent connection may win the race and the
-     * later real reservation then follows the fatal {@code 0x11} path; never another connection's
-     * data.
+     * the per-connection budget, instead of starting bytes it could never charge. It reads
+     * {@link ReceiveBudget#available()}, so it reserves nothing and can never make another
+     * connection's real reservation fail; a real reservation that a concurrent connection wins
+     * the race for follows the fatal {@code 0x11} path, never another connection's data.
      */
     public boolean nodeCreditAvailable(long additionalBytes) {
-        if (additionalBytes <= 0) {
-            return true;
-        }
-        if (!node.tryReserve(additionalBytes)) {
-            return false;
-        }
-        node.release(additionalBytes);
-        return true;
+        return additionalBytes <= 0 || node.available() >= additionalBytes;
     }
 
     /**

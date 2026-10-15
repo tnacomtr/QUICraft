@@ -68,6 +68,18 @@ class ReceiveBudgetTest {
     }
 
     @Test
+    void theAvailableHeadroomIsTheCapacityMinusWhatIsReserved() {
+        assertEquals(Long.MAX_VALUE, ReceiveBudget.unlimited().available());
+        ReceiveBudget budget = ReceiveBudget.bounded(100);
+        assertEquals(100, budget.available());
+        assertTrue(budget.tryReserve(60));
+        assertEquals(40, budget.available());
+        budget.release(60);
+        assertEquals(100, budget.available());
+        assertEquals(0, ReceiveBudget.bounded(0).available());
+    }
+
+    @Test
     void manyConnectionsReservingAtOnceNeverOvercommitTheBudget() throws Exception {
         final int capacity = 4096;
         final int threads = 8;

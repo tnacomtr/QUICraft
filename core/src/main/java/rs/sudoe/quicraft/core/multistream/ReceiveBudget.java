@@ -42,6 +42,11 @@ public abstract class ReceiveBudget {
         public long reserved() {
             return 0;
         }
+
+        @Override
+        public long available() {
+            return Long.MAX_VALUE;
+        }
     };
 
     /**
@@ -81,6 +86,14 @@ public abstract class ReceiveBudget {
 
     /** The bytes currently reserved against this budget. */
     public abstract long reserved();
+
+    /**
+     * Query only: the bytes this budget could still reserve without exceeding its capacity, never
+     * negative. {@link #unlimited()} reports {@link Long#MAX_VALUE}. Unlike a
+     * {@link #tryReserve(long)} followed by {@link #release(long)}, it changes nothing, so a probe
+     * can never make another connection's real reservation fail.
+     */
+    public abstract long available();
 
     private static void require(long bytes) {
         if (bytes < 0) {
@@ -134,6 +147,12 @@ public abstract class ReceiveBudget {
         @Override
         public long reserved() {
             return reserved.get();
+        }
+
+        @Override
+        public long available() {
+            long free = capacity - reserved.get();
+            return free < 0 ? 0 : free;
         }
     }
 }

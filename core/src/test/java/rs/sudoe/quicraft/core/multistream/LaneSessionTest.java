@@ -368,6 +368,11 @@ class LaneSessionTest {
         public long reserved() {
             return delegate.reserved();
         }
+
+        @Override
+        public long available() {
+            return delegate.available();
+        }
     }
 
     @Test

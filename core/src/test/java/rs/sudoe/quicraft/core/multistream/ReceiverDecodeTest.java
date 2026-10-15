@@ -19,6 +19,55 @@ class ReceiverDecodeTest {
         assertEquals(0x11, assertThrows(OrderingException.class, action::run).closeCode());
     }
 
+    @Test
+    void theNodeCreditProbeIsAQueryThatNeverMutatesTheSharedBudget() {
+        RecordingBudget budget = new RecordingBudget(ReceiveBudget.bounded(100));
+        ReceiverScheduler scheduler = new ReceiverScheduler(
+                (envelope, insideBundle, now) -> { }, delivery -> { }, budget);
+        assertTrue(scheduler.nodeCreditAvailable(0), "a zero-byte grant is always available");
+        assertTrue(scheduler.nodeCreditAvailable(100));
+        assertFalse(scheduler.nodeCreditAvailable(101));
+        assertEquals(0, budget.tryReserves, "the probe must not reserve");
+        assertEquals(0, budget.releases, "the probe must not release");
+        assertEquals(2, budget.availableCalls);
+        assertEquals(0, budget.reserved());
+    }
+
+    /** Wraps a budget and counts what a scheduler asks of it. */
+    private static final class RecordingBudget extends ReceiveBudget {
+        private final ReceiveBudget delegate;
+        private int tryReserves;
+        private int releases;
+        private int availableCalls;
+
+        RecordingBudget(ReceiveBudget delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public boolean tryReserve(long bytes) {
+            tryReserves++;
+            return delegate.tryReserve(bytes);
+        }
+
+        @Override
+        public void release(long bytes) {
+            releases++;
+            delegate.release(bytes);
+        }
+
+        @Override
+        public long reserved() {
+            return delegate.reserved();
+        }
+
+        @Override
+        public long available() {
+            availableCalls++;
+            return delegate.available();
+        }
+    }
+
     private static final class Harness {
         final List<Envelope> requests = new ArrayList<Envelope>();
         final List<ReceiverScheduler.Delivery> deliveries = new ArrayList<ReceiverScheduler.Delivery>();
