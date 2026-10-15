@@ -174,6 +174,8 @@ public final class LaneSession {
     private boolean activated;
     private long activatedAt;
     private boolean closed;
+    /** A node-budget refusal withheld at least one lane: the tick retries and clears it. */
+    private boolean withheldForNode;
     private boolean processing;
     private boolean reprocess;
     private boolean draining;
@@ -732,10 +734,12 @@ public final class LaneSession {
      * for a legal record); otherwise reading waits and QUIC flow control pushes back. The same
      * amount, plus the chunk about to be read, must fit the shared node budget (13.12): a node
      * refusal withholds this lane's credit exactly like the per-connection budget, so this
-     * connection never starts bytes it could not charge.
+     * connection never starts bytes it could not charge. A node refusal is remembered in
+     * {@link #withheldForNode} so the tick retries once other connections have released space.
      */
     private boolean credit(Lane lane) {
         if (!receiver.nodeCreditAvailable(READ_CHUNK + MAX_RECORD_WIRE)) {
+            withheldForNode = true;
             return false;
         }
         if (lane == Lane.CONTROL) {
@@ -1062,6 +1066,16 @@ public final class LaneSession {
         }
         try {
             long t = now();
+            if (withheldForNode) {
+                // 13.12: another connection may have released node space since the refusal, so
+                // retry the withheld lanes before checking deadlines. process() sets the flag
+                // again when the node is still too full.
+                withheldForNode = false;
+                process();
+                if (closed) {
+                    return;
+                }
+            }
             receiver.checkDeadlines(t);
             sender.checkDeadlines(t);
             if (activated && peerStoppedReading()) {
