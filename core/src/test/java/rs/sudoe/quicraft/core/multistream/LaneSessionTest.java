@@ -52,7 +52,6 @@ class LaneSessionTest {
         assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() >= client + 2
                 && rig.serverGame.packetCount() >= server + 2, 10000), "round trip");
     }
-    }
 
     private static void assertPending(LaneSession receiver, int atLeast) throws Exception {
         assertTrue(LaneRig.await(() -> {
