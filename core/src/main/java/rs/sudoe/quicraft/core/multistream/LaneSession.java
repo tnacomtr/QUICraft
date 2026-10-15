@@ -33,7 +33,9 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * other than stream 0 to {@link #acceptStream} from the stream handler's {@code initChannel},
  * and call {@link #activate} at the activation point of 12.11/12.12. Before that the session
  * touches nothing on stream 0, which still belongs to the single-stream login code; after it, it
- * installs its handler first in stream 0's pipeline and never forwards events to older handlers.
+ * installs its handler first in stream 0's pipeline, removes the handlers that preceded it so the
+ * old single-stream owner can no longer read from or drive stream 0 (13.14), and never forwards
+ * events to older handlers.
  *
  * <p>Threading: the sequencer, the scheduler and every callback of {@link LaneGame} run on the
  * connection's event loop. {@link #send}, {@link #sendBundle}, {@link #end}, {@link #abort},
@@ -269,6 +271,11 @@ public final class LaneSession {
      * there. A server must therefore call this on the event loop before, or in the same task as,
      * the flush that sends SERVER_SWITCH (13.3): a queued activation could run after the client
      * has already opened stream 4, which is fatal.
+     *
+     * <p>From that point stream 0 belongs to this session (13.14): the handlers the single-stream
+     * owner installed before activation are removed from stream 0's pipeline so none of them can
+     * read from it, answer a peer FIN or drive its own bare FIN. The old owner must route its
+     * stream-0 close into {@link #end} (or {@link #abort}), never into its own FIN path.
      */
     public void activate(ByteBuffer controlLeftover) {
         final ByteBuf leftover = controlLeftover == null || !controlLeftover.hasRemaining() ? null
@@ -365,6 +372,10 @@ public final class LaneSession {
      * Normal shutdown (13.14): queues END as a full fence after everything submitted so far (send
      * any disconnect packet first). The peer closes with 0x0 when END is delivered; this side
      * closes after at most 10 seconds from the moment END is written. Later sends are dropped.
+     *
+     * <p>This is also the stream-0 close path after activation: the owner of the old single-stream
+     * handler hands over at {@link #activate} and must route its close here, because a bare FIN
+     * would make the peer close with 0x11 instead of a graceful END.
      */
     public void end() {
         run(this::doEnd);
@@ -540,6 +551,7 @@ public final class LaneSession {
         control.opened = true;
         streams[Lane.CONTROL.ordinal()] = control;
         controlChannel.pipeline().addFirst(control);
+        takeOverStreamZero(control);
         if (leftover != null) {
             control.inbound.add(leftover);
         }
@@ -585,6 +597,24 @@ public final class LaneSession {
         s.channel.writeAndFlush(s.channel.alloc().buffer(bytes.length).writeBytes(bytes))
                 .addListener(s.writeFailed);
         drain();
+    }
+
+    /**
+     * Stream-0 takeover of 13.14: after activation this session owns stream 0, so the handlers the
+     * single-stream owner installed before it are removed from stream 0's pipeline. They can no
+     * longer read bytes, answer a peer FIN or drive a bare FIN of their own, and the lane END/close
+     * path (see {@link #end}) is the only close left. The session's own lane handler stays first;
+     * a peer FIN that the lane handler does not forward no longer reaches them either.
+     */
+    private void takeOverStreamZero(LaneStream mine) {
+        io.netty.channel.ChannelPipeline pipeline = controlChannel.pipeline();
+        for (String name : new ArrayList<String>(pipeline.names())) {
+            io.netty.channel.ChannelHandler handler = pipeline.get(name);
+            if (handler != null && handler != mine) {
+                LOG.log(Level.FINE, "13.14: stream-0 takeover removes the handler {0}", name);
+                pipeline.remove(handler);
+            }
+        }
     }
 
     // --- Receive.

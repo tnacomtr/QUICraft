@@ -4,11 +4,16 @@ package rs.sudoe.quicraft.core.multistream;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.socket.ChannelInputShutdownReadComplete;
 import io.netty.handler.codec.quic.QuicChannel;
 import io.netty.handler.codec.quic.QuicStreamChannel;
+import io.netty.handler.codec.quic.QuicStreamType;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -729,6 +734,71 @@ class LaneSessionTest {
             channel(rig.client, Lane.REALTIME).shutdownInput(0x43);
             closedWith(rig.serverGame, 0x11, false);
             closedWith(rig.clientGame, 0x11, true);
+        }
+    }
+
+    @Test
+    void aBridgeSideCloseAfterActivationIsTakenOverByTheControlEndPath() throws Exception {
+        LaneRig.Config config = new LaneRig.Config();
+        config.serverSession = false;
+        config.clientTiming = new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
+                TimeUnit.MILLISECONDS.toNanos(400), TimeUnit.MILLISECONDS.toNanos(20));
+        try (LaneRig rig = LaneRig.start(config)) {
+            LegacyControlOwner bridge = new LegacyControlOwner();
+            rig.clientControl.pipeline().addLast(bridge);
+            rig.client.activate(null);
+            // The raw server answers both preambles so the client's two lanes open.
+            LaneLoopback.write(rig.serverRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 1);
+            QuicChannel server = rig.net.serverConnection.get(10, TimeUnit.SECONDS);
+            LaneLoopback.write(server.createStream(QuicStreamType.BIDIRECTIONAL,
+                    new ChannelInboundHandlerAdapter()).get(10, TimeUnit.SECONDS), (byte) 2, (byte) 2);
+            // The takeover of 13.14 removes the old single-stream owner from stream 0.
+            assertNull(rig.clientControl.pipeline().get(LegacyControlOwner.class),
+                    "activation takes stream 0 over from the old handler");
+            final LaneRig.Bytes controlBytes = new LaneRig.Bytes();
+            final java.util.concurrent.atomic.AtomicBoolean fin = new java.util.concurrent.atomic.AtomicBoolean();
+            rig.serverControl.pipeline().addLast(finWatch(fin));
+            rig.serverControl.pipeline().addLast(controlBytes);
+            // The lane path owns the close: END, never the old owner's bare FIN.
+            rig.client.end();
+            boolean closedPeersStream = LaneRig.await(() -> controlBytes.snapshot().length > 0, 10000);
+            LaneRig.Closed clientState = rig.clientGame.closed.isDone()
+                    ? rig.clientGame.closed.getNow(null) : null;
+            assertTrue(closedPeersStream, "the peer sees the record stream close (client: " + clientState + ")");
+            List<RecordCodec.Record> records = new RecordCodec.Decoder(true)
+                    .feed(java.nio.ByteBuffer.wrap(controlBytes.snapshot()));
+            assertEquals(RecordCodec.KIND_END, records.get(records.size() - 1).kind(),
+                    "the taken-over stream 0 closes with END, not a bare FIN");
+            assertFalse(fin.get(), "no bare FIN on the taken-over stream 0");
+            closedWith(rig.clientGame, 0x0, false);
+            sawClose(rig.net.serverSawClose, 0x0);
+        }
+    }
+
+    private static ChannelInboundHandlerAdapter finWatch(final java.util.concurrent.atomic.AtomicBoolean fin) {
+        return new ChannelInboundHandlerAdapter() {
+            @Override
+            public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+                if (evt instanceof ChannelInputShutdownReadComplete) {
+                    fin.set(true);
+                }
+                ctx.fireUserEventTriggered(evt);
+            }
+        };
+    }
+
+    /** A NettyQuicByteStream-like old stream-0 owner whose close sends a bare FIN. */
+    private static final class LegacyControlOwner extends ChannelInboundHandlerAdapter {
+        QuicStreamChannel channel;
+
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) {
+            channel = (QuicStreamChannel) ctx.channel();
+        }
+
+        /** The path 13.14 forbids after activation: a bare FIN instead of an END fence. */
+        void closeWithABareFin() {
+            channel.shutdownOutput();
         }
     }
 
