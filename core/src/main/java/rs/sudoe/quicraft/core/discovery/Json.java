@@ -42,7 +42,7 @@ public final class Json {
     }
 
     /** Parses {@code text}, letting the last of repeated member names win. */
-    public static Object parse(String text) {
+    static Object parse(String text) {
         return parse(text, false);
     }
 
