@@ -571,7 +571,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 ## 12. Channel binding, pinning and dropping Minecraft's cipher (Phase 5)
 
-**Draft v2, awaiting user sign-off and security review.**
+**Draft v2. Design approved by the user 2026-10-15 (open questions 1-4 as written below); implementation may proceed behind a disabled-by-default flag. Security review is required before any release or enablement.**
 
 ### Scope and capability gate
 
@@ -738,7 +738,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 ## 13. Multi-stream (Phase 5)
 
-**Draft v2, awaiting user sign-off and security review.**
+**Draft v2. Design approved by the user 2026-10-15 (open questions 1-4 as written below); implementation may proceed behind a disabled-by-default flag. Security review is required before any release or enablement.**
 
 ### Negotiation and stream map
 
@@ -914,7 +914,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
     requires measured loss improvement over TCP AND single-stream and security review;
     this draft makes no performance or completed-review claim.
 
-### OPEN QUESTIONS (user sign-off required)
+### DECIDED QUESTIONS (user, 2026-10-15: all four approved as written)
 
 1. Approve `/3`, the configuration-stage four-proof/switch exchange after OFFER, and the
    conservative exporter gate even for offline multi-stream tests?
