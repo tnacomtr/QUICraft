@@ -23,9 +23,21 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * preserving compression and protocol-state transitions. Game-specific stricter limits and
  * validation of routing/packet contents remain the adapter's responsibility.</p>
  *
- * <p>Not thread-safe. Every call and callback belongs on the owner's game executor. Time is a
- * caller-supplied monotonic nanosecond value. Any {@link OrderingException} requires closing the
- * whole connection; do not resume using this instance after failure.</p>
+ * <p>Pump priority: CONTROL is examined first, then REALTIME, then WORLD, and one decode or
+ * delivery is outstanding at a time. A continuously busy CONTROL lane can therefore starve an
+ * auxiliary lane; such starvation is bounded only by the 10 s blocked-head timer.</p>
+ *
+ * <p>Adapter contract: {@link #offer}, {@link #complete}, {@link #decoded} and {@link #applied}
+ * may call {@link Decoder#decode} and {@link Handler#deliver} inline on the caller's thread. An
+ * asynchronous decoder must call {@link #reserveDecoded} and {@link #decoded} back on that same
+ * single thread or executor. All calls use one monotonic {@code now} base, in nanoseconds.</p>
+ *
+ * <p>Not thread-safe: confine the instance, its callbacks and the transport glue to one thread
+ * (the channel event loop). Any {@link OrderingException} requires closing the whole connection
+ * with close code 0x11. If a {@link Decoder} or {@link Handler} callback throws any
+ * RuntimeException, the scheduler latches as failed: the exception is rethrown (wrapped in an
+ * {@link OrderingException} with the cause unless it already is one) and every later call throws
+ * {@link OrderingException} "scheduler failed". Do not resume using this instance after failure.</p>
  */
 public final class ReceiverScheduler {
     /** Combined pending record ceiling, including partials and staged/decoded records. */
@@ -189,6 +201,9 @@ public final class ReceiverScheduler {
     public boolean ended() {
         return ended;
     }
+    // The 64 CONTROL slots and the 1 MiB reserve follow 13.12's literal "at most 960 auxiliary
+    // records": auxiliary records are capped at 960 regardless of how many CONTROL records are
+    // pending, so CONTROL always keeps 64 slots and 1 MiB that auxiliary lanes cannot use.
     /** Query only. Transport must separately debit outstanding granted credit before granting more. */
     public boolean auxiliaryCreditAvailable(long additionalBytes, int additionalRecords) {
         return additionalBytes >= 0 && additionalRecords >= 0
