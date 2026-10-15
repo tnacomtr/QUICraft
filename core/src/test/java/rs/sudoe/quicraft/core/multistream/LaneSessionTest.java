@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.multistream;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.netty.handler.codec.quic.QuicChannel;
@@ -867,4 +868,54 @@ class LaneSessionTest {
         }
     }
 
+    @Test
+    void readChunksAndParserBuffersAreChargedToTheNodeBudgetUntilTheyAreConsumed() throws Exception {
+        // The budget must leave room for one 16 KiB read plus the largest legal record, otherwise
+        // no lane may start reading at all (13.12/13.13: never grant credit beyond the budget).
+        ReceiveBudget node = ReceiveBudget.bounded(3L << 20);
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        config.deferClientGame = true;
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.server.activate(null);
+            rig.client.activate(null);
+            rig.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "buffered"));
+            assertTrue(LaneRig.await(() -> node.reserved() > 0, 10000),
+                    "the unparsed chunk is charged while it is held: " + node.reserved());
+            sleep(300);
+            assertEquals(0, rig.clientGame.packetCount(), "nothing is delivered before the game is bound");
+            assertEquals(0, LaneRig.snapshot(rig.client)[0], "nothing is parsed before the game is bound");
+            rig.client.bindGame(rig.clientGame);
+            assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() == 1, 10000));
+            assertEquals("buffered", rig.clientGame.labels().get(0));
+            assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
+                    "consumed chunks and applied records release every charge: " + node.reserved());
+            assertFalse(rig.clientGame.closed.isDone());
+        }
+    }
+
+    // --- Deferred game binding (13.12).
+
+    @Test
+    void aGameBoundBeforeActivationRunsTheSessionNormally() throws Exception {
+        LaneRig.Config config = new LaneRig.Config();
+        config.deferClientGame = true;
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.client.bindGame(rig.clientGame);
+            rig.activateBoth();
+            roundTrip(rig);
+            assertFalse(rig.clientGame.closed.isDone());
+            assertFalse(rig.serverGame.closed.isDone());
+        }
+    }
+
+    @Test
+    void bindingTheGameTwiceIsRejected() throws Exception {
+        LaneRig.Config config = new LaneRig.Config();
+        config.deferClientGame = true;
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.client.bindGame(rig.clientGame);
+            assertThrows(IllegalStateException.class, () -> rig.client.bindGame(rig.clientGame));
+        }
+    }
 }

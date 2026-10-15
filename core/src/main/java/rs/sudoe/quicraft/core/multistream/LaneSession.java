@@ -209,6 +209,31 @@ public final class LaneSession {
     // --- Public API.
 
     /**
+     * Attaches the game side, at most once, before or after {@link #activate} (13.12). Bytes
+     * accepted while no game is bound stay buffered and undecoded under the receive limits;
+     * binding resumes parsing on the connection's event loop, in call order with the other calls
+     * from any thread.
+     */
+    public void bindGame(final LaneGame game) {
+        if (game == null) {
+            throw new IllegalArgumentException("game");
+        }
+        if (bound) {
+            throw new IllegalStateException("the game is already bound");
+        }
+        bound = true;
+        run(() -> doBindGame(game));
+    }
+
+    private void doBindGame(LaneGame bound) {
+        if (closed) {
+            return;
+        }
+        this.game = bound;
+        process();
+    }
+
+    /**
      * Activation (12.11/12.12): this side's switch is validated. Takes over stream 0, opens this
      * side's auxiliary stream (client stream 4, server stream 1) and starts the 10 second clock
      * for the peer's. {@code controlLeftover} holds bytes already read from stream 0 beyond the
@@ -451,6 +476,9 @@ public final class LaneSession {
     }
 
     private void notifyClosed(int code, boolean byPeer, Throwable cause) {
+        if (game == null) {
+            return;
+        }
         try {
             game.onClosed(code, byPeer, cause);
         } catch (Throwable t) {
@@ -659,6 +687,11 @@ public final class LaneSession {
                 s.opened = true;
                 continue;
             }
+            if (game == null) {
+                // 13.3/13.12: no game is bound yet, so nothing may be decoded or delivered. Keep the
+                // bytes already read buffered (they stay charged) and stop reading until bindGame().
+                break;
+            }
             if (!s.midRecord() && !credit(s.lane)) {
                 break;
             }
@@ -803,8 +836,12 @@ public final class LaneSession {
         }
         if (now != writable) {
             writable = now;
+            LaneGame attached = game;
+            if (attached == null) {
+                return;
+            }
             try {
-                game.onWritabilityChanged(now);
+                attached.onWritabilityChanged(now);
             } catch (Throwable t) {
                 LOG.log(Level.FINE, "game onWritabilityChanged failed", t);
             }
