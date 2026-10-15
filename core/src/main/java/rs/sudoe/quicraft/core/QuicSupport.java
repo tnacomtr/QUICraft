@@ -14,6 +14,7 @@ public final class QuicSupport {
     private static final Logger LOG = Logger.getLogger("QUICraft");
     private static volatile Boolean available;
     private static volatile Boolean relaxedLossThreshold;
+    private static volatile Boolean keyingMaterialExport;
 
     private QuicSupport() {}
 
@@ -60,6 +61,39 @@ public final class QuicSupport {
                     + " cause spurious retransmissions");
         } catch (Throwable t) {
             LOG.log(Level.INFO, "QUIC native without the relaxed loss threshold: {0}", String.valueOf(t));
+        }
+        return false;
+    }
+
+    /**
+     * True if the loaded native can export TLS keying material, which only QUICraft's patched
+     * build of Netty's QUIC native can (natives/patches/netty/0004, docs/protocol.md §12.2). With an
+     * upstream native, logs once at INFO and returns false: QUIC still works, but nothing that
+     * needs the exporter (channel binding, §12.3) may be selected.
+     */
+    public static boolean hasKeyingMaterialExport() {
+        Boolean result = keyingMaterialExport;
+        if (result == null) {
+            synchronized (QuicSupport.class) {
+                result = keyingMaterialExport;
+                if (result == null) {
+                    result = isAvailable() && probeKeyingMaterialExport();
+                    keyingMaterialExport = result;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static boolean probeKeyingMaterialExport() {
+        try {
+            if (Quic.isKeyingMaterialExportSupported()) {
+                return true;
+            }
+            LOG.log(Level.INFO, "QUIC native without the TLS keying material exporter;"
+                    + " channel binding is unavailable");
+        } catch (Throwable t) {
+            LOG.log(Level.INFO, "QUIC native without the TLS keying material exporter: {0}", String.valueOf(t));
         }
         return false;
     }

@@ -41,6 +41,14 @@ abstract class PreambleStream implements QuicByteStream, QuicByteStream.Listener
     }
 
     /**
+     * The Netty stream of the connection, for the package's own code that needs the connection
+     * rather than the game's view of it, e.g. {@link TlsExporter}.
+     */
+    final NettyQuicByteStream rawStream() {
+        return raw;
+    }
+
+    /**
      * Starts reading the peer's preamble, whatever the game wants. Separate from the constructor:
      * on the event loop, data already received may be delivered within this call.
      */
