@@ -282,6 +282,22 @@ public final class BindingStateMachine {
         return BindingResult.active(null);
     }
 
+    /**
+     * Aborts the exchange locally (docs/protocol.md §12.14: timeout, premature close or queue
+     * overflow) and wipes every precomputed tag, so nothing can be built from them afterwards. The
+     * machine becomes settled and failed: {@link #isActivated()} is false, {@link #expectedKind()}
+     * is null, {@link #start()} throws and every later {@link #receive(byte[])} reports
+     * {@link BindingFailure#ALREADY_SETTLED}. Idempotent, and a no-op once the machine has settled
+     * for any other reason.
+     */
+    public void abort() {
+        if (settled) {
+            return;
+        }
+        settled = true;
+        wipeTags();
+    }
+
     private BindingMessage offer() {
         return BindingMessage.of(BindingKind.OFFER, mode, protocolNumber, fingerprint, routing,
                 tags[BindingKind.OFFER.code()]);

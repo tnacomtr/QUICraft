@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
 import java.util.Arrays;
 import org.junit.jupiter.api.Test;
 
@@ -156,6 +157,58 @@ class BindingStateMachineTest {
         assertFalse(result.isFailed());
         assertNotNull(result.machine());
         assertNull(result.failure());
+    }
+
+    @Test
+    void abortWipesTagsSettlesAndIsIdempotent() throws Exception {
+        BindingStateMachine server = onlineServer();
+        assertFalse(server.isSettled());
+        server.abort();
+        server.abort();
+
+        assertTrue(server.isSettled());
+        assertFalse(server.isActivated());
+        assertNull(server.expectedKind());
+        byte[][] tags = tagsOf(server);
+        assertEquals(5, tags.length);
+        for (int i = 0; i < tags.length; i++) {
+            assertNull(tags[i], "precomputed tag " + i + " must be wiped");
+        }
+
+        // Every later call that would use a tag fails.
+        assertThrows(IllegalStateException.class, server::start);
+        assertEquals(BindingFailure.ALREADY_SETTLED, server.receive(new byte[103]).failure());
+    }
+
+    @Test
+    void abortMidExchangeStopsTheRemainingMessages() {
+        BindingStateMachine server = onlineServer();
+        BindingStateMachine client = onlineClient();
+        BindingResult offer = server.start();
+        assertTrue(client.receive(offer.message().encode()).isSend());
+
+        client.abort();
+        assertNull(client.expectedKind());
+        assertEquals(BindingFailure.ALREADY_SETTLED,
+                client.receive(offer.message().encode()).failure());
+        assertFalse(client.isActivated());
+        assertFalse(server.isSettled(), "abort is local to one endpoint");
+    }
+
+    @Test
+    void abortAfterSettlementChangesNothing() {
+        BindingStateMachine server = onlineServer();
+        BindingStateMachine client = onlineClient();
+        BindingResult cp = client.receive(server.start().message().encode());
+        BindingResult sp = server.receive(cp.message().encode());
+        BindingResult cs = client.receive(sp.message().encode());
+        BindingResult ss = server.receive(cs.message().encode());
+        assertTrue(server.isActivated());
+        server.abort();
+        assertTrue(server.isSettled());
+        assertTrue(server.isActivated());
+        assertEquals(BindingFailure.ALREADY_SETTLED, server.receive(ss.message().encode()).failure());
+        assertTrue(client.receive(ss.message().encode()).isActive());
     }
 
     @Test
@@ -396,6 +449,13 @@ class BindingStateMachineTest {
         byte[] transcript = BindingTranscript.compute(BindingTestData.PROTOCOL_NUMBER,
                 BindingTestData.MODE_ONLINE, F, R);
         return BindingTags.tag(key, kind, transcript, E);
+    }
+
+    /** Reads the private precomputed tags so a wipe can be asserted, not assumed. */
+    private static byte[][] tagsOf(BindingStateMachine machine) throws Exception {
+        Field field = BindingStateMachine.class.getDeclaredField("tags");
+        field.setAccessible(true);
+        return (byte[][]) field.get(machine);
     }
 
     private static byte[] tamper(byte[] payload) {
