@@ -36,6 +36,9 @@ import rs.sudoe.quicraft.core.discovery.Advertisement;
  *       fallback" setting of §4, except that {@code tcp-only} still returns {@code TCP}.
  * </ul>
  *
+ * <p>Every {@link Result} carries the blocker as a {@link Missing} value next to the prose reason, so
+ * a caller can branch on the rule without matching strings.
+ *
  * <p>Not in scope here: §6's failure cache and §5's racing, which stay with
  * {@link ConnectDecision} and {@code ConnectionRace}. The player's setting is
  * {@link ConnectDecision.Mode}, the same enum the shipped decision uses, so the two can never drift
@@ -91,6 +94,40 @@ public final class TransportSelection {
         CHANGED,
         /** The pin file is corrupt or unreadable; {@code /3} stays disabled until repaired (12.15). */
         STORE_UNUSABLE
+    }
+
+    /**
+     * Why {@link Result#transport()} is not {@link Transport#V3}, as a value a caller can switch on
+     * instead of matching the prose {@link Result#reason()}. When several blockers apply, this is the
+     * first one in the documented order the selection checks them: the setting, the advertisement,
+     * the pin store, the multistream flag, the exporter, a local routing table, the advertised
+     * digest, and the changed-pin re-bind backoff.
+     */
+    public enum Missing {
+        /** Nothing blocked {@code /3}: it was selected, so no blocker applies. */
+        NONE,
+        /** The player set {@code tcp-only}, which never selects a QUIC transport (§4). */
+        TCP_ONLY_SETTING,
+        /** There is no advertisement for the server (§1). */
+        NO_ADVERTISEMENT,
+        /** The advertisement names an ALPN this client does not offer (13.1). */
+        UNKNOWN_ALPN,
+        /** The listener advertises {@code quicraft/2}, so it offers no {@code /3} (13.1). */
+        ONLY_V2_ADVERTISED,
+        /** The client multistream flag is off (12.1). */
+        MULTISTREAM_FLAG_OFF,
+        /** The TLS exporter capability probe failed (12.3). */
+        NO_EXPORTER,
+        /** The client has no routing table for its protocol number (12.3, 13.1). */
+        NO_LOCAL_ROUTING_TABLE,
+        /** The advertisement has no routing digest for the client's protocol number (13.1). */
+        NO_ADVERTISED_DIGEST,
+        /** The advertised digest for the client's protocol number differs from the local one (13.1). */
+        DIGEST_MISMATCH,
+        /** The changed-pin re-bind backoff has not elapsed, so this attempt uses fresh TCP (12.16). */
+        REBIND_BACKOFF,
+        /** The pin store is unusable, which disables {@code /3} until it is repaired (12.15). */
+        PIN_STORE_UNUSABLE
     }
 
     /**
@@ -284,15 +321,18 @@ public final class TransportSelection {
     /**
      * What to use, and why. {@code transport} is the decision; {@code reason} is a short sentence
      * naming the rule and its spec section, fit to be shown to the player or written to a log (12.15
-     * requires the player to be told the pin store is unusable).
+     * requires the player to be told the pin store is unusable); {@code missing} is the same blocker
+     * as a {@link Missing} value, for code that must not match on prose.
      */
     public static final class Result {
         private final Transport transport;
         private final String reason;
+        private final Missing missing;
 
-        private Result(Transport transport, String reason) {
+        private Result(Transport transport, String reason, Missing missing) {
             this.transport = transport;
             this.reason = reason;
+            this.missing = missing;
         }
 
         public Transport transport() {
@@ -301,6 +341,11 @@ public final class TransportSelection {
 
         public String reason() {
             return reason;
+        }
+
+        /** Why this is not {@code V3}: {@link Missing#NONE} only when {@link #transport()} is V3. */
+        public Missing missing() {
+            return missing;
         }
 
         public boolean isFail() {
@@ -313,12 +358,12 @@ public final class TransportSelection {
                 return false;
             }
             Result other = (Result) o;
-            return transport == other.transport && reason.equals(other.reason);
+            return transport == other.transport && reason.equals(other.reason) && missing == other.missing;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(transport, reason);
+            return Objects.hash(transport, reason, missing);
         }
 
         @Override
@@ -334,15 +379,17 @@ public final class TransportSelection {
     public static Result select(Inputs inputs) {
         Objects.requireNonNull(inputs, "inputs");
         if (inputs.setting() == ConnectDecision.Mode.TCP_ONLY) {
-            return decide(inputs, Transport.TCP, "the player set tcp-only (protocol §4)");
+            return decide(inputs, Transport.TCP, "the player set tcp-only (protocol §4)",
+                    Missing.TCP_ONLY_SETTING);
         }
         Optional<Advertisement> advertisement = inputs.advertisement();
         if (!advertisement.isPresent()) {
             if (inputs.pinState() == PinState.STORE_UNUSABLE) {
                 return decide(inputs, Transport.TCP, "there is no advertisement for this server "
-                        + "(protocol §1); " + PIN_STORE_UNUSABLE);
+                        + "(protocol §1); " + PIN_STORE_UNUSABLE, Missing.PIN_STORE_UNUSABLE);
             }
-            return decide(inputs, Transport.TCP, "there is no advertisement for this server (protocol §1)");
+            return decide(inputs, Transport.TCP, "there is no advertisement for this server (protocol §1)",
+                    Missing.NO_ADVERTISEMENT);
         }
         Advertisement ad = advertisement.get();
         if (Protocol.ALPN_V3.equals(ad.alpn())) {
@@ -354,7 +401,7 @@ public final class TransportSelection {
         // Unreachable through extract, extractForSelection and of, which all reject an unknown ALPN.
         // It stays explicit so no ALPN other than quicraft/2 can ever be treated as /2 (13.1).
         return decide(inputs, Transport.TCP,
-                "the advertisement names an ALPN this client does not offer (13.1)");
+                "the advertisement names an ALPN this client does not offer (13.1)", Missing.UNKNOWN_ALPN);
     }
 
     /**
@@ -364,12 +411,15 @@ public final class TransportSelection {
     private static Result selectV2(Inputs inputs) {
         if (inputs.pinState() == PinState.CHANGED) {
             return decide(inputs, Transport.TCP, "the advertised fingerprint differs from the pin and "
-                    + "only quicraft/2 is advertised, but a re-bind needs /3 (12.16); using fresh TCP");
+                    + "only quicraft/2 is advertised, but a re-bind needs /3 (12.16); using fresh TCP",
+                    Missing.ONLY_V2_ADVERTISED);
         }
         if (inputs.pinState() == PinState.STORE_UNUSABLE) {
-            return decide(inputs, Transport.V2, PIN_STORE_UNUSABLE + ", using /2");
+            return decide(inputs, Transport.V2, PIN_STORE_UNUSABLE + ", using /2",
+                    Missing.PIN_STORE_UNUSABLE);
         }
-        return decide(inputs, Transport.V2, "the server advertises quicraft/2 (13.1)");
+        return decide(inputs, Transport.V2, "the server advertises quicraft/2 (13.1)",
+                Missing.ONLY_V2_ADVERTISED);
     }
 
     /**
@@ -379,56 +429,76 @@ public final class TransportSelection {
      */
     private static Result selectV3(Inputs inputs, Advertisement ad) {
         if (inputs.pinState() == PinState.STORE_UNUSABLE) {
-            return decide(inputs, Transport.V2, PIN_STORE_UNUSABLE + ", using /2");
+            return decide(inputs, Transport.V2, PIN_STORE_UNUSABLE + ", using /2",
+                    Missing.PIN_STORE_UNUSABLE);
         }
-        String missing = missingPrerequisite(inputs, ad);
+        Missing missing = missingPrerequisite(inputs, ad);
         if (inputs.pinState() == PinState.CHANGED) {
             if (!inputs.rebindAllowed()) {
                 return decide(inputs, Transport.TCP, "the changed-pin re-bind backoff is active (12.16); "
-                        + "using fresh TCP");
+                        + "using fresh TCP", Missing.REBIND_BACKOFF);
             }
-            if (missing != null) {
-                return decide(inputs, Transport.TCP, "a changed pin needs /3, but " + missing
-                        + " (12.16, 13.1); using fresh TCP without trusting F'");
+            if (missing != Missing.NONE) {
+                return decide(inputs, Transport.TCP, "a changed pin needs /3, but " + describe(missing, inputs)
+                        + " (12.16, 13.1); using fresh TCP without trusting F'", missing);
             }
             return decide(inputs, Transport.V3, "the one automatic re-bind attempt uses /3 with the "
-                    + "advertised fingerprint F' (12.16)");
+                    + "advertised fingerprint F' (12.16)", Missing.NONE);
         }
-        if (missing != null) {
-            return decide(inputs, Transport.V2, "quicraft/3 is advertised, but " + missing
-                    + "; using /2, which a /3 listener also accepts (13.1)");
+        if (missing != Missing.NONE) {
+            return decide(inputs, Transport.V2, "quicraft/3 is advertised, but " + describe(missing, inputs)
+                    + "; using /2, which a /3 listener also accepts (13.1)", missing);
         }
         return decide(inputs, Transport.V3, "quicraft/3 is advertised and the routing digest for "
-                + "protocol " + inputs.clientProtocolNumber() + " matches the local one (13.1)");
+                + "protocol " + inputs.clientProtocolNumber() + " matches the local one (13.1)",
+                Missing.NONE);
     }
 
     /**
-     * The first 12.3/13.1 prerequisite that a {@code /3} selection is missing, as a phrase to
-     * embed in a reason, or {@code null} when they all hold: the enabled multistream flag, a
-     * successful exporter probe, a local routing table for the client's protocol number, and an
-     * advertised digest for that number equal to the local one.
+     * The first 12.3/13.1 prerequisite that a {@code /3} selection is missing, or
+     * {@link Missing#NONE} when they all hold: the enabled multistream flag, a successful exporter
+     * probe, a local routing table for the client's protocol number, and an advertised digest for
+     * that number equal to the local one.
      */
-    private static String missingPrerequisite(Inputs inputs, Advertisement ad) {
+    private static Missing missingPrerequisite(Inputs inputs, Advertisement ad) {
         if (!inputs.multistreamEnabled()) {
-            return "the client multistream flag is off (12.1)";
+            return Missing.MULTISTREAM_FLAG_OFF;
         }
         if (!inputs.exporterCapable()) {
-            return "the TLS exporter capability probe failed (12.3)";
+            return Missing.NO_EXPORTER;
         }
         if (!inputs.localRoutingDigestHex().isPresent()) {
-            return "the client has no routing table for protocol " + inputs.clientProtocolNumber()
-                    + " (12.3, 13.1)";
+            return Missing.NO_LOCAL_ROUTING_TABLE;
         }
         Optional<String> advertised = ad.routingDigest(inputs.clientProtocolNumber());
         if (!advertised.isPresent()) {
-            return "the advertisement has no routing digest for protocol "
-                    + inputs.clientProtocolNumber() + " (13.1)";
+            return Missing.NO_ADVERTISED_DIGEST;
         }
         if (!advertised.get().equals(DIGEST_PREFIX + inputs.localRoutingDigestHex().get())) {
-            return "the advertised routing digest for protocol " + inputs.clientProtocolNumber()
-                    + " differs from the local one (13.1)";
+            return Missing.DIGEST_MISMATCH;
         }
-        return null;
+        return Missing.NONE;
+    }
+
+    /** The reason phrase of a missing prerequisite, or of {@link Missing#NONE} for none of them. */
+    private static String describe(Missing missing, Inputs inputs) {
+        switch (missing) {
+            case MULTISTREAM_FLAG_OFF:
+                return "the client multistream flag is off (12.1)";
+            case NO_EXPORTER:
+                return "the TLS exporter capability probe failed (12.3)";
+            case NO_LOCAL_ROUTING_TABLE:
+                return "the client has no routing table for protocol " + inputs.clientProtocolNumber()
+                        + " (12.3, 13.1)";
+            case NO_ADVERTISED_DIGEST:
+                return "the advertisement has no routing digest for protocol "
+                        + inputs.clientProtocolNumber() + " (13.1)";
+            case DIGEST_MISMATCH:
+                return "the advertised routing digest for protocol " + inputs.clientProtocolNumber()
+                        + " differs from the local one (13.1)";
+            default:
+                return "no /3 prerequisite is missing";
+        }
     }
 
     /**
@@ -436,11 +506,11 @@ public final class TransportSelection {
      * because every other transport is QUIC. {@code tcp-only} is handled before this and is never
      * turned into a failure.
      */
-    private static Result decide(Inputs inputs, Transport transport, String reason) {
+    private static Result decide(Inputs inputs, Transport transport, String reason, Missing missing) {
         if (transport == Transport.TCP && inputs.setting() == ConnectDecision.Mode.QUIC_ONLY) {
             return new Result(Transport.FAIL, reason
-                    + "; quic-only has no TCP fallback, so the connection fails (protocol §4)");
+                    + "; quic-only has no TCP fallback, so the connection fails (protocol §4)", missing);
         }
-        return new Result(transport, reason);
+        return new Result(transport, reason, missing);
     }
 }
