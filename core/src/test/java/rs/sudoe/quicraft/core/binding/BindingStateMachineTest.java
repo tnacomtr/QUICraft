@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.core.binding;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -23,13 +24,18 @@ class BindingStateMachineTest {
     private static final byte[] ZEROS = new byte[32];
 
     private static BindingStateMachine onlineClient() {
-        return BindingStateMachine.client(BindingTestData.exporter(E), S,
-                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        return machine(BindingStateMachine.client(BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
     }
 
     private static BindingStateMachine onlineServer() {
-        return BindingStateMachine.server(BindingTestData.exporter(E), S,
-                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        return machine(BindingStateMachine.server(BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
+    }
+
+    private static BindingStateMachine machine(BindingMachineResult result) {
+        assertNotNull(result.machine(), "expected a machine but got " + result);
+        return result.machine();
     }
 
     private static BindingMessage message(BindingKind kind, int mode, int protocol, byte[] tag) {
@@ -74,14 +80,92 @@ class BindingStateMachineTest {
         assertArrayEquals(serverSwitch.message().tag(), clientTag(BindingKind.SERVER_SWITCH));
     }
 
+    /**
+     * Regression: one {@link ExporterSource} may hand out the same array instance forever, because it
+     * keeps ownership of it. Building a machine must therefore never wipe the source's array, or a
+     * second machine derived from it would work with a zeroed exporter value.
+     */
+    @Test
+    void oneExporterArrayInstanceCanBackTwoMachines() {
+        byte[] shared = BindingTestData.hex(BindingTestData.E_HEX);
+        byte[] expected = shared.clone();
+        ExporterSource source = () -> shared;
+
+        BindingStateMachine server = machine(BindingStateMachine.server(source, S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
+        BindingStateMachine client = machine(BindingStateMachine.client(source, S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
+
+        BindingResult offer = server.start();
+        assertTrue(offer.isSend());
+        BindingResult clientProof = client.receive(offer.message().encode());
+        assertArrayEquals(clientTag(BindingKind.CLIENT_PROOF), clientProof.message().tag());
+        BindingResult serverProof = server.receive(clientProof.message().encode());
+        assertArrayEquals(clientTag(BindingKind.SERVER_PROOF), serverProof.message().tag());
+        BindingResult clientSwitch = client.receive(serverProof.message().encode());
+        assertArrayEquals(clientTag(BindingKind.CLIENT_SWITCH), clientSwitch.message().tag());
+        BindingResult serverSwitch = server.receive(clientSwitch.message().encode());
+        assertTrue(serverSwitch.isActive());
+        assertArrayEquals(clientTag(BindingKind.SERVER_SWITCH), serverSwitch.message().tag());
+        assertTrue(client.receive(serverSwitch.message().encode()).isActive());
+        assertTrue(client.isActivated() && server.isActivated());
+
+        assertArrayEquals(expected, shared, "the exporter source keeps ownership of its array");
+    }
+
+    @Test
+    void buildingAMachineLeavesTheSharedFixtureExporterValueIntact() {
+        onlineServer();
+        onlineClient();
+        assertArrayEquals(BindingTestData.hex(BindingTestData.E_HEX), E,
+                "the shared fixture E must survive a machine build");
+    }
+
+    @Test
+    void exporterFailureIsATypedFailureAndNotAnException() {
+        ExporterSource throwing = () -> {
+            throw new IllegalStateException("no exporter value");
+        };
+        BindingMachineResult thrown = BindingStateMachine.client(throwing, S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        assertTrue(thrown.isFailed());
+        assertEquals(BindingFailure.EXPORTER_ERROR, thrown.failure());
+        assertNull(thrown.machine());
+
+        BindingMachineResult absent = BindingStateMachine.client(() -> null, S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        assertTrue(absent.isFailed());
+        assertEquals(BindingFailure.EXPORTER_ERROR, absent.failure());
+
+        BindingMachineResult tooShort = BindingStateMachine.server(BindingTestData.exporter(new byte[16]), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        assertTrue(tooShort.isFailed());
+        assertEquals(BindingFailure.EXPORTER_ERROR, tooShort.failure());
+
+        // Offline mode has no S, but the exchange still needs the exporter value (§12.3, §12.19).
+        BindingMachineResult offline = BindingStateMachine.client(() -> null, null,
+                BindingTestData.MODE_OFFLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        assertEquals(BindingFailure.EXPORTER_ERROR, offline.failure());
+    }
+
+    @Test
+    void aSuccessfulBuildCarriesOnlyTheMachine() {
+        BindingMachineResult result = BindingStateMachine.client(BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        assertTrue(result.isOk());
+        assertFalse(result.isFailed());
+        assertNotNull(result.machine());
+        assertNull(result.failure());
+    }
+
     @Test
     void wrongExporterValueFails() {
-        BindingStateMachine server = BindingStateMachine.server(
+        BindingStateMachine server = machine(BindingStateMachine.server(
                 BindingTestData.exporter(BindingTestData.hex(BindingTestData.E_HEX)), S,
-                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
-        BindingStateMachine client = BindingStateMachine.client(
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
+        BindingStateMachine client = machine(BindingStateMachine.client(
                 BindingTestData.exporter(new byte[32]), S,
-                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
 
         BindingResult offer = server.start();
         BindingResult clientProof = client.receive(offer.message().encode());
@@ -91,9 +175,9 @@ class BindingStateMachineTest {
 
     @Test
     void wrongMinecraftSecretFails() {
-        BindingStateMachine server = BindingStateMachine.server(BindingTestData.exporter(E),
+        BindingStateMachine server = machine(BindingStateMachine.server(BindingTestData.exporter(E),
                 BindingTestData.hex("ffffffffffffffffffffffffffffffff"),
-                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
         BindingStateMachine client = onlineClient();
 
         BindingResult clientProof = client.receive(server.start().message().encode());
@@ -104,8 +188,8 @@ class BindingStateMachineTest {
     void wrongFingerprintFails() {
         byte[] otherF = new byte[32];
         Arrays.fill(otherF, (byte) 7);
-        BindingStateMachine server = BindingStateMachine.server(BindingTestData.exporter(E), S,
-                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, otherF, R);
+        BindingStateMachine server = machine(BindingStateMachine.server(BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, otherF, R));
         BindingStateMachine client = onlineClient();
 
         assertEquals(BindingFailure.WRONG_FINGERPRINT,
@@ -116,8 +200,8 @@ class BindingStateMachineTest {
     void wrongRoutingDigestFails() {
         byte[] otherR = new byte[32];
         Arrays.fill(otherR, (byte) 9);
-        BindingStateMachine server = BindingStateMachine.server(BindingTestData.exporter(E), S,
-                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, otherR);
+        BindingStateMachine server = machine(BindingStateMachine.server(BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, otherR));
         BindingStateMachine client = onlineClient();
 
         assertEquals(BindingFailure.WRONG_ROUTING,
@@ -126,8 +210,8 @@ class BindingStateMachineTest {
 
     @Test
     void wrongModeFails() {
-        BindingStateMachine offlineServer = BindingStateMachine.server(BindingTestData.exporter(E), null,
-                BindingTestData.MODE_OFFLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        BindingStateMachine offlineServer = machine(BindingStateMachine.server(BindingTestData.exporter(E), null,
+                BindingTestData.MODE_OFFLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
         BindingStateMachine onlineClient = onlineClient();
 
         assertEquals(BindingFailure.WRONG_MODE,
@@ -136,8 +220,8 @@ class BindingStateMachineTest {
 
     @Test
     void wrongProtocolNumberFails() {
-        BindingStateMachine server = BindingStateMachine.server(BindingTestData.exporter(E), S,
-                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER + 1, F, R);
+        BindingStateMachine server = machine(BindingStateMachine.server(BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER + 1, F, R));
         BindingStateMachine client = onlineClient();
 
         assertEquals(BindingFailure.WRONG_PROTOCOL,
@@ -231,17 +315,17 @@ class BindingStateMachineTest {
 
     @Test
     void offlineModeUsesZeroTagsAndCompletes() {
-        BindingStateMachine server = BindingStateMachine.server(BindingTestData.exporter(E), null,
-                BindingTestData.MODE_OFFLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
-        BindingStateMachine client = BindingStateMachine.client(BindingTestData.exporter(E), null,
-                BindingTestData.MODE_OFFLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        BindingStateMachine server = machine(BindingStateMachine.server(BindingTestData.exporter(E), null,
+                BindingTestData.MODE_OFFLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
+        BindingStateMachine client = machine(BindingStateMachine.client(BindingTestData.exporter(E), null,
+                BindingTestData.MODE_OFFLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
         assertOfflineHappyPath(server, client);
     }
 
     @Test
     void offlineModeRejectsNonZeroTag() throws Exception {
-        BindingStateMachine server = BindingStateMachine.server(BindingTestData.exporter(E), null,
-                BindingTestData.MODE_OFFLINE, BindingTestData.PROTOCOL_NUMBER, F, R);
+        BindingStateMachine server = machine(BindingStateMachine.server(BindingTestData.exporter(E), null,
+                BindingTestData.MODE_OFFLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
         assertTrue(server.start().isSend());
         byte[] clientProof = message(BindingKind.CLIENT_PROOF, BindingTestData.MODE_OFFLINE,
                 BindingTestData.PROTOCOL_NUMBER, BindingTags.zeros()).encode();
@@ -270,10 +354,9 @@ class BindingStateMachineTest {
     }
 
     @Test
-    void badExporterLengthIsRejectedAtConstruction() {
+    void missingExporterSourceIsAProgrammingError() {
         assertThrows(IllegalArgumentException.class, () -> BindingStateMachine.client(
-                BindingTestData.exporter(new byte[16]), S,
-                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
+                null, S, BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
     }
 
     @Test
@@ -284,6 +367,13 @@ class BindingStateMachineTest {
         assertThrows(IllegalArgumentException.class, () -> BindingStateMachine.client(
                 BindingTestData.exporter(E), new byte[8],
                 BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, F, R));
+    }
+
+    @Test
+    void invalidModeIsRejectedBeforeTheExporterIsTouched() {
+        assertThrows(IllegalArgumentException.class, () -> BindingStateMachine.client(
+                BindingTestData.exporter(E), S,
+                2, BindingTestData.PROTOCOL_NUMBER, F, R));
     }
 
     private static void assertOfflineHappyPath(BindingStateMachine server, BindingStateMachine client) {

@@ -18,9 +18,16 @@ import java.security.MessageDigest;
  * received payloads to {@link #receive(byte[])} and sends whatever {@link BindingResult} asks for.
  * The cipher cutover and quiescence rules of §12.10-12.13 are the transport's responsibility.</p>
  *
+ * <p>Machines are built through {@link #client} and {@link #server}, which resolve the exporter
+ * value first. An exporter that fails is therefore reported as the typed
+ * {@link BindingFailure#EXPORTER_ERROR} of {@link BindingMachineResult} instead of thrown
+ * (docs/protocol.md §12.3, §12.14). The machine derives from a private copy of the exporter value:
+ * the {@link ExporterSource} keeps ownership of the array it returns, which is never modified.</p>
+ *
  * <p>Secret hygiene: {@code S}, the intermediate PRK, {@code K}, the exporter value {@code E} and
- * the transcript are all wiped as soon as the per-kind tags have been derived, which happens in the
- * constructor. Only the per-kind tags survive until the exchange settles, then they are wiped too.
+ * the transcript are all wiped as soon as the per-kind tags have been derived, which happens while
+ * the machine is built. Only the per-kind tags survive until the exchange settles or is aborted,
+ * then they are wiped too.
  * This is best effort: the JVM may have copied the material (for example inside a
  * {@code SecretKeySpec} or a {@code Mac}) and Java has no way to erase those copies.</p>
  */
@@ -29,6 +36,9 @@ public final class BindingStateMachine {
     public static final int MODE_ONLINE = 1;
     /** offline test mode, docs/protocol.md §12.19. */
     public static final int MODE_OFFLINE = 0;
+
+    /** The only accepted exporter value length, docs/protocol.md §12.7. */
+    private static final int EXPORTER_LENGTH = 32;
 
     public enum Role {
         CLIENT,
@@ -50,11 +60,87 @@ public final class BindingStateMachine {
     private boolean activated;
     private BindingFailure failure;
 
-    private BindingStateMachine(Role role, ExporterSource exporter, byte[] minecraftSecret,
+    private BindingStateMachine(Role role, byte[] exporterValue, byte[] minecraftSecret,
                                 int mode, int protocolNumber, byte[] fingerprint, byte[] routing) {
+        validateArguments(minecraftSecret, mode, fingerprint, routing);
+        if (exporterValue == null || exporterValue.length != EXPORTER_LENGTH) {
+            throw new IllegalArgumentException("exporter value must be exactly 32 raw bytes");
+        }
+        this.role = role;
+        this.mode = mode;
+        this.protocolNumber = protocolNumber;
+        this.fingerprint = fingerprint.clone();
+        this.routing = routing.clone();
+        this.expected = role == Role.CLIENT ? BindingKind.OFFER : null;
+        deriveTags(exporterValue, minecraftSecret);
+    }
+
+    /**
+     * A client-side machine. The next inbound message must be OFFER.
+     *
+     * @return a machine, or {@link BindingFailure#EXPORTER_ERROR} when the exporter value cannot be
+     *     obtained
+     */
+    public static BindingMachineResult client(ExporterSource exporter, byte[] minecraftSecret,
+                                              int mode, int protocolNumber,
+                                              byte[] fingerprint, byte[] routing) {
+        return build(Role.CLIENT, exporter, minecraftSecret, mode, protocolNumber, fingerprint,
+                routing);
+    }
+
+    /**
+     * A server-side machine. The first action is {@link #start()}, which yields OFFER.
+     *
+     * @return a machine, or {@link BindingFailure#EXPORTER_ERROR} when the exporter value cannot be
+     *     obtained
+     */
+    public static BindingMachineResult server(ExporterSource exporter, byte[] minecraftSecret,
+                                              int mode, int protocolNumber,
+                                              byte[] fingerprint, byte[] routing) {
+        return build(Role.SERVER, exporter, minecraftSecret, mode, protocolNumber, fingerprint,
+                routing);
+    }
+
+    private static BindingMachineResult build(Role role, ExporterSource exporter,
+                                              byte[] minecraftSecret, int mode, int protocolNumber,
+                                              byte[] fingerprint, byte[] routing) {
         if (exporter == null) {
             throw new IllegalArgumentException("exporter is required");
         }
+        // Local misuse stays an exception; only the exporter itself can fail at run time.
+        validateArguments(minecraftSecret, mode, fingerprint, routing);
+        byte[] exporterValue = export(exporter);
+        if (exporterValue == null) {
+            return BindingMachineResult.failed(BindingFailure.EXPORTER_ERROR);
+        }
+        return BindingMachineResult.ok(new BindingStateMachine(role, exporterValue, minecraftSecret,
+                mode, protocolNumber, fingerprint, routing));
+    }
+
+    /**
+     * Resolves the exporter value into a private copy this machine owns, or null for an exporter
+     * error: a source that throws, returns null or returns another length (docs/protocol.md §12.3,
+     * §12.14). Only the copy is ever wiped, so the source keeps ownership of its own array.
+     */
+    private static byte[] export(ExporterSource exporter) {
+        byte[] returned;
+        try {
+            returned = exporter.export();
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+        if (returned == null) {
+            return null;
+        }
+        byte[] copy = returned.clone();
+        if (copy.length != EXPORTER_LENGTH) {
+            return null;
+        }
+        return copy;
+    }
+
+    private static void validateArguments(byte[] minecraftSecret, int mode,
+                                          byte[] fingerprint, byte[] routing) {
         if (mode != MODE_OFFLINE && mode != MODE_ONLINE) {
             throw new IllegalArgumentException("mode must be 0 (offline) or 1 (online)");
         }
@@ -63,40 +149,14 @@ public final class BindingStateMachine {
         if (mode == MODE_ONLINE && (minecraftSecret == null || minecraftSecret.length != 16)) {
             throw new IllegalArgumentException("online mode needs Minecraft's 16-byte shared secret");
         }
-        this.role = role;
-        this.mode = mode;
-        this.protocolNumber = protocolNumber;
-        this.fingerprint = fingerprint.clone();
-        this.routing = routing.clone();
-        this.expected = role == Role.CLIENT ? BindingKind.OFFER : null;
-        deriveTags(exporter, minecraftSecret);
-    }
-
-    /** A client-side machine. The next inbound message must be OFFER. */
-    public static BindingStateMachine client(ExporterSource exporter, byte[] minecraftSecret,
-                                             int mode, int protocolNumber,
-                                             byte[] fingerprint, byte[] routing) {
-        return new BindingStateMachine(Role.CLIENT, exporter, minecraftSecret, mode, protocolNumber,
-                fingerprint, routing);
-    }
-
-    /** A server-side machine. The first action is {@link #start()}, which yields OFFER. */
-    public static BindingStateMachine server(ExporterSource exporter, byte[] minecraftSecret,
-                                             int mode, int protocolNumber,
-                                             byte[] fingerprint, byte[] routing) {
-        return new BindingStateMachine(Role.SERVER, exporter, minecraftSecret, mode, protocolNumber,
-                fingerprint, routing);
     }
 
     /**
-     * Precomputes the tags for the four authenticated kinds, then wipes every secret input. In
-     * offline mode the tags are all zeros (docs/protocol.md §12.19) and no key is derived.
+     * Precomputes the tags for the four authenticated kinds, then wipes every secret input,
+     * including the machine's own copy of the exporter value. In offline mode the tags are all
+     * zeros (docs/protocol.md §12.19) and no key is derived.
      */
-    private void deriveTags(ExporterSource exporter, byte[] minecraftSecret) {
-        byte[] exporterValue = exporter.export();
-        if (exporterValue == null || exporterValue.length != 32) {
-            throw new IllegalArgumentException("exporter must return exactly 32 bytes");
-        }
+    private void deriveTags(byte[] exporterValue, byte[] minecraftSecret) {
         byte[] transcript = BindingTranscript.compute(protocolNumber, mode, fingerprint, routing);
         byte[] secretCopy = minecraftSecret == null ? null : minecraftSecret.clone();
         byte[] key = null;

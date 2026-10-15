@@ -10,8 +10,14 @@ package rs.sudoe.quicraft.core.binding;
  */
 public interface ExporterSource {
     /**
-     * Returns exactly 32 bytes. Consequences of other lengths are handled by the caller as an
-     * exporter error (fatal, docs/protocol.md §12.14).
+     * Returns the 32-byte exporter value {@code E} of docs/protocol.md §12.7. The implementation
+     * keeps ownership of the array it returns: handing out the same instance on every call is
+     * safe, and callers must neither modify nor wipe it. {@link BindingStateMachine} derives from a
+     * private copy and wipes only that copy. A source that throws, returns null or returns another
+     * length is an exporter error (fatal, docs/protocol.md §12.3, §12.14), reported by the machine
+     * factories as {@link BindingFailure#EXPORTER_ERROR}.
+     *
+     * @return exactly 32 raw bytes
      */
     byte[] export();
 }

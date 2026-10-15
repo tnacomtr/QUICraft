@@ -35,7 +35,8 @@ final class BindingTestData {
         return sb.toString();
     }
 
+    /** A source that hands out a private copy of {@code value} on every call, so no machine can wipe the fixture. */
     static ExporterSource exporter(byte[] value) {
-        return () -> value;
+        return () -> value.clone();
     }
 }
