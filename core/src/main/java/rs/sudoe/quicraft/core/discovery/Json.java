@@ -9,11 +9,21 @@ import java.util.Map;
 
 /**
  * Strict RFC 8259 parser for status responses. The input comes from untrusted servers, so depth
- * and length are bounded and every malformed input throws {@link IllegalArgumentException}.
- * Objects become {@code Map<String, Object>}, arrays {@code List<Object>}, numbers
- * {@link BigDecimal}, and JSON null {@link #NULL}.
+ * and length are bounded and every malformed input throws {@link IllegalArgumentException}. Objects
+ * become {@code Map<String, Object>}, arrays {@code List<Object>}, numbers
+ * {@link BigDecimal}, and JSON null {@link #NULL}. A number also keeps the text it was spelled
+ * with, because a {@link BigDecimal} cannot tell {@code 1e2} from {@code 100} or {@code -0} from
+ * {@code 0}: {@link #numberText(Object)} returns it.
+ *
+ * <p>{@link #parse(String)} keeps the last value of a repeated member name (RFC 8259 leaves that
+ * undefined, and a status response only ever reads a member it expects). Callers that must reject
+ * duplicates, like {@code core.routing} for routing resources (docs/protocol.md 13.7), use
+ * {@link #parseRejectingDuplicateKeys(String)}.
+ *
+ * <p>Public so {@code core.routing} can reuse it for routing resources (docs/protocol.md 13.7)
+ * instead of adding a JSON dependency or a second parser.
  */
-final class Json {
+public final class Json {
     static final Object NULL = new Object() {
         @Override
         public String toString() {
@@ -23,19 +33,47 @@ final class Json {
     static final int MAX_DEPTH = 64;
     /** Generous bound above the 32767-character status cap. */
     static final int MAX_LENGTH = 1 << 20;
+    /** The most characters of untrusted input any single diagnostic may quote back. */
+    static final int MAX_DIAGNOSTIC = 64;
 
     private final String s;
+    private final boolean rejectDuplicateKeys;
     private int pos;
 
-    private Json(String s) {
+    private Json(String s, boolean rejectDuplicateKeys) {
         this.s = s;
+        this.rejectDuplicateKeys = rejectDuplicateKeys;
     }
 
+    /** Parses {@code text}, letting the last of repeated member names win. */
     static Object parse(String text) {
+        return parse(text, false);
+    }
+
+    /**
+     * Parses {@code text} like {@link #parse(String)}, but throws
+     * {@link IllegalArgumentException} when any object, at any level, repeats a member name.
+     * docs/protocol.md 13.7 requires routing resources to be rejected on duplicates.
+     */
+    public static Object parseRejectingDuplicateKeys(String text) {
+        return parse(text, true);
+    }
+
+    /**
+     * The exact source text of the JSON number {@code value}, or {@code null} when {@code value} is
+     * not a number this parser produced. {@link BigDecimal} normalizes the spelling away, so a
+     * caller that must accept only a plain integer, like the routing validator of
+     * docs/protocol.md 13.7, has to look at this text instead of the parsed value.
+     */
+    public static String numberText(Object value) {
+        return value instanceof JsonNumber ? ((JsonNumber) value).text : null;
+    }
+
+    private static Object parse(String text, boolean rejectDuplicateKeys) {
         if (text == null || text.length() > MAX_LENGTH) {
             throw new IllegalArgumentException("missing or oversized JSON");
         }
-        Json json = new Json(text);
+        Json json = new Json(text, rejectDuplicateKeys);
         json.ws();
         Object value = json.value(0);
         json.ws();
@@ -91,6 +129,9 @@ final class Json {
             ws();
             expect(':');
             ws();
+            if (rejectDuplicateKeys && map.containsKey(key)) {
+                throw error("duplicate member name " + quote(bounded(key)));
+            }
             map.put(key, value(depth + 1));
             ws();
             char c = next();
@@ -150,17 +191,24 @@ final class Json {
                 case 'n': sb.append('\n'); break;
                 case 'r': sb.append('\r'); break;
                 case 't': sb.append('\t'); break;
-                case 'u':
+                case 'u': {
+                    // Exactly four hex digits: a sign (backslash-u+041, backslash-u-041) is not a
+                    // digit, and a short escape is not padded from what follows the quote.
                     if (pos + 4 > s.length()) {
                         throw error("short unicode escape");
                     }
-                    try {
-                        sb.append((char) Integer.parseInt(s.substring(pos, pos + 4), 16));
-                    } catch (NumberFormatException ex) {
-                        throw error("bad unicode escape");
+                    int code = 0;
+                    for (int i = 0; i < 4; i++) {
+                        int digit = hexDigit(s.charAt(pos + i));
+                        if (digit < 0) {
+                            throw error("bad unicode escape");
+                        }
+                        code = (code << 4) | digit;
                     }
+                    sb.append((char) code);
                     pos += 4;
                     break;
+                }
                 default:
                     throw error("bad escape");
             }
@@ -205,7 +253,7 @@ final class Json {
         if (pos - start > 100) {
             throw error("number too long");
         }
-        return new BigDecimal(s.substring(start, pos));
+        return new JsonNumber(s.substring(start, pos));
     }
 
     private Object literal(String word, Object value) {
@@ -247,8 +295,32 @@ final class Json {
         return c >= '0' && c <= '9';
     }
 
+    /** The value of {@code c} as a hexadecimal digit, or -1 when it is not an ASCII hex digit. */
+    private static int hexDigit(char c) {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        if (c >= 'A' && c <= 'F') {
+            return c - 'A' + 10;
+        }
+        return -1;
+    }
+
     private IllegalArgumentException error(String what) {
         return new IllegalArgumentException(what + " at offset " + pos);
+    }
+
+    /**
+     * {@code value} as a diagnostic, capped at {@link #MAX_DIAGNOSTIC} characters: the input is
+     * untrusted and bounded only by {@link #MAX_LENGTH}, so a message must not repeat all of it.
+     */
+    private static String bounded(String value) {
+        return value.length() <= MAX_DIAGNOSTIC
+                ? value
+                : value.substring(0, MAX_DIAGNOSTIC - 3) + "...";
     }
 
     /** JSON string literal for {@code value}, escaping what RFC 8259 requires. */
@@ -265,5 +337,19 @@ final class Json {
             }
         }
         return sb.append('"').toString();
+    }
+
+    /**
+     * A parsed number that also keeps the exact text it was spelled with, so a caller can require a
+     * plain integer (docs/protocol.md 13.7) instead of the normalized {@link BigDecimal}.
+     */
+    private static final class JsonNumber extends BigDecimal {
+        private static final long serialVersionUID = 1L;
+        private final String text;
+
+        JsonNumber(String text) {
+            super(text);
+            this.text = text;
+        }
     }
 }
