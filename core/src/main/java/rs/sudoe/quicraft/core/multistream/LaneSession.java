@@ -429,6 +429,16 @@ public final class LaneSession {
                 r != null && r.decoder.hasPartial() ? 1 : 0};
     }
 
+    /**
+     * Test hook: true once this session has both of its auxiliary lanes open (13.3), i.e. the
+     * peer's preamble has been parsed on each; call on the loop. A test that drives a lane must
+     * wait for this, because a peer-created stream can otherwise arrive during activation and be
+     * refused with 0x11.
+     */
+    boolean auxiliaryLanesOpened() {
+        return activated && !awaitingPeerStreams();
+    }
+
     /** Test hook: the sender's last-assigned sequences per lane; call on the loop. */
     long[] assignedSequences() {
         return sender.assigned();
@@ -513,6 +523,8 @@ public final class LaneSession {
         if (closed) {
             return;
         }
+        System.out.println("CLOSEREASON " + role + " " + code + " " + why);
+        if (cause != null) { cause.printStackTrace(System.out); }
         LOG.log(Level.FINE, "closing multi-stream connection with {0}: {1}", new Object[] {code, why});
         shutdown();
         final int closeCode = code;
@@ -564,6 +576,16 @@ public final class LaneSession {
             game.onClosed(code, byPeer, cause);
         } catch (Throwable t) {
             LOG.log(Level.FINE, "game onClosed failed", t);
+        }
+    }
+
+    /**
+     * Checks a lane's outstanding record grant against a lane that wants to start a record, and
+     * records when the lane first waited so 13.12's incomplete-record deadline can close it.
+     */
+    private void noteWaiting(LaneStream s, boolean withheld) {
+        if (withheld && s.waitingSince == 0) {
+            s.waitingSince = now();
         }
     }
 
@@ -722,6 +744,11 @@ public final class LaneSession {
         LaneGame.Decoded d;
         try {
             d = game.decode(envelope.lane(), envelope.sequence(), frame, insideBundle, reservation);
+        } catch (ReceiverScheduler.RetryLater retry) {
+            // 13.12: the node budget cannot carry the decompressed output yet. Nothing was
+            // allocated; the record stays undecoded and the tick retries it.
+            withheldForNode = true;
+            throw retry;
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {
@@ -731,7 +758,12 @@ public final class LaneSession {
             throw new OrderingException("decoder returned nothing");
         }
         if (!reserved[0]) {
-            receiver.reserveDecoded(envelope, d.retainedBytes(), d.uncompressedBytes(), now());
+            try {
+                receiver.reserveDecoded(envelope, d.retainedBytes(), d.uncompressedBytes(), now());
+            } catch (ReceiverScheduler.RetryLater retry) {
+                withheldForNode = true;
+                throw retry;
+            }
         }
         if (d.bundle() == Envelope.Bundle.NONE
                 && table.laneFor(d.state(), receiveDirection, d.packetId()) != envelope.lane()) {
@@ -800,16 +832,12 @@ public final class LaneSession {
      * Whether a new record may be started on {@code lane}. An auxiliary record needs room for the
      * largest legal record, so a conformant peer's record can always complete (13.12: never fatal
      * for a legal record); otherwise reading waits and QUIC flow control pushes back. The same
-     * amount, plus the chunk about to be read, must fit the shared node budget (13.12): a node
-     * refusal withholds this lane's credit exactly like the per-connection budget, so this
-     * connection never starts bytes it could not charge. A node refusal is remembered in
+     * amount must fit the per-connection budget. The shared node budget is taken before the record
+     * starts ({@link LaneStream#reserveRecord}) and before each read ({@link LaneStream#grantRead}),
+     * each of which withholds this lane instead of failing it and is remembered in
      * {@link #withheldForNode} so the tick retries once other connections have released space.
      */
     private boolean credit(Lane lane) {
-        if (!receiver.nodeCreditAvailable(READ_CHUNK + MAX_RECORD_WIRE)) {
-            withheldForNode = true;
-            return false;
-        }
         if (lane == Lane.CONTROL) {
             return receiver.pendingRecords() < ReceiverScheduler.MAX_RECORDS
                     && receiver.pendingBytes() < ReceiverScheduler.SHARED_BYTES + ReceiverScheduler.CONTROL_RESERVE_BYTES;
@@ -842,15 +870,31 @@ public final class LaneSession {
                 // bytes already read buffered (they stay charged) and stop reading until bindGame().
                 break;
             }
+            boolean atBoundary = s.partial == null && !s.decoder.hasPartial();
             if (!s.midRecord() && !credit(s.lane)) {
+                // 13.12: the per-connection budget has no room for this record (or its growth), so
+                // the lane waits; the wait starts its incomplete-record deadline.
+                noteWaiting(s, true);
+                break;
+            }
+            if (atBoundary && !s.recordGranted && !s.reserveRecord()) {
+                noteWaiting(s, true);
                 break;
             }
             RecordCodec.Record record = s.decoder.next(s.current);
             if (record != null) {
                 admit(s, record);
             } else if (s.partial == null && s.decoder.hasPartial()) {
-                s.partial = receiver.reservePartial(s.lane, s.decoder.partialWireBytes(), now());
-                s.charged = s.decoder.partialWireBytes();
+                long size = s.decoder.partialWireBytes();
+                long prepaid = Math.min(size, MAX_RECORD_WIRE - s.recordGrantUsed);
+                long startedAt = s.waitingSince != 0 ? s.waitingSince : now();
+                s.partial = receiver.reservePartial(s.lane, size, prepaid, startedAt, now());
+                s.recordGrantUsed += prepaid;
+                s.waitingSince = 0;
+                s.charged = size;
+            } else if (s.recordGrantUsed > 0 && !s.recordGranted) {
+                // the record finished; nothing to carry over
+                s.recordGrantUsed = 0;
             }
         }
         if (closed) {
@@ -870,6 +914,8 @@ public final class LaneSession {
     }
 
     private void admit(LaneStream s, RecordCodec.Record record) {
+        if (s.lane == Lane.CONTROL) {
+        }
         ReceiverScheduler.Partial partial = s.partial;
         s.partial = null;
         s.charged = 0;
@@ -1067,7 +1113,11 @@ public final class LaneSession {
         LaneStream s = streams[i];
         ArrayDeque<byte[]> queue = out.get(i);
         if (s == null || s.channel == null || !s.preambleWritten || held[i] || queue.isEmpty()) {
+            if (lane == Lane.CONTROL && !queue.isEmpty()) {
+            }
             return false;
+        }
+        if (lane == Lane.CONTROL) {
         }
         int budget = WRITE_QUANTUM;
         boolean wrote = false;
@@ -1148,13 +1198,14 @@ public final class LaneSession {
             long t = now();
             if (withheldForNode) {
                 // 13.12: another connection may have released node space since the refusal, so
-                // retry the withheld lanes before checking deadlines. process() sets the flag
-                // again when the node is still too full.
+                // retry the withheld lanes and the undecoded head before checking deadlines.
+                // process() and retry() set the flag again when the node is still too full.
                 withheldForNode = false;
                 process();
                 if (closed) {
                     return;
                 }
+                receiver.retry(t);
             }
             receiver.checkDeadlines(t);
             sender.checkDeadlines(t);
@@ -1313,6 +1364,12 @@ public final class LaneSession {
         boolean lengthKnown;
         /** An outstanding node read grant of {@link LaneSession#READ_CHUNK} for the next read. */
         boolean granted;
+        /** An outstanding node record grant of {@link LaneSession#MAX_RECORD_WIRE} for this record. */
+        boolean recordGranted;
+        /** How many bytes of the record grant have been transferred to the parser buffer. */
+        long recordGrantUsed;
+        /** When this lane first held bytes of a record it could not admit; 0 while it has none. */
+        long waitingSince;
 
         LaneStream(Lane lane) {
             this.lane = lane;
@@ -1327,13 +1384,19 @@ public final class LaneSession {
 
         /** The decoder's admission hook: charges the full parser buffer once the length is known. */
         private boolean reserveWire(int wireBytes) {
+            int growth = wireBytes - (partial == null ? 0 : (int) charged);
+            long prepaid = Math.min(growth, MAX_RECORD_WIRE - recordGrantUsed);
             if (partial == null) {
-                partial = receiver.reservePartial(lane, wireBytes, now());
+                long startedAt = waitingSince != 0 ? waitingSince : now();
+                partial = receiver.reservePartial(lane, wireBytes, prepaid, startedAt, now());
             } else {
-                receiver.growPartial(partial, wireBytes - charged, now());
+                receiver.growPartial(partial, growth, prepaid, now());
             }
+            recordGrantUsed += prepaid;
             charged = wireBytes;
             lengthKnown = true;
+            // 13.12: the record's real size is known, so the rest of its grant goes back.
+            releaseRecordGrant();
             return true;
         }
 
@@ -1359,6 +1422,36 @@ public final class LaneSession {
             }
             granted = true;
             return true;
+        }
+
+        /**
+         * Reserves the record grant for this lane (13.12): {@link LaneSession#MAX_RECORD_WIRE}
+         * before the record's first byte is consumed. A refusal withholds the lane instead of
+         * failing it, so the owner retries from its tick once another connection frees space.
+         */
+        boolean reserveRecord() {
+            if (recordGranted) {
+                return true;
+            }
+            if (!node.tryReserve(MAX_RECORD_WIRE)) {
+                withheldForNode = true;
+                return false;
+            }
+            recordGranted = true;
+            recordGrantUsed = 0;
+            return true;
+        }
+
+        /** Returns whatever is left of the record grant once the record's real size is known. */
+        void releaseRecordGrant() {
+            if (recordGranted) {
+                recordGranted = false;
+                long unused = MAX_RECORD_WIRE - recordGrantUsed;
+                recordGrantUsed = 0;
+                if (unused > 0) {
+                    node.release(unused);
+                }
+            }
         }
 
         /** Gives an unused read grant back: the lane stopped reading or the session closed. */
@@ -1404,6 +1497,7 @@ public final class LaneSession {
 
         void releaseInbound() {
             releaseGrant();
+            releaseRecordGrant();
             ByteBuf b;
             while ((b = inbound.poll()) != null) {
                 releaseChunk(b);
@@ -1429,6 +1523,8 @@ public final class LaneSession {
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             ByteBuf buf = (ByteBuf) msg;
+            if (lane == Lane.CONTROL) {
+            }
             readPending = false;
             if (closed || !buf.isReadable()) {
                 buf.release();

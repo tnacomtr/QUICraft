@@ -137,6 +137,8 @@ final class LaneRig implements AutoCloseable {
         volatile LaneSession session;
         volatile boolean autoApply = true;
         volatile boolean applyOnOtherThread;
+        /** Retained bytes this game asks the node budget for while decoding (13.12). */
+        volatile long decodeReserveBytes;
 
         @Override
         public Decoded decode(Lane lane, long sequence, byte[] frame, boolean insideBundle,
@@ -149,7 +151,7 @@ final class LaneRig implements AutoCloseable {
             int id = frame[prefix] & 0xff;
             String label = new String(frame, prefix + 1, frame.length - prefix - 1,
                     java.nio.charset.StandardCharsets.UTF_8);
-            reservation.reserve(0, frame.length);
+            reservation.reserve((int) decodeReserveBytes, frame.length);
             Envelope.Bundle bundle = id == BUNDLE_OPEN ? Envelope.Bundle.OPEN
                     : id == BUNDLE_CLOSE ? Envelope.Bundle.CLOSE
                     : insideBundle ? Envelope.Bundle.MEMBER : Envelope.Bundle.NONE;
@@ -381,6 +383,11 @@ final class LaneRig implements AutoCloseable {
 
     static long[] snapshot(LaneSession session) throws Exception {
         return session.eventLoop().submit(session::snapshot).get(10, TimeUnit.SECONDS);
+    }
+
+    /** True once both of the session's auxiliary lanes are open, read on the event loop. */
+    static boolean lanesOpened(LaneSession session) throws Exception {
+        return session.eventLoop().submit(session::auxiliaryLanesOpened).get(10, TimeUnit.SECONDS);
     }
 
     /** The sender's last-assigned sequences per lane, from the session's event loop. */

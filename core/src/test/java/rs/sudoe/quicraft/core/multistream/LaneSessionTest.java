@@ -83,15 +83,28 @@ class LaneSessionTest {
     @Test
     void gamePacketsOnAllThreeLanesAreDeliveredWithTheGamesAcknowledgementFromAnotherThread() throws Exception {
         try (LaneRig rig = LaneRig.start()) {
+            System.out.println("REPSTART");
             rig.clientGame.applyOnOtherThread = true;
             rig.serverGame.applyOnOtherThread = true;
             rig.activateBoth();
+            // Both sessions must have their auxiliary lanes open before lane traffic starts: a
+            // record that arrives while a lane is still being set up is refused (13.3).
+            assertTrue(LaneRig.await(() -> {
+                try {
+                    return LaneRig.lanesOpened(rig.client) && LaneRig.lanesOpened(rig.server);
+                } catch (Exception e) {
+                    return false;
+                }
+            }, 10000), "both sessions opened their auxiliary lanes");
             rig.server.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "spawn"));
             rig.server.send(PLAY, LaneRig.MOVE, LaneRig.frame(LaneRig.MOVE, "move"));
             rig.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "block"));
             rig.client.send(PLAY, LaneRig.MOVE, LaneRig.frame(LaneRig.MOVE, "c-move"));
             assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() == 3
-                    && rig.serverGame.packetCount() == 1, 10000), rig.clientGame.deliveries.toString());
+                    && rig.serverGame.packetCount() == 1, 10000),
+                    "client=" + rig.clientGame.packetCount() + rig.clientGame.deliveries.toString()
+                            + " " + rig.clientGame.closed.getNow(null) + " server=" + rig.serverGame.packetCount()
+                            + " " + rig.serverGame.closed.getNow(null));
             List<Lane> lanes = new ArrayList<>();
             synchronized (rig.clientGame.deliveries) {
                 for (LaneRig.Delivered d : rig.clientGame.deliveries) {
@@ -135,7 +148,7 @@ class LaneSessionTest {
             LaneRig.Config config = new LaneRig.Config();
             config.clientSession = false;
             try (LaneRig rig = LaneRig.start(config)) {
-                rig.server.activate(null);
+                rig.activate(rig.server, null);
                 QuicStreamChannel four = rig.net.clientStream();
                 LaneLoopback.write(four, preamble);
                 closedWith(rig.serverGame, 0x11, false);
@@ -150,7 +163,7 @@ class LaneSessionTest {
         config.clientSession = false;
         config.options.serverMaxStreamsBidi = 8;
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             QuicStreamChannel four = rig.net.clientStream();
             LaneLoopback.write(four, (byte) 2, (byte) 1);
             assertTrue(LaneRig.await(() -> rig.server.isWritable(), 1000));
@@ -306,7 +319,9 @@ class LaneSessionTest {
 
     @Test
     void theActivationLeftoverIsChargedAndReleasedWithTheNodeBudget() throws Exception {
-        ReceiveBudget node = ReceiveBudget.bounded(3L << 20);
+        // A budget that records any release of bytes it never had: an uncharged leftover chunk
+        // released by the lane would show up here instead of silently shifting the accounting.
+        StrictBudget node = new StrictBudget(3L << 20);
         LaneRig.Config config = new LaneRig.Config();
         config.nodeBudget = node;
         config.clientSession = false;
@@ -322,13 +337,52 @@ class LaneSessionTest {
                     return false;
                 }
             }, 10000), "the leftover starts an incomplete record");
-            // Every outstanding read grant is a whole READ_CHUNK, so what remains besides them is
-            // the held parser buffer. Releasing bytes that were never charged would swallow it.
-            assertTrue(LaneRig.await(() -> node.reserved() % LaneSession.READ_CHUNK == 1, 10000),
-                    "the held parser buffer stays reserved: " + node.reserved());
+            assertTrue(node.reserved() > 0, "the held leftover is charged: " + node.reserved());
         }
         assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
                 "closing releases every charge: " + node.reserved());
+        assertEquals(0, node.releasesWithoutReservation,
+                "no byte was released that was never reserved");
+    }
+
+    /** A bounded budget that counts releases of bytes it never reserved. */
+    private static final class StrictBudget extends ReceiveBudget {
+        private final ReceiveBudget delegate;
+        private final AtomicLong reserved = new AtomicLong();
+        volatile int releasesWithoutReservation;
+
+        StrictBudget(long capacity) {
+            this.delegate = ReceiveBudget.bounded(capacity);
+        }
+
+        @Override
+        public boolean tryReserve(long bytes) {
+            if (delegate.tryReserve(bytes)) {
+                reserved.addAndGet(bytes);
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public void release(long bytes) {
+            if (reserved.addAndGet(-bytes) < 0) {
+                releasesWithoutReservation++;
+                reserved.addAndGet(bytes);
+                return;
+            }
+            delegate.release(bytes);
+        }
+
+        @Override
+        public long reserved() {
+            return delegate.reserved();
+        }
+
+        @Override
+        public long available() {
+            return delegate.available();
+        }
     }
 
     @Test
@@ -434,6 +488,25 @@ class LaneSessionTest {
             closedWith(rig.serverGame, 0x11, false);
             sawClose(rig.net.clientSawClose, 0x11);
         }
+    }
+
+    /** A raw-server rig that shares {@code node} and ticks quickly. */
+    private static LaneRig.Config rawServerConfig(ReceiveBudget node) {
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        config.clientSession = false;
+        config.serverTiming = new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
+        return config;
+    }
+
+    /** Activates a raw-server rig and answers both preambles, returning the raw REALTIME stream. */
+    private static QuicStreamChannel openRawServerLanes(LaneRig rig) throws Exception {
+        rig.server.activate(null);
+        LaneLoopback.write(rig.clientRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 2);
+        QuicStreamChannel four = rig.net.clientStream();
+        LaneLoopback.write(four, (byte) 2, (byte) 1);
+        return four;
     }
 
     // --- Ordering over real streams (13.9-13.11).
@@ -1066,99 +1139,129 @@ class LaneSessionTest {
     // --- Node receive budget (13.12).
 
     @Test
-    void aConnectionWithheldByTheNodeBudgetResumesWhenTheNodeFreesSpace() throws Exception {
-        ReceiveBudget node = ReceiveBudget.bounded(3L << 20);
-        LaneRig.Config starved = new LaneRig.Config();
-        starved.nodeBudget = node;
-        starved.clientSession = false;
-        starved.serverTiming = new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
-                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
-        try (LaneRig rigB = LaneRig.start(starved)) {
-            QuicStreamChannel four = openRawServerLanes(rigB);
-            // A payload over 127 bytes needs a two-byte length prefix, so one byte is incomplete.
-            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.MOVE, 200));
-            // The first byte only: the lane holds an incomplete record while the node is free.
-            LaneLoopback.write(four, record[0]);
-            assertTrue(LaneRig.await(() -> snapshotIs(rigB.server, 0, 1) && snapshotIs(rigB.server, 1, 1), 10000),
-                    "the first byte is charged while the node budget is still free");
+    void aConnectionWhoseRecordGrantWasRefusedResumesWhenTheNodeFreesSpace() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(6L << 20);
+        // The holder keeps ~4.5 MiB of the node budget reserved while it does not apply.
+        LaneRig.Config holder = new LaneRig.Config();
+        holder.nodeBudget = node;
+        LaneRig rigA = LaneRig.start(holder);
+        try {
+            rigA.activateBoth();
+            rigA.clientGame.autoApply = false;
+            for (int i = 0; i < 3; i++) {
+                rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 1_500_000));
+            }
+            assertTrue(LaneRig.await(() -> node.available() < (6L << 20) - 4_000_000L, 30000),
+                    "the holder charged the node budget: " + node.available());
 
-            LaneRig.Config holder = new LaneRig.Config();
-            holder.nodeBudget = node;
-            try (LaneRig rigA = LaneRig.start(holder)) {
-                rigA.activateBoth();
-                rigA.clientGame.autoApply = false; // the record stays charged and undelivered
-                rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 2_000_000));
-                assertTrue(LaneRig.await(() -> node.reserved() > 2_000_000L, 30000),
-                        "the holder charged the node budget: " + node.reserved());
-                // The rest of the record arrives, but the node budget cannot carry it: the lane
-                // stops reading instead of stealing the holder's reservation.
-                LaneLoopback.write(four, java.util.Arrays.copyOfRange(record, 1, record.length));
+            LaneRig.Config starved = new LaneRig.Config();
+            starved.nodeBudget = node;
+            starved.clientSession = false;
+            try (LaneRig rigB = LaneRig.start(starved)) {
+                QuicStreamChannel four = openRawServerLanes(rigB);
+                byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.MOVE, 200));
+                // The record arrives whole, but its node record grant cannot be taken: the lane must
+                // stop before its first byte and wait, never fail.
+                LaneLoopback.write(four, record);
                 sleep(500);
-                assertTrue(snapshotIs(rigB.server, 1, 1),
-                        "credit withheld, only the first byte stays charged: " + LaneRig.snapshot(rigB.server)[1]);
-                assertFalse(rigB.serverGame.closed.isDone(), "withheld credit is not a close by itself");
+                assertTrue(snapshotIs(rigB.server, 0, 0), "nothing is admitted while the grant is refused");
+                assertFalse(rigB.serverGame.closed.isDone(), "a refused grant is not a close");
+                assertFalse(rigB.serverGame.closed.isDone());
 
-                // The holder gives its bytes back, so the starved lane must resume on its own and
-                // deliver the record with no close at all (13.12).
-                rigA.clientGame.apply(rigA.clientGame.deliveries.get(0));
-                assertTrue(LaneRig.await(() -> node.reserved() < 2_000_000L, 10000),
-                        "the holder released its charge: " + node.reserved());
+                // The holder gives its bytes back, so the starved lane must resume and deliver.
+                for (int i = 0; i < 3; i++) {
+                    final int index = i;
+                    assertTrue(LaneRig.await(() -> rigA.clientGame.deliveries.size() > index, 10000),
+                            "the holder delivered record " + index);
+                    rigA.clientGame.apply(rigA.clientGame.deliveries.get(index));
+                }
                 assertTrue(LaneRig.await(() -> rigB.serverGame.packetCount() == 1, 10000),
-                        "the withheld lane resumes and delivers its record");
+                        "the lane resumes and delivers its record");
                 assertFalse(rigB.serverGame.closed.isDone(), "resuming is not a close");
                 assertFalse(rigA.clientGame.closed.isDone(), "the holder is never evicted");
             }
+        } finally {
+            rigA.close();
         }
     }
 
     @Test
-    void aConnectionStillStarvedAtTheDeadlineClosesWith0x11() throws Exception {
-        ReceiveBudget node = ReceiveBudget.bounded(3L << 20);
-        LaneRig.Config starved = new LaneRig.Config();
-        starved.nodeBudget = node;
-        starved.clientSession = false;
-        AtomicLong clock = new AtomicLong(5_000_000_000L);
-        starved.serverTiming = new LaneSession.Timing(clock::get, LaneSession.OPEN_TIMEOUT_NANOS,
-                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
-        try (LaneRig rigB = LaneRig.start(starved)) {
+    void aRecordWhoseGrantWasTakenBeforeTheNodeFilledUpIsStillAdmitted() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(6L << 20);
+        LaneRig rigB = LaneRig.start(rawServerConfig(node));
+        try {
             QuicStreamChannel four = openRawServerLanes(rigB);
-            // A payload over 127 bytes needs a two-byte length prefix, so one byte is incomplete.
-            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.MOVE, 200));
+            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.MOVE, 2_000_000));
+            // Only the first byte of the two-byte length prefix: the record boundary already took
+            // its node grant, so the node can be filled up while its real size is unknown.
             LaneLoopback.write(four, record[0]);
-            assertTrue(LaneRig.await(() -> snapshotIs(rigB.server, 0, 1) && snapshotIs(rigB.server, 1, 1), 10000),
-                    "the first byte is charged while the node budget is still free");
+            assertTrue(LaneRig.await(() -> snapshotIs(rigB.server, 0, 1), 10000), "the record started");
 
-            // Another connection of the same node takes almost the whole budget and keeps it.
             LaneRig.Config holder = new LaneRig.Config();
             holder.nodeBudget = node;
-            try (LaneRig rigA = LaneRig.start(holder)) {
+            LaneRig rigA = LaneRig.start(holder);
+            try {
                 rigA.activateBoth();
                 rigA.clientGame.autoApply = false;
-                rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 2_000_000));
-                assertTrue(LaneRig.await(() -> node.reserved() > 2_000_000L, 30000),
-                        "the holder charged the node budget: " + node.reserved());
+                // rigB's record boundary already holds a MAX_RECORD_WIRE grant, so this fills the rest.
+                for (int i = 0; i < 2; i++) {
+                    rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 1_900_000));
+                }
+                assertTrue(LaneRig.await(() -> node.available() < 800_000L, 8000),
+                        "the node is nearly full: " + node.available());
+                // The rest of the legal record arrives with almost no node space left: the grant
+                // taken at its boundary must carry it, never 0x11.
                 LaneLoopback.write(four, java.util.Arrays.copyOfRange(record, 1, record.length));
-                sleep(500);
-                assertTrue(snapshotIs(rigB.server, 1, 1),
-                        "credit withheld, only the first byte stays charged: " + LaneRig.snapshot(rigB.server)[1]);
-                assertFalse(rigB.serverGame.closed.isDone(), "withheld credit is not a close by itself");
-                // Still starved when the 13.12 deadline passes: the existing timer closes it 0x11.
-                clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + 1_000_000_000L);
-                closedWith(rigB.serverGame, 0x11, false);
-                sawClose(rigB.net.clientSawClose, 0x11);
+                assertTrue(LaneRig.await(() -> rigB.serverGame.packetCount() == 1, 30000),
+                        "a legal record is admitted from its own grant");
+                assertFalse(rigB.serverGame.closed.isDone(), "node contention is not fatal for a legal record");
                 assertFalse(rigA.clientGame.closed.isDone(), "the holder is never evicted");
-                assertFalse(rigA.serverGame.closed.isDone());
+            } finally {
+                rigA.close();
             }
+        } finally {
+            rigB.close();
         }
     }
 
-    /** Activates a raw-server rig and answers both preambles, returning the raw REALTIME stream. */
-    private static QuicStreamChannel openRawServerLanes(LaneRig rig) throws Exception {
-        rig.server.activate(null);
-        LaneLoopback.write(rig.clientRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 2);
-        QuicStreamChannel four = rig.net.clientStream();
-        LaneLoopback.write(four, (byte) 2, (byte) 1);
-        return four;
+    @Test
+    void aDecodeWhoseGrowthCannotBeReservedWaitsInsteadOfClosing() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(14L << 20);
+        LaneRig.Config holder = new LaneRig.Config();
+        holder.nodeBudget = node;
+        LaneRig rigA = LaneRig.start(holder);
+        try {
+            rigA.activateBoth();
+            rigA.clientGame.autoApply = false;
+            for (int i = 0; i < 6; i++) {
+                rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 1_900_000));
+            }
+            assertTrue(LaneRig.await(() -> node.available() < 4_000_000L, 8000),
+                    "the holder charged the node budget: " + node.available());
+
+            LaneRig.Config receiver = new LaneRig.Config();
+            receiver.nodeBudget = node;
+            try (LaneRig rig = LaneRig.start(receiver)) {
+                rig.activateBoth();
+                rig.clientGame.decodeReserveBytes = 5_000_000L; // more than the node can carry
+                rig.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "grow"));
+                sleep(500);
+                assertEquals(0, rig.clientGame.packetCount(), "the decode waits for node space");
+                assertFalse(rig.clientGame.closed.isDone(), "a refused decode growth is not a close");
+
+                for (int i = 0; i < 6; i++) {
+                    final int index = i;
+                    assertTrue(LaneRig.await(() -> rigA.clientGame.deliveries.size() > index, 9000),
+                            "the holder delivered record " + index);
+                    rigA.clientGame.apply(rigA.clientGame.deliveries.get(index));
+                }
+                assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() == 1, 20000),
+                        "the withheld decode resumes once the node has room");
+                assertFalse(rig.clientGame.closed.isDone(), "resuming is not a close");
+            }
+        } finally {
+            rigA.close();
+        }
     }
 
     @Test
