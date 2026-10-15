@@ -569,88 +569,358 @@ single-socket listener: no dispatcher is installed and the connection id length 
   compiled into libcrypto. As upstream, the native statically links libstdc++ and libgcc (GPL-3.0
   with the GCC Runtime Library Exception).
 
-## 12. Channel binding, pinning and dropping Minecraft's cipher (Phase 5 draft)
+## 12. Channel binding, pinning and dropping Minecraft's cipher (Phase 5)
 
-**Status: proposed direction (user, 2026-10-09). Draft only: not part of v1. Needs a full spec
-here, the user's sign-off on that spec and a security review before any of it ships.**
+**Draft v2, awaiting user sign-off and security review.**
 
-### Problem
+### Scope and capability gate
 
-- v1 runs Minecraft's AES/CFB8 inside QUIC (§8). Every byte is encrypted twice, CFB8 has no
-  integrity, and its single continuous cipher state can't be split across streams, which blocks
-  multi-stream.
-- Simply switching Minecraft's cipher off after login is **unsafe**. The fingerprint arrives in an
-  unauthenticated, plain TCP ping (§1, §7). An active attacker who swaps it terminates QUIC/TLS on
-  both sides. Minecraft's login inside still succeeds end to end (the shared secret is
-  RSA-encrypted to the real server, and Mojang authenticates the player). But once the cipher is
-  off, the attacker reads and injects everything between the two TLS hops.
-- Encrypting the ping doesn't help either. Without a key the client already trusts,
-  encryption stops only passive eavesdroppers; an active attacker runs both exchanges.
+1. **12.1 Compatibility.** Sections 12 and 13 describe only the proposed `quicraft/3`
+   ALPN. They MUST NOT change shipped `quicraft/2` (v1), its preamble version 1,
+   encryption, 0-RTT, stream counts, or TCP. No implementation or enablement is authorized
+   by this draft. Initially only reviewed 26.x Fabric client/dedicated-server adapters may
+   enable it; Velocity remains single-stream until Phase 7.
+2. **12.2 Exporter availability.** Upstream Netty QUIC exposes no TLS exporter. The required
+   new Netty-only `natives/patches/netty/0004` patch must bind BoringSSL's
+   `SSL_export_keying_material` through JNI and `BoringSSL.java`, expose an accessor on
+   `QuicheQuicChannel` restricted to that channel's event loop, and provide
+   `Quic.isKeyingMaterialExportSupported()`. Its build version must become `quicraft4`.
+   This is a prerequisite, not a claim that §11's quicraft3 implements it. Only linux-x86_64
+   currently has a patched native; linux-aarch_64, osx-x86_64, osx-aarch_64 and
+   windows-x86_64 use upstream natives. Ship and test patched natives for all five platforms
+   before enabling this feature on all five; enable a platform only after its own native
+   load, exporter equality, and upstream-native compatibility tests pass.
+3. **12.3 Gate before negotiation.** Both peers MUST have a true exporter capability probe
+   and a supported routing table before advertising/offering `/3`, even for the offline
+   test profile. A peer without either uses `/2`, retains Minecraft's cipher in online
+   mode, and uses one stream. No native at all retains §11's TCP-only behavior. An exporter
+   error after `/3` selection is fatal, not permission to continue cipher-off or to silently
+   renegotiate that connection. A false capability probe is an ordinary compatibility
+   condition, logged once at INFO, not a binding failure.
 
-### Design: compound authentication over a TLS exporter (online mode)
+### Cryptographic inputs and messages
 
-After an online-mode login completes over QUIC, still under Minecraft's encryption:
+4. **12.4 Login prerequisite.** Keep the vanilla RSA exchange, 16-byte Minecraft shared
+   secret `S`, AES/CFB8, Mojang hash inputs and session authentication unchanged. Begin binding
+   only in configuration state, after successful online authentication and TLS handshake
+   confirmation on both ends. Hold Finish Configuration until activation completes. The
+   server terminating Minecraft login and the QUIC endpoint must be the same trusted
+   component; forwarding a secret to an unrelated endpoint is not supported.
+5. **12.5 Encoding.** In these sections `||` is byte concatenation; quoted cryptographic
+   strings are US-ASCII without a terminating NUL. `u8`, `u32` and `u64` are unsigned
+   big-endian fixed-width integers. Hashes and MACs are raw 32-byte values, not hex.
+   Minecraft packet lengths/ids retain Minecraft VarInt encoding. New VarInts MUST be
+   minimally encoded, nonnegative and at most five bytes; invalid encodings are fatal.
+6. **12.6 Key derivation.** Use RFC 5869 HKDF-SHA256 exactly:
+   `PRK = HKDF-Extract(salt = SHA256("quicraft binding v2 salt"), IKM = S)`;
+   `K = HKDF-Expand(PRK, info = "quicraft binding v2 key", L = 32)`.
+   Do not use a password encoding, UUID, Mojang hash, or TLS secret in place of `S`.
+   Erase task-owned copies of `S`, `PRK` and `K` after activation or failure; never log them.
+7. **12.7 Exporter and transcript.** On the channel event loop, after handshake confirmation,
+   obtain `E = TLS-Exporter("EXPORTER-quicraft-binding-v2", context = empty byte string,
+   length = 32)` using the RFC 8446 §7.5 normal exporter, with context explicitly supplied
+   (JNI `use_context = 1`, context length 0), never the early exporter. Define
+   `T = SHA256("quicraft/3 binding v2" || u32(protocol_number) || u8(mode) || F || R)`.
+   `mode = 1` means online, `0` offline; `F` is SHA-256 of the actual leaf certificate DER
+   (or the original ticket-associated certificate on resumption); `R` is the routing
+   resource digest in 13.7. Both peers calculate these locally and reject differing inputs.
+8. **12.8 Plugin-message format.** Use configuration Custom Payload packets on channel
+   `quicraft:binding` in both directions, intercepted by the adapter, never delivered to
+   ordinary plugins. Payload is exactly `u8(version=2) || u8(kind) || u8(mode) ||
+   u32(protocol_number) || F[32] || R[32] || tag[32]` (103 bytes). There are no optional
+   fields or trailing bytes. `kind`: 0 OFFER (server), 1 CLIENT_PROOF, 2 SERVER_PROOF,
+   3 CLIENT_SWITCH, 4 SERVER_SWITCH. OFFER has an all-zero tag; every other online tag is
+   `HMAC-SHA256(K, "quicraft binding v2 message" || u8(kind) || T || E)`.
+   Distinct kinds provide direction and phase separation. No bare tag is a valid packet.
+9. **12.9 Validation.** Accept exactly OFFER, CLIENT_PROOF, SERVER_PROOF, CLIENT_SWITCH,
+   SERVER_SWITCH, in that order, one each, in the specified direction and configuration
+   state. Client responds only to a matching OFFER; server sends SERVER_PROOF only after
+   verifying CLIENT_PROOF; client sends CLIENT_SWITCH only after verifying SERVER_PROOF;
+   server sends SERVER_SWITCH only after verifying CLIENT_SWITCH. Compare all 32 MAC bytes
+   in constant time after exact-length validation. Unknown versions/kinds, duplicates,
+   reflection, mismatched metadata, unsolicited payloads or invalid MACs terminate `/3`.
 
-1. Each side derives `E = TLS-Exporter(label = "EXPORTER-quicraft-binding", context = "", length = 32)`
-   from its QUIC TLS session (RFC 8446 §7.5). With no attacker both get the same `E`. Behind an
-   attacker there are two TLS sessions and two different values.
-2. Client → server (plugin message): `HMAC-SHA256(K, "quicraft client binding" ‖ E)`.
-3. Server → client: `HMAC-SHA256(K, "quicraft server binding" ‖ E)`, sent only if step 2
-   verified.
-4. `K` is derived from Minecraft's login shared secret, which only the real client and the real
-   server know (exact derivation to be specified, e.g. HKDF with a QUICraft-specific label).
-5. If both checks pass, both sides switch Minecraft's cipher off at an agreed packet boundary in
-   each direction, the same way vanilla switches it on. From then on QUIC/TLS alone protects the
-   session: authenticated encryption, one encryption layer, and per-stream protection for
-   multi-stream.
-6. If either check fails: disconnect, record the failure in the failure cache (§6), and log. The
-   attacker learns nothing beyond what vanilla exposes.
+### Exact cipher and framing cutover
 
-The Minecraft login and the hash sent to Mojang's session server stay exactly as vanilla.
+10. **12.10 Quiescence.** Before sending OFFER, the server drains all previously queued
+    outbound configuration packets. On receiving OFFER the client drains its earlier writes
+    before CLIENT_PROOF. Thereafter both pause ordinary outbound game packets and state
+    changes, queueing at most 256 packets or 8 MiB per endpoint (whichever is reached first;
+    overflow disconnects). Binding packets alone may bypass that queue. Earlier inbound game
+    packets remain legal until the peer's final switch packet. No other streams may carry
+    bytes before activation. Cutover and pipeline changes execute on the connection event loop.
+11. **12.11 Client-to-server boundary.** CLIENT_SWITCH is the last complete Minecraft-framed,
+    compressed-as-negotiated, AES/CFB8-encrypted packet in the client-to-server direction.
+    Client disables its outbound cipher immediately after encrypting its final byte and
+    sends nothing more until SERVER_SWITCH is verified. Server decrypts through precisely
+    the final byte of CLIENT_SWITCH, validates it, then disables its inbound cipher.
+12. **12.12 Server-to-client boundary.** SERVER_SWITCH is likewise the last encrypted
+    Minecraft packet in the server-to-client direction. Server queues its entire encrypted
+    frame before disabling its outbound cipher; all following bytes use §13 records.
+    Client decrypts exactly through that packet, verifies it, then disables its inbound
+    cipher and starts the §13 parser on the very next byte. Server may start records after
+    queuing SERVER_SWITCH; client starts records only after validating it. Stream ordering
+    provides the agreement; QUIC ACKs are not application activation acknowledgements.
+13. **12.13 No read-ahead ambiguity.** The adapter MUST consume ciphertext only as far as the
+    current packet boundary while binding, not decrypt an entire received buffer blindly.
+    If encrypted SERVER_SWITCH and new record bytes arrive in one read, the suffix MUST
+    remain untouched until the cipher/parser transition; split reads must produce the same
+    result. Pending encrypted writes remain encrypted, and queued ordinary packets are
+    encoded anew as records after activation. Do not reset or reuse CFB8 on another stream.
 
-### Pinning
+### Failure, pins and rotation
 
-- A binding check that passes authenticates the server's QUIC certificate through Mojang's login.
-  On a resumed connection (§8) no certificate is presented: the check then authenticates the
-  session resumed from a ticket of an earlier full handshake, and pins what that handshake
-  presented. The exporter is still unique per connection.
-  The client then **pins** that fingerprint for the server, so the fingerprint is
-  authenticated without any TCP-first join: the first join can be over QUIC directly.
-- On a later join, a different advertised fingerprint is not trusted silently. Behaviour (TCP
-  fallback, re-binding, user-visible notice) to be specified, including legitimate key
-  rotation by the server owner.
+14. **12.14 Fail closed.** At each endpoint, allow 10 seconds total from entering configuration
+    to activation, using a monotonic clock; a missing OFFER also expires this deadline.
+    Any validation/exporter error, timeout, premature close or queue overflow closes
+    the whole QUIC connection with application error `0x10` (binding/activation failure).
+    Client records §6's failure-cache entry for the attempted address/port/fingerprint;
+    activation failure overrides a previous handshake success and is cleared only by a
+    later successful activation for that key. Server logs a reason code and rate-limits
+    to one warning per minute per listener; client logs once per failed attempt. Logs contain
+    no secrets, exporter values, tags or payload dumps. Do not retry cipher-off, continue
+    half-switched, or automatically replay the authenticated login over TCP. A subsequent
+    player-initiated join may use TCP under §6, with vanilla encryption. Pre-login racing
+    and compatibility fallback remain §5 behavior.
+15. **12.15 Pin persistence.** Only the client, after valid SERVER_SWITCH in online mode,
+    records an authenticated pin. Store in its config directory `quicraft/pins-v2.json`,
+    schema version 1: entries contain normalized logical host (lowercase IDNA ASCII, or
+    canonical literal IP), original logical TCP port, lowercase `sha256:` hex fingerprint,
+    first-bound and last-bound UTC timestamps. Do not key pins by SRV target or transient
+    resolved IP. Write via temporary file and atomic replacement with owner-only permissions
+    where supported. v1 silent observations MUST NOT be promoted to authenticated pins.
+    A corrupt/unreadable existing pin file or failed write disables `/3` until repaired;
+    notify the player and use `/2` or TCP on the next attempt, never silently treat corruption
+    as first contact. A write failure after activation closes the current connection with
+    `0x10`; do not attempt a live transport downgrade.
+16. **12.16 Changed fingerprint.** With an existing authenticated pin, a different advertised
+    fingerprint MUST NOT be silently accepted: discard tickets/tokens/recorded flights for
+    that logical server, notify the player that the identity changed, and use vanilla TCP
+    for this join (or fail in `quic-only`). Leave the pin unchanged. Rotation requires an
+    explicit player action authorizing a new online-bound attempt, with old/new fingerprints
+    displayed; that attempt uses a full handshake, no early data, and replaces the pin only
+    after 12.15. Failed rotation preserves the old pin. No automatic overlap or unsigned
+    rotation message is trusted; deleting a pin requires explicit confirmation too.
 
-### Offline mode
+### Resumption, offline mode and threat model
 
-There is no Mojang-bound secret, so no binding is possible. QUIC/TLS stops passive
-eavesdropping only. Minecraft's cipher isn't used in offline mode anyway. Pinning is TOFU
-(Phase 9).
+17. **12.17 Resumption.** Partition tickets, tokens and recorded flights by logical server,
+    resolved endpoint, fingerprint and ALPN; never reuse `/2` material for `/3`. On a resumed
+    `/3` connection retain the ticket's original `F` and require fresh Minecraft login,
+    fresh `S`, and the current connection's normal exporter. Binding authenticates possession
+    of that Minecraft secret on the same resumed TLS connection, anchored to the certificate
+    associated with the ticket; it does not prove a fresh certificate was presented. Missing
+    ticket provenance requires a full handshake. Reject stale/changed-pin tickets before use.
+18. **12.18 Early data and replay.** `/3` permits only the preamble, Minecraft handshake and
+    Login Start as early bytes, with §8's single-use tokens, duplicate removal, confirmation
+    deadline and abandoned-login handling unchanged. No binding payload, encryption response,
+    configuration/play packet, auxiliary stream, pin update or cipher transition may occur
+    before handshake confirmation. Replayed early data may cause the bounded login effects
+    in §8, not activation. Old binding messages fail under fresh `S` and `E`; never cache a
+    successful binding as permission to skip the next check.
+19. **12.19 Offline mode.** Offline login has no Mojang-authenticated `S`: do not derive `K`,
+    claim binding, or create/update authenticated pins. Minecraft's cipher is already off,
+    exactly as vanilla; no cipher is being dropped. For explicit offline `/3` testing,
+    use the same five-message exchange with mode 0 and all-zero tags, still enforcing TLS
+    confirmation, metadata, state, deadlines and byte boundaries. It negotiates framing only,
+    not identity. Never accept mode 0 for a connection authenticated in online mode, or as a
+    fallback after online binding fails. Offline TOFU and change warnings remain Phase 9.
+20. **12.20 Security claims and exclusions.** Test a transparent relay (same TLS channel,
+    check passes), a fingerprint-swapping TLS terminator (different exporters, check fails
+    before cipher-off), reflected/modified/replayed messages (fail), and honest resumed
+    sessions (fresh check passes). Passive observers see only QUIC ciphertext after TLS;
+    a TLS terminator must not obtain post-binding game plaintext. This does not add integrity
+    to pre-binding CFB8, conceal Login Start from a TLS terminator, stop advertisement stripping,
+    UDP blocking, replay-induced login DoS, a malicious authenticated server, compromised
+    endpoints/session services, or stolen Minecraft/TLS secrets. Offline first contact remains
+    vulnerable to active MITM. No WebPKI validation, per-stream CFB8, exporter-derived Minecraft
+    secret, TCP-first authentication or live TCP-to-QUIC handover is introduced.
 
-### Optional, later
+## 13. Multi-stream (Phase 5)
 
-CA-signed certificates for owners with a domain, validated like WebPKI, would authenticate even
-the first contact. Off by default.
+**Draft v2, awaiting user sign-off and security review.**
 
-### Limits (unchanged from vanilla)
+### Negotiation and stream map
 
-- An attacker can always strip the advertisement and force TCP: the worst case equals vanilla.
-- The handshake and Login Start (player name, UUID) are visible to a fingerprint-swapping
-  attacker, as they are in plain vanilla TCP.
+1. **13.1 Version selection.** Keep the advertisement object version `v:1`; a capable,
+   explicitly enabled server advertises `alpn:"quicraft/3"`. Such a listener accepts both
+   `/3` and `/2`; a capable client offers the advertised ALPN only. Existing clients that
+   do not recognize `/3` use TCP; new clients seeing `/2` use unchanged v1. A failed `/3`
+   handshake races/falls back under §5, never sends a v2 preamble to a `/2` peer, and never
+   alters the TCP listener. No feature is inferred from a plugin payload on `/2`.
+2. **13.2 Preamble.** Under `/3` only, stream 0 begins in each direction with exactly
+   `VarInt(length) || u8(version=2) || u8(token_length) || token`; token length is 0 or 16,
+   length exactly 2 or 18. Retain §8's token semantics. Unknown version/length is `0x1`.
+   Following bytes remain the ordinary single-stream Minecraft login/configuration format
+   until 12.11/12.12, then become records. The existing v1 `Preamble`/`PreambleStream` are
+   not extensibility negotiation; `/3` requires a separate version-aware parser and cutover.
+3. **13.3 Stream identities.** Exactly three bidirectional QUIC streams are allowed:
+   stream 0 CONTROL (client opens, both directions), stream 4 REALTIME (client opens,
+   both directions), stream 1 WORLD (server opens, both directions). The latter two open
+   only after the opener activates under §12. This explicitly lifts v1's ban on server-opened
+   streams for `/3` only. No unidirectional streams, datagrams, replacement streams or other
+   ids are permitted. WORLD and REALTIME each start in each direction with
+   `u8(version=2) || u8(type)` where type is 1 REALTIME or 2 WORLD; CONTROL has no second
+   preamble. A receiver may buffer early auxiliary bytes until its own activation, under
+   13.12's bounds, but must not deliver them before it validates SERVER_SWITCH (client) or
+   CLIENT_SWITCH and queues SERVER_SWITCH (server).
 
-### Considered and set aside
+### Records, control and routing data
 
-- Per-stream Minecraft ciphers derived from the shared secret: keeps double encryption and CFB8's
-  lack of integrity.
-- Deriving Minecraft's shared secret from the TLS exporter: changes the Mojang hash input and the
-  vanilla login.
-- A TCP-first join, followed by a live handover to QUIC or a vanilla transfer packet: binding
-  makes a QUIC first join safe, so neither is needed.
+4. **13.4 Record format.** Each activated stream direction carries repeated
+   `VarInt(record_length) || u8(kind) || u64(sequence) || u64(dep_control) ||
+   u64(dep_realtime) || u64(dep_world) || body`. Length excludes its own VarInt and
+   includes the 33-byte fixed header. Kind 0 is one GAME packet; body is exactly one
+   Minecraft VarInt-length frame including packet id and the negotiated compression wrapper,
+   without CFB8. Kind 1 is END, CONTROL only, with empty body. Reject unknown kinds,
+   trailing bytes, invalid inner lengths or a record longer than 8 MiB + 33 bytes.
+   Sequence starts at 1 independently per stream and direction and increments by exactly
+   one per record, including END; zero dependencies mean no predecessor. No integer wraps.
+5. **13.5 CONTROL semantics.** State transitions (including Finish Configuration and
+   acknowledgements), registry/dimension changes, compression changes, object create/destroy,
+   teleport/respawn, disconnects, and unknown/custom packets MUST use CONTROL. CONTROL is
+   ordered and is a full fence: a control record depends on every record previously assigned
+   in that sending direction on all lanes; every subsequent non-control record depends on
+   that control record. Receivers apply state changes only at delivery, before decoding
+   subsequent dependent packet bodies. Reconfiguration retains the streams and sequences,
+   drains play through a control fence and uses CONTROL exclusively until play resumes.
+6. **13.6 Routing algorithm.** At the sender's original game packet ordering point, assign
+   sequences and dependencies before parallel encoding or scheduling. Lookup is by exact
+   Minecraft protocol number, protocol state, direction and numeric packet id. Missing entries
+   default to CONTROL, never an inferred category. The receiver checks the selected lane
+   against the same table after dependencies permit decoding; wrong-lane packets disconnect.
+   Unknown protocol numbers disable `/3` before connecting; unequal table digests discovered
+   in OFFER fail activation under 12.14 before entering play, not a guessed routing table.
+   Runtime packet-id remappers/modded registries require an explicitly
+   matching reviewed table or stay `/2`.
+7. **13.7 Data resource.** Store routing as UTF-8 JSON data, one resource per protocol number,
+   with `schema:1`, `protocol:<number>`, `default:"control"`, and `routes` entries containing
+   `state`, `direction` (`clientbound`/`serverbound`), `packet_id` (nonnegative integer),
+   `lane` (`control`/`realtime`/`world`) and `dependency` (`fence`/`lane`). Reject duplicates,
+   unknown fields and unsupported schema. Require `fence` for CONTROL and `lane` otherwise;
+   every non-control entry needs ordering tests. `R` is SHA-256 of the exact resource bytes,
+   including whitespace, shipped identically to both peers; no runtime normalization. The
+   following is a synthetic schema example, NOT a mapping for any released Minecraft version:
 
-### Open points
+   ```json
+   {"schema":1,"protocol":12345,"default":"control","routes":[
+     {"state":"play","direction":"clientbound","packet_id":10,"lane":"control","dependency":"fence"},
+     {"state":"play","direction":"clientbound","packet_id":11,"lane":"realtime","dependency":"lane"},
+     {"state":"play","direction":"clientbound","packet_id":12,"lane":"world","dependency":"lane"}
+   ]}
+   ```
 
-- Whether Netty's QUIC TLS engine exposes BoringSSL's exporter (`SSL_export_keying_material`).
-  If not, it's a small patch in the custom Netty build.
-- Exact key derivation, message format, the switch-off boundary, and pin storage and rotation.
-- Security review: resumption × channel binding (what a pin means when the binding check runs on
-  a resumed connection; the client must remember which fingerprint each ticket was issued under,
-  as it does today through one TLS context per fingerprint).
+8. **13.8 Explicit game invariants.** Entity spawn/create and destroy are CONTROL fences;
+   entity movement/metadata may be REALTIME only after the corresponding spawn is delivered,
+   and destroy must wait for all prior updates before id reuse. Chunk install, unload and
+   world reset are CONTROL fences. Block, light and block-entity updates for that chunk
+   MUST share WORLD in original order, or remain CONTROL; they depend on the install fence.
+   No update may pass its chunk
+   install or reference an entity after its destroy. Dimension/registry changes fence all
+   affected lanes. Where a packet's dependency cannot be demonstrated from these rules,
+   route it to CONTROL. Stream classification is not permission to omit a predecessor.
+
+### Sequence barriers, bounds and delivery
+
+9. **13.9 Dependency vector.** For each sending direction maintain last-assigned sequences
+   `A[control,realtime,world]`. A non-control record depends on the latest CONTROL and its
+   own lane predecessor; other components default to zero. A CONTROL record depends on
+   the whole previous `A`. The sender MUST additionally include any cross-lane semantic
+   predecessor required by 13.8, taking componentwise maxima. Only already assigned records
+   may be referenced; a record's own-lane dependency is exactly `sequence-1`. These rules
+   make dependencies acyclic. Initial records have zero predecessors as appropriate.
+10. **13.10 Receiver algorithm.** Maintain contiguous delivered watermarks `D` per direction.
+    Parse envelopes without decoding game bodies; queue each in lane order. Deliver only a
+    lane's head record, only when every dependency is <= the corresponding `D`, and only
+    after the game's serial packet handler has accepted/applied it in order (not merely
+    when bytes arrive or decoding completes). Then advance that lane's `D` and retry heads.
+    Serialize delivery on the game connection executor; preserve the vanilla main-thread
+    dispatch order for each dependency. No cross-direction dependency is implied: request/
+    response semantics still use the game's application acknowledgements. A record with a
+    future own-lane dependency, skipped sequence or duplicate is a protocol error.
+11. **13.11 Barrier example.** CONTROL spawn sequence 5 followed by REALTIME move sequence 9
+    carries `dep_control=5`, `dep_realtime=8`. If move arrives first, hold it until spawn 5
+    and move 8 have been delivered. A subsequent CONTROL destroy sequence 6 depends on
+    REALTIME 9 (and every prior WORLD record), so cannot overtake that move. CONTROL chunk
+    install 7 followed by WORLD block update 8 carries `dep_control=7`; the update waits
+    for the install even if their bytes arrive out of order. Fault tests
+    MUST withhold each predecessor independently and observe these delivery orders.
+12. **13.12 Memory and timeout.** Per connection, cap pending received records (including
+    partial records, pre-activation auxiliary bytes and decoded-but-undelivered packets)
+    at 1024 records or 16 MiB total wire/retained decoded bytes, whichever comes first.
+    Cap each decompressed packet at 8 MiB or the game's stricter limit. Count parser buffers,
+    staged bundles and decompression output in these budgets, not just complete envelopes.
+    Reserve a further 1 MiB receive budget for CONTROL so blocked auxiliary queues cannot
+    prevent reading small control predecessors; aggregate cap is 17 MiB. A predecessor
+    larger than the remaining budget disconnects rather than evicting buffered data.
+    Stop granting auxiliary credit
+    before exceeding its budget; if data already received cannot fit, close, never evict
+    a predecessor. Also cap unsent application queues at 1024 packets or 16 MiB and apply
+    backpressure; an unpausable producer over the cap disconnects. A head record blocked on
+    a dependency, incomplete record, or unapplied handler for 10 seconds disconnects with
+    `0x11` (ordering/resource failure). Cycles, impossible references, limit violations and
+    parser/ordering errors use the same code; do not skip packets or release a barrier on
+    timeout. Start the incomplete-record timer at its first byte and the blocked-head timer
+    when it becomes head; progress on other lanes does not restart either deadline. This
+    deliberately favors disconnect over an undetected game desync.
+
+### Flow control, resets, bundles and compression
+
+13. **13.13 Transport limits.** `/3` sets `initial_max_data=16 MiB`, both bidi per-stream
+    limits to 4 MiB, `initial_max_streams_bidi=2` at the server (client streams 0 and 4),
+    `=1` at the client (server stream 1), and both uni limits to 0. Never increase MAX_STREAMS;
+    grow MAX_DATA/MAX_STREAM_DATA only against uncommitted bounded receive budget, reserving
+    CONTROL capacity as in 13.12, and reclaim that budget after delivery. In particular,
+    extend credit for a partial record larger than the initial 4 MiB window when it fits
+    the remaining budget; do not wait for complete-record delivery to extend that window.
+    All other §9 values remain unchanged. Prioritize available
+    CONTROL writes, then round-robin REALTIME and WORLD in at most 64 KiB write quanta;
+    priority must not starve a WORLD predecessor needed by CONTROL. Measure memory and
+    throughput before changing these draft limits, including at the 50,000-player target.
+14. **13.14 Reset and shutdown.** RESET_STREAM, STOP_SENDING, unexpected FIN on any lane,
+    failure to open an allowed stream within 10 seconds of activation, or an extra stream
+    terminates the whole connection with `0x11`; never reopen just one lane or remap lost
+    packets to CONTROL. Normal close sends a CONTROL disconnect if applicable, then END
+    as a full fence after all queued game records. On END delivery the peer closes with
+    `0x0`; sender waits at most 10 seconds before closing. A connection close is always
+    terminal. TCP retry is a new player join, never mid-session recovery.
+15. **13.15 Bundles.** Treat a vanilla bundle (opening delimiter, all members, closing
+    delimiter) as one CONTROL-fenced scheduling unit, keeping its actual packets as separate
+    sequential GAME records, all on CONTROL, with no other game record assigned between
+    them. Buffer before assigning routes, at most 4096 members or 8 MiB total uncompressed
+    bytes, further limited by the game's own cap; missing closing delimiter for 10 seconds
+    or excess bounds disconnects. Do not split members onto auxiliary lanes or deliver a
+    partial bundle to game logic. Receiver stages contiguous CONTROL members through the
+    closing delimiter using provisional watermarks for their internal predecessor checks;
+    external dependencies must already satisfy the committed watermarks. It commits those
+    watermarks only after delivering the whole validated bundle atomically to the game's
+    bundle handler. No other lane may depend on a provisional watermark. Reserve/validate
+    the complete bundle against queue bounds before scheduling it; never interleave an
+    activation, compression change or state transition with a bundle. Such a member makes
+    the bundle invalid rather than changing decoder state partway through it.
+16. **13.16 Compression.** Compression remains per Minecraft packet, not a shared compressed
+    stream. Threshold changes are CONTROL fences; encode the change packet using the old
+    threshold, subsequent packets using the new one. Receiver applies the new threshold
+    after delivering that change and before decoding later dependent GAME bodies. Do not
+    decompress a blocked packet using the current threshold speculatively. Keep ordinary
+    Minecraft malformed-compression and size checks; no dictionary spans streams.
+17. **13.17 Acceptance tests.** Before enablement require golden HKDF/exporter/message/record
+    vectors; wrong/absent exporter and upstream-native tests; all MAC/state/timeout failures;
+    switch packets split at every byte and coalesced with following plaintext; changed pins,
+    rotation and corrupt storage; full/resumed/accepted and rejected early-data sessions;
+    offline/online confusion; v1/new-client/new-server/TCP compatibility; resets on every
+    stream; exhausted credit/buffers; delayed spawn/chunk/fences, bundles and compression
+    changes. Run full-play desync assertions under every testkit netem profile. Phase 5
+    requires measured loss improvement over TCP AND single-stream and security review;
+    this draft makes no performance or completed-review claim.
+
+### OPEN QUESTIONS (user sign-off required)
+
+1. Approve `/3`, the configuration-stage four-proof/switch exchange after OFFER, and the
+   conservative exporter gate even for offline multi-stream tests?
+2. Approve changed-pin TCP fallback plus explicit player-authorized online re-binding for
+   rotation, rather than automatic trust replacement?
+3. Approve the three fixed lanes, conservative full CONTROL fences, and exact-byte JSON
+   routing digests as the first reviewable design?
+4. Approve the proposed memory/packet limits and 10-second fail-closed deadlines for
+   benchmarking, particularly their per-node cost at 50,000 concurrent players?
