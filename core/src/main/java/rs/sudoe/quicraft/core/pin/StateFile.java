@@ -30,12 +30,15 @@ import rs.sudoe.quicraft.core.Faults;
  * {@code AtomicMoveNotSupportedException} the write fails and the state is disabled rather than
  * falling back to a plain replacement a reader could catch half-written. The directory flush is
  * skipped on Windows, which cannot open a directory for reading; everywhere else a failure to flush
- * is a write failure too.</p>
+ * is a write failure too. That flush happens after the rename, so a failure there leaves the new
+ * content already in place while the write is reported as failed and the caller disables the state:
+ * fail closed, the file is not read again in this process and is never overwritten, and the state on
+ * disk is the new one rather than a mixture.</p>
  *
  * <p>A caller that gets an {@link IOException} (or a {@link RuntimeException} from the fault
- * injection of {@link #FAULT_FORCE} and {@link #FAULT_MOVE}) must treat the state as unusable: a
- * partial write never leaves a truncated file, but it does mean the new state was not stored and the
- * old one is still in place.</p>
+ * injection of {@link #FAULT_FORCE} and {@link #FAULT_MOVE}) must treat the state as unusable: it
+ * either left the old content in place (a failure before the rename, or a rename that failed) or the
+ * new content in place but unproven (a failed directory flush), and never a partial write.</p>
  */
 final class StateFile {
     /**
