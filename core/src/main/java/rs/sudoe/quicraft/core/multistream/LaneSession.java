@@ -188,6 +188,11 @@ public final class LaneSession {
      * side's auxiliary stream (client stream 4, server stream 1) and starts the 10 second clock
      * for the peer's. {@code controlLeftover} holds bytes already read from stream 0 beyond the
      * switch packet; they are the start of the record stream. May be null.
+     *
+     * <p>Activation runs on the connection's event loop; a call from another thread is queued
+     * there. A server must therefore call this on the event loop before, or in the same task as,
+     * the flush that sends SERVER_SWITCH (13.3): a queued activation could run after the client
+     * has already opened stream 4, which is fatal.
      */
     public void activate(ByteBuffer controlLeftover) {
         final ByteBuf leftover = controlLeftover == null || !controlLeftover.hasRemaining() ? null
