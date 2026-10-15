@@ -537,9 +537,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
 ### QUICraft's Netty QUIC build
 
 `core` doesn't use Maven Central's `netty-codec-classes-quic`. It uses QUICraft's build,
-`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft4` from
+`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft5` from
 `natives/`. That is Netty `netty-4.2.19.Final` (64cc10f3), quiche `be47c501` and BoringSSL
-`d03dbc3e`, the same revisions as upstream 4.2.19, plus six patches:
+`d03dbc3e`, the same revisions as upstream 4.2.19, plus seven patches:
 
 | Patch | What it does |
 | --- | --- |
@@ -548,6 +548,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 | `netty/0002-complete-connect-after-handshake-send` | Completes a client connect as soon as the handshake does (§5), in a task on the connection's event loop. |
 | `netty/0003-server-reads-accepted-early-data` | A server that accepted 0-RTT reads early stream data before the handshake completes: the connection is active during early data, and after the send that decrypts a buffered 0-RTT packet it processes the readable streams. Java only, so it works with upstream natives too. `SslHandshakeCompletionEvent` still marks the completed handshake. |
 | `netty/0004` | TLS keying material exporter accessor and capability probe, with JNI `SSL_export_keying_material` (12.2). Netty-only patch; the patched native is available only on linux-x86_64. |
+| `netty/0005-max-flow-control-windows` | `QuicCodecBuilder.maxConnectionWindow(long)` and `maxStreamWindow(long)` with JNI `quiche_config_set_max_connection_window` / `quiche_config_set_max_stream_window`, so the maxima of quiche's flow-control auto-tuning can be pinned as 13.13 requires. Unset, quiche keeps its defaults. |
 | `quiche/0002-backport-fc9fe129-handshake-close` | Upstream quiche fc9fe129 (2026-09-25), unchanged. Without it, an application close sent after the client's handshake completed but before HANDSHAKE_DONE (the window netty/0002 opens) never goes out, and the send loop spins forever. |
 
 - `natives/build-linux.sh` runs Netty's own Maven build unchanged in Docker, on AlmaLinux 8 with
