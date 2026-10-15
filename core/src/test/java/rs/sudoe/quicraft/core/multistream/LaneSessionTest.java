@@ -602,6 +602,39 @@ class LaneSessionTest {
     }
 
     @Test
+    void twoAuxiliaryLanesWithSplitLengthPrefixesCannotOvercommitTheBudget() throws Exception {
+        LaneRig.Config config = new LaneRig.Config();
+        config.clientSession = false;
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.server.activate(null);
+            QuicStreamChannel world = rig.clientRawStreams.poll(10, TimeUnit.SECONDS);
+            LaneLoopback.write(world, (byte) 2, (byte) 2);
+            QuicStreamChannel realtime = rig.net.clientStream();
+            LaneLoopback.write(realtime, (byte) 2, (byte) 1);
+            byte[] frame = LaneRig.frame(LaneRig.MOVE, RecordCodec.MAX_INNER_CONTENT - 1);
+            // Six maximum-size records leave room for one more but not for two.
+            java.io.ByteArrayOutputStream six = new java.io.ByteArrayOutputStream();
+            for (int i = 1; i <= 6; i++) {
+                six.write(RecordCodec.encodeGame(i, 1, i - 1, 0, frame));
+            }
+            LaneLoopback.write(realtime, six.toByteArray());
+            assertTrue(LaneRig.await(() -> snapshotIs(rig.server, 0, 6), 30000));
+            byte[] seventh = RecordCodec.encodeGame(7, 1, 6, 0, frame);
+            byte[] first = RecordCodec.encodeGame(1, 1, 0, 0, frame);
+            // The four-byte length prefixes arrive in halves on both lanes.
+            LaneLoopback.write(realtime, Arrays.copyOf(seventh, 2));
+            LaneLoopback.write(world, Arrays.copyOf(first, 2));
+            assertTrue(LaneRig.await(() -> snapshotIs(rig.server, 0, 8), 10000));
+            LaneLoopback.write(realtime, Arrays.copyOfRange(seventh, 2, seventh.length));
+            LaneLoopback.write(world, Arrays.copyOfRange(first, 2, first.length));
+            sleep(1500);
+            assertFalse(rig.serverGame.closed.isDone(),
+                    "a legal record must wait for budget, never be fatal for lack of it");
+            assertFalse(rig.net.clientSawClose.isDone());
+        }
+    }
+
+    @Test
     void aMaximumSizeRecordWaitsForAuxiliaryBudgetInsteadOfBeingFatal() throws Exception {
         try (LaneRig rig = LaneRig.start()) {
             rig.activateBoth();

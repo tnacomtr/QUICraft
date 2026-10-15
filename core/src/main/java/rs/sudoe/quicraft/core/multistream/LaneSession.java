@@ -609,7 +609,7 @@ public final class LaneSession {
                 s.opened = true;
                 continue;
             }
-            if (!s.decoder.hasPartial() && !credit(s.lane)) {
+            if (!s.midRecord() && !credit(s.lane)) {
                 break;
             }
             RecordCodec.Record record = s.decoder.next(s.current);
@@ -627,9 +627,10 @@ public final class LaneSession {
             throw new MultistreamProtocolException(CLOSE_ORDERING, "13.14",
                     "unexpected FIN on the " + s.lane + " lane");
         }
-        // The rest of a record in progress, or of a preamble, already holds its slot and charge.
+        // The rest of a record whose length is known, or of a preamble, already holds its charge.
+        // A bare, still incomplete length prefix holds almost nothing, so it needs credit again.
         if (!s.fin && !s.readPending && !s.hasUnparsed() && s.channel != null
-                && (s.decoder.hasPartial() || !s.opened || credit(s.lane))) {
+                && (s.midRecord() || !s.opened || credit(s.lane))) {
             s.readPending = true;
             s.channel.read();
         }
@@ -639,6 +640,7 @@ public final class LaneSession {
         ReceiverScheduler.Partial partial = s.partial;
         s.partial = null;
         s.charged = 0;
+        s.lengthKnown = false;
         if (partial == null) {
             throw new OrderingException("record without a reservation");
         }
@@ -891,6 +893,8 @@ public final class LaneSession {
         boolean readPending;
         boolean fin;
         boolean preambleWritten;
+        /** The record in progress has announced its length, so its full size is charged. */
+        boolean lengthKnown;
 
         LaneStream(Lane lane) {
             this.lane = lane;
@@ -911,7 +915,13 @@ public final class LaneSession {
                 receiver.growPartial(partial, wireBytes - charged, now());
             }
             charged = wireBytes;
+            lengthKnown = true;
             return true;
+        }
+
+        /** A record in progress whose whole parser buffer is already charged. */
+        boolean midRecord() {
+            return decoder.hasPartial() && lengthKnown;
         }
 
         boolean nextBuffer() {
