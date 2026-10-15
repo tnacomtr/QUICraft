@@ -43,18 +43,37 @@ public final class TlsExporter {
     /**
      * As {@link #bindingValue}, for another label, context or length. The label must be US-ASCII;
      * the context may be {@code null} or empty, and the two are the same exporter call.
+     *
+     * @throws NullPointerException if {@code stream} is {@code null}.
+     * @throws IllegalArgumentException if {@code stream} is not a QUICraft stream over a QUIC
+     *                                  connection.
+     * @throws IllegalStateException if called from outside the stream's event loop.
      */
     public static byte[] export(QuicByteStream stream, String label, byte[] context, int length) {
         if (stream == null) {
             throw new NullPointerException("stream");
         }
-        if (!(stream instanceof NettyQuicByteStream)) {
+        NettyQuicByteStream raw = nettyStream(stream);
+        if (raw == null) {
             throw new IllegalArgumentException("not a QUIC connection: " + stream.getClass().getName());
         }
         if (!stream.inEventLoop()) {
             throw new IllegalStateException("the TLS exporter must run on the stream's event loop");
         }
-        QuicChannel connection = ((NettyQuicByteStream) stream).connection();
+        QuicChannel connection = raw.connection();
         return connection.exportKeyingMaterial(label, context, length);
+    }
+
+    /**
+     * The Netty stream the connection lives on, or {@code null} when {@code stream} is not a
+     * QUICraft stream. The game holds a {@link PreambleStream} (a {@link ClientStream} or a
+     * {@link ServerStream}), which carries the {@link NettyQuicByteStream} in
+     * {@link PreambleStream#rawStream()}: the stream a caller sees is never the Netty one itself.
+     */
+    private static NettyQuicByteStream nettyStream(QuicByteStream stream) {
+        if (stream instanceof PreambleStream) {
+            return ((PreambleStream) stream).rawStream();
+        }
+        return stream instanceof NettyQuicByteStream ? (NettyQuicByteStream) stream : null;
     }
 }
