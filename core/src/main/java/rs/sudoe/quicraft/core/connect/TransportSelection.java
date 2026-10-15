@@ -136,8 +136,10 @@ public final class TransportSelection {
         }
 
         /**
-         * The advertisement for the server, if any. Only its ALPN and routing member are read: a
-         * malformed advertisement is already "no advertisement" by the time it gets here (§1, 13.1).
+         * The advertisement for the server, if any, parsed with
+         * {@link Advertisement#extractForSelection(String)} so that a {@code quicraft/3} member is
+         * recognized (13.1). Only its ALPN and routing member are read: a malformed advertisement is
+         * already "no advertisement" by the time it gets here (§1, 13.1).
          */
         public Optional<Advertisement> advertisement() {
             return advertisement;

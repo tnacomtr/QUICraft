@@ -23,6 +23,12 @@ import rs.sudoe.quicraft.core.tls.Fingerprint;
  * invalidates an otherwise valid advertisement: it is treated as absent, so {@code quicraft/2} and
  * TCP keep working exactly as before (12.1, 13.1). The same holds for the entry bound
  * {@link #MAX_ROUTING_ENTRIES}.
+ *
+ * <p>The parse entry points differ in the ALPNs they accept: {@link #extract(String)} keeps the
+ * shipped {@code quicraft/2}-only behaviour and reads no routing, so a {@code quicraft/3}
+ * advertisement is no advertisement to it and every shipped caller stays on TCP (13.1), while
+ * {@link #extractForSelection(String)} also reads {@code quicraft/3} and its routing member for the
+ * 12/13 selection.
  */
 public final class Advertisement {
     /** Status response cap in UTF-16 code units (verified for 26.1.2, docs/protocol.md §1). */
@@ -162,12 +168,33 @@ public final class Advertisement {
     }
 
     /**
-     * Reads a v1 advertisement from a raw status response. Empty if the member is absent,
-     * malformed, of an unknown version, or for an ALPN this client doesn't offer. Unknown
-     * fields inside the member are ignored, and so is an unusable routing member, which never
-     * invalidates the rest (13.1). Never throws.
+     * Reads a v1 advertisement from a raw status response, for the ALPN this build offers:
+     * {@code quicraft/2} only, exactly as before 13.1. Empty if the member is absent, malformed, of
+     * an unknown version, or for another ALPN; a {@code quicraft/3} advertisement is deliberately
+     * not recognized here, so every shipped caller (13.1: clients that do not recognize {@code /3})
+     * treats it as no advertisement and uses TCP. Unknown fields inside the member are ignored, and
+     * neither is the routing member read: it only matters for the {@code /3} selection, so the value
+     * this returns carries no routing (13.1). Never throws.
+     *
+     * <p>Callers that implement the pre-connect selection of 13.1 use
+     * {@link #extractForSelection(String)} instead.
      */
     public static Optional<Advertisement> extract(String statusJson) {
+        return extract(statusJson, false);
+    }
+
+    /**
+     * Reads a v1 advertisement for the pre-connect selection of 13.1: the same rules as
+     * {@link #extract(String)}, but {@code quicraft/3} is accepted alongside {@code quicraft/2}, and
+     * the optional routing member is parsed. A caller that races or connects from this advertisement
+     * MUST have the {@code /3} rules of 12 and 13, which is why the shipped parse entry point stays
+     * {@link #extract(String)}. Never throws.
+     */
+    public static Optional<Advertisement> extractForSelection(String statusJson) {
+        return extract(statusJson, true);
+    }
+
+    private static Optional<Advertisement> extract(String statusJson, boolean acceptV3) {
         try {
             Object parsed = Json.parse(statusJson);
             if (!(parsed instanceof Map)) {
@@ -183,22 +210,24 @@ public final class Advertisement {
             Object alpn = ad.get("alpn");
             Object fp = ad.get("fp");
             if (version == null || version != Protocol.VERSION || port == null || port < 1 || port > 65535
-                    || !isKnownAlpn(alpn) || !(fp instanceof String)) {
+                    || !isKnownAlpn(alpn, acceptV3) || !(fp instanceof String)) {
                 return Optional.empty();
             }
             return Optional.of(new Advertisement(version, port, (String) alpn,
-                    Fingerprint.parse((String) fp), parseRouting(ad.get(ROUTING_KEY))));
+                    Fingerprint.parse((String) fp),
+                    acceptV3 ? parseRouting(ad.get(ROUTING_KEY)) : Collections.<Integer, String>emptyMap()));
         } catch (RuntimeException e) {
             return Optional.empty();
         }
     }
 
     /**
-     * The ALPNs this build understands: the shipped {@code quicraft/2} and the proposed
-     * {@code quicraft/3} (13.1). Any other value keeps the v1 behaviour, "no advertisement".
+     * The ALPNs this build understands in the member: the shipped {@code quicraft/2} always, and the
+     * proposed {@code quicraft/3} only for the selection parse (13.1). Any other value keeps the v1
+     * behaviour, "no advertisement".
      */
-    private static boolean isKnownAlpn(Object alpn) {
-        return Protocol.ALPN.equals(alpn) || Protocol.ALPN_V3.equals(alpn);
+    private static boolean isKnownAlpn(Object alpn, boolean acceptV3) {
+        return Protocol.ALPN.equals(alpn) || (acceptV3 && Protocol.ALPN_V3.equals(alpn));
     }
 
     /**

@@ -118,17 +118,39 @@ class AdvertisementTest {
     }
 
     @Test
-    void acceptsQuicraft3AndKeepsTheV1Fields() {
-        Advertisement ad = extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/3\",\"fp\":\"" + fp + "\"}")
-                .orElseThrow(() -> new AssertionError("quicraft/3 must parse"));
+    void extractKeepsTheShippedQuicraft2OnlyBehaviour() {
+        String v2 = "{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}";
+        // A /2 advertisement parses to exactly the value the shipped code always produced.
+        assertEquals(Optional.of(Advertisement.v1(25565, fp)), extract(v2));
+        assertEquals(extract(v2), extractForSelection(v2));
+        Advertisement inserted = Advertisement.v1(25565, fp);
+        assertEquals(Optional.of(inserted), Advertisement.extract(inserted.insertInto(VANILLA)));
+        // Nor does routing on a /2 advertisement change what the shipped code reads.
+        assertEquals(Optional.of(Advertisement.v1(25565, fp)),
+                extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp
+                        + "\",\"routing\":{\"775\":\"" + digest('a') + "\"}}"));
+        // 13.1: a client that does not recognize quicraft/3 treats it as no advertisement.
+        String v3 = "{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/3\",\"fp\":\"" + fp + "\"}";
+        assertFalse(extract(v3).isPresent());
+        assertTrue(extractForSelection(v3).isPresent());
+    }
+
+    @Test
+    void acceptsQuicraft3ForSelectionAndKeepsTheV1Fields() {
+        Advertisement ad = extractForSelection(
+                        "{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/3\",\"fp\":\"" + fp + "\"}")
+                .orElseThrow(() -> new AssertionError("quicraft/3 must parse for selection"));
         assertEquals(1, ad.version());
         assertEquals(25565, ad.port());
         assertEquals("quicraft/3", ad.alpn());
         assertEquals(fp, ad.fingerprint());
         assertTrue(ad.routing().isEmpty());
         assertEquals(Optional.empty(), ad.routingDigest(775));
-        assertTrue(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}").isPresent());
-        assertFalse(extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/4\",\"fp\":\"" + fp + "\"}").isPresent());
+        assertTrue(extractForSelection(
+                "{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/2\",\"fp\":\"" + fp + "\"}").isPresent());
+        // Neither entry point recognizes anything else (13.1).
+        assertFalse(extractForSelection(
+                "{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/4\",\"fp\":\"" + fp + "\"}").isPresent());
     }
 
     @Test
@@ -145,12 +167,12 @@ class AdvertisementTest {
         assertEquals(Optional.empty(), ad.routingDigest(776));
 
         String status = ad.insertInto(VANILLA);
-        assertEquals(Optional.of(ad), Advertisement.extract(status));
-        Advertisement reparsed = Advertisement.extract(status).orElseThrow(AssertionError::new);
+        assertEquals(Optional.of(ad), Advertisement.extractForSelection(status));
+        Advertisement reparsed = Advertisement.extractForSelection(status).orElseThrow(AssertionError::new);
         assertEquals(ad.toJson(), reparsed.toJson());
         assertEquals(ad.hashCode(), reparsed.hashCode());
         // A hand-written status response with the same member parses to the same value too.
-        assertEquals(ad, extract("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/3\",\"fp\":\"" + fp
+        assertEquals(ad, extractForSelection("{\"v\":1,\"port\":25565,\"alpn\":\"quicraft/3\",\"fp\":\"" + fp
                 + "\",\"routing\":{\"775\":\"" + digest('a') + "\",\"0\":\"" + digest('b') + "\"}}")
                 .orElseThrow(AssertionError::new));
     }
@@ -181,7 +203,8 @@ class AdvertisementTest {
 
     @Test
     void boundsTheRoutingMember() {
-        Optional<Advertisement> atLimit = extract(withRouting("quicraft/3", routingJson(Advertisement.MAX_ROUTING_ENTRIES)));
+        Optional<Advertisement> atLimit = extractForSelection(
+                withRouting("quicraft/3", routingJson(Advertisement.MAX_ROUTING_ENTRIES)));
         assertTrue(atLimit.isPresent());
         assertEquals(Advertisement.MAX_ROUTING_ENTRIES, atLimit.get().routing().size());
         assertEquals(Optional.of(digest('a')), atLimit.get().routingDigest(Advertisement.MAX_ROUTING_ENTRIES - 1));
@@ -263,6 +286,10 @@ class AdvertisementTest {
 
     private static Optional<Advertisement> extract(String member) {
         return Advertisement.extract("{\"description\":\"x\",\"quicraft:quic\":" + member + "}");
+    }
+
+    private static Optional<Advertisement> extractForSelection(String member) {
+        return Advertisement.extractForSelection("{\"description\":\"x\",\"quicraft:quic\":" + member + "}");
     }
 
     private static String padded(int length) {
