@@ -24,11 +24,12 @@ class OrderingCoreTest {
     private static final class Harness {
         final List<ReceiverScheduler.Delivery> calls = new ArrayList<ReceiverScheduler.Delivery>();
         final List<Envelope> delivered = new ArrayList<Envelope>();
-        final ReceiverScheduler scheduler = new ReceiverScheduler(d -> {
+        final ReceiverScheduler scheduler = new ReceiverScheduler(this::onDelivery);
+        private void onDelivery(ReceiverScheduler.Delivery d) {
+            assertDeliveryDependencies(d,scheduler.delivered());
             calls.add(d);
-            // At callback time every external predecessor must already be committed.
             delivered.addAll(d.records());
-        });
+        }
         void drain(long now) {
             while (!calls.isEmpty()) {
                 ReceiverScheduler.Delivery d = calls.remove(0);
@@ -152,6 +153,21 @@ class OrderingCoreTest {
         for (Envelope e : records) {
             for (Lane lane : Lane.values()) assertTrue(Long.compareUnsigned(e.dependency(lane),d[lane.ordinal()])<=0);
             assertEquals(d[e.lane().ordinal()]+1,e.sequence()); d[e.lane().ordinal()]++;
+        }
+    }
+    private static void assertDeliveryDependencies(ReceiverScheduler.Delivery delivery, long[] committed) {
+        long[] allowed = committed.clone();
+        boolean bundle = delivery.records().size() > 1;
+        if (bundle) assertEquals(Envelope.Bundle.OPEN,delivery.records().get(0).bundle());
+        for (Envelope e : delivery.records()) {
+            for (Lane lane : Lane.values()) {
+                assertTrue(Long.compareUnsigned(e.dependency(lane),allowed[lane.ordinal()]) <= 0,
+                        "unsatisfied " + lane + " dependency at callback for " + e.lane() + ":" + e.sequence());
+            }
+            if (bundle) {
+                assertEquals(C,e.lane());
+                allowed[0] = e.sequence();
+            }
         }
     }
 
@@ -363,6 +379,7 @@ class OrderingCoreTest {
     @Test void synchronousAcknowledgementsDoNotRecurseThroughHandlerStack() {
         ReceiverScheduler[] ref=new ReceiverScheduler[1]; int[] depth={0}, max={0};
         ref[0]=new ReceiverScheduler(d -> {
+            assertDeliveryDependencies(d,ref[0].delivered());
             depth[0]++; max[0]=Math.max(max[0],depth[0]);
             ref[0].applied(d.lane(),d.sequence(),0); depth[0]--;
         });
@@ -401,6 +418,7 @@ class OrderingCoreTest {
     @Test void inlineApplicationUsesItsSuppliedTimeForTheNextHandlerDeadline() {
         ReceiverScheduler[] ref = new ReceiverScheduler[1];
         ref[0] = new ReceiverScheduler(d -> {
+            assertDeliveryDependencies(d,ref[0].delivered());
             if (d.lane() == C) ref[0].applied(C,1,T-1);
         });
         ref[0].offer(e(R,1,1,0,0),0);
