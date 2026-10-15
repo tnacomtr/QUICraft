@@ -28,7 +28,7 @@ QUICHE_COMMIT=be47c5011215b9f13bad06bd7627d3ae49888a19
 # Apache-2.0 since 33d1049b (2025-02-03); this pin is from 2026-05-12 (CLAUDE.md "Licensing").
 BORINGSSL_COMMIT=d03dbc3e5d7de44183ff17018af22323af650fbc
 # Bump the suffix whenever a patch, the lock file or a pin changes.
-QUICRAFT_VERSION=4.2.19.Final-quicraft3
+QUICRAFT_VERSION=4.2.19.Final-quicraft4
 GROUP_PATH=rs/sudoe/quicraft/netty
 QUICHE_FEATURES="ffi qlog custom-client-dcid"
 
@@ -196,6 +196,10 @@ lib="$(find "$check/META-INF/native" -type f -name '*netty_quiche42*')"
 if [[ "${SKIP_PATCHES:-0}" != 1 ]]; then
     grep -q quiche_config_set_enable_relaxed_loss_threshold "$lib" \
         || { echo "native has no relaxed loss threshold binding" >&2; exit 1; }
+    # The JNI name, not the BoringSSL symbol: the latter is in the statically linked libssl
+    # whatever the patches are, so it would pass an unpatched native.
+    grep -q SSL_export_keying_material_supported "$lib" \
+        || { echo "native has no TLS keying material export binding" >&2; exit 1; }
 fi
 info="$out/build-info-$classifier.txt"
 {
