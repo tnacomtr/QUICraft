@@ -52,6 +52,7 @@ public final class BindingMessage {
             throw new IllegalArgumentException("kind is required");
         }
         checkMode(mode);
+        checkProtocolNumber(protocolNumber);
         checkDigest(fingerprint, "fingerprint");
         checkDigest(routing, "routing");
         checkDigest(tag, "tag");
@@ -145,6 +146,19 @@ public final class BindingMessage {
     private static void checkMode(int mode) {
         if (mode != 0 && mode != 1) {
             throw new IllegalArgumentException("mode must be 0 (offline) or 1 (online)");
+        }
+    }
+
+    /**
+     * §12.8: {@code protocol_number} is an unsigned u32 and MUST be rejected outside
+     * {@code 0..4294967295} before encoding, never truncated or wrapped. A Java {@code int} cannot
+     * hold a value above {@link Integer#MAX_VALUE}, so the only out-of-range value a caller can
+     * pass is negative: reject it rather than writing four bytes that mean something else.
+     */
+    private static void checkProtocolNumber(int protocolNumber) {
+        if (protocolNumber < 0) {
+            throw new IllegalArgumentException("protocol number must be in unsigned 32-bit range, got "
+                    + protocolNumber);
         }
     }
 
