@@ -281,10 +281,11 @@ idea: derive H from the RTT the server-list ping already measured.
   the handshake once loss detection declares it lost (4.2 RTT to the first reply measured at
   200 ms RTT, instead of 2); the token then works as for any data after the handshake.
 - **Rejected 0-RTT.** Waiting for quiche's loss detection (above) is slow. So when the handshake
-  completes and the server's preamble hasn't arrived yet, the client waits a grace period
+  completes and the server's preamble hasn't arrived yet, the client waits up to a grace period
   G = clamp(handshake time / 4, 5 ms, 100 ms), the handshake time being connect start to
   handshake completion (measured on the client). A preamble that arrives within G changes
-  nothing. If none has arrived by then, the 0-RTT is treated as rejected: the client closes
+  nothing, and the connection goes on as soon as it arrives, not when G ends. If none has
+  arrived by then, the 0-RTT is treated as rejected: the client closes
   that connection with `0x4` (early data abandoned), without passing it to the game, and opens a
   new connection to the same address in the same attempt. The new connection is a full
   handshake with no 0-RTT and no session ticket for that server (the client may drop the tickets

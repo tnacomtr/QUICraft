@@ -18,6 +18,7 @@ import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.handler.codec.quic.QuicStreamType;
 import io.netty.handler.codec.quic.SslEarlyDataReadyEvent;
 import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.ScheduledFuture;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -399,10 +400,10 @@ public final class QuicClient {
         }
 
         /**
-         * The handshake completed with 0-RTT data out. If the server's preamble is still missing
-         * after a grace period, the 0-RTT was rejected (or lost): the connection is abandoned and
-         * the attempt retried, without the game seeing it (docs/protocol.md §8, "Rejected 0-RTT").
-         * On the connection's event loop.
+         * The handshake completed with 0-RTT data out. The connection goes to the game as soon as
+         * the server's preamble is read. If it is still missing after a grace period, the 0-RTT
+         * was rejected (or lost): the connection is abandoned and the attempt retried, without the
+         * game seeing it (docs/protocol.md §8, "Rejected 0-RTT"). On the connection's event loop.
          */
         private void awaitPreamble(QuicChannel connection, ClientStream stream, long handshakeNanos) {
             if (stream.preambleRead() || !connection.isOpen()) {
@@ -411,13 +412,27 @@ public final class QuicClient {
             }
             long grace = Math.max(Math.max(MIN_GRACE_NANOS, testGraceFloorNanos),
                     Math.min(MAX_GRACE_NANOS, handshakeNanos / 4));
-            connection.eventLoop().schedule(() -> {
+            boolean[] settled = new boolean[1]; // event loop only
+            ScheduledFuture<?> timer = connection.eventLoop().schedule(() -> {
+                if (settled[0]) {
+                    return;
+                }
+                settled[0] = true;
                 if (stream.preambleRead() || !connection.isOpen() || result.isDone()) {
                     deliver(stream);
                 } else {
                     abandonEarly(connection);
                 }
             }, grace, TimeUnit.NANOSECONDS);
+            stream.whenPreambleRead(() -> {
+                if (settled[0]) {
+                    return;
+                }
+                settled[0] = true;
+                timer.cancel(false);
+                // After the read that completed the preamble has finished with its data.
+                connection.eventLoop().execute(() -> deliver(stream));
+            });
         }
 
         private void deliver(ClientStream stream) {

@@ -27,6 +27,8 @@ public final class ClientStream extends PreambleStream {
     private FlightRecorder recorder;
     private volatile boolean mismatched;
     private volatile Runnable onMismatch;
+    /** Event loop only: runs once the server's preamble is complete; null when none is waiting. */
+    private Runnable onPreambleRead;
 
     ClientStream(NettyQuicByteStream raw, EarlyCache cache, List<Object> server, String joinInputs, byte[] sentEarly) {
         super(raw);
@@ -66,6 +68,20 @@ public final class ClientStream extends PreambleStream {
         }
         if (sentEarly == null) {
             openGate();
+        }
+        Runnable task = onPreambleRead;
+        if (task != null) {
+            onPreambleRead = null;
+            task.run();
+        }
+    }
+
+    /** On the event loop: runs {@code task} once the server's preamble is read, at once if it already is. */
+    void whenPreambleRead(Runnable task) {
+        if (preambleRead()) {
+            task.run();
+        } else {
+            onPreambleRead = task;
         }
     }
 

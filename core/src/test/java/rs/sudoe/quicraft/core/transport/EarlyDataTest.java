@@ -87,6 +87,7 @@ class EarlyDataTest {
     void reset() {
         Faults.set();
         QuicServer.confirmMillis = 10_000;
+        QuicClient.setGraceFloorForTests(0);
     }
 
     @Test
@@ -112,6 +113,22 @@ class EarlyDataTest {
             assertArrayEquals(concat(FLIGHT, AFTER), second.collector.await(FLIGHT.length + AFTER.length, 5,
                     TimeUnit.SECONDS));
             assertArrayEquals(concat(FLIGHT, AFTER), game.received(1, FLIGHT.length + AFTER.length));
+            second.stream.close();
+        }
+    }
+
+    @Test
+    void aZeroRttConnectionReachesTheGameWhenThePreambleArrivesNotWhenTheGraceEnds() throws Exception {
+        QuicClient.setGraceFloorForTests(2_000);
+        ServerIdentity identity = ServerIdentity.generate();
+        try (GameServer game = new GameServer(identity); DelayRelay relay = new DelayRelay(game.address(), 20)) {
+            Join.run(relay, identity, "inputs", FLIGHT).closeAfterTicket(relay);
+
+            long start = System.nanoTime();
+            Join second = Join.run(relay, identity, "inputs", FLIGHT);
+            long joinMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            assertTrue(second.early.sent(), () -> "no 0-RTT: " + QuicClient.lastEarlyOutcome());
+            assertTrue(joinMillis < 1_000, "the join waited out the 2 s grace: " + joinMillis + " ms");
             second.stream.close();
         }
     }
