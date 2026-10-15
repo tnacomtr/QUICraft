@@ -327,17 +327,32 @@ public final class RebindState {
     /**
      * Records that the server was reached, which clears its backoff window (section 6). Its notice
      * history goes with it; the bloom filter still suppresses the tuples that were noticed.
+     *
+     * <p>An entry with a live attempt is not removed, only cleared: its active token stays, so the
+     * invariant that an active attempt's state is never evicted holds and the single-attempt
+     * guarantee cannot be broken by a success landing in the middle of one (a second
+     * {@link #tryBeginAttempt(String, int, long)} stays refused, and
+     * {@link #endAttempt(Attempt, boolean)} still matches the token that started it). A success
+     * outside an attempt, and a successful end through {@link #endAttempt(Attempt, boolean)}, do
+     * remove the entry.</p>
      */
     public synchronized void recordSuccess(String host, int port) {
         PinKey key = PinKey.of(host, port);
         if (disabled) {
             return;
         }
-        Entry removed = entries.remove(PinKey.mapKey(key));
-        if (removed == null) {
+        String mapKey = PinKey.mapKey(key);
+        Entry entry = entries.get(mapKey);
+        if (entry == null) {
             return;
         }
-        noticeCount -= removed.notices.size();
+        if (entry.active != null) {
+            entry.failures = 0;
+            entry.blockedUntil = 0;
+        } else {
+            entries.remove(mapKey);
+            noticeCount -= entry.notices.size();
+        }
         if (!persist()) {
             disabled = true;
         }

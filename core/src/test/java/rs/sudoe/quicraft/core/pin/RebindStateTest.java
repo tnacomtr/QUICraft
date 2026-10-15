@@ -128,6 +128,36 @@ class RebindStateTest {
     }
 
     @Test
+    void recordSuccessKeepsAnActiveAttemptAndOnlyClearsItsWindow(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertTrue(state.recordAttemptFailure("mc.example.com", 25565));
+        now.addAndGet(MINUTE - 1);
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), "inside the window");
+        now.addAndGet(1);
+
+        RebindState.Attempt first = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(first);
+        state.recordSuccess("mc.example.com", 25565);
+        String json = jsonOf(Files.readAllBytes(file));
+        assertTrue(json.contains("\"failures\":0"), "the window was cleared: " + json);
+        assertTrue(json.contains("\"blockedUntil\":\"1970-01-01T00:00:00Z\""), json);
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()),
+                "the first attempt is still active, so there is no second token");
+        assertTrue(state.endAttempt(first, true), "the token that started the attempt still matches");
+
+        RebindState.Attempt next = state.tryBeginAttempt("mc.example.com", 25565, now.get());
+        assertNotNull(next, "the entry went with the successful end");
+        assertTrue(state.endAttempt(next, false));
+        assertTrue(state.recordAttemptFailure("mc.example.com", 25565));
+        now.addAndGet(MINUTE - 1);
+        assertNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()), "the schedule started over");
+        now.addAndGet(1);
+        assertNotNull(state.tryBeginAttempt("mc.example.com", 25565, now.get()));
+    }
+
+    @Test
     void evictsTheLeastRecentlyUsedServerThatIsNotActive(@TempDir Path dir) throws IOException {
         Path file = dir.resolve("rebind-v1.bin");
         Files.write(file, stateFile(serversWithOpenFirst(RebindState.MAX_ENTRIES)));
