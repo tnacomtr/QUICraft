@@ -63,6 +63,12 @@ public final class RoutingTableLoader {
     /** The most characters of any single value a diagnostic message may quote back. */
     public static final int MAX_DIAGNOSTIC = 64;
 
+    /**
+     * The largest routing or mandatory-CONTROL resource accepted, in bytes. Checked while reading
+     * and before UTF-8 decoding, so an oversized resource is rejected before it is buffered whole.
+     */
+    public static final int MAX_RESOURCE_BYTES = 1 << 20;
+
     private static final String SCHEMA_FIELD = "schema";
     private static final String PROTOCOL_FIELD = "protocol";
     private static final String DEFAULT_FIELD = "default";
@@ -439,6 +445,10 @@ public final class RoutingTableLoader {
     }
 
     private static Object decode(byte[] bytes, String rule) {
+        if (bytes.length > MAX_RESOURCE_BYTES) {
+            throw new RoutingTableException(rule + ": the resource is larger than "
+                    + MAX_RESOURCE_BYTES + " bytes");
+        }
         CharsetDecoder decoder = StandardCharsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT);
@@ -498,11 +508,15 @@ public final class RoutingTableLoader {
         }
     }
 
-    private static byte[] readAll(InputStream in) throws IOException {
+    static byte[] readAll(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buffer = new byte[8192];
         int read;
         while ((read = in.read(buffer)) != -1) {
+            if (out.size() + read > MAX_RESOURCE_BYTES) {
+                throw new RoutingTableException("13.7: the resource is larger than "
+                        + MAX_RESOURCE_BYTES + " bytes");
+            }
             out.write(buffer, 0, read);
         }
         return out.toByteArray();

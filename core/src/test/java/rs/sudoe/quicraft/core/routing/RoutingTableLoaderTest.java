@@ -521,4 +521,48 @@ class RoutingTableLoaderTest {
         }
         return sb.toString();
     }
+
+    @Test
+    void aResourceAtTheSizeLimitParsesAndOneByteMoreIsRejectedBeforeDecoding() throws IOException {
+        byte[] table = ("{\"schema\":1,\"protocol\":12345,\"default\":\"control\",\"routes\":[]}")
+                .getBytes(StandardCharsets.UTF_8);
+        byte[] atLimit = new byte[RoutingTableLoader.MAX_RESOURCE_BYTES];
+        java.util.Arrays.fill(atLimit, (byte) ' ');
+        System.arraycopy(table, 0, atLimit, 0, table.length);
+        assertEquals(12345, RoutingTableLoader.parse(atLimit).protocolNumber());
+
+        byte[] over = java.util.Arrays.copyOf(atLimit, atLimit.length + 1);
+        over[over.length - 1] = ' ';
+        RoutingTableException e = assertThrows(RoutingTableException.class,
+                () -> RoutingTableLoader.parse(over));
+        assertTrue(e.getMessage().contains("larger than"), e.getMessage());
+
+        byte[] set = "{\"schema\":1,\"protocol\":12345,\"mandatory_control\":[]}"
+                .getBytes(StandardCharsets.UTF_8);
+        byte[] setAtLimit = new byte[RoutingTableLoader.MAX_RESOURCE_BYTES];
+        java.util.Arrays.fill(setAtLimit, (byte) ' ');
+        System.arraycopy(set, 0, setAtLimit, 0, set.length);
+        assertTrue(RoutingTableLoader.parseMandatoryControlSet(setAtLimit, 12345, "test").isEmpty());
+        byte[] setOver = java.util.Arrays.copyOf(setAtLimit, setAtLimit.length + 1);
+        setOver[setOver.length - 1] = ' ';
+        RoutingTableException setError = assertThrows(RoutingTableException.class,
+                () -> RoutingTableLoader.parseMandatoryControlSet(setOver, 12345, "test"));
+        assertTrue(setError.getMessage().contains("larger than"), setError.getMessage());
+    }
+
+    @Test
+    void readingStopsAsSoonAsAResourceExceedsTheSizeLimit() throws IOException {
+        final long[] served = {0};
+        InputStream endless = new InputStream() {
+            @Override
+            public int read() {
+                served[0]++;
+                return ' ';
+            }
+        };
+        RoutingTableException e = assertThrows(RoutingTableException.class,
+                () -> RoutingTableLoader.readAll(endless));
+        assertTrue(e.getMessage().contains("larger than"), e.getMessage());
+        assertTrue(served[0] <= RoutingTableLoader.MAX_RESOURCE_BYTES + 8192L, "read " + served[0]);
+    }
 }
