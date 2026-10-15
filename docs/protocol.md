@@ -537,9 +537,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
 ### QUICraft's Netty QUIC build
 
 `core` doesn't use Maven Central's `netty-codec-classes-quic`. It uses QUICraft's build,
-`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft4` from
+`rs.sudoe.quicraft.netty:netty-codec-{classes,native}-quic:4.2.19.Final-quicraft5` from
 `natives/`. That is Netty `netty-4.2.19.Final` (64cc10f3), quiche `be47c501` and BoringSSL
-`d03dbc3e`, the same revisions as upstream 4.2.19, plus six patches:
+`d03dbc3e`, the same revisions as upstream 4.2.19, plus seven patches:
 
 | Patch | What it does |
 | --- | --- |
@@ -548,6 +548,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 | `netty/0002-complete-connect-after-handshake-send` | Completes a client connect as soon as the handshake does (§5), in a task on the connection's event loop. |
 | `netty/0003-server-reads-accepted-early-data` | A server that accepted 0-RTT reads early stream data before the handshake completes: the connection is active during early data, and after the send that decrypts a buffered 0-RTT packet it processes the readable streams. Java only, so it works with upstream natives too. `SslHandshakeCompletionEvent` still marks the completed handshake. |
 | `netty/0004` | TLS keying material exporter accessor and capability probe, with JNI `SSL_export_keying_material` (12.2). Netty-only patch; the patched native is available only on linux-x86_64. |
+| `netty/0005-max-flow-control-windows` | `QuicCodecBuilder.maxConnectionWindow(long)` and `maxStreamWindow(long)` with JNI `quiche_config_set_max_connection_window` / `quiche_config_set_max_stream_window`, and the capability probe `Quic.isMaxFlowControlWindowsSupported()`, so the maxima of quiche's flow-control auto-tuning can be pinned. A maximum equal to the initial window disables growth for it (quiche clamps every window to its maximum). The setters alone do not satisfy 13.13: the values `/3` configures must still keep growth within 13.12's budgets, and `/3` stays off until they do. Unset, quiche keeps its defaults. Netty-only patch; the quicraft5 native has been built locally for linux-x86_64 only. |
 | `quiche/0002-backport-fc9fe129-handshake-close` | Upstream quiche fc9fe129 (2026-09-25), unchanged. Without it, an application close sent after the client's handshake completed but before HANDSHAKE_DONE (the window netty/0002 opens) never goes out, and the send loop spins forever. |
 
 - `natives/build-linux.sh` runs Netty's own Maven build unchanged in Docker, on AlmaLinux 8 with
@@ -560,6 +561,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
   `Quic.isRelaxedLossThresholdSupported()` then returns false, and core leaves quiche's default
   in place after one INFO line. The exporter probe also returns false with upstream
   natives, disabling `/3` under 12.3 rather than attempting the unbound exporter JNI call.
+  `Quic.isMaxFlowControlWindowsSupported()` likewise returns false, the maximum-window setters
+  throw `UnsupportedOperationException`, and `QuicSupport.hasMaxFlowControlWindows()` is false,
+  so `/3` is not offered.
   `testUpstreamNative` checks this combination on every build.
   `.github/workflows/netty-quic-natives.yml` builds all five platforms, but has not run yet.
 - **glibc.** The Linux native built on AlmaLinux 8 needs glibc 2.28 (`statx`), where upstream's
@@ -834,6 +838,13 @@ single-socket listener: no dispatcher is installed and the connection id length 
    alters the TCP listener. No feature is inferred from a plugin payload on `/2`.
    Add optional advertisement field `routing` containing an object mapping decimal unsigned
    protocol-number strings to lowercase `sha256:` hex routing-resource digests (13.7).
+   `routing` holds at most 64 entries. Each key is a decimal unsigned protocol number with no
+   sign and no leading zero except `"0"`, at most 10 digits, fitting a signed 32-bit int; each
+   value is exactly `sha256:` followed by 64 lowercase hex digits. Any malformed entry, and more
+   than 64 entries, discards the whole member (all-or-nothing), never the rest of the
+   advertisement; a client treats a discarded member as absent, which can only select `/2` or
+   TCP. A server whose response would exceed §1's cap with the member omits the routing object
+   first and still advertises.
    Vanilla ignores it; obey §1's response-size cap. Before connecting, clients require a
    matching digest for their protocol to select `/3`; absent/unknown/mismatched entries
    select `/2` if supported by that listener, otherwise TCP (a changed pin instead uses

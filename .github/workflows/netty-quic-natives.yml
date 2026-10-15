@@ -134,9 +134,17 @@ jobs:
             [[ "$d" == *linux-x86_64* ]] || cp -R "$d/repo/." natives/build/out/repo/
           done
           cp -R natives/build/artifacts/netty-quic-linux-x86_64/repo/. natives/build/out/repo/
+      # macOS routes only 127.0.0.1 on lo0; the rejoin-from-another-address test binds 127.0.0.2.
+      - if: runner.os == 'macOS'
+        run: sudo ifconfig lo0 alias 127.0.0.2 up
       - run: ./gradlew -Pquicraft.patchedNatives=all :core:test :core:shadedTest :core:checkShadedNotices
       - uses: actions/upload-artifact@v7
         if: matrix.native == 'linux-x86_64'
         with:
           name: netty-quic-repo-all
           path: natives/build/out/repo/
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: core-test-results-${{ matrix.native }}
+          path: core/build/test-results/
