@@ -358,10 +358,18 @@ final class LaneRig implements AutoCloseable {
         return true;
     }
 
-    /** Both sessions' activation, server first. */
-    void activateBoth() {
-        server.activate(null);
+    /**
+     * Both sessions' activation, server first and complete before the client starts: as in the
+     * protocol, the client's stream 4 must never reach a server that has not activated yet.
+     */
+    void activateBoth() throws Exception {
+        activate(server, null);
         client.activate(null);
+    }
+
+    void activate(LaneSession session, java.nio.ByteBuffer leftover) throws Exception {
+        session.activate(leftover);
+        session.eventLoop().submit(() -> null).get(10, TimeUnit.SECONDS);
     }
 
     static long[] snapshot(LaneSession session) throws Exception {

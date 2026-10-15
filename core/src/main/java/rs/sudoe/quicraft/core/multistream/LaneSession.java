@@ -53,7 +53,13 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * order, so CONTROL goes first and neither auxiliary lane can be starved by it. Writes stop on a
  * stream while it is not writable. The unsent queue is capped at {@link #MAX_UNSENT_PACKETS}
  * packets or {@link #MAX_UNSENT_BYTES} bytes; {@link LaneGame#onWritabilityChanged} turns false at
- * three quarters of either and true again at one quarter. Exceeding the cap disconnects (13.12).
+ * three quarters of either and true again at one quarter. Exceeding the cap disconnects (13.12);
+ * END alone bypasses the cap. A bundle must fit the cap as a whole, so the game checks
+ * {@link #isWritable()} before submitting a large one.
+ *
+ * <p>Call {@link #activate} without delay: the peer's 10 second clock for opening its streams
+ * starts at its own activation. A STOP_SENDING from the peer is visible only as a failed write on
+ * that lane (Netty fires no event for it), so a lane that never writes does not notice it.
  */
 public final class LaneSession {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -90,7 +96,7 @@ public final class LaneSession {
     /** The largest chunk one read delivers; bounds the unparsed bytes held per stream. */
     static final int READ_CHUNK = 16 * 1024;
     /** The smallest record on the wire: length prefix, kind, sequence and three dependencies. */
-    private static final int MIN_RECORD_WIRE = 1 + RecordCodec.HEADER_LENGTH;
+    private static final int MAX_RECORD_WIRE = 4 + RecordCodec.MAX_RECORD_LENGTH;
     private static final int CONTROL_STREAM_ID = 0;
     private static final int REALTIME_STREAM_ID = 4;
     private static final int WORLD_STREAM_ID = 1;
@@ -315,9 +321,14 @@ public final class LaneSession {
         });
     }
 
-    /** {pending records, pending bytes, unsent packets, unsent bytes}; call on the loop. */
+    /**
+     * {pending records, pending bytes, unsent packets, unsent bytes, REALTIME record in progress
+     * (0 or 1)}; call on the loop.
+     */
     long[] snapshot() {
-        return new long[] {receiver.pendingRecords(), receiver.pendingBytes(), unsentPackets, unsentBytes};
+        LaneStream r = streams[Lane.REALTIME.ordinal()];
+        return new long[] {receiver.pendingRecords(), receiver.pendingBytes(), unsentPackets, unsentBytes,
+                r != null && r.decoder.hasPartial() ? 1 : 0};
     }
 
     /** The stream channel of a lane, or null before it exists; call on the loop. */
@@ -335,6 +346,7 @@ public final class LaneSession {
 
     // --- Plumbing.
 
+    /** A call on the event loop runs at once, so it may overtake earlier calls other threads queued. */
     private void run(Runnable task) {
         if (loop.inEventLoop()) {
             guarded(task);
@@ -564,12 +576,17 @@ public final class LaneSession {
         }
     }
 
+    /**
+     * Whether a new record may be started on {@code lane}. An auxiliary record needs room for the
+     * largest legal record, so a conformant peer's record can always complete (13.12: never fatal
+     * for a legal record); otherwise reading waits and QUIC flow control pushes back.
+     */
     private boolean credit(Lane lane) {
         if (lane == Lane.CONTROL) {
             return receiver.pendingRecords() < ReceiverScheduler.MAX_RECORDS
                     && receiver.pendingBytes() < ReceiverScheduler.SHARED_BYTES + ReceiverScheduler.CONTROL_RESERVE_BYTES;
         }
-        return receiver.auxiliaryCreditAvailable(MIN_RECORD_WIRE, 1);
+        return receiver.auxiliaryCreditAvailable(MAX_RECORD_WIRE, 1);
     }
 
     private void consume(LaneStream s) throws MultistreamProtocolException {
@@ -610,7 +627,9 @@ public final class LaneSession {
             throw new MultistreamProtocolException(CLOSE_ORDERING, "13.14",
                     "unexpected FIN on the " + s.lane + " lane");
         }
-        if (!s.fin && !s.readPending && !s.hasUnparsed() && credit(s.lane) && s.channel != null) {
+        // The rest of a record in progress, or of a preamble, already holds its slot and charge.
+        if (!s.fin && !s.readPending && !s.hasUnparsed() && s.channel != null
+                && (s.decoder.hasPartial() || !s.opened || credit(s.lane))) {
             s.readPending = true;
             s.channel.read();
         }
@@ -694,7 +713,7 @@ public final class LaneSession {
         if (closed || endQueued) {
             return;
         }
-        reserveQueue(1, RecordCodec.HEADER_LENGTH + 1L);
+        // END bypasses the unsent cap: a full queue must still be able to close gracefully.
         Envelope e = sender.end(now());
         endRecord = RecordCodec.encodeEnd(e.sequence(), e.dependency(Lane.CONTROL),
                 e.dependency(Lane.REALTIME), e.dependency(Lane.WORLD), true);
@@ -777,7 +796,12 @@ public final class LaneSession {
             byte[] head = queue.peek();
             int n = Math.min(head.length - outOffset[i], budget);
             ByteBuf buf = s.channel.alloc().buffer(n);
-            buf.writeBytes(head, outOffset[i], n);
+            try {
+                buf.writeBytes(head, outOffset[i], n);
+            } catch (RuntimeException e) {
+                buf.release();
+                throw e;
+            }
             s.channel.write(buf).addListener(s.writeFailed);
             outOffset[i] += n;
             budget -= n;
@@ -789,6 +813,7 @@ public final class LaneSession {
                 unsentBytes -= head.length;
                 if (head == endRecord) {
                     endWrittenAt = now();
+                    armTick();
                 }
             }
         }

@@ -52,6 +52,7 @@ class LaneSessionTest {
         assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() >= client + 2
                 && rig.serverGame.packetCount() >= server + 2, 10000), "round trip");
     }
+    }
 
     private static void assertPending(LaneSession receiver, int atLeast) throws Exception {
         assertTrue(LaneRig.await(() -> {
@@ -262,7 +263,7 @@ class LaneSessionTest {
     void controlBytesReadBeforeActivationAreParsedAsTheStartOfTheRecordStream() throws Exception {
         try (LaneRig rig = LaneRig.start()) {
             byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, "leftover"));
-            rig.server.activate(java.nio.ByteBuffer.wrap(record));
+            rig.activate(rig.server, java.nio.ByteBuffer.wrap(record));
             rig.client.activate(null);
             assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() == 1, 10000));
             assertEquals("leftover", rig.serverGame.labels().get(0));
@@ -558,6 +559,90 @@ class LaneSessionTest {
         }
     }
 
+    /** Encoded REALTIME records numbered from..to, each depending on a CONTROL record that never comes. */
+    private static byte[] blockedRealtimeRecords(int from, int to, byte[] frame) throws Exception {
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        for (int i = from; i <= to; i++) {
+            out.write(RecordCodec.encodeGame(i, 1, i - 1, 0, frame));
+        }
+        return out.toByteArray();
+    }
+
+    private static boolean snapshotIs(LaneSession session, int index, long value) {
+        try {
+            return LaneRig.snapshot(session)[index] == value;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    @Test
+    void aSplitRecordStillCompletesWhenTheAuxiliaryRecordBudgetIsFull() throws Exception {
+        LaneRig.Config config = new LaneRig.Config();
+        config.clientSession = false;
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.server.activate(null);
+            LaneLoopback.write(rig.clientRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 2);
+            QuicStreamChannel four = rig.net.clientStream();
+            byte[] frame = LaneRig.frame(LaneRig.MOVE, "r");
+            byte[] first = blockedRealtimeRecords(1, 959, frame);
+            byte[] head = new byte[2 + first.length];
+            head[0] = 2;
+            head[1] = 1;
+            System.arraycopy(first, 0, head, 2, first.length);
+            LaneLoopback.write(four, head);
+            assertTrue(LaneRig.await(() -> snapshotIs(rig.server, 0, 959), 15000));
+            byte[] last = blockedRealtimeRecords(960, 960, frame);
+            LaneLoopback.write(four, Arrays.copyOf(last, 3));
+            assertTrue(LaneRig.await(() -> snapshotIs(rig.server, 0, 960) && snapshotIs(rig.server, 4, 1), 10000));
+            LaneLoopback.write(four, Arrays.copyOfRange(last, 3, last.length));
+            assertTrue(LaneRig.await(() -> snapshotIs(rig.server, 4, 0), 5000),
+                    "the rest of a record in progress is read without new credit");
+            assertFalse(rig.serverGame.closed.isDone());
+        }
+    }
+
+    @Test
+    void aMaximumSizeRecordWaitsForAuxiliaryBudgetInsteadOfBeingFatal() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activateBoth();
+            roundTrip(rig);
+            int base = rig.serverGame.packetCount();
+            int max = RecordCodec.MAX_INNER_CONTENT - 1;
+            rig.client.holdWrites(Lane.CONTROL);
+            rig.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "spawn"));
+            for (int i = 0; i < 7; i++) {
+                rig.client.send(PLAY, LaneRig.MOVE, LaneRig.frame(LaneRig.MOVE, max));
+            }
+            assertTrue(LaneRig.await(() -> snapshotIs(rig.server, 0, 7), 30000));
+            rig.client.send(PLAY, LaneRig.MOVE, LaneRig.frame(LaneRig.MOVE, max));
+            sleep(1000);
+            assertEquals(7, LaneRig.snapshot(rig.server)[0], "the eighth waits for budget");
+            assertFalse(rig.serverGame.closed.isDone(), "a legal record is never fatal for lack of budget");
+            rig.client.releaseWrites(Lane.CONTROL);
+            assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() == base + 9, 60000),
+                    "delivered " + (rig.serverGame.packetCount() - base));
+            assertFalse(rig.serverGame.closed.isDone());
+        }
+    }
+
+    @Test
+    void fourMegabytesOfRecordsReachTheServerThroughItsGrowthOffWindows() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activateBoth();
+            roundTrip(rig);
+            int base = rig.serverGame.packetCount();
+            int max = RecordCodec.MAX_INNER_CONTENT - 1;
+            long start = System.nanoTime();
+            rig.client.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, max));
+            rig.client.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, max));
+            assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() == base + 2, 30000));
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            assertTrue(millis < 10000, "took " + millis + " ms");
+            assertFalse(rig.serverGame.closed.isDone());
+        }
+    }
+
     // --- Resets, FIN and END (13.14).
 
     private void resetCloses(Lane lane, boolean fromClient) throws Exception {
@@ -651,6 +736,45 @@ class LaneSessionTest {
             closedWith(rig.clientGame, 0x0, false);
             assertTrue(System.nanoTime() - start >= TimeUnit.MILLISECONDS.toNanos(350), "waited for the peer");
             sawClose(rig.net.serverSawClose, 0x0);
+        }
+    }
+
+    @Test
+    void anEndWrittenOnlyAfterAReleaseStillClosesAfterTheLinger() throws Exception {
+        LaneRig.Config config = new LaneRig.Config();
+        config.serverSession = false;
+        config.clientTiming = new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
+                TimeUnit.MILLISECONDS.toNanos(400), TimeUnit.MILLISECONDS.toNanos(20));
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.client.activate(null);
+            rig.client.holdWrites(Lane.CONTROL);
+            rig.client.end();
+            sleep(700);
+            assertFalse(rig.clientGame.closed.isDone(), "the linger starts when END is written");
+            long start = System.nanoTime();
+            rig.client.releaseWrites(Lane.CONTROL);
+            closedWith(rig.clientGame, 0x0, false);
+            assertTrue(System.nanoTime() - start >= TimeUnit.MILLISECONDS.toNanos(350));
+        }
+    }
+
+    @Test
+    void endBypassesTheUnsentCapSoAFullQueueStillClosesGracefully() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activateBoth();
+            roundTrip(rig);
+            int base = rig.serverGame.packetCount();
+            rig.client.holdWrites(Lane.CONTROL);
+            for (int i = 0; i < LaneSession.MAX_UNSENT_PACKETS; i++) {
+                rig.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "c" + i));
+            }
+            rig.client.end();
+            sleep(300);
+            assertFalse(rig.clientGame.closed.isDone(), "END at the cap is not an overflow");
+            rig.client.releaseWrites(Lane.CONTROL);
+            closedWith(rig.serverGame, 0x0, false);
+            closedWith(rig.clientGame, 0x0, true);
+            assertEquals(LaneSession.MAX_UNSENT_PACKETS, rig.serverGame.packetCount() - base);
         }
     }
 }
