@@ -83,7 +83,6 @@ class LaneSessionTest {
     @Test
     void gamePacketsOnAllThreeLanesAreDeliveredWithTheGamesAcknowledgementFromAnotherThread() throws Exception {
         try (LaneRig rig = LaneRig.start()) {
-            System.out.println("REPSTART");
             rig.clientGame.applyOnOtherThread = true;
             rig.serverGame.applyOnOtherThread = true;
             rig.activateBoth();

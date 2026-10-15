@@ -523,7 +523,6 @@ public final class LaneSession {
         if (closed) {
             return;
         }
-        System.out.println("CLOSEREASON " + role + " " + code + " " + why);
         if (cause != null) { cause.printStackTrace(System.out); }
         LOG.log(Level.FINE, "closing multi-stream connection with {0}: {1}", new Object[] {code, why});
         shutdown();
