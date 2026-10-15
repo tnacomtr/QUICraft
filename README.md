@@ -4,7 +4,7 @@ QUIC transport for Minecraft: Java Edition. QUICraft is a client mod plus server
 plugins. When both sides have it, the game connection runs over QUIC (UDP). In every other case
 it runs over plain TCP, exactly like vanilla.
 
-> **Status: public alpha (0.1.0-alpha.1).** The Velocity plugin and the Fabric client and server mod
+> **Status: public alpha (0.1.0-alpha.2).** The Velocity plugin and the Fabric client and server mod
 > for 26.x and 1.21.11 are released for testing on [GitHub](https://github.com/tnacomtr/QUICraft/releases)
 > and [git.sudoe.rs](https://git.sudoe.rs/tna/QUICraft/releases). Expect rough edges; TCP keeps working
 > whatever happens. See [Roadmap](#roadmap).
