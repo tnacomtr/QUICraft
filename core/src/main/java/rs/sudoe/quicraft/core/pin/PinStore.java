@@ -43,6 +43,12 @@ import java.util.logging.Logger;
  * <p>Writes go through a temporary file in the same directory and an atomic replacement, with
  * owner-only permissions where the file system supports them ({@link StateFile}). The file is JSON,
  * schema version 1, timestamps in UTC ISO-8601. Thread-safe: every method is synchronized.</p>
+ *
+ * <p><b>Calling it.</b> {@link #recordPin(String, int, String)} and {@link #deletePin(String, int)}
+ * write the whole file synchronously, with an fsync of the file and of its directory: never call
+ * them on the Netty event loop or the render thread, hand the work to a worker. A caller that gets
+ * {@link RecordResult#DISABLED} should tell the player that pinning is off and use {@code /2} or TCP;
+ * {@link #isUsable()} is the same fact for code that only reads.</p>
  */
 public final class PinStore {
     /** The most pins the store holds; docs/protocol.md 12.16. */

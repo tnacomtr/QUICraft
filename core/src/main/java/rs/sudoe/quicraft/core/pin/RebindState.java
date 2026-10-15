@@ -72,6 +72,18 @@ import java.util.logging.Logger;
  * <p>Thread-safe: every method is synchronized. The time a window starts from is the injected
  * {@code clock}; the {@code now} of {@link #tryBeginAttempt(String, int, long)} must be read from
  * that same clock.</p>
+ *
+ * <p><b>Calling it.</b> Every mutating call ({@link #tryBeginAttempt(String, int, long)},
+ * {@link #endAttempt(Attempt, boolean)}, {@link #recordSuccess(String, int)} and
+ * {@link #shouldNotify(String, int, String)}) writes the whole state file synchronously, with an
+ * fsync of the file and of its directory. Never call them on the Netty event loop or the render
+ * thread: hand the work to a worker. A null from {@link #tryBeginAttempt(String, int, long)} covers
+ * all four refusals (the state is disabled, the server is inside its window, an attempt for it is
+ * already running, or no entry may be evicted for it) and the caller uses TCP without a re-bind in
+ * every one of them; {@link #isUsable()} is what tells the four apart for the player-facing "pins
+ * are disabled" notice. After a successful re-bind, record the pin first and end the attempt second
+ * ({@code recordPin(...)} then {@link #endAttempt(Attempt, boolean)} with {@code success} true), so
+ * the new pin is durable before the attempt's window is cleared.</p>
  */
 public final class RebindState {
     /** The most logical servers that keep re-bind state; docs/protocol.md 12.16. */
