@@ -16,13 +16,16 @@ public final class RouteKey {
     /**
      * @param protocolNumber Minecraft protocol number the routing resource is for (13.7)
      * @param packetId nonnegative numeric packet id (13.7)
+     * @throws RoutingTableException if a component is out of range: an invalid routing entry is
+     *     reported with the routing package's own exception type, which is still an
+     *     {@link IllegalArgumentException}
      */
     public RouteKey(int protocolNumber, ProtocolState state, Direction direction, int packetId) {
         if (protocolNumber < 0) {
-            throw new IllegalArgumentException("protocol number out of range: " + protocolNumber);
+            throw new RoutingTableException("protocol number out of range: " + protocolNumber);
         }
         if (packetId < 0) {
-            throw new IllegalArgumentException("packet id out of range: " + packetId);
+            throw new RoutingTableException("packet id out of range: " + packetId);
         }
         this.protocolNumber = protocolNumber;
         this.state = Objects.requireNonNull(state, "state");
