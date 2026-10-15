@@ -20,10 +20,12 @@ feat/phase4-alpha are on the development version 0.1.0-alpha.2-SNAPSHOT.
      abandoned 0-RTT. The gametest sets QuicClient.setGraceFloorForTests(100); production is unchanged.
   QuicClient.lastEarlyOutcome() names why an attempt sent no 0-RTT; failure messages include it.
 
+## 0-RTT delivery (owner approved, 2026-10-15)
+- After a 0-RTT handshake the client now hands the connection to the game as soon as the server's preamble is
+  read (ClientStream.whenPreambleRead); the grace G is only the abandon timeout. protocol.md section 8 says
+  "waits up to G". Regression test: EarlyDataTest.aZeroRttConnectionReachesTheGameWhenThePreambleArrives...
+
 ## Open follow-ups
-- Owner decision: after 0-RTT, the client delivers the connection only when the grace timer fires, even if the
-  server's preamble arrived earlier (QuicClient.awaitPreamble). That costs up to G (≤100 ms) of join latency
-  on real links. Delivering as soon as the preamble arrives would fix it; it changes transport timing, so ask first.
 - Re-sign a seq 2 release manifest before 2026-11-13T19:52:53Z (same entries; the owner signs).
 - updater.md blocker 6 (withdrawal), macOS FileChannel.force semantics, Velocity builds other than 4.2.0-30.
 - The owner should revoke the Forgejo token pasted in chat and delete ~/.config/quicraft/forgejo-token.
