@@ -11,6 +11,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -59,12 +60,15 @@ import java.util.logging.Logger;
  * persisted in least-recently-used order, so the order survives a restart.</p>
  *
  * <p><b>Pin expiry.</b> When a pin expires, 12.15 expires its re-bind backoff and its detailed notice
- * history with it, and they live in this state's file: the caller passes the keys
- * {@link PinStore#purgeExpired(Set)} returned to {@link #forgetExpiredPins(Set)}, which removes those
- * entries and persists this file atomically, so the two files change one after the other and each
- * change is complete. The Bloom filter bits are never cleared there: a tuple that was noticed before
- * the pin expired is still never noticed twice, which is what keeps 12.16's at-most-once rule true
- * across an expiry. An entry with a live attempt is kept, like everywhere else here.</p>
+ * history with it, and they live in this state's file. The caller passes the keys
+ * {@link PinStore#expiredKeys(Set)} returned to {@link #forgetExpiredPins(Set)} <em>before</em> the
+ * pins are removed: a crash between the two writes then leaves an expired pin, which the next expiry
+ * finds again, rather than a re-bind entry nothing would ever remove.
+ * {@link PinExpiry#purge(PinStore, RebindState, Set)} is the whole sequence in one call, and takes
+ * the active set from {@link #activeKeys()}. The Bloom filter bits are never cleared there: a tuple
+ * that was noticed before the pin expired is still never noticed twice, which is what keeps 12.16's
+ * at-most-once rule true across an expiry. An entry whose attempt is running is kept, like everywhere
+ * else here.</p>
  *
  * <p>Reordering on its own is not a write: a call that only touches an entry leaves the file as it
  * was, so the on-disk order can lag the in-memory one until the next call that persists. That is safe
@@ -404,14 +408,21 @@ public final class RebindState {
      * Forgets the re-bind state of logical servers whose pin has expired (docs/protocol.md 12.15):
      * their backoff window and their detailed notice history go, in one atomic write of this state's
      * own file, so the next join of such a server is first contact with no re-bind backoff and no
-     * changed-fingerprint notice. The caller passes the keys {@link PinStore#purgeExpired(Set)}
-     * returned, after that call, so the pin file and this one change one after the other.
+     * changed-fingerprint notice.
+     *
+     * <p>The caller passes the keys {@link PinStore#expiredKeys(Set)} returned, and calls this
+     * <em>before</em> {@link PinStore#purgeExpired(Set)}: the two live in two files, and this order
+     * is the one that leaks nothing. A process that dies after this write and before the pin file's
+     * leaves an expired pin, which the next expiry finds again; the other order would leave a
+     * re-bind entry for a pin that is gone, and nothing would ever remove it.
+     * {@link PinExpiry#purge(PinStore, RebindState, Set)} is the two calls in that order.</p>
      *
      * <p>The Bloom filter bits are not cleared, which is the point: a tuple that was noticed before
      * the pin expired is still never noticed twice, so 12.16's at-most-once rule holds across an
-     * expiry. An entry with a live attempt is kept, like everywhere else in this class: an attempt
-     * that is running keeps its state, and only {@link #endAttempt(Attempt, boolean)} decides its
-     * outcome.</p>
+     * expiry. An entry with an attempt running, that is one whose token has not been ended by
+     * {@link #endAttempt(Attempt, boolean)}, is kept, like everywhere else in this class: a stale
+     * token nobody ended still holds its server's state until it is ended or replaced, so an expiry
+     * can never race an attempt.</p>
      *
      * <p>Nothing is written when there is nothing to forget. A failed write disables the state and
      * leaves the old file in place, exactly like every other write here; the entries were removed in
@@ -424,12 +435,11 @@ public final class RebindState {
         if (disabled || expiredKeys == null || expiredKeys.isEmpty()) {
             return 0;
         }
-        long now = clock.getAsLong();
         int removed = 0;
         for (PinKey key : expiredKeys) {
             String mapKey = PinKey.mapKey(key);
             Entry entry = entries.get(mapKey);
-            if (entry == null || live(entry, now)) {
+            if (entry == null || entry.active != null) {
                 continue;
             }
             entries.remove(mapKey);
@@ -443,6 +453,28 @@ public final class RebindState {
             disabled = true;
         }
         return removed;
+    }
+
+    /**
+     * The keys of the logical servers whose attempt is running: one whose token has been handed out
+     * and not yet ended, so the entry still holds its active token. A snapshot, in the state's own
+     * order; later admissions and ends do not change it.
+     *
+     * <p>This is the one place the active set comes from: the connect path passes it to
+     * {@link PinStore#pin(String, int, Set)}, {@link PinStore#recordPin(String, int, String, Set)},
+     * {@link PinStore#expiredKeys(Set)} and {@link PinExpiry#purge(PinStore, RebindState, Set)}, so
+     * that a pin is never expired, and a re-bind entry is never forgotten, under an attempt that is
+     * running (docs/protocol.md 12.15). An attempt that nobody ended stays in this set, which is the
+     * safe direction: it only delays an expiry until the attempt is ended or replaced.</p>
+     */
+    public synchronized Set<PinKey> activeKeys() {
+        Set<PinKey> active = new LinkedHashSet<>();
+        for (Entry entry : entries.values()) {
+            if (entry.active != null) {
+                active.add(PinKey.of(entry.host, entry.port));
+            }
+        }
+        return active;
     }
 
     /**

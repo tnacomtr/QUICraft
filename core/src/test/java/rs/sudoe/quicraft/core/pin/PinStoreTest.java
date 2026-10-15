@@ -363,17 +363,57 @@ class PinStoreTest {
     }
 
     @Test
+    void aPinExactlyAtTheTtlIsKeptAndOneMillisecondPastItIsNot(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("pins-v2.json");
+        TestClock now = new TestClock(BASE);
+        PinStore store = PinStore.load(file, now);
+        assertEquals(PinStore.RecordResult.RECORDED, store.recordPin("mc.example.com", 25565, FP_A));
+
+        now.advance(PinStore.PIN_TTL_MILLIS);
+        assertTrue(store.pin("mc.example.com", 25565).isPresent(),
+                "exactly 30 days is not yet more than 30 days");
+        now.advance(1);
+        assertFalse(store.pin("mc.example.com", 25565).isPresent(), "one millisecond more has expired");
+        assertEquals(0, store.size());
+    }
+
+    @Test
+    void expiredKeysAnswersWithoutChangingAnything(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("pins-v2.json");
+        TestClock now = new TestClock(BASE);
+        PinStore store = PinStore.load(file, now);
+        assertEquals(PinStore.RecordResult.RECORDED, store.recordPin("mc.example.com", 25565, FP_A));
+        byte[] before = Files.readAllBytes(file);
+
+        now.advance(PinStore.PIN_TTL_MILLIS + 1);
+        Set<PinKey> expired = store.expiredKeys(Collections.<PinKey>emptySet());
+        assertEquals(Collections.singleton(PinKey.of("mc.example.com", 25565)), expired);
+        assertEquals(1, store.size(), "asking which pins expired expires nothing");
+        assertArrayEquals(before, Files.readAllBytes(file), "and writes nothing");
+        assertTrue(store.expiredKeys(expired).isEmpty(), "a key in the active set has not expired");
+        assertEquals(1, store.size(), "and the pin is still there until something removes it");
+        assertFalse(store.pin("mc.example.com", 25565).isPresent(),
+                "a lookup without the active set removes it, and answers empty");
+        assertEquals(0, store.size());
+    }
+
+    @Test
     void aLastBoundTimeInTheFutureHasExpired(@TempDir Path dir) throws IOException {
         Path file = dir.resolve("pins-v2.json");
         TestClock now = new TestClock(BASE);
         PinStore store = PinStore.load(file, now);
         assertEquals(PinStore.RecordResult.RECORDED, store.recordPin("mc.example.com", 25565, FP_A));
 
-        now.advance(-DAY);
+        now.advance(-1);
         assertFalse(store.pin("mc.example.com", 25565).isPresent(),
-                "the clock moved backwards, so the pin it wrote is in the future and has expired");
+                "a last-bound time one millisecond in the future has expired");
         assertEquals("{\"version\":1,\"pins\":[]}",
                 new String(Files.readAllBytes(file), StandardCharsets.UTF_8));
+
+        assertEquals(PinStore.RecordResult.RECORDED, store.recordPin("mc.example.com", 25565, FP_A));
+        now.advance(-DAY);
+        assertFalse(store.pin("mc.example.com", 25565).isPresent(),
+                "and so has one a day in the future, after the clock moved backwards");
 
         now.advance(DAY + PinStore.PIN_TTL_MILLIS + 1);
         assertFalse(store.pin("mc.example.com", 25565).isPresent(),
@@ -494,6 +534,8 @@ class PinStoreTest {
         try {
             assertTrue(store.purgeExpired(Collections.<PinKey>emptySet()).isEmpty(),
                     "a removal that could not be written removed nothing");
+            assertFalse(store.pin("mc.example.com", 25565).isPresent(),
+                    "a store that just became disabled answers empty, not the pin it still holds");
         } finally {
             Faults.set();
         }

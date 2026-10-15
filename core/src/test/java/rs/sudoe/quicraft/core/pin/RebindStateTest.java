@@ -24,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -740,19 +741,50 @@ class RebindStateTest {
     }
 
     @Test
-    void forgettingKeepsTheStateOfALiveAttempt(@TempDir Path dir) throws IOException {
+    void forgettingKeepsTheStateOfAnAttemptNobodyEnded(@TempDir Path dir) throws IOException {
         Path file = dir.resolve("rebind-v1.bin");
         AtomicLong now = new AtomicLong(BASE);
         RebindState state = RebindState.load(file, now::get);
         RebindState.Attempt attempt = state.tryBeginAttempt("mc.example.com", 25565, now.get());
         assertNotNull(attempt);
+        // Older than STALE_ATTEMPT_MILLIS, which is how the rest of this class decides that an
+        // attempt nobody ended may be evicted or replaced; an expiry still leaves it alone, because
+        // its token was never ended.
+        now.addAndGet(RebindState.STALE_ATTEMPT_MILLIS);
         byte[] before = Files.readAllBytes(file);
 
         assertEquals(0, state.forgetExpiredPins(Collections.singleton(PinKey.of("mc.example.com", 25565))),
-                "an attempt that is running keeps its state");
+                "the state of an attempt nobody ended is kept");
         assertEquals(1, state.size());
         assertArrayEquals(before, Files.readAllBytes(file), "and nothing was written");
-        assertTrue(state.endAttempt(attempt, false), "the token still matches, so the attempt is still live");
+        assertTrue(state.endAttempt(attempt, false), "its token still matches, so its state was kept");
+    }
+
+    @Test
+    void activeKeysAreTheAttemptsThatWereNotEnded(@TempDir Path dir) {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        assertTrue(state.activeKeys().isEmpty(), "nothing is running");
+
+        RebindState.Attempt first = state.tryBeginAttempt("a.example.com", 25565, now.get());
+        RebindState.Attempt second = state.tryBeginAttempt("b.example.com", 25566, now.get());
+        assertNotNull(first);
+        assertNotNull(second);
+        Set<PinKey> both = state.activeKeys();
+        assertEquals(2, both.size());
+        assertTrue(both.contains(PinKey.of("a.example.com", 25565)));
+        assertTrue(both.contains(PinKey.of("b.example.com", 25566)));
+        both.clear();
+        assertEquals(2, state.activeKeys().size(), "the set is a snapshot, not the state's own");
+
+        assertTrue(state.endAttempt(first, true), "a success ends the first attempt");
+        assertEquals(Collections.singleton(PinKey.of("b.example.com", 25566)), state.activeKeys());
+        now.addAndGet(RebindState.STALE_ATTEMPT_MILLIS);
+        assertEquals(Collections.singleton(PinKey.of("b.example.com", 25566)), state.activeKeys(),
+                "an attempt nobody ended is still the attempt for its server, stale or not");
+        assertTrue(state.endAttempt(second, false));
+        assertTrue(state.activeKeys().isEmpty(), "an ended attempt is not active");
     }
 
     @Test

@@ -51,13 +51,14 @@ import java.util.logging.Logger;
  * already knows is always allowed.</p>
  *
  * <p><b>Expiry and a running attempt.</b> A pin is never expired while an attempt for its logical
- * server is running (12.15). The caller passes the keys of its attempts in flight, and expiry skips
- * them: {@link #pin(String, int, Set)} and {@link #recordPin(String, int, String, Set)} for a lookup
- * or a decision, {@link #purgeExpired(Set)} on its own to expire pins without deciding anything. The
- * shorter overloads pass an empty set, so a caller with an attempt running must use the longer ones.
- * {@link #purgeExpired(Set)} returns the keys it removed, which are exactly the keys whose re-bind
- * state {@link RebindState#forgetExpiredPins(Set)} must forget in the same breath (12.15, 12.16):
- * the two live in two files, so each removal is its own atomic write, the pin file's first.</p>
+ * server is running (12.15). The caller passes the keys of its attempts in flight,
+ * {@link RebindState#activeKeys()}, and expiry skips them: {@link #pin(String, int, Set)} and
+ * {@link #recordPin(String, int, String, Set)} for a lookup or a decision,
+ * {@link #expiredKeys(Set)} to ask which pins have expired, {@link #purgeExpired(Set)} to remove
+ * them. The two shorter overloads take no such set and are for tests only, so a caller with an
+ * attempt running always has to say so. Expiry is finished in the order that leaks nothing when the
+ * process dies in the middle of it: the expired pins' re-bind state is forgotten first, then the
+ * pins go, which is what {@link PinExpiry#purge(PinStore, RebindState, Set)} does in one call.</p>
  *
  * <p>There is no cross-process lock: two clients sharing one config directory writing this file are
  * last-writer-wins, each write being atomic ({@link StateFile}).</p>
@@ -194,13 +195,17 @@ public final class PinStore {
     /**
      * The pin for {@code host} and {@code port}, normalized the same way {@link #recordPin} stores
      * it, or an empty result when there is none. Pins that expired at the store's clock are removed
-     * first, so this may write the file (docs/protocol.md 12.15). Meaningless as "no pin" while
-     * {@link #isUsable()} is false.
+     * first, so this may write the file (docs/protocol.md 12.15).
      *
-     * <p>A caller with an attempt running for any server must use
-     * {@link #pin(String, int, Set)} instead, so that attempt's pin is not expired under it.</p>
+     * <p>An empty result is only "no pin was ever recorded" while {@link #isUsable()} is true: a
+     * store that a corrupt file or a failed write disabled answers empty for everything, because
+     * what it holds is not a pin the caller may act on.</p>
+     *
+     * <p>The caller passes the keys of its running attempts, from {@link RebindState#activeKeys()},
+     * so a pin is never expired under an attempt. It must also have forgotten the expired pins'
+     * re-bind state first: see {@link #purgeExpired(Set)}.</p>
      */
-    public synchronized Optional<Pin> pin(String host, int port) {
+    synchronized Optional<Pin> pin(String host, int port) {
         return pin(host, port, Collections.<PinKey>emptySet());
     }
 
@@ -208,12 +213,21 @@ public final class PinStore {
      * The pin for {@code host} and {@code port}, after removing the pins that expired at the store's
      * clock, except those in {@code activeKeys} (docs/protocol.md 12.15).
      *
-     * @param activeKeys the logical servers an attempt is running for, whose pins are never expired
-     *     here; empty when the caller has no attempt running
+     * <p>The purge here does not forget the expired pins' re-bind state, which lives in another file
+     * and another object: run {@link PinExpiry#purge(PinStore, RebindState, Set)} first, with the
+     * same {@code activeKeys}, so that nothing is left for this call to purge. An empty result while
+     * {@link #isUsable()} is false means the store is unusable, not that no pin was ever recorded.</p>
+     *
+     * @param activeKeys the logical servers an attempt is running for, as
+     *     {@link RebindState#activeKeys()} returns them, whose pins are never expired here; empty
+     *     when the caller has no attempt running
      */
     public synchronized Optional<Pin> pin(String host, int port, Set<PinKey> activeKeys) {
         PinKey key = PinKey.of(host, port);
         purgeExpired(activeKeys);
+        if (disabled) {
+            return Optional.empty();
+        }
         return Optional.ofNullable(pins.get(PinKey.mapKey(key)));
     }
 
@@ -224,8 +238,10 @@ public final class PinStore {
      *
      * <p>Pins that expired at the store's clock are removed first (12.15), so a name whose pin has
      * expired is recorded as a new one: it is {@link RecordResult#FULL} only if the store is still
-     * full after those removals. A caller with an attempt running for any server must use
-     * {@link #recordPin(String, int, String, Set)} instead.</p>
+     * full after those removals. The caller passes the keys of its running attempts, from
+     * {@link RebindState#activeKeys()}, so a pin is never expired under an attempt, and must have
+     * forgotten the expired pins' re-bind state first: see
+     * {@link #recordPin(String, int, String, Set)}.</p>
      *
      * <p><b>Only the post-SERVER_SWITCH online-mode path of docs/protocol.md 12.15 may call this</b>,
      * once the binding exchange has proved the connection that just completed is the one the pin is
@@ -236,7 +252,7 @@ public final class PinStore {
      * @param fingerprint the advertised fingerprint, lowercase {@code sha256:<64 hex>}
      * @throws IllegalArgumentException when the host, port or fingerprint is not in its canonical form
      */
-    public synchronized RecordResult recordPin(String host, int port, String fingerprint) {
+    synchronized RecordResult recordPin(String host, int port, String fingerprint) {
         return recordPin(host, port, fingerprint, Collections.<PinKey>emptySet());
     }
 
@@ -244,8 +260,13 @@ public final class PinStore {
      * The same, after removing the pins that expired at the store's clock, except those in
      * {@code activeKeys} (docs/protocol.md 12.15).
      *
-     * @param activeKeys the logical servers an attempt is running for, whose pins are never expired
-     *     here; empty when the caller has no attempt running
+     * <p>The purge here does not forget the expired pins' re-bind state, which lives in another file
+     * and another object: run {@link PinExpiry#purge(PinStore, RebindState, Set)} first, with the
+     * same {@code activeKeys}, so that nothing is left for this call to purge.</p>
+     *
+     * @param activeKeys the logical servers an attempt is running for, as
+     *     {@link RebindState#activeKeys()} returns them, whose pins are never expired here; empty
+     *     when the caller has no attempt running
      */
     public synchronized RecordResult recordPin(String host, int port, String fingerprint,
                                                Set<PinKey> activeKeys) {
@@ -279,21 +300,43 @@ public final class PinStore {
     }
 
     /**
-     * Removes the pins that expired at the store's clock, in one atomic write, and returns their
-     * keys (docs/protocol.md 12.15). A pin has expired when its last-bound time is more than
+     * The keys of the pins that have expired at the store's clock, without changing anything
+     * (docs/protocol.md 12.15). A pin has expired when its last-bound time is more than
      * {@link #PIN_TTL_MILLIS} before that clock, or is in the future; a pin whose server is in
-     * {@code activeKeys} is never expired, because an attempt for it is running.
+     * {@code activeKeys} has not, because an attempt for it is running. This is the same rule
+     * {@link #purgeExpired(Set)} removes by, and it reads nothing else: no write, no reordering.
      *
-     * <p>The caller passes the returned keys to {@link RebindState#forgetExpiredPins(Set)}: 12.15
-     * expires a pin's re-bind backoff and detailed notices with the pin itself, and those live in
-     * the re-bind state's own file. The Bloom filter bits stay, so a notice that was shown is still
-     * never shown twice.</p>
+     * <p>It exists so that expiry can be finished in the order that leaks nothing when the process
+     * dies in the middle of it: forget the expired pins' re-bind state first, then remove the pins,
+     * which is what {@link PinExpiry#purge(PinStore, RebindState, Set)} does. Both halves must run
+     * with the same {@code activeKeys}.</p>
+     *
+     * @param activeKeys the logical servers an attempt is running for, as
+     *     {@link RebindState#activeKeys()} returns them; empty when there is none
+     * @return the keys that would be removed, empty when none has expired
+     */
+    public synchronized Set<PinKey> expiredKeys(Set<PinKey> activeKeys) {
+        return keysOf(expiredMapKeys(activeKeys, clock.millis()));
+    }
+
+    /**
+     * Removes the pins that expired at the store's clock, in one atomic write, and returns their
+     * keys (docs/protocol.md 12.15). The rule is {@link #expiredKeys(Set)}'s.
+     *
+     * <p>This removes the pins only. Their re-bind backoff and detailed notices live in the re-bind
+     * state's own file and must be forgotten first, with the keys
+     * {@link #expiredKeys(Set)} returned, so that a crash between the two writes leaves a pin to
+     * expire again rather than a re-bind entry nothing will ever remove:
+     * {@link PinExpiry#purge(PinStore, RebindState, Set)} is that whole sequence in one call, and
+     * the connect path uses it. A lookup or a {@link #recordPin(String, int, String, Set)} decision
+     * purges by itself, so the caller must have run that sequence before them.</p>
      *
      * <p>Nothing is written when no pin has expired. A failed write disables the store, leaves the
      * old file in place and removes nothing, so the returned set is empty, exactly like every other
      * failed write here; the caller then has {@link #isUsable()} false and uses {@code /2} or TCP.</p>
      *
-     * @param activeKeys the logical servers an attempt is running for; empty when there is none
+     * @param activeKeys the logical servers an attempt is running for, as
+     *     {@link RebindState#activeKeys()} returns them; empty when there is none
      * @return the keys of the pins that were removed, empty when there was nothing to remove
      */
     public synchronized Set<PinKey> purgeExpired(Set<PinKey> activeKeys) {
@@ -301,22 +344,14 @@ public final class PinStore {
         if (disabled) {
             return Collections.emptySet();
         }
-        long now = clock.millis();
-        Set<String> active = new LinkedHashSet<>();
-        for (PinKey key : activeKeys) {
-            active.add(PinKey.mapKey(key));
-        }
-        Map<String, Pin> next = new LinkedHashMap<>(pins);
-        Set<PinKey> expired = new LinkedHashSet<>();
-        for (Map.Entry<String, Pin> candidate : pins.entrySet()) {
-            Pin pin = candidate.getValue();
-            if (isExpired(pin, now) && !active.contains(candidate.getKey())) {
-                next.remove(candidate.getKey());
-                expired.add(PinKey.of(pin.host(), pin.port()));
-            }
-        }
-        if (expired.isEmpty()) {
+        Set<String> expiredMapKeys = expiredMapKeys(activeKeys, clock.millis());
+        if (expiredMapKeys.isEmpty()) {
             return Collections.emptySet();
+        }
+        Set<PinKey> expired = keysOf(expiredMapKeys);
+        Map<String, Pin> next = new LinkedHashMap<>(pins);
+        for (String mapKey : expiredMapKeys) {
+            next.remove(mapKey);
         }
         if (!write(next)) {
             disabled = true;
@@ -325,6 +360,38 @@ public final class PinStore {
         pins.clear();
         pins.putAll(next);
         return expired;
+    }
+
+    /**
+     * The map keys of the pins that have expired at {@code now}, except those whose server is in
+     * {@code activeKeys}, which an attempt is running for. Reads the pins and nothing else.
+     */
+    private Set<String> expiredMapKeys(Set<PinKey> activeKeys, long now) {
+        Objects.requireNonNull(activeKeys, "activeKeys");
+        Set<String> expired = new LinkedHashSet<>();
+        if (disabled) {
+            return expired;
+        }
+        Set<String> active = new LinkedHashSet<>();
+        for (PinKey key : activeKeys) {
+            active.add(PinKey.mapKey(key));
+        }
+        for (Map.Entry<String, Pin> candidate : pins.entrySet()) {
+            if (isExpired(candidate.getValue(), now) && !active.contains(candidate.getKey())) {
+                expired.add(candidate.getKey());
+            }
+        }
+        return expired;
+    }
+
+    /** The keys of the pins at {@code mapKeys}, which must still be in this store. */
+    private Set<PinKey> keysOf(Set<String> mapKeys) {
+        Set<PinKey> keys = new LinkedHashSet<>();
+        for (String mapKey : mapKeys) {
+            Pin pin = pins.get(mapKey);
+            keys.add(PinKey.of(pin.host(), pin.port()));
+        }
+        return keys;
     }
 
     /**
@@ -363,7 +430,10 @@ public final class PinStore {
         return true;
     }
 
-    /** How many pins the store holds. */
+    /**
+     * How many pins the store holds, expired ones included: a pin is only gone once a lookup, a
+     * decision or {@link #purgeExpired(Set)} has removed it (docs/protocol.md 12.15).
+     */
     public synchronized int size() {
         return pins.size();
     }
