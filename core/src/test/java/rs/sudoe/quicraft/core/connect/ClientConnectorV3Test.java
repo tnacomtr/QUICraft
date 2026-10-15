@@ -724,6 +724,29 @@ class ClientConnectorV3Test {
     }
 
     @Test
+    void aPreconnectFailureAfterAnAdmittedRebindReleasesTheAttempt(@TempDir Path dir) throws Exception {
+        Path file = dir.resolve("rebind-v1.bin");
+        Fixture f = new Fixture(PinStore.load(null), RebindState.load(file));
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString());
+        Faults.set(Faults.V3_SELECT);
+        Outcome<String> outcome = f.connect(f.connector(true, true), new FakePlatform(), Mode.AUTO);
+        Faults.set();
+
+        assertEquals("tcp", outcome.tcp(), "a failed pre-connect step still joins over TCP");
+        // The plan's fixture keeps its re-bind state in memory, so this one writes a real file to
+        // observe the admitted attempt: tryBeginAttempt only pre-stores the window (failures stays
+        // 0), while endAttempt(false) counts one failure.
+        String state = stateFile(file);
+        assertTrue(state.contains("\"failures\":1"),
+                "the failed pre-connect step must end the attempt it admitted: " + state);
+    }
+
+    private static String stateFile(Path file) throws Exception {
+        return new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
+    }
+
+    @Test
     void cancellingTheJoinEndsAnAdmittedRebind(@TempDir Path dir) throws Exception {
         Path file = dir.resolve("rebind-v1.bin");
         Fixture f = new Fixture(PinStore.load(null), RebindState.load(file));
@@ -740,10 +763,6 @@ class ClientConnectorV3Test {
         String state = stateFile(file);
         assertTrue(state.contains("\"failures\":1"),
                 "an abandoned join must not leave the server's re-bind state held: " + state);
-    }
-
-    private static String stateFile(Path file) throws Exception {
-        return new String(Files.readAllBytes(file), StandardCharsets.UTF_8);
     }
 
     @Test

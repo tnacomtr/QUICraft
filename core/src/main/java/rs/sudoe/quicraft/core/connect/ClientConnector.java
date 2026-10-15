@@ -549,7 +549,6 @@ public final class ClientConnector {
     /** The worker half of {@link #prepare}: every {@code /3} input is read here, and nowhere else. */
     private Prepared prepare0(InetSocketAddress server, String logicalHost, int logicalPort,
             ConnectDecision.Mode mode, Optional<Advertisement> advertisement) {
-        Faults.check(Faults.V3_SELECT);
         long now = v3.clock().getAsLong();
         TransportSelection.PinState pinState = pinState(logicalHost, logicalPort, advertisement);
         InetSocketAddress target = advertisement.isPresent() ? quicTarget(server, advertisement.get()) : null;
@@ -564,44 +563,64 @@ public final class ClientConnector {
             // state that cannot be trusted and a state that cannot hold another server.
             attempt = v3.rebinds().tryBeginAttempt(logicalHost, logicalPort, now);
         }
-        Optional<RoutingTable> table = routingTable(advertisement);
-        TransportSelection.Result selection = TransportSelection.select(TransportSelection.Inputs.builder()
-                .setting(mode)
-                .multistreamEnabled(v3.multistreamEnabled())
-                .exporterCapable(v3.exporterCapable())
-                .advertisement(advertisement)
-                .pinState(pinState)
-                .rebindAllowed(attempt != null)
-                .clientProtocolNumber(v3.protocolNumber())
-                .localRoutingDigestHex(table.isPresent() ? Optional.of(table.get().digestHex())
-                        : Optional.<String>empty())
-                .build());
-        if (attempt != null && advertisement.isPresent()
-                && selection.transport() != TransportSelection.Transport.V3
-                && prerequisiteMissing(selection.missing())) {
-            // 12.16's pre-connect precedence: a changed pin whose /3 prerequisites are missing
-            // leaves the pin alone, records §6's entry and the re-bind backoff, and joins over fresh
-            // vanilla TCP. It never selects /2 and never sends 0x10, because no connection exists.
-            failures.recordFailure(target.getAddress(), target.getPort(),
-                    advertisement.get().fingerprint());
-            v3.rebinds().endAttempt(attempt, false);
-            attempt = null;
+        boolean kept = false;
+        try {
+            // The selection step of 12.3, 13.1 and 12.16. It is checked after the pin and re-bind
+            // reads, so a fault here models a failure with an attempt already admitted, which is the
+            // case that must release it.
+            Faults.check(Faults.V3_SELECT);
+            Optional<RoutingTable> table = routingTable(advertisement);
+            TransportSelection.Result selection = TransportSelection.select(TransportSelection.Inputs.builder()
+                    .setting(mode)
+                    .multistreamEnabled(v3.multistreamEnabled())
+                    .exporterCapable(v3.exporterCapable())
+                    .advertisement(advertisement)
+                    .pinState(pinState)
+                    .rebindAllowed(attempt != null)
+                    .clientProtocolNumber(v3.protocolNumber())
+                    .localRoutingDigestHex(table.isPresent() ? Optional.of(table.get().digestHex())
+                            : Optional.<String>empty())
+                    .build());
+            if (attempt != null && advertisement.isPresent()
+                    && selection.transport() != TransportSelection.Transport.V3
+                    && prerequisiteMissing(selection.missing())) {
+                // 12.16's pre-connect precedence: a changed pin whose /3 prerequisites are missing
+                // leaves the pin alone, records §6's entry and the re-bind backoff, and joins over
+                // fresh vanilla TCP. It never selects /2 and never sends 0x10, because no connection
+                // exists.
+                failures.recordFailure(target.getAddress(), target.getPort(),
+                        advertisement.get().fingerprint());
+                v3.rebinds().endAttempt(attempt, false);
+                attempt = null;
+            }
+            String tcpReason = null;
+            if (activationBlocked) {
+                tcpReason = "the /3 activation failure for this key is still backing off (12.14)";
+            } else if (pinStoreFullForNewName(pinState, logicalHost, logicalPort, advertisement)) {
+                // 12.16, spec-literal: "Never automatically evict pins: when the pin store is full,
+                // use TCP for new names until the player explicitly deletes a pin." So a new name
+                // with a full store is TCP, not /2, even though /2 itself needs no pin.
+                tcpReason = "the pin store is full and has no pin for this name (12.16)";
+            } else if (handshakeBackoff(server, advertisement, mode)) {
+                // §6: a UDP-blocked or frontend-proxied /3 server costs at most one head start per
+                // backoff window, exactly as the shipped decision treats a /2 server.
+                tcpReason = "the section 6 backoff for this address, port and fingerprint is still active";
+            }
+            kept = true;
+            return new Prepared(selection, pinState, attempt, tcpReason,
+                    table.isPresent() ? table.get().digest() : null);
+        } finally {
+            if (attempt != null && !kept) {
+                // A pre-connect failure must not leave the attempt holding the server's re-bind
+                // state: the caller falls back to TCP, and the state would otherwise stay active for
+                // the whole attempt's lifetime.
+                try {
+                    v3.rebinds().endAttempt(attempt, false);
+                } catch (Throwable ignored) {
+                    // Best effort: the state disables itself on a failed write.
+                }
+            }
         }
-        String tcpReason = null;
-        if (activationBlocked) {
-            tcpReason = "the /3 activation failure for this key is still backing off (12.14)";
-        } else if (pinStoreFullForNewName(pinState, logicalHost, logicalPort, advertisement)) {
-            // 12.16, spec-literal: "Never automatically evict pins: when the pin store is full, use
-            // TCP for new names until the player explicitly deletes a pin." So a new name with a
-            // full store is TCP, not /2, even though /2 itself needs no pin.
-            tcpReason = "the pin store is full and has no pin for this name (12.16)";
-        } else if (handshakeBackoff(server, advertisement, mode)) {
-            // §6: a UDP-blocked or frontend-proxied /3 server costs at most one head start per
-            // backoff window, exactly as the shipped decision treats a /2 server.
-            tcpReason = "the section 6 backoff for this address, port and fingerprint is still active";
-        }
-        return new Prepared(selection, pinState, attempt, tcpReason,
-                table.isPresent() ? table.get().digest() : null);
     }
 
     /**
@@ -686,12 +705,7 @@ public final class ClientConnector {
                     "QUIC only: the /3 pre-connect step failed and there is no TCP fallback"));
             return;
         }
-        tcpOnly(platform, result, fallbackMessage(V3Plan.INTERNAL_ERROR));
-    }
-
-    /** The player-facing message of a {@code /3} fallback (user decision). */
-    private static String fallbackMessage(String reason) {
-        return "QUIC multi-stream failed (" + reason + "), fell back to TCP";
+        tcpOnly(platform, result, V3Plan.fallbackMessage(V3Plan.INTERNAL_ERROR));
     }
 
     /**
@@ -1051,7 +1065,7 @@ public final class ClientConnector {
             failures.recordFailure(target.getAddress(), target.getPort(), ad.fingerprint());
             endRebindAttemptOnWorker(plans);
             Outcome<T> outcome = new Outcome<T>(null, r.tcp(), r.quicFailure(), null,
-                    plans == null ? null : fallbackMessage(fallbackReason(r.quicFailure())));
+                    plans == null ? null : V3Plan.fallbackMessage(fallbackReason(r.quicFailure())));
             if (early != null && early.sent()) {
                 // The server may have started a login on the 0-RTT flight. The lost QUIC attempt
                 // sends CONNECTION_CLOSE; give it one TCP round trip to arrive before the TCP login
