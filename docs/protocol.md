@@ -139,7 +139,8 @@ idea: derive H from the RTT the server-list ping already measured.
 - Key: (resolved IP, QUIC port, advertised fingerprint). `/3` additionally enforces the
   fingerprint-independent logical-server join-retry limiter in 12.14; rotating addresses,
   advertised ports or fingerprints cannot reset that limiter. Resource aborts (`0x12`)
-  never create or advance a failure-cache entry.
+  get only the failure-cache exceptions specified in 12.14; unauthenticated peer claims
+  exceeding its allowance follow normal backoff.
 - After a failure, the client skips QUIC for that key for the backoff period. It starts at
   **1 minute** and doubles with each consecutive failure, up to **1 hour** *(user)*. A successful
   QUIC connection removes the entry.
@@ -757,9 +758,16 @@ single-socket listener: no dispatcher is installed and the connection id length 
      Resource-caused closes instead use `0x12`, including expiry of an activation deadline
      while a local resource refusal prevents progress. Both peers recognize this application
       code, but only LOCALLY detected resource aborts MUST NOT create/advance §6's failure
-      cache or the re-bind failure backoff. Before SERVER_SWITCH verifies, a PEER-sent
-      `0x12` is untrusted and treated like `0x10` for both caches/backoffs and retry limiting;
-      it cannot authenticate its own resource claim. After verification a peer resource
+      cache or the re-bind failure backoff, subject to the peer-attribution rule in 13.12.
+      Before SERVER_SWITCH verifies, a PEER-sent `0x12` cannot authenticate its resource
+      claim. Apply the fixed 60-second resource window below to at most three such reports
+      per rolling 10 minutes per logical server; the fourth and subsequent reports in that
+      interval are treated like `0x10` for failure-cache/re-bind-backoff and retry limiting.
+      Retain the last three report timestamps, including reports treated as `0x10`; decide
+      from prior reports in the window before recording the current one. Persist them
+      with the logical-host limiter below (also shared with 12.16);
+      success, reconnects and endpoint/fingerprint changes do not reset them. This allowance
+      never shortens an existing non-resource window. After verification a peer resource
       report also avoids failure-cache/re-bind-backoff updates. They still close fail-closed, log the resource reason,
      and use the same fresh join-time TCP retry and chat notice below. For non-resource
      failures, client records §6's failure-cache entry for the attempted address/port/fingerprint;
@@ -781,11 +789,16 @@ single-socket listener: no dispatcher is installed and the connection id length 
       it. A failed non-resource attempt consumes it and starts §6's exponential schedule for this limiter;
      during that window start joins directly over TCP (`quic-only` fails instead), without another QUIC login/session
       join. For a locally detected resource abort (or an authenticated peer report after
-      SERVER_SWITCH), instead use a fixed 60-second window: at most one QUIC attempt and
+      SERVER_SWITCH, or a pre-verification report within the allowance above), instead use
+      a fixed 60-second window: at most one QUIC attempt and
       its automatic TCP retry per minute per logical server, with NO doubling and no
       increase of any existing non-resource exponent. Resource aborts cannot extend a
       non-resource window beyond its original expiry. This bounds extra login attempts,
-      not endpoint trust; it does not modify failure-cache entries or pins. The first
+      not endpoint trust; it does not modify failure-cache entries or pins. No new wire
+      message is needed: a short honest server-pressure episode avoids exponential TCP
+      suppression, while unauthenticated claims buy only three fixed-window exceptions
+      per 10 minutes, not unlimited exemption from normal backoff. These counts/windows
+      are provisional measure-then-set retry policy. The first
       join after this short window attempts QUIC again; TCP is not a scale-capacity remedy.
       Use 12.16's 4096-entry bound, active-entry protection and atomic persistence;
      if limiter state cannot be read/written or safely reserved, choose TCP before QUIC login.
@@ -835,8 +848,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
     backoff, and joins over fresh vanilla TCP directly (`quic-only` fails), never `/2`;
     `0x10` is sent only when a `/3` connection exists. Any failure after connection creation (binding,
      exporter error, timeout, write failure) closes with `0x10` (resource aborts use `0x12`
-      and only locally detected resources get the pre-SERVER_SWITCH cache/backoff exception
-      in 12.14), leaves the pin unchanged, applies 12.14's authenticated-report distinction
+      and the cache/backoff exceptions are exactly those in 12.14), leaves the pin unchanged,
+      applies 12.14's local/authenticated/bounded-unauthenticated distinction
       to §6's failure cache and re-bind backoff, and uses 12.14's
      join-time TCP retry and logical-server limiter:
      close the failed QUIC connection first, then start a fresh vanilla TCP join
@@ -1316,31 +1329,47 @@ position extraction. Those implementations must change together before this revi
       set these pool sizes/caps at 50,000 players; they are not idle reservations or proven
       capacity. Use the same binding-cap eligibility/recompute rule as inbound. Shed only
       outbound byte holders with `0x12`, never a requester holding no outbound bytes.
-      Atomically retry
-     waiting charges from released capacity before new charges; if no reclaimable holder
-     exists, wait under backpressure for at most 10 seconds on the local monotonic transport
+      Atomically retry waiting outbound grants FIFO from released capacity before new
+      charges. Skip a still-ineligible wait without blocking grants under unrelated caps;
+      preserve its FIFO position for the next retry, exactly as for inbound excess grants.
+      If no reclaimable holder exists, wait under backpressure for at most 10 seconds on
+     the local monotonic transport
      clock, without executor-stall exclusion. During binding 12.10/12.14's earlier activation
      bound also applies. Never abort an honest binding on the first pool refusal while
      other connections retain reclaimable outbound bytes. Never deny honest protected
-     inbound reads because another peer stopped reading. Resource aborts never update the
-      failure cache when locally detected (12.14); the fixed resource retry window remains independent.
+     inbound reads because another peer stopped reading. Locally detected genuine shared
+      resource aborts do not update the failure cache (12.14); apply the peer-attribution
+      exception below before classifying a refusal as resource-caused.
      **Pressure ranking (both pools, separately accounted):** maintain exponentially decayed
      byte-seconds per source IP and authenticated account, not per connection; half-life
      60 seconds provisionally. Integrate retained charged bytes, excluding known local
      executor-stall intervals. Track progress over a rolling 10-second window per identity:
-     inbound bytes completing validated records, outbound bytes acknowledged/released by QUIC
-     (not merely handed to it). Rank identities holding bytes with zero progress for at
-     least 5 seconds first (start at first acquisition for a new identity, retain the last
-     progress/acquisition timestamp across reconnects),
-     then descending `decayedByteSeconds / (1 + progressBytesPerSecond)`, then current retained
-     bytes descending. Thus stalled readers precede merely large queues and trickling
-     holders outrank otherwise comparable progressing holders. A connection's rank is the
-     worse of its IP/account ranks; tie by oldest current acquisition then stable connection id.
+     newly received inbound record bytes (including partial records, counted once, not
+     retransmissions or copies), outbound bytes acknowledged/released by QUIC (not merely
+     handed to it). Rank descending `decayedByteSeconds / (1 + progressBytesPerSecond)`,
+     then current retained bytes descending. There is NO strict zero-progress/stalled-first
+     tier or 5-second acquisition clock: a short mobile radio stall does not automatically
+     outrank every progressing holder, nor can a trickle escape a priority tier. A connection's
+     rank is the worse of its IP/account ranks; within tied identity ranks apply the same
+     score and retained-byte comparison using each connection's own byte-seconds/progress,
+     then oldest current acquisition, then stable connection id. A reconnect starts only
+     its new connection-local statistics, never the identity history; no 5-second clock restarts.
      Aggregate across simultaneous connections and retain identity history for 10 minutes
-     after last use; reconnects never reset it. Bound each pool's history to the configured
-     admission IP/account tracking capacities, admitting no new tracked identity when full
-     until an expired inactive entry is available; never evict live/unexpired history to
-     admit a reconnect. Rate admission limits still apply. All ranking windows/weights are
+     after last use; reconnects never reset it. Bound each pool's exact history to the
+     configured admission IP/account tracking capacities, plus one shared overflow bucket.
+     Reclaim expired inactive entries first; if full, evict the lowest-score inactive IP
+     entry with neither an account association nor a live connection, folding its history
+     into the overflow bucket. Never evict live entries or unexpired account history. If no
+     such slot exists, charge the new identity's history/progress to that shared bucket
+     instead of refusing it; count a connection's bytes/progress only once in overflow
+     even if both its IP and account lack exact entries. Its actual IP/account caps still
+     apply independently. Until overflow has no live users and its 10-minute inactive
+     history expires, identities without an exact entry continue using it even if exact
+     slots become free; do not promote them and erase reconnect history. Existing exact
+     entries remain separate and protected. Decay bucket history under the same rules.
+     The ranking-history table NEVER causes admission/grant refusal or TCP fallback,
+     even when all exact entries are protected. Independent rate admission limits
+     still apply. All ranking windows/weights are
      provisional operational defaults: measure then set, including CGNAT fairness and
      reconnect/trickle attacks. Scores only choose among eligible holders, never protected shares.
     Incomplete record/bundle: 10 seconds from first byte on the local monotonic transport
@@ -1349,9 +1378,22 @@ position extraction. Those implementations must change together before this revi
     of pre-enqueue active work; FIFO enqueue Q completes that timer, while D still waits for actual
     application (13.10). Executor queue/tick-stall time is excluded at both client and server;
     do not let a >10-second tick stall disconnect every peer. Unrelated network progress
-     restarts none of these clocks. **Deadline precedence:** ANY deadline expiring while
+     restarts none of these clocks. **Peer attribution before resource classification:**
+     a refusal caused only by the requesting peer's own caps or its own retained bytes is
+     peer-attributable, not shared resource exhaustion. In particular this covers a binding
+     connection-local cap, or shared binding caps held exclusively by that peer; do not
+     reclaim unrelated holders or grant the fixed resource retry exception in those cases.
+     If an abort is required (unpausable producer or deadline expiry), close with `0x11`
+     (during binding, `0x10`) when peer-caused, using normal client
+     failure-cache/backoff and existing server peer-attributable handling, including on
+     deadline expiry. Local implementation/producer faults are not evidence of peer fault.
+     When no connection-local cap independently blocks the grant, shared pressure caused
+     by other peers remains `0x12` even when this peer also holds bytes. Apply this distinction
+     to both pools, pending ACK caps and binding queues.
+     **Deadline precedence:** ANY deadline expiring while
      this node is withholding reads/grants needed for completion due to a LOCAL resource
-     refusal closes `0x12`, never peer blame `0x11` (or binding blame `0x10`). The earlier
+     refusal closes `0x12`, never peer blame `0x11` (or binding blame `0x10`), except for
+     the peer-attributable refusals just defined. The earlier
      deadline still wins in time; resource classification wins when causes/timers overlap.
      In particular, an incomplete timer started by a prefix may expire before the later
      resource-wait timer; it then closes `0x12`, without extending either 10-second bound.
@@ -1474,13 +1516,14 @@ position extraction. Those implementations must change together before this revi
     fresh-TCP ordering, new Login Start/session join, bounded OFFER wait, unchanged pin and
     retained (unused) tickets/tokens/recorded flights on failure, failure-cache and re-bind
      backoff updated on non-resource failure (asserted separately), no failure-cache or
-      re-bind-backoff update on locally detected `0x12`; peer-sent `0x12` before verified
-      SERVER_SWITCH must instead update both as `0x10`. Test this with rotating unauthenticated
-      peers, and the authenticated resource-report exception; success-only discard of tickets/tokens/
+      re-bind-backoff update on locally detected genuine shared-resource `0x12`; peer-sent
+      `0x12` before verified SERVER_SWITCH uses exactly 12.14's bounded allowance, then
+      updates both as `0x10`. Test rotating unauthenticated peers, persistence of the allowance
+      across successes/restarts, and the authenticated resource-report exception; success-only discard of tickets/tokens/
     flights, changed fingerprint with unavailable exporter or missing/mismatched routing
     digest selecting fresh TCP without `/2` or `0x10`, restart-persisted fingerprint-independent
     backoff, notice deduplication/eviction, the join-time TCP retry (close before fresh TCP, log and
-      chat message, failure-cache entry except for locally detected resource aborts) for every pre-activation failure kind, no retry after
+      chat message, failure-cache entries/exceptions exactly as in 12.14) for every pre-activation failure kind, no retry after
     activation, and, with 0-RTT accepted on `/3`, neither side starting binding before the
     server's TLS handshake completes (12.7).
     Run a 50,000-concurrent-QUIC-connection node benchmark before enablement, recording
@@ -1533,9 +1576,10 @@ position extraction. Those implementations must change together before this revi
       logical send point, take the maximum sequence of every covered update on each chunk
       stream, plus the CONTROL frontier covering the relevant action processing. Include
       the current CONTROL A[0] conservatively, and any globally routed covered updates.
-      Delay the ack at the sender until every covered update has been assigned; this
-      sender-local wait is not a reason to close the connection. Assignment MUST proceed
-      independently of the outbound FIFO: retain the pending ack outside the sequenced
+      Remove intentionally suppressed/not-sent updates from coverage; they have no wire
+      frontier. Delay the ack at the sender until every remaining covered update has been
+      assigned; this sender-local wait is not a reason to close the connection. Assignment
+      MUST proceed independently of the outbound FIFO: retain the pending ack outside the sequenced
       queues, never let it block assignment/enqueueing of updates it covers, and never
       publish its sequence/frontier to later records before resolving coverage. Covered
       updates are ordered before the ack at the logical assignment point even if the game
@@ -1558,12 +1602,26 @@ position extraction. Those implementations must change together before this revi
       creation, not only after assignment. Moving an ack into the sequenced queue transfers
       its charge, never duplicates it. Backpressure the ack producer at the limit without
       stopping covered-update/fence assignment; if this separation is impossible or the
-      producer cannot pause, resource-abort `0x12`, never silently drop/coalesce or retain
-      unbounded acks. These are provisional measure-then-set limits, not idle reservations.
+      producer cannot pause, resource-abort `0x12` (subject to 13.12's peer-attribution rule),
+      never silently drop/coalesce or retain unbounded acks, except for the explicit drops
+      below. These are provisional measure-then-set limits, not idle reservations.
+      A pending ack has a 10-second monotonic transport-clock deadline from creation,
+      never extended by other traffic or executor stalls. No later than that deadline, or
+      before ANY protocol-state, epoch or disconnect transition (including graceful disconnect),
+      settle coverage: remove suppressed updates and resolve/enqueue in the old state/epoch
+      using the safe-superset rule below if all remaining covered updates are assigned;
+      otherwise drop the still-unassigned ack and release its charge. Never carry pending
+      ACKs into another state/epoch, synthesize missing updates or publish forward edges.
+      An actual disconnect discards unsent ACKs; resolving does not delay transport close.
+      Dropping a pending ack does not suppress any mandatory game update. This explicit
+      deadline/transition drop is the only drop exception to the storage-limit rule above;
+      count/log it without packet contents. Verify that both bounded deferral and these
+      drops preserve game prediction semantics for the adapter, or disable `/3` for that
+      version. No sender wait alone disconnects an honest client.
       If exact causal
       coverage cannot be established, use all prior chunk frontiers plus CONTROL as a safe
-      superset once all covered updates are assigned; otherwise keep the ack pending under
-      normal sender backpressure rather than guessing a frontier or disconnecting.
+      superset once all non-suppressed covered updates are assigned; otherwise keep the ack
+      pending only until the deadline/transition above, rather than guessing a frontier.
       The ack's game sequence is not a transport sequence and does not identify one chunk.
     - **BATCH_JOIN (chunk_batch_finished):** chunk_batch_start is a CONTROL/view gate,
       so every following chunk install waits for its execution through the latest V,
@@ -1632,10 +1690,10 @@ position extraction. Those implementations must change together before this revi
      Separately refuse excess/outbound grants across a stall and verify their transport-clock
      10-second waits do not pause and only resource-blocked requesters/eligible holders close.
      Test a compressed record whose wire length fits P but declared output does not: refuse
-     excess before inflation, retain bounded prefixes, then recover after grant. Test legal
+      shared excess before inflation, retain bounded prefixes, then recover after grant. Test legal
      small records marked ordinarySmall:false using P without `0x11`, plus invalid declarations
       and output/scratch overruns. Start an incomplete timer with partial prefix bytes,
-      refuse excess after classification later, and let the earlier incomplete deadline
+      refuse excess under other-peer shared pressure after classification later, and let the earlier incomplete deadline
       expire: assert `0x12`, not `0x11`, including simultaneous deadlines and an executor stall.
       With a tight node pool all allowed stream preambles must still read from reservations;
       inject an erroneous withheld preamble grant and assert the 13.14 expiry is `0x12`.
@@ -1644,27 +1702,48 @@ position extraction. Those implementations must change together before this revi
       only holders relieving a binding deficit, recompute after each, stop when the grant
       fits, and retry waiting grants FIFO before new arrivals (including shared-IP peers).
       Verify decayed identity-level byte-second/progress ranking: long-held modest trickle
-      versus fresh larger allocation, fast progress versus trickle, simultaneous connections
-      and reconnects with unchanged IP/account history, expiry and history-table saturation.
-      Outbound tests must enforce node/IP/account caps and rank stalled readers before large
-      progressing queues; rotate connections without resetting aggregated progress/history.
+      versus fresh larger allocation, fast progress versus trickle, partial inbound-record
+      progress, a 5-second radio stall with no strict priority tier, simultaneous connections
+      and reconnects with unchanged IP/account history, connection-local tie-breaking and
+      expiry. Saturate history with rotating IPv6 /64s: reclaim eligible lowest-score inactive
+      IP entries or use overflow, protect account/live history, and admit new honest players
+      over QUIC without history-based refusal; verify cap accounting remains exact and
+      reconnects cannot escape unexpired overflow history when an exact slot becomes free.
+      Outbound tests must enforce node/IP/account caps and the same continuous score ranking;
+      rotate connections without resetting aggregated progress/history. Under outbound
+      contention queue A then B on the same binding cap and a new arrival C: released capacity
+      grants A then B before C. With A still IP/account-ineligible and unrelated B eligible,
+      grant B without moving A's FIFO position; grant A first when its caps permit.
      Fill outbound capacity with non-reading peers, then activate an honest connection:
      shed-then-atomic-retry must succeed without abort/cache/chat notice. Persistent refusal
      must backpressure then close `0x12` and retry TCP with notice; when the detecting node is
      the client, never write a failure-cache entry. When the server detects it and the client
-     receives only a pre-verification peer `0x12`, assert normal failure-cache/backoff updates
-     instead: honest remote exhaustion is not distinguishable from a forged resource claim.
+     receives only a pre-verification peer `0x12`, assert fixed-window handling for the first
+     three reports per rolling 10 minutes, then normal failure-cache/backoff updates: honest
+     remote exhaustion is not distinguishable from a forged resource claim, so exceptions
+     are bounded, not authenticated. Verify a brief honest server-pressure episode can retry
+     QUIC after 60 seconds and an attacker cannot obtain unlimited fixed-window exemptions.
      Rotate fingerprints/IPs/advertised ports for one logical server across restarts
      and assert the independent join-retry limit still bounds extra session joins, including
       after resource aborts. Repeated locally detected resource aborts across restarts must
       permit QUIC again after each fixed 60-second window, never double to hour-long TCP
-      suppression or advance failure/re-bind backoff; unauthenticated peer `0x12` instead
-      follows normal non-resource backoff. Emit an ack before its covered updates with a full outbound FIFO:
+      suppression or advance failure/re-bind backoff; unauthenticated peer `0x12` follows
+      12.14's bounded allowance then normal non-resource backoff. Fill only a requesting
+      peer's own connection cap or a shared cap held exclusively by it, inbound/outbound
+      and during binding: peer-caused refusal/deadline expiry is `0x11`/`0x10` with normal
+      backoff, never a fixed-window resource exemption or eviction of unrelated peers.
+      Contrast other-peer shared exhaustion and a local producer fault, neither blamed on
+      the peer. Emit an ack before its covered updates with a full outbound FIFO:
      update assignment must progress independently, no future/cyclic dependency or client
       `0x11` may result, and the ack follows all covered updates. Test game order A, view/global
       fence V, covered U: assignment is V,U,A, never U,A,V, and all edges point backward.
       Test both ACK pending limits, pool charging before assignment, and inability to pause
       only the ACK producer: bounded resource abort, never unbounded retention or a cycle.
+      Suppress a covered update and verify it is excluded, not awaited forever. Leave
+      coverage unresolved until the 10-second pending deadline and assert a counted drop,
+      released charge and no client close. For protocol-state, epoch and disconnect
+      transitions test both safe-superset resolution and unresolved-coverage drop; no pending
+      ack crosses the transition, no mandatory update is lost and all emitted edges remain backward.
       Also test active-work timeouts,
      CLIENT-only OFFER-first enforcement (server accepts early brand/client-information writes)
      and both OFFER clocks, server binding-queue/node caps, u31
@@ -1706,6 +1785,7 @@ position extraction. Those implementations must change together before this revi
    elapsed-time budget, and this draft does not change the approved duration.
 5. Approve the new close code `0x12` (resource abort) next to `0x10` (binding/setup failure)
    and `0x11` (peer ordering/protocol violation)? It marks closes caused by the local node's
-   own resource limits so they never blame the peer and locally detected aborts never write
-   a failure-cache entry; before SERVER_SWITCH verifies, peer reports remain untrusted (12.14).
+   genuine shared resource exhaustion, not peer-attributable self-cap refusals (13.12).
+   Locally detected resource aborts never write a failure-cache entry; before SERVER_SWITCH
+   verifies, peer reports remain untrusted and receive only 12.14's bounded retry allowance.
    Close codes are wire format; nothing ships with `0x12` until this is confirmed.
