@@ -96,6 +96,25 @@ final class PreLoginRegistry {
     }
 
     /**
+     * Frees one open-connection slot for a validated newcomer when the listener's global limits are full
+     * (12.13): sheds one pre-login victim in the order of {@link #admit}, unless the newcomer's own prefix is
+     * already over its fair share. The victim's close gives back its lease synchronously, so the caller can
+     * take it at once. Returns false when nobody is sheddable: the caller refuses the newcomer.
+     */
+    synchronized boolean shedForLease(InetAddress source, int shards) {
+        if (overFairShare(coarsePrefix(source), PreLoginTracker.stagedShare(shards))) {
+            return false;
+        }
+        Entry victim = pickVictim();
+        if (victim == null) {
+            return false;
+        }
+        LOG.log(Level.FINE, "shedding a staged /3 connection to free an open-connection slot");
+        shed(victim);
+        return true;
+    }
+
+    /**
      * Reserves one session-server call for {@code source}'s coarse prefix, or returns false when the
      * prefix already has its cap in flight. Pair every true with {@link #endSessionCall}.
      */

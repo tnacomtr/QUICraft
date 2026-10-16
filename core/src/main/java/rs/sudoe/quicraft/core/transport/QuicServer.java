@@ -75,6 +75,9 @@ public final class QuicServer implements Closeable {
     /** The /3 connection's staged pre-login lifecycle (12.13), see {@link #preLoginStage}. */
     private static final io.netty.util.AttributeKey<PreLoginConnection> PRE_LOGIN =
             io.netty.util.AttributeKey.valueOf(QuicServer.class, "preLogin");
+    /** The connection's open-connection lease, so a shed can give its slot back at once (12.13). */
+    private static final io.netty.util.AttributeKey<ConnectionAdmission.Lease> LEASE =
+            io.netty.util.AttributeKey.valueOf(QuicServer.class, "openLease");
     /**
      * Chunk streams charged for a staged connection. N is not negotiated before OFFER, so every
      * staged connection is charged for the largest N (13.2): conservative, and at most six streams.
@@ -1025,6 +1028,14 @@ public final class QuicServer implements Closeable {
                 java.net.SocketAddress remote = connection.remoteSocketAddress();
                 if (remote instanceof InetSocketAddress && ((InetSocketAddress) remote).getAddress() != null) {
                     lease = admission.tryAcquire(((InetSocketAddress) remote).getAddress());
+                    if (lease == null && preLogin != null) {
+                        // 12.13: a validated /3 newcomer over the open-connection limits sheds a pre-login
+                        // victim instead of being dropped; the victim's close returns its lease at once.
+                        InetAddress source = ((InetSocketAddress) remote).getAddress();
+                        if (preLogin.shedForLease(source, STAGED_LANES)) {
+                            lease = admission.tryAcquire(source);
+                        }
+                    }
                     if (lease == null) {
                         // Last resort: AdmissionTokenHandler checked the same limits on this thread
                         // just before the connection was created, so this should not happen. It
@@ -1043,6 +1054,9 @@ public final class QuicServer implements Closeable {
                 LOG.log(Level.FINE, "QUIC open-connection check failed; admitting the connection", t);
             }
             Admitted admitted = new Admitted(lease);
+            if (lease != null) {
+                connection.attr(LEASE).set(lease);
+            }
             if (preLogin != null) {
                 // 12.13: /3 is staged from its first accepted Initial, charged to the pre-login pool
                 // instead of the node budget until promotion (Login Success online, activation offline).
@@ -1090,7 +1104,18 @@ public final class QuicServer implements Closeable {
                 return null;
             }
             return preLogin.admit(((InetSocketAddress) remote).getAddress(), connection, STAGED_LANES, online,
-                    System::nanoTime, () -> Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE));
+                    System::nanoTime, () -> {
+                        releaseLease(connection);
+                        Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
+                    });
+        }
+
+        /** Gives a connection's open-connection lease back now, before its close completes (12.13). */
+        private static void releaseLease(QuicChannel connection) {
+            ConnectionAdmission.Lease held = connection.attr(LEASE).getAndSet(null);
+            if (held != null) {
+                held.close();
+            }
         }
 
         @Override

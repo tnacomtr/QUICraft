@@ -326,4 +326,30 @@ class PreLoginRegistryTest {
         assertTrue(slow.closed, "the least-progressed connection of the over-share prefix is shed");
         assertFalse(fast.closed);
     }
+
+    @Test
+    void aValidatedNewcomerShedsAnIdleStagedVictimForAnOpenSlot() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(poolFor(2), 4, new Random(1));
+        List<Conn> shed = new ArrayList<>();
+        Conn idle = admit(registry, "idle", "192.0.2.1", false, shed);
+
+        assertTrue(registry.shedForLease(ip("198.51.100.1"), 6), "12.13: an idle staged victim frees a slot");
+        assertTrue(idle.closed, "the victim is closed");
+        assertEquals(0, registry.stagedCount());
+    }
+
+    @Test
+    void aNewcomerWithNothingSheddableOrOverItsShareGetsNoSlot() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(poolFor(3), 4, new Random(1));
+        assertFalse(registry.shedForLease(ip("198.51.100.1"), 6), "nothing is staged, so nothing is sheddable");
+
+        List<Conn> shed = new ArrayList<>();
+        Conn a1 = admit(registry, "a1", "192.0.2.1", false, shed);
+        Conn a2 = admit(registry, "a2", "192.0.2.2", false, shed);
+        Conn b1 = admit(registry, "b1", "198.51.100.1", false, shed);
+        // 192.0.2.x holds two of three shares, so a newcomer from it is over its fair share and is refused.
+        assertFalse(registry.shedForLease(ip("192.0.2.3"), 6), "an over-share newcomer sheds no one");
+        assertFalse(a1.closed || a2.closed || b1.closed, "no staged connection was shed");
+        assertEquals(3, registry.stagedCount());
+    }
 }

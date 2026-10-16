@@ -124,7 +124,9 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
             return offset;
         }
         try {
-            if (!spendValidatedAttempt(address.getAddress()) || !openSlotFree(address)) {
+            // A /3 listener leaves the open-slot decision to the connection's admission, which sheds a
+            // pre-login victim when the limits are full (12.13). /2 keeps dropping the Initial here.
+            if (!spendValidatedAttempt(address.getAddress()) || (!fairValidated && !openSlotFree(address))) {
                 return -1;
             }
         } catch (Throwable t) {

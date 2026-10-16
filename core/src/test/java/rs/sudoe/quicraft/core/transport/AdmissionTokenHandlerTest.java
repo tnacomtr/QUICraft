@@ -241,6 +241,24 @@ class AdmissionTokenHandlerTest {
                 "after the lease is freed a fresh valid token is accepted");
     }
 
+    @Test
+    void aFairValidatedTokenIsNotDroppedWhileTheOpenSlotIsFull() {
+        // 12.13: a /3 listener admits the validated Initial here and lets the connection's admission shed a
+        // pre-login victim for the slot; dropping it at the token stage would starve the honest client.
+        AtomicLong retries = new AtomicLong();
+        ConnectionAdmission admission = admission(1000, 100, 4, 1, 1000);
+        ConnectionAdmission validated = admission(1000, 100, 4, 1, 1000);
+        ConnectionAdmission.Lease held = admission.tryAcquire(ADDRESS_1.getAddress());
+        assertNotNull(held);
+
+        AdmissionTokenHandler handler = new AdmissionTokenHandler(admission, validated,
+                TransportConfig.RetryMode.ALWAYS, retries, true, KEY, FROZEN);
+        ByteBuf token = token(handler, ADDRESS_1);
+        assertEquals(PREFIX_LENGTH, handler.validateToken(token, ADDRESS_1),
+                "a /3 valid token is accepted while the open slot is full");
+        held.close();
+    }
+
     // ── 12. validateToken limits ─────────────────────────────────────────
 
     @Test
