@@ -12,6 +12,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -132,19 +133,28 @@ class InboundExcessPoolTest {
         final NodePools node = new NodePools(200, 200, 0, 10, false, E);
         final InboundExcessPool pool = new InboundExcessPool(node, 200, 200, ranks(new HashMap<Object, Double>()));
         final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        final AtomicInteger grants = new AtomicInteger();
+        final AtomicInteger refusals = new AtomicInteger();
         final List<Thread> threads = new ArrayList<Thread>();
         for (int n = 0; n < 6; n++) {
             final String owner = "owner" + n;
             Thread t = new Thread(() -> {
                 try {
                     for (int i = 0; i < 2000; i++) {
+                        // Six owners each ask for 60 bytes against a 200-byte node cap, so grants contend at the cap.
+                        // Each step ends the owner's previous grant, or asks again; a refused wait is dropped at once.
                         synchronized (pool) {
+                            if (pool.reserved(owner) > 0) {
+                                pool.release(owner, pool.reserved(owner));
+                            } else if (pool.reserve(owner, "ip-" + owner, null, 60, false)) {
+                                grants.incrementAndGet();
+                            } else {
+                                refusals.incrementAndGet();
+                                pool.cancel(owner);
+                            }
+                            // Shed victims are closed as the integration does, so every release stays legal.
+                            for (Object victim : pool.drainShedOwners()) pool.confirmClosed(victim);
                             if (node.reserved(ResourcePools.Pool.INBOUND_EXCESS) > 200) throw new AssertionError("over cap");
-                        }
-                        try {
-                            if (pool.reserve(owner, "ip-" + owner, null, 10, false)) pool.release(owner, 10);
-                        } catch (IllegalStateException shed) {
-                            // the owner was shed by a peer's grant; its release is then rightly refused
                         }
                     }
                 } catch (Throwable e) {
@@ -156,6 +166,8 @@ class InboundExcessPoolTest {
         }
         for (Thread t : threads) t.join();
         assertEquals(null, failure.get());
+        assertTrue(grants.get() > 0, "some requests are granted");
+        assertTrue(refusals.get() > 0, "requests contend at the node cap and are refused");
         assertTrue(node.reserved(ResourcePools.Pool.INBOUND_EXCESS) <= 200);
     }
 
