@@ -799,8 +799,10 @@ The `/3` pre-login pool has a hard cap, default 10% of the node budget (profile 
 Require `maxOpen >= logged-in target + pre-login connection cap`, where the pre-login connection cap is the pre-login pool's bytes divided by the staged per-connection reservation; raise `maxOpen`, `maxTrackedIps` and
 `globalAttemptsPerSecond` together from TransportConfig defaults 65536, 131072 and 2000 as needed.
 When global capacity is full, shed pre-login work rather than drop an honest token-bearing Initial.
-Fair share is measured in pool bytes charged per prefix, not connection count, and applies to every
-charge, including declared-length charges and waits for one. Choose a victim by hierarchical
+Fair share is measured in pool bytes charged per prefix, not connection count, and counts every
+charge, including declared-length charges. A declared-length charge is also bounded by a per-prefix
+cap (profile value); within that cap it is granted while the pool has room and waits otherwise, so
+two prefixes never hold each other back on an uncontended pool. A waiting charge never sheds. Choose a victim by hierarchical
 source-prefix fair share first (IPv6 /48 then /64, IPv4 /24; used
 only for this choice), then least-progressed state, then random. A connection waiting on the
 server (hasJoined or platform event in flight) is not shed while its prefix is within its fair
