@@ -180,9 +180,9 @@ final class V3Handler extends ChannelDuplexHandler implements DecodeContext.Gate
     }
 
     /**
-     * The last handler of the pipeline once the lanes are active. Packets pass it into the game's own
-     * handlers (anything a mod or vanilla put in front of the encoder sees them as it always did),
-     * unless the lanes cannot take more: then they wait here, in order, until they can.
+     * The last handler of the pipeline once the lanes are active. Every packet passes into the game's
+     * own encoder so protocol transitions happen exactly as on TCP; lane backpressure is applied to
+     * the resulting encoded frame in {@link Sink}.
      */
     static final class Tail extends ChannelOutboundHandlerAdapter {
         private final V3Client client;
@@ -193,9 +193,6 @@ final class V3Handler extends ChannelDuplexHandler implements DecodeContext.Gate
 
         @Override
         public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
-            if (msg instanceof Packet && client.holdForLanes(ctx, msg, promise)) {
-                return;
-            }
             if (msg instanceof Packet) {
                 client.stampSendState();
             }

@@ -124,13 +124,16 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private final List<Held> deferred = new ArrayList<>();
     private GameLanes lanes;
     private V3Handler handler;
-    /** Writes the lanes were too full to take (13.12), in order; the tail's own context drains them. */
-    private final java.util.ArrayDeque<Held> backlog = new java.util.ArrayDeque<>();
+    /** Fully encoded/compressed writes the lanes cannot take yet, in original outbound order. */
+    private final java.util.ArrayDeque<QueuedFrame> backlog = new java.util.ArrayDeque<>();
     private long backlogBytes;
-    private ChannelHandlerContext tailContext;
-    /** The protocol the packet being written is sent in, stamped at the tail before the encoder swaps. */
+    /** Protocol for the packet currently traversing the encoder; captured before terminal swaps. */
     private ProtocolState sendState = ProtocolState.CONFIGURATION;
     private LaneSend laneSend;
+    /** Counts actual encoder output frames that reached the sink; exposed for the pipeline harness. */
+    private int encodedFramesObserved;
+    /** Counts final frame/compression passes performed for those encoder outputs. */
+    private int framedFramesObserved;
     /**
      * What may be accepted but not yet run on the main thread before acknowledgements are held back.
      * Provisional: the 13.17 benchmark sets the real numbers.
@@ -174,6 +177,14 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     /** Tests: replaces the lane session as the destination of encoded packets. */
     void useLaneSend(LaneSend send) {
         this.laneSend = send;
+    }
+
+    int encodedFramesObserved() {
+        return encodedFramesObserved;
+    }
+
+    int framedFramesObserved() {
+        return framedFramesObserved;
     }
 
     GameLanes lanes() {
@@ -333,7 +344,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     boolean hold(Object packet, ChannelPromise promise) {
         switch (state) {
             case BINDING: {
-                BindingDriver.QueueResult result = payloads.queueOrdinary(new Held(packet, promise, 0),
+                BindingDriver.QueueResult result = payloads.queueOrdinary(new Held(packet, promise),
                         BINDING_HELD_ESTIMATE_BYTES);
                 if (result == BindingDriver.QueueResult.DROPPED_FAILED) {
                     promise.tryFailure(new ClosedChannelException());
@@ -342,7 +353,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                 return result == BindingDriver.QueueResult.QUEUED;
             }
             case ACTIVATING:
-                deferred.add(new Held(packet, promise, 0));
+                deferred.add(new Held(packet, promise));
                 return true;
             case FAILED:
                 promise.tryFailure(new ClosedChannelException());
@@ -367,53 +378,16 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         }
     }
 
-    /**
-     * A packet the game writes once the lanes are active. Held (true) while the lanes are not
-     * writable or earlier writes are still waiting, so order is kept; only the spec's caps
-     * (1024 packets or 16 MiB, 13.12) are fatal.
-     */
-    boolean holdForLanes(ChannelHandlerContext ctx, Object packet, ChannelPromise promise) {
-        tailContext = ctx;
-        GameLanes current = lanes;
-        if (backlog.isEmpty() && (current == null || current.isWritable())) {
-            return false;
-        }
-        final int encodedBytes;
-        try {
-            encodedBytes = LaneCodec.encodedFrameSize(channel, (net.minecraft.network.protocol.Packet<?>) packet);
-        } catch (Throwable t) {
-            promise.tryFailure(t);
-            failActive("could not estimate held packet size", LaneSession.CLOSE_INTERNAL_ERROR);
-            return true;
-        }
-        if (backlog.size() >= LaneSession.MAX_UNSENT_PACKETS
-                || backlogBytes + encodedBytes > LaneSession.MAX_UNSENT_BYTES) {
-            promise.tryFailure(new ClosedChannelException());
-            failActive("send queue overflow", LaneSession.CLOSE_ORDERING);
-            return true;
-        }
-        backlog.add(new Held(packet, promise, encodedBytes));
-        backlogBytes += encodedBytes;
-        return true;
-    }
-
-    /** The lanes' writability changed: on recovery the held writes go on, in order. */
+    /** The lanes' writability changed: on recovery the encoded frames go on, in order. */
     void writabilityChanged() {
         GameLanes current = lanes;
-        ChannelHandlerContext ctx = tailContext;
-        if (current == null || ctx == null || state != State.ACTIVE) {
+        if (current == null || state != State.ACTIVE) {
             return;
         }
-        boolean wrote = false;
         while (current.isWritable() && !backlog.isEmpty()) {
-            Held next = backlog.poll();
-            backlogBytes -= next.bytes;
-            stampSendState();
-            ctx.write(next.packet, next.promise);
-            wrote = true;
-        }
-        if (wrote) {
-            ctx.flush();
+            QueuedFrame next = backlog.poll();
+            backlogBytes -= next.frame.length;
+            sendFrame(next);
         }
     }
 
@@ -424,15 +398,39 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                 promise.tryFailure(new ClosedChannelException());
                 return;
             }
+            encodedFramesObserved++;
             int packetId = VarInt.read(body.duplicate());
             byte[] frame = LaneCodec.frame(channel, body);
-            laneSend.send(sendState, packetId, frame);
-            promise.trySuccess();
+            framedFramesObserved++;
+            GameLanes current = lanes;
+            if (!backlog.isEmpty() || current == null || !current.isWritable()) {
+                if (backlog.size() >= LaneSession.MAX_UNSENT_PACKETS
+                        || backlogBytes + frame.length > LaneSession.MAX_UNSENT_BYTES) {
+                    promise.tryFailure(new ClosedChannelException());
+                    failActive("send queue overflow", LaneSession.CLOSE_ORDERING);
+                    return;
+                }
+                backlog.add(new QueuedFrame(sendState, packetId, frame, promise));
+                backlogBytes += frame.length;
+            } else {
+                sendFrame(new QueuedFrame(sendState, packetId, frame, promise));
+            }
         } catch (Throwable t) {
             promise.tryFailure(t);
             fail(t);
         } finally {
             body.release();
+        }
+    }
+
+    /** Transfers one fully encoded GAME frame to the lane session. */
+    private void sendFrame(QueuedFrame queued) {
+        try {
+            laneSend.send(queued.state, queued.packetId, queued.frame);
+            queued.promise.trySuccess();
+        } catch (Throwable t) {
+            queued.promise.tryFailure(t);
+            failActive("lane send failed", LaneSession.CLOSE_INTERNAL_ERROR);
         }
     }
 
@@ -884,7 +882,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         for (Object o : held) {
             ((Held) o).promise.tryFailure(new ClosedChannelException());
         }
-        Held waiting;
+        QueuedFrame waiting;
         while ((waiting = backlog.poll()) != null) {
             waiting.promise.tryFailure(new ClosedChannelException());
         }
@@ -901,12 +899,25 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private static final class Held {
         final Object packet;
         final ChannelPromise promise;
-        final int bytes;
 
-        Held(Object packet, ChannelPromise promise, int bytes) {
+        Held(Object packet, ChannelPromise promise) {
             this.packet = packet;
             this.promise = promise;
-            this.bytes = bytes;
+        }
+    }
+
+    /** The queue owns final framed bytes after the game encoder and compression have run once. */
+    private static final class QueuedFrame {
+        final ProtocolState state;
+        final int packetId;
+        final byte[] frame;
+        final ChannelPromise promise;
+
+        QueuedFrame(ProtocolState state, int packetId, byte[] frame, ChannelPromise promise) {
+            this.state = state;
+            this.packetId = packetId;
+            this.frame = frame;
+            this.promise = promise;
         }
     }
 

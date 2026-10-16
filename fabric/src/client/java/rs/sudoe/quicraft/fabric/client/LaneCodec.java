@@ -202,26 +202,6 @@ public final class LaneCodec implements GameLanes.Codec {
         }
     }
 
-    /**
-     * The exact frame size the game's encoder and compression handler will retain for this packet.
-     * Used before a packet is held behind a full lane, while it is still a packet object and cannot
-     * otherwise be charged by its encoded size.
-     */
-    static int encodedFrameSize(Channel channel, Packet<?> packet) throws Exception {
-        ChannelPipeline pipeline = channel.pipeline();
-        ChannelHandlerContext encoderContext = pipeline.context("encoder");
-        if (encoderContext == null || !(encoderContext.handler() instanceof PacketEncoder)) {
-            throw new IllegalStateException("no outbound protocol is configured");
-        }
-        ByteBuf body = channel.alloc().buffer();
-        try {
-            ((PacketEncoderAccessor) encoderContext.handler()).quicraft$encode(encoderContext, packet, body);
-            return frame(channel, body).length;
-        } finally {
-            body.release();
-        }
-    }
-
     @Override
     public void encode(Object message, ByteBuf out) {
         if (message != encodedPacket || encodedFrame == null) {
