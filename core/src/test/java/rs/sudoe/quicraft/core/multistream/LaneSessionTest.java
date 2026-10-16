@@ -1340,6 +1340,42 @@ class LaneSessionTest {
         }
     }
 
+    @Test
+    void aThrowingNodeReleaseStillFreesTheRestOfALanesChunks() throws Exception {
+        ThrowingReleaseBudget node = new ThrowingReleaseBudget();
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        config.deferClientGame = true;
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.activateBoth();
+            // No game is bound, so the lane keeps what it reads: the chunk it would parse from and
+            // the ones queued behind it. A transport read is capped at READ_CHUNK and stops while a
+            // chunk is held, so the chunks the lane holds are fed to it directly.
+            QuicStreamChannel control = LaneRig.channelOf(rig.client, Lane.CONTROL);
+            rig.client.eventLoop().submit(() -> {
+                for (int i = 0; i < 3; i++) {
+                    control.pipeline().fireChannelRead(control.alloc().buffer(1000).writeZero(1000));
+                }
+                return null;
+            }).get(10, TimeUnit.SECONDS);
+            List<ByteBuf> held = rig.client.eventLoop().submit(() -> rig.client.heldChunks(Lane.CONTROL))
+                    .get(10, TimeUnit.SECONDS);
+            assertEquals(3, held.size(), "the lane holds the chunk it parses from and the two behind it");
+            for (ByteBuf chunk : held) {
+                assertEquals(1, chunk.refCnt());
+            }
+            node.failTheNextRelease();
+            rig.client.abort(0x11);
+            sawClose(rig.net.serverSawClose, 0x11);
+            for (ByteBuf chunk : held) {
+                assertEquals(0, chunk.refCnt(), "a held chunk is freed even when a node release throws");
+            }
+            assertEquals(1, node.failed);
+            assertEquals(node.refusedBytes, node.reserved(),
+                    "only the release that failed stays charged: " + node.reserved());
+        }
+    }
+
     /**
      * Feeds a lane's handler one chunk of {@code bytes} directly, on the session's event loop: the
      * lane's allocator caps a transport read at {@link LaneSession#READ_CHUNK}, so the oversized
@@ -1351,6 +1387,44 @@ class LaneSessionTest {
             channel.pipeline().fireChannelRead(channel.alloc().buffer(bytes).writeZero(bytes));
             return null;
         }).get(10, TimeUnit.SECONDS);
+    }
+
+    /** A budget whose next release throws before delegating; the bytes it refused stay charged. */
+    private static final class ThrowingReleaseBudget extends ReceiveBudget {
+        private final ReceiveBudget delegate = ReceiveBudget.bounded(16L << 20);
+        private volatile boolean failNext;
+        volatile int failed;
+        volatile long refusedBytes;
+
+        void failTheNextRelease() {
+            failNext = true;
+        }
+
+        @Override
+        public boolean tryReserve(long bytes) {
+            return delegate.tryReserve(bytes);
+        }
+
+        @Override
+        public void release(long bytes) {
+            if (failNext) {
+                failNext = false;
+                failed++;
+                refusedBytes = bytes;
+                throw new IllegalStateException("release " + bytes + " fails");
+            }
+            delegate.release(bytes);
+        }
+
+        @Override
+        public long reserved() {
+            return delegate.reserved();
+        }
+
+        @Override
+        public long available() {
+            return delegate.available();
+        }
     }
 
     @Test

@@ -445,6 +445,22 @@ public final class LaneSession {
     }
 
     /**
+     * Test hook: the chunks a lane still holds, the one it parses from first; call on the loop.
+     */
+    List<ByteBuf> heldChunks(Lane lane) {
+        LaneStream s = streams[lane.ordinal()];
+        List<ByteBuf> chunks = new ArrayList<ByteBuf>();
+        if (s == null) {
+            return chunks;
+        }
+        if (s.currentBuf != null) {
+            chunks.add(s.currentBuf);
+        }
+        chunks.addAll(s.inbound);
+        return chunks;
+    }
+
+    /**
      * Test hook: the pinned Netty's {@code QUICHE_ERR_STREAM_STOPPED}, or {@link Integer#MIN_VALUE}
      * when the probe cannot resolve it.
      */
@@ -1486,11 +1502,15 @@ public final class LaneSession {
          * Releases one chunk that was charged when it arrived and is now consumed or discarded:
          * gives its bytes back to the node budget and frees it. A chunk's reader index never moves
          * while it is parsed (the decoder works on a {@code nioBuffer} view), so the amount
-         * released is exactly the amount charged.
+         * released is exactly the amount charged. The buffer is freed even when the release fails:
+         * nothing else will ever free it, so a throwing release must not leak it.
          */
         void releaseChunk(ByteBuf chunk) {
-            node.release(chunk.readableBytes());
-            chunk.release();
+            try {
+                node.release(chunk.readableBytes());
+            } finally {
+                chunk.release();
+            }
         }
 
         boolean nextBuffer() {
@@ -1515,17 +1535,34 @@ public final class LaneSession {
             return !inbound.isEmpty() || (current != null && current.hasRemaining());
         }
 
+        /**
+         * 13.12: gives everything this lane still holds back, whatever fails. Each step is guarded
+         * on its own and ownership is dropped before the release, so one throwing release can
+         * neither skip the rest of this lane's chunks nor free the same bytes twice. A lane that
+         * kept its chunks charged would leak them into a budget every other connection shares.
+         */
         void releaseInbound() {
-            releaseGrant();
-            releaseRecordGrant();
-            ByteBuf b;
-            while ((b = inbound.poll()) != null) {
-                releaseChunk(b);
+            quietly(this::releaseGrant, "read grant");
+            quietly(this::releaseRecordGrant, "record grant");
+            ByteBuf queued;
+            while ((queued = inbound.poll()) != null) {
+                final ByteBuf chunk = queued;
+                quietly(() -> releaseChunk(chunk), "queued chunk");
             }
             if (currentBuf != null) {
-                releaseChunk(currentBuf);
+                final ByteBuf chunk = currentBuf;
                 currentBuf = null;
                 current = null;
+                quietly(() -> releaseChunk(chunk), "held chunk");
+            }
+        }
+
+        /** Runs one release step, logging a failure instead of letting it skip the later steps. */
+        private void quietly(Runnable step, String what) {
+            try {
+                step.run();
+            } catch (Throwable t) {
+                LOG.log(Level.FINE, "releasing a lane's " + what + " failed", t);
             }
         }
 
