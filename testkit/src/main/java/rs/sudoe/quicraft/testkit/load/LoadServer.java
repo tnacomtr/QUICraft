@@ -49,6 +49,9 @@ public final class LoadServer {
     private static final long MIB = 1024L * 1024L;
     private static final long HANDSHAKE_WAIT_MS = 10_000;
     private static final long HANDSHAKE_RETRY_MS = 10;
+    /** Closes of activated server lane sessions by close key (code, side, cause). */
+    private static final Map<String, AtomicLong> LANE_CLOSES = new ConcurrentHashMap<>();
+
     /**
      * One shared daemon timer retries the activation check of every pending connection. core has no
      * handshake-complete callback on {@code V3Connection}, so the check has to poll; a thread per
@@ -152,7 +155,8 @@ public final class LoadServer {
                         + " retries=" + retriesSent(serverForStats) + refusals.fields()
                         : " streams=" + open.size())
                 + " rss_mb=" + ProcStats.rssMb() + " threads=" + ProcStats.threads()
-                + " cpu_ticks=" + ProcStats.cpuTicks()), statusSec, statusSec, TimeUnit.SECONDS);
+                + " cpu_ticks=" + ProcStats.cpuTicks()
+                + (v3 ? " lane_closes=" + LANE_CLOSES : "")), statusSec, statusSec, TimeUnit.SECONDS);
 
         CountDownLatch stop = new CountDownLatch(1);
         CountDownLatch closed = new CountDownLatch(1);
@@ -201,7 +205,9 @@ public final class LoadServer {
             connection.write(java.nio.ByteBuffer.wrap(ACTIVATION_MARKER));
             connection.flush();
             connection.detachForActivation(leftover -> { });
-            connection.activate(new IdleLaneGame((code, cause) -> {}), PROTOCOL, null);
+            connection.activate(new IdleLaneGame((code, byPeer, cause) -> LANE_CLOSES
+                    .computeIfAbsent(LoadClient.closeKey(code, byPeer, cause), k -> new AtomicLong())
+                    .incrementAndGet()), PROTOCOL, null);
             lanesActive.incrementAndGet();
         } catch (Throwable t) {
             lanesFailed.incrementAndGet();

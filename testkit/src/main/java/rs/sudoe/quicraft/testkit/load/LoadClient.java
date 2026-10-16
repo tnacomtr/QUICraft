@@ -198,6 +198,13 @@ public final class LoadClient {
         return root == t ? text : t.getClass().getSimpleName() + " <- " + text;
     }
 
+    /** Close-cause key of an activated connection: lane close code, which side closed it, and why. */
+    static String closeKey(int code, boolean byPeer, Throwable cause) {
+        return "code=" + (code < 0 ? "none" : "0x" + Integer.toHexString(code))
+                + " by=" + (byPeer ? "peer" : "local")
+                + " " + (cause == null ? "normal" : normalizeCause(cause));
+    }
+
     /** One FAIL_CAUSE line per distinct cause, most frequent first. */
     private void printCauses() {
         List<Map.Entry<String, AtomicLong>> entries = new ArrayList<>(causes.entrySet());
@@ -208,9 +215,7 @@ public final class LoadClient {
         List<Map.Entry<String, AtomicLong>> closes = new ArrayList<>(closeCauses.entrySet());
         closes.sort((a, b) -> Long.compare(b.getValue().get(), a.getValue().get()));
         for (Map.Entry<String, AtomicLong> e : closes) {
-            String key = e.getKey();
-            String code = key.contains("0x11") || key.contains("rule 13.4") ? "0x11" : "other";
-            System.out.println("CLOSE_CAUSE count=" + e.getValue().get() + " code=" + code + " " + key);
+            System.out.println("CLOSE_CAUSE count=" + e.getValue().get() + " " + e.getKey());
         }
     }
 
@@ -240,12 +245,11 @@ public final class LoadClient {
                     ByteBuffer suffix = data.hasRemaining() ? data.slice() : null;
                     v3.detachForActivation(leftover -> { });
                     activationTracked.add(v3);
-                    v3.activate(new IdleLaneGame((code, cause) -> {
+                    v3.activate(new IdleLaneGame((code, byPeer, cause) -> {
                         if (closeRecorded.compareAndSet(false, true)) {
                             activationTracked.remove(v3);
                             closed.incrementAndGet();
-                            String key = "code=" + (code < 0 ? "none" : "0x" + Integer.toHexString(code))
-                                    + " " + (cause == null ? "normal" : normalizeCause(cause));
+                            String key = closeKey(code, byPeer, cause);
                             closeCauses.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
                         }
                     }), suffix);

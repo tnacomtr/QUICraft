@@ -2,7 +2,6 @@
 package rs.sudoe.quicraft.testkit.load;
 
 import java.util.List;
-import java.util.function.BiConsumer;
 import rs.sudoe.quicraft.core.multistream.Envelope;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
@@ -16,9 +15,14 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
  * spike has no Minecraft login).
  */
 final class IdleLaneGame implements LaneGame {
-    private final BiConsumer<Integer, Throwable> closed;
+    /** Told once when the activated connection closes: the close code, who closed it, and why. */
+    interface CloseListener {
+        void closed(int code, boolean byPeer, Throwable cause);
+    }
 
-    IdleLaneGame(BiConsumer<Integer, Throwable> closed) { this.closed = closed; }
+    private final CloseListener closed;
+
+    IdleLaneGame(CloseListener closed) { this.closed = closed; }
 
     @Override
     public Decoded decode(Lane lane, long sequence, byte[] frame, boolean insideBundle,
@@ -39,5 +43,5 @@ final class IdleLaneGame implements LaneGame {
     public void onWritabilityChanged(boolean writable) {}
 
     @Override
-    public void onClosed(int code, boolean byPeer, Throwable cause) { closed.accept(code, cause); }
+    public void onClosed(int code, boolean byPeer, Throwable cause) { closed.closed(code, byPeer, cause); }
 }
