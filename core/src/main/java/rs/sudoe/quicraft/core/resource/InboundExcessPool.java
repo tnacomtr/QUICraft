@@ -1,86 +1,103 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.resource;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.logging.Logger;
 
-/** Inbound excess accounting, cap eligibility and FIFO retry queue (protocol.md 13.12). */
+/**
+ * Inbound refusable-excess accounting (protocol.md 13.12 "Inbound excess").
+ *
+ * <p>Each connection may hold at most E bytes of excess; per-source-IP and per-authenticated-account
+ * caps supplement the node-wide cap. Caller-local, per-IP and per-account caps below E are clamped up to
+ * E at construction with a warning, never a startup failure (13.12 "Misconfiguration").</p>
+ *
+ * <p>Thread-safe: every call synchronises on the shared ledger.</p>
+ */
 public final class InboundExcessPool {
-    private final NodePools node;
-    private final long perIpLimit, perAccountLimit;
-    private final Map<Object, Holder> holders = new LinkedHashMap<Object, Holder>();
-    private final List<Request> waiting = new ArrayList<Request>();
+    private static final Logger LOG = Logger.getLogger("QUICraft");
 
-    /** Creates an inbound excess pool with independent node, IP and account caps. */
-    public InboundExcessPool(NodePools node, long perIpLimit, long perAccountLimit) {
-        if (node == null || perIpLimit < node.excessLimit() || perAccountLimit < node.excessLimit())
-            throw new IllegalArgumentException("caps must admit one E");
-        this.node = node; this.perIpLimit = Math.min(perIpLimit, node.limit(ResourcePools.Pool.INBOUND_EXCESS));
-        this.perAccountLimit = Math.min(perAccountLimit, node.limit(ResourcePools.Pool.INBOUND_EXCESS));
+    private final CappedLedger ledger;
+    private final long perIpCap;
+    private final long perAccountCap;
+
+    /**
+     * Creates the inbound excess pool over the shared node pools.
+     *
+     * @param node shared pools whose INBOUND_EXCESS capacity is the node-wide cap
+     * @param perIpLimit configured per-source-IP excess cap, clamped up to E
+     * @param perAccountLimit configured per-account excess cap, clamped up to E
+     * @param rank current pressure scores used to choose victims
+     */
+    public InboundExcessPool(NodePools node, long perIpLimit, long perAccountLimit, HolderRank rank) {
+        if (node == null || rank == null || perIpLimit < 0 || perAccountLimit < 0) throw new IllegalArgumentException("limits");
+        long e = node.connectionExcess();
+        this.perIpCap = clampToE(perIpLimit, node, e, "per-IP");
+        this.perAccountCap = clampToE(perAccountLimit, node, e, "per-account");
+        this.ledger = new CappedLedger(node, ResourcePools.Pool.INBOUND_EXCESS, perIpCap, perAccountCap, e, rank);
     }
 
-    /** Attempts to reserve; ineligible refusals are retained in FIFO order for retry. */
-    public synchronized boolean reserve(Object owner, Object ip, Object account, long bytes, double rank, boolean localStall) {
-        if (owner == null || ip == null || bytes < 0) throw new IllegalArgumentException("request");
-        Holder h = holders.get(owner);
-        if (h == null) { h = new Holder(owner, ip, account); holders.put(owner, h); }
-        if (fits(h, bytes) && waiting.isEmpty() && node.reserve(ResourcePools.Pool.INBOUND_EXCESS, owner, bytes)) {
-            h.bytes += bytes; h.rank = rank; h.localStall = localStall; return true;
+    /** Effective per-source-IP cap after the startup clamp. */
+    public long perIpCap() { return perIpCap; }
+
+    /** Effective per-account cap after the startup clamp. */
+    public long perAccountCap() { return perAccountCap; }
+
+    /**
+     * Grants excess bytes for an owner, or queues the request FIFO and reclaims eligible holders.
+     *
+     * @param localStall true while this owner's bytes wait only on our game executor (never a victim)
+     * @return true when the bytes are charged now
+     */
+    public synchronized boolean reserve(Object owner, Object ip, Object account, long bytes, boolean localStall) {
+        return ledger.reserve(owner, ip, account, bytes, localStall);
+    }
+
+    /** Releases excess once its ownership has actually ended, then retries waiters FIFO. */
+    public synchronized void release(Object owner, long bytes) { ledger.release(owner, bytes); }
+
+    /** Ends an owner after it was closed with 0x12: releases all its excess and drops its waits. */
+    public synchronized void cancel(Object owner) { ledger.cancel(owner); }
+
+    /** Returns and clears owners selected for local 0x12 closure; the integration closes them. */
+    public synchronized List<Object> drainShedOwners() { return ledger.drainShed(); }
+
+    /** Retained excess for one owner. */
+    public synchronized long reserved(Object owner) { return ledger.reserved(owner); }
+
+    /** Retained excess charged to one source IP. */
+    public synchronized long reservedByIp(Object ip) { return ledger.reservedByIp(ip); }
+
+    /** Retained excess charged to one authenticated account. */
+    public synchronized long reservedByAccount(Object account) { return ledger.reservedByAccount(account); }
+
+    /** Number of queued refused requests. */
+    public synchronized int waitingCount() { return ledger.waitingCount(); }
+
+    /**
+     * Peer attribution for an inbound refusal (13.12 "Peer attribution before resource classification").
+     *
+     * @param anyBytesOnExecutor some of this connection's bytes wait on our game executor: never peer-caused
+     * @param excessExcludingLocal this connection's retained excess minus bytes held only by our executor
+     * @param requested bytes of the refused request
+     * @param connectionCap the per-connection cap (E, or a higher caller-local cap after the clamp)
+     * @param capHeldOnlyBySelf the refused shared IP/account/node cap is held exclusively by this connection
+     * @param bindingCap the shared cap that refused the request; below E it is a local fault
+     * @return true when the refusal may close {@code 0x11}; false for a local fault or shared-pressure {@code 0x12}
+     */
+    public static boolean peerAttributable(boolean anyBytesOnExecutor, long excessExcludingLocal, long requested,
+                                           long connectionCap, boolean capHeldOnlyBySelf, long bindingCap, long e) {
+        if (anyBytesOnExecutor) return false;
+        if (bindingCap < e) return false; // misconfiguration: a local fault, never peer-caused
+        if (excessExcludingLocal + requested > connectionCap) return true;
+        return capHeldOnlyBySelf && bindingCap >= e;
+    }
+
+    private static long clampToE(long configured, NodePools node, long e, String what) {
+        long value = Math.min(configured, node.limit(ResourcePools.Pool.INBOUND_EXCESS));
+        if (value < e) {
+            LOG.warning("QUICraft: " + what + " inbound excess cap " + configured + " raised to E=" + e);
+            return e;
         }
-        waiting.add(new Request(h, bytes));
-        reclaim(h, bytes);
-        retry();
-        return false;
+        return value;
     }
-
-    /** Releases bytes and retries waiting grants FIFO before later charges. */
-    public synchronized void release(Object owner, long bytes) {
-        Holder h = holders.get(owner);
-        if (h == null || bytes < 0 || bytes > h.bytes) throw new IllegalStateException("release exceeds reservation");
-        node.release(ResourcePools.Pool.INBOUND_EXCESS, owner, bytes); h.bytes -= bytes;
-        if (h.bytes == 0) holders.remove(owner);
-        retry();
-    }
-
-    /** Returns current FIFO wait count. */
-    public synchronized int waitingCount() { return waiting.size(); }
-    /** Returns bytes retained by an owner. */
-    public synchronized long reserved(Object owner) { Holder h = holders.get(owner); return h == null ? 0 : h.bytes; }
-
-    private boolean fits(Holder request, long bytes) {
-        long ip = bytes, account = bytes;
-        for (Holder h : holders.values()) {
-            if (h.ip.equals(request.ip)) ip += h.bytes;
-            if (request.account != null && request.account.equals(h.account)) account += h.bytes;
-        }
-        return ip <= perIpLimit && (request.account == null || account <= perAccountLimit);
-    }
-    private void reclaim(Holder request, long bytes) {
-        List<Holder> candidates = new ArrayList<Holder>(holders.values());
-        candidates.sort(Comparator.comparingDouble((Holder h) -> h.rank).reversed().thenComparingLong(h -> -h.bytes));
-        for (Holder h : candidates) {
-            if (h == request || h.bytes == 0 || h.localStall || !relieves(h, request)) continue;
-            node.release(ResourcePools.Pool.INBOUND_EXCESS, h.owner, h.bytes);
-            h.bytes = 0; holders.remove(h.owner);
-            if (fits(request, bytes) && bytes <= node.limit(ResourcePools.Pool.INBOUND_EXCESS) - node.reserved(ResourcePools.Pool.INBOUND_EXCESS)) break;
-        }
-    }
-    private boolean relieves(Holder victim, Holder request) {
-        return victim.ip.equals(request.ip) || request.account != null && request.account.equals(victim.account);
-    }
-    private void retry() {
-        for (int i = 0; i < waiting.size();) {
-            Request r = waiting.get(i);
-            if (!fits(r.holder, r.bytes) || !node.reserve(ResourcePools.Pool.INBOUND_EXCESS, r.holder.owner, r.bytes)) { i++; continue; }
-            r.holder.bytes += r.bytes; waiting.remove(i);
-        }
-    }
-    private static final class Holder {
-        final Object owner, ip, account; long bytes; double rank; boolean localStall;
-        Holder(Object owner, Object ip, Object account) { this.owner=owner; this.ip=ip; this.account=account; }
-    }
-    private static final class Request { final Holder holder; final long bytes; Request(Holder h,long b){holder=h;bytes=b;} }
 }

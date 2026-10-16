@@ -1,72 +1,57 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.resource;
 
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.List;
 
-/** Capped outbound byte pool with FIFO retry and binding-cap eligibility (protocol.md 13.12). */
+/**
+ * Capped outbound byte pool (protocol.md 13.12 "Shared accounting" and "Pressure ranking").
+ *
+ * <p>Queued, packet-held and transport-owned outbound bytes are charged here, never against the inbound
+ * pool or its admission shares. Node, per-source-IP, per-account and per-connection caps all apply.
+ * Refused requests wait FIFO; released capacity is retried in arrival order before new charges. Victims are
+ * holders of outbound bytes only, chosen by the same ranking and eligibility as inbound excess, but without
+ * executor-stall exclusion. Outbound caps are not clamped to E.</p>
+ *
+ * <p>Thread-safe: every call synchronises on the shared ledger.</p>
+ */
 public final class OutboundPool {
-    private final NodePools node;
-    private final long ipLimit, accountLimit;
-    private final Map<Object, Holder> holders = new LinkedHashMap<Object, Holder>();
-    private final java.util.List<Request> waiting = new java.util.ArrayList<Request>();
+    private final CappedLedger ledger;
 
-    /** Creates an outbound pool with independent node, source-IP and account limits. */
-    public OutboundPool(NodePools node, long ipLimit, long accountLimit) {
-        if (node == null || ipLimit < 0 || accountLimit < 0) throw new IllegalArgumentException("limits");
-        this.node = node;
-        this.ipLimit = Math.min(ipLimit, node.limit(ResourcePools.Pool.OUTBOUND));
-        this.accountLimit = Math.min(accountLimit, node.limit(ResourcePools.Pool.OUTBOUND));
+    /**
+     * Creates the outbound pool.
+     *
+     * @param node shared pools; the OUTBOUND capacity is the node-wide cap
+     * @param ipLimit per-source-IP cap (13.12 provisional default 32 MiB)
+     * @param accountLimit per-account cap (13.12 provisional default 32 MiB)
+     * @param perConnectionLimit per-connection unsent-byte cap (13.12: 16 MiB)
+     * @param rank current pressure scores used to choose victims
+     */
+    public OutboundPool(NodePools node, long ipLimit, long accountLimit, long perConnectionLimit, HolderRank rank) {
+        if (node == null || rank == null || ipLimit < 0 || accountLimit < 0 || perConnectionLimit < 0) {
+            throw new IllegalArgumentException("limits");
+        }
+        long nodeCap = node.limit(ResourcePools.Pool.OUTBOUND);
+        this.ledger = new CappedLedger(node, ResourcePools.Pool.OUTBOUND,
+                Math.min(ipLimit, nodeCap), Math.min(accountLimit, nodeCap), perConnectionLimit, rank);
     }
 
-    /** Reserves queued or transport-owned bytes; refused requests retain FIFO position. */
+    /** Reserves queued or transport-owned outbound bytes; true when charged now, else queued FIFO. */
     public synchronized boolean reserve(Object owner, Object ip, Object account, long bytes) {
-        if (owner == null || ip == null || bytes < 0) throw new IllegalArgumentException("request");
-        Holder holder = holders.get(owner);
-        if (holder == null) { holder = new Holder(owner, ip, account); holders.put(owner, holder); }
-        if (waiting.isEmpty() && fits(holder, bytes) && node.reserve(ResourcePools.Pool.OUTBOUND, owner, bytes)) {
-            holder.bytes += bytes;
-            return true;
-        }
-        waiting.add(new Request(holder, bytes));
-        return false;
+        return ledger.reserve(owner, ip, account, bytes, false);
     }
 
-    /** Releases bytes only after the corresponding outbound ownership ends; then retries FIFO. */
-    public synchronized void release(Object owner, long bytes) {
-        Holder holder = holders.get(owner);
-        if (holder == null || bytes < 0 || bytes > holder.bytes) throw new IllegalStateException("release exceeds reservation");
-        node.release(ResourcePools.Pool.OUTBOUND, owner, bytes);
-        holder.bytes -= bytes;
-        if (holder.bytes == 0) holders.remove(owner);
-        retry();
-    }
+    /** Releases bytes once QUIC has acknowledged or otherwise released them; then retries FIFO. */
+    public synchronized void release(Object owner, long bytes) { ledger.release(owner, bytes); }
 
-    /** Returns currently charged bytes for an owner. */
-    public synchronized long reserved(Object owner) { Holder h = holders.get(owner); return h == null ? 0 : h.bytes; }
-    /** Returns the number of waiting requests. */
-    public synchronized int waitingCount() { return waiting.size(); }
+    /** Ends an owner after it was shed with 0x12: releases its bytes and drops its waits. */
+    public synchronized void cancel(Object owner) { ledger.cancel(owner); }
 
-    private boolean fits(Holder request, long bytes) {
-        long ip = bytes, account = bytes;
-        for (Holder h : holders.values()) {
-            if (h.ip.equals(request.ip)) ip = saturatedAdd(ip, h.bytes);
-            if (request.account != null && request.account.equals(h.account)) account = saturatedAdd(account, h.bytes);
-        }
-        return ip <= ipLimit && (request.account == null || account <= accountLimit);
-    }
-    private void retry() {
-        for (int i = 0; i < waiting.size();) {
-            Request request = waiting.get(i);
-            if (!fits(request.holder, request.bytes) || !node.reserve(ResourcePools.Pool.OUTBOUND, request.holder.owner, request.bytes)) { i++; continue; }
-            request.holder.bytes += request.bytes;
-            waiting.remove(i);
-        }
-    }
-    private static long saturatedAdd(long a, long b) { return b > Long.MAX_VALUE - a ? Long.MAX_VALUE : a + b; }
-    private static final class Holder {
-        final Object owner, ip, account; long bytes;
-        Holder(Object owner, Object ip, Object account) { this.owner = owner; this.ip = ip; this.account = account; }
-    }
-    private static final class Request { final Holder holder; final long bytes; Request(Holder holder, long bytes) { this.holder = holder; this.bytes = bytes; } }
+    /** Returns and clears owners selected for local 0x12 closure. */
+    public synchronized List<Object> drainShedOwners() { return ledger.drainShed(); }
+
+    /** Charged outbound bytes for one owner. */
+    public synchronized long reserved(Object owner) { return ledger.reserved(owner); }
+
+    /** Number of queued refused requests. */
+    public synchronized int waitingCount() { return ledger.waitingCount(); }
 }

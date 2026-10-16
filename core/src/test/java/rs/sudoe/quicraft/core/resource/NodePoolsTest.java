@@ -1,51 +1,108 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.resource;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class NodePoolsTest {
-    @Test void clampsExcessAndPromotionIsAtomic() {
-        NodePools pools = new NodePools(1000, 1, 1000, 10, false);
-        assertEquals(NodePools.MIN_EXCESS, pools.excessLimit());
+    @Test void preLoginPoolIsPercentOfNodeBudget() {
+        NodePools pools = new NodePools(1001, 0, 0, 10, false, 100);
+        assertEquals(100, pools.limit(ResourcePools.Pool.PRE_LOGIN));
+    }
+
+    @Test void connectionExcessIsKeptSeparateFromNodeExcessCap() {
+        NodePools pools = new NodePools(1000, 64, 1000, 10, false, 500);
+        assertEquals(500, pools.connectionExcess());
+        assertEquals(64, pools.limit(ResourcePools.Pool.INBOUND_EXCESS));
+    }
+
+    @Test void defaultConstructorUsesConservativeExcessBound() {
+        NodePools pools = new NodePools(1000);
+        assertEquals(NodePools.MIN_EXCESS, pools.connectionExcess());
+    }
+
+    @Test void deflaterPoolFollowsAdmissionOption() {
+        assertEquals(ResourcePools.Pool.INFLATER, new NodePools(1000, 0, 0, 10, true, 0).deflaterPool());
+        assertEquals(ResourcePools.Pool.OUTBOUND, new NodePools(1000, 0, 0, 10, false, 0).deflaterPool());
+    }
+
+    @Test void refusedPromotionLeavesBothPoolsUnchanged() {
+        NodePools pools = new NodePools(1000, 0, 0, 10, false, 0);
         assertTrue(pools.reserve(ResourcePools.Pool.NODE, "full", 1000));
         assertTrue(pools.reserve(ResourcePools.Pool.PRE_LOGIN, "a", 100));
         assertFalse(pools.promote(ResourcePools.Pool.PRE_LOGIN, ResourcePools.Pool.NODE, "a", 100));
         assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN, "a"));
+        assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
         assertEquals(1000, pools.reserved(ResourcePools.Pool.NODE));
     }
 
-    @Test void concurrentReservationsStayWithinCapacity() throws Exception {
-        final NodePools pools = new NodePools(10000, 10000, 10000, 10, false);
-        List<Thread> threads = new ArrayList<Thread>();
-        for (int n = 0; n < 8; n++) {
-            final int id = n;
-            Thread t = new Thread(() -> {
-                for (int i = 0; i < 10000; i++) {
-                    String owner = "owner" + id;
-                    if (pools.reserve(ResourcePools.Pool.NODE, owner, 10)) pools.release(ResourcePools.Pool.NODE, owner, 10);
-                }
-            });
-            threads.add(t); t.start();
-        }
-        for (Thread t : threads) t.join();
-        assertEquals(0, pools.reserved(ResourcePools.Pool.NODE));
-        assertTrue(pools.reserved(ResourcePools.Pool.NODE) <= pools.limit(ResourcePools.Pool.NODE));
+    @Test void successfulPromotionMovesTheWholeChargeAtomically() {
+        NodePools pools = new NodePools(1000, 0, 0, 10, false, 0);
+        assertTrue(pools.reserve(ResourcePools.Pool.PRE_LOGIN, "a", 60));
+        assertTrue(pools.promote(ResourcePools.Pool.PRE_LOGIN, ResourcePools.Pool.NODE, "a", 60));
+        assertEquals(0, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
+        assertEquals(60, pools.reserved(ResourcePools.Pool.NODE, "a"));
+        assertEquals(60, pools.reserved(ResourcePools.Pool.NODE));
     }
 
-    @Test void identityPressureDecaysAndPrefixBucketsAreDeterministic() throws Exception {
-        IdentityHistory history = new IdentityHistory(60000, 0);
-        history.integrate(100, 1_000_000_000L, 0);
-        double before = history.byteSeconds();
-        history.integrate(0, 60_000_000_000L, 0);
-        assertTrue(history.byteSeconds() < before);
-        byte[] secret = new byte[] {1,2,3};
-        PrefixKey a = PrefixKey.overflow(java.net.InetAddress.getByName("2001:db8:1::1"));
-        PrefixKey b = PrefixKey.overflow(java.net.InetAddress.getByName("2001:db8:1:ffff::1"));
-        assertEquals(a, b);
-        assertEquals(a.bucket(secret), b.bucket(secret));
+    @Test void releaseBeyondReservationIsRejected() {
+        NodePools pools = new NodePools(1000, 0, 0, 10, false, 0);
+        assertTrue(pools.reserve(ResourcePools.Pool.NODE, "a", 10));
+        assertThrows(IllegalStateException.class, () -> pools.release(ResourcePools.Pool.NODE, "a", 11));
+        assertEquals(10, pools.reserved(ResourcePools.Pool.NODE));
+    }
+
+    @Test void concurrentReservationsNeverExceedCapOrGoNegative() throws Exception {
+        final NodePools pools = new NodePools(1000, 0, 0, 10, false, 0);
+        final AtomicInteger overCap = new AtomicInteger();
+        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        List<Thread> threads = new ArrayList<Thread>();
+        for (int n = 0; n < 8; n++) {
+            final String owner = "owner" + n;
+            Thread t = new Thread(() -> {
+                try {
+                    for (int i = 0; i < 20_000; i++) {
+                        if (pools.reserve(ResourcePools.Pool.NODE, owner, 7)) {
+                            if (pools.reserved(ResourcePools.Pool.NODE) > 1000) overCap.incrementAndGet();
+                            pools.release(ResourcePools.Pool.NODE, owner, 7);
+                        }
+                    }
+                } catch (Throwable e) {
+                    failure.compareAndSet(null, e);
+                }
+            });
+            threads.add(t);
+            t.start();
+        }
+        for (Thread t : threads) t.join();
+        assertEquals(null, failure.get());
+        assertEquals(0, overCap.get());
+        assertEquals(0, pools.reserved(ResourcePools.Pool.NODE));
+    }
+
+    @Test void concurrentPromotionsConserveTotalBytes() throws Exception {
+        final NodePools pools = new NodePools(10_000, 0, 0, 50, false, 0);
+        for (int n = 0; n < 8; n++) assertTrue(pools.reserve(ResourcePools.Pool.PRE_LOGIN, "p" + n, 500));
+        final int initial = 8 * 500;
+        List<Thread> threads = new ArrayList<Thread>();
+        for (int n = 0; n < 8; n++) {
+            final String owner = "p" + n;
+            Thread t = new Thread(() -> {
+                for (int i = 0; i < 500; i++) pools.promote(ResourcePools.Pool.PRE_LOGIN, ResourcePools.Pool.NODE, owner, 1);
+            });
+            threads.add(t);
+            t.start();
+        }
+        for (Thread t : threads) t.join();
+        assertEquals(initial, pools.reserved(ResourcePools.Pool.PRE_LOGIN) + pools.reserved(ResourcePools.Pool.NODE));
+        assertEquals(0, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
     }
 }
