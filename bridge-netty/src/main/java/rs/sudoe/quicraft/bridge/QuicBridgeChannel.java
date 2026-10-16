@@ -341,10 +341,19 @@ public final class QuicBridgeChannel extends AbstractChannel {
             }
             ByteBuf heldBuffer;
             while ((heldBuffer = held.poll()) != null) {
-                leftover.writeBytes(heldBuffer);
-                heldBuffer.release();
+                // A polled buffer that is not handed to the leftover or released here would be owned
+                // by nobody: the queue no longer holds it. Every path through this loop therefore
+                // ends with it released.
+                try {
+                    leftover.writeBytes(heldBuffer);
+                } finally {
+                    heldBuffer.release();
+                }
             }
         } catch (Throwable t) {
+            // An allocation or copy failure leaves whatever is still queued and the leftover itself
+            // to release, and the caller must not get a partially built buffer.
+            releaseHeld();
             leftover.release();
             throw t;
         }

@@ -9,9 +9,11 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.AbstractByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.buffer.UnpooledHeapByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
@@ -214,6 +216,37 @@ class QuicBridgeChannelHandOverTest {
         channel.close().sync();
     }
 
+    @Test
+    void aFailedLeftoverCopyReleasesEveryHeldBuffer() throws Exception {
+        FakeStream stream = new FakeStream();
+        QuicBridgeChannel channel = new QuicBridgeChannel(stream);
+        loop.register(channel).sync();
+        ThrowingAllocator allocator = new ThrowingAllocator(false);
+        channel.config().setAllocator(allocator);
+        onLoop(channel, () -> channel.config().setAutoRead(false));
+        onLoop(channel, () -> {
+            stream.deliver(new byte[] {1, 2, 3});
+            stream.deliver(new byte[] {4, 5});
+        });
+        assertEquals(5, channel.heldBytesForTest(), "both chunks are held, not delivered");
+
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        onLoop(channel, () -> {
+            try {
+                channel.handOver(null);
+            } catch (Throwable t) {
+                thrown.set(t);
+            }
+        });
+
+        assertNotNull(thrown.get(), "a failed copy must never hand out a partial leftover");
+        assertEquals(0, channel.heldBytesForTest(),
+                "the held data is emptied on the failure path, so nothing is owned by nobody");
+        allocator.assertAllReleased("a failed copy must release the polled buffer, the rest of the held"
+                + " data and the leftover, ");
+        channel.close().sync();
+    }
+
     private static Channel open(FakeStream stream) throws Exception {
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
         loop.register(channel).sync();
@@ -234,7 +267,7 @@ class QuicBridgeChannelHandOverTest {
      * Remembers every buffer it hands out, so a test can prove the hand-over released its own:
      * the {@code controlLeftover}, and the zero-byte marker it appends to the outbound buffer.
      */
-    static final class TrackingAllocator extends AbstractByteBufAllocator {
+    static class TrackingAllocator extends AbstractByteBufAllocator {
         final List<ByteBuf> all = Collections.synchronizedList(new ArrayList<ByteBuf>());
 
         TrackingAllocator(boolean direct) {
@@ -266,6 +299,35 @@ class QuicBridgeChannelHandOverTest {
                     assertEquals(0, all.get(i).refCnt(), what + " buffer #" + i + " leaked");
                 }
             }
+        }
+    }
+
+    /**
+     * Hands out buffers whose {@code writeBytes(ByteBuf)} copy fails, the way an allocation or a
+     * copy inside {@code handOver} can, and tracks every one of them.
+     */
+    static final class ThrowingAllocator extends TrackingAllocator {
+        ThrowingAllocator(boolean direct) {
+            super(direct);
+        }
+
+        @Override
+        protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
+            ByteBuf buffer = new ThrowingByteBuf(this, initialCapacity, maxCapacity);
+            all.add(buffer);
+            return buffer;
+        }
+    }
+
+    /** A buffer that cannot be copied into, but can be written from a ByteBuffer as onData does. */
+    static final class ThrowingByteBuf extends UnpooledHeapByteBuf {
+        ThrowingByteBuf(ByteBufAllocator allocator, int initialCapacity, int maxCapacity) {
+            super(allocator, initialCapacity, maxCapacity);
+        }
+
+        @Override
+        public ByteBuf writeBytes(ByteBuf src) {
+            throw new IllegalStateException("the copy failed");
         }
     }
 
