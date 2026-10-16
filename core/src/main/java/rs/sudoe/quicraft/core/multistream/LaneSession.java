@@ -966,6 +966,11 @@ public final class LaneSession {
         if (closed || endQueued) {
             return;
         }
+        // 13.4: a frame that is not exactly one Minecraft length-framed GAME body never goes on the
+        // wire, and this is the same answer a bundle part gets: 0x11, not an internal error. A
+        // relaying adapter sends frames it received from its own peer, so a malformed frame is peer
+        // input here, not a bug of ours.
+        checkGameFrame(frame, "frame");
         Lane lane = table.laneFor(state, sendDirection, packetId);
         long[] semantic = null;
         if (after != null && after.length > 0) {
@@ -1049,10 +1054,20 @@ public final class LaneSession {
         if (frame == null || frame.length > RecordCodec.MAX_BODY_LENGTH) {
             throw new OrderingException("bundle part frame over the record bound (13.4)");
         }
+        checkGameFrame(frame, "bundle part");
+    }
+
+    /**
+     * 13.4: a GAME body is exactly one Minecraft VarInt-length frame, so its inner length must
+     * match what follows it. A frame that does not is never put on the wire; the sender closes with
+     * 0x11, exactly like 13.15's other sender bounds, whether the frame came from the game or was
+     * relayed from the peer. {@code what} names the caller's unit in the message.
+     */
+    private void checkGameFrame(byte[] frame, String what) {
         try {
             RecordCodec.validateBody(RecordCodec.KIND_GAME, frame, true);
         } catch (MultistreamProtocolException e) {
-            throw new OrderingException("bundle part is not a GAME body: " + e.getMessage(), e);
+            throw new OrderingException(what + " is not a GAME body: " + e.getMessage(), e);
         }
     }
 

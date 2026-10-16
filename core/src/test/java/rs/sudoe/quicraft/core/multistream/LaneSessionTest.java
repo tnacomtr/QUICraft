@@ -1156,6 +1156,52 @@ class LaneSessionTest {
         }
     }
 
+    // --- Malformed records and frames (13.4).
+
+    @Test
+    void aPeerRecordWithAMismatchedInnerFrameLengthClosesBothSidesWith0x11() throws Exception {
+        LaneRig.Config config = new LaneRig.Config();
+        config.clientSession = false;
+        try (LaneRig rig = LaneRig.start(config)) {
+            QuicStreamChannel four = openRawServerLanes(rig);
+            // record_length 35, kind GAME, sequence 1, no dependencies, and a body whose inner
+            // frame length claims 5 bytes while one content byte follows (13.4).
+            LaneLoopback.write(four, record(new byte[] {0x05, 0x01}));
+            closedWith(rig.serverGame, 0x11, false);
+            sawClose(rig.net.clientSawClose, 0x11);
+            assertEquals(0, rig.serverGame.deliveries.size());
+        }
+    }
+
+    @Test
+    void aSubmittedFrameThatIsNotAGameBodyClosesBothSidesWith0x11() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activateBoth();
+            // An adapter that relays what its own peer sent (a proxy) submits frames it did not
+            // build itself, so a frame that is not one 13.4 inner frame is peer input: the sender
+            // closes 0x11, exactly like a bundle part that fails the same check (13.15).
+            rig.server.send(PLAY, LaneRig.SPAWN, new byte[] {0x05, 0x01});
+            closedWith(rig.serverGame, 0x11, false);
+            closedWith(rig.clientGame, 0x11, true);
+            sawClose(rig.net.clientSawClose, 0x11);
+        }
+    }
+
+    /**
+     * A hand-built GAME record with sequence 1 and no dependencies (13.4): a one-byte
+     * record_length prefix, kind, sequence, three zero dependencies and {@code body}. Hand-built
+     * because {@link RecordCodec#encodeGame} validates the body and refuses to encode this one.
+     */
+    private static byte[] record(byte[] body) {
+        int recordLength = RecordCodec.HEADER_LENGTH + body.length;
+        byte[] out = new byte[1 + recordLength];
+        out[0] = (byte) recordLength;
+        out[1] = RecordCodec.KIND_GAME;
+        out[9] = 1; // sequence 1: the last byte of the big-endian u64 at offsets 2..9
+        System.arraycopy(body, 0, out, 1 + RecordCodec.HEADER_LENGTH, body.length);
+        return out;
+    }
+
     // --- Node receive budget (13.12).
 
     @Test
@@ -1484,7 +1530,6 @@ class LaneSessionTest {
     }
 
     // --- The shared loop ticker (13.12, 13.14).
-
     @Test
     void theSharedTickPeriodGrowsBackWhenTheFastestSessionLeaves() throws Exception {
         long fast = TimeUnit.MILLISECONDS.toNanos(5);
