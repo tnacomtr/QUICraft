@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.testkit.load;
 
+import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
@@ -67,18 +73,23 @@ public final class LoadServer {
                     .maxOpenPerIp(v3 ? 100_000 : 64)
                     .maxTrackedIps(300_000)
                     .globalAttemptsPerSecond(100_000)
-                    .perIpAttemptsPerSecond(1_000)
+                    // Same reason for the per-IP attempt and ingress Initial budgets: every /3 dial is
+                    // one Initial stream from the same address, and a fixed 1 s window of 1000 drops
+                    // Initials (ingress guard, silently) once the ramp passes about 1000 per second.
+                    .perIpAttemptsPerSecond(v3 ? 100_000 : 1_000)
                     .retryThresholdPerSecond(100_000)
                     .ingressInitialsPerSecond(100_000)
-                    .ingressInitialsPerIpPerSecond(1_000);
+                    .ingressInitialsPerIpPerSecond(v3 ? 100_000 : 1_000);
         }
         TransportConfig config = builder.build();
 
         AtomicLong accepted = new AtomicLong();
         AtomicLong lanesActive = new AtomicLong();
         Set<QuicByteStream> open = ConcurrentHashMap.newKeySet();
+        Refusals refusals = new Refusals();
         QuicServer server;
         if (v3) {
+            refusals.install();
             V3Listener listener = protocol -> protocol == PROTOCOL ? TABLE : null;
             server = QuicServer.bind(bind, sockets, identity, config, stream -> {
                 accepted.incrementAndGet();
@@ -115,12 +126,14 @@ public final class LoadServer {
         System.out.println("SOCKETS requested=" + sockets);
         System.out.println("MODE " + (v3 ? "v3 node_budget_mb=" + nodeBudgetMb + " lanes=" + lanes : "v2"));
 
+        QuicServer serverForStats = server;
         Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "load-server-status");
             t.setDaemon(true);
             return t;
         }).scheduleAtFixedRate(() -> System.out.println("STAT connections=" + accepted.get()
                 + (v3 ? " admitted=" + accepted.get() + " lanes_active=" + lanesActive.get()
+                        + " retries=" + retriesSent(serverForStats) + refusals.fields()
                         : " streams=" + open.size())
                 + " rss_mb=" + ProcStats.rssMb() + " threads=" + ProcStats.threads()
                 + " cpu_ticks=" + ProcStats.cpuTicks()), statusSec, statusSec, TimeUnit.SECONDS);
@@ -164,6 +177,73 @@ public final class LoadServer {
                 // Left unactivated; the count shows how many did not get their lanes.
             }
         });
+    }
+
+    /** Retry packets the listener has sent (core's package-private counter, read reflectively). */
+    static long retriesSent(QuicServer server) {
+        try {
+            Method m = QuicServer.class.getDeclaredMethod("retriesSent");
+            m.setAccessible(true);
+            return (long) m.invoke(server);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * Counts core's FINE-level refusal logs by reason. The QUICraft logger is raised to FINE for
+     * this process only; the console handler stays at INFO, so nothing new is printed.
+     */
+    static final class Refusals extends Handler {
+        private static final String[][] REASONS = {
+            {"over the open-connection limits", "open_limit"},
+            {"over the node pending-bytes budget", "budget"},
+            {"early token check failed", "early_token"},
+            {"QUIC connection error", "connection_error"},
+            {"stream acceptor failed", "acceptor_failed"},
+            {"admission check failed", "admission_check_failed"},
+            {"ingress guard failed", "ingress_guard_failed"},
+        };
+        private final Map<String, AtomicLong> counts = new ConcurrentHashMap<>();
+
+        void install() {
+            Logger logger = Logger.getLogger("QUICraft");
+            logger.setLevel(Level.FINE);
+            setLevel(Level.FINE);
+            logger.addHandler(this);
+        }
+
+        @Override
+        public void publish(LogRecord record) {
+            String message = record.getMessage();
+            if (message == null) {
+                return;
+            }
+            for (String[] reason : REASONS) {
+                if (message.contains(reason[0])) {
+                    counts.computeIfAbsent(reason[1], k -> new AtomicLong()).incrementAndGet();
+                    return;
+                }
+            }
+        }
+
+        /** Space-separated counters, e.g. " refused_open_limit=3"; empty when nothing counted. */
+        String fields() {
+            StringBuilder out = new StringBuilder();
+            for (String[] reason : REASONS) {
+                AtomicLong n = counts.get(reason[1]);
+                if (n != null) {
+                    out.append(" refused_").append(reason[1]).append('=').append(n.get());
+                }
+            }
+            return out.toString();
+        }
+
+        @Override
+        public void flush() {}
+
+        @Override
+        public void close() {}
     }
 
     /** Parses {@code host:port} with a numeric or resolvable host; the last colon splits. */
