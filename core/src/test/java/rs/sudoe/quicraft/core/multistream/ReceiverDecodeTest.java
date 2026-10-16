@@ -305,7 +305,7 @@ class ReceiverDecodeTest {
 
     @Test void oneDecodeResumingDoesNotForgetAnotherLanesLocalWait() {
         ReceiveBudget node = ReceiveBudget.bounded(1000);
-        assertTrue(node.tryReserve(700));
+        assertTrue(node.tryReserve(850));
         final ReceiverScheduler[] self = new ReceiverScheduler[1];
         List<ReceiverScheduler.Delivery> deliveries = new ArrayList<>();
         ReceiverScheduler scheduler = new ReceiverScheduler((envelope, insideBundle, now) -> {
