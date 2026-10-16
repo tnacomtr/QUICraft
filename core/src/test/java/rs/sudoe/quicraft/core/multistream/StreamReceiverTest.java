@@ -222,11 +222,22 @@ class StreamReceiverTest {
         assertAdmitted(f.receiver, rec(2, 1, 1));
     }
 
+    @Test void serverboundReceiverRejectsEveryChunkStreamRecord() {
+        StreamReceiver rx = new StreamReceiver(2, Direction.SERVERBOUND,
+                (s, r, route) -> true, () -> 0L);
+        assertViolation(offer(rx, rec(2, 1, 0)));
+        assertViolation(offer(rx, rec(3, 1, 0)));
+        assertViolation(offer(rx, recKind(2, 1, 0, BATCH_JOIN)));
+        assertAdmitted(rx, rec(0, 1, 0));
+        assertViolation(offer(rx, rec(1, 1, 0, dep(2, 1))));
+        assertViolation(offer(rx, rec(1, 1, 0, dep(3, 1))));
+        assertAdmitted(rx, rec(1, 1, 0));
+    }
+
     @Test void serverboundReceiverAllowsEpochZeroOnly() {
         StreamReceiver rx = new StreamReceiver(2, Direction.SERVERBOUND,
                 (s, r, route) -> true, () -> 0L);
-        assertAdmitted(rx, rec(2, 1, 0));
-        assertViolation(offer(rx, rec(2, 2, 1)));
+        assertViolation(offer(rx, rec(1, 1, 1)));
         assertViolation(rx.offer(rec(0, 1, 0), boundary(), 100, 1));
     }
 

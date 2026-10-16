@@ -184,6 +184,9 @@ public final class StreamReceiver {
         if (stream < 0 || stream >= streams) {
             return Admission.violation("stream index " + stream + " outside 0.." + (streams - 1));
         }
+        if (direction == Direction.SERVERBOUND && stream >= 2) {
+            return Admission.violation("serverbound record on CHUNK stream " + stream + " (13.3)");
+        }
         if (record.sequence() != admitted[stream] + 1) {
             return Admission.violation("skipped or duplicate sequence on stream " + stream);
         }
@@ -510,6 +513,9 @@ public final class StreamReceiver {
             }
             if (index == stream) {
                 return Admission.violation("same-stream dependency entry on stream " + stream);
+            }
+            if (direction == Direction.SERVERBOUND && index >= 2) {
+                return Admission.violation("serverbound dependency on CHUNK stream " + index + " (13.3)");
             }
             if (index <= previous) {
                 return Admission.violation("dependency entries not strictly increasing");
