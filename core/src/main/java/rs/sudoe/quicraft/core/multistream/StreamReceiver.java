@@ -7,6 +7,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.LongSupplier;
+import rs.sudoe.quicraft.core.routing.Direction;
 
 /**
  * Receiver-side ordering policy for the N+2 streams of one direction (protocol.md 13.10, 13.12,
@@ -108,6 +109,7 @@ public final class StreamReceiver {
         }
     }
 
+    private final Direction direction;
     private final int streams;
     private final long[] admitted;
     private final long[] enqueued;
@@ -122,15 +124,28 @@ public final class StreamReceiver {
     private boolean stalled;
 
     /**
+     * Clientbound receiver, kept for existing callers.
+     *
      * @param chunks negotiated chunk count N, 1..6
      * @param validator injected shard, fence and join checks
      * @param clock monotonic nanosecond transport clock
      */
     public StreamReceiver(int chunks, Validator validator, LongSupplier clock) {
+        this(chunks, Direction.CLIENTBOUND, validator, clock);
+    }
+
+    /**
+     * @param chunks negotiated chunk count N, 1..6
+     * @param direction sending direction this receiver serves; serverbound allows epoch 0 only (13.18)
+     * @param validator injected shard, fence and join checks
+     * @param clock monotonic nanosecond transport clock
+     */
+    public StreamReceiver(int chunks, Direction direction, Validator validator, LongSupplier clock) {
         LogicalStream.validateShardCount(chunks);
-        if (validator == null || clock == null) {
-            throw new IllegalArgumentException("validator and clock are required");
+        if (direction == null || validator == null || clock == null) {
+            throw new IllegalArgumentException("direction, validator and clock are required");
         }
+        this.direction = direction;
         streams = chunks + 2;
         admitted = new long[streams];
         enqueued = new long[streams];
@@ -172,6 +187,10 @@ public final class StreamReceiver {
         Admission depCheck = checkDependencies(stream, record);
         if (depCheck != null) {
             return depCheck;
+        }
+        Admission pathCheck = checkTransitionPath(record);
+        if (pathCheck != null) {
+            return pathCheck;
         }
         if (!validator.valid(stream, record, route)) {
             return Admission.violation("shard, fence or join validation failed on stream " + stream);
@@ -355,6 +374,9 @@ public final class StreamReceiver {
         if (recordEpoch < 0 || recordEpoch > MAX_EPOCH) {
             return Admission.violation("epoch " + recordEpoch + " outside the signed-31-bit range");
         }
+        if (direction == Direction.SERVERBOUND && (recordEpoch != 0 || route.epochChange())) {
+            return Admission.violation("serverbound records must stay at epoch 0 (13.18)");
+        }
         if (recordEpoch < epoch) {
             return Admission.violation("stale epoch " + recordEpoch + " < " + epoch);
         }
@@ -374,6 +396,27 @@ public final class StreamReceiver {
             return Admission.violation("future epoch " + recordEpoch);
         }
         return null;
+    }
+
+    /**
+     * An epoch+1 record is only admissible while it can reach its transition: either the transition is
+     * already admitted and unapplied, or one of its own dependencies is still unapplied and may lead to
+     * it. Runs after dependency validation, so dependency indices are in range.
+     */
+    private Admission checkTransitionPath(Record record) {
+        if (record.epoch() != epoch + 1 || transitionPending || !prerequisitesApplied(record)) {
+            return null;
+        }
+        return Admission.violation("epoch " + record.epoch() + " without a transition path");
+    }
+
+    private boolean prerequisitesApplied(Record record) {
+        for (Record.Dependency dependency : record.dependencies()) {
+            if (Long.compareUnsigned(dependency.sequence(), applied[dependency.streamIndex()]) > 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private Admission checkRoute(int stream, Record record, ReceiveRoute route) {
@@ -396,14 +439,15 @@ public final class StreamReceiver {
                 }
                 break;
         }
-        if (route.join() && stream != 2) {
+        boolean joinKind = record.kind() == KIND_ACK_JOIN || record.kind() == KIND_BATCH_JOIN;
+        if ((route.join() || joinKind) && stream != 2) {
             return Admission.violation("join record outside CHUNK[0]");
+        }
+        if (joinKind != route.join()) {
+            return Admission.violation("join kind and join route disagree");
         }
         if (record.kind() == KIND_END && !control) {
             return Admission.violation("END record outside CONTROL");
-        }
-        if ((record.kind() == KIND_ACK_JOIN || record.kind() == KIND_BATCH_JOIN) && stream < 2) {
-            return Admission.violation("join kind outside chunk streams");
         }
         return null;
     }

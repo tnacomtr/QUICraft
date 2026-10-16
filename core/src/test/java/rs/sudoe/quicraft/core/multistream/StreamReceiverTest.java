@@ -7,9 +7,13 @@ import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.routing.Dependency;
+import rs.sudoe.quicraft.core.routing.Direction;
 
 class StreamReceiverTest {
     private static final long SEC = 1_000_000_000L;
+    /** Record kind values (13.4): join records are chunk-only. */
+    private static final int ACK_JOIN = 2;
+    private static final int BATCH_JOIN = 3;
 
     private static final class Fixture {
         final AtomicLong now = new AtomicLong();
@@ -26,6 +30,10 @@ class StreamReceiverTest {
 
     static Record rec(int stream, long seq, long epoch, Record.Dependency... deps) {
         return new Record(stream, seq, epoch, Arrays.asList(deps), RecordCodec.KIND_GAME, new byte[] {1});
+    }
+
+    static Record recKind(int stream, long seq, long epoch, int kind, Record.Dependency... deps) {
+        return new Record(stream, seq, epoch, Arrays.asList(deps), kind, new byte[] {1});
     }
 
     static Record.Dependency dep(int stream, long seq) {
@@ -126,7 +134,7 @@ class StreamReceiverTest {
 
     @Test void newEpochRecordsArriveEarlyButStayOpaqueUntilTheTransitionApplies() {
         Fixture f = new Fixture(2);
-        assertAdmitted(f.receiver, rec(2, 1, 1));
+        assertAdmitted(f.receiver, rec(2, 1, 1, dep(0, 1)));
         assertEquals(-1, f.receiver.nextToEnqueue(), "held until the epoch opens");
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
                 f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
@@ -171,11 +179,61 @@ class StreamReceiverTest {
         assertViolation(offer(f.receiver, rec(2, 1, 0, dep(3, 1), dep(0, 1))));
     }
 
-    @Test void joinRecordsLiveOnlyOnChunkZero() {
+    @Test void joinKindRecordsLiveOnlyOnChunkZero() {
         Fixture f = new Fixture(2);
         ReceiveRoute join = new ReceiveRoute(ReceiveRoute.Lane.CHUNK, Dependency.ACK_JOIN, null, false, true);
-        assertViolation(f.receiver.offer(rec(3, 1, 0), join, 100, 1));
-        assertEquals(StreamReceiver.Admission.Kind.ADMITTED, f.receiver.offer(rec(2, 1, 0), join, 100, 1).kind());
+        assertViolation(f.receiver.offer(recKind(3, 1, 0, ACK_JOIN), join, 100, 1));
+        assertViolation(f.receiver.offer(recKind(1, 1, 0, BATCH_JOIN), join, 100, 1));
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
+                f.receiver.offer(recKind(2, 1, 0, BATCH_JOIN), join, 100, 1).kind());
+    }
+
+    @Test void joinRouteWithANonJoinKindIsAViolation() {
+        Fixture f = new Fixture(2);
+        ReceiveRoute join = new ReceiveRoute(ReceiveRoute.Lane.CHUNK, Dependency.ACK_JOIN, null, false, true);
+        assertViolation(f.receiver.offer(rec(2, 1, 0), join, 100, 1));
+    }
+
+    @Test void joinKindWithANonJoinRouteIsAViolation() {
+        Fixture f = new Fixture(2);
+        assertViolation(offer(f.receiver, recKind(2, 1, 0, ACK_JOIN)));
+    }
+
+    @Test void epochPlusOneWithoutAnyTransitionPathIsAViolation() {
+        Fixture f = new Fixture(2);
+        assertViolation(offer(f.receiver, rec(2, 1, 1)));
+    }
+
+    @Test void epochPlusOneAfterTransitionAppliedWithoutPathIsAViolation() {
+        Fixture f = new Fixture(2);
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
+                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
+        f.receiver.enqueued(0, 1);
+        f.receiver.applied(0, 1);
+        assertEquals(1, f.receiver.epoch());
+        assertViolation(offer(f.receiver, rec(2, 1, 2)));
+        assertViolation(offer(f.receiver, rec(2, 1, 2, dep(0, 1))));
+    }
+
+    @Test void epochPlusOneWithAPendingTransitionIsAdmitted() {
+        Fixture f = new Fixture(2);
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
+                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
+        assertAdmitted(f.receiver, rec(2, 1, 1));
+    }
+
+    @Test void serverboundReceiverAllowsEpochZeroOnly() {
+        StreamReceiver rx = new StreamReceiver(2, Direction.SERVERBOUND,
+                (s, r, route) -> true, () -> 0L);
+        assertAdmitted(rx, rec(2, 1, 0));
+        assertViolation(offer(rx, rec(2, 2, 1)));
+        assertViolation(rx.offer(rec(0, 1, 0), boundary(), 100, 1));
+    }
+
+    @Test void serverboundTransitionRouteIsAViolation() {
+        StreamReceiver rx = new StreamReceiver(2, Direction.SERVERBOUND,
+                (s, r, route) -> true, () -> 0L);
+        assertViolation(rx.offer(rec(0, 1, 0), boundary(), 100, 1));
     }
 
     @Test void provableCyclesCloseWithZeroX11() {
