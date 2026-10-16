@@ -766,11 +766,15 @@ initial transport limits are `initial_max_data = 8 KiB`,
 `initial_max_stream_data_bidi_remote = 8 KiB`; uni limits remain zero. Connection credit and stream
 windows are distinct, per endpoint and direction; use asymmetric windows and one-byte reverse-CHUNK
 guards as specified in §13.13, with pinned stream maxima. Require a per-connection maximum-window
-setter to prevent quiche auto-growth before authentication. Four KiB is insufficient:
-the legal pre-login flight includes handshake/Login Start, online-mode encryption and session
-authentication traffic, and `/3` OFFER/proofs/switch messages with routing digest, whose listed
-variable-length fields can exceed 4 KiB. Eight KiB is the specified initial ceiling and MUST be
-validated against the maximum legal pre-login encodings before enablement. Do not reserve inflater state before compression is enabled. Compressed pre-login connections
+setter so quiche auto-growth cannot raise a window before authentication. The current patched
+native sets the maximum window per listener configuration only (`Codecs`), so this needs a
+native change, which is an owner decision before implementation. The pre-login interval
+(Handshake through Login Success) carries Handshake, Login Start, the online-mode encryption
+request/response and login plugin traffic; `/3` OFFER, proofs and switch messages (fixed
+104-byte binding payloads, 12.8) belong to configuration, after Login Success, and are not
+pre-login. Eight KiB is a rolling credit, not a size limit: a larger legal message (for
+example a large login plugin answer) is read in window-sized steps, bounded by the
+game-read-but-unconsumed cap above. Do not reserve inflater state before compression is enabled. Compressed pre-login connections
 are charged to the pre-login pool. At `/3` activation reserve the full 24 KiB
 share from the node budget before raising MAX_DATA and MAX_STREAM_DATA to the full 24 KiB share.
 Reserve the shared 40 KiB inflater only when Minecraft enables compression. If a raise or inflater
@@ -778,7 +782,7 @@ reservation cannot be made, follow existing resource refusal/backpressure rules:
 then close locally for resource exhaustion; never close `0x11`.
 
 The `/3` pre-login pool has a hard cap, default 10% of the node budget (profile value, to be measured).
-Require `maxOpen >= logged-in target + pre-login cap`; raise `maxOpen`, `maxTrackedIps` and
+Require `maxOpen >= logged-in target + pre-login connection cap`, where the pre-login connection cap is the pre-login pool's bytes divided by the staged per-connection reservation; raise `maxOpen`, `maxTrackedIps` and
 `globalAttemptsPerSecond` together from TransportConfig defaults 65536, 131072 and 2000 as needed.
 When global capacity is full, shed pre-login work rather than drop an honest token-bearing Initial.
 Choose a victim by source-prefix fair share first (IPv6 /64, IPv4 /24, only for this choice), then
@@ -1809,13 +1813,20 @@ position extraction. Those implementations must change together before this revi
       by both lanes; decode is serialized and no per-lane inflater is created. Enforce actual
       output against the reserved bound while inflating. Keep ordinary
     Minecraft malformed-compression and size checks; no dictionary spans streams.
-17. **13.17 Acceptance tests.** Before enablement require golden HKDF/exporter/message/record
+17. **13.17 Acceptance tests.** Pre-login admission (12.13, `/3` only): unit-test shedding order
+    (source-prefix fair share, then least progress, then random; never one waiting on the
+    server), the 10-second client-wait deadline paused during a slow session server, the
+    30-second hard cap, pool charge from first accepted 0-RTT data, the read-but-unconsumed cap
+    and oversized declared frame close, and failed window or inflater raises waiting
+    non-fatally rather than closing `0x11`. Load harness: on top of 50,000 logged-in players, run
+    50,000 handshake-only connections from many distinct IPv6 /64 and IPv4 /24 prefixes, with
+    churn at the raised attempt rate, mid-handshake stalls, Login Start then stall, an
+    offline-mode Login Success flood and a slow session server. Pass only if at least 99% of
+    honest joins get QUIC, honest p99 join time is recorded against the unloaded baseline, no
+    logged-in player is shed for a pre-login one, and no honest Initial is dropped while
+    pre-login work could be shed. Before enablement require golden HKDF/exporter/message/record
     vectors; wrong/absent exporter and upstream-native tests; all MAC/state/timeout failures;
-     unit-test pre-login pool shedding oldest-first, login-deadline expiry and failed window
-     raises waiting non-fatally rather than closing `0x11`. Run the load harness with 50,000
-     handshake-only connections from many source IPs while honest joins continue; pass only if
-     honest joins continue to get QUIC and no logged-in player is shed for a pre-login one.
-    switch packets split at every byte and coalesced with following plaintext; changed pins,
+     switch packets split at every byte and coalesced with following plaintext; changed pins,
     rotation and corrupt storage; full/resumed/accepted and rejected early-data sessions;
     offline/online confusion; v1/new-client/new-server/TCP compatibility; resets on every
     stream; exhausted credit/buffers; delayed spawn/chunk/fences, bundles and compression
