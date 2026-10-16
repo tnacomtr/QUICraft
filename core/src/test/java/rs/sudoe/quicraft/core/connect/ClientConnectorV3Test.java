@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
@@ -892,6 +893,66 @@ class ClientConnectorV3Test {
 
         assertTrue(clockReads.get() > 0,
                 "the preparation must run to completion, cancelled join or not");
+        assertTrue(f.rebinds.activeKeys().isEmpty(),
+                "and the attempt it admitted must be ended, never left held");
+        assertEquals(0, p.v3Dials.get(), "nothing may dial for an abandoned join");
+        assertEquals(0, p.tcpAttempts.get());
+    }
+
+    @Test
+    void cancellingWhileThePreparationSupplierIsStillRunningEndsTheAttemptItAdmits(@TempDir Path dir)
+            throws Exception {
+        Path file = dir.resolve("rebind-v1.bin");
+        Fixture f = new Fixture(PinStore.load(null), RebindState.load(file));
+        f.advertiseV3();
+        f.pins.recordPin(HOST, LOGICAL_PORT, fingerprint('d').toString(), NO_ACTIVE_KEYS);
+        // Every worker task on its own thread, so the supplier really is in flight while the join
+        // is cancelled: prepare0 reads the clock first, and that read is what the latch holds.
+        f.worker = command -> {
+            Thread thread = new Thread(command, "v3-preparation");
+            thread.setDaemon(true);
+            thread.start();
+        };
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger clockReads = new AtomicInteger();
+        f.clock = () -> {
+            if (clockReads.incrementAndGet() == 1) {
+                started.countDown();
+                try {
+                    release.await(FIVE_SECONDS, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return System.currentTimeMillis();
+        };
+        FakePlatform p = new FakePlatform();
+        p.quic = new CompletableFuture<QuicByteStream>();
+
+        CompletableFuture<Outcome<String>> join = f.join(f.connector(true, true), p);
+        try {
+            assertTrue(started.await(FIVE_SECONDS, TimeUnit.SECONDS),
+                    "the preparation supplier must be running, not merely queued");
+            assertTrue(join.cancel(false));
+        } finally {
+            release.countDown();
+        }
+
+        // The supplier runs to completion on its thread, and the branch that sees the cancelled
+        // join must end the attempt it admitted.
+        String state = "";
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(FIVE_SECONDS);
+        while (System.nanoTime() < deadline) {
+            state = Files.exists(file) ? stateFile(file) : "";
+            if (state.contains("\"failures\":1")) {
+                break;
+            }
+            Thread.sleep(10);
+        }
+        assertTrue(state.contains("\"failures\":1"),
+                "a join cancelled while the preparation ran must not leave the server's re-bind"
+                        + " state held: " + state);
         assertTrue(f.rebinds.activeKeys().isEmpty(),
                 "and the attempt it admitted must be ended, never left held");
         assertEquals(0, p.v3Dials.get(), "nothing may dial for an abandoned join");

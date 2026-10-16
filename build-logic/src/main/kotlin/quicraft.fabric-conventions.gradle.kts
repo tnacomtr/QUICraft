@@ -45,6 +45,11 @@ sourceSets {
         java.setSrcDirs(listOf(shared.dir("client/java"), layout.projectDirectory.dir("src/client/java")))
         resources.setSrcDirs(listOf(shared.dir("client/resources")))
     }
+    // Minecraft-free unit tests, shared by both jars (ServerSettings parsing and the /3 switch's
+    // inputs). They never start a game; each module's own src/test/java applies on top.
+    named("test") {
+        java.srcDirs(shared.dir("test/java"), layout.projectDirectory.dir("src/test/java"))
+    }
 }
 // Separate run directories, so a client and a server can run side by side (both gitignored).
 // Loom 1.18 deprecates runDir without a replacement yet.
