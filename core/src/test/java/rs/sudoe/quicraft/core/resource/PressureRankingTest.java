@@ -277,6 +277,19 @@ class PressureRankingTest {
         assertEquals(1000, r.bucketBytes(bucket), "the reconnect is charged to its bucket, not a fresh exact entry");
     }
 
+    @Test void liveIdleBothOverflowConnectionKeepsItsIpRecordSticky() throws Exception {
+        PressureRanking r = new PressureRanking(60_000, 1, 1, SECRET);
+        r.connect("c1", ip("192.0.2.70"), "holder", 0);
+        InetAddress guest = ip("192.0.2.71");
+        // Both identities overflow; the connection lives on with an unchanged charge past the window.
+        r.connect("c2", guest, "guest", 0);
+        r.disconnect("c1", 601 * S);
+        r.connect("c3", guest, null, 601 * S);
+        r.setRetained("c3", 1000, 601 * S);
+        assertEquals(1000, r.bucketBytes(r.bucketFor(guest)),
+                "a sibling of a live overflowed identity stays in its bucket, it is not promoted");
+    }
+
     /** An IPv4 address in the same overflow bucket as {@code bucket}, distinct from every address in {@code avoid}. */
     private static InetAddress sameBucket(PressureRanking r, int bucket, InetAddress... avoid) throws Exception {
         for (int i = 1; i < 65_536; i++) {

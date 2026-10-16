@@ -154,6 +154,14 @@ public final class PressureRanking {
             if (account != null && accountExact != null && ipExact != null) touchAccountIp(account, ip);
         }
         for (IdentityHistory target : c.charged) target.liveDelta(1);
+        if (ipExact == null) {
+            c.ipRecord = overflowMemory.get(ip);
+            if (c.ipRecord != null) c.ipRecord.live++;
+        }
+        if (account != null && accountExact == null) {
+            c.acctRecord = accountOverflow.get(account);
+            if (c.acctRecord != null) c.acctRecord.live++;
+        }
         if (c.liveBucket >= 0) {
             Map<Object, Integer> live = bucketLive.get(c.liveBucket);
             Integer count = live.get(c.liveKey);
@@ -169,6 +177,8 @@ public final class PressureRanking {
         refusedWaiters.remove(c);
         if (c.bytes != 0) setBytesInternal(c, 0, nowNanos, effStall(nowNanos));
         touchContinuity(c, nowNanos);
+        if (c.ipRecord != null) c.ipRecord.live--;
+        if (c.acctRecord != null) c.acctRecord.live--;
         for (IdentityHistory target : c.charged) target.liveDelta(-1);
         if (c.liveBucket >= 0) {
             Map<Object, Integer> live = bucketLive.get(c.liveBucket);
@@ -294,14 +304,8 @@ public final class PressureRanking {
      * from last use, so a long-lived overflow connection keeps its continuity record while its charge changes.
      */
     private void touchContinuity(Connection c, long now) {
-        if (c.ip != null && c.ip.bucket >= 0) {
-            Continuity record = overflowMemory.get(c.addr);
-            if (record != null) record.lastUse = now;
-        }
-        if (c.account != null && c.account.bucket >= 0 && c.acct != null) {
-            Continuity record = accountOverflow.get(c.acct);
-            if (record != null) record.lastUse = now;
-        }
+        if (c.ipRecord != null) c.ipRecord.lastUse = now;
+        if (c.acctRecord != null) c.acctRecord.lastUse = now;
     }
 
     /** Returns the exact IP entry, or null when the identity is served by its overflow bucket. */
@@ -347,17 +351,19 @@ public final class PressureRanking {
     }
 
     /**
-     * An overflowed identity keeps using its bucket (13.12): until its bucket has no live users and its
-     * 10-minute inactive history expires, reconnects map back there even when exact slots are free.
+     * An overflowed identity keeps using its bucket (13.12): while it has a live connection there, and until its
+     * bucket has no live users and its 10-minute inactive history expires, reconnects map back there even when
+     * exact slots are free.
      */
     private boolean stickyOverflow(Continuity record, long now) {
-        return now - record.lastUse < IdentityHistory.RETENTION_NANOS || !bucketLive.get(record.bucket).isEmpty();
+        return record.live > 0 || now - record.lastUse < IdentityHistory.RETENTION_NANOS
+                || !bucketLive.get(record.bucket).isEmpty();
     }
 
     /**
      * Trims a continuity map to its bound (13.12): the oldest expired record first, then the oldest record whose
-     * bucket has live users. Only when neither exists (every record is recent and idle) is the oldest one trimmed,
-     * so the bound always holds. Under churn beyond the bound, overflowed identities can lose continuity.
+     * bucket has live users. Only when neither exists (every record is recent and idle) is the oldest one
+     * trimmed, so the bound always holds. Under churn beyond the bound, overflowed identities can lose continuity.
      */
     private <K> void trimContinuity(Map<K, Continuity> map, int bound, long now) {
         while (map.size() > bound) {
@@ -469,6 +475,8 @@ public final class PressureRanking {
     private static final class Continuity {
         final int bucket;
         long lastUse;
+        /** Live connections of this identity served by the bucket: while above zero the record stays sticky. */
+        int live;
 
         Continuity(int bucket, long lastUse) {
             this.bucket = bucket;
@@ -495,6 +503,9 @@ public final class PressureRanking {
         Read account;
         InetAddress addr;
         String acct;
+        /** Continuity records this connection holds live (13.12); null when the identity has an exact entry. */
+        Continuity ipRecord;
+        Continuity acctRecord;
         int liveBucket = -1;
         Object liveKey;
         long bytes;

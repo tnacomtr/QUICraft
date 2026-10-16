@@ -1639,9 +1639,11 @@ position extraction. Those implementations must change together before this revi
      first, never to protected shares.
      Under churn beyond the continuity table's bound (the exact IP and account tracking
      capacities), the oldest overflowed identities can lose bucket continuity. When the
-     table is full it drops, in order: the oldest record past the 10-minute history window,
+     table is full it drops, in order: the oldest record that is no longer sticky (past
+     the 10-minute history window, its bucket idle, and no live connection of its own),
      else the oldest record whose bucket still has live users, else the oldest record, so
-     the bound always holds. Like poisoning, this is DDoS-sized and affects only the
+     the bound always holds. A record with a live connection of its own stays sticky
+     however long that connection's charge stays unchanged. Like poisoning, this is DDoS-sized and affects only the
      shedding order.
      The ranking-history table NEVER causes admission/grant refusal or TCP fallback,
      even when all exact entries are protected. Independent rate admission limits
