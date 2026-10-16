@@ -5,6 +5,10 @@ import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
+import io.netty.handler.timeout.ReadTimeoutException;
+import io.netty.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.ClientboundDisconnectPacket;
@@ -31,13 +35,60 @@ final class V3Handler extends ChannelDuplexHandler {
     static final String TAIL_NAME = "quicraft_v3_tail";
 
     private final V3Client client;
+    private ChannelHandlerContext context;
+    /** When the connection last delivered anything to the game (nanoTime). */
+    private volatile long lastRead = System.nanoTime();
+    /** Deliveries the game has been handed but not yet applied: while any, it is busy, not silent. */
+    private final AtomicInteger unapplied = new AtomicInteger();
+    private ScheduledFuture<?> silenceWatch;
 
     V3Handler(V3Client client) {
         this.client = client;
+        client.attach(this);
+    }
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) {
+        this.context = ctx;
+    }
+
+    void deliveryQueued() {
+        unapplied.incrementAndGet();
+    }
+
+    void deliveryApplied() {
+        unapplied.decrementAndGet();
+        lastRead = System.nanoTime();
+    }
+
+    /**
+     * Vanilla's read timeout (30 s without a read, the pipeline's {@code timeout} handler) sits in
+     * front of the byte path, which a {@code /3} connection leaves at activation, so nothing would
+     * reset it. This takes over: the same {@code TimeoutException} reaches the game's own handling
+     * when nothing was delivered for {@code timeoutNanos} and the game is not simply busy applying
+     * what it was given.
+     */
+    void startSilenceWatch(long timeoutNanos) {
+        lastRead = System.nanoTime();
+        long period = Math.max(timeoutNanos / 6, TimeUnit.MILLISECONDS.toNanos(50));
+        ChannelHandlerContext ctx = context;
+        silenceWatch = ctx.executor().scheduleWithFixedDelay(() -> {
+            if (!ctx.channel().isOpen()) {
+                silenceWatch.cancel(false);
+                return;
+            }
+            if (unapplied.get() > 0) {
+                lastRead = System.nanoTime();
+            } else if (System.nanoTime() - lastRead >= timeoutNanos) {
+                silenceWatch.cancel(false);
+                ctx.fireExceptionCaught(ReadTimeoutException.INSTANCE);
+            }
+        }, period, period, TimeUnit.NANOSECONDS);
     }
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        lastRead = System.nanoTime();
         try {
             if (msg instanceof GameLanes.Ack) {
                 client.acknowledge((GameLanes.Ack) msg);
@@ -75,6 +126,9 @@ final class V3Handler extends ChannelDuplexHandler {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        if (silenceWatch != null) {
+            silenceWatch.cancel(false);
+        }
         client.channelClosed();
         ctx.fireChannelInactive();
     }

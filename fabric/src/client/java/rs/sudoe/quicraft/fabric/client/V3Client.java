@@ -17,10 +17,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.RejectedExecutionException;
 import javax.crypto.Cipher;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.Connection;
+import net.minecraft.network.PacketListener;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.bridge.BindingPayloads;
@@ -68,6 +69,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     /** 12.16: the bounded wait for OFFER on a changed-pin re-bind is twice the RTT, within these. */
     static final long REBIND_WAIT_MIN_MILLIS = 500;
     static final long REBIND_WAIT_MAX_MILLIS = 3000;
+    /** Vanilla's read timeout (30 s), which a connection with lanes has to keep itself; tests shorten it. */
+    static volatile long readTimeoutMillis = 30_000L;
     /** {@code -Dquicraft.multistream.offlineTest=true}: lets an unencrypted login reach the exchange (12.19). */
     static final String OFFLINE_TEST_PROPERTY = "quicraft.multistream.offlineTest";
 
@@ -106,6 +109,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private ByteBuffer coreLeftover;
     private final List<Held> deferred = new ArrayList<>();
     private GameLanes lanes;
+    private V3Handler handler;
 
     V3Client(Connection connection, QuicBridgeChannel channel, EventLoop loop, V3Connection v3, V3Plan plan,
             RoutingTable table, int protocolNumber, boolean quicOnly, ClientV3State files, String logicalHost, int logicalPort,
@@ -124,6 +128,11 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         this.offlineTest = Boolean.getBoolean(OFFLINE_TEST_PROPERTY);
         this.loop = loop; // the channel is not registered yet when this is built
         this.codec = new LaneCodec(channel, table);
+    }
+
+    /** The pipeline handler of this join, set by its constructor. */
+    void attach(V3Handler handler) {
+        this.handler = handler;
     }
 
     State state() {
@@ -287,11 +296,21 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         }
     }
 
-    /** The game applied everything up to this delivery (13.10): acknowledge from the render thread. */
+    /**
+     * The game applied everything up to this delivery (13.10): acknowledge from the game's main
+     * thread, queued behind the packets on the queue that applies them ({@link AckPacket}).
+     */
     void acknowledge(GameLanes.Ack ack) {
         Lane lane = ack.lane();
         long sequence = ack.sequence();
-        Minecraft.getInstance().execute(() -> {
+        final V3Handler watcher = handler;
+        if (watcher != null) {
+            watcher.deliveryQueued();
+        }
+        Runnable apply = () -> {
+            if (watcher != null) {
+                watcher.deliveryApplied();
+            }
             try {
                 GameLanes current = lanes;
                 if (current != null && !current.isClosed()) {
@@ -300,7 +319,18 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             } catch (Throwable t) {
                 fail(t);
             }
-        });
+        };
+        Minecraft minecraft = Minecraft.getInstance();
+        PacketListener listener = connection.getPacketListener();
+        if (listener == null) {
+            minecraft.execute(apply);
+            return;
+        }
+        try {
+            minecraft.packetProcessor().scheduleIfPossible(listener, new AckPacket(apply));
+        } catch (RejectedExecutionException closing) {
+            // The game is shutting down; nothing is left to acknowledge.
+        }
     }
 
     // --- BindingDriver.Callbacks and PayloadSender.
@@ -425,6 +455,11 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         lanes = started;
         started.installOutbound();
         pipeline.addLast(V3Handler.TAIL_NAME, new V3Handler.Tail());
+        // The byte path's read timeout (vanilla's "timeout" handler) can no longer see reads.
+        if (pipeline.get("timeout") != null) {
+            pipeline.remove("timeout");
+        }
+        handler.startSilenceWatch(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readTimeoutMillis));
         v3.activate(started, leftover);
         state = State.ACTIVE;
         QuicraftFabric.LOG.info("QUICraft: multi-stream active to {}", v3.remoteAddress());

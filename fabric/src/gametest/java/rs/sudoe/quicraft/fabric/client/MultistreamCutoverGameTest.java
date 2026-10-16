@@ -108,6 +108,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             aClosedConnectionBeforeActivationFallsBack(protocol, table.get());
             aServerDisconnectIsNotAMultistreamFailure(protocol, table.get());
             heldPacketsStayHeldUntilActivation(protocol, table.get());
+            aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             aChangedCertificateIsReboundAndTheNewPinIsNoticed(protocol, table.get());
             aReboundThatGetsNoOfferFailsAfterTheBoundedWait(protocol, table.get());
         } catch (Exception e) {
@@ -279,6 +280,27 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             rig.fake.closeByPeer(); // the attempt ends: the held packet's promise fails with the connection
             check(rig.awaitState(V3Client.State.FAILED), "failed");
             check(rig.awaitCondition(held::isDone) && !held.isSuccess(), "the held packet failed with the connection");
+        }
+    }
+
+    /**
+     * Vanilla's 30 s read timeout cannot see lane traffic, so an active /3 connection watches for
+     * silence itself and raises the same TimeoutException (shortened to 400 ms here).
+     */
+    private static void aSilentConnectionTimesOutLikeVanillasDoes(int protocol, RoutingTable table)
+            throws Exception {
+        V3Client.readTimeoutMillis = 400;
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+            check(rig.awaitState(V3Client.State.ACTIVE), "active");
+            check(rig.channel.pipeline().get("timeout") == null, "the byte path's timeout handler is gone");
+            check(rig.awaitCondition(() -> !rig.channel.isOpen()), "silence closed the connection, as vanilla does");
+        } finally {
+            V3Client.readTimeoutMillis = 30_000L;
         }
     }
 
