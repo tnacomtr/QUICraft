@@ -183,6 +183,52 @@ class PressureRankingTest {
         assertTrue(r.score("keeps-asking", 10 * S) > 0, "retained bytes accrue during a refused wait");
     }
 
+    @Test void evictedIdentityReconnectsToItsBucketInsteadOfAFreshExactEntry() throws Exception {
+        PressureRanking r = new PressureRanking(60_000, 2, 10, SECRET);
+        r.connect("c1", ip("192.0.2.90"), null, 0);
+        r.setRetained("c1", 100, 0);
+        r.disconnect("c1", 10 * S);
+        r.connect("c2", ip("192.0.2.91"), null, 10 * S);
+        r.connect("c3", ip("192.0.2.92"), null, 10 * S);
+        assertEquals(2, r.exactIpCount());
+        r.disconnect("c2", 10 * S);
+        r.disconnect("c3", 10 * S);
+        // Exact slots are full of inactive entries with no bytes; a reconnect must not take one (13.12 continuity).
+        r.connect("c4", ip("192.0.2.90"), null, 11 * S);
+        assertEquals(2, r.exactIpCount());
+        assertEquals(held(100, 10) * Math.pow(0.5, 1.0 / 60), r.score("c4", 11 * S), 1e-6,
+                "the evicted identity reads its folded history from its bucket");
+    }
+
+    @Test void refusedWaitFloorDoesNotApplyToAConnectionYoungerThanTheWindow() throws Exception {
+        PressureRanking plain = new PressureRanking(60_000, 100, 100, SECRET);
+        PressureRanking floored = new PressureRanking(60_000, 100, 100, SECRET);
+        for (PressureRanking r : new PressureRanking[] {plain, floored}) {
+            r.connect("young", ip("192.0.2.100"), null, 0);
+            r.setRetained("young", 100, 0);
+            r.progress("young", 1000, 1 * S);
+        }
+        // The connection is only 2 s old at its first refusal: the floor is the live rate, which adds nothing.
+        floored.beginRefusedWait("young", 2 * S);
+        assertEquals(plain.score("young", 15 * S), floored.score("young", 15 * S), 1e-9);
+    }
+
+    @Test void refusedWaitFloorLiftsTheSiblingsSharingTheIdentity() throws Exception {
+        PressureRanking plain = new PressureRanking(60_000, 100, 100, SECRET);
+        PressureRanking floored = new PressureRanking(60_000, 100, 100, SECRET);
+        for (PressureRanking r : new PressureRanking[] {plain, floored}) {
+            r.connect("stalled", ip("192.0.2.110"), null, 0);
+            r.setRetained("stalled", 100, 0);
+            r.progress("stalled", 1000, 5 * S);
+            r.connect("sibling", ip("192.0.2.110"), null, 0);
+        }
+        floored.beginRefusedWait("stalled", 10 * S);
+        double siblingWithFloor = floored.score("sibling", 15 * S);
+        double siblingWithout = plain.score("sibling", 15 * S);
+        assertTrue(siblingWithFloor < siblingWithout / 50,
+                "the stalled holder's floor lifts the shared IP identity: " + siblingWithFloor);
+    }
+
     @Test void unknownConnectionsAreRejected() throws Exception {
         PressureRanking r = new PressureRanking();
         assertThrows(IllegalStateException.class, () -> r.setRetained("nobody", 1, 0));

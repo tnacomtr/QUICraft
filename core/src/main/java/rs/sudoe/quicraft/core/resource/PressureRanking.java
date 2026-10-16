@@ -5,10 +5,12 @@ import java.net.InetAddress;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.LongSupplier;
 
 /**
@@ -35,7 +37,12 @@ public final class PressureRanking {
     private final Map<InetAddress, IdentityHistory> ips = new HashMap<InetAddress, IdentityHistory>();
     private final Map<String, IdentityHistory> accounts = new HashMap<String, IdentityHistory>();
     private final Map<String, List<InetAddress>> accountRecentIps = new HashMap<String, List<InetAddress>>();
+    /** Evicted or overflowed IP identities and the time each was last served by its bucket (13.12 continuity). */
     private final Map<InetAddress, Long> overflowMemory = new LinkedHashMap<InetAddress, Long>(16, 0.75f, true);
+    /** Accounts turned away from an exact entry, with the time each was last served by its bucket. */
+    private final Map<String, Long> accountOverflow = new LinkedHashMap<String, Long>(16, 0.75f, true);
+    /** Connections currently in a refused wait, whose refused-wait floor lifts their identities (13.12). */
+    private final Set<Connection> refusedWaiters = new HashSet<Connection>();
     private final IdentityHistory[] buckets = new IdentityHistory[OVERFLOW];
     private final List<Map<Object, Integer>> bucketLive = new ArrayList<Map<Object, Integer>>(OVERFLOW);
     private final Map<Object, Connection> connections = new HashMap<Object, Connection>();
@@ -112,7 +119,7 @@ public final class PressureRanking {
         int accountBucket = account == null ? -1 : PrefixKey.accountBucket(secret, account);
         IdentityHistory ipExact = exactIp(ip, nowNanos, eff);
         IdentityHistory accountExact = account == null ? null : exactAccount(account, nowNanos, eff);
-        Connection c = new Connection(connection, new IdentityHistory(halfLifeNanos, nowNanos, eff));
+        Connection c = new Connection(connection, new IdentityHistory(halfLifeNanos, nowNanos, eff), nowNanos);
 
         if (ipExact == null && account != null && accountExact == null) {
             // Both identities overflowed: one charge, to the account bucket, read by both (13.12).
@@ -157,6 +164,7 @@ public final class PressureRanking {
     public synchronized void disconnect(Object connection, long nowNanos) {
         Connection c = connections.remove(connection);
         if (c == null) return;
+        refusedWaiters.remove(c);
         if (c.bytes != 0) setBytesInternal(c, 0, nowNanos, effStall(nowNanos));
         for (IdentityHistory target : c.charged) target.liveDelta(-1);
         if (c.liveBucket >= 0) {
@@ -189,7 +197,10 @@ public final class PressureRanking {
         Connection c = require(connection);
         if (!c.refusedWait) {
             c.refusedWait = true;
-            c.floorRate = c.local.rate(nowNanos, 0);
+            // A connection younger than the window at its first refusal uses the live rate: no floor.
+            boolean established = nowNanos - c.startNanos >= IdentityHistory.WINDOW_SECONDS * 1_000_000_000L;
+            c.floorRate = established ? c.local.rate(nowNanos, 0) : 0;
+            refusedWaiters.add(c);
         }
     }
 
@@ -198,6 +209,7 @@ public final class PressureRanking {
         Connection c = require(connection);
         c.refusedWait = false;
         c.floorRate = 0;
+        refusedWaiters.remove(c);
     }
 
     /** Worst-of pressure score of a connection at {@code nowNanos} (13.12); 0 for an unknown connection. */
@@ -205,14 +217,30 @@ public final class PressureRanking {
         Connection c = connections.get(connection);
         if (c == null) return 0;
         long eff = effStall(nowNanos);
-        // Refused-wait floor (13.12): this connection's rate is at least its pre-wait rate, and the same
-        // shortfall lifts its contribution to each identity it is charged to.
-        double extra = c.refusedWait ? Math.max(0, c.floorRate - c.local.rate(nowNanos, 0)) : 0;
-        double local = c.local.score(nowNanos, eff, extra);
+        // Refused-wait floor (13.12): this connection's rate is at least its pre-wait rate. The shortfall of
+        // every refused waiter charged to an identity lifts that identity's progress, so siblings sharing it
+        // cannot hide a stalled holder behind cheap records.
+        double local = c.local.score(nowNanos, eff, floorShortfall(c, nowNanos));
         double worst = local;
-        worst = Math.max(worst, readScore(c.ip, local, nowNanos, eff, extra));
-        if (c.account != null) worst = Math.max(worst, readScore(c.account, local, nowNanos, eff, extra));
+        worst = Math.max(worst, readScore(c.ip, local, nowNanos, eff, identityShortfall(c.ip.history, nowNanos)));
+        if (c.account != null) {
+            worst = Math.max(worst, readScore(c.account, local, nowNanos, eff, identityShortfall(c.account.history, nowNanos)));
+        }
         return worst;
+    }
+
+    /** Refused-wait shortfall of one connection: how far its floor rate lifts its live rate. */
+    private static double floorShortfall(Connection c, long nowNanos) {
+        return c.refusedWait ? Math.max(0, c.floorRate - c.local.rate(nowNanos, 0)) : 0;
+    }
+
+    /** Sum of refused-wait shortfalls of every waiting connection charged to one identity history. */
+    private double identityShortfall(IdentityHistory target, long nowNanos) {
+        double total = 0;
+        for (Connection waiter : refusedWaiters) {
+            if (waiter.charged.contains(target)) total += floorShortfall(waiter, nowNanos);
+        }
+        return total;
     }
 
     /** Number of exact IP entries currently held. */
@@ -259,12 +287,16 @@ public final class PressureRanking {
         IdentityHistory existing = ips.get(ip);
         if (existing != null) return existing;
         Long remembered = overflowMemory.get(ip);
-        if (remembered != null && now - remembered < IdentityHistory.RETENTION_NANOS) return null;
+        if (remembered != null && stickyOverflow(remembered, PrefixKey.overflow(ip).bucket(secret), now)) {
+            overflowMemory.put(ip, now);
+            return null;
+        }
         if (ips.size() >= maxTrackedIps && !makeIpRoom(now, eff)) {
             overflowMemory.put(ip, now);
             trimOverflowMemory();
             return null;
         }
+        overflowMemory.remove(ip);
         IdentityHistory created = new IdentityHistory(halfLifeNanos, now, eff);
         ips.put(ip, created);
         return created;
@@ -273,13 +305,39 @@ public final class PressureRanking {
     private IdentityHistory exactAccount(String account, long now, long eff) {
         IdentityHistory existing = accounts.get(account);
         if (existing != null) return existing;
+        Long remembered = accountOverflow.get(account);
+        if (remembered != null && stickyOverflow(remembered, PrefixKey.accountBucket(secret, account), now)) {
+            accountOverflow.put(account, now);
+            return null;
+        }
         if (accounts.size() >= maxTrackedAccounts) {
             removeExpiredAccounts(now);
-            if (accounts.size() >= maxTrackedAccounts) return null;
+            if (accounts.size() >= maxTrackedAccounts) {
+                accountOverflow.put(account, now);
+                trimAccountOverflow();
+                return null;
+            }
         }
+        accountOverflow.remove(account);
         IdentityHistory created = new IdentityHistory(halfLifeNanos, now, eff);
         accounts.put(account, created);
         return created;
+    }
+
+    /**
+     * An overflowed identity keeps using its bucket (13.12): until its bucket has no live users and its
+     * 10-minute inactive history expires, reconnects map back there even when exact slots are free.
+     */
+    private boolean stickyOverflow(long lastServed, int bucket, long now) {
+        return now - lastServed < IdentityHistory.RETENTION_NANOS || !bucketLive.get(bucket).isEmpty();
+    }
+
+    private void trimAccountOverflow() {
+        while (accountOverflow.size() > maxTrackedAccounts) {
+            Iterator<String> oldest = accountOverflow.keySet().iterator();
+            oldest.next();
+            oldest.remove();
+        }
     }
 
     /** Frees one exact IP slot: expired entries first, then fold the lowest-score unprotected inactive entry. */
@@ -307,6 +365,9 @@ public final class PressureRanking {
         if (victim == null) return false;
         IdentityHistory evicted = ips.remove(victim);
         int bucket = PrefixKey.overflow(victim).bucket(secret);
+        // The evicted identity keeps its bucket on reconnect; its history is already folded into that bucket.
+        overflowMemory.put(victim, now);
+        trimOverflowMemory();
         overflow(bucket, now, eff).absorb(evicted, now, eff);
         return true;
     }
@@ -394,8 +455,11 @@ public final class PressureRanking {
         boolean refusedWait;
         double floorRate;
 
-        Connection(Object id, IdentityHistory local) {
+        final long startNanos;
+
+        Connection(Object id, IdentityHistory local, long startNanos) {
             this.local = local;
+            this.startNanos = startNanos;
         }
     }
 }
