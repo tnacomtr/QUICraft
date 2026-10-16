@@ -147,6 +147,14 @@ sample() {
 server_args=(load-server --bind "$LOAD_BIND" --status-interval 5 --idle-minutes "$IDLE_MIN")
 [[ "${SHIPPED_LIMITS:-0}" == "1" ]] && server_args+=(--shipped-limits)
 [[ -n "${SOCKETS:-}" ]] && server_args+=(--sockets "$SOCKETS")
+case "$LANES" in
+    ""|0) LANES="" ;;
+    1) ;;
+    *) echo "LANES must be empty, 0 or 1, got $LANES" >&2; exit 2 ;;
+esac
+if [[ "${SHIPPED_LIMITS:-0}" == "1" && "$MODE" == v3 ]]; then
+    echo "WARNING: SHIPPED_LIMITS=1 with MODE=v3: the per-IP open cap (64) limits a single-loopback-IP v3 run" >&2
+fi
 case "$MODE" in
     v2) [[ -z "$LANES" ]] || { echo "LANES needs MODE=v3" >&2; exit 2; } ;;
     v3) server_args+=(--mode v3 --node-budget-mb "$NODE_BUDGET_MB")
