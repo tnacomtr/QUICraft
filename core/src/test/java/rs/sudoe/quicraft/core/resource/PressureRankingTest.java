@@ -19,6 +19,11 @@ class PressureRankingTest {
         return InetAddress.getByName(literal);
     }
 
+    /** Exact decayed byte-seconds of {@code bytes} held for {@code seconds} with the 60 s half-life (13.12). */
+    private static double held(double bytes, double seconds) {
+        return bytes * 60.0 / Math.log(2) * -Math.expm1(-Math.log(2) * seconds / 60.0);
+    }
+
     @Test void longHeldModestBytesOutrankFreshLargerAllocation() throws Exception {
         PressureRanking r = new PressureRanking(60_000, 100, 100, SECRET);
         r.connect("a", ip("192.0.2.1"), null, 0);
@@ -27,9 +32,23 @@ class PressureRankingTest {
         r.setRetained("b", 1000, 59 * S);
         double longHeld = r.score("a", 60 * S);
         double fresh = r.score("b", 60 * S);
-        assertEquals(6000.0, longHeld, 1e-6);
-        assertEquals(1000.0, fresh, 1e-6);
+        assertEquals(held(100, 60), longHeld, 1e-6);
+        assertEquals(held(1000, 1), fresh, 1e-6);
         assertTrue(longHeld > fresh);
+    }
+
+    @Test void oneUpdateAndManySmallUpdatesGiveTheSameDecayedScore() {
+        IdentityHistory one = new IdentityHistory(60 * S, 0, 0);
+        one.addBytes(100, 0, 0);
+        double single = one.projected(600 * S, 0);
+
+        IdentityHistory many = new IdentityHistory(60 * S, 0, 0);
+        many.addBytes(100, 0, 0);
+        for (long tick = 1; tick <= 6000; tick++) many.accrue(tick * S / 10, 0);
+        double split = many.projected(600 * S, 0);
+
+        assertEquals(single, split, single * 1e-9, "exact integration composes across update points");
+        assertEquals(held(100, 600), single, 1e-6);
     }
 
     @Test void localExecutorStallIsExcludedFromByteSeconds() throws Exception {
@@ -39,12 +58,12 @@ class PressureRankingTest {
         stalled.setRetained("holder", 100, 0);
         stalled.stallStart(10 * S);
         stalled.stallEnd(20 * S);
-        assertEquals(2000.0, stalled.score("holder", 30 * S), 1e-6);
+        assertEquals(held(100, 20), stalled.score("holder", 30 * S), 1e-6);
 
         PressureRanking control = new PressureRanking(60_000, 100, 100, SECRET);
         control.connect("holder", ip("192.0.2.10"), null, 0);
         control.setRetained("holder", 100, 0);
-        assertEquals(3000.0, control.score("holder", 30 * S), 1e-6);
+        assertEquals(held(100, 30), control.score("holder", 30 * S), 1e-6);
     }
 
     @Test void progressWindowLowersScoreAndExpiresAfterTenSeconds() throws Exception {
@@ -53,8 +72,8 @@ class PressureRankingTest {
         r.setRetained("p", 100, 0);
         r.progress("p", 1000, 10 * S);
         double withProgress = r.score("p", 10 * S);
-        assertTrue(withProgress < 10.0, "progress rate 100 B/s divides the 1000 byte-seconds: " + withProgress);
-        assertEquals(2500.0, r.score("p", 25 * S), 1e-6);
+        assertTrue(withProgress < 10.0, "progress rate 100 B/s divides the decayed byte-seconds: " + withProgress);
+        assertEquals(held(100, 25), r.score("p", 25 * S), 1e-6);
     }
 
     @Test void scoreIsWorstOfConnectionLocalAndIdentityHistory() throws Exception {
@@ -65,7 +84,7 @@ class PressureRankingTest {
         r.disconnect("old", 10 * S);
         r.connect("new", ip("192.0.2.30"), null, 10 * S);
         double score = r.score("new", 10 * S);
-        assertTrue(score >= 999.0, "identity history persists across reconnects: " + score);
+        assertEquals(held(100, 10), score, 1e-6, "identity history persists across reconnects");
     }
 
     @Test void reconnectKeepsIdentityHistoryButNotConnectionLocalStatistics() throws Exception {
@@ -75,7 +94,7 @@ class PressureRankingTest {
         r.disconnect("r1", 10 * S);
         r.connect("r2", ip("192.0.2.31"), null, 20 * S);
         double score = r.score("r2", 20 * S);
-        assertTrue(score > 800 && score < 1000, "decayed identity history only: " + score);
+        assertEquals(held(100, 10) * Math.pow(0.5, 10.0 / 60), score, 1e-6, "decayed identity history only");
     }
 
     @Test void overflowShareIsAnEqualPerIdentityShareOfTheBucket() {
@@ -120,7 +139,7 @@ class PressureRankingTest {
         r.connect("c2", ip("192.0.2.41"), null, 10 * S);
         r.connect("c3", ip("192.0.2.42"), null, 10 * S);
         assertEquals(2, r.exactIpCount());
-        assertEquals(1000.0, r.bucketScore(r.bucketFor(ip("192.0.2.40")), 10 * S), 1e-6);
+        assertEquals(held(100, 10), r.bucketScore(r.bucketFor(ip("192.0.2.40")), 10 * S), 1e-6);
     }
 
     @Test void accountProtectedIpEntryIsNotEvictedWhileOtherInactiveEntryIs() throws Exception {
@@ -135,7 +154,7 @@ class PressureRankingTest {
         r.setRetained("c2", 100, 0);
         r.disconnect("c2", 10 * S);
         r.connect("c3", ip("192.0.2.52"), null, 10 * S);
-        assertEquals(1000.0, r.bucketScore(evictedBucket, 10 * S), 1e-6);
+        assertEquals(held(100, 10), r.bucketScore(evictedBucket, 10 * S), 1e-6);
         assertEquals(0.0, r.bucketScore(protectedBucket, 10 * S), 1e-9);
     }
 
@@ -150,10 +169,10 @@ class PressureRankingTest {
         floored.beginRefusedWait("w", 10 * S);
         double withFloor = floored.score("w", 15 * S);
         double withoutFloor = plain.score("w", 15 * S);
-        assertEquals(1500.0, withoutFloor, 1e-6);
+        assertEquals(held(100, 15), withoutFloor, 1e-6);
         assertTrue(withFloor < withoutFloor / 50, "floor rate 100 B/s applies: " + withFloor);
         floored.endRefusedWait("w");
-        assertEquals(1500.0, floored.score("w", 15 * S), 1e-6);
+        assertEquals(held(100, 15), floored.score("w", 15 * S), 1e-6);
     }
 
     @Test void refusedWaitIsNotAnExcludedRetainedByteAccrual() throws Exception {

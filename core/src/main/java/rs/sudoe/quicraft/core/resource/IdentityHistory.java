@@ -6,12 +6,10 @@ package rs.sudoe.quicraft.core.resource;
  * "Pressure ranking").
  *
  * <p>Retained bytes are a piecewise-constant function of time. Each history remembers the bytes it held and
- * the time it was last accrued, and integrates {@code bytes x seconds} exactly between changes. Decay with
- * the configured half-life (60 s provisionally) is applied at accrual points, not continuously within one
- * constant-bytes interval, so an interval's contribution is slightly overstated for long intervals. The
- * bias is conservative for ranking (it never hides a holder) and is documented in protocol.md 13.12 terms as
- * a provisional operational detail. Local executor-stall time reported to {@link PressureRanking} is
- * excluded through an effective cumulative stall counter.</p>
+ * the time it was last accrued. Decayed byte-seconds are integrated exactly with the configured half-life
+ * (60 s provisionally), so the score does not depend on how often the history is updated. Local
+ * executor-stall time reported to {@link PressureRanking} is excluded through an effective cumulative stall
+ * counter: the decay clock is frozen during a stall.</p>
  *
  * <p>Progress is counted in a rolling 10-second window of one-second slots, so memory per history is
  * constant. Score is {@code decayedByteSeconds / (1 + progressBytesPerSecond)}.</p>
@@ -121,11 +119,23 @@ final class IdentityHistory {
     /** Last use time, for least-recently-used decisions. */
     long lastUseNanos() { return lastUseNanos; }
 
-    /** Decayed byte-seconds projected to {@code nowNanos} without changing state. */
+    /**
+     * Decayed byte-seconds projected to {@code nowNanos} without changing state (13.12 exact integration).
+     *
+     * <p>Decay runs on the effective clock (stall time frozen). For a constant {@code b} held over an
+     * effective interval {@code dt} with half-life {@code H}, the contribution is
+     * {@code b * H / ln2 * (1 - 2^(-dt/H))}, and the prior score decays by {@code 2^(-dt/H)}. Because this
+     * composes exactly, one update and many small updates over the same span give the same score.</p>
+     */
     double projected(long nowNanos, long effStall) {
         long elapsed = nowNanos - asOfNanos;
         long excluded = effStall - asOfStall;
         long effective = Math.max(0L, elapsed - excluded);
-        return byteSeconds * Math.pow(0.5, elapsed / halfLifeNanos) + bytes * (effective / 1e9);
+        double exponent = LN2 * (effective / halfLifeNanos);
+        double decay = Math.exp(-exponent);
+        double held = bytes * (halfLifeNanos / 1e9 / LN2) * -Math.expm1(-exponent);
+        return byteSeconds * decay + held;
     }
+
+    private static final double LN2 = Math.log(2.0);
 }
