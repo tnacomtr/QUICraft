@@ -56,6 +56,11 @@ public final class LoadClient {
     private final AtomicLong lanesActive = new AtomicLong();
     private final AtomicLong activationRequested = new AtomicLong();
     private final Set<V3Connection> activationTracked = ConcurrentHashMap.newKeySet();
+    /**
+     * Connections that reached a settled state: observed activated or closed. Added once, never
+     * removed, so a connection that activates and then closes is still counted once.
+     */
+    private final Set<V3Connection> settled = ConcurrentHashMap.newKeySet();
     private final AtomicLong preMarkerReads = new AtomicLong();
     private final AtomicLong lanesFailed = new AtomicLong();
     private final Map<String, AtomicLong> closeCauses = new ConcurrentHashMap<>();
@@ -145,11 +150,10 @@ public final class LoadClient {
             // dial may not be observable as activated yet. Wait (bounded) until every connected
             // dial is either observed activated or closed before taking the baseline.
             long settleDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(settleSec);
-            while (load.activatedLive() + load.closed.get() < load.connected.get()
-                    && System.nanoTime() < settleDeadline) {
+            while (load.settledCount() < load.connected.get() && System.nanoTime() < settleDeadline) {
                 Thread.sleep(50);
             }
-            long unsettled = load.connected.get() - load.activatedLive() - load.closed.get();
+            long unsettled = load.connected.get() - load.settledCount();
             System.out.println((unsettled > 0 ? "SETTLE_TIMEOUT" : "SETTLED") + " unsettled=" + Math.max(0, unsettled)
                     + " seconds=" + (System.nanoTime() - t0) / 1_000_000_000L);
         }
@@ -261,6 +265,7 @@ public final class LoadClient {
                     activationTracked.add(v3);
                     v3.activate(new IdleLaneGame((code, byPeer, cause) -> {
                         if (closeRecorded.compareAndSet(false, true)) {
+                            settled.add(v3);
                             activationTracked.remove(v3);
                             closed.incrementAndGet();
                             String key = closeKey(code, byPeer, cause);
@@ -279,6 +284,7 @@ public final class LoadClient {
             @Override
             public void onClosed(Throwable cause) {
                 if (closeRecorded.compareAndSet(false, true)) {
+                    settled.add(v3);
                     activationTracked.remove(v3);
                     closed.incrementAndGet();
                     String key = cause == null ? "normal" : normalizeCause(cause);
@@ -310,9 +316,18 @@ public final class LoadClient {
     private long activatedLive() {
         long live = 0;
         for (V3Connection connection : activationTracked) {
-            if (connection.session() != null && connection.isOpen()) live++;
+            if (connection.session() != null && connection.isOpen()) {
+                live++;
+                settled.add(connection);
+            }
         }
         return live;
+    }
+
+    /** Connections counted once each when first observed activated or closed. */
+    private long settledCount() {
+        activatedLive(); // records newly observed activations
+        return settled.size();
     }
 
     private void status() {
