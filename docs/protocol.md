@@ -1561,7 +1561,7 @@ position extraction. Those implementations must change together before this revi
      byte-seconds as identity history per source IP and per authenticated account (plus
      connection-local statistics that live only as long as that connection, see below);
      half-life 60 seconds provisionally. Integrate retained charged bytes, excluding only
-     known local executor-stall intervals. Retained bytes ALWAYS accrue byte-seconds, also
+     known local executor-stall intervals. The decay dt uses the same stall-excluded effective clock as integration. Retained bytes ALWAYS accrue byte-seconds, also
      while the holder waits on OUR refusal of its request, so a holder that keeps asking for
      refused grants cannot freeze its score while keeping its bytes. During such a refused
      wait, and only for an INBOUND requester's own incomplete-record bytes while our refusal
