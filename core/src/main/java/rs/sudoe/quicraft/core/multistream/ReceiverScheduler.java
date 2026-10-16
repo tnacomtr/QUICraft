@@ -71,6 +71,18 @@ public final class ReceiverScheduler {
         }
     }
 
+    /**
+     * A decode request the node budget can never carry, whatever other connections release. It is a
+     * local resource failure, never peer misconduct: the owner closes with its internal-error code
+     * (0x2), not 0x11, and it is not wrapped into an {@link OrderingException}.
+     */
+    static final class LocalResourceException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        LocalResourceException(String message) {
+            super(message);
+        }
+    }
+
     /** Decodes only an eligible record, reserving output before allocation and reporting decoded(). */
     public interface Decoder {
         /**
@@ -127,12 +139,148 @@ public final class ReceiverScheduler {
     /** Identity token for a first-byte reservation; never reuse after release/complete. */
     public static final class Partial {
         private final Lane lane;
-        private final long started;
+        private long started;
         private long bytes;
         private Partial(Lane lane, long bytes, long now) {
             this.lane = lane;
             this.bytes = bytes;
             this.started = now;
+        }
+    }
+
+    /**
+     * Transport-local withholding is not evidence of a stalled peer. Event-loop only. A lane is
+     * marked here only while it is actually retrying a refused parser allocation (the owner
+     * recomputes that on every pass). At most the next decodable entry in each lane can be refused;
+     * keep those independently in this lane-sized array so regular deadline checks stay O(lanes).
+     */
+    private final long[] receiveBlockedSince = {-1, -1, -1};
+    private final Entry[] nodeBlockedByLane = new Entry[Lane.values().length];
+    private long bundlePausedSince = -1;
+
+    void receiveBlocked(Lane lane, boolean blocked, long now) {
+        enter();
+        int index = lane.ordinal();
+        long since = receiveBlockedSince[index];
+        if (blocked == (since >= 0)) {
+            return;
+        }
+        if (blocked) {
+            receiveBlockedSince[index] = now;
+        } else {
+            for (Partial p : partials.keySet()) {
+                if (p.lane == lane) {
+                    p.started += now - Math.max(p.started, since);
+                }
+            }
+            receiveBlockedSince[index] = -1;
+        }
+        updatePauses(now);
+    }
+
+    /** True while a decode waits for node space; the owner's cap on local waits counts it. */
+    boolean decodeBlocked() {
+        return anyDecodeBlocked();
+    }
+
+    private boolean anyDecodeBlocked() {
+        for (Entry entry : nodeBlockedByLane) {
+            if (entry != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean decodeBlocked(Lane lane, long upTo) {
+        Entry entry = nodeBlockedByLane[lane.ordinal()];
+        return entry != null && Long.compareUnsigned(entry.envelope.sequence(), upTo) <= 0;
+    }
+
+    /**
+     * Whether {@code lane} is withheld locally in a way that delays the record with sequence
+     * {@code upTo} (unsigned) on it: the lane is retrying a refused parser allocation and has not yet
+     * received that record, or the decode that cannot allocate is that lane's record at or before it.
+     */
+    private boolean laneLocallyBlocked(Lane lane, long upTo) {
+        int i = lane.ordinal();
+        if (receiveBlockedSince[i] >= 0 && Long.compareUnsigned(received[i], upTo) < 0) {
+            return true;
+        }
+        return decodeBlocked(lane, upTo);
+    }
+
+    /**
+     * Whether the head of {@code q} is waiting only on something a locally withheld lane has to
+     * deliver: a missing predecessor on a lane that is blocked, or the rest of an open bundle on a
+     * blocked CONTROL lane. Mirrors {@link #blocked}; a head that waits on a peer's silence is never
+     * paused, and neither is one that waits on a lane that is merely idle.
+     */
+    private boolean headPaused(ArrayDeque<Entry> q) {
+        long provisional = delivered[0];
+        boolean bundle = false;
+        boolean first = true;
+        for (Entry entry : q) {
+            Envelope env = entry.envelope;
+            boolean missing = false;
+            for (Lane lane : Lane.values()) {
+                long watermark = lane == Lane.CONTROL ? provisional : delivered[lane.ordinal()];
+                long dependency = env.dependency(lane);
+                if (Long.compareUnsigned(dependency, watermark) > 0) {
+                    missing = true;
+                    if (lane != env.lane() && laneLocallyBlocked(lane, dependency)) {
+                        return true;
+                    }
+                }
+            }
+            if (missing || entry.decoded == null) {
+                return false;
+            }
+            Envelope e = entry.decoded;
+            if (first) {
+                first = false;
+                bundle = e.bundle() == Envelope.Bundle.OPEN;
+            }
+            if (!bundle || e.bundle() == Envelope.Bundle.CLOSE) {
+                return false;
+            }
+            provisional = e.sequence();
+        }
+        return bundle && laneLocallyBlocked(Lane.CONTROL, -1L);
+    }
+
+    private void setPaused(Entry head, boolean paused, long now) {
+        if (paused && head.pausedSince < 0) {
+            head.pausedSince = now;
+        } else if (!paused && head.pausedSince >= 0) {
+            head.headSince += now - Math.max(head.headSince, head.pausedSince);
+            head.pausedSince = -1;
+        }
+    }
+
+    /**
+     * Recomputes, from the current state, which blocked heads and which open bundle are paused by a
+     * local wait, and moves their start times forward by the time they spent paused. Nothing is
+     * remembered between calls except when each pause began, so a pause ends the moment the lane or
+     * decode it depended on stops being blocked.
+     */
+    private void updatePauses(long now) {
+        boolean anyBlocker = anyDecodeBlocked();
+        for (long since : receiveBlockedSince) {
+            anyBlocker |= since >= 0;
+        }
+        for (ArrayDeque<Entry> q : queues) {
+            Entry head = q.peek();
+            if (head != null) {
+                setPaused(head, anyBlocker && headPaused(q), now);
+            }
+        }
+        boolean bundlePaused = anyBlocker && receivingBundle && laneLocallyBlocked(Lane.CONTROL, -1L);
+        if (bundlePaused && bundlePausedSince < 0) {
+            bundlePausedSince = now;
+        } else if (!bundlePaused && bundlePausedSince >= 0) {
+            bundleStarted += now - Math.max(bundleStarted, bundlePausedSince);
+            bundlePausedSince = -1;
         }
     }
 
@@ -146,8 +294,15 @@ public final class ReceiverScheduler {
         boolean head;
         /** First attempt of this entry's current decode, or -1 while it has none (13.12). */
         long decodeSince = -1;
+        long nodeBlockedSince = -1;
+        /** When a local wait started pausing this entry's blocked-head timer, or -1. */
+        long pausedSince = -1;
         /** Bytes the current decode attempt reserved, released if that attempt is refused. */
         long decodeReservedBytes;
+        /** What the refused attempt needed from the node; the decode is not rerun before it is free. */
+        long retryNeed;
+        /** The refused request exceeds the node's capacity: no wait can ever carry it. */
+        boolean impossible;
         Entry(Envelope envelope, long bytes) {
             this.envelope = envelope;
             this.bytes = bytes;
@@ -222,6 +377,10 @@ public final class ReceiverScheduler {
     private OrderingException escape(RuntimeException ex) {
         if (ex instanceof RetryLater) {
             throw (RetryLater) ex;
+        }
+        if (ex instanceof LocalResourceException) {
+            failed = true;
+            throw (LocalResourceException) ex;
         }
         if (ex instanceof OrderingException) {
             return (OrderingException) ex;
@@ -333,6 +492,7 @@ public final class ReceiverScheduler {
             }
         }
         partials.clear();
+        java.util.Arrays.fill(nodeBlockedByLane, null);
         for (ArrayDeque<Entry> q : queues) {
             q.clear();
         }
@@ -658,7 +818,22 @@ public final class ReceiverScheduler {
                     break;
                 }
                 if (next.decode != null) {
-                    decoding = next.decode;
+                    Entry candidate = next.decode;
+                    if (candidate.nodeBlockedSince >= 0 && node.available() < candidate.retryNeed) {
+                        // 13.12: the refused attempt needed more than the node has free right now.
+                        // Rerunning the game's decode could only be refused again, so it waits (still
+                        // paused, still counted by the owner's cap) until that much is free.
+                        return;
+                    }
+                    decoding = candidate;
+                    if (decoding.nodeBlockedSince >= 0) {
+                        decoding.decodeSince += pumpNow - Math.max(decoding.decodeSince, decoding.nodeBlockedSince);
+                        decoding.nodeBlockedSince = -1;
+                        if (nodeBlockedByLane[decoding.envelope.lane().ordinal()] == decoding) {
+                            nodeBlockedByLane[decoding.envelope.lane().ordinal()] = null;
+                        }
+                        updatePauses(pumpNow);
+                    }
                     if (decoding.decodeSince < 0) {
                         // This entry's own first attempt. A retry of the same entry keeps it, so the
                         // 13.12 decode deadline runs from the first attempt; a later entry starts
@@ -673,8 +848,17 @@ public final class ReceiverScheduler {
                         // attempt's own reservations back before the entry waits: the decoder is
                         // rerun from its start, so keeping them would charge the same output again on
                         // every retry and drain the budget.
-                        releaseDecodeAttempt(decoding);
+                        Entry refused = decoding;
+                        releaseDecodeAttempt(refused);
                         decoding = null;
+                        if (refused.impossible) {
+                            throw new LocalResourceException("a decode needs " + refused.retryNeed
+                                    + " bytes but the node budget holds at most " + node.capacity()
+                                    + ": it can never be carried (13.12)");
+                        }
+                        refused.nodeBlockedSince = pumpNow;
+                        nodeBlockedByLane[refused.envelope.lane().ordinal()] = refused;
+                        updatePauses(pumpNow);
                         return;
                     } catch (RuntimeException ex) {
                         throw fatal(ex);
@@ -718,7 +902,12 @@ public final class ReceiverScheduler {
             budget(envelope.lane(), additionalRetainedBytes, 0);
             if (additionalRetainedBytes > 0 && !node.tryReserve(additionalRetainedBytes)) {
                 // 13.12: the bytes are about to be allocated, not yet received, so the owner can
-                // wait for node space instead of failing the connection.
+                // wait for node space instead of failing the connection. The refusal is rethrown as
+                // the retry the game already passes through; what it needed is kept so the decode is
+                // not rerun before that much is free, and a need above the node's whole capacity is
+                // flagged so the scheduler fails it locally once the game has let the throw out.
+                decoding.retryNeed = decoding.decodeReservedBytes + additionalRetainedBytes;
+                decoding.impossible = decoding.bytes + additionalRetainedBytes > node.capacity();
                 throw new RetryLater();
             }
             decoding.bytes += additionalRetainedBytes;
@@ -788,6 +977,9 @@ public final class ReceiverScheduler {
             // they cannot reach a later entry.
             decoding.decodeSince = -1;
             decoding.decodeReservedBytes = 0;
+            if (nodeBlockedByLane[envelope.lane().ordinal()] == decoding) {
+                nodeBlockedByLane[envelope.lane().ordinal()] = null;
+            }
             decoding = null;
             pump(now);
         } catch (RuntimeException ex) {
@@ -837,31 +1029,30 @@ public final class ReceiverScheduler {
     public void checkDeadlines(long now) {
         enter();
         try {
-            // 13.12: every entry with an active decode deadline, whether that decode is still
-            // running or was refused before any allocation. A refused entry is queued, undecoded and
-            // eligible, so it is not a "blocked head" and no retry of it may ever come: its deadline
-            // has to be enforced here and cannot wait for another attempt to check it.
+            updatePauses(now);
+            // Local allocation refusal pauses the decode timer, not application/handler timeouts.
             for (ArrayDeque<Entry> q : queues) {
                 for (Entry entry : q) {
-                    if (entry.decodeSince >= 0 && now - entry.decodeSince >= TIMEOUT_NANOS) {
+                    if (entry.nodeBlockedSince < 0 && entry.decodeSince >= 0
+                            && now - entry.decodeSince >= TIMEOUT_NANOS) {
                         throw new OrderingException("uncompleted decode timeout");
                     }
                 }
             }
-            if (receivingBundle && now - bundleStarted >= TIMEOUT_NANOS) {
+            if (bundlePausedSince < 0 && receivingBundle && now - bundleStarted >= TIMEOUT_NANOS) {
                 throw new OrderingException("missing bundle close timeout");
             }
             if (outstanding != null && now - outstandingSince >= TIMEOUT_NANOS) {
                 throw new OrderingException("unapplied handler timeout");
             }
             for (Partial p : partials.keySet()) {
-                if (now - p.started >= TIMEOUT_NANOS) {
+                if (receiveBlockedSince[p.lane.ordinal()] < 0 && now - p.started >= TIMEOUT_NANOS) {
                     throw new OrderingException("incomplete record timeout");
                 }
             }
             for (ArrayDeque<Entry> q : queues) {
                 Entry head = q.peek();
-                if (head != null && now - head.headSince >= TIMEOUT_NANOS
+                if (head != null && head.pausedSince < 0 && now - head.headSince >= TIMEOUT_NANOS
                         && (outstanding == null || outstanding.lane() != head.envelope.lane())
                         && (decoding == null || decoding.envelope.lane() != head.envelope.lane())
                         && blocked(q)) {

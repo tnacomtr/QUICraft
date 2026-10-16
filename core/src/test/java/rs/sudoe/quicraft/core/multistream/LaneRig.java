@@ -134,6 +134,7 @@ final class LaneRig implements AutoCloseable {
         final List<Delivered> deliveries = Collections.synchronizedList(new ArrayList<Delivered>());
         final List<Boolean> writability = Collections.synchronizedList(new ArrayList<Boolean>());
         final CompletableFuture<Closed> closed = new CompletableFuture<>();
+        volatile Throwable closeCause;
         volatile LaneSession session;
         volatile boolean autoApply = true;
         volatile boolean applyOnOtherThread;
@@ -181,6 +182,7 @@ final class LaneRig implements AutoCloseable {
 
         @Override
         public void onClosed(int code, boolean byPeer, Throwable cause) {
+            closeCause = cause;
             closed.complete(new Closed(code, byPeer));
         }
 

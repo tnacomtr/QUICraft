@@ -203,6 +203,11 @@ public final class RecordCodec {
          * The consumed byte count is the buffer position delta.
          */
         public Record next(ByteBuffer in) throws MultistreamProtocolException {
+            return next(in, false);
+        }
+
+        /** Session-only pull mode: a refused allocation leaves the validated header retryable. */
+        Record next(ByteBuffer in, boolean withholdOnRefusal) throws MultistreamProtocolException {
             if (recordLength < 0) {
                 while (!length.done()) {
                     if (!in.hasRemaining()) {
@@ -220,8 +225,13 @@ public final class RecordCodec {
                     throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
                             "record_length " + recordLength + " > " + MAX_RECORD_LENGTH);
                 }
+            }
+            if (frame == null) {
                 int wireBytes = lengthPrefixBytes + recordLength;
                 if (!budget.reserve(wireBytes)) {
+                    if (withholdOnRefusal) {
+                        return null;
+                    }
                     throw new MultistreamProtocolException(CLOSE_CODE, "13.12",
                             "record of " + wireBytes + " wire bytes refused by the receive budget");
                 }
@@ -237,6 +247,10 @@ public final class RecordCodec {
             Record record = decode(frame, recordLength, controlStream);
             reset();
             return record;
+        }
+
+        boolean awaitingAdmission() {
+            return recordLength >= 0 && frame == null;
         }
 
         /** Bytes of the current incomplete record consumed so far (length prefix and header). */

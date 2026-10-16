@@ -77,6 +77,22 @@ public abstract class ReceiveBudget {
     public abstract boolean tryReserve(long bytes);
 
     /**
+     * Reserves {@code bytes} unconditionally, as an admitted overdraft, for bytes that already
+     * arrived under an earlier admission and must not be refused (the activation leftover). The
+     * reservation is released normally with {@link #release(long)}; while it exceeds the capacity
+     * {@link #tryReserve(long)} refuses everything and {@link #available()} reports 0. The default
+     * suits a budget without a capacity; a bounded budget must override it.
+     *
+     * @throws IllegalStateException when this budget cannot take an overdraft and refuses the bytes
+     */
+    public boolean forceReserve(long bytes) {
+        if (!tryReserve(bytes)) {
+            throw new IllegalStateException("budget cannot take an overdraft of " + bytes);
+        }
+        return true;
+    }
+
+    /**
      * Releases {@code bytes} of an earlier reservation once the retained bytes or the credit
      * exposure they paid for are gone.
      *
@@ -94,6 +110,15 @@ public abstract class ReceiveBudget {
      * can never make another connection's real reservation fail.
      */
     public abstract long available();
+
+    /**
+     * The most this budget can ever carry, or {@link Long#MAX_VALUE} for one without a capacity. A
+     * request above it can never succeed however long the caller waits, so it is a local failure and
+     * not a wait (13.12).
+     */
+    public long capacity() {
+        return Long.MAX_VALUE;
+    }
 
     private static void require(long bytes) {
         if (bytes < 0) {
@@ -129,6 +154,13 @@ public abstract class ReceiveBudget {
         }
 
         @Override
+        public boolean forceReserve(long bytes) {
+            require(bytes);
+            reserved.addAndGet(bytes);
+            return true;
+        }
+
+        @Override
         public void release(long bytes) {
             require(bytes);
             while (true) {
@@ -153,6 +185,11 @@ public abstract class ReceiveBudget {
         public long available() {
             long free = capacity - reserved.get();
             return free < 0 ? 0 : free;
+        }
+
+        @Override
+        public long capacity() {
+            return capacity;
         }
     }
 }

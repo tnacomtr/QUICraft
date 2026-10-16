@@ -28,6 +28,41 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
  * fit is refused, and a closed one gives its reservation back. A {@code /2} listener has no budget.
  */
 class V3NodeBudgetTest {
+    @Test
+    void activatedIdleConnectionsReserveThirtyKiBAndRefuseTheNext() throws Exception {
+        assumeTrue(QuicSupport.hasMaxFlowControlWindows() && QuicSupport.hasKeyingMaterialExport());
+        rs.sudoe.quicraft.core.routing.RoutingTable table =
+                rs.sudoe.quicraft.core.routing.RoutingTableLoader.loadResource(775);
+        int n = 3;
+        long idle = TransportConfig.V3_INITIAL_EXPOSURE_BYTES + 6 * 1024;
+        ReceiveBudget budget = ReceiveBudget.bounded(n * idle);
+        List<V3Connection> peers = Collections.synchronizedList(new ArrayList<V3Connection>());
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity,
+                TransportConfig.builder().nodeBudget(budget).build(), stream -> peers.add((V3Connection) stream),
+                protocol -> table)) {
+            for (int i = 0; i < n; i++) {
+                V3Connection client = QuicClient.connectV3(server.localAddress(), identity.fingerprint(),
+                        table, null).get(10, TimeUnit.SECONDS);
+                final int count = i + 1;
+                assertTrue(await(() -> peers.size() == count, 5000));
+                V3ConnectionTest.activate(peers.get(i), new V3ConnectionTest.Game(), 775);
+                V3ConnectionTest.activate(client, new V3ConnectionTest.Game(), -1);
+                long expected = count * idle;
+                assertTrue(await(() -> budget.reserved() == expected, 5000),
+                        "idle reservation expected " + expected + " but was " + budget.reserved());
+            }
+            try {
+                V3Connection extra = QuicClient.connectV3(server.localAddress(), identity.fingerprint(),
+                        table, null).get(10, TimeUnit.SECONDS);
+                assertTrue(await(() -> !extra.isOpen(), 5000));
+            } catch (java.util.concurrent.ExecutionException refused) {
+                // Refused before the handshake completed.
+            }
+            assertEquals(n, peers.size());
+        }
+        assertTrue(await(() -> budget.reserved() == 0, 5000));
+    }
+
     private static ServerIdentity identity;
 
     /** The server's log line for a connection refused by the node budget (QuicServer, 13.12). */

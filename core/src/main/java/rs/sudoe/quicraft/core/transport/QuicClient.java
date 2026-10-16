@@ -46,6 +46,15 @@ import rs.sudoe.quicraft.core.tls.FingerprintTrustManager.FingerprintMismatchExc
 
 /** Opens QUIC connections and their v1 stream (docs/protocol.md §5, §8). */
 public final class QuicClient {
+    private static ChannelInitializer<QuicStreamChannel> readGrantInitializer() {
+        return new ChannelInitializer<QuicStreamChannel>() {
+            @Override
+            protected void initChannel(QuicStreamChannel stream) {
+                rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
+            }
+        };
+    }
+
     private static final Logger LOG = Logger.getLogger("QUICraft");
     static final int CONNECT_TIMEOUT_MILLIS = 10_000;
     /** Bounds of the grace period for a late server preamble after 0-RTT (docs/protocol.md §8). */
@@ -908,6 +917,7 @@ public final class QuicClient {
                             if (stream.isLocalCreated()) {
                                 return; // stream 0 is created with its own handler below
                             }
+                            rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
                             // A server-created stream: only stream 1 (WORLD) is allowed (13.3).
                             V3ConnectionImpl current = v3;
                             if (current == null || stream.streamId() != 1) {
@@ -1060,7 +1070,7 @@ public final class QuicClient {
             // Netty fires this event inside its own send; a stream written from here would only go
             // out with the next flight, a round trip later. A task runs right after that send.
             connection.eventLoop().execute(() -> connection.createStream(QuicStreamType.BIDIRECTIONAL,
-                    new ChannelInboundHandlerAdapter()).addListener(s -> {
+                    readGrantInitializer()).addListener(s -> {
                         if (!s.isSuccess()) {
                             LOG.log(Level.FINE, "0-RTT stream failed", s.cause());
                             sent.complete(null);
@@ -1095,7 +1105,7 @@ public final class QuicClient {
         }
 
         private void openStream(QuicChannel connection) {
-            connection.createStream(QuicStreamType.BIDIRECTIONAL, new ChannelInboundHandlerAdapter())
+            connection.createStream(QuicStreamType.BIDIRECTIONAL, readGrantInitializer())
                     .addListener(s -> {
                         if (!s.isSuccess()) {
                             Codecs.closeLater(connection, true, Protocol.CLOSE_INTERNAL_ERROR);

@@ -1350,6 +1350,16 @@ position extraction. Those implementations must change together before this revi
     untouched. Debit further server buffering before taking ownership of bytes. Release
     credit reservations only when their exposure is gone. Record admission shares, actual
     active peaks and refusals at the 50,000-player target; profile values remain unmeasured.
+    Pending application reads start at 4 KiB, grow on full reads to 16 KiB, and shrink on
+    short reads or after one idle second; their cached allocator handle MUST enforce the
+    current grant before each read. Serverbound auxiliary lanes absent from the routing
+    table instead hold 1 KiB sentinel reads and reject any post-preamble data with `0x11`.
+    Thus an activated idle server connection with the shipped table reserves 30 KiB:
+    the separate 24 KiB quiche-unread admission share plus 4 + 1 + 1 KiB read grants.
+    Do not reserve a maximum-sized record at its boundary: charge the exact parser
+    allocation only once its length is known, withholding allocation and further reads
+    non-fatally if it cannot fit. A partial record's remaining allocation is thereby
+    charged before its next read; complete buffered records need no speculative grant.
      Outbound queues use a separate capped node pool, never the inbound pool or its admission
     shares. Each connection is limited to 1024 packets or 16 MiB unsent data, including
     binding quiescence bytes and bytes handed to QUIC but not yet released from its send
