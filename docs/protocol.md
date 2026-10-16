@@ -764,7 +764,10 @@ ownership, cap game-read-but-unconsumed bytes per connection at the staged share
 at the cap, and close locally if a declared frame exceeds the pre-login maximum frame size of 1 MiB plus
 framing (the vanilla login plugin answer bound; confirm per supported version). A declared frame
 larger than the staged share is charged at its exact declared length against the pre-login pool
-before further reads, subject to the prefix fair share below, then read in credit-sized steps;
+before further reads, subject to the prefix fair share below and a per-prefix cap on
+declared-length bytes in flight (profile value); once charged, its assembly may exceed the
+game-read-but-unconsumed cap up to that exact charge, and is then read in credit-sized steps.
+Time spent waiting for such a charge counts toward the client-wait deadline;
 if the charge cannot be made it waits non-fatally under the deadline, never `0x11`. This cap is not a
 total-byte limit. `/3` 0-RTT tickets carry the staged limits; never reduce remembered 0-RTT limits.
 Staging changes only the server's advertised CONNECTION credit: `initial_max_data = 8 KiB`
@@ -791,7 +794,9 @@ The `/3` pre-login pool has a hard cap, default 10% of the node budget (profile 
 Require `maxOpen >= logged-in target + pre-login connection cap`, where the pre-login connection cap is the pre-login pool's bytes divided by the staged per-connection reservation; raise `maxOpen`, `maxTrackedIps` and
 `globalAttemptsPerSecond` together from TransportConfig defaults 65536, 131072 and 2000 as needed.
 When global capacity is full, shed pre-login work rather than drop an honest token-bearing Initial.
-Choose a victim by hierarchical source-prefix fair share first (IPv6 /48 then /64, IPv4 /24; used
+Fair share is measured in pool bytes charged per prefix, not connection count, and applies to every
+charge, including declared-length charges and waits for one. Choose a victim by hierarchical
+source-prefix fair share first (IPv6 /48 then /64, IPv4 /24; used
 only for this choice), then least-progressed state, then random. A connection waiting on the
 server (hasJoined or platform event in flight) is not shed while its prefix is within its fair
 share; a prefix over its fair share loses that protection, and session-server calls in flight per
@@ -822,7 +827,7 @@ activation, even after Login Success. A shed closes before Login Success and cli
       client-detected zero-progress transport-failure case in 13.12 (including a peer `0x12`
       received while the client's own ack-eliciting data sat unACKed for the fixed 10 seconds; shortest step, 13.12) does
       advance §6's failure cache (and, during binding, the non-resource join-retry schedule below).
-      A pre-login shed (a `/3` close received before Login Success, 12.13) is excluded: it is
+      A pre-login shed (a `/3` `0x12` close received before Login Success, 12.13; any other code, idle timeout or dead path keeps its normal classification, and 13.12's zero-progress rule takes precedence) is excluded: it is
       not counted toward the allowance below, writes no failure-cache or re-bind-backoff
       entry and does not start the fixed 60-second window; the client retries TCP for that
       join only, and the next join tries QUIC as usual. Bound: after three consecutive pre-login
@@ -859,7 +864,8 @@ activation, even after Login Success. A shed closes before Login Success and cli
       it. A failed non-resource attempt consumes it and starts §6's exponential schedule for this limiter;
      during that window start joins directly over TCP (`quic-only` fails instead), without another QUIC login/session
       join. For a locally detected resource abort (or an authenticated peer report after
-      SERVER_SWITCH, or a pre-verification report within the allowance above), instead use
+      SERVER_SWITCH, or a pre-verification report within the allowance above; pre-login sheds
+      are not such reports and use only their own three-consecutive-shed bound above), instead use
       a fixed 60-second window: at most one QUIC attempt and
       its automatic TCP retry per minute per logical server, with NO doubling and no
       increase of any existing non-resource exponent. Resource aborts cannot extend a
