@@ -875,6 +875,14 @@ class LaneSessionTest {
         return out.toByteArray();
     }
 
+    private static boolean pendingAtLeast(LaneSession session, long records) {
+        try {
+            return LaneRig.snapshot(session)[0] >= records;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private static boolean snapshotIs(LaneSession session, int index, long value) {
         try {
             return LaneRig.snapshot(session)[index] == value;
@@ -1453,34 +1461,87 @@ class LaneSessionTest {
 
     @Test
     void aWaitThatClearedLeavesThePeersStallToItsOwnDeadline() throws Exception {
-        ReceiveBudget node = ReceiveBudget.bounded(512 * 1024);
+        ReceiveBudget node = ReceiveBudget.bounded(1 << 20);
         AtomicLong clock = new AtomicLong(5_000_000_000L);
         try (LaneRig rig = LaneRig.start(clockedRawServer(node, clock))) {
-            openRawServerLanes(rig);
-            long held = node.available();
+            QuicStreamChannel four = openRawServerLanes(rig);
+            // Leave room for small records but not for the big record the peer announces.
+            long held = node.available() - 150_000;
             assertTrue(node.tryReserve(held));
-            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, 200_000));
-            LaneLoopback.write(rig.clientControl, Arrays.copyOfRange(record, 0, 100));
-            sleep(300);
+            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.MOVE, 300_000));
+            LaneLoopback.write(four, Arrays.copyOfRange(record, 0, 100));
+            sleep(500);
             clock.addAndGet(5_000_000_000L);
             sleep(100);
-            assertFalse(rig.serverGame.closed.isDone(), "the local wait pauses the deadline");
+            assertFalse(rig.serverGame.closed.isDone(), "the local node refusal pauses the deadline");
+            // The connection's own record budget fills up from control records that wait for the stalled
+            // lane's record, so the next consume
+            // pass of the stalled lane leaves through the per-connection credit gate without
+            // retrying the refused allocation.
+            for (int i = 1; i <= 1023; i++) {
+                LaneLoopback.write(rig.clientControl,
+                        RecordCodec.encodeGame(i, i - 1, 1, 0, LaneRig.frame(LaneRig.SPAWN, 4)));
+            }
+            assertTrue(LaneRig.await(() -> pendingAtLeast(rig.server, 1024), 20000),
+                    "the control records are held: " + java.util.Arrays.toString(LaneRig.snapshot(rig.server)));
+            sleep(300);
+            // The node has room again; the lane's credit does not.
             node.release(held);
-            assertTrue(LaneRig.await(() -> snapshotIs(rig.server, 0, 1) && node.available() < 330_000, 10000),
-                    "the allocation was granted once the node had room: " + node.available());
-            // The peer now stalls with the rest of the record unsent: its own deadline runs again,
-            // from the moment the local wait ended.
+            rig.server.eventLoop().submit(rig.server::tick).get(10, TimeUnit.SECONDS);
+            sleep(300);
+            // The peer stalls: its own deadline runs from the moment the local wait ended.
             clock.addAndGet(9_000_000_000L);
-            sleep(200);
+            rig.server.eventLoop().submit(rig.server::tick).get(10, TimeUnit.SECONDS);
             assertFalse(rig.serverGame.closed.isDone(), "not yet 10 seconds after the wait ended");
             clock.addAndGet(2_000_000_000L);
+            rig.server.eventLoop().submit(rig.server::tick).get(10, TimeUnit.SECONDS);
             closedWith(rig.serverGame, 0x11, false);
+        }
+    }
+
+    /**
+     * A node budget that is full for anything above a ceiling: the bytes other connections hold
+     * leave only a sliver, so every read grant and record allocation is refused while small
+     * reservations still fit. One transport read delivers about one datagram, never a whole
+     * grant, so a nearly full node is modelled here instead of racing the freed grant bytes.
+     */
+    private static final class SliverBudget extends ReceiveBudget {
+        private final ReceiveBudget inner;
+        private volatile long ceiling = Long.MAX_VALUE;
+
+        SliverBudget(ReceiveBudget inner) {
+            this.inner = inner;
+        }
+
+        @Override
+        public boolean tryReserve(long bytes) {
+            return bytes <= ceiling && inner.tryReserve(bytes);
+        }
+
+        @Override
+        public boolean forceReserve(long bytes) {
+            return inner.forceReserve(bytes);
+        }
+
+        @Override
+        public void release(long bytes) {
+            inner.release(bytes);
+        }
+
+        @Override
+        public long reserved() {
+            return inner.reserved();
+        }
+
+        @Override
+        public long available() {
+            return Math.min(inner.available(), ceiling);
         }
     }
 
     @Test
     void peersThatStallInsideChargedRecordsAreClosedWhileTheNodeIsFullAndHonestConnectionsRecover() throws Exception {
-        ReceiveBudget node = ReceiveBudget.bounded(6L << 20);
+        SliverBudget node = new SliverBudget(ReceiveBudget.bounded(6L << 20));
         AtomicLong clock = new AtomicLong(5_000_000_000L);
         try (LaneRig attacker = LaneRig.start(clockedRawServer(node, clock));
                 LaneRig honest = LaneRig.start(clockedRawServer(node, clock))) {
@@ -1490,23 +1551,23 @@ class LaneSessionTest {
             LaneLoopback.write(attacker.clientControl, Arrays.copyOfRange(big, 0, 200));
             assertTrue(LaneRig.await(() -> snapshotIs(attacker.server, 0, 1), 10000), "the record is charged");
             sleep(300);
-            // The node fills up (other connections), then the attacker sends one more fragment and
-            // stalls: its next read must not depend on fresh node bytes.
-            long held = node.available();
-            assertTrue(node.tryReserve(held));
-            LaneLoopback.write(attacker.clientControl, Arrays.copyOfRange(big, 200, 400));
-            sleep(300);
+            // The node fills up (other connections): it can carry no read grant and no record
+            // allocation any more. The attacker sends one more fragment and stalls: reading the rest
+            // of the record it already paid for must not depend on fresh node bytes.
+            node.ceiling = 1000;
+            LaneLoopback.write(attacker.clientControl, Arrays.copyOfRange(big, 200, 800));
+            sleep(500);
             byte[] ok = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, 500_000));
             LaneLoopback.write(honest.clientControl, ok);
             sleep(300);
             assertEquals(0, honest.serverGame.packetCount(), "the honest record waits for node room");
             clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + 1_000_000_000L);
             closedWith(attacker.serverGame, 0x11, false);
+            node.ceiling = Long.MAX_VALUE;
             assertTrue(LaneRig.await(() -> honest.serverGame.packetCount() == 1, 30000),
-                    "the honest connection recovers when the attacker's charge is released: "
+                    "the honest connection recovers when the node has room again: "
                             + honest.serverGame.closed.getNow(null));
             assertFalse(honest.serverGame.closed.isDone());
-            node.release(held);
         }
     }
 
