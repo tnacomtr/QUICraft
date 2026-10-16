@@ -77,6 +77,7 @@ class V3ConnectionTest {
         QuicServer.confirmMillis = 10_000;
         QuicServer.v3StreamsForTests = -1;
         QuicClient.setGraceFloorForTests(0);
+        QuicClient.setBeforeConnectCompletionForTests(null);
         QuicClient.forgetSessions();
     }
 
@@ -127,6 +128,51 @@ class V3ConnectionTest {
                     identity.fingerprint(), TABLE, null);
             assertThrows(ExecutionException.class, () -> attempt.get(20, TimeUnit.SECONDS),
                     "the ALPN mismatch must fail the handshake");
+        }
+    }
+
+    @Test
+    void cancellingAfterServerAcceptsV3SendsPeerVisibleClose() throws Exception {
+        requireV3();
+        CountDownLatch completionPaused = new CountDownLatch(1);
+        CountDownLatch releaseCompletion = new CountDownLatch(1);
+        CountDownLatch acceptedAndCancelled = new CountDownLatch(1);
+        AtomicReference<CompletableFuture<V3Connection>> attemptRef = new AtomicReference<>();
+        AtomicReference<Boolean> cancelledAtAccept = new AtomicReference<>(Boolean.FALSE);
+        Loopback.Collector collector = new Loopback.Collector();
+        QuicClient.setBeforeConnectCompletionForTests(() -> awaitCompletionRelease(completionPaused,
+                releaseCompletion));
+        try (QuicServer server = bindServer(connection -> {
+            connection.setListener(collector);
+            connection.setAutoRead(true);
+            CompletableFuture<V3Connection> attempt = attemptRef.get();
+            cancelledAtAccept.set(Boolean.valueOf(attempt != null && attempt.cancel(false)));
+            acceptedAndCancelled.countDown();
+        })) {
+            CompletableFuture<V3Connection> attempt = QuicClient.connectV3(server.localAddress(),
+                    identity.fingerprint(), TABLE, null);
+            attemptRef.set(attempt);
+            assertTrue(completionPaused.await(5, TimeUnit.SECONDS), "client completion hook reached");
+            assertTrue(acceptedAndCancelled.await(5, TimeUnit.SECONDS), "server accepted and cancelled the attempt");
+            assertTrue(cancelledAtAccept.get().booleanValue(), "the /3 connect future was pending at acceptance");
+            releaseCompletion.countDown();
+            assertTrue(collector.closed.await(2, TimeUnit.SECONDS),
+                    "the accepted /3 connection must see CONNECTION_CLOSE before its deadline");
+        } finally {
+            releaseCompletion.countDown();
+            QuicClient.setBeforeConnectCompletionForTests(null);
+        }
+    }
+
+    private static void awaitCompletionRelease(CountDownLatch entered, CountDownLatch release) {
+        entered.countDown();
+        try {
+            if (!release.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting to release connect completion");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting to release connect completion", e);
         }
     }
 

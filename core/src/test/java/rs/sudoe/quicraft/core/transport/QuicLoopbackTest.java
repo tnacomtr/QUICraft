@@ -31,9 +31,11 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -522,6 +524,50 @@ class QuicLoopbackTest {
             } catch (java.util.concurrent.TimeoutException noStreamAccepted) {
                 // The cancellation may have arrived before the server accepted a QUIC stream.
             }
+        }
+    }
+
+    @Test
+    void cancellingAfterServerAcceptsV2SendsPeerVisibleClose() throws Exception {
+        CountDownLatch completionPaused = new CountDownLatch(1);
+        CountDownLatch releaseCompletion = new CountDownLatch(1);
+        CountDownLatch acceptedAndCancelled = new CountDownLatch(1);
+        AtomicReference<CompletableFuture<QuicByteStream>> attemptRef = new AtomicReference<>();
+        AtomicBoolean cancelledAtAccept = new AtomicBoolean();
+        Loopback.Collector collector = new Loopback.Collector();
+        QuicClient.setBeforeConnectCompletionForTests(() -> awaitCompletionRelease(completionPaused,
+                releaseCompletion));
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity, TransportConfig.DEFAULT, stream -> {
+            stream.setListener(collector);
+            stream.setAutoRead(true);
+            CompletableFuture<QuicByteStream> attempt = attemptRef.get();
+            cancelledAtAccept.set(attempt != null && attempt.cancel(false));
+            acceptedAndCancelled.countDown();
+        })) {
+            CompletableFuture<QuicByteStream> attempt = QuicClient.connect(server.localAddress(),
+                    identity.fingerprint(), TransportConfig.DEFAULT);
+            attemptRef.set(attempt);
+            assertTrue(completionPaused.await(5, TimeUnit.SECONDS), "client completion hook reached");
+            assertTrue(acceptedAndCancelled.await(5, TimeUnit.SECONDS), "server accepted and cancelled the attempt");
+            assertTrue(cancelledAtAccept.get(), "the connect future was still pending at server acceptance");
+            releaseCompletion.countDown();
+            assertTrue(collector.closed.await(2, TimeUnit.SECONDS),
+                    "the accepted /2 connection must see CONNECTION_CLOSE before its deadline");
+        } finally {
+            releaseCompletion.countDown();
+            QuicClient.setBeforeConnectCompletionForTests(null);
+        }
+    }
+
+    private static void awaitCompletionRelease(CountDownLatch entered, CountDownLatch release) {
+        entered.countDown();
+        try {
+            if (!release.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("timed out waiting to release connect completion");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting to release connect completion", e);
         }
     }
 

@@ -52,6 +52,8 @@ public final class QuicClient {
     private static final long MAX_GRACE_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     /** Tests only: a higher floor for the grace period; 0 keeps the specified one. */
     private static volatile long testGraceFloorNanos;
+    /** Tests only: pauses immediately before a successful connect future is completed. */
+    private static volatile Runnable testBeforeConnectCompletion;
     private static volatile EventLoopGroup group;
 
     private QuicClient() {}
@@ -400,6 +402,17 @@ public final class QuicClient {
         testGraceFloorNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0, millis));
     }
 
+    static void setBeforeConnectCompletionForTests(Runnable hook) {
+        testBeforeConnectCompletion = hook;
+    }
+
+    private static void beforeConnectCompletionForTests() {
+        Runnable hook = testBeforeConnectCompletion;
+        if (hook != null) {
+            hook.run();
+        }
+    }
+
     /**
      * What the latest QUIC attempt did about 0-RTT: {@code sent}, or why it sent nothing (no
      * early-data event from TLS, no recorded flight, no early token, ...). For tests and
@@ -662,6 +675,7 @@ public final class QuicClient {
                         stream.start();
                         raw.write(ByteBuffer.wrap(Preamble.encode(null)));
                         raw.flush();
+                        beforeConnectCompletionForTests();
                         if (!result.complete(stream)) {
                             stream.close(); // cancelled meanwhile
                         }
@@ -683,7 +697,7 @@ public final class QuicClient {
             }
             connection.eventLoop().execute(() -> connection
                     .close(true, Protocol.CLOSE_NORMAL, io.netty.buffer.Unpooled.EMPTY_BUFFER)
-                    // Let the close datagram leave before the socket goes.
+                    // This delay only applies if this listener runs first; closeFuture may close UDP sooner.
                     .addListener(closed -> udp.eventLoop().schedule(() -> udp.close(), 50,
                             java.util.concurrent.TimeUnit.MILLISECONDS)));
         }
@@ -980,6 +994,7 @@ public final class QuicClient {
                         stream.start();
                         raw.write(ByteBuffer.wrap(PreambleV2.encode(null)));
                         raw.flush();
+                        beforeConnectCompletionForTests();
                         if (!result.complete(stream)) {
                             stream.close(); // cancelled meanwhile
                         }
@@ -995,7 +1010,7 @@ public final class QuicClient {
             }
             connection.eventLoop().execute(() -> connection
                     .close(true, Protocol.CLOSE_NORMAL, io.netty.buffer.Unpooled.EMPTY_BUFFER)
-                    // Let the close datagram leave before the socket goes.
+                    // This delay only applies if this listener runs first; closeFuture may close UDP sooner.
                     .addListener(closed -> udp.eventLoop().schedule(() -> udp.close(), 50,
                             java.util.concurrent.TimeUnit.MILLISECONDS)));
         }
