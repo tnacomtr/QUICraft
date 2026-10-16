@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.InetAddress;
+import java.util.List;
 import java.util.Random;
 import org.junit.jupiter.api.Test;
 
@@ -44,11 +45,47 @@ class PreLoginAdmissionTest {
             assertTrue(admission.reserve("att" + i, ip("2001:db8:1:" + i + "::1"), 10));
         }
         assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
+        // The honest requester waits: four victims (40 bytes) are pending shed but still charged.
+        assertFalse(admission.reserve("honest", ip("2001:db8:2::1"), 40));
+        List<Object> shed = admission.drainShedOwners();
+        assertEquals(4, shed.size());
+        assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN), "shed bytes stay charged until confirmed");
+        assertEquals(100, admission.reservedByPrefix(ip("2001:db8:1::99")), "shed victims still count against their prefix");
+        // Pending sheds already cover the deficit: a retry picks no further victim.
+        assertFalse(admission.reserve("honest", ip("2001:db8:2::1"), 40));
+        assertTrue(admission.drainShedOwners().isEmpty());
+        for (Object owner : shed) admission.confirmClosed(owner);
+        assertEquals(60, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
+        // The replacement is granted only once the confirmed bytes have left the pool.
         assertTrue(admission.reserve("honest", ip("2001:db8:2::1"), 40));
         assertEquals(40, admission.reservedByPrefix(ip("2001:db8:2::99")));
         assertEquals(60, admission.reservedByPrefix(ip("2001:db8:1::99")));
-        assertEquals(4, admission.drainShedOwners().size());
-        assertTrue(pools.reserved(ResourcePools.Pool.PRE_LOGIN) <= 100);
+        assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
+    }
+
+    @Test void shedVictimStaysChargedUntilConfirmedAndReplacementFollowsIt() throws Exception {
+        NodePools pools = pools();
+        PreLoginAdmission admission = new PreLoginAdmission(pools, new Random(8));
+        for (int i = 0; i < 10; i++) {
+            assertTrue(admission.reserve("att" + i, ip("2001:db8:1:" + i + "::1"), 10));
+        }
+        assertFalse(admission.reserve("honest", ip("2001:db8:2::1"), 10));
+        List<Object> shed = admission.drainShedOwners();
+        assertEquals(1, shed.size());
+        Object victim = shed.get(0);
+        // The old charge is still held: pool and victim both unchanged, the replacement is not granted.
+        assertEquals(10, admission.reserved(victim));
+        assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
+        assertFalse(admission.reserve("honest", ip("2001:db8:2::1"), 10));
+        // The victim takes no new bytes while it is pending shed.
+        int victimIndex = Integer.parseInt(victim.toString().substring("att".length()));
+        assertFalse(admission.reserve(victim, ip("2001:db8:1:" + victimIndex + "::1"), 5));
+        assertEquals(10, admission.reserved(victim));
+        admission.confirmClosed(victim);
+        assertEquals(0, admission.reserved(victim));
+        assertEquals(90, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
+        assertTrue(admission.reserve("honest", ip("2001:db8:2::1"), 10));
+        assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
     }
 
     @Test void overShareRequesterIsRefusedWithoutShedding() throws Exception {
@@ -69,7 +106,7 @@ class PreLoginAdmissionTest {
             assertTrue(admission.reserve("att" + i, ip("2001:db8:1:" + i + "::1"), 10));
         }
         admission.progress("att1", 50);
-        assertTrue(admission.reserve("honest", ip("2001:db8:2::1"), 10));
+        assertFalse(admission.reserve("honest", ip("2001:db8:2::1"), 10));
         java.util.List<Object> shed = admission.drainShedOwners();
         assertEquals(1, shed.size());
         assertFalse(shed.contains("att1"), "most progressed connection must survive: " + shed);
@@ -99,8 +136,11 @@ class PreLoginAdmissionTest {
         for (int i = 1; i <= 4; i++) assertTrue(admission.reserve("c" + i, ip("2001:db8:3:1::" + i), 10));
         assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
         // Max-min over /48s gives A 60 and C 40. Inside A, the new /64 gets its 20 by shedding over-share /64 bytes.
+        assertFalse(admission.reserve("y", ip("2001:db8:1:2::1"), 20));
+        List<Object> shed = admission.drainShedOwners();
+        assertEquals(2, shed.size());
+        for (Object owner : shed) admission.confirmClosed(owner);
         assertTrue(admission.reserve("y", ip("2001:db8:1:2::1"), 20));
-        assertEquals(2, admission.drainShedOwners().size());
         assertEquals(20, admission.reserved("y"));
         assertEquals(60, admission.reservedByPrefix(ip("2001:db8:1::9")), "X keeps 40, Y holds 20");
         assertEquals(40, admission.reservedByPrefix(ip("2001:db8:3::9")));

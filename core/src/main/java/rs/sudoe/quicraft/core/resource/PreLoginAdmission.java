@@ -22,6 +22,10 @@ import java.util.Random;
  * first, then narrow excess, then least progress, then a seeded random tie-break. A requester over its narrow
  * allowance is refused rather than allowed to shed. The allocation is computed only on the full-pool path.</p>
  *
+ * <p>A shed victim stays charged to the pool (and to its prefixes' demand) until {@link #confirmClosed} is called.
+ * A requester that needs room is refused while pending sheds cover its deficit, and is granted only from bytes
+ * that were confirmed closed (protocol.md 12, pre-login shedding).</p>
+ *
  * <p>Promotion from PRE_LOGIN to NODE is atomic, via {@link NodePools#promote}. Thread-safe.</p>
  *
  * <p>Not implemented here (integration owns them): per-prefix declared-length caps, session-server call
@@ -61,10 +65,13 @@ public final class PreLoginAdmission {
         if (existing != null && (!existing.broad.equals(broad) || !existing.narrow.equals(narrow))) {
             throw new IllegalArgumentException("owner source prefix changed");
         }
+        // An owner already selected for shedding takes no new bytes.
+        if (existing != null && existing.shed) return false;
         if (!pools.reserve(ResourcePools.Pool.PRE_LOGIN, owner, bytes)) {
             if (!snapshot(broad, narrow, bytes).admits(broad, narrow)) return false;
-            if (!shedUntilRoom(owner, broad, narrow, bytes)) return false;
-            if (!pools.reserve(ResourcePools.Pool.PRE_LOGIN, owner, bytes)) return false;
+            // Victims are only marked pending here; the requester waits until their bytes are confirmed closed.
+            shedForRoom(owner, broad, narrow, bytes);
+            return false;
         }
         Charge charge = existing;
         if (charge == null) {
@@ -85,6 +92,8 @@ public final class PreLoginAdmission {
     public synchronized boolean promote(Object owner, long bytes) {
         Charge charge = charges.get(owner);
         if (charge == null || bytes < 0 || bytes > charge.bytes) throw new IllegalStateException("promotion exceeds reservation");
+        // A shed owner is closing; its bytes are not promoted.
+        if (charge.shed) return false;
         if (!pools.promote(ResourcePools.Pool.PRE_LOGIN, ResourcePools.Pool.NODE, owner, bytes)) return false;
         removeBytes(charge, bytes);
         return true;
@@ -116,7 +125,21 @@ public final class PreLoginAdmission {
         return prefixBytes(PrefixKey.broad(address));
     }
 
-    /** Returns and clears owners whose staged bytes were released for shedding; the integration closes them. */
+    /**
+     * Confirms that a shed owner was closed (integration sent 0x12 and the connection is gone). Only now are its
+     * staged bytes released to the pool, so the waiting requester can be granted on its next attempt.
+     *
+     * @throws IllegalStateException when the owner was not shed
+     */
+    public synchronized void confirmClosed(Object owner) {
+        Charge charge = charges.get(owner);
+        if (charge == null) return;
+        if (!charge.shed) throw new IllegalStateException("owner was not shed");
+        pools.release(ResourcePools.Pool.PRE_LOGIN, owner, charge.bytes);
+        removeBytes(charge, charge.bytes);
+    }
+
+    /** Returns and clears owners newly selected for shedding; they stay charged until {@link #confirmClosed}. */
     public synchronized List<Object> drainShedOwners() {
         List<Object> result = new ArrayList<Object>(shed);
         shed.clear();
@@ -124,19 +147,27 @@ public final class PreLoginAdmission {
     }
 
     /**
-     * Frees charges of over-share prefixes until {@code bytes} fit, or returns false when no victim is left. Only
-     * the pool's own releasable bytes are counted, so nothing is shed when the shared budget is full elsewhere.
+     * Marks over-share victims as pending shed until their charged bytes would cover {@code bytes}. Shedding is
+     * skipped when releasing every PRE_LOGIN byte could not make room (the shared budget may be full elsewhere),
+     * and no further victim is picked while pending sheds already cover the deficit.
      */
-    private boolean shedUntilRoom(Object requester, PrefixKey broad, PrefixKey narrow, long bytes) {
-        if (!pools.hasRoom(ResourcePools.Pool.PRE_LOGIN, bytes, pools.reserved(ResourcePools.Pool.PRE_LOGIN))) return false;
-        while (!pools.hasRoom(ResourcePools.Pool.PRE_LOGIN, bytes, 0)) {
-            Charge victim = snapshot(broad, narrow, bytes).victim(requester);
-            if (victim == null) return false;
-            pools.release(ResourcePools.Pool.PRE_LOGIN, victim.owner, victim.bytes);
-            removeBytes(victim, victim.bytes);
+    private void shedForRoom(Object requester, PrefixKey broad, PrefixKey narrow, long bytes) {
+        if (!pools.hasRoom(ResourcePools.Pool.PRE_LOGIN, bytes, pools.reserved(ResourcePools.Pool.PRE_LOGIN))) return;
+        if (pools.hasRoom(ResourcePools.Pool.PRE_LOGIN, bytes, pendingShedBytes())) return;
+        Snapshot snapshot = snapshot(broad, narrow, bytes);
+        while (!pools.hasRoom(ResourcePools.Pool.PRE_LOGIN, bytes, pendingShedBytes())) {
+            Charge victim = snapshot.victim(requester);
+            if (victim == null) return;
+            victim.shed = true;
             shed.add(victim.owner);
         }
-        return true;
+    }
+
+    /** Bytes still charged to owners pending shed (closing, not yet confirmed). */
+    private long pendingShedBytes() {
+        long total = 0;
+        for (Charge charge : charges.values()) if (charge.shed) total = add(total, charge.bytes);
+        return total;
     }
 
     /** Hierarchical max-min allocation with the requester's {@code bytes} included in its prefixes' demand. */
@@ -216,7 +247,7 @@ public final class PreLoginAdmission {
         Charge victim(final Object requester) {
             List<Charge> candidates = new ArrayList<Charge>();
             for (Charge charge : charges.values()) {
-                if (charge.owner.equals(requester) || charge.bytes == 0) continue;
+                if (charge.owner.equals(requester) || charge.bytes == 0 || charge.shed) continue;
                 if (broadExcess(charge) > 0 || narrowExcess(charge) > 0) candidates.add(charge);
             }
             if (candidates.isEmpty()) return null;
@@ -274,6 +305,7 @@ public final class PreLoginAdmission {
         final long tieBreak;
         long bytes;
         long progress;
+        boolean shed;
 
         Charge(Object owner, PrefixKey broad, PrefixKey narrow, long sequence, long tieBreak) {
             this.owner = owner;
