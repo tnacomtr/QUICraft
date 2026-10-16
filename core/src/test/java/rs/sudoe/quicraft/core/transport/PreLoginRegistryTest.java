@@ -431,6 +431,59 @@ class PreLoginRegistryTest {
     }
 
     @Test
+    void roomShedForANewcomersSlotIsNotTakenByAWaiterFirst() throws Exception {
+        // 12.13: a lease shed keeps the victim's pool bytes for the newcomer's admit too.
+        PreLoginTrackerTest.FakePools pools = new PreLoginTrackerTest.FakePools()
+                .capacity(ResourcePools.Pool.PRE_LOGIN, 3 * STAGED + 100);
+        PreLoginRegistry registry = new PreLoginRegistry(pools, 4, new Random(1));
+        List<Conn> shed = new ArrayList<>();
+        Conn quiet = admit(registry, "quiet", "203.0.113.1", true, shed);
+        admit(registry, "busy1", "198.51.100.1", true, shed);
+        admit(registry, "busy2", "198.51.100.2", true, shed);
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, quiet.entry.chargeDeclaredFrame(STAGED, 100));
+
+        assertTrue(registry.shedForLease(ip("192.0.2.1"), 6));
+        Conn newcomer = admit(registry, "newcomer", "192.0.2.1", true, shed);
+        assertNotNull(newcomer.entry, "the newcomer is admitted");
+        assertEquals(1, shed.size(), "one shed frees both the slot and the newcomer's room");
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, quiet.entry.chargeDeclaredFrame(STAGED, 100));
+    }
+
+    @Test
+    void theWaitSetIsReRankedAfterEveryGrant() throws Exception {
+        // 12.13: group A holds the least, but after one grant it holds more than group B, so B's waiter comes next.
+        long want = STAGED + 100;
+        PreLoginTrackerTest.FakePools pools = new PreLoginTrackerTest.FakePools()
+                .capacity(ResourcePools.Pool.PRE_LOGIN, 8 * STAGED + 3 * want);
+        PreLoginRegistry registry = new PreLoginRegistry(pools, 4, new Random(1));
+        List<Conn> shed = new ArrayList<>();
+        List<Conn> groupA = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            groupA.add(admit(registry, "a" + i, "203.0.113." + (i + 1), true, shed));
+        }
+        List<Conn> groupB = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            groupB.add(admit(registry, "b" + i, "198.51.100." + (i + 1), true, shed));
+        }
+        Conn filler = admit(registry, "filler", "192.0.2.1", true, shed);
+        assertTrue(filler.entry.chargeEarlyData(3 * want));
+        assertEquals(8 * STAGED + 3 * want, pools.held(ResourcePools.Pool.PRE_LOGIN), "the pool is full");
+        for (Conn c : groupA) {
+            assertEquals(PreLoginTracker.ChargeResult.WAIT, c.entry.chargeDeclaredFrame(STAGED, 100));
+        }
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, groupB.get(0).entry.chargeDeclaredFrame(STAGED, 100));
+
+        filler.entry.releaseExtra(3 * want);
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, groupB.get(0).entry.chargeDeclaredFrame(STAGED, 100),
+                "B is granted once A's first grant lifts A above it");
+        int grantedA = 0;
+        for (Conn c : groupA) {
+            if (c.entry.chargeDeclaredFrame(STAGED, 100) == PreLoginTracker.ChargeResult.CHARGED) grantedA++;
+        }
+        assertEquals(2, grantedA);
+    }
+
+    @Test
     void aWaiterThatDoesNotFitDoesNotBlockASmallerLowerPriorityOne() throws Exception {
         // 12.13 wait set: the quiet prefix (higher priority) needs more than the freed room, so it is skipped
         // and the busy prefix's smaller charge, which fits, is granted in the same pass.

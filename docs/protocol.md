@@ -802,13 +802,16 @@ When global capacity is full, shed pre-login work rather than drop an honest tok
 Fair share is measured in pool bytes charged per prefix, not connection count, and counts every
 charge, including declared-length charges. A declared-length charge is also bounded by a per-prefix
 cap (profile value). It is granted while the pool has room, so two prefixes never hold each other
-back on an uncontended pool. When the pool is full, or other charges are already waiting, the charge
-waits. Freed bytes (a release, a promotion, a close or a shed) go first to the waiting charge whose
+back on an uncontended pool. When the pool is full or the prefix is at its cap, the charge waits;
+when other charges are already waiting, it joins the wait set and is granted at once only if it
+fits in priority order. Freed bytes (a release, a promotion, a close or a shed) go first to the waiting charge whose
 address group holds the least pre-login bytes, using the same hierarchical prefixes as shedding
 (IPv6 /48, then /64 within it; IPv4 /24), then to the earlier arrival, then to the lower connection
-id. Each waiting charge that fits is granted in that order, and a larger one that does not fit is
+id. Each grant raises its group's holding, so the order is re-ranked before every grant. Each
+waiting charge that fits is granted in that order, and a larger one that does not fit is
 skipped rather than blocking a smaller one behind it. Bytes freed by shedding for a newcomer go to
-that newcomer first; the wait set is served once its admission is settled. A waiting charge never sheds, and it keeps the
+that newcomer first (whether shed for pool bytes or for an open-connection slot); the wait set is
+served once its admission is settled. A waiting charge never sheds, and it keeps the
 client-wait and 30 s hard-cap deadlines; an expired or closed waiter leaves the wait set and its bytes
 are never granted. A refusal stays a local `0x12` close at the deadline, never `0x11`. Choose a victim by hierarchical
 source-prefix fair share first (IPv6 /48 then /64, IPv4 /24; used

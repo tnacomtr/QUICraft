@@ -50,6 +50,8 @@ final class PreLoginRegistry {
      * bytes until its connection claims the frame, closes, or expires.
      */
     private final Set<Entry> declaredWaiters = new HashSet<>();
+    /** A lease shed freed pool bytes for a newcomer; its admit serves the wait set once it settles (12.13). */
+    private boolean drainOwed;
     private final Map<InetAddress, Integer> sessionCalls = new HashMap<>();
     private long nextEntryId;
     private long arrivals;
@@ -86,7 +88,8 @@ final class PreLoginRegistry {
      * fair share. Returns null when the connection cannot be admitted; the caller then refuses it
      * (the client falls back to TCP).
      *
-     * @param closeConnection non-blocking close with {@code 0x12}, run when this connection is shed
+     * @param closeConnection non-blocking close with {@code 0x12}, run when this connection is shed; it runs under
+     *     the registry lock and must not close the {@link Entry} synchronously
      */
     synchronized Entry admit(InetAddress source, Object owner, int shards, boolean online, LongSupplier clock,
             Runnable closeConnection) {
@@ -115,7 +118,7 @@ final class PreLoginRegistry {
                 shedAny = true;
             }
         } finally {
-            if (shedAny) {
+            if (shedAny || drainOwed) {
                 drainDeclaredWaiters();
             }
         }
@@ -136,7 +139,9 @@ final class PreLoginRegistry {
             return false;
         }
         LOG.log(Level.FINE, "shedding a staged /3 connection to free an open-connection slot");
-        shed(victim, true);
+        // The victim's pool bytes are kept for the newcomer's admit, which serves the wait set once it settles.
+        shed(victim, false);
+        drainOwed = true;
         return true;
     }
 
@@ -259,6 +264,7 @@ final class PreLoginRegistry {
      * Called after every release.
      */
     private void drainDeclaredWaiters() {
+        drainOwed = false;
         if (declaredWaiters.isEmpty()) {
             return;
         }
@@ -272,20 +278,38 @@ final class PreLoginRegistry {
         }
         Map<InetAddress, Long> byCoarse = bytesByCoarse();
         Map<InetAddress, Long> byFine = bytesByFine();
-        List<Entry> order = new ArrayList<>(declaredWaiters);
-        order.sort(Comparator.<Entry>comparingLong(e -> byCoarse.getOrDefault(e.coarse, 0L))
+        Comparator<Entry> priority = Comparator.<Entry>comparingLong(e -> byCoarse.getOrDefault(e.coarse, 0L))
                 .thenComparingLong(e -> byFine.getOrDefault(e.fine, 0L))
                 .thenComparingLong(e -> e.arrival)
-                .thenComparingLong(e -> e.id));
-        for (Entry e : order) {
-            if (e.pendingGranted || declaredInFlight(e.coarse) + e.pendingTotal > declaredBytesPerPrefix) {
-                continue;
+                .thenComparingLong(e -> e.id);
+        List<Entry> remaining = new ArrayList<>();
+        for (Entry e : declaredWaiters) {
+            if (!e.pendingGranted) {
+                remaining.add(e);
             }
-            if (e.tracker.chargeDeclaredFrame(e.pendingDeclared, e.pendingFraming)
-                    == PreLoginTracker.ChargeResult.CHARGED) {
-                e.declaredExtra += e.pendingTotal;
-                e.pendingGranted = true;
+        }
+        // Each grant raises its group's holding, so the order is re-ranked before every pick.
+        while (!remaining.isEmpty()) {
+            remaining.sort(priority);
+            Entry granted = null;
+            for (Entry e : remaining) {
+                if (declaredInFlight(e.coarse) + e.pendingTotal > declaredBytesPerPrefix) {
+                    continue;
+                }
+                if (e.tracker.chargeDeclaredFrame(e.pendingDeclared, e.pendingFraming)
+                        == PreLoginTracker.ChargeResult.CHARGED) {
+                    e.declaredExtra += e.pendingTotal;
+                    e.pendingGranted = true;
+                    granted = e;
+                    break;
+                }
             }
+            if (granted == null) {
+                return;
+            }
+            remaining.remove(granted);
+            byCoarse.merge(granted.coarse, granted.pendingTotal, Long::sum);
+            byFine.merge(granted.fine, granted.pendingTotal, Long::sum);
         }
     }
 
