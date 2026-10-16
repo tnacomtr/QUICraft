@@ -762,7 +762,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
       create/advance §6's failure cache or the re-bind failure backoff; peer-attributable
       inbound aborts (13.12) close `0x11`/`0x10` and use normal backoff, and the
       client-detected zero-progress transport-failure case in 13.12 (including a peer `0x12`
-      received while the client's own ack-eliciting data sat unACKed for the fixed 10 seconds) does
+      received while the client's own ack-eliciting data sat unACKed for the fixed 10 seconds; shortest step, 13.12) does
       advance §6's failure cache (and, during binding, the non-resource join-retry schedule below).
       Before SERVER_SWITCH verifies, a PEER-sent `0x12` cannot authenticate its resource
       claim. Apply the fixed 60-second resource window below to at most three such reports
@@ -1424,7 +1424,7 @@ position extraction. Those implementations must change together before this revi
      failure-cache write). `liveIdentitiesInBucket` can also be inflated with cheap idle
      connections to dilute an attacker's own bucket share; that only lowers shares, the
      worst-of rule still ranks the attacker's heavy connection, and the cost to the
-     attacker is admission slots. an attacker spanning all K buckets that has also filled every exact
+     attacker is admission slots. An attacker spanning all K buckets that has also filled every exact
      slot still degrades overflow reconnect-history fairness (bucket history is shared and
      bounded, not per identity); that precondition is DDoS-sized and the table never
      refuses admission, so the damage is limited to which eligible holder is reclaimed
@@ -1488,11 +1488,13 @@ position extraction. Those implementations must change together before this revi
      a failure). Asymmetric case: a client that receives a peer `0x12` while its own
      ack-eliciting data has been unACKed for at least a fixed 10 seconds on the client's
      own monotonic clock treats that close as a transport failure (cache advanced, using the
-     SHORTEST backoff step). While waiting for SERVER_SWITCH during binding the client sends
+     SHORTEST backoff step; it never shortens an existing non-resource window and does not
+     increase the backoff exponent). While waiting for SERVER_SWITCH during binding the client sends
      PING probes, so a dead client-to-server path always has ack-eliciting data outstanding.
      Both peers MUST produce QUIC ACKs in the transport, independently of game/tick or
      executor pressure, so a stalled game thread never looks like a dead path. A zero-progress abort during binding uses the
-     12.14 join-retry limiter's non-resource exponential schedule. Shared-pool `0x12`
+     12.14 join-retry limiter's non-resource exponential schedule; this split is deliberate:
+     the asymmetric case's shortest step applies to the failure cache only, never to the limiter. Shared-pool `0x12`
      aborts on a live path never do this.
      **Deadline precedence:** ANY deadline expiring while
      this node is withholding reads/grants needed for completion due to a LOCAL resource
@@ -1847,8 +1849,8 @@ position extraction. Those implementations must change together before this revi
       and does write the cache per 12.14) write no cache entry; the same abort with live-path ACKs (a
       shared-pool `0x12`) does not touch the cache; a server-detected case only logs; a
       client receiving a peer `0x12` after its own data sat unACKed for a fixed 10 seconds
-      treats it as a transport failure with the shortest backoff step; when the loss stops
-      after that window, the next join uses QUIC. Floor test: a refused-wait inbound
+      treats it as a transport failure with the shortest backoff step; when the loss stops,
+      after the backoff window expires the next join uses QUIC. Floor test: a refused-wait inbound
       holder's IP/account identity progress also uses the pre-wait floor. A sibling connection streaming cheap records on the same
       IP/account does not shield a stalled holder (worst-of ranking).
       Outbound tests must enforce node/IP/account caps and the same continuous score ranking;
