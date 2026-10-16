@@ -5,6 +5,7 @@ import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -43,7 +44,15 @@ final class PreLoginRegistry {
     private final long declaredBytesPerPrefix;
     private final Random random;
     private final Set<Entry> staged = new HashSet<>();
+    /**
+     * Declared-length charges that could not be granted at once (12.13 wait set). Drained in priority order
+     * (coarse holding, fine holding, arrival, id) whenever bytes are released; a granted waiter keeps its
+     * bytes until its connection claims the frame, closes, or expires.
+     */
+    private final Set<Entry> declaredWaiters = new HashSet<>();
     private final Map<InetAddress, Integer> sessionCalls = new HashMap<>();
+    private long nextEntryId;
+    private long arrivals;
 
     PreLoginRegistry(ResourcePools pools) {
         this(pools, ServerProfile.DEFAULT_SESSION_CALLS_PER_PREFIX, ServerProfile.DEFAULT_DECLARED_BYTES_PER_PREFIX,
@@ -151,15 +160,21 @@ final class PreLoginRegistry {
         return staged.size();
     }
 
-    /** Stops tracking a connection that promoted or closed. Called by {@link Entry}. */
+    /**
+     * Stops tracking a connection that promoted or closed, and takes it out of the wait set. Its bytes go
+     * with its tracker; the caller drains the wait set after the release. Called by {@link Entry}.
+     */
     private synchronized void forget(Entry entry) {
         staged.remove(entry);
+        dropDeclared(entry);
     }
 
     /** Sheds one victim. Only staged connections are shed; the tracker's state guards that. */
     private void shed(Entry victim) {
         staged.remove(victim);
+        dropDeclared(victim);
         victim.tracker.onShed();
+        drainDeclaredWaiters();
         try {
             victim.closeConnection.run();
         } catch (RuntimeException e) {
@@ -176,6 +191,87 @@ final class PreLoginRegistry {
             }
         }
         return bytes;
+    }
+
+    /** Declared-length bytes in flight for {@code fine}, over its staged connections (12.13 wait-set order). */
+    private Map<InetAddress, Long> bytesByFine() {
+        Map<InetAddress, Long> bytes = new HashMap<>();
+        for (Entry e : staged) {
+            bytes.merge(e.fine, e.charged(), Long::sum);
+        }
+        return bytes;
+    }
+
+    /** Adds {@code e} to the wait set for its declared charge; a waiter already in the set keeps its arrival. */
+    private void enqueueDeclared(Entry e, long declaredBytes, long framingBytes, long total) {
+        if (e.pendingTotal < 0) {
+            e.arrival = ++arrivals;
+            declaredWaiters.add(e);
+        }
+        e.pendingDeclared = declaredBytes;
+        e.pendingFraming = framingBytes;
+        e.pendingTotal = total;
+        e.pendingGranted = false;
+    }
+
+    /** Takes {@code e} out of the wait set without touching any bytes (a claimed, closed or shed charge). */
+    private void dropDeclared(Entry e) {
+        declaredWaiters.remove(e);
+        e.pendingTotal = -1;
+        e.pendingGranted = false;
+    }
+
+    /**
+     * Takes {@code e} out of the wait set and gives back a grant it was made but never claimed (an abandoned
+     * or expired frame), so the bytes return to the pool at once rather than at close.
+     */
+    private void abandonDeclared(Entry e) {
+        if (e.pendingTotal < 0) {
+            return;
+        }
+        if (e.pendingGranted) {
+            e.tracker.releaseExtra(e.pendingTotal);
+            e.declaredExtra -= Math.min(e.pendingTotal, e.declaredExtra);
+        }
+        dropDeclared(e);
+    }
+
+    /**
+     * Grants waiting declared-length charges in priority order (12.13): each waiter whose prefix is within the
+     * per-prefix cap and whose bytes fit the pool is granted; the others are skipped, so room is never left
+     * idle while a waiter fits. Expired or closed waiters leave the set without being granted. Priority is
+     * the hierarchical holding (IPv6 /48 then /64, IPv4 /24), then arrival order, then connection id.
+     * Called after every release.
+     */
+    private void drainDeclaredWaiters() {
+        if (declaredWaiters.isEmpty()) {
+            return;
+        }
+        for (Entry e : new ArrayList<>(declaredWaiters)) {
+            if (e.tracker.state() != PreLoginTracker.State.STAGED || e.tracker.expired()) {
+                abandonDeclared(e);
+            }
+        }
+        if (declaredWaiters.isEmpty()) {
+            return;
+        }
+        Map<InetAddress, Long> byCoarse = bytesByCoarse();
+        Map<InetAddress, Long> byFine = bytesByFine();
+        List<Entry> order = new ArrayList<>(declaredWaiters);
+        order.sort(Comparator.<Entry>comparingLong(e -> byCoarse.getOrDefault(e.coarse, 0L))
+                .thenComparingLong(e -> byFine.getOrDefault(e.fine, 0L))
+                .thenComparingLong(e -> e.arrival)
+                .thenComparingLong(e -> e.id));
+        for (Entry e : order) {
+            if (e.pendingGranted || declaredInFlight(e.coarse) + e.pendingTotal > declaredBytesPerPrefix) {
+                continue;
+            }
+            if (e.tracker.chargeDeclaredFrame(e.pendingDeclared, e.pendingFraming)
+                    == PreLoginTracker.ChargeResult.CHARGED) {
+                e.declaredExtra += e.pendingTotal;
+                e.pendingGranted = true;
+            }
+        }
     }
 
     /** True when adding {@code bytes} to {@code coarse}'s pre-login bytes would exceed its fair share. */
@@ -330,6 +426,15 @@ final class PreLoginRegistry {
         private long progress;
         /** Declared-length charges this connection holds beyond its staged share (12.13 per-prefix cap). */
         private long declaredExtra;
+        /** Connection id: the last tie-break of the wait-set order. */
+        private final long id;
+        /** Order in which this connection joined the wait set; set when it joins. */
+        private long arrival;
+        /** The declared-length charge waiting (or granted and unclaimed) for this connection; -1 when none. */
+        private long pendingDeclared;
+        private long pendingFraming;
+        private long pendingTotal = -1;
+        private boolean pendingGranted;
 
         private Entry(PreLoginTracker tracker, InetAddress source, InetAddress coarse, Runnable closeConnection) {
             this.tracker = tracker;
@@ -337,6 +442,7 @@ final class PreLoginRegistry {
             this.coarse = coarse;
             this.fine = finePrefix(source);
             this.closeConnection = Objects.requireNonNull(closeConnection, "closeConnection");
+            this.id = nextEntryId++;
         }
 
         /** The underlying accounting. Package-private: outside code uses the {@link PreLoginConnection} view. */
@@ -420,19 +526,38 @@ final class PreLoginRegistry {
                 if (total <= tracker.stagedShare()) {
                     return PreLoginTracker.ChargeResult.CHARGED;
                 }
-                // The per-prefix declared-length cap always applies, so one prefix holds at most that many bytes
-                // of extra charges. Beyond it, the pool decides: a charge that fits is granted, so an idle or
-                // uncontended pool never makes a prefix wait (fair share is not checked against an empty pool,
-                // which would stall two equally charged prefixes). A charge the pool cannot take waits, and
-                // waiting never sheds anyone else (12.13).
-                if (declaredInFlight(coarse) + total > declaredBytesPerPrefix) {
+                if (pendingTotal >= 0 && (pendingDeclared != declaredBytes || pendingFraming != framingBytes)) {
+                    // The caller moved on to another frame: the earlier request is abandoned.
+                    abandonDeclared(this);
+                }
+                if (tracker.expired()) {
+                    // 12.13: the deadlines still run; an expired connection is refused and never granted.
+                    abandonDeclared(this);
                     return PreLoginTracker.ChargeResult.WAIT;
                 }
-                PreLoginTracker.ChargeResult result = tracker.chargeDeclaredFrame(declaredBytes, framingBytes);
-                if (result == PreLoginTracker.ChargeResult.CHARGED) {
-                    declaredExtra += total;
+                if (pendingTotal >= 0 && pendingGranted) {
+                    // The grant made while this frame waited is claimed; its bytes are already charged.
+                    dropDeclared(this);
+                    return PreLoginTracker.ChargeResult.CHARGED;
                 }
-                return result;
+                // Grant at once while the pool has room, the prefix is under its per-prefix cap and no other charge
+                // is waiting (fair share is not checked against an empty pool, which would stall two equally charged
+                // prefixes). Otherwise the charge joins the wait set, and the pass grants it in priority order when
+                // bytes free up (12.13). Waiting never sheds anyone else.
+                if (declaredWaiters.isEmpty() && declaredInFlight(coarse) + total <= declaredBytesPerPrefix) {
+                    PreLoginTracker.ChargeResult result = tracker.chargeDeclaredFrame(declaredBytes, framingBytes);
+                    if (result == PreLoginTracker.ChargeResult.CHARGED) {
+                        declaredExtra += total;
+                        return result;
+                    }
+                }
+                enqueueDeclared(this, declaredBytes, framingBytes, total);
+                drainDeclaredWaiters();
+                if (pendingGranted) {
+                    dropDeclared(this);
+                    return PreLoginTracker.ChargeResult.CHARGED;
+                }
+                return PreLoginTracker.ChargeResult.WAIT;
             }
         }
 
@@ -451,6 +576,7 @@ final class PreLoginRegistry {
                     declaredExtra -= Math.min(bytes, declaredExtra);
                 }
                 tracker.releaseExtra(bytes);
+                drainDeclaredWaiters();
             }
         }
 
@@ -492,6 +618,7 @@ final class PreLoginRegistry {
                 }
                 forget(this);
                 tracker.close();
+                drainDeclaredWaiters();
             }
         }
 
@@ -500,6 +627,7 @@ final class PreLoginRegistry {
                 promotion.run();
                 if (tracker.state() != PreLoginTracker.State.STAGED) {
                     forget(this);
+                    drainDeclaredWaiters();
                 }
             }
         }

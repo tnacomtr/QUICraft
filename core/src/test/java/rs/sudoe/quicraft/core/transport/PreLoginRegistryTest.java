@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.resource.ResourcePools;
 
@@ -377,5 +378,88 @@ class PreLoginRegistryTest {
         assertFalse(registry.shedForLease(ip("192.0.2.3"), 6), "an over-share newcomer sheds no one");
         assertFalse(a1.closed || a2.closed || b1.closed, "no staged connection was shed");
         assertEquals(3, registry.stagedCount());
+    }
+
+    @Test
+    void aWaitingChargeIsGrantedBeforeBusyPrefixesWhenRoomFrees() throws Exception {
+        // 12.13 wait set: 50 busy prefixes each sit at their declared-length cap and fill the pool. An honest
+        // prefix's charge waits, and the first freed bytes go to it at once, not to a later retry.
+        long frame = 900_000 + 100;
+        int busy = 50;
+        long capacity = (busy + 1) * STAGED + busy * frame;
+        PreLoginTrackerTest.FakePools pools = new PreLoginTrackerTest.FakePools()
+                .capacity(ResourcePools.Pool.PRE_LOGIN, capacity);
+        PreLoginRegistry registry = new PreLoginRegistry(pools, 4,
+                rs.sudoe.quicraft.core.profile.ServerProfile.MIN_DECLARED_BYTES_PER_PREFIX, new Random(1));
+        Conn honest = admit(registry, "honest", "203.0.113.1", true, new ArrayList<>());
+        List<Conn> busyConns = new ArrayList<>();
+        for (int i = 0; i < busy; i++) {
+            busyConns.add(admit(registry, "busy" + i, "198.51." + i + ".1", true, new ArrayList<>()));
+        }
+        for (Conn c : busyConns) {
+            assertEquals(PreLoginTracker.ChargeResult.CHARGED, c.entry.chargeDeclaredFrame(900_000, 100));
+        }
+        assertEquals(capacity, pools.held(ResourcePools.Pool.PRE_LOGIN), "the busy prefixes fill the pool");
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, honest.entry.chargeDeclaredFrame(900_000, 100));
+
+        busyConns.get(0).entry.releaseExtra(frame);
+        assertEquals(capacity, pools.held(ResourcePools.Pool.PRE_LOGIN),
+                "the freed bytes were granted to the honest prefix on the release itself");
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, honest.entry.chargeDeclaredFrame(900_000, 100),
+                "the honest charge is claimed without another pool reservation");
+    }
+
+    @Test
+    void aWaiterThatDoesNotFitDoesNotBlockASmallerLowerPriorityOne() throws Exception {
+        // 12.13 wait set: the quiet prefix (higher priority) needs more than the freed room, so it is skipped
+        // and the busy prefix's smaller charge, which fits, is granted in the same pass.
+        long frame = 900_100;
+        long early = 50_000;
+        long room = 10_000;
+        long capacity = 3 * STAGED + frame + early + room;
+        PreLoginTrackerTest.FakePools pools = new PreLoginTrackerTest.FakePools()
+                .capacity(ResourcePools.Pool.PRE_LOGIN, capacity);
+        PreLoginRegistry registry = new PreLoginRegistry(pools, 4, new Random(1));
+        Conn quiet = admit(registry, "quiet", "203.0.113.1", true, new ArrayList<>());
+        Conn busy = admit(registry, "busy", "198.51.100.1", true, new ArrayList<>());
+        Conn filler = admit(registry, "filler", "192.0.2.1", true, new ArrayList<>());
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, filler.entry.chargeDeclaredFrame(900_000, 100));
+        assertTrue(busy.entry.chargeEarlyData(early));
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, quiet.entry.chargeDeclaredFrame(900_000, 100));
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, busy.entry.chargeDeclaredFrame(29_000, 1_000),
+                "the pool has only 10 000 bytes free");
+
+        filler.entry.releaseExtra(20_000);
+        assertEquals(capacity, pools.held(ResourcePools.Pool.PRE_LOGIN),
+                "the 30 000 bytes freed go to the busy prefix; the quiet one does not fit and is skipped");
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, busy.entry.chargeDeclaredFrame(29_000, 1_000));
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, quiet.entry.chargeDeclaredFrame(900_000, 100),
+                "the large waiter still waits for its own room");
+    }
+
+    @Test
+    void anExpiredWaiterIsRemovedAndNeverGranted() throws Exception {
+        // 12.13: an expired waiter leaves the wait set and its bytes are never granted by a later release.
+        AtomicLong now = new AtomicLong();
+        long capacity = 2 * STAGED + 950_000 + 10_000;
+        PreLoginTrackerTest.FakePools pools = new PreLoginTrackerTest.FakePools()
+                .capacity(ResourcePools.Pool.PRE_LOGIN, capacity);
+        PreLoginRegistry registry = new PreLoginRegistry(pools, 4, new Random(1));
+        Conn filler = new Conn("filler");
+        filler.entry = registry.admit(ip("192.0.2.1"), filler, 6, true, now::get, () -> filler.closed = true);
+        Conn waiter = new Conn("waiter");
+        waiter.entry = registry.admit(ip("198.51.100.1"), waiter, 6, true, now::get, () -> waiter.closed = true);
+
+        assertTrue(filler.entry.chargeEarlyData(950_000));
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, waiter.entry.chargeDeclaredFrame(900_000, 100));
+        now.set(PreLoginTracker.CLIENT_WAIT_NANOS);
+        assertTrue(waiter.entry.expired());
+
+        filler.entry.releaseExtra(950_000);
+        assertEquals(2 * STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN),
+                "the expired waiter was not granted the freed bytes");
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, waiter.entry.chargeDeclaredFrame(900_000, 100),
+                "an expired connection is refused a declared-length charge");
+        assertEquals(2 * STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN));
     }
 }
