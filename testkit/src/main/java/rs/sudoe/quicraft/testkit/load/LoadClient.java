@@ -7,7 +7,11 @@ import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -48,6 +52,8 @@ public final class LoadClient {
     private final AtomicLong failed = new AtomicLong();
     private final AtomicLong closed = new AtomicLong();
     private final AtomicLong lanesActive = new AtomicLong();
+    /** Failed dials by normalized cause (root exception class and message, digits folded). */
+    private final Map<String, AtomicLong> causes = new ConcurrentHashMap<>();
     private final Queue<Object> held = new ConcurrentLinkedQueue<>();
     private final CountDownLatch allDone;
     private final boolean v3;
@@ -130,6 +136,7 @@ public final class LoadClient {
         monitor.shutdownNow();
         System.out.println("SUMMARY started=" + load.started.get() + " connected=" + load.connected.get()
                 + " failed=" + load.failed.get() + load.v3Fields() + " rss_mb=" + ProcStats.rssMb());
+        load.printCauses();
         return 0;
     }
 
@@ -146,12 +153,41 @@ public final class LoadClient {
                 }
             } catch (java.util.concurrent.TimeoutException e) {
                 future.cancel(true);
-                failed.incrementAndGet();
+                recordFailure("attempt timed out after " + ATTEMPT_TIMEOUT_SEC + " s (no handshake result)");
             }
         } catch (Throwable t) {
-            failed.incrementAndGet();
+            recordFailure(normalizeCause(t));
         } finally {
             allDone.countDown();
+        }
+    }
+
+    private void recordFailure(String cause) {
+        failed.incrementAndGet();
+        causes.computeIfAbsent(cause, k -> new AtomicLong()).incrementAndGet();
+    }
+
+    /** Root cause as "class: message", digits folded to N so per-connection numbers group together. */
+    static String normalizeCause(Throwable t) {
+        Throwable root = t;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        String message = root.getMessage() == null ? "" : root.getMessage().replace('\n', ' ');
+        message = message.replaceAll("[0-9]+", "N");
+        if (message.length() > 160) {
+            message = message.substring(0, 160);
+        }
+        String text = root.getClass().getName() + ": " + message;
+        return root == t ? text : t.getClass().getSimpleName() + " <- " + text;
+    }
+
+    /** One FAIL_CAUSE line per distinct cause, most frequent first. */
+    private void printCauses() {
+        List<Map.Entry<String, AtomicLong>> entries = new ArrayList<>(causes.entrySet());
+        entries.sort((a, b) -> Long.compare(b.getValue().get(), a.getValue().get()));
+        for (Map.Entry<String, AtomicLong> e : entries) {
+            System.out.println("FAIL_CAUSE count=" + e.getValue().get() + " " + e.getKey());
         }
     }
 
