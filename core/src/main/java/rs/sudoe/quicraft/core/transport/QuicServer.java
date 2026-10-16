@@ -546,7 +546,7 @@ public final class QuicServer implements Closeable {
                         + "ingressInitialsPerSecond (" + config.ingressInitialsPerSecond + "), and the ingress guard "
                         + "shares that tracking limit; Initials from new addresses may be dropped while it is full");
             }
-            this.tokenHandler = new AdmissionTokenHandler(admission, validated, config.retryMode, retries);
+            this.tokenHandler = new AdmissionTokenHandler(admission, validated, config.retryMode, retries, v3 != null);
             this.ssl = QuicSslContextBuilder
                     .forServer(identity.privateKey(), null, identity.certificate())
                     // A /3 listener is /3-only: a /2 client fails the ALPN and falls back to TCP.

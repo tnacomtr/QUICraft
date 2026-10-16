@@ -57,7 +57,33 @@ class AdmissionTokenHandlerTest {
     /** A handler with the deterministic key and frozen clock. */
     private static AdmissionTokenHandler handler(ConnectionAdmission admission, ConnectionAdmission validated,
             TransportConfig.RetryMode mode, AtomicLong retries) {
-        return new AdmissionTokenHandler(admission, validated, mode, retries, KEY, FROZEN);
+        return new AdmissionTokenHandler(admission, validated, mode, retries, false, KEY, FROZEN);
+    }
+
+    /** A {@code /3}-style handler (prefix-fair validated budget) with the deterministic key and frozen clock. */
+    private static AdmissionTokenHandler fairHandler(ConnectionAdmission admission, ConnectionAdmission validated) {
+        return new AdmissionTokenHandler(admission, validated, TransportConfig.RetryMode.NEVER, new AtomicLong(),
+                true, KEY, FROZEN);
+    }
+
+    @Test
+    void v2ValidatedBudgetKeepsThePlainLimitWhileV3IsPrefixFair() {
+        // Two prefixes, a validated window of two attempts. The first prefix spends both.
+        InetSocketAddress attacker1 = new InetSocketAddress("10.0.1.1", 5000);
+        InetSocketAddress attacker2 = new InetSocketAddress("10.0.1.2", 5000);
+        InetSocketAddress honest = new InetSocketAddress("10.0.2.1", 5000);
+
+        AdmissionTokenHandler v2 = handler(admission(100, 100, 10, 10, 1), admission(2, 100, 10, 10, 2),
+                TransportConfig.RetryMode.NEVER, new AtomicLong());
+        assertTrue(v2.spendValidatedAttempt(attacker1.getAddress()));
+        assertTrue(v2.spendValidatedAttempt(attacker2.getAddress()));
+        assertFalse(v2.spendValidatedAttempt(honest.getAddress()), "/2: the plain limit refuses an honest prefix");
+
+        AdmissionTokenHandler v3 = fairHandler(admission(100, 100, 10, 10, 1), admission(2, 100, 10, 10, 2));
+        assertTrue(v3.spendValidatedAttempt(attacker1.getAddress()));
+        assertTrue(v3.spendValidatedAttempt(attacker2.getAddress()));
+        assertTrue(v3.spendValidatedAttempt(honest.getAddress()),
+                "/3: an honest prefix within its share is admitted by taking from the over-share prefix");
     }
 
     private ByteBuf owned(ByteBuf buffer) {
