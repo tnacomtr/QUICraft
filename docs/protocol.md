@@ -761,11 +761,10 @@ at first accepted 0-RTT early data, not handshake completion. Maintain a rolling
 ownership, cap game-read-but-unconsumed bytes per connection at the staged share, stop reading quiche
 at the cap, and close locally if a declared frame exceeds the pre-login maximum. This cap is not a
 total-byte limit. `/3` 0-RTT tickets carry the staged limits; never reduce remembered 0-RTT limits.
-initial transport limits are `initial_max_data = 8 KiB`,
-`initial_max_stream_data_bidi_local = 8 KiB`, and
-`initial_max_stream_data_bidi_remote = 8 KiB`; uni limits remain zero. Connection credit and stream
-windows are distinct, per endpoint and direction; use asymmetric windows and one-byte reverse-CHUNK
-guards as specified in §13.13, with pinned stream maxima. Require a per-connection maximum-window
+Staging changes only the server's advertised CONNECTION credit: `initial_max_data = 8 KiB`
+until promotion (online mode: Login Success, after session-server authentication; offline mode: `/3` activation), then MAX_DATA to 24 KiB. Stream windows are unchanged from §13.13: 8 KiB on
+client-opened bidi directions (CONTROL, REALTIME), one byte on reverse-CHUNK guards, pinned
+maxima; uni limits remain zero. The client's advertised limits are unchanged. Require a per-connection maximum-window
 setter so quiche auto-growth cannot raise a window before authentication. The current patched
 native sets the maximum window per listener configuration only (`Codecs`), so this needs a
 native change, which is an owner decision before implementation. The pre-login interval
@@ -775,8 +774,8 @@ request/response and login plugin traffic; `/3` OFFER, proofs and switch message
 pre-login. Eight KiB is a rolling credit, not a size limit: a larger legal message (for
 example a large login plugin answer) is read in window-sized steps, bounded by the
 game-read-but-unconsumed cap above. Do not reserve inflater state before compression is enabled. Compressed pre-login connections
-are charged to the pre-login pool. At `/3` activation reserve the full 24 KiB
-share from the node budget before raising MAX_DATA and MAX_STREAM_DATA to the full 24 KiB share.
+are charged to the pre-login pool. At promotion reserve the full 24 KiB
+share from the node budget before raising MAX_DATA to 24 KiB.
 Reserve the shared 40 KiB inflater only when Minecraft enables compression. If a raise or inflater
 reservation cannot be made, follow existing resource refusal/backpressure rules: wait non-fatally,
 then close locally for resource exhaustion; never close `0x11`.
@@ -811,6 +810,10 @@ activation, even after Login Success. A shed closes before Login Success and cli
       client-detected zero-progress transport-failure case in 13.12 (including a peer `0x12`
       received while the client's own ack-eliciting data sat unACKed for the fixed 10 seconds; shortest step, 13.12) does
       advance §6's failure cache (and, during binding, the non-resource join-retry schedule below).
+      A pre-login shed (a `/3` close received before Login Success, 12.13) is excluded: it is
+      not counted toward the allowance below, writes no failure-cache or re-bind-backoff
+      entry and does not start the fixed 60-second window; the client retries TCP for that
+      join only, and the next join tries QUIC as usual.
       Before SERVER_SWITCH verifies, a PEER-sent `0x12` cannot authenticate its resource
       claim. Apply the fixed 60-second resource window below to at most three such reports
       per rolling 10 minutes per logical server; the fourth and subsequent reports in that
@@ -1474,8 +1477,8 @@ position extraction. Those implementations must change together before this revi
 
     **Shared accounting:** no advertised credit or retained allocation may overcommit the
      node budget. Before login completes reserve only the staged pre-login share and charge it
-     against the separately capped pre-login pool (12.14). On login success (`/2`) or `/3`
-     activation, reserve the server's full 24 KiB share before increasing transport credit; if
+     against the separately capped `/3` pre-login pool (12.13; `/2` is not staged). At
+     promotion (online mode: Login Success, after session-server authentication; offline mode: `/3` activation), reserve the server's full 24 KiB share before increasing transport credit; if
      reservation is unavailable, apply the non-fatal wait and local/resource-close rules in
       12.14. Reserve the shared 40 KiB inflater when Minecraft enables compression, not at
      admission. Before ordinary post-login admission, reserve the server's 24 KiB share, not the client's
@@ -1495,7 +1498,8 @@ position extraction. Those implementations must change together before this revi
     then carries records within its 512-byte wire cap instead of holding a sentinel read,
     its reads come from the 2 KiB REALTIME slice inside the 24 KiB share, and the 40 KiB
      shared inflater is reserved at compression enablement; compressed pre-login connections are
-     charged to the pre-login pool until activation (open question 3).
+     charged to the pre-login pool until promotion (online Login Success, offline activation;
+     open question 3).
     Sentinel reads remain only for lanes the table leaves out.
     Do not reserve a maximum-sized record at its boundary: charge the exact parser
     allocation only once its length is known, withholding allocation and further reads
@@ -1722,11 +1726,11 @@ position extraction. Those implementations must change together before this revi
     uni limits are zero. Never increase MAX_STREAMS. Application validation rejects any
     server stream index >= N even though transport permits six. The client initially
     advertises 256 KiB per bidi stream and 2 MiB connection credit; the server advertises
-    24 KiB connection credit, preserving the existing per-connection credit and admission
+    24 KiB connection credit after promotion (8 KiB while staged pre-login, 12.13), preserving the existing per-connection credit and admission
     share. Server stream credit is asymmetric: 8 KiB on client-opened bidi directions
     (CONTROL and REALTIME), but only one byte on server-opened bidi directions (reverse
     CHUNK streams, which carry no valid bytes). Pin server stream maximum windows at
-    8 KiB and its connection maximum at 24 KiB; client maxima equal its initial windows.
+    8 KiB and its connection maximum at the current staged or promoted credit; client maxima equal its initial windows.
     No reverse-CHUNK guard read may replenish credit: its first byte closes the connection
     on the event loop before any further credit/send work. Thus the reverse chunk windows
     never grow beyond one byte on a live connection; the valid serverbound native exposure
@@ -1758,8 +1762,10 @@ position extraction. Those implementations must change together before this revi
     (no CHUNK preamble), charge before read, and close `0x11` on any CHUNK byte. Keep the respective exposure reserved
     until connection close; unused streams do not multiply the server's 24 KiB aggregate.
     Maximum-window pins are provided by the project's existing, tested Netty patch
-    `natives/patches/netty/0005-max-flow-control-windows.patch` (netty/0005); no further native
-    patch is planned. Retest pins and bounded reads for these revised limits before enabling
+    `natives/patches/netty/0005-max-flow-control-windows.patch` (netty/0005), which sets them per
+    listener. Staged pre-login admission (12.13) additionally needs a per-connection connection-
+    maximum setter so the 8 KiB staged maximum can be raised at promotion; that native change is
+    an owner decision before implementation. Retest pins and bounded reads for these revised limits before enabling
     `/3`; initial values alone are insufficient.
     These windows trade throughput for a provable memory bound. A clientbound 2 MiB record
      needs roughly eight window turns; a large serverbound CONTROL record at 8 KiB per RTT can hit
