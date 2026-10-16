@@ -107,7 +107,7 @@ Spectrum and similar) relay the ping, advertisement included, but drop UDP. The 
 4. The Minecraft handshake goes **only** over the winner. The loser is closed at once: QUIC with
    `CONNECTION_CLOSE` error `NO_ERROR`, TCP with a normal close.
 5. A QUIC loss or failure is recorded in the failure cache (§6), except `/3` resource aborts
-   under 12.14. Losing to TCP after the head
+   under 12.14 (with the authenticated unseen-prerequisite exception in 13.12). Losing to TCP after the head
    start counts as a failure.
 
 Known limit (Netty 4.2.19, verified in `QuicLoopbackTest`): when the server rejects the
@@ -759,7 +759,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
      while a local resource refusal prevents progress. Both peers recognize this application
       code, but locally detected resource aborts, authenticated peer resource reports (after
       SERVER_SWITCH verifies) and in-allowance pre-verification peer reports below MUST NOT
-      create/advance §6's failure cache or the re-bind failure backoff; peer-attributable
+      create/advance §6's failure cache or the re-bind failure backoff, with one exception:
+      two counted unseen-prerequisite expiries (13.12, "Deadline precedence") write a
+      shortest-step entry; peer-attributable
       inbound aborts (13.12) close `0x11`/`0x10` and use normal backoff, and the
       client-detected zero-progress transport-failure case in 13.12 (including a peer `0x12`
       received while the client's own ack-eliciting data sat unACKed for the fixed 10 seconds; shortest step, 13.12) does
@@ -812,7 +814,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
     TCP with Minecraft's own encryption, which an attacker can already force by stripping the
     advertisement (§7); the security review MUST confirm this. A failure
     after activation (during play) is not retried: the disconnect screen shows the reason and
-     the next join consults §6 (resource aborts do not add an entry). Pre-login racing and compatibility fallback remain §5
+     the next join consults §6 (resource aborts do not add an entry, except the authenticated unseen-prerequisite exception in 13.12). Pre-login racing and compatibility fallback remain §5
     behavior.
 15. **12.15 Pin persistence.** Only the client, after valid SERVER_SWITCH in online mode,
     records an authenticated pin. Store in its config directory `quicraft/pins-v2.json`,
@@ -1447,7 +1449,7 @@ position extraction. Those implementations must change together before this revi
      bound also applies. Never abort an honest binding on the first pool refusal while
      other connections retain reclaimable outbound bytes. Never deny honest protected
      inbound reads because another peer stopped reading. Locally detected genuine shared
-      resource aborts do not update the failure cache (12.14); apply the inbound peer-attribution
+      resource aborts do not update the failure cache (12.14), except the authenticated unseen-prerequisite exception in 13.12; apply the inbound peer-attribution
       exception below before classifying a refusal as resource-caused.
       A client-detected outbound/pending-ACK/binding-queue abort on a dead path is instead a
       transport failure that advances the failure cache (zero-progress definition, below).
@@ -1609,16 +1611,30 @@ position extraction. Those implementations must change together before this revi
      aborts on a live path never do this.
      **Deadline precedence:** Any unseen-prerequisite expiry closes the connection with the
       current local/resource code (proposed `0x12` if approved), never `0x11`, because the
-      receiver cannot distinguish honest loss from a forged dependency. The client writes no
-       failure-cache entry for an individual close, except through 12.14's existing client-local
-       zero-progress rule. This applies even if the blocked record is complete or held in excess.
-        The client counts each unseen-prerequisite/local-resource-code close it detects or
-        receives per (address,fingerprint), regardless of which direction carried the prerequisite. After
-       two within 10 minutes it writes a failure-cache entry at the SHORTEST backoff step, so
-       the next join uses TCP until expiry. The server logs a rate-limited warning per IP under
-       the existing warning limits. Residual: an attacker forging future dependencies gets a
-       resource close rather than `0x11`; memory remains bounded by 70 seconds, and it ranks
-       with zero lane progress and remains eligible for shedding under the existing ranking.
+      receiver cannot distinguish honest loss from a forged dependency. The sender of that
+      close puts the fixed ASCII reason phrase `unseen-prerequisite` in the CONNECTION_CLOSE
+      frame (authenticated after the handshake). Any other reason phrase, or none, on a
+      local/resource-code close means generic shedding or refusal. A server MUST NOT send the
+      phrase, and closes as generic resource instead, when the expired wait consumed any
+      recorded tick-stall time or when any part of the blocked record's prerequisite chain was
+      withheld locally (node pool, read grant or decode refusal). This applies even if the
+      blocked record is complete or held in excess.
+       **Repeated unseen-prerequisite closes (the only resource-close failure-cache write):**
+       per (address,fingerprint), regardless of which direction carried the prerequisite, the
+       client counts ONLY (a) received closes carrying exactly the `unseen-prerequisite`
+       reason phrase and (b) its own blocked-head timer expiries under the same conditions
+       (no recorded stall time consumed, nothing locally withheld). Generic resource closes,
+       pool refusals and shedding never count and never write the cache. After two counted
+       events within 10 minutes the client writes a failure-cache entry at the SHORTEST
+       backoff step, so the next join uses TCP until it expires. This entry never shortens or
+       resets an existing longer non-resource backoff window and never changes its exponent.
+       An individual close writes no entry, except through 12.14's existing client-local
+       zero-progress rule. The server logs a rate-limited warning per IP under the existing
+       warning limits. Residual: an attacker forging future dependencies gets a resource close
+       rather than `0x11`; memory remains bounded by 70 seconds, and it ranks with zero lane
+       progress and remains eligible for shedding under the existing ranking. Pressure from
+       other clients or a long server stall cannot produce a counted event, so shedding never
+       moves honest clients to TCP.
        For any other deadline, if its transitive prerequisite chain includes a locally withheld
       read, grant or decode, close with the current local/resource code and do not write a
       failure-cache entry. A deadline with no local withholding otherwise follows its existing
@@ -1756,7 +1772,9 @@ position extraction. Those implementations must change together before this revi
      including the per-connection shared inflater, peak pending bytes/records, CONTROL progress,
       latency and throughput under auxiliary
      pressure; measure inflater memory under a forced-compression flood and outbound Deflater
-     memory per connection. zlib defaults are about 256 KiB per Deflater (about 12.2 GiB at
+     memory per connection. Until measured, outbound compression state is either reserved at
+     admission or drawn from a shared bounded encoder pool; the choice follows the benchmark.
+     zlib defaults are about 256 KiB per Deflater (about 12.2 GiB at
      50,000 connections); measure actual use. A reduced deflate window/memLevel is a candidate
      profile value, not normative. Show the budgets hold without relying on TCP for the target
      QUIC population.
@@ -1775,11 +1793,12 @@ position extraction. Those implementations must change together before this revi
      no close. Test a large CONTROL head naming an unsent REALTIME sequence while unrelated
      movement flows: expiry frees excess and closes with the local/resource code, not `0x11`.
      An honest prerequisite lost beyond 10 seconds also closes non-`0x11` with no failure-cache
-      entry. A forged future dependency therefore gets a resource close, not `0x11`; memory
+      entry for that single close (repeated counted closes follow "Deadline precedence"). A forged future dependency therefore gets a resource close, not `0x11`; memory
       remains bounded by the deadline, ranks with zero lane progress and remains eligible for
       shedding under the existing ranking. Hold a transitive
      prerequisite on a local read/grant/decode refusal,
-     expire the dependent deadline, and assert local/resource close with no failure-cache write;
+     expire the dependent deadline, and assert a generic local/resource close (no
+     `unseen-prerequisite` phrase) with no failure-cache write;
       a complete dependency-blocked head in excess counts only for ranking/shedding, not close
       attribution. Include provable
       missing/wrong dependency rejection, duplicate id assignments across REALTIME/control-fence
@@ -1787,9 +1806,12 @@ position extraction. Those implementations must change together before this revi
        per-record REALTIME handoff overhead at 50,000 connections; a small
      count-based multi-record REALTIME slot within the same 512 bytes is a future option only,
      not normative. Across either blocked sending direction, test three successive join
-     attempts for one (address,fingerprint): the first two QUIC sessions close for unseen
-     prerequisites, then the third attempt uses TCP after the shortest backoff entry is
-     written. Verify the server warning is rate-limited per IP under the existing limits.
+     attempts for one (address,fingerprint): the first two QUIC sessions close with the exact
+     `unseen-prerequisite` reason phrase, then the third attempt uses TCP after the shortest
+     backoff entry is written. Negative tests: two generic resource closes (shedding) within
+     10 minutes write no entry and the third attempt still uses QUIC; an expiry whose wait
+     consumed recorded tick-stall time closes without the phrase; an existing longer
+     non-resource entry is not shortened. Verify the server warning is rate-limited per IP under the existing limits.
      Phase 5
     requires measured loss improvement over TCP AND single-stream and security review;
     this draft makes no performance or completed-review claim.
@@ -2096,6 +2118,9 @@ position extraction. Those implementations must change together before this revi
    10 seconds on the client's own clock) is a transport failure: it
    keeps the same wire code but advances section 6's failure cache like an idle timeout
    (13.12); a server-detected case only logs.
-   Locally detected resource aborts never write a failure-cache entry; before SERVER_SWITCH
-   verifies, peer reports remain untrusted and receive only 12.14's bounded retry allowance.
+   Generic locally detected resource aborts never write a failure-cache entry. The single
+   exception is the unseen-prerequisite expiry (13.12): two counted events within 10 minutes,
+   identified only by the authenticated `unseen-prerequisite` reason phrase or the client's
+   own blocked-head timer, write a shortest-step entry; shedding and stall-affected or locally
+   withheld expiries never count. Before SERVER_SWITCH verifies, other peer reports remain untrusted and receive only 12.14's bounded retry allowance.
    Close codes are wire format; nothing ships with `0x12` until this is confirmed.
