@@ -606,6 +606,15 @@ public final class ClientConnector {
             // TCP for new names until the player explicitly deletes a pin." So a new name with a
             // full store is TCP, not /2, even though /2 itself needs no pin.
             tcpReason = "the pin store is full and has no pin for this name (12.16)";
+        } else if (mode != ConnectDecision.Mode.QUIC_ONLY
+                && selection.transport() == TransportSelection.Transport.V3
+                && v3.rebinds().resourceWindowActive(logicalHost, logicalPort, now)) {
+            // 12.14: inside the fixed 60-second resource window (or with limiter state that cannot
+            // be read or written) the join starts directly over TCP, without another QUIC login.
+            // quic-only, the debug setting, ignores it as it ignores section 6's cache.
+            tcpReason = v3.rebinds().isUsable()
+                    ? "the fixed 60-second /3 resource window for this server is still active (12.14)"
+                    : "the /3 join-retry state cannot be read or written (12.14)";
         } else if (handshakeBackoff(server, advertisement, mode)) {
             // §6: a UDP-blocked or frontend-proxied /3 server costs at most one head start per
             // backoff window, exactly as the shipped decision treats a /2 server.
