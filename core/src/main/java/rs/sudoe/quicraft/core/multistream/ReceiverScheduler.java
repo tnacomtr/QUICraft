@@ -80,6 +80,13 @@ public final class ReceiverScheduler {
          * classification. The identity of {@code envelope} is the decode token. Callbacks may
          * complete inline or later on the same executor. {@code insideBundle} is true only for
          * CONTROL records following a decoded OPEN and preceding its decoded CLOSE.</p>
+         *
+         * <p>{@link #reserveDecoded} may refuse ({@link RetryLater}) when the shared node budget
+         * cannot carry an allocation yet. A decode that is refused that way owns the cleanup of
+         * everything it allocated for this attempt: it must release it before it lets the refusal
+         * propagate, because the entry stays undecoded and the scheduler reruns the decoder from
+         * its start. A decoder that keeps what it allocated leaks it and charges the same output
+         * again on every attempt.</p>
          */
         void decode(Envelope envelope, boolean insideBundle, long now);
     }

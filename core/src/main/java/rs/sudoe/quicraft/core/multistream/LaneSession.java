@@ -758,8 +758,10 @@ public final class LaneSession {
         try {
             d = game.decode(envelope.lane(), envelope.sequence(), frame, insideBundle, reservation);
         } catch (ReceiverScheduler.RetryLater retry) {
-            // 13.12: the node budget cannot carry the decompressed output yet. Nothing was
-            // allocated; the record stays undecoded and the tick retries it.
+            // 13.12: the node budget cannot carry the decompressed output yet. The game has released
+            // what it allocated for this attempt (LaneGame#decode) and the scheduler has already
+            // given this attempt's own reservations back, so the record stays undecoded and the
+            // tick reruns the whole decode.
             withheldForNode = true;
             throw retry;
         } catch (RuntimeException e) {

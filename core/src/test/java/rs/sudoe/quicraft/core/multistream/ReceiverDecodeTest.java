@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.multistream;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -318,6 +320,52 @@ class ReceiverDecodeTest {
         assertEquals(e.wireBytes() + 800, node.reserved(),
                 "exactly one decode's reservations stay charged");
         assertEquals(e.wireBytes() + 800, scheduler.pendingBytes());
+    }
+
+    @Test void aDecoderThatAllocatesBeforeItsSecondReservationIsRefusedReleasesItForTheRetry() {
+        // Room for the wire charge, a holder's bytes and one decode, but not for a refused attempt
+        // plus a rerun: the first attempt allocates output and is then refused its second
+        // reservation, and the retry starts the decode over (13.12).
+        ReceiveBudget node = ReceiveBudget.bounded(900);
+        List<ReceiverScheduler.Delivery> deliveries = new ArrayList<ReceiverScheduler.Delivery>();
+        List<ByteBuf> earlierAttempts = new ArrayList<ByteBuf>();
+        int[] attempts = new int[1];
+        final ReceiverScheduler[] self = new ReceiverScheduler[1];
+        ReceiverScheduler scheduler = new ReceiverScheduler((envelope, insideBundle, now) -> {
+            attempts[0]++;
+            // The contract a decoder has to keep: a refused attempt released what it allocated.
+            for (ByteBuf earlier : earlierAttempts) {
+                assertEquals(0, earlier.refCnt(),
+                        "a refused decode released what it had allocated before the rerun");
+            }
+            self[0].reserveDecoded(envelope, 300, 400, now);
+            ByteBuf output = Unpooled.buffer(64);
+            earlierAttempts.add(output);
+            try {
+                self[0].reserveDecoded(envelope, 500, 800, now);
+            } catch (ReceiverScheduler.RetryLater refused) {
+                output.release();
+                throw refused;
+            }
+            self[0].decoded(envelope, Envelope.Bundle.NONE, false, output, now);
+        }, deliveries::add, node);
+        self[0] = scheduler;
+        assertTrue(node.tryReserve(200), "a holder takes part of the node budget");
+        Envelope e = raw(Lane.CONTROL, 1, 0, 0, 0);
+        scheduler.offer(e, 0);
+        assertTrue(deliveries.isEmpty(), "the first attempt is refused");
+        scheduler.retry(1_000_000_000L);
+        assertTrue(deliveries.isEmpty(), "the second attempt is refused too");
+        assertEquals(e.wireBytes() + 200, node.reserved(),
+                "every refused attempt gave its own reservations back");
+        node.release(200);
+        scheduler.retry(2_000_000_000L);
+        assertEquals(3, attempts[0], "the offer and each retry ran the decoder once");
+        assertEquals(1, deliveries.size(), "the record is delivered by the successful attempt");
+        assertEquals(e.wireBytes() + 800, node.reserved(), "exactly one decode stays charged");
+        ByteBuf delivered = (ByteBuf) deliveries.get(0).records().get(0).body();
+        assertEquals(1, delivered.refCnt(), "the delivered body is the successful attempt's output");
+        delivered.release();
     }
 
     @Test void closingDecodedBundleDoesNotPermitDecodingTheFollowingControlBeforeCommit() {
