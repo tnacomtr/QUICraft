@@ -1623,9 +1623,9 @@ position extraction. Those implementations must change together before this revi
        per (address,fingerprint), regardless of which direction carried the prerequisite, the
        client counts ONLY (a) received application CONNECTION_CLOSE frames (type `0x1d`) with
        the local/resource code and exactly the `unseen-prerequisite` reason phrase, received
-       while `/3` is active after SERVER_SWITCH has verified (the phrase on any other frame
-       type, error code or connection state is ignored, and that close follows 12.14's
-       pre-verification rules), and (b) its own blocked-head timer expiries under the same conditions
+       while `/3` is active after SERVER_SWITCH has verified (a close that does not match
+       all of these is not counted and keeps its normal classification; only a peer resource
+       close before SERVER_SWITCH verifies uses 12.14's bounded pre-verification allowance), and (b) its own blocked-head timer expiries under the same conditions
        (no recorded stall time consumed, nothing locally withheld). Generic resource closes,
        pool refusals and shedding never count and never write the cache. After two counted
        events within 10 minutes the client writes a failure-cache entry at the SHORTEST
