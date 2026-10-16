@@ -6,7 +6,7 @@ import net.minecraft.network.ProtocolInfo;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
 
-/** The inbound protocol the game's decoder currently runs; the /3 codec decodes with the same one. */
+/** The inbound protocol the game's decoder currently runs: the state a /3 record is decoded in. */
 @Mixin(PacketDecoder.class)
 public interface PacketDecoderAccessor {
     @Accessor("protocolInfo")

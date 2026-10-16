@@ -16,11 +16,16 @@ import rs.sudoe.quicraft.fabric.server.V3Join;
  * holds Finish Configuration until it is over (docs/protocol.md 12.4). Any other connection has no
  * join and nothing happens.
  */
-@Mixin(ServerConfigurationPacketListenerImpl.class)
+@Mixin(value = ServerConfigurationPacketListenerImpl.class, priority = 2000)
 abstract class ServerConfigurationPacketListenerImplMixin {
-    @Inject(method = "startConfiguration", at = @At("HEAD"))
+    @Inject(method = "startConfiguration", at = @At("HEAD"), cancellable = true)
     private void quicraft$bindingStart(CallbackInfo ci) {
         Connection game = null;
+        if (ci.isCancelled()) {
+            // Fabric API holds the stage back until the client's channel registration arrived and
+            // calls startConfiguration again; the exchange begins on that call, not this one.
+            return;
+        }
         try {
             Hooks.enter("binding configuration");
             game = ((ServerCommonPacketListenerImplAccessor) (Object) this).quicraft$connection();

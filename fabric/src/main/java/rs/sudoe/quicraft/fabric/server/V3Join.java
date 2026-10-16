@@ -14,9 +14,7 @@ import io.netty.util.AttributeKey;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -24,7 +22,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import javax.crypto.Cipher;
 import net.minecraft.SharedConstants;
 import net.minecraft.network.Connection;
-import net.minecraft.network.ProtocolInfo;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.server.MinecraftServer;
@@ -39,7 +36,6 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.binding.BindingDriver;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
-import rs.sudoe.quicraft.core.routing.Direction;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.transport.V3Connection;
@@ -50,6 +46,7 @@ import rs.sudoe.quicraft.fabric.mixin.CipherDecoderAccessor;
 import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
 import rs.sudoe.quicraft.fabric.mixin.PacketEncoderAccessor;
 import rs.sudoe.quicraft.fabric.net.BindingPayload;
+import rs.sudoe.quicraft.fabric.net.FrameCodec;
 import rs.sudoe.quicraft.fabric.net.PacketLaneCodec;
 
 /**
@@ -73,7 +70,8 @@ public final class V3Join {
     private static final String ENCRYPT = "encrypt";
     private static final String SPLITTER = "splitter";
     private static final String FILTER = "quicraft_lane_out";
-    private static final String LANE_IN = "quicraft_lane_in";
+    private static final String ENCODER = "encoder";
+    private static final String SINK = "quicraft_lane_sink";
     private static final String LANE_ACK = "quicraft_lane_ack";
     /** 12.19: the explicit offline test profile; production servers never set it. */
     static final String OFFLINE_TEST_PROPERTY = "quicraft.multistream.offlineTest";
@@ -102,6 +100,9 @@ public final class V3Join {
     private RoutingTable table;
     private int protocol;
     private GameLanes lanes;
+    private PacketLaneCodec codec;
+    /** The protocol state of the packet now in the encoder, set where it enters the pipeline. */
+    private ProtocolState outboundState;
     private OutboundFilter filter;
     private ChannelFuture lastBindingWrite;
     private ByteBuf remainder;
@@ -431,17 +432,23 @@ public final class V3Join {
             handed.release();
         }
         ChannelPipeline pipeline = channel.pipeline();
-        PacketLaneCodec codec = new PacketLaneCodec(pipeline, table, Direction.CLIENTBOUND);
-        pipeline.addBefore(PACKET_HANDLER, LANE_IN, new ChannelInboundHandlerAdapter());
-        ChannelHandlerContext deliverFrom = pipeline.context(LANE_IN);
+        codec = new PacketLaneCodec(pipeline);
+        // Inbound: decoded records re-enter the game's pipeline right behind the frame splitter, as
+        // the frames TCP would have delivered, so every handler after it runs as usual.
+        ChannelHandlerContext deliverFrom = pipeline.context(SPLITTER);
+        if (deliverFrom == null) {
+            throw new IllegalStateException("no frame splitter to deliver behind");
+        }
         lanes = new GameLanes(channel, codec, connection::session, ProtocolState.CONFIGURATION, deliverFrom);
         pipeline.addAfter(PACKET_HANDLER, LANE_ACK, new AckHandler());
-        // The filter must stay the first handler a write meets: replace it around the lanes' own
-        // outbound handler.
+        // Outbound: the game's encoder keeps encoding, and its output goes to the session instead of
+        // the compression, length and cipher handlers. The filter stays the first handler a write
+        // meets and notes the state it is encoded in.
+        pipeline.addBefore(ENCODER, SINK, new EncoderSink());
         pipeline.remove(filter);
-        lanes.installOutbound();
         filter = new OutboundFilter(true);
         pipeline.addLast(FILTER, filter);
+        outboundState = encoderState(pipeline);
         phase = Phase.ACTIVE;
         connection.activate(lanes, protocol, control);
         // 12.13: what was queued during the exchange is encoded anew, as records.
@@ -509,9 +516,8 @@ public final class V3Join {
 
     /**
      * Tail-most outbound handler. Before activation it holds ordinary packets back while the exchange
-     * runs (12.10). After activation, in front of the lanes' own handler, it unbundles bundles into the
-     * records 13.15 describes, lets the game's pipeline-configuration messages reach the handlers they
-     * are for, and ends the lane session when the game closes the channel (13.14).
+     * runs (12.10). After activation it notes the state each packet is encoded in and ends the lane
+     * session when the game closes the channel (13.14).
      */
     private final class OutboundFilter extends ChannelOutboundHandlerAdapter {
         private final boolean active;
@@ -530,9 +536,9 @@ public final class V3Join {
         public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
             try {
                 if (!(msg instanceof Packet)) {
-                    // Configuration tasks of Connection.setupInboundProtocol/setupOutboundProtocol: they are
-                    // for the game's own handlers, not for a record.
-                    ctx.pipeline().context(PACKET_HANDLER).write(msg, promise);
+                    // The game's own pipeline-configuration messages (Connection.setupInboundProtocol
+                    // and setupOutboundProtocol) are for its handlers, not for a record.
+                    ctx.write(msg, promise);
                     return;
                 }
                 if (!active) {
@@ -549,28 +555,18 @@ public final class V3Join {
                                 break;
                         }
                     }
-                    ctx.write(msg, promise);
-                    return;
+                } else {
+                    // The encoder swaps itself out when it writes a terminal packet, so this is where the
+                    // state a packet is sent in can still be read (bundles and split payloads share it).
+                    ProtocolState state = encoderState(ctx.pipeline());
+                    if (state != null) {
+                        outboundState = state;
+                    }
                 }
-                writeActive(ctx, (Packet<?>) msg, promise);
+                ctx.write(msg, promise);
             } catch (Throwable t) {
                 promise.tryFailure(t);
                 fail("binding outbound filter: " + describe(t), t);
-            }
-        }
-
-        private void writeActive(ChannelHandlerContext ctx, Packet<?> packet, ChannelPromise promise) {
-            io.netty.channel.ChannelHandler encoder = ctx.pipeline().get("encoder");
-            ProtocolInfo<?> info = encoder instanceof net.minecraft.network.PacketEncoder<?>
-                    ? ((PacketEncoderAccessor) encoder).quicraft$protocolInfo() : null;
-            if (info == null || info.bundlerInfo() == null) {
-                ctx.write(packet, promise);
-                return;
-            }
-            List<Packet<?>> parts = new ArrayList<>();
-            info.bundlerInfo().unbundlePacket(packet, parts::add);
-            for (int i = 0; i < parts.size(); i++) {
-                ctx.write(parts.get(i), i == parts.size() - 1 ? promise : ctx.voidPromise());
             }
         }
 
@@ -584,6 +580,46 @@ public final class V3Join {
                 }
             }
             ctx.close(promise);
+        }
+    }
+
+    /** The state of the protocol the game's encoder runs right now, or null while none is configured. */
+    private static ProtocolState encoderState(ChannelPipeline pipeline) {
+        io.netty.channel.ChannelHandler encoder = pipeline.get(ENCODER);
+        if (!(encoder instanceof net.minecraft.network.PacketEncoder<?>)) {
+            return null;
+        }
+        return PacketLaneCodec.stateOf(((PacketEncoderAccessor) encoder).quicraft$protocolInfo().id());
+    }
+
+    /**
+     * Sits behind the game's encoder, where its output (packet id and payload) would go on to the
+     * compression, length-prefix and cipher handlers. After activation that output is a GAME record
+     * instead (13.4), framed as those handlers would have framed it. The packets before it ran the
+     * game's whole outbound pipeline, so bundles, split payloads and protocol swaps behaved as on TCP.
+     */
+    private final class EncoderSink extends ChannelOutboundHandlerAdapter {
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+            if (!(msg instanceof ByteBuf)) {
+                ctx.write(msg, promise);
+                return;
+            }
+            ByteBuf buffer = (ByteBuf) msg;
+            try {
+                byte[] packet = ByteBufUtil.getBytes(buffer);
+                ProtocolState state = outboundState;
+                if (state == null) {
+                    throw new IllegalStateException("no outbound state for an encoded packet");
+                }
+                connection.session().send(state, FrameCodec.packetId(packet), codec.outboundFrame(packet));
+                promise.trySuccess();
+            } catch (Throwable t) {
+                promise.tryFailure(t);
+                fail("binding outbound sink: " + describe(t), t);
+            } finally {
+                buffer.release();
+            }
         }
     }
 
