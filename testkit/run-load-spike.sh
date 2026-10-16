@@ -228,6 +228,11 @@ if [[ "$MODE" == v3 && "$LANES" == 1 ]]; then
         echo "FAIL lanes validation missing counters: baseline='$baseline_line' client='$client_summary' server='$server_stats'" >&2
         exit 1
     fi
+    settle_line="$(grep -E '^(SETTLED|SETTLE_TIMEOUT) ' "$results/client.log" | tail -n 1)"
+    if [[ "$settle_line" != SETTLED* ]]; then
+        echo "FAIL lanes settle: '$settle_line' (connected dials neither activated nor closed in time)" >&2
+        exit 1
+    fi
     if (( active_count != baseline_count || baseline_count != admitted_count )); then
         echo "FAIL lanes held check: activated_live_baseline=$baseline_count activated_live_end=$active_count admitted=$admitted_count" >&2
         exit 1

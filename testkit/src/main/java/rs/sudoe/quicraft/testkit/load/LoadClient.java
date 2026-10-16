@@ -82,6 +82,7 @@ public final class LoadClient {
         double rate = args.decimal("rate", 0);
         long sourceBase = ipv4ToLong(InetAddress.getByName(args.string("source-base", "127.1.0.0")));
         int holdSec = args.integer("hold-sec", 120);
+        int settleSec = args.integer("settle-sec", 15);
         int idleMin = args.integer("idle-minutes", 10);
         int statusSec = args.integer("status-interval", 5);
         long maxRssMb = args.integer("max-rss-mb", 12288);
@@ -139,6 +140,19 @@ public final class LoadClient {
 
         load.allDone.await();
         System.out.println("ALL_ATTEMPTS_RESOLVED seconds=" + (System.nanoTime() - t0) / 1_000_000_000L);
+        if (v3 && lanes) {
+            // Activation waits for the server's marker and runs on the event loop, so a connected
+            // dial may not be observable as activated yet. Wait (bounded) until every connected
+            // dial is either observed activated or closed before taking the baseline.
+            long settleDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(settleSec);
+            while (load.activatedLive() + load.closed.get() < load.connected.get()
+                    && System.nanoTime() < settleDeadline) {
+                Thread.sleep(50);
+            }
+            long unsettled = load.connected.get() - load.activatedLive() - load.closed.get();
+            System.out.println((unsettled > 0 ? "SETTLE_TIMEOUT" : "SETTLED") + " unsettled=" + Math.max(0, unsettled)
+                    + " seconds=" + (System.nanoTime() - t0) / 1_000_000_000L);
+        }
         long closedAtHoldStart = load.closed.get();
         long activatedLiveBaseline = v3 && lanes ? load.activatedLive() : 0;
         if (v3 && lanes) System.out.println("HOLD_BASELINE activated_live=" + activatedLiveBaseline);
