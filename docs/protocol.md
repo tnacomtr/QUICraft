@@ -548,15 +548,18 @@ single-socket listener: no dispatcher is installed and the connection id length 
 | `netty/0002-complete-connect-after-handshake-send` | Completes a client connect as soon as the handshake does (§5), in a task on the connection's event loop. |
 | `netty/0003-server-reads-accepted-early-data` | A server that accepted 0-RTT reads early stream data before the handshake completes: the connection is active during early data, and after the send that decrypts a buffered 0-RTT packet it processes the readable streams. Java only, so it works with upstream natives too. `SslHandshakeCompletionEvent` still marks the completed handshake. |
 | `netty/0004` | TLS keying material exporter accessor and capability probe, with JNI `SSL_export_keying_material` (12.2). Netty-only patch; the patched native is available only on linux-x86_64. |
-| `netty/0005-max-flow-control-windows` | `QuicCodecBuilder.maxConnectionWindow(long)` and `maxStreamWindow(long)` with JNI `quiche_config_set_max_connection_window` / `quiche_config_set_max_stream_window`, and the capability probe `Quic.isMaxFlowControlWindowsSupported()`, so the maxima of quiche's flow-control auto-tuning can be pinned. A maximum equal to the initial window disables growth for it (quiche clamps every window to its maximum). The setters alone do not satisfy 13.13: the values `/3` configures must still keep growth within 13.12's budgets, and `/3` stays off until they do. Unset, quiche keeps its defaults. Netty-only patch; the quicraft5 native has been built locally for linux-x86_64 only. |
+| `netty/0005-max-flow-control-windows` | `QuicCodecBuilder.maxConnectionWindow(long)` and `maxStreamWindow(long)` with JNI `quiche_config_set_max_connection_window` / `quiche_config_set_max_stream_window`, and the capability probe `Quic.isMaxFlowControlWindowsSupported()`, so the maxima of quiche's flow-control auto-tuning can be pinned. A maximum equal to the initial window disables growth for it (quiche clamps every window to its maximum). The setters alone do not satisfy 13.13: the values `/3` configures must still keep growth within 13.12's budgets, and `/3` stays off until they do. Unset, quiche keeps its defaults. Netty-only patch; the quicraft5 native is built and tested on all five platforms by the `netty-quic-natives` workflow (first green run 38876125706). |
 | `quiche/0002-backport-fc9fe129-handshake-close` | Upstream quiche fc9fe129 (2026-09-25), unchanged. Without it, an application close sent after the client's handshake completed but before HANDSHAKE_DONE (the window netty/0002 opens) never goes out, and the send loop spins forever. |
 
 - `natives/build-linux.sh` runs Netty's own Maven build unchanged in Docker, on AlmaLinux 8 with
   pinned GCC 13, Rust 1.98.0, CMake 3.31.9, Ninja 1.12.1 and Temurin 11. quiche commits no
   `Cargo.lock`, so `natives/quiche-Cargo.lock` pins the crate versions. Built jars stay in
   `natives/build/` and are never committed.
-- **Platforms.** The patched classes are used everywhere. The patched native exists for
-  linux-x86_64 only, and the other four platforms use upstream Netty's native. A patched class
+- **Platforms.** The patched classes are used everywhere. The `netty-quic-natives` workflow
+  builds the patched native for all five platforms and runs core's tests against it on each
+  platform's own runner (first green run 38876125706, 2026-10-16). A local build bundles the patched
+  native only for the platforms named in `-Pquicraft.patchedNatives` (linux-x86_64 by default,
+  from `natives/build-linux.sh`); the others use upstream Netty's native. A patched class
   with an upstream native still works: the extra JNI method is simply unbound.
   `Quic.isRelaxedLossThresholdSupported()` then returns false, and core leaves quiche's default
   in place after one INFO line. The exporter probe also returns false with upstream
@@ -592,9 +595,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
    Netty-only `natives/patches/netty/0004` patch binds BoringSSL's
    `SSL_export_keying_material` through JNI and `BoringSSL.java`, exposes an accessor on
    `QuicheQuicChannel` restricted to that channel's event loop, and provides
-   `Quic.isKeyingMaterialExportSupported()` in §11's `quicraft4` build. Only linux-x86_64
-   currently has a patched native; linux-aarch_64, osx-x86_64, osx-aarch_64 and
-   windows-x86_64 use upstream natives. Ship and test patched natives for all five platforms
+   `Quic.isKeyingMaterialExportSupported()` in §11's `quicraft4` build. Patched natives
+   for all five platforms are built and pass core's tests (native load, exporter, shaded jar)
+   on their own CI runners (run 38876125706), but a release only carries the ones it is built
+   with (`-Pquicraft.patchedNatives`). Ship and test patched natives for all five platforms
    before enabling this feature on all five; enable a platform only after its own native
    load, exporter equality, and upstream-native compatibility tests pass.
 3. **12.3 Gate before negotiation.** Both peers MUST have a true exporter capability probe

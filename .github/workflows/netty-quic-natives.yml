@@ -4,9 +4,8 @@
 # (-Pquicraft.patchedNatives=all). Manual only: macOS minutes are expensive and a cold build takes
 # 15-30 min per platform.
 #
-# NOT RUN YET. Linux x86_64 is the only platform built and tested so far (locally, through
-# natives/build-linux.sh). The macOS and Windows toolchain steps follow Netty's own release
-# workflow but are untested; expect to fix them on the first run.
+# First fully green run: 38876125706 (2026-10-16, quicraft5): all five platforms built, and
+# core's tests, shaded jar test and shaded notices check passed on each platform's runner.
 name: netty-quic-natives
 
 on:
@@ -139,9 +138,9 @@ jobs:
         run: sudo ifconfig lo0 alias 127.0.0.2 up
       # macOS runners miss the Linux-calibrated round-trip timings (see core/build.gradle.kts).
       - run: ./gradlew -Pquicraft.patchedNatives=all ${{ runner.os == 'macOS' && '-Pquicraft.skipRttTimingTests' || '' }} :core:test :core:shadedTest :core:checkShadedNotices
+      # Not named netty-quic-*: a slower verify job downloading that pattern would pick it up.
       - uses: actions/upload-artifact@v7
         if: matrix.native == 'linux-x86_64'
-      # Not named netty-quic-*: a slower verify job downloading that pattern would pick it up.
         with:
           name: quicraft-natives-repo-all
           path: natives/build/out/repo/
