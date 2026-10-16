@@ -27,6 +27,8 @@ import rs.sudoe.quicraft.core.profile.ServerProfile;
  *     more than one quantum. Inside a bundle run, stream 0 stays open (13.15).</li>
  * <li>Urgent records (REALTIME, and ACK_JOIN or BATCH_JOIN) whose prerequisites are unsent promote
  *     the earliest ready prerequisite chain instead of filling QUIC with dependents.</li>
+ * <li>A ready CHUNK passed over {@link #MAX_CHUNK_SKIPS} times in a row is taken next, so chunks
+ *     progress under any REALTIME or promoted CONTROL load.</li>
  * <li>Fair selection: each class (REALTIME, CHUNK, CONTROL) has a virtual time advanced by the
  *     slice bytes divided by its profile weight. The lowest one wins, so each runnable class gets a
  *     share proportional to its weight. Ties go REALTIME, then CHUNK, then CONTROL. REALTIME is also
@@ -50,6 +52,12 @@ public final class SendScheduler {
     public static final int MAX_REALTIME_BURST = 8;
     /** Selections a ready CONTROL head may wait before it is taken regardless of weight (13.20). */
     public static final int AGE_LIMIT = 32;
+    /**
+     * Selections that may pass over a ready CHUNK before it is taken. A ready, writable chunk is
+     * therefore selected by the ninth selection, whatever REALTIME or promoted CONTROL load runs
+     * (13.20).
+     */
+    public static final int MAX_CHUNK_SKIPS = 8;
 
     private static final int CONTROL = LogicalStream.CONTROL;
     private static final int REALTIME = LogicalStream.REALTIME;
@@ -70,6 +78,7 @@ public final class SendScheduler {
     private long virtualTime;
     private long selections;
     private int realtimeRun;
+    private int chunkSkips;
     private int lastChunk = 1;
     private boolean bundleOpen;
     private int queuedRecords;
@@ -187,6 +196,29 @@ public final class SendScheduler {
             }
             return select(next);
         }
+        Item chunk = chunkCandidate(writable);
+        if (chunk != null && chunkSkips >= MAX_CHUNK_SKIPS) {
+            chunkSkips = 0;
+            return select(chunk);
+        }
+        Item chosen = promotedHead(writable);
+        if (chosen == null) {
+            chosen = choose(writable, chunk);
+        }
+        if (chunk == null || chosen == null || classOf(chosen.record.streamIndex()) == CLASS_CHUNK) {
+            chunkSkips = 0;
+        } else {
+            chunkSkips++;
+        }
+        return chosen == null ? null : select(chosen);
+    }
+
+    /**
+     * Earliest ready prerequisite chain of a blocked urgent head, or null. A promoted pick is charged
+     * like any other pick in {@link #select}, and it cannot pass a ready CHUNK forever: the
+     * {@link #MAX_CHUNK_SKIPS} rule in {@link #pollSelection} applies first (13.20).
+     */
+    private Item promotedHead(IntPredicate writable) {
         for (Map.Entry<Integer, ArrayDeque<Item>> entry : queues.entrySet()) {
             Item head = entry.getValue().peekFirst();
             if (head == null || !isUrgent(head) || ready(head)) {
@@ -194,11 +226,10 @@ public final class SendScheduler {
             }
             Item promoted = promote(head, new HashSet<Long>(), writable);
             if (promoted != null) {
-                return select(promoted);
+                return promoted;
             }
         }
-        Item chosen = choose(writable);
-        return chosen == null ? null : select(chosen);
+        return null;
     }
 
     /** Records queued and not yet fully selected (13.20). */
@@ -216,12 +247,11 @@ public final class SendScheduler {
         return queuedRecords >= queuePacketLimit || queuedBytes >= queueByteLimit;
     }
 
-    private Item choose(IntPredicate writable) {
+    private Item choose(IntPredicate writable, Item chunk) {
         Item control = usableFront(CONTROL, writable);
         if (control != null && selections - control.enqueuedAt >= AGE_LIMIT) {
             return control;
         }
-        Item chunk = chunkCandidate(writable);
         Item realtime = usableFront(REALTIME, writable);
         boolean others = chunk != null || control != null;
         List<Item> candidates = new ArrayList<Item>(3);

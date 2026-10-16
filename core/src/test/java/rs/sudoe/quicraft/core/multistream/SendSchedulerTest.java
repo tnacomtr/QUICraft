@@ -101,6 +101,30 @@ class SendSchedulerTest {
                 "REALTIME burst was " + longestRealtimeRun);
     }
 
+    @Test void independentChunkIsServedWithinTheSkipBoundUnderPromotedControlRealtimePairs() {
+        // REALTIME weight far above CONTROL: each promoted CONTROL slice pushes the virtual time past
+        // REALTIME's, so fairness alone would let the REALTIME record tie-win over the chunk forever.
+        SendScheduler scheduler = new SendScheduler(profile(1, 1000, 1));
+        scheduler.offer(rec(2, 1), 1000);
+        // Every REALTIME record waits for its own CONTROL fence, so each pick is a promotion of that
+        // CONTROL record followed by the REALTIME record, which used to keep the chunk out forever.
+        for (int i = 1; i <= 200; i++) {
+            scheduler.offer(rec(0, i), 1);
+            scheduler.offer(rec(1, i, 0, i), 1000);
+        }
+        int position = -1;
+        for (int i = 0; i < 40 && position < 0; i++) {
+            SendScheduler.Selection selection = scheduler.pollSelection(ALL);
+            assertNotNull(selection);
+            if (selection.record().streamIndex() == 2) {
+                position = i;
+            }
+        }
+        assertTrue(position >= 0 && position <= SendScheduler.MAX_CHUNK_SKIPS,
+                "independent chunk selected at position " + position + ", bound is "
+                        + SendScheduler.MAX_CHUNK_SKIPS);
+    }
+
     @Test void chunkShardsAreServedRoundRobin() {
         SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
         for (int i = 1; i <= 50; i++) {
