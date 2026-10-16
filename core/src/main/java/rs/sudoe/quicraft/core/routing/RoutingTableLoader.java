@@ -297,8 +297,12 @@ public final class RoutingTableLoader {
             catch (IllegalArgumentException e) { throw new RoutingTableException(e.getMessage()); }
             limits.put(state, new RouteV2.ServerboundLimits(control, realtime, decoded, allowance, (String) accounting));
         }
-        if (!limits.containsKey(ProtocolState.PLAY))
-            throw new RoutingTableException("13.7: missing play limits");
+        // Every state needs limits, not only those with explicit routes: implicit CONTROL/global
+        // default routes (13.6) inherit their state's accounting for unknown packet ids.
+        for (ProtocolState state : ProtocolState.values()) {
+            if (!limits.containsKey(state))
+                throw new RoutingTableException("13.7: missing limits for state " + state.wireName());
+        }
         Object entries = root.get("routes");
         if (!(entries instanceof List)) throw new RoutingTableException("13.7: routes must be an array");
         Map<RouteKey, RouteV2> routes = new LinkedHashMap<>();

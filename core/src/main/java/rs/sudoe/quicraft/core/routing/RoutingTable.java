@@ -63,10 +63,16 @@ public final class RoutingTable {
     /** Reviewed per-state read/decode limits (13.7). */
     public Map<ProtocolState, RouteV2.ServerboundLimits> serverboundLimits() { return serverboundLimits; }
 
-    /** Exact schema-2 lookup, defaulting to CONTROL/global without guessing (13.6). */
+    /**
+     * Exact schema-2 lookup, defaulting to CONTROL/global without guessing (13.6). A defaulted route
+     * carries its state's accounting identifier, the same one an explicit route in that state gets,
+     * so unknown ids are footprint-bounded like known ones (13.7).
+     */
     public RouteV2 routeV2For(RouteKey key) {
         RouteV2 route = routesV2.get(key);
-        return route == null ? new RouteV2(null, null, false, serverboundLimits.get(key.state()), null) : route;
+        if (route != null) return route;
+        RouteV2.ServerboundLimits bound = serverboundLimits.get(key.state());
+        return new RouteV2(null, null, false, bound, bound == null ? null : bound.decodeFootprintBound);
     }
 
     /** The Minecraft protocol number this table is for (13.7). */

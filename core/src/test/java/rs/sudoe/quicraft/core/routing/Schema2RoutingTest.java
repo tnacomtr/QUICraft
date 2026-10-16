@@ -8,9 +8,19 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 class Schema2RoutingTest {
-    private static final String LIMITS = "{\"play\":{\"maxServerboundRecord\":100,"
+    private static final String STATE_LIMIT = "{\"maxServerboundRecord\":100,"
             + "\"maxServerboundRealtimeRecord\":510,\"maxDecodedFootprint\":300,"
-            + "\"ordinaryReadAllowance\":5619,\"decodeFootprintBound\":\"primitive.raw_copies.v1\"}}";
+            + "\"ordinaryReadAllowance\":5619,\"decodeFootprintBound\":\"primitive.raw_copies.v1\"}";
+    /** serverboundLimits with exactly these states; every supported state is required (13.7). */
+    private static String limits(String... states) {
+        StringBuilder out = new StringBuilder("{");
+        for (String state : states) {
+            if (out.length() > 1) out.append(',');
+            out.append('"').append(state).append("\":").append(STATE_LIMIT);
+        }
+        return out.append('}').toString();
+    }
+    private static final String LIMITS = limits("handshaking", "status", "login", "configuration", "play");
 
     private static String route(String direction, String lane, String dependency, String position) {
         return "{\"state\":\"play\",\"direction\":\"" + direction + "\",\"packet_id\":1,\"lane\":\""
@@ -149,16 +159,40 @@ class Schema2RoutingTest {
         assertDoesNotThrow(() -> RoutingTableLoader.parse(table(loginRoute)));
         String serverLogin = route("serverbound", "control", "global", "null")
                 .replace("\"state\":\"play\"", "\"state\":\"login\"");
-        reject(table(serverLogin));
-        String bothLimits = LIMITS.substring(0, LIMITS.length() - 1) + ","
-                + LIMITS.substring(1, LIMITS.length() - 1).replace("\"play\":", "\"login\":") + "}";
-        assertDoesNotThrow(() -> RoutingTableLoader.parse(table(serverLogin).replace(LIMITS, bothLimits)));
+        assertDoesNotThrow(() -> RoutingTableLoader.parse(table(serverLogin)));
+        reject(table(serverLogin).replace(LIMITS, limits("handshaking", "status", "configuration", "play")));
         assertDoesNotThrow(() -> RoutingTableLoader.parse(json, Collections.singleton(
                 new RouteKey(12345, ProtocolState.PLAY, Direction.CLIENTBOUND, 1))));
         for (String lane : new String[] {"realtime", "chunk"})
             assertThrows(RoutingTableException.class, () -> RoutingTableLoader.parse(table(
                     route("clientbound", lane, "lane", lane.equals("chunk") ? "\"one\"" : "null")),
                     Collections.singleton(new RouteKey(12345, ProtocolState.PLAY, Direction.CLIENTBOUND, 1))));
+    }
+
+    @Test void rejectsAnyStateWithoutLimitsEvenWithoutExplicitRoutes() {
+        String playRoute = route("clientbound", "control", "global", "null");
+        String json = table(playRoute);
+        for (ProtocolState state : ProtocolState.values()) {
+            String without = limits(java.util.Arrays.stream(ProtocolState.values())
+                    .filter(other -> other != state).map(ProtocolState::wireName).toArray(String[]::new));
+            reject(json.replace(LIMITS, without));
+        }
+        assertDoesNotThrow(() -> RoutingTableLoader.parse(json));
+    }
+
+    @Test void defaultRoutesForUnknownIdsCarryTheirStateAccounting() {
+        RoutingTable table = RoutingTableLoader.parse(table(route("serverbound", "control", "ordinary", "null")));
+        for (ProtocolState state : ProtocolState.values()) {
+            for (Direction direction : Direction.values()) {
+                RouteV2 route = table.routeV2For(new RouteKey(12345, state, direction, 999));
+                assertEquals(RouteV2.StreamLane.CONTROL, route.lane, state + " " + direction);
+                assertEquals(Dependency.GLOBAL, route.dependency, state + " " + direction);
+                assertNull(route.ordinarySmall, state + " " + direction);
+                assertEquals("primitive.raw_copies.v1", route.decodeFootprintBound, state + " " + direction);
+                assertSame(table.serverboundLimits().get(state), route.serverboundLimits, state + " " + direction);
+                assertNotNull(route.serverboundLimits, state + " " + direction);
+            }
+        }
     }
 
     private static void reject(String json) {
