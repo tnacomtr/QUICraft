@@ -25,6 +25,9 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
  * channel the connection runs on. No Minecraft classes: what a game packet is, how it is encoded
  * and where it routes are the platform's, behind {@link Codec}.
  *
+ * <p><b>Construction.</b> Build it before activation and hand it {@code connection::session}: the
+ * constructor's javadoc shows why the session cannot be a constructor argument.</p>
+ *
  * <p><b>Inbound.</b> Every delivery is fired into the game pipeline on the game channel's event
  * loop, in the order the session delivered it, followed by one {@link Ack} naming the lane and the
  * final sequence. A game that applies packets on another thread (its main thread) hops there itself
