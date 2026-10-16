@@ -12,7 +12,12 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * <p>Not thread-safe. The owner supplies monotonic time and calls this sequencer serially.
  * A bundle is buffered completely before assignment; the owner encodes and queues the returned
  * records without interleaving other game records. Any {@link OrderingException} is terminal.</p>
+ *
+ * @deprecated Single-chain N+2 sequencing of the /3 format is replaced by {@link StreamSequencer},
+ *     which keeps per-stream sequences, G/V/C fence frontiers and sparse dependencies (13.5, 13.9).
+ *     Kept only for the 3-lane LaneSession; unit U8 removes it.
  */
+@Deprecated
 public final class SenderSequencer {
     /** Leaves two delimiter slots within the 1024-record receive cap (13.15). */
     public static final int MAX_BUNDLE_MEMBERS = 1022;
