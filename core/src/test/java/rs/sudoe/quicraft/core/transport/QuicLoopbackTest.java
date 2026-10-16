@@ -531,28 +531,26 @@ class QuicLoopbackTest {
     void cancellingAfterServerAcceptsV2SendsPeerVisibleClose() throws Exception {
         CountDownLatch completionPaused = new CountDownLatch(1);
         CountDownLatch releaseCompletion = new CountDownLatch(1);
-        CountDownLatch acceptedAndCancelled = new CountDownLatch(1);
-        AtomicReference<CompletableFuture<QuicByteStream>> attemptRef = new AtomicReference<>();
-        AtomicBoolean cancelledAtAccept = new AtomicBoolean();
+        CountDownLatch accepted = new CountDownLatch(1);
+        AtomicReference<QuicByteStream> serverStream = new AtomicReference<>();
         Loopback.Collector collector = new Loopback.Collector();
         QuicClient.setBeforeConnectCompletionForTests(() -> awaitCompletionRelease(completionPaused,
                 releaseCompletion));
         try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity, TransportConfig.DEFAULT, stream -> {
             stream.setListener(collector);
             stream.setAutoRead(true);
-            CompletableFuture<QuicByteStream> attempt = attemptRef.get();
-            cancelledAtAccept.set(attempt != null && attempt.cancel(false));
-            acceptedAndCancelled.countDown();
+            serverStream.set(stream);
+            accepted.countDown();
         })) {
             CompletableFuture<QuicByteStream> attempt = QuicClient.connect(server.localAddress(),
                     identity.fingerprint(), TransportConfig.DEFAULT);
-            attemptRef.set(attempt);
             assertTrue(completionPaused.await(5, TimeUnit.SECONDS), "client completion hook reached");
-            assertTrue(acceptedAndCancelled.await(5, TimeUnit.SECONDS), "server accepted and cancelled the attempt");
-            assertTrue(cancelledAtAccept.get(), "the connect future was still pending at server acceptance");
+            assertTrue(accepted.await(5, TimeUnit.SECONDS), "server accepted the stream");
+            assertTrue(attempt.cancel(false), "the connect future is still pending after server acceptance");
             releaseCompletion.countDown();
             assertTrue(collector.closed.await(2, TimeUnit.SECONDS),
                     "the accepted /2 connection must see CONNECTION_CLOSE before its deadline");
+            assertFalse(serverStream.get().isOpen(), "server stream is closed");
         } finally {
             releaseCompletion.countDown();
             QuicClient.setBeforeConnectCompletionForTests(null);

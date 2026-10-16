@@ -136,28 +136,26 @@ class V3ConnectionTest {
         requireV3();
         CountDownLatch completionPaused = new CountDownLatch(1);
         CountDownLatch releaseCompletion = new CountDownLatch(1);
-        CountDownLatch acceptedAndCancelled = new CountDownLatch(1);
-        AtomicReference<CompletableFuture<V3Connection>> attemptRef = new AtomicReference<>();
-        AtomicReference<Boolean> cancelledAtAccept = new AtomicReference<>(Boolean.FALSE);
+        CountDownLatch accepted = new CountDownLatch(1);
+        AtomicReference<V3Connection> serverConnection = new AtomicReference<>();
         Loopback.Collector collector = new Loopback.Collector();
         QuicClient.setBeforeConnectCompletionForTests(() -> awaitCompletionRelease(completionPaused,
                 releaseCompletion));
         try (QuicServer server = bindServer(connection -> {
             connection.setListener(collector);
             connection.setAutoRead(true);
-            CompletableFuture<V3Connection> attempt = attemptRef.get();
-            cancelledAtAccept.set(Boolean.valueOf(attempt != null && attempt.cancel(false)));
-            acceptedAndCancelled.countDown();
+            serverConnection.set(connection);
+            accepted.countDown();
         })) {
             CompletableFuture<V3Connection> attempt = QuicClient.connectV3(server.localAddress(),
                     identity.fingerprint(), TABLE, null);
-            attemptRef.set(attempt);
             assertTrue(completionPaused.await(5, TimeUnit.SECONDS), "client completion hook reached");
-            assertTrue(acceptedAndCancelled.await(5, TimeUnit.SECONDS), "server accepted and cancelled the attempt");
-            assertTrue(cancelledAtAccept.get().booleanValue(), "the /3 connect future was pending at acceptance");
+            assertTrue(accepted.await(5, TimeUnit.SECONDS), "server accepted the connection");
+            assertTrue(attempt.cancel(false), "the /3 connect future is pending after server acceptance");
             releaseCompletion.countDown();
             assertTrue(collector.closed.await(2, TimeUnit.SECONDS),
                     "the accepted /3 connection must see CONNECTION_CLOSE before its deadline");
+            assertFalse(serverConnection.get().isOpen(), "server connection is closed");
         } finally {
             releaseCompletion.countDown();
             QuicClient.setBeforeConnectCompletionForTests(null);
