@@ -43,6 +43,12 @@ public final class OutboundPool {
     /** Releases bytes once QUIC has acknowledged or otherwise released them; then retries FIFO. */
     public synchronized void release(Object owner, long bytes) { ledger.release(owner, bytes); }
 
+    /**
+     * Confirms that a shed owner (see {@link #drainShedOwners}) has been closed with 0x12. Its bytes stay
+     * charged until this call, then are released and waiters are retried FIFO.
+     */
+    public synchronized void confirmClosed(Object owner) { ledger.confirmClosed(owner); }
+
     /** Ends an owner after it was shed with 0x12: releases its bytes and drops its waits. */
     public synchronized void cancel(Object owner) { ledger.cancel(owner); }
 

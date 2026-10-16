@@ -55,6 +55,12 @@ public final class InboundExcessPool {
     /** Releases excess once its ownership has actually ended, then retries waiters FIFO. */
     public synchronized void release(Object owner, long bytes) { ledger.release(owner, bytes); }
 
+    /**
+     * Confirms that a shed owner (see {@link #drainShedOwners}) has been closed with 0x12. Its excess stays
+     * charged until this call, then is released and waiters are retried FIFO.
+     */
+    public synchronized void confirmClosed(Object owner) { ledger.confirmClosed(owner); }
+
     /** Ends an owner after it was closed with 0x12: releases all its excess and drops its waits. */
     public synchronized void cancel(Object owner) { ledger.cancel(owner); }
 

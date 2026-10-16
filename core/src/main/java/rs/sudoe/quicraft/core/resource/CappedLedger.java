@@ -19,9 +19,14 @@ import java.util.Map;
  * acquisition. Deficits and eligibility are recomputed after every reclamation, and reclamation stops as
  * soon as the waiting request fits.</p>
  *
- * <p>New arrivals and retries respect FIFO position: a request is never granted while an earlier waiting
- * request shares its IP or account cap, or while an earlier waiting request is refused for lack of node
- * room. Waiting requests blocked only by unrelated caps are skipped without losing their position.</p>
+ * <p>New arrivals and retries respect FIFO position: a request waits behind an earlier waiter only when that
+ * waiter is blocked by a reason the later request also faces: node room, or the IP or account cap the two
+ * share. A waiter blocked only by its own owner cap does not block anyone else. Waiting requests blocked by
+ * unrelated caps are skipped without losing their position.</p>
+ *
+ * <p>A shed victim stays charged to its caps and to the node pool until {@link #confirmClosed} is called.
+ * Its bytes are never granted to waiters before that confirmation, and no further victims are picked for a
+ * waiter while a shed holder that relieves the same deficit is still unconfirmed.</p>
  *
  * <p>Not thread-safe by itself; the public wrappers synchronise every call.</p>
  */
@@ -57,6 +62,8 @@ final class CappedLedger {
             throw new IllegalArgumentException("request of " + bytes + " bytes exceeds a cap that can never admit it");
         }
         Holder holder = holder(owner, ip, account);
+        // An owner already selected for closure takes no new bytes; it is refused without queueing.
+        if (holder.shed) return false;
         holder.localStall = localStall;
         if (!blockedForNew(holder, bytes) && fitsNow(holder, bytes)) {
             charge(holder, bytes);
@@ -74,11 +81,22 @@ final class CappedLedger {
         if (holder == null || bytes < 0 || bytes > holder.bytes) throw new IllegalStateException("release exceeds reservation");
         node.release(pool, owner, bytes);
         holder.bytes -= bytes;
-        if (holder.bytes == 0 && !hasWait(holder)) holders.remove(owner);
+        if (holder.bytes == 0 && !hasWait(holder) && !holder.shed) holders.remove(owner);
         reclaim();
     }
 
-    /** Ends an owner entirely: releases its bytes and drops its waits (used when a victim is closed). */
+    /**
+     * Confirms that a shed victim was closed: releases its bytes, drops its waits and retries waiters. Bytes
+     * of a shed holder stay charged until this call (13.12 reclaim ownership).
+     */
+    void confirmClosed(Object owner) {
+        Holder holder = holders.get(owner);
+        if (holder == null) return;
+        if (!holder.shed) throw new IllegalStateException("owner was not shed");
+        cancel(owner);
+    }
+
+    /** Ends an owner entirely: releases its bytes and drops its waits. */
     void cancel(Object owner) {
         Holder holder = holders.get(owner);
         if (holder == null) return;
@@ -120,14 +138,24 @@ final class CappedLedger {
         holder.lastCharge = ++tick;
     }
 
-    /** A new arrival waits behind any waiter sharing its IP or account, or behind a node-refused waiter. */
+    /** A new arrival waits behind any earlier waiter that blocks it (see {@link #blocksLater}). */
     private boolean blockedForNew(Holder holder, long bytes) {
         for (Request other : waiting) {
-            if (other.holder.ip.equals(holder.ip)) return true;
-            if (holder.account != null && holder.account.equals(other.holder.account)) return true;
-            if (!nodeRoom(other.bytes)) return true;
+            if (blocksLater(other, holder)) return true;
         }
         return false;
+    }
+
+    /**
+     * True when an earlier waiter must keep its FIFO place ahead of a later request from {@code later}. The
+     * waiter blocks only for a reason the later request also faces: node room, or the IP or account cap it
+     * would share. A waiter blocked only by its own owner cap blocks nobody.
+     */
+    private boolean blocksLater(Request other, Holder later) {
+        if (!nodeRoom(other.bytes)) return true;
+        if (other.holder.ip.equals(later.ip) && add(reservedByIp(later.ip), other.bytes) > ipCap) return true;
+        return later.account != null && later.account.equals(other.holder.account)
+                && add(reservedByAccount(later.account), other.bytes) > accountCap;
     }
 
     /** Every cap and the node pool have room now, ignoring FIFO position. */
@@ -153,6 +181,7 @@ final class CappedLedger {
             retry();
             for (Request request : new ArrayList<Request>(waiting)) {
                 if (!request.pending || fitsNow(request.holder, request.bytes)) continue;
+                if (awaitingShedRelief(request)) continue;
                 Holder victim = victim(request);
                 if (victim != null) {
                     shedHolder(victim);
@@ -183,10 +212,15 @@ final class CappedLedger {
 
     private boolean blockedByEarlier(int index, Request request) {
         for (int earlier = 0; earlier < index; earlier++) {
-            Request other = waiting.get(earlier);
-            if (other.holder.ip.equals(request.holder.ip)) return true;
-            if (request.holder.account != null && request.holder.account.equals(other.holder.account)) return true;
-            if (!nodeRoom(other.bytes)) return true;
+            if (blocksLater(waiting.get(earlier), request.holder)) return true;
+        }
+        return false;
+    }
+
+    /** True while a shed holder that relieves this request's deficit is still charged, awaiting confirmation. */
+    private boolean awaitingShedRelief(Request request) {
+        for (Holder holder : holders.values()) {
+            if (holder.shed && relieves(holder, request)) return true;
         }
         return false;
     }
@@ -204,7 +238,7 @@ final class CappedLedger {
         for (Holder candidate : candidates) {
             // A waiter reclaims only from holders charged before it queued: a grant made from the queue after
             // this arrival is protected from it, so retries never shed what FIFO just admitted.
-            if (candidate == request.holder || candidate.bytes == 0 || candidate.localStall) continue;
+            if (candidate == request.holder || candidate.bytes == 0 || candidate.localStall || candidate.shed) continue;
             if (candidate.lastCharge > request.enqueued) continue;
             if (relieves(candidate, request)) return candidate;
         }
@@ -223,11 +257,10 @@ final class CappedLedger {
                 || (accountDeficit && requester.account.equals(victim.account));
     }
 
+    /** Selects a victim for closure. Its bytes stay charged until {@link #confirmClosed}. */
     private void shedHolder(Holder victim) {
-        if (victim.bytes > 0) node.release(pool, victim.owner, victim.bytes);
-        victim.bytes = 0;
+        victim.shed = true;
         removeWaits(victim);
-        holders.remove(victim.owner);
         shed.add(victim.owner);
     }
 
@@ -270,6 +303,7 @@ final class CappedLedger {
         long bytes;
         long lastCharge;
         boolean localStall;
+        boolean shed;
 
         Holder(Object owner, Object ip, Object account, long sequence) {
             this.owner = owner;

@@ -59,8 +59,11 @@ class InboundExcessPoolTest {
         InboundExcessPool pool = pool(1000, 150, 150, scores);
         assertTrue(pool.reserve("a", "ip-a", null, 100, false));
         assertTrue(pool.reserve("b", "ip-b", null, 100, false));
-        assertTrue(pool.reserve("c", "ip-a", null, 100, false));
+        assertFalse(pool.reserve("c", "ip-a", null, 100, false));
         assertEquals(Arrays.asList((Object) "a"), pool.drainShedOwners());
+        assertEquals(100, pool.reserved("b"));
+        pool.confirmClosed("a");
+        assertEquals(0, pool.reserved("a"));
         assertEquals(100, pool.reserved("b"));
         assertEquals(100, pool.reserved("c"));
     }
@@ -160,8 +163,10 @@ class InboundExcessPoolTest {
         Map<Object, Double> scores = Collections.<Object, Double>singletonMap("a", 1.0);
         InboundExcessPool pool = pool(1000, 150, 150, scores);
         assertTrue(pool.reserve("a", "ip-a", null, 100, false));
-        assertTrue(pool.reserve("c", "ip-a", null, 100, false));
+        assertFalse(pool.reserve("c", "ip-a", null, 100, false), "c waits until the victim is confirmed closed");
         assertEquals(1, pool.drainShedOwners().size());
         assertTrue(pool.drainShedOwners().isEmpty());
+        pool.confirmClosed("a");
+        assertEquals(100, pool.reserved("c"));
     }
 }
