@@ -8,6 +8,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Handler;
@@ -45,6 +46,17 @@ public final class LoadServer {
             "{\"schema\":1,\"protocol\":" + PROTOCOL + ",\"default\":\"control\",\"routes\":[]}");
     private static final long MIB = 1024L * 1024L;
     private static final long HANDSHAKE_WAIT_MS = 10_000;
+    private static final long HANDSHAKE_RETRY_MS = 10;
+    /**
+     * One shared daemon timer retries the activation check of every pending connection. core has no
+     * handshake-complete callback on {@code V3Connection}, so the check has to poll; a thread per
+     * connection would not scale to the spike's connection counts.
+     */
+    private static final ScheduledExecutorService ACTIVATOR = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "load-server-activator");
+        t.setDaemon(true);
+        return t;
+    });
 
     private LoadServer() {}
 
@@ -85,6 +97,7 @@ public final class LoadServer {
 
         AtomicLong accepted = new AtomicLong();
         AtomicLong lanesActive = new AtomicLong();
+        AtomicLong lanesFailed = new AtomicLong();
         Set<QuicByteStream> open = ConcurrentHashMap.newKeySet();
         Refusals refusals = new Refusals();
         QuicServer server;
@@ -94,7 +107,7 @@ public final class LoadServer {
             server = QuicServer.bind(bind, sockets, identity, config, stream -> {
                 accepted.incrementAndGet();
                 if (lanes) {
-                    activateWhenHandshaken((V3Connection) stream, lanesActive);
+                    activateWhenHandshaken((V3Connection) stream, lanesActive, lanesFailed);
                 }
             }, listener);
         } else {
@@ -133,6 +146,7 @@ public final class LoadServer {
             return t;
         }).scheduleAtFixedRate(() -> System.out.println("STAT connections=" + accepted.get()
                 + (v3 ? " admitted=" + accepted.get() + " lanes_active=" + lanesActive.get()
+                        + " lanes_failed=" + lanesFailed.get()
                         + " retries=" + retriesSent(serverForStats) + refusals.fields()
                         : " streams=" + open.size())
                 + " rss_mb=" + ProcStats.rssMb() + " threads=" + ProcStats.threads()
@@ -157,26 +171,35 @@ public final class LoadServer {
 
     /**
      * Activates a /3 connection's lanes once its handshake is complete (activation fails closed
-     * before that, 12.7). The poll runs on its own virtual thread so the acceptor returns at once.
-     * Failures are counted as not active; the connection is left as it is.
+     * before that, 12.7). The acceptor returns at once: the first check runs inline and a pending
+     * connection is re-checked on the shared {@link #ACTIVATOR} timer until its handshake deadline.
+     * A deadline miss or a thrown activation call counts as {@code lanes_failed}; a failure inside
+     * core's event loop is closed by core and is not visible through {@code V3Connection}.
      */
-    private static void activateWhenHandshaken(V3Connection connection, AtomicLong lanesActive) {
-        Thread.ofVirtual().start(() -> {
-            try {
-                long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_WAIT_MS);
-                while (!connection.handshakeComplete()) {
-                    if (System.nanoTime() > deadline) {
-                        return;
-                    }
-                    Thread.sleep(10);
+    private static void activateWhenHandshaken(V3Connection connection, AtomicLong lanesActive,
+            AtomicLong lanesFailed) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_WAIT_MS);
+        attemptActivation(connection, lanesActive, lanesFailed, deadline);
+    }
+
+    private static void attemptActivation(V3Connection connection, AtomicLong lanesActive,
+            AtomicLong lanesFailed, long deadline) {
+        try {
+            if (!connection.handshakeComplete()) {
+                if (System.nanoTime() > deadline) {
+                    lanesFailed.incrementAndGet();
+                    return;
                 }
-                connection.detachForActivation(leftover -> { });
-                connection.activate(IdleLaneGame.INSTANCE, PROTOCOL, null);
-                lanesActive.incrementAndGet();
-            } catch (Throwable t) {
-                // Left unactivated; the count shows how many did not get their lanes.
+                ACTIVATOR.schedule(() -> attemptActivation(connection, lanesActive, lanesFailed, deadline),
+                        HANDSHAKE_RETRY_MS, TimeUnit.MILLISECONDS);
+                return;
             }
-        });
+            connection.detachForActivation(leftover -> { });
+            connection.activate(IdleLaneGame.INSTANCE, PROTOCOL, null);
+            lanesActive.incrementAndGet();
+        } catch (Throwable t) {
+            lanesFailed.incrementAndGet();
+        }
     }
 
     /** Retry packets the listener has sent (core's package-private counter, read reflectively). */
