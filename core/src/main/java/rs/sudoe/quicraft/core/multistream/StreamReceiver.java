@@ -28,6 +28,10 @@ import rs.sudoe.quicraft.core.routing.Direction;
  * withheld prerequisites are recorded per (stream, sequence) and only matter for the expiring head's
  * own prerequisite chain.
  *
+ * <p>Admission ({@link #offer}) reads only the envelope. The packet route and the injected
+ * {@link Validator} run later, in {@link #validateEligible}, once a head is ready: a blocked or
+ * future-epoch record is never handed to the body validator (13.10, 13.18). Enqueue requires that step.
+ *
  * <p>Protocol violations are returned as {@link ReceiveClose} values with code 0x11, never thrown.
  * Refusals (a stream already holds its head) are returned as {@link Admission#busy()}. Nothing here
  * closes a connection by itself; the caller acts on the returned close.
@@ -105,16 +109,18 @@ public final class StreamReceiver {
         final Record record;
         /** Sequence of the last record of the unit; equals the opener's for a single record. */
         final long closing;
-        final ReceiveRoute route;
         final BlockedHeadTimer timer;
+        /** Route from the body, known only once the head is eligible and validated (null before). */
+        ReceiveRoute route;
+        /** True once {@link StreamReceiver#validateEligible} accepted the head; the validator ran once. */
+        boolean validated;
         boolean enqueued;
         /** Sticky for the current wait: some prerequisite on the chain was withheld locally (13.12). */
         boolean chainWasWithheld;
 
-        Unit(Record record, long closing, ReceiveRoute route, BlockedHeadTimer timer) {
+        Unit(Record record, long closing, BlockedHeadTimer timer) {
             this.record = record;
             this.closing = closing;
-            this.route = route;
             this.timer = timer;
         }
     }
@@ -169,39 +175,40 @@ public final class StreamReceiver {
     }
 
     /**
-     * Offers one single-record head unit for admission (13.10). Shorthand for
-     * {@link #offer(Record, long, ReceiveRoute, long, int)} with closing sequence equal to the record's own.
+     * Envelope admission of one single-record unit (13.10). Shorthand for
+     * {@link #offer(Record, long, long, int)} with closing sequence equal to the record's own.
      *
      * @param record decoded envelope; its body stays opaque here
-     * @param route the route the integration decoded from the packet id
      * @param wireBytes total wire size of the unit, prefixes included, charged to the stream slot
      * @param recordCount must be 1 for a single record
      * @return ADMITTED, BUSY, or VIOLATION with a 0x11 close
      */
-    public Admission offer(Record record, ReceiveRoute route, long wireBytes, int recordCount) {
+    public Admission offer(Record record, long wireBytes, int recordCount) {
         if (record == null) {
-            throw new IllegalArgumentException("record and route are required");
+            throw new IllegalArgumentException("record is required");
         }
-        return offer(record, record.sequence(), route, wireBytes, recordCount);
+        return offer(record, record.sequence(), wireBytes, recordCount);
     }
 
     /**
-     * Offers one scheduling unit for admission (13.10, 13.15). A unit is one record or one complete
+     * Envelope admission of one scheduling unit (13.10, 13.15). A unit is one record or one complete
      * bundle: its members occupy consecutive sequences from the opening record's sequence through
      * {@code closingSequence}, and only the opener carries external dependencies. Admission advances
      * the stream's frontier to the closing sequence, so the next unit must open at closing + 1.
      *
+     * <p>Admission reads only the envelope: stream, sequence, epoch, dependencies, kind and sizes. It never
+     * reads the body and never runs the {@link Validator}, because the packet route is unknown until the
+     * head is eligible. The route, shard and fence checks run later in {@link #validateEligible}.
+     *
      * @param record the opening record; its body stays opaque here
      * @param closingSequence sequence of the last record of the unit, equal to the opener's for one record
-     * @param route the route the integration decoded from the packet id
      * @param wireBytes total wire size of the unit, prefixes included, charged to the stream slot
      * @param recordCount records in the unit, delimiters included; must equal closing - opening + 1
      * @return ADMITTED, BUSY, or VIOLATION with a 0x11 close
      */
-    public Admission offer(Record record, long closingSequence, ReceiveRoute route, long wireBytes,
-            int recordCount) {
-        if (record == null || route == null) {
-            throw new IllegalArgumentException("record and route are required");
+    public Admission offer(Record record, long closingSequence, long wireBytes, int recordCount) {
+        if (record == null) {
+            throw new IllegalArgumentException("record is required");
         }
         if (violation != null) {
             return Admission.of(violation);
@@ -220,13 +227,15 @@ public final class StreamReceiver {
             return Admission.violation("unit closes at " + closingSequence + " but holds " + recordCount
                     + " records from " + record.sequence() + " on stream " + stream);
         }
-        Admission epochCheck = checkEpoch(record, route);
+        Admission epochCheck = checkEpoch(record);
         if (epochCheck != null) {
             return epochCheck;
         }
-        Admission laneCheck = checkRoute(stream, record, route);
-        if (laneCheck != null) {
-            return laneCheck;
+        if ((record.kind() == KIND_ACK_JOIN || record.kind() == KIND_BATCH_JOIN) && stream != 2) {
+            return Admission.violation("join record outside CHUNK[0]");
+        }
+        if (record.kind() == KIND_END && stream != LogicalStream.CONTROL) {
+            return Admission.violation("END record outside CONTROL");
         }
         Admission depCheck = checkDependencies(stream, record);
         if (depCheck != null) {
@@ -236,9 +245,6 @@ public final class StreamReceiver {
         if (pathCheck != null) {
             return pathCheck;
         }
-        if (!validator.valid(stream, record, route)) {
-            return Admission.violation("shard, fence or join validation failed on stream " + stream);
-        }
         if (closesCycle(record)) {
             return Admission.violation("provable dependency cycle through stream " + stream);
         }
@@ -246,7 +252,7 @@ public final class StreamReceiver {
                 || recordCount < 0 || wireBytes < 0) {
             return Admission.violation("unit exceeds the stream slot on stream " + stream);
         }
-        ReceiveClose heldViolation = heldPathViolation(transitionPending || route.epochChange());
+        ReceiveClose heldViolation = heldPathViolation(transitionReachable());
         if (heldViolation != null) {
             return Admission.of(heldViolation);
         }
@@ -256,12 +262,9 @@ public final class StreamReceiver {
         if (!slots.admitHead(stream, wireBytes, recordCount)) {
             return Admission.busy();
         }
-        Unit unit = new Unit(record, closingSequence, route, new BlockedHeadTimer(clock, true));
+        Unit unit = new Unit(record, closingSequence, new BlockedHeadTimer(clock, true));
         head[stream] = unit;
         admitted[stream] = closingSequence;
-        if (route.epochChange()) {
-            transitionPending = true;
-        }
         if (!ready(unit)) {
             unit.timer.start();
             if (stalled) {
@@ -273,7 +276,8 @@ public final class StreamReceiver {
 
     /**
      * Returns the stream whose head should be enqueued next, or -1 if none is ready. REALTIME is
-     * preferred, then CONTROL, then chunk streams in index order (13.10, REALTIME-first).
+     * preferred, then CONTROL, then chunk streams in index order (13.10, REALTIME-first). The returned head
+     * still needs {@link #validateEligible} before {@link #enqueued}.
      */
     public int nextToEnqueue() {
         int[] order = new int[streams];
@@ -291,6 +295,52 @@ public final class StreamReceiver {
         return -1;
     }
 
+    /**
+     * Body validation of the eligible head of a stream (13.6, 13.10, 13.18). Call it once the head is
+     * returned by {@link #nextToEnqueue()}, supplying the route the integration decoded from the packet id.
+     * Runs the route, join, transition, shard and fence checks, and runs the {@link Validator} exactly once.
+     * Later calls for the same head return null without re-running anything.
+     *
+     * @return null when the head is valid and may be enqueued, or a 0x11 close; a close is also sticky
+     */
+    public ReceiveClose validateEligible(int stream, ReceiveRoute route) {
+        checkStream(stream);
+        if (route == null) {
+            throw new IllegalArgumentException("route is required");
+        }
+        if (violation != null) {
+            return violation;
+        }
+        Unit unit = head[stream];
+        if (unit == null || unit.enqueued) {
+            throw new IllegalStateException("no unenqueued head on stream " + stream);
+        }
+        if (!ready(unit)) {
+            throw new IllegalStateException("validated before its prerequisites were applied");
+        }
+        if (unit.validated) {
+            return null;
+        }
+        ReceiveClose close = validateBody(stream, unit.record, route);
+        if (close == null) {
+            close = checkTransition(unit.record, route);
+        }
+        if (close != null) {
+            violation = close;
+            return close;
+        }
+        unit.route = route;
+        unit.validated = true;
+        if (route.epochChange()) {
+            transitionPending = true;
+        }
+        ReceiveClose held = heldPathViolation(transitionReachable());
+        if (held != null) {
+            violation = held;
+        }
+        return held;
+    }
+
     /** Returns the record held as the head of a stream, or null. */
     public Record head(int stream) {
         checkStream(stream);
@@ -306,6 +356,9 @@ public final class StreamReceiver {
         Unit unit = currentHead(stream, sequence);
         if (unit.enqueued) {
             throw new IllegalStateException("already enqueued on stream " + stream);
+        }
+        if (!unit.validated) {
+            throw new IllegalStateException("enqueued before validateEligible on stream " + stream);
         }
         if (!ready(unit)) {
             throw new IllegalStateException("enqueued before its prerequisites were applied");
@@ -336,7 +389,7 @@ public final class StreamReceiver {
         }
         stopTimersOfReadyHeads();
         if (violation == null) {
-            violation = heldPathViolation(transitionPending);
+            violation = heldPathViolation(transitionReachable());
         }
     }
 
@@ -428,32 +481,21 @@ public final class StreamReceiver {
     }
 
     /**
-     * Epoch rules (13.18). A transition record carries the OLD epoch and advances it on apply; it may
-     * not overlap another pending transition. Other records may be at the current epoch or at exactly
-     * one ahead (early arrival, opaque until the transition applies); anything further is future.
+     * Envelope epoch rules (13.18), checked at admission: range, serverbound epoch 0, stale and future.
+     * Other records may be at the current epoch or at exactly one ahead (early arrival, opaque until the
+     * transition applies); anything further is future. Whether a record is a transition, and so must carry
+     * the old epoch, is known only from its route and is checked in {@link #checkTransition}.
      */
-    private Admission checkEpoch(Record record, ReceiveRoute route) {
+    private Admission checkEpoch(Record record) {
         long recordEpoch = record.epoch();
         if (recordEpoch < 0 || recordEpoch > MAX_EPOCH) {
             return Admission.violation("epoch " + recordEpoch + " outside the signed-31-bit range");
         }
-        if (direction == Direction.SERVERBOUND && (recordEpoch != 0 || route.epochChange())) {
+        if (direction == Direction.SERVERBOUND && recordEpoch != 0) {
             return Admission.violation("serverbound records must stay at epoch 0 (13.18)");
         }
         if (recordEpoch < epoch) {
             return Admission.violation("stale epoch " + recordEpoch + " < " + epoch);
-        }
-        if (route.epochChange()) {
-            if (recordEpoch != epoch) {
-                return Admission.violation("transition must carry the old epoch " + epoch);
-            }
-            if (transitionPending) {
-                return Admission.violation("second transition before the first applied");
-            }
-            if (epoch == MAX_EPOCH) {
-                return Admission.violation("epoch exhausted");
-            }
-            return null;
         }
         if (recordEpoch > epoch + 1) {
             return Admission.violation("future epoch " + recordEpoch);
@@ -462,15 +504,55 @@ public final class StreamReceiver {
     }
 
     /**
-     * An epoch+1 record is only admissible while it can reach its transition: either the transition is
-     * already admitted and unapplied, or one of its own dependencies is still unapplied and may lead to
-     * it. Runs after dependency validation, so dependency indices are in range.
+     * An epoch+1 record is only admissible while it can reach its transition: either a transition for the
+     * current epoch is reachable (see {@link #transitionReachable()}), or one of its own dependencies is
+     * still unapplied and may lead to it. Runs after dependency validation, so dependency indices are in range.
      */
     private Admission checkTransitionPath(Record record) {
-        if (record.epoch() != epoch + 1 || transitionPending || !prerequisitesApplied(record)) {
+        if (record.epoch() != epoch + 1 || transitionReachable() || !prerequisitesApplied(record)) {
             return null;
         }
         return Admission.violation("epoch " + record.epoch() + " without a transition path");
+    }
+
+    /**
+     * Returns true when a transition for the current epoch is pending (validated, not yet applied) or can
+     * still be admitted: an unvalidated head at the current epoch might turn out to be one (13.18).
+     */
+    private boolean transitionReachable() {
+        if (transitionPending) {
+            return true;
+        }
+        for (Unit unit : head) {
+            if (unit != null && !unit.validated && unit.record.epoch() == epoch) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Transition rules for a validated head whose route marks an epoch change (13.18): the transition is
+     * CONTROL-only, never serverbound, carries the OLD epoch, may not overlap another pending transition and
+     * may not exhaust the epoch range.
+     */
+    private ReceiveClose checkTransition(Record record, ReceiveRoute route) {
+        if (!route.epochChange()) {
+            return null;
+        }
+        if (direction == Direction.SERVERBOUND) {
+            return ReceiveClose.peerViolation("serverbound transition route (13.18)");
+        }
+        if (record.epoch() != epoch) {
+            return ReceiveClose.peerViolation("transition must carry the old epoch " + epoch);
+        }
+        if (transitionPending) {
+            return ReceiveClose.peerViolation("second transition before the first applied");
+        }
+        if (epoch == MAX_EPOCH) {
+            return ReceiveClose.peerViolation("epoch exhausted");
+        }
+        return null;
     }
 
     private boolean prerequisitesApplied(Record record) {
@@ -499,35 +581,57 @@ public final class StreamReceiver {
         return null;
     }
 
-    private Admission checkRoute(int stream, Record record, ReceiveRoute route) {
+    /**
+     * Body validation of an eligible head (13.6, 13.10, 13.18): the packet route must match the stream's lane,
+     * join routes live on CHUNK[0], and the injected {@link Validator} must accept shard and fence. Runs only
+     * from {@link #validateEligible}, never at admission.
+     */
+    private ReceiveClose validateBody(int stream, Record record, ReceiveRoute route) {
+        ReceiveClose laneClose = checkRoute(stream, route);
+        if (laneClose != null) {
+            return laneClose;
+        }
+        ReceiveClose joinClose = checkJoinKind(record, route);
+        if (joinClose != null) {
+            return joinClose;
+        }
+        if (!validator.valid(stream, record, route)) {
+            return ReceiveClose.peerViolation("shard, fence or join validation failed on stream " + stream);
+        }
+        return null;
+    }
+
+    private ReceiveClose checkRoute(int stream, ReceiveRoute route) {
         boolean control = stream == LogicalStream.CONTROL;
         boolean realtime = stream == LogicalStream.REALTIME;
         switch (route.lane()) {
             case CONTROL:
                 if (!control) {
-                    return Admission.violation("CONTROL route on stream " + stream);
+                    return ReceiveClose.peerViolation("CONTROL route on stream " + stream);
                 }
                 break;
             case REALTIME:
                 if (!realtime) {
-                    return Admission.violation("REALTIME route on stream " + stream);
+                    return ReceiveClose.peerViolation("REALTIME route on stream " + stream);
                 }
                 break;
             default:
                 if (control || realtime) {
-                    return Admission.violation("CHUNK route on stream " + stream);
+                    return ReceiveClose.peerViolation("CHUNK route on stream " + stream);
                 }
                 break;
         }
+        if (route.join() && stream != 2) {
+            return ReceiveClose.peerViolation("join record outside CHUNK[0]");
+        }
+        return null;
+    }
+
+    /** Join kind and join route must agree; checked once the route is known (13.19). */
+    private ReceiveClose checkJoinKind(Record record, ReceiveRoute route) {
         boolean joinKind = record.kind() == KIND_ACK_JOIN || record.kind() == KIND_BATCH_JOIN;
-        if ((route.join() || joinKind) && stream != 2) {
-            return Admission.violation("join record outside CHUNK[0]");
-        }
         if (joinKind != route.join()) {
-            return Admission.violation("join kind and join route disagree");
-        }
-        if (record.kind() == KIND_END && !control) {
-            return Admission.violation("END record outside CONTROL");
+            return ReceiveClose.peerViolation("join kind and join route disagree");
         }
         return null;
     }

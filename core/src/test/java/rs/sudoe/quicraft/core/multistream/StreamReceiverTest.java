@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.multistream;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.routing.Dependency;
@@ -51,16 +52,34 @@ class StreamReceiverTest {
     }
 
     static StreamReceiver.Admission offer(StreamReceiver rx, Record record) {
-        return rx.offer(record, route(record.streamIndex()), 100, 1);
+        return rx.offer(record, 100, 1);
     }
 
     static void assertAdmitted(StreamReceiver rx, Record record) {
-        assertEquals(StreamReceiver.Admission.Kind.ADMITTED, offer(rx, record).kind());
+        StreamReceiver.Admission admission = offer(rx, record);
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED, admission.kind(),
+                () -> "stream " + record.streamIndex() + " seq " + record.sequence() + " epoch "
+                        + record.epoch() + ": " + (admission.close() == null ? "" : admission.close().detail()));
+    }
+
+    static void assertClose(ReceiveClose close) {
+        assertNotNull(close, "a violation must close the connection");
+        assertEquals(0x11, close.errorCode());
     }
 
     static void assertViolation(StreamReceiver.Admission admission) {
         assertEquals(StreamReceiver.Admission.Kind.VIOLATION, admission.kind());
         assertEquals(0x11, admission.close().errorCode());
+    }
+
+    /** Body validation with the default route for the stream, then enqueue (the route is known only now). */
+    static void enqueue(StreamReceiver rx, int stream, long sequence) {
+        enqueue(rx, stream, sequence, route(stream));
+    }
+
+    static void enqueue(StreamReceiver rx, int stream, long sequence, ReceiveRoute route) {
+        assertNull(rx.validateEligible(stream, route), "eligible head must validate on stream " + stream);
+        rx.enqueued(stream, sequence);
     }
 
     @Test void everyStreamHoldsOneHeadAndASecondIsRefusedNotViolated() {
@@ -81,7 +100,7 @@ class StreamReceiverTest {
                 assertAdmitted(f.receiver, rec(prereq, 1, 0));
                 assertAdmitted(f.receiver, rec(blocked, 1, 0, dep(prereq, 1)));
                 assertEquals(prereq, f.receiver.nextToEnqueue(), "blocked " + blocked + " prereq " + prereq);
-                f.receiver.enqueued(prereq, 1);
+                enqueue(f.receiver, prereq, 1);
                 f.receiver.applied(prereq, 1);
                 assertEquals(blocked, f.receiver.nextToEnqueue());
             }
@@ -94,23 +113,23 @@ class StreamReceiverTest {
         int records = ReceiveSlots.RECORDS_PER_STREAM;
         // REALTIME, CONTROL and a chunk head each hold a complete slot at its limit.
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(1, 1, 0), records, route(1), full, records).kind());
+                f.receiver.offer(rec(1, 1, 0), records, full, records).kind());
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), records, route(0), full, records).kind());
+                f.receiver.offer(rec(0, 1, 0), records, full, records).kind());
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(2, 1, 0), records, route(2), full, records).kind());
+                f.receiver.offer(rec(2, 1, 0), records, full, records).kind());
         assertEquals(1, f.receiver.nextToEnqueue(), "REALTIME before CONTROL and chunks");
-        f.receiver.enqueued(1, 1);
+        enqueue(f.receiver, 1, 1);
         assertEquals(0, f.receiver.nextToEnqueue(), "CONTROL before the chunk head");
-        f.receiver.enqueued(0, 1);
+        enqueue(f.receiver, 0, 1);
         assertEquals(2, f.receiver.nextToEnqueue());
     }
 
     @Test void transitionCarriesTheOldEpochAndApplyAdvancesItByExactlyOne() {
         Fixture f = new Fixture(2);
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
-        f.receiver.enqueued(0, 1);
+                f.receiver.offer(rec(0, 1, 0), 100, 1).kind());
+        enqueue(f.receiver, 0, 1, boundary());
         assertEquals(0, f.receiver.epoch(), "the epoch does not move until D");
         f.receiver.applied(0, 1);
         assertEquals(1, f.receiver.epoch(), "exactly one increment on apply");
@@ -118,14 +137,14 @@ class StreamReceiverTest {
 
     @Test void transitionWithANewEpochNumberIsAViolation() {
         Fixture f = new Fixture(2);
-        assertViolation(f.receiver.offer(rec(0, 1, 1), boundary(), 100, 1));
+        assertViolation(f.receiver.offer(rec(0, 1, 1), 100, 1));
     }
 
     @Test void staleAndFutureEpochsAreViolationsAfterATransition() {
         Fixture f = new Fixture(2);
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
-        f.receiver.enqueued(0, 1);
+                f.receiver.offer(rec(0, 1, 0), 100, 1).kind());
+        enqueue(f.receiver, 0, 1, boundary());
         f.receiver.applied(0, 1);
         assertEquals(1, f.receiver.epoch());
         assertViolation(offer(f.receiver, rec(2, 1, 0)));
@@ -137,8 +156,8 @@ class StreamReceiverTest {
         assertAdmitted(f.receiver, rec(2, 1, 1, dep(0, 1)));
         assertEquals(-1, f.receiver.nextToEnqueue(), "held until the epoch opens");
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
-        f.receiver.enqueued(0, 1);
+                f.receiver.offer(rec(0, 1, 0), 100, 1).kind());
+        enqueue(f.receiver, 0, 1, boundary());
         assertEquals(-1, f.receiver.nextToEnqueue(), "new-epoch chunk still waits for the transition");
         f.receiver.applied(0, 1);
         assertEquals(2, f.receiver.nextToEnqueue());
@@ -147,27 +166,29 @@ class StreamReceiverTest {
     @Test void epochTwoAheadIsFutureEvenWithAPendingTransition() {
         Fixture f = new Fixture(2);
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
+                f.receiver.offer(rec(0, 1, 0), 100, 1).kind());
         assertViolation(offer(f.receiver, rec(2, 1, 2)));
     }
 
-    @Test void secondTransitionWhileOneIsPendingIsAViolation() {
+    @Test void secondTransitionWhileOneIsPendingIsRefusedByTheControlHead() {
         Fixture f = new Fixture(2);
-        assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
-        assertViolation(f.receiver.offer(rec(0, 2, 0), boundary(), 100, 1));
+        assertAdmitted(f.receiver, rec(0, 1, 0));
+        assertNull(f.receiver.validateEligible(0, boundary()));
+        // Transitions are CONTROL-only, so a held transition blocks the next CONTROL head (BUSY, not a violation).
+        assertEquals(StreamReceiver.Admission.Kind.BUSY, f.receiver.offer(rec(0, 2, 0), 100, 1).kind());
     }
 
     @Test void wrongShardIsAViolationFromTheInjectedValidator() {
         Fixture f = new Fixture(2, (s, r, route) -> false);
-        assertViolation(offer(f.receiver, rec(3, 1, 0)));
+        assertAdmitted(f.receiver, rec(3, 1, 0));
+        assertClose(f.receiver.validateEligible(3, route(3)));
     }
 
     @Test void skippedAndDuplicateSequencesAreViolations() {
         Fixture f = new Fixture(2);
         assertViolation(offer(f.receiver, rec(2, 2, 0)));
         assertAdmitted(f.receiver, rec(2, 1, 0));
-        f.receiver.enqueued(2, 1);
+        enqueue(f.receiver, 2, 1);
         f.receiver.applied(2, 1);
         assertViolation(offer(f.receiver, rec(2, 1, 0)));
     }
@@ -182,21 +203,24 @@ class StreamReceiverTest {
     @Test void joinKindRecordsLiveOnlyOnChunkZero() {
         Fixture f = new Fixture(2);
         ReceiveRoute join = new ReceiveRoute(ReceiveRoute.Lane.CHUNK, Dependency.ACK_JOIN, null, false, true);
-        assertViolation(f.receiver.offer(recKind(3, 1, 0, ACK_JOIN), join, 100, 1));
-        assertViolation(f.receiver.offer(recKind(1, 1, 0, BATCH_JOIN), join, 100, 1));
+        assertViolation(f.receiver.offer(recKind(3, 1, 0, ACK_JOIN), 100, 1));
+        assertViolation(f.receiver.offer(recKind(1, 1, 0, BATCH_JOIN), 100, 1));
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(recKind(2, 1, 0, BATCH_JOIN), join, 100, 1).kind());
+                f.receiver.offer(recKind(2, 1, 0, BATCH_JOIN), 100, 1).kind());
+        assertNull(f.receiver.validateEligible(2, join));
     }
 
     @Test void joinRouteWithANonJoinKindIsAViolation() {
         Fixture f = new Fixture(2);
         ReceiveRoute join = new ReceiveRoute(ReceiveRoute.Lane.CHUNK, Dependency.ACK_JOIN, null, false, true);
-        assertViolation(f.receiver.offer(rec(2, 1, 0), join, 100, 1));
+        assertAdmitted(f.receiver, rec(2, 1, 0));
+        assertClose(f.receiver.validateEligible(2, join));
     }
 
     @Test void joinKindWithANonJoinRouteIsAViolation() {
         Fixture f = new Fixture(2);
-        assertViolation(offer(f.receiver, recKind(2, 1, 0, ACK_JOIN)));
+        assertAdmitted(f.receiver, recKind(2, 1, 0, ACK_JOIN));
+        assertClose(f.receiver.validateEligible(2, route(2)));
     }
 
     @Test void epochPlusOneWithoutAnyTransitionPathIsAViolation() {
@@ -207,8 +231,8 @@ class StreamReceiverTest {
     @Test void epochPlusOneAfterTransitionAppliedWithoutPathIsAViolation() {
         Fixture f = new Fixture(2);
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
-        f.receiver.enqueued(0, 1);
+                f.receiver.offer(rec(0, 1, 0), 100, 1).kind());
+        enqueue(f.receiver, 0, 1, boundary());
         f.receiver.applied(0, 1);
         assertEquals(1, f.receiver.epoch());
         assertViolation(offer(f.receiver, rec(2, 1, 2)));
@@ -218,7 +242,7 @@ class StreamReceiverTest {
     @Test void epochPlusOneWithAPendingTransitionIsAdmitted() {
         Fixture f = new Fixture(2);
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
+                f.receiver.offer(rec(0, 1, 0), 100, 1).kind());
         assertAdmitted(f.receiver, rec(2, 1, 1));
     }
 
@@ -226,13 +250,13 @@ class StreamReceiverTest {
         Fixture f = new Fixture(2);
         // CONTROL bundle: opener at 1, one member at 2, closer at 3, admitted as one unit.
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), 3, route(0), 300, 3).kind());
+                f.receiver.offer(rec(0, 1, 0), 3, 300, 3).kind());
         assertEquals(0, f.receiver.nextToEnqueue());
         // A later record on the same stream must open at closing + 1, not at opening + 1.
         assertViolation(offer(f.receiver, rec(0, 2, 0)));
         // A dependency on the bundle's closing sequence waits for the whole bundle to apply.
         assertAdmitted(f.receiver, rec(1, 1, 0, dep(0, 3)));
-        f.receiver.enqueued(0, 1);
+        enqueue(f.receiver, 0, 1);
         assertEquals(3, f.receiver.enqueuedWatermark(0));
         assertEquals(-1, f.receiver.nextToEnqueue(), "closing sequence is not applied yet");
         f.receiver.applied(0, 1);
@@ -244,10 +268,33 @@ class StreamReceiverTest {
 
     @Test void unitWithAWrongRecordCountOrClosingSequenceIsAViolation() {
         Fixture f = new Fixture(2);
-        assertViolation(f.receiver.offer(rec(0, 1, 0), 3, route(0), 300, 2));
-        assertViolation(f.receiver.offer(rec(0, 1, 0), 0, route(0), 300, 1));
-        assertViolation(f.receiver.offer(rec(0, 1, 0), 1, route(0), 300, 0));
+        assertViolation(f.receiver.offer(rec(0, 1, 0), 3, 300, 2));
+        assertViolation(f.receiver.offer(rec(0, 1, 0), 0, 300, 1));
+        assertViolation(f.receiver.offer(rec(0, 1, 0), 1, 300, 0));
         assertAdmitted(f.receiver, rec(0, 1, 0));
+    }
+
+    @Test void admissionNeverRunsTheBodyValidatorAndAnEligibleHeadRunsItExactlyOnce() {
+        AtomicInteger calls = new AtomicInteger();
+        Fixture f = new Fixture(2, (s, r, route) -> {
+            calls.incrementAndGet();
+            return true;
+        });
+        assertAdmitted(f.receiver, rec(0, 1, 0));
+        assertAdmitted(f.receiver, rec(1, 1, 0, dep(0, 1)));
+        assertAdmitted(f.receiver, rec(2, 1, 1));
+        assertEquals(0, calls.get(), "blocked and future-epoch admission must not touch the body");
+        assertNull(f.receiver.validateEligible(0, boundary()));
+        assertEquals(1, calls.get());
+        assertNull(f.receiver.validateEligible(0, boundary()), "a second call is a no-op");
+        assertEquals(1, calls.get(), "the validator runs exactly once per head");
+        f.receiver.enqueued(0, 1);
+        f.receiver.applied(0, 1);
+        assertEquals(1, f.receiver.nextToEnqueue(), "REALTIME waits on its dependency, then is eligible");
+        assertNull(f.receiver.validateEligible(1, route(1)));
+        assertEquals(2, calls.get());
+        assertNull(f.receiver.validateEligible(2, route(2)));
+        assertEquals(3, calls.get(), "the epoch+1 record is validated once the transition applied");
     }
 
     @Test void serverboundReceiverRejectsEveryChunkStreamRecord() {
@@ -266,13 +313,15 @@ class StreamReceiverTest {
         StreamReceiver rx = new StreamReceiver(2, Direction.SERVERBOUND,
                 (s, r, route) -> true, () -> 0L);
         assertViolation(offer(rx, rec(1, 1, 1)));
-        assertViolation(rx.offer(rec(0, 1, 0), boundary(), 100, 1));
+        assertAdmitted(rx, rec(0, 1, 0));
+        assertClose(rx.validateEligible(0, boundary()));
     }
 
     @Test void serverboundTransitionRouteIsAViolation() {
         StreamReceiver rx = new StreamReceiver(2, Direction.SERVERBOUND,
                 (s, r, route) -> true, () -> 0L);
-        assertViolation(rx.offer(rec(0, 1, 0), boundary(), 100, 1));
+        assertAdmitted(rx, rec(0, 1, 0));
+        assertClose(rx.validateEligible(0, boundary()));
     }
 
     @Test void provableCyclesCloseWithZeroX11() {
@@ -329,7 +378,7 @@ class StreamReceiverTest {
         Fixture f = new Fixture(2);
         assertAdmitted(f.receiver, rec(2, 1, 0));
         assertAdmitted(f.receiver, rec(3, 1, 0, dep(2, 1)));
-        f.receiver.enqueued(2, 1);
+        enqueue(f.receiver, 2, 1);
         assertEquals(1, f.receiver.enqueuedWatermark(2));
         assertEquals(0, f.receiver.appliedWatermark(2));
         assertEquals(-1, f.receiver.nextToEnqueue(), "Q must not release the dependent");
@@ -369,7 +418,7 @@ class StreamReceiverTest {
         Fixture f = new Fixture(2);
         assertAdmitted(f.receiver, rec(3, 1, 0));
         assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 1)));
-        f.receiver.enqueued(3, 1);
+        enqueue(f.receiver, 3, 1);
         f.receiver.applied(3, 1);
         f.now.set(100 * SEC);
         assertNull(f.receiver.expiredWait(), "resolved prerequisites stop the wait");
@@ -409,7 +458,7 @@ class StreamReceiverTest {
         assertAdmitted(f.receiver, rec(2, 1, 0, dep(0, 1), dep(1, 1)));
         f.receiver.markLocallyWithheld(0, 1);
         assertAdmitted(f.receiver, rec(0, 1, 0));
-        f.receiver.enqueued(0, 1);
+        enqueue(f.receiver, 0, 1);
         f.receiver.applied(0, 1);
         f.now.set(10 * SEC);
         ReceiveClose close = f.receiver.expiredWait();
@@ -433,7 +482,7 @@ class StreamReceiverTest {
         for (int s = 0; s < 8; s++) {
             Record r = s == blocked ? rec(s, 1, 0, dep(prereq, 1)) : rec(s, 1, 0);
             assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                    f.receiver.offer(r, records, route(s), full, records).kind(), "stream " + s + " prereq " + prereq);
+                    f.receiver.offer(r, records, full, records).kind(), "stream " + s + " prereq " + prereq);
         }
         if (locallyWithheld) {
             f.receiver.markLocallyWithheld(prereq, 1);
@@ -455,7 +504,7 @@ class StreamReceiverTest {
         // The CHUNK head at epoch 1 is admitted while REALTIME 1 is unseen, so a path still exists.
         assertAdmitted(f.receiver, rec(2, 1, 1, dep(1, 1)));
         assertAdmitted(f.receiver, rec(1, 1, 0));
-        f.receiver.enqueued(1, 1);
+        enqueue(f.receiver, 1, 1);
         f.receiver.applied(1, 1);
         // No transition was admitted, so the held head can never reach its epoch: 0x11, not a 0x12 expiry.
         ReceiveClose close = f.receiver.pendingViolation();
@@ -469,13 +518,13 @@ class StreamReceiverTest {
         Fixture f = new Fixture(2);
         assertAdmitted(f.receiver, rec(2, 1, 1, dep(1, 1)));
         assertAdmitted(f.receiver, rec(1, 1, 0));
-        f.receiver.enqueued(1, 1);
+        enqueue(f.receiver, 1, 1);
         // The transition arrives while REALTIME 1 is still held, so the path is reachable again.
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
+                f.receiver.offer(rec(0, 1, 0), 100, 1).kind());
         f.receiver.applied(1, 1);
         assertNull(f.receiver.pendingViolation(), "a pending transition keeps the head legal");
-        f.receiver.enqueued(0, 1);
+        enqueue(f.receiver, 0, 1, boundary());
         f.receiver.applied(0, 1);
         assertEquals(1, f.receiver.epoch());
         assertNull(f.receiver.pendingViolation());
