@@ -1152,15 +1152,16 @@ public final class QuicServer implements Closeable {
                         stagedCheck.cancel(false);
                         return;
                     }
+                    // 12.13: the hard cap is checked before any retry, so an expired connection closes.
+                    if (staged.expired()) {
+                        stagedCheck.cancel(false);
+                        Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
+                        return;
+                    }
                     // 12.13: a promotion that the node budget refused is retried on every tick.
                     staged.retryPromotion();
                     if (staged.tracker().state() != PreLoginTracker.State.STAGED) {
                         stagedCheck.cancel(false);
-                        return;
-                    }
-                    if (staged.expired()) {
-                        stagedCheck.cancel(false);
-                        Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
                     }
                 }, STAGED_CHECK_MILLIS, STAGED_CHECK_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
             } catch (Throwable t) {

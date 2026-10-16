@@ -239,13 +239,18 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
     /**
      * Promotes the connection: reserves the full 24 KiB exposure from the node budget, then releases
      * the staged charge (12.13). Returns false when the node budget cannot take it right now; the
-     * caller waits non-fatally and retries, and the connection stays staged.
+     * caller waits non-fatally and retries, and the connection stays staged. Also returns false once
+     * the connection has expired, so the deadline check closes it.
      */
     public boolean promote() {
         if (state == State.PROMOTED) {
             return true;
         }
         if (state != State.STAGED) {
+            return false;
+        }
+        if (expired()) {
+            // 12.13: the hard cap is unconditional; an expired staged connection closes, never promotes.
             return false;
         }
         if (!pools.reserve(ResourcePools.Pool.NODE, owner, PROMOTED_BYTES)) {

@@ -159,8 +159,28 @@ class PreLoginTrackerTest {
                 .capacity(ResourcePools.Pool.NODE, TransportConfig.V3_INITIAL_EXPOSURE_BYTES)
                 .capacity(ResourcePools.Pool.PRE_LOGIN, STAGED_N6);
         PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        pools.log.clear();
         assertTrue(tracker.promote());
         assertEquals(PreLoginTracker.State.PROMOTED, tracker.state());
+        assertEquals(java.util.Arrays.asList("reserve NODE", "release PRE_LOGIN"), pools.log,
+                "the node share is reserved before the staged charge is released");
+    }
+
+    @Test
+    void anExpiredStagedConnectionNeverPromotesEvenWhenTheNodeBudgetHasRoom() {
+        FakePools pools = new FakePools().capacity(ResourcePools.Pool.NODE, 1000);
+        Clock clock = new Clock();
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, clock);
+        tracker.onLoginSuccess();
+        assertEquals(PreLoginTracker.State.STAGED, tracker.state());
+        clock.advance(TimeUnit.SECONDS.toNanos(31));
+        assertTrue(tracker.expired());
+        pools.capacity(ResourcePools.Pool.NODE, TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
+        assertFalse(tracker.retryPromotion(), "the hard cap wins over a freed node budget");
+        assertFalse(tracker.promote());
+        tracker.onActivation();
+        assertEquals(PreLoginTracker.State.STAGED, tracker.state());
+        assertEquals(0, pools.held(ResourcePools.Pool.NODE));
     }
 
     @Test
@@ -237,6 +257,7 @@ class PreLoginTrackerTest {
     static final class FakePools implements ResourcePools {
         private final Map<Pool, Long> held = new EnumMap<>(Pool.class);
         private final Map<Pool, Long> caps = new EnumMap<>(Pool.class);
+        final java.util.List<String> log = new java.util.ArrayList<>();
 
         FakePools capacity(Pool pool, long bytes) {
             caps.put(pool, bytes);
@@ -254,12 +275,14 @@ class PreLoginTrackerTest {
                 return false;
             }
             held.put(pool, next);
+            log.add("reserve " + pool);
             return true;
         }
 
         @Override
         public void release(Pool pool, Object owner, long bytes) {
             held.put(pool, held(pool) - bytes);
+            log.add("release " + pool);
         }
 
         @Override
