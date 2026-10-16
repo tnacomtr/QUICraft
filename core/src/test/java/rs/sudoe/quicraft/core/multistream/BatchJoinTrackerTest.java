@@ -75,6 +75,34 @@ class BatchJoinTrackerTest {
         assertThrows(IllegalArgumentException.class, () -> batch.recordJoin(4), "joins never move backward");
     }
 
+    @Test void epochMismatchOnFinishClearsTheActiveBatchBeforeThrowing() {
+        BatchJoinTracker batch = new BatchJoinTracker();
+        batch.begin(1, 1, 0);
+        batch.chunk(1, 2, 4, 0);
+        assertThrows(IllegalArgumentException.class, () -> batch.finish(1, 1), "epoch mismatch");
+        assertFalse(batch.active(), "the mismatched batch is no longer active");
+        batch.begin(2, 2, 0);
+        assertEquals(expect(0, 2), pairs(batch.finish(2, 0)), "install of the aborted batch is gone");
+    }
+
+    @Test void abortDiscardsTheBatchButKeepsTheLastJoinForTheNextStart() {
+        BatchJoinTracker batch = new BatchJoinTracker();
+        batch.begin(1, 3, 0);
+        batch.finish(1, 0);
+        batch.recordJoin(5);
+        batch.begin(2, 8, 0);
+        batch.chunk(2, 3, 6, 0);
+        batch.abort();
+        assertFalse(batch.active());
+        assertEquals(expect(2, 5), pairs(new Record.Dependency[] {batch.previousJoinDependency()}));
+        assertThrows(IllegalArgumentException.class, () -> batch.chunk(2, 3, 7, 0), "aborted batch id");
+        batch.begin(3, 9, 0);
+        assertEquals(expect(0, 9), pairs(batch.finish(3, 0)), "aborted installs are not carried over");
+        batch.abort();
+        batch.abort();
+        assertFalse(batch.active(), "abort without an active batch does nothing");
+    }
+
     @Test void batchEdgesAreBackwardThroughTheSequencer() {
         StreamSequencer sequencer = new StreamSequencer(2);
         BatchJoinTracker batch = new BatchJoinTracker();

@@ -67,19 +67,40 @@ public final class BatchJoinTracker {
      * Ends the active batch and returns its BATCH_JOIN dependencies: the start on CONTROL, then the
      * per-stream maximum of every install (13.19). An empty batch depends on its start only.
      *
+     * <p>An epoch mismatch on the active batch clears that batch before it throws, so a later
+     * {@link #begin} is not rejected as nested.
+     *
      * @throws IllegalArgumentException for an unmatched marker or an epoch mismatch
      */
     public synchronized Record.Dependency[] finish(long id, long epoch) {
+        if (active && activeId == id && epoch != batchEpoch) {
+            clearActive();
+        }
         require(id, epoch);
         List<Record.Dependency> dependencies = new ArrayList<Record.Dependency>();
         dependencies.add(new Record.Dependency(LogicalStream.CONTROL, startSequence));
         for (Map.Entry<Integer, Long> install : installs.entrySet()) {
             dependencies.add(new Record.Dependency(install.getKey(), install.getValue()));
         }
+        clearActive();
+        return dependencies.toArray(new Record.Dependency[dependencies.size()]);
+    }
+
+    /**
+     * Discards the active batch and its recorded installs at a protocol-state, epoch or disconnect
+     * transition (13.19). {@link #lastJoinSequence} is kept, so the next chunk_batch_start still
+     * depends on the last BATCH_JOIN that was sequenced. Does nothing when no batch is active.
+     */
+    public synchronized void abort() {
+        clearActive();
+    }
+
+    private void clearActive() {
         active = false;
+        activeId = 0;
         installs.clear();
         startSequence = 0;
-        return dependencies.toArray(new Record.Dependency[dependencies.size()]);
+        batchEpoch = 0;
     }
 
     /**
