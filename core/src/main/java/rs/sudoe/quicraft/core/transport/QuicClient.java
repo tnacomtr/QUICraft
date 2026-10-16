@@ -209,6 +209,37 @@ public final class QuicClient {
                 .bind(0), remote, fingerprint, table, effective, early, bypassResumption);
     }
 
+    /**
+     * As {@link #connectV3(InetSocketAddress, Fingerprint, RoutingTable, TransportConfig,
+     * EarlyFlight, boolean)}, but QUIC runs on the platform's {@code loop} over its {@code socket}
+     * (hosted transport, docs/protocol.md §11), exactly as the hosted {@code /2} dial does: the
+     * connection's event loop is the game's, so the TLS exporter, the binding session's deadlines and
+     * the game channel all run on the one thread 12.10 requires. The socket is closed with the
+     * connection, or when the attempt fails or is cancelled.
+     */
+    public static CompletableFuture<V3Connection> connectV3(HostLoop loop, HostDatagramSocket socket,
+            InetSocketAddress remote, Fingerprint fingerprint, RoutingTable table, TransportConfig config,
+            EarlyFlight early, boolean bypassResumption) {
+        if (table == null) {
+            throw new NullPointerException("table");
+        }
+        if (config == null) {
+            throw new NullPointerException("config");
+        }
+        if (!QuicSupport.hasMaxFlowControlWindows()) {
+            CompletableFuture<V3Connection> unavailable = new CompletableFuture<V3Connection>();
+            unavailable.completeExceptionally(new V3UnavailableException(
+                    "/3 needs QUICraft's patched native that caps quiche's flow-control windows (12.3, 13.13);"
+                            + " fall back to /2 or TCP"));
+            return unavailable;
+        }
+        return connectV3(codec -> {
+            HostedDatagramChannel udp = new HostedDatagramChannel(socket);
+            udp.pipeline().addLast(codec);
+            return new HostedEventLoop(loop).register(udp);
+        }, remote, fingerprint, table, config.withMultistream(), early, bypassResumption);
+    }
+
     private static CompletableFuture<V3Connection> connectV3(UdpFactory udpFactory, InetSocketAddress remote,
             Fingerprint fingerprint, RoutingTable table, TransportConfig config, EarlyFlight early,
             boolean bypassResumption) {
