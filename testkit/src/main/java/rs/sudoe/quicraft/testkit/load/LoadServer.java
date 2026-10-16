@@ -40,6 +40,8 @@ import rs.sudoe.quicraft.testkit.Args;
  * <p>Runs until SIGTERM or SIGINT, then closes the listener.
  */
 public final class LoadServer {
+    /** Testkit-only SERVER_SWITCH stand-in, sent on stream 0 before server activation. */
+    static final byte[] ACTIVATION_MARKER = new byte[] {0x51};
     /** The Minecraft protocol number the /3 test table is for; the spike has no real login. */
     static final int PROTOCOL = 4242;
     static final RoutingTable TABLE = RoutingTableLoader.parse(
@@ -194,6 +196,10 @@ public final class LoadServer {
                         HANDSHAKE_RETRY_MS, TimeUnit.MILLISECONDS);
                 return;
             }
+            // Mirror /3 cutover ordering: the harness marker substitutes for SERVER_SWITCH. The
+            // peer observes it on stream 0 before enabling its lane parser.
+            connection.write(java.nio.ByteBuffer.wrap(ACTIVATION_MARKER));
+            connection.flush();
             connection.detachForActivation(leftover -> { });
             connection.activate(IdleLaneGame.INSTANCE, PROTOCOL, null);
             lanesActive.incrementAndGet();

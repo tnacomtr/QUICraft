@@ -217,4 +217,20 @@ echo "last sample: $(tail -n 1 "$samples")"
 echo "client: $(grep '^SUMMARY ' "$results/client.log" || echo 'no SUMMARY line; see client.log')"
 echo "server: $(grep '^CLOSED ' "$results/server.log" || echo 'no CLOSED line')"
 echo "exit codes: client=$client_rc server=$server_rc"
+if [[ "$MODE" == v3 && "$LANES" == 1 ]]; then
+    client_summary="$(grep '^SUMMARY ' "$results/client.log" | tail -n 1)"
+    server_stats="$(grep '^STAT .*admitted=' "$results/server.log" | tail -n 1)"
+    closed_count="$(sed -n 's/.* closed_during_hold=\([0-9][0-9]*\).*/\1/p' <<<"$client_summary")"
+    active_count="$(sed -n 's/.* lanes_active=\([0-9][0-9]*\).*/\1/p' <<<"$client_summary")"
+    admitted_count="$(sed -n 's/.* admitted=\([0-9][0-9]*\).*/\1/p' <<<"$server_stats")"
+    if [[ -z "$closed_count" || -z "$active_count" || -z "$admitted_count" ]]; then
+        echo "FAIL lanes validation missing counters: client='$client_summary' server='$server_stats'" >&2
+        exit 1
+    fi
+    if (( closed_count > 0 || active_count < admitted_count )); then
+        echo "FAIL lanes held check: lanes_active=$active_count admitted=$admitted_count client_closed_during_hold=$closed_count" >&2
+        exit 1
+    fi
+    echo "PASS lanes held check: lanes_active=$active_count admitted=$admitted_count client_closed_during_hold=$closed_count"
+fi
 exit "$client_rc"

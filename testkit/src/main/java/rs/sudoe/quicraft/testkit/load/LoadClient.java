@@ -19,6 +19,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.Consumer;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
@@ -53,6 +54,7 @@ public final class LoadClient {
     private final AtomicLong closed = new AtomicLong();
     private final AtomicLong lanesActive = new AtomicLong();
     private final AtomicLong lanesFailed = new AtomicLong();
+    private final Map<String, AtomicLong> closeCauses = new ConcurrentHashMap<>();
     /** Failed dials by normalized cause (root exception class and message, digits folded). */
     private final Map<String, AtomicLong> causes = new ConcurrentHashMap<>();
     private final Queue<Object> held = new ConcurrentLinkedQueue<>();
@@ -133,10 +135,13 @@ public final class LoadClient {
 
         load.allDone.await();
         System.out.println("ALL_ATTEMPTS_RESOLVED seconds=" + (System.nanoTime() - t0) / 1_000_000_000L);
+        long closedAtHoldStart = load.closed.get();
         Thread.sleep(TimeUnit.SECONDS.toMillis(holdSec));
         monitor.shutdownNow();
         System.out.println("SUMMARY started=" + load.started.get() + " connected=" + load.connected.get()
-                + " failed=" + load.failed.get() + load.v3Fields() + " rss_mb=" + ProcStats.rssMb());
+                + " failed=" + load.failed.get() + load.v3Fields()
+                + (v3 ? " closed_during_hold=" + (load.closed.get() - closedAtHoldStart) : "")
+                + " rss_mb=" + ProcStats.rssMb());
         load.printCauses();
         return 0;
     }
@@ -190,19 +195,37 @@ public final class LoadClient {
         for (Map.Entry<String, AtomicLong> e : entries) {
             System.out.println("FAIL_CAUSE count=" + e.getValue().get() + " " + e.getKey());
         }
+        List<Map.Entry<String, AtomicLong>> closes = new ArrayList<>(closeCauses.entrySet());
+        closes.sort((a, b) -> Long.compare(b.getValue().get(), a.getValue().get()));
+        for (Map.Entry<String, AtomicLong> e : closes) {
+            String key = e.getKey();
+            String code = key.contains("0x11") || key.contains("rule 13.4") ? "0x11" : "other";
+            System.out.println("CLOSE_CAUSE count=" + e.getValue().get() + " code=" + code + " " + key);
+        }
     }
 
-    /**
-     * Per v3 connection: installs the close listener, then activates its lanes with the idle game
-     * when asked. The listener is set before activation and {@code V3ConnectionImpl} keeps it as the
-     * game listener, so a close after activation still reaches it; a close that came before the
-     * listener was set is replayed by {@code setListener}.
-     */
+    /** Installs the listener and waits for the test server's marker before activating lanes. */
     private void onV3Connected(Object connection, boolean lanes) {
         V3Connection v3 = (V3Connection) connection;
+        byte marker = LoadServer.ACTIVATION_MARKER[0];
+        AtomicBoolean activated = new AtomicBoolean();
         v3.setListener(new QuicByteStream.Listener() {
             @Override
-            public void onData(ByteBuffer data) {}
+            public void onData(ByteBuffer data) {
+                if (!lanes || !data.hasRemaining() || data.get(data.position()) != marker
+                        || !activated.compareAndSet(false, true)) {
+                    return;
+                }
+                try {
+                    data.get(); // Consume the harness SERVER_SWITCH marker, never a lane record.
+                    ByteBuffer suffix = data.hasRemaining() ? data.slice() : null;
+                    v3.detachForActivation(leftover -> { });
+                    v3.activate(IdleLaneGame.INSTANCE, suffix);
+                    lanesActive.incrementAndGet();
+                } catch (Throwable t) {
+                    lanesFailed.incrementAndGet();
+                }
+            }
 
             @Override
             public void onWritabilityChanged(boolean writable) {}
@@ -210,18 +233,10 @@ public final class LoadClient {
             @Override
             public void onClosed(Throwable cause) {
                 closed.incrementAndGet();
+                String key = cause == null ? "normal" : normalizeCause(cause);
+                closeCauses.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
             }
         });
-        if (!lanes) {
-            return;
-        }
-        try {
-            v3.detachForActivation(leftover -> { });
-            v3.activate(IdleLaneGame.INSTANCE, null);
-            lanesActive.incrementAndGet();
-        } catch (Throwable t) {
-            lanesFailed.incrementAndGet();
-        }
     }
 
     /**
