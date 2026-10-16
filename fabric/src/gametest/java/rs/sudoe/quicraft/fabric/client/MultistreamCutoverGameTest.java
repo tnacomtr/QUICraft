@@ -128,6 +128,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             aCancelDuringBindingEndsTheSession(protocol, table.get());
             aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), false);
             aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), true);
+            aFailureAfterPublishingV3FallsBackToTcpWithoutStaleConnectionState(protocol, table.get());
             aChangedCertificateIsReboundAndTheNewPinIsNoticed(protocol, table.get());
             aReboundThatGetsNoOfferFailsAfterTheBoundedWait(protocol, table.get());
         } catch (Exception e) {
@@ -795,6 +796,31 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
                 check(notices.size() == 1 && notices.get(0).literal().contains("fell back to TCP"),
                         "with the notice: " + notices);
             }
+        }
+    }
+
+    /** A failure immediately after both /3 transport entries were published must roll them back. */
+    private static void aFailureAfterPublishingV3FallsBackToTcpWithoutStaleConnectionState(int protocol,
+            RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            Connection reused = new Connection(PacketFlow.CLIENTBOUND);
+            io.netty.channel.ChannelPromise promise = new io.netty.channel.DefaultChannelPromise(
+                    new EmbeddedChannel(), rig.loop);
+            int[] tcpJoins = {0};
+            Hooks.setFaultInjection("v3 published");
+            try {
+                ClientConnect.useV3(rig.fake, rig.plan, rig.loop, reused, promise, new boolean[] {false}, Mode.AUTO,
+                        rig.files, new net.minecraft.client.multiplayer.resolver.ServerAddress(HOST, PORT), () -> {
+                            tcpJoins[0]++;
+                            return new EmbeddedChannel().newSucceededFuture();
+                        });
+            } finally {
+                Hooks.setFaultInjection(false);
+            }
+            check(rig.awaitCondition(promise::isDone), "the fallback future completes");
+            check(promise.isSuccess() && tcpJoins[0] == 1, "the same connection can join over TCP");
+            check(!Transports.isQuic(reused), "the abandoned /3 transport is removed");
+            check(Transports.v3(reused) == null, "the abandoned /3 controller is removed");
         }
     }
 

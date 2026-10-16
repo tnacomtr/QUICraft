@@ -8,6 +8,7 @@ import net.minecraft.network.Connection;
 import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.core.connect.FallbackReason;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
+import rs.sudoe.quicraft.core.transport.V3Connection;
 
 /** Per-connection client state: the transport in use and a pending fallback report. */
 public final class Transports {
@@ -46,6 +47,17 @@ public final class Transports {
 
     static synchronized void v3(Connection connection, V3Client client) {
         V3.put(connection, new WeakReference<>(client));
+    }
+
+    /** Remove a half-published /3 attempt without clearing a newer transport/controller. */
+    static synchronized void rollbackV3(Connection connection, V3Connection stream, V3Client client) {
+        if (QUIC.get(connection) == stream) {
+            QUIC.remove(connection);
+        }
+        WeakReference<V3Client> reference = V3.get(connection);
+        if (reference != null && reference.get() == client) {
+            V3.remove(connection);
+        }
     }
 
     /** The multi-stream controller of {@code connection}, or null when it is not a {@code /3} join. */

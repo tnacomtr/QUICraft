@@ -225,13 +225,14 @@ public final class ClientConnect {
         // to the screen's future, and any failure releases what was built and takes the mode-aware
         // fallback (docs/protocol.md 12.14).
         QuicBridgeChannel channel = null;
+        V3Client client = null;
         try {
             int protocol = SharedConstants.getCurrentVersion().protocolVersion();
             RoutingTable table = RoutingRegistry.forProtocol(protocol)
                     .orElseThrow(() -> new IllegalStateException("no routing table for protocol " + protocol));
             channel = new QuicBridgeChannel(v3);
             Hooks.enter("v3 setup");
-            V3Client client = new V3Client(connection, channel, loop, v3, plan, table, protocol,
+            client = new V3Client(connection, channel, loop, v3, plan, table, protocol,
                     mode == Mode.QUIC_ONLY, files, logical.getHost(), logical.getPort(),
                     plan.pinState() == TransportSelection.PinState.CHANGED
                             ? V3Client.oldPin(files, logical.getHost(), logical.getPort())
@@ -240,29 +241,32 @@ public final class ClientConnect {
             channel.pipeline().addBefore("packet_handler", V3Handler.NAME, new V3Handler(client));
             Transports.quic(connection, v3);
             Transports.v3(connection, client);
+            Hooks.enter("v3 published");
+            V3Client controller = client;
             if (v3 instanceof V3ConnectionImpl impl) {
                 // The game's first flight differed from the 0-RTT one: the connection closes, and the join
                 // starts again over TCP like any other /3 failure before activation.
-                impl.onFirstFlightMismatch(() -> client.fail("the early data did not match"));
+                impl.onFirstFlightMismatch(() -> controller.fail("the early data did not match"));
             }
             final QuicBridgeChannel registering = channel;
             attached[0] = true;
             loop.register(channel).addListener(f -> {
                 if (!f.isSuccess()) {
-                    setupFailed(v3, registering, plan, mode, f.cause(), promise, vanilla);
+                    setupFailed(v3, controller, connection, registering, plan, mode, f.cause(), promise, vanilla);
                 } else if (!promise.trySuccess()) {
                     registering.close(); // cancelled meanwhile
                 }
             });
         } catch (Throwable t) {
             attached[0] = false;
-            setupFailed(v3, channel, plan, mode, t, promise, vanilla);
+            setupFailed(v3, client, connection, channel, plan, mode, t, promise, vanilla);
         }
     }
 
     /** Releases a half-built /3 join and falls back as the mode requires: TCP and a notice, or the error. */
-    private static void setupFailed(V3Connection v3, QuicBridgeChannel channel, V3Plan plan, Mode mode, Throwable cause,
-            ChannelPromise promise, Supplier<ChannelFuture> vanilla) {
+    private static void setupFailed(V3Connection v3, V3Client client, Connection connection, QuicBridgeChannel channel,
+            V3Plan plan, Mode mode, Throwable cause, ChannelPromise promise, Supplier<ChannelFuture> vanilla) {
+        Transports.rollbackV3(connection, v3, client);
         try {
             if (channel != null && channel.isRegistered()) {
                 channel.close();
