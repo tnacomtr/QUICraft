@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
@@ -1480,6 +1481,58 @@ class LaneSessionTest {
             rig.client.bindGame(rig.clientGame);
             assertThrows(IllegalStateException.class, () -> rig.client.bindGame(rig.clientGame));
         }
+    }
+
+    // --- The shared loop ticker (13.12, 13.14).
+
+    @Test
+    void theSharedTickPeriodGrowsBackWhenTheFastestSessionLeaves() throws Exception {
+        long fast = TimeUnit.MILLISECONDS.toNanos(5);
+        long slow = TimeUnit.MILLISECONDS.toNanos(200);
+        LaneRig.Config config = new LaneRig.Config();
+        config.serverSession = false;
+        config.clientTiming = new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, fast);
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.activateClient();
+            io.netty.channel.EventLoop loop = rig.client.eventLoop();
+            QuicChannel secondConnection = QuicChannel.newBootstrap(rig.net.clientUdp)
+                    .handler(new ChannelInboundHandlerAdapter())
+                    .streamHandler(new io.netty.channel.ChannelInitializer<QuicStreamChannel>() {
+                        @Override
+                        protected void initChannel(QuicStreamChannel stream) {
+                            stream.config().setAutoRead(false);
+                        }
+                    })
+                    .remoteAddress(rig.net.serverUdp.localAddress())
+                    .connect().get(10, TimeUnit.SECONDS);
+            try {
+                // One listener's loop serves many connections, so its single ticker must run at the
+                // fastest period any session on that loop asks for. This second session shares the
+                // first one's event loop (the same UDP channel), with a slower period.
+                QuicStreamChannel control = secondConnection.createStream(QuicStreamType.BIDIRECTIONAL,
+                        new ChannelInboundHandlerAdapter()).get(10, TimeUnit.SECONDS);
+                LaneSession second = new LaneSession(secondConnection, LaneSession.Role.CLIENT, control,
+                        LaneRig.TABLE, new LaneRig.TestGame(), ReceiveBudget.unlimited(),
+                        new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
+                                LaneSession.END_LINGER_NANOS, slow));
+                assertEquals(loop, second.eventLoop(), "both sessions share one event loop");
+                second.activate(null);
+                loop.submit(() -> null).get(10, TimeUnit.SECONDS);
+                assertEquals(fast, tickPeriod(loop), "the loop ticks at the fastest session's period");
+                // The faster session leaves: the loop's period must grow back to the slower one's.
+                rig.client.abort(0x11);
+                assertEquals(slow, tickPeriod(loop),
+                        "the period is recomputed when a session is removed");
+            } finally {
+                secondConnection.close(true, 0, Unpooled.EMPTY_BUFFER).awaitUninterruptibly(2, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    /** The shared tick period of a loop, read on that loop. */
+    private static long tickPeriod(io.netty.channel.EventLoop loop) throws Exception {
+        return loop.submit(() -> LaneSession.tickPeriodNanos(loop)).get(10, TimeUnit.SECONDS);
     }
 
     // --- Bundles (13.15).

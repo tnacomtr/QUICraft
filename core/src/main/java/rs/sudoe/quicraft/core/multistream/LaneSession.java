@@ -461,6 +461,15 @@ public final class LaneSession {
     }
 
     /**
+     * Test hook: the tick period the shared ticker of {@code loop} uses right now, in nanoseconds,
+     * or {@code -1} when that loop has no ticker; call on that loop.
+     */
+    static long tickPeriodNanos(io.netty.channel.EventLoop loop) {
+        LoopTicker ticker = LoopTicker.TICKERS.get(loop);
+        return ticker == null ? -1L : ticker.periodNanos;
+    }
+
+    /**
      * Test hook: the pinned Netty's {@code QUICHE_ERR_STREAM_STOPPED}, or {@link Integer#MIN_VALUE}
      * when the probe cannot resolve it.
      */
@@ -1275,13 +1284,7 @@ public final class LaneSession {
         /** Adds a session, shortening the shared period when it asks for a faster one. */
         void register(LaneSession session) {
             active.add(session);
-            if (session.timing.tickNanos < periodNanos) {
-                periodNanos = session.timing.tickNanos;
-                if (task != null) {
-                    task.cancel(false);
-                    task = null;
-                }
-            }
+            recompute();
             if (task == null) {
                 task = loop.scheduleAtFixedRate(this, periodNanos, periodNanos, TimeUnit.NANOSECONDS);
             }
@@ -1297,6 +1300,32 @@ public final class LaneSession {
                 }
                 periodNanos = Long.MAX_VALUE;
                 TICKERS.remove(loop, this);
+                return;
+            }
+            recompute();
+            if (task == null) {
+                task = loop.scheduleAtFixedRate(this, periodNanos, periodNanos, TimeUnit.NANOSECONDS);
+            }
+        }
+
+        /**
+         * Sets the shared period to the fastest period of the sessions still registered and
+         * reschedules when it changed. A session that leaves may have been the fastest, so the
+         * period has to grow back: keeping the smallest period ever seen would tick this loop
+         * faster than any session left on it asks for.
+         */
+        private void recompute() {
+            long fastest = Long.MAX_VALUE;
+            for (LaneSession session : active) {
+                fastest = Math.min(fastest, session.timing.tickNanos);
+            }
+            if (fastest == periodNanos) {
+                return;
+            }
+            periodNanos = fastest;
+            if (task != null) {
+                task.cancel(false);
+                task = null;
             }
         }
 
