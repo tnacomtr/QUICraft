@@ -9,7 +9,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.AbstractByteBufAllocator;
 import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
@@ -94,14 +96,17 @@ class QuicBridgeChannelHandOverTest {
     @Test
     void handOverWaitsForTheWritesQueuedBeforeItOnANonWritableStream() throws Exception {
         FakeStream stream = new FakeStream();
-        Channel channel = open(stream);
+        QuicBridgeChannel channel = new QuicBridgeChannel(stream);
+        loop.register(channel).sync();
+        TrackingAllocator allocator = new TrackingAllocator(false);
+        channel.config().setAllocator(allocator);
         stream.writable = false; // the switch packet cannot go out yet
         byte[] switchPacket = {0x10, 0x11, 0x12, 0x13};
         onLoop(channel, () -> channel.writeAndFlush(Unpooled.wrappedBuffer(switchPacket)));
 
         ByteBuf cumulation = Unpooled.wrappedBuffer(new byte[] {0x21});
         AtomicReference<CompletableFuture<ByteBuf>> handed = new AtomicReference<>();
-        onLoop(channel, () -> handed.set(((QuicBridgeChannel) channel).handOver(cumulation)));
+        onLoop(channel, () -> handed.set(channel.handOver(cumulation)));
         CompletableFuture<ByteBuf> future = handed.get();
 
         assertFalse(future.isDone(),
@@ -120,6 +125,7 @@ class QuicBridgeChannelHandOverTest {
         assertArrayEquals(switchPacket, stream.writtenBytes(),
                 "the switch packet reached the stream, and the marker added no bytes");
         cumulation.release();
+        allocator.assertAllReleased("the drained hand-over must release every buffer it took, ");
 
         channel.close().sync();
     }
@@ -127,12 +133,15 @@ class QuicBridgeChannelHandOverTest {
     @Test
     void handOverFailsAndReleasesTheLeftoverWhenTheChannelClosesWithWritesPending() throws Exception {
         FakeStream stream = new FakeStream();
-        Channel channel = open(stream);
+        QuicBridgeChannel channel = new QuicBridgeChannel(stream);
+        loop.register(channel).sync();
+        TrackingAllocator allocator = new TrackingAllocator(false);
+        channel.config().setAllocator(allocator);
         stream.writable = false;
         onLoop(channel, () -> channel.writeAndFlush(Unpooled.wrappedBuffer(new byte[] {0x31})));
 
         AtomicReference<CompletableFuture<ByteBuf>> handed = new AtomicReference<>();
-        onLoop(channel, () -> handed.set(((QuicBridgeChannel) channel).handOver(null)));
+        onLoop(channel, () -> handed.set(channel.handOver(null)));
         CompletableFuture<ByteBuf> future = handed.get();
         assertFalse(future.isDone());
 
@@ -140,8 +149,7 @@ class QuicBridgeChannelHandOverTest {
         assertThrows(ExecutionException.class, () -> future.get(5, TimeUnit.SECONDS),
                 "the hand-over fails rather than silently reordering");
         assertTrue(future.isCompletedExceptionally());
-        // The leftover it would have handed out is released on the failure path; a test allocator
-        // would be the general check, so here the failure itself is the guarantee that matters.
+        allocator.assertAllReleased("a failed hand-over must release the leftover it took ownership of,");
     }
 
     @Test
@@ -222,9 +230,47 @@ class QuicBridgeChannelHandOverTest {
         return out;
     }
 
+    /**
+     * Remembers every buffer it hands out, so a test can prove the hand-over released its own:
+     * the {@code controlLeftover}, and the zero-byte marker it appends to the outbound buffer.
+     */
+    static final class TrackingAllocator extends AbstractByteBufAllocator {
+        final List<ByteBuf> all = Collections.synchronizedList(new ArrayList<ByteBuf>());
+
+        TrackingAllocator(boolean direct) {
+            super(direct);
+        }
+
+        @Override
+        public boolean isDirectBufferPooled() {
+            return false;
+        }
+
+        @Override
+        protected ByteBuf newHeapBuffer(int initialCapacity, int maxCapacity) {
+            ByteBuf buffer = UnpooledByteBufAllocator.DEFAULT.heapBuffer(initialCapacity, maxCapacity);
+            all.add(buffer);
+            return buffer;
+        }
+
+        @Override
+        protected ByteBuf newDirectBuffer(int initialCapacity, int maxCapacity) {
+            ByteBuf buffer = UnpooledByteBufAllocator.DEFAULT.directBuffer(initialCapacity, maxCapacity);
+            all.add(buffer);
+            return buffer;
+        }
+
+        void assertAllReleased(String what) {
+            synchronized (all) {
+                for (int i = 0; i < all.size(); i++) {
+                    assertEquals(0, all.get(i).refCnt(), what + " buffer #" + i + " leaked");
+                }
+            }
+        }
+    }
+
     /** Collects what reaches the pipeline and remembers the first exception. */
-    static final class Collector extends ChannelInboundHandlerAdapter {
-        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    static final class Collector extends ChannelInboundHandlerAdapter {        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         final AtomicReference<Throwable> cause = new AtomicReference<>();
 
         @Override
