@@ -1023,12 +1023,14 @@ position extraction. Those implementations must change together before this revi
    max(G,C), latest global/control fence. Movement can run ahead of CONTROL until that fence
    recovers, bounded by CONTROL recovery and 10-second deadlines; reach/validity checks can
    observe a position later than vanilla ordering. Adapters MUST leave vanilla anti-cheat
-   validation unchanged. Exact packet ids are routed as whole packets: action variants sharing
-    an id cannot receive separate routes. Mount/dismount is not a separate fence category;
+    validation unchanged. Exact packet ids are routed as whole packets: action variants sharing
+    an id cannot receive separate routes, and an id cannot be both REALTIME and a CONTROL
+    fence. Mount/dismount is not a separate fence category;
     an interact/attack packet id remains `interaction` and is not a fence merely because it
     can represent mounting. Client-command ids that include respawn are fences as
-   a whole packet id. Movement-state command ids (sprint/sneak/fall-flying) and abilities/
-   flying packet ids are CONTROL fences, whole id. Keepalive is REALTIME and waits on fences,
+    a whole packet id. Distinct movement-state command ids (for example sprint or fall-flying)
+    and the abilities/flying packet id are CONTROL fences, whole id; the player-input packet id
+    may carry sneak and remains REALTIME, never a fence. Keepalive is REALTIME and waits on fences,
    not ordinary CONTROL; its independent stream and protected decode slice keep it progressing
    through unrelated CONTROL loss. Vanilla keepalive timeout handling is unchanged.
    Measure movement-validation false positives and serverbound HOL delay before/after for
@@ -1119,11 +1121,15 @@ position extraction. Those implementations must change together before this revi
    null for other routes except globally routed multi-chunk packets. `lane` is REALTIME or
    chunk only; global/view/control/interaction/ordinary are CONTROL only; joins are chunk only.
    Resources also carry `serverboundLimits`, keyed by protocol state. Each entry specifies
-   positive integer `maxServerboundRecord` (record_length, excluding its prefix), `maxDecodedFootprint`
-    (decoded packet plus scratch), and positive integer `ordinaryReadAllowance` for an ordinary small CONTROL packet. Let P be
-    the total protected read/decode area; the CONTROL allowance is at most P minus the fixed
-    2 KiB REALTIME slice. The reviewed ordinary CONTROL packet set is marked by
-    `ordinarySmall:true/false` on every serverbound CONTROL route; clientbound routes omit it.
+   positive integer `maxServerboundRecord` (CONTROL record_length, excluding its prefix),
+    positive integer `maxServerboundRealtimeRecord` (REALTIME record_length, excluding its
+    prefix, <=510),
+    `maxDecodedFootprint` (CONTROL decoded packet plus scratch), and positive integer
+    `ordinaryReadAllowance` for an ordinary small CONTROL packet, including complete retained
+    wire, parser/read copies, decoded output and scratch. Let P be the total protected
+    read/decode area; the CONTROL allowance is at most P minus the fixed 2 KiB REALTIME slice.
+    The reviewed ordinary CONTROL packet set is marked by `ordinarySmall:true/false` on every
+    serverbound CONTROL route; clientbound routes omit it.
     Values come from that version's game's serverbound packet limits and reviewed decoder
     accounting, not guessed Minecraft constants. Each limits entry also specifies
     `decodeFootprintBound`, a versioned closed-allowlist accounting identifier (not executable
@@ -1132,15 +1138,16 @@ position extraction. Those implementations must change together before this revi
     within F and the protected area, never outside E. P must also cover the
     maximum bounded-prefix staging needed before classification. Check all limits and
     accounting identifiers into R with boundary vectors, as for position extractors.
-   Require `maxServerboundRecord <= 2097208`, decoded footprint <= 8 MiB, REALTIME wire
-    <= 512 bytes, and REALTIME declared decoded size <= 1024 bytes. Its fixed 2 KiB slice
-    includes parsing, output and inflater scratch. At N=6 require
-    `P + 16 KiB + 2*6 + 1 + 512 <= 24 KiB`, so P <= 7667 bytes and the CONTROL ordinary
-    allowance <= 5619 bytes. `maxServerboundRecord` must leave room for the outer prefix
-    within the 512-byte REALTIME wire cap. Missing/unreviewed limits or an ordinary CONTROL
+   Require `maxServerboundRecord <= 2097208`, `maxServerboundRealtimeRecord <= 510`, CONTROL
+    decoded footprint <= 8 MiB, and REALTIME declared decoded size <= 1024 bytes. The fixed
+    2 KiB REALTIME slice includes parsing and output copies only, not inflater state/scratch.
+    A 510-byte REALTIME record_length plus its two-byte VarInt prefix fills the 512-byte wire
+    cap. At N=6 require `P + 16 KiB + 2*6 + 1 + 512 <= 24 KiB`, so P <= 7667 bytes and the
+    CONTROL ordinary allowance <= 5619 bytes. Missing/unreviewed limits or a CONTROL ordinary
     footprint that cannot fit its allowance disable `/3`.
-   Reject a play record exceeding its state's maxServerboundRecord immediately after its
-   length prefix, before allocating/buffering its body; enforce the state limit elsewhere too.
+    Reject a CONTROL play record exceeding its state's `maxServerboundRecord`, or a REALTIME
+    record exceeding `maxServerboundRealtimeRecord`, immediately after its length prefix and
+    before allocating/buffering its body; enforce state limits elsewhere too.
     Oversized decoded data or an invalid compression declaration is `0x11`. `ordinarySmall`
     is a reviewed resource guarantee, not a peer-supplied flag or permission to use P:
     any legal CONTROL record whose pre-inflate footprint fits its remaining allowance may use it,
@@ -1156,13 +1163,18 @@ position extraction. Those implementations must change together before this revi
     route must be global, view or control fence. `interaction` is serverbound CONTROL-only:
     ordinary plus latest preceding REALTIME, not a fence; its referenced route must be a
     serverbound REALTIME route. Any tuple outside this table closes
-   `0x11`; serverbound chunk routes are forbidden. Receiver validates route, required
-   dependency presence, sequence and referenced fence class from received wire data. Sender
+    `0x11`; serverbound chunk routes are forbidden. Receiver validates route, dependency
+    components/values when present, sequence and referenced fence class from received wire
+    data; an absent dependency entry alone is never an error. An omission/wrong value closes
+    `0x11` only when a nonzero required frontier is provable from received records. Sender
    MUST attach the latest frontier at the original send-order point; receiver cannot infer an
-   unreceived record or independently prove send order. Exact packet ids are the routing unit;
+   unreceived record or independently prove send order. Omission of a dependency entry alone
+   is never `0x11`: zero frontiers are omitted, so an interaction with no REALTIME entry is
+   valid while A[REALTIME]=0. Exact packet ids are the routing unit;
    sub-actions sharing an id cannot be separately routed. Missing or wrong dependencies
    provable from received records close `0x11`.
-   Reject missing/unknown fields, duplicate keys/routes,
+    Reject missing/unknown fields, duplicate keys/routes, and multiple routes for the same
+    `(state,direction,packet_id)` with different lanes or fence classes,
    unsupported schema/identifiers and invalid combinations before offering `/3`.
    R is SHA-256 of the exact resource bytes, whitespace included, identical at both peers.
    Mandatory CONTROL data must now enforce the required fence policy too, not merely lane.
@@ -1247,23 +1259,25 @@ position extraction. Those implementations must change together before this revi
     successful enqueue of a validated eligible unit commits it for the application timer,
     but Q MUST NOT release dependencies, reuse receive/workspace capacity or change epochs.
      Each endpoint uses its local monotonic transport clock for network/incomplete/resource
-     waits (only the incomplete-read pause expressly specified in 13.12 applies), and its
-      local executor-active clock for blocked-head/decode/application work. A head whose named
-      prerequisite has never been received uses the transport clock, without pauses. Pause a
-      blocked-head timer only while that exact prerequisite, or its own-stream predecessor,
-      is enqueued or executing. Here and below
+      waits (only the incomplete-read pause expressly specified in 13.12 applies), and its
+      local executor-active clock for decode/application work. An unseen-prerequisite
+      blocked-head timer uses the transport clock and never pauses for ordinary FIFO queueing;
+      exclude only recorded executor tick-stall intervals. It expires after 10 seconds of
+      counted time, so retention is bounded by 10 seconds plus recorded stall time. The
+      receiver cannot distinguish an honestly lost prerequisite from a forged future one.
+      A prerequisite is locally withheld only during a recorded tick stall, or while its lane
+      has unread bytes in our native receive window that we are not reading. Here and below
      "executor" means the game's serial/main-thread executor, NOT the Netty event loop.
      Resource waits do not exclude executor stalls; no resource wait starts for an operation
      blocked solely on that local executor rather than a refused excess/outbound grant.
     Executor-active time excludes intervals waiting for the game executor to run, including
     prerequisites already queued there and a handler suspended by a main-thread/tick stall.
-    Track the enqueue/completion acknowledgements and stall intervals on each endpoint;
-     while the exact prerequisite is FIFO-enqueued or stalled in that executor, pause only its
-     dependent-head timers and backpressure further reads. Retain/charge queued data until actual completion.
+     Track the enqueue/completion acknowledgements and recorded stall intervals on each endpoint;
+     ordinary FIFO queueing does not pause unseen-prerequisite timers. Retain/charge queued data until actual completion.
     Decode/dispatch work actually running BEFORE Q still consumes its 10-second allowance;
     a decoder busy loop is not an excluded scheduling wait. After Q there is no transport
     application timeout on that unit; local game-handler watchdogs are separate from `0x11`.
-    Heads waiting on that unit remain paused until D commits. Never classify local game
+    Heads waiting on that unit remain blocked until D commits; ordinary FIFO queueing does not pause unseen-prerequisite timers. Never classify local game
     execution/stalls as peer misconduct or release dependencies early to evade a stall.
 11. **13.11 Barrier example.** CONTROL spawn 5 precedes REALTIME move 9, whose explicit
     CONTROL dependency is 5 (own predecessor 8 implicit). CONTROL remove 6 waits for REALTIME
@@ -1305,7 +1319,10 @@ position extraction. Those implementations must change together before this revi
     partial/read/decode buffers
     and hold no more than this admission share against the receive budget. This figure is
     not total connection memory: QUIC metadata, crypto/handshake and other subsystems remain
-    separately accounted. At 50,000 idle connections the receive admission shares total
+    separately accounted. Use one inflater per connection shared by both lanes; decoding is
+    serialized and MUST NOT create a second per-lane inflater. Its state/window is about
+    40 KiB and is separately charged as connection memory outside this 24 KiB receive share,
+    like QUIC metadata. At 50,000 idle connections the receive admission shares total
     1,228,800,000 bytes (about 1.14 GiB), not a multi-MiB workspace per player.
     Admit at most one complete head per lane. REALTIME uses its fixed protected slice and
     wire slot, never inbound excess. At most one CONTROL record uses excess at a time. Let
@@ -1316,7 +1333,8 @@ position extraction. Those implementations must change together before this revi
     24 KiB share. This hard per-record cap
      accommodates movement, rotation, vehicle/input state, animation and keepalive records;
      exact maximum encodings must be checked against every selected routing table before
-     `/3` is offered. A REALTIME record whose complete wire size (including the outer prefix) exceeds 512 bytes is
+      `/3` is offered. A REALTIME record with record_length > 510 (complete wire size above
+      512 bytes including its two-byte prefix) is
      peer misconduct and closes `0x11`, like other inbound self-cap violations. Neither another connection nor this connection's
     outbound queue may borrow it. Native exposure is bounded by 16 KiB + N guard bytes,
     plus at most N+1 one-byte guard-read copies: hence `16 KiB + 2*N + 1 + P + 512 <= 24 KiB`.
@@ -1331,21 +1349,21 @@ position extraction. Those implementations must change together before this revi
       staged prefixes and their read/parser copies (54-byte header plus three at-most-5-byte
       lengths, at most two retained copies = 138 bytes, rounded up to 160);
       validate this bound against the reviewed envelope/length encodings before enablement.
-       The REALTIME 2 KiB parsing/decode slice is also partitioned within P, never lent to
+        The REALTIME 2 KiB parse/output-copy slice is also partitioned within P, never lent to
        CONTROL, so a CONTROL head waiting on REALTIME cannot consume it.
       Define footprint as the entire
      retained wire record (including prefixes), all parser/read copies, plus declared
      uncompressed output and a conservative reviewed decoder/scratch bound. When compression
      is disabled or Data Length is zero, use the uncompressed inner payload length instead.
-     The resource's reviewed decodeFootprintBound accounting must compute this bound from lengths/compression
-     state alone, without inspecting a compressed packet id, and include prefix staging.
+      The resource's reviewed decodeFootprintBound accounting must compute this bound from lengths/compression
+      state alone, without inspecting a compressed packet id, and include prefix staging.
       Before inflating REALTIME, reject with `0x11` if its declared Data Length, or its
       uncompressed inner length, exceeds 1024 bytes. Its wire footprint and decoded size
-      must fit the fixed 512-byte/2 KiB REALTIME slot/slice, including inflater scratch.
+       must fit the fixed 512-byte wire slot and the 2 KiB parse/output-copy slice.
       A CONTROL record is in-share ONLY if that entire footprint fits remaining CONTROL
       allowance; reserve it before
-     further body reads/inflation. Every other record requires refusable excess grants for
-     its footprint before proceeding, even if its wire length alone fits P. Prefix reads
+      further body reads/inflation. Every other CONTROL record requires refusable excess grants
+      for its footprint before proceeding, even if its wire length alone fits P. Prefix reads
      fitting P are non-refusable; reject invalid lengths before further allocation. Review
      P-2 KiB against this conservative calculation for every ordinarySmall CONTROL route's boundary vectors.
       Protected reads/decodes cannot be refused by the node pool. Keepalive is on REALTIME,
@@ -1511,12 +1529,16 @@ position extraction. Those implementations must change together before this revi
      buckets must not make honest newcomers
      among several live identities inherit its bad score; a lone newcomer's residual is stated above). Scores only choose among eligible holders, never protected shares.
     Incomplete record/bundle: 10 seconds from first byte on the local monotonic transport
-    clock, paused while local executor backpressure prevents reads. Blocked head: 10 seconds from becoming head. An unseen prerequisite uses the transport
-     clock without pauses; pause only while that exact prerequisite or own-stream predecessor
-     is enqueued or executing on the game executor. Decode/application dispatch: 10 seconds
-    of pre-enqueue active work; FIFO enqueue Q completes that timer, while D still waits for actual
-    application (13.10). Executor queue/tick-stall time is excluded at both client and server;
-    do not let a >10-second tick stall disconnect every peer. Unrelated network progress
+     clock, paused while local executor backpressure prevents reads. An unseen-prerequisite
+     blocked-head timer runs for 10 seconds of transport time and never pauses for ordinary
+     FIFO queueing; subtract only recorded executor tick-stall intervals. Thus retention is
+     bounded by 10 seconds plus recorded stall time. The receiver cannot distinguish an
+     honestly lost prerequisite from a forged future dependency. A prerequisite is locally
+     withheld only while a tick stall is recorded, or while that lane has unread bytes in our
+     native receive window that we are not reading. Decode/application dispatch: 10 seconds
+     of pre-enqueue active work; FIFO enqueue Q completes that timer, while D still waits for actual
+     application (13.10). Executor queue/tick-stall time is excluded at both client and server;
+     do not let a >10-second tick stall disconnect every peer. Unrelated network progress
      restarts none of these clocks. **Peer attribution before resource classification
      (INBOUND only):** "peer" means this one connection's OWN sent bytes; other
      connections sharing its IP or account (CGNAT, family accounts) are other peers.
@@ -1525,9 +1547,9 @@ position extraction. Those implementations must change together before this revi
      this connection's retained EXCESS bytes, excluding bytes held solely because our
      executor/game has not released them, plus requested bytes exceed that cap, or a shared
      IP/account/node binding cap whose holders are exclusively this connection's own retained
-     bytes AND that cap is >= E. A complete dependency-blocked head held in excess is peer-
-     attributable, not executor-held; count only that head's lane bytes, never protected
-     REALTIME progress. A refusal while ANY of
+     bytes AND that cap is >= E. A complete dependency-blocked head held in excess counts as peer-held for RANKING and
+       shedding order only and never makes a close peer-attributable by itself. Closure
+       classification follows the deadline rules below. A refusal while ANY of
      this connection's bytes wait on our executor/game is never peer-attributable and closes
      `0x12` (an honest peer's second legal record during our tick stall is not blamed). A refusal
      under any cap that is below what one legal serverbound record needs (a
@@ -1573,18 +1595,17 @@ position extraction. Those implementations must change together before this revi
      12.14 join-retry limiter's non-resource exponential schedule; this split is deliberate:
      the asymmetric case's shortest step applies to the failure cache only, never to the limiter. Shared-pool `0x12`
      aborts on a live path never do this.
-     **Deadline precedence:** ANY deadline whose transitive prerequisite chain includes a locally
-      withheld read, grant or decode is a local/resource close (the current local resource
-      code; `0x12` only if approved), never `0x11`, and writes no failure-cache entry. This
-      holds even when the blocked record is complete. In particular, an incomplete timer
-      started by a prefix may expire before a later resource-wait timer; resource classification
-      still wins without extending either 10-second bound. This covers activation,
-      missing-stream/preamble, bundle and transitive dependency deadlines. A blocked head whose
-      prerequisite has never been received and is not locally withheld expires on its
-      transport-clock deadline with `0x11`; cycles, impossible references, malformed packets,
-      wrong shard/epoch/sequence and oversized units also close `0x11`. Resource
-      refusals/pressure aborts use the current local resource code (proposed `0x12`), never
-      peer blame. Never evict a record, skip, release a barrier or retry mid-play.
+     **Deadline precedence:** Any unseen-prerequisite expiry closes the connection with the
+      current local/resource code (proposed `0x12` if approved), never `0x11`, because the
+      receiver cannot distinguish honest loss from a forged dependency. The client writes no
+      failure-cache entry for this close, except through 12.14's existing client-local
+      zero-progress rule. This applies even if the blocked record is complete or held in excess. Residual: an attacker
+      forging future dependencies receives a resource close rather than `0x11`; its memory
+      remains bounded by the deadline and it ranks first for shedding. For any other deadline, if its transitive prerequisite chain includes a locally withheld
+      read, grant or decode, close with the current local/resource code and do not write a
+      failure-cache entry. A deadline with no local withholding otherwise follows its existing
+      rule. This covers activation, missing-stream/preamble, bundle and transitive dependency
+      deadlines; incomplete timers retain their own stated pause rule. Never evict a record, skip, release a barrier or retry mid-play.
 
 ### Flow control, resets, bundles and compression
 
@@ -1676,11 +1697,13 @@ position extraction. Those implementations must change together before this revi
     stream. Threshold changes are global fences; encode the change packet using the old
     threshold, subsequent packets using the new one. Receiver applies the new threshold
     after delivering that change and before decoding later dependent GAME bodies. Do not
-     decompress a blocked packet using the current threshold speculatively. At the server,
-     check declared output length and the full 13.12 footprint BEFORE inflating; a small
-     compressed wire record declaring up to 8 MiB output is not automatically in-share.
-     Acquire its excess charge first if the footprint exceeds remaining P, and enforce
-     actual output/scratch against the reserved bound while inflating. Keep ordinary
+      decompress a blocked packet using the current threshold speculatively. At the server,
+      check declared output length and the full 13.12 footprint BEFORE inflating. Dispatch
+      by lane: REALTIME uses only its protected wire slot/slice and pre-inflate caps, never
+      excess; CONTROL compares its footprint with the remaining CONTROL allowance and obtains
+      an excess grant first if it does not fit. Use the single per-connection inflater shared
+      by both lanes; decode is serialized and no per-lane inflater is created. Enforce actual
+      output against the reserved bound while inflating. Keep ordinary
     Minecraft malformed-compression and size checks; no dictionary spans streams.
 17. **13.17 Acceptance tests.** Before enablement require golden HKDF/exporter/message/record
     vectors; wrong/absent exporter and upstream-native tests; all MAC/state/timeout failures;
@@ -1711,8 +1734,9 @@ position extraction. Those implementations must change together before this revi
     activation, and, with 0-RTT accepted on `/3`, neither side starting binding before the
     server's TLS handshake completes (12.7).
     Run a 50,000-concurrent-QUIC-connection node benchmark before enablement, recording
-    configured node budget, admission reservations/refusals, retained and native memory,
-    peak pending bytes/records, CONTROL progress, latency and throughput under auxiliary
+     configured node budget, admission reservations/refusals, retained and native memory,
+     including the per-connection shared inflater, peak pending bytes/records, CONTROL progress,
+     latency and throughput under auxiliary
     pressure; show the budgets hold without relying on TCP for the target QUIC population.
      Run full-play desync assertions under every testkit netem profile. Exercise serverbound
      REALTIME activation/records, 512-byte wire-cap boundary and oversize rejection, CONTROL
@@ -1722,15 +1746,22 @@ position extraction. Those implementations must change together before this revi
     under each netem profile; verify adapters preserve vanilla anti-cheat validation unchanged.
     Include repeated CONTROL loss while REALTIME movement continues and reach-sensitive actions
     follow; ensure REALTIME advances only within fence/deadline bounds. With both lane heads
-    occupied, CONTROL waiting on a missing REALTIME sequence, and excess unavailable, prove
-    the protected REALTIME slice and keepalive still progress. Refuse resources simultaneously
-    on both lane heads and assert no `0x11`; test a large CONTROL head naming an unsent REALTIME
-     sequence while unrelated movement flows, and assert transport-clock expiry closes `0x11`
-     and frees its excess. Hold a transitive prerequisite on a local read/grant/decode refusal,
+     occupied, CONTROL waiting on a missing REALTIME sequence, and excess unavailable, prove
+     the protected REALTIME slice and keepalive still progress. Refuse resources simultaneously
+     on both lane heads and assert no `0x11`; an honest lost REALTIME prerequisite that recovers
+     within the deadline and a >10-second recorded tick stall with pending interactions cause
+     no close. Test a large CONTROL head naming an unsent REALTIME sequence while unrelated
+     movement flows: expiry frees excess and closes with the local/resource code, not `0x11`.
+     An honest prerequisite lost beyond 10 seconds also closes non-`0x11` with no failure-cache
+     entry. A forged future dependency therefore gets a resource close, not `0x11`; memory
+     remains bounded by the deadline and it ranks first for shedding. Hold a transitive
+     prerequisite on a local read/grant/decode refusal,
      expire the dependent deadline, and assert local/resource close with no failure-cache write;
-     a complete dependency-blocked head in excess remains peer-attributable. Include provable
-     missing/wrong dependency rejection, REALTIME decoded-cap rejection before inflation and implicit-edge
-     cycles. Measure per-record REALTIME handoff overhead at 50,000 connections; a small
+      a complete dependency-blocked head in excess counts only for ranking/shedding, not close
+      attribution. Include provable
+      missing/wrong dependency rejection, duplicate id assignments across REALTIME/control-fence
+      classes, REALTIME decoded-cap rejection before inflation and implicit-edge cycles. Measure
+      per-record REALTIME handoff overhead at 50,000 connections; a small
     count-based multi-record REALTIME slot within the same 512 bytes is a future option only,
     not normative.
      Phase 5
@@ -2018,8 +2049,13 @@ position extraction. Those implementations must change together before this revi
    implementing golden vectors? This is a wire decision, not administrator configuration.
 3. Confirm the direction-specific receive policy: the client reserves up to 16 MiB + 1 KiB
    wire and 8 MiB execution, plus 2 MiB native exposure and at most 128 KiB unparsed reads;
-   the server reserves only 24 KiB per idle connection, including a reviewed protected small
-    CONTROL allowance <= 5619 bytes within total protected P <= 7667 bytes at N=6, its 2 KiB fixed REALTIME decode slice, 512-byte REALTIME wire cap and 1024-byte decoded cap, and one-byte unused chunk-direction guards, charging CONTROL excess separately from outbound queues (13.12/13.13)? The server remains 24 KiB per idle connection. Confirm packet encodings and benchmark admission at 50,000 connections. Hardware profiles stay planned.
+   the server reserves 24 KiB per idle connection, including total protected P <= 7667 bytes
+   at N=6 (CONTROL allowance <= 5619 bytes), its 2 KiB REALTIME parse/output-copy slice,
+   512-byte REALTIME wire cap (`record_length <= 510`) and 1024-byte decoded cap, plus
+   one-byte unused chunk-direction guards. A shared per-connection inflater (about 40 KiB)
+   is separately charged outside that receive share; CONTROL excess is separately capped
+   from outbound queues (13.12/13.13). Confirm packet encodings and benchmark admission and
+   inflater memory at 50,000 connections. Hardware profiles stay planned.
 4. Should the pre-enqueue decode/dispatch executor-active work budget be raised above the
    approved 10 seconds? Executor waits and tick stalls are excluded; after FIFO enqueue
    there is no transport application timeout. This is not a comparison with the keepalive's
