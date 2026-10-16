@@ -23,6 +23,14 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * preserving compression and protocol-state transitions. Game-specific stricter limits and
  * validation of routing/packet contents remain the adapter's responsibility.</p>
  *
+ * <p>Node budget (13.12): every byte this scheduler retains is also reserved against a shared
+ * {@link ReceiveBudget}, in addition to the per-connection ceilings above. A refused node
+ * reservation is never satisfied by evicting someone else's data: when the bytes have not
+ * arrived yet the owner withholds the credit that would carry them (see
+ * {@link #nodeCreditAvailable(long)}), and when they already arrived and can never fit, that one
+ * connection fails with {@code 0x11}. {@link #releaseAll()} gives every charge back when the
+ * connection closes.</p>
+ *
  * <p>Pump priority: CONTROL is examined first, then REALTIME, then WORLD, and one decode or
  * delivery is outstanding at a time. A continuously busy CONTROL lane can therefore starve an
  * auxiliary lane; such starvation is bounded only by the 10 s blocked-head timer.</p>
@@ -51,6 +59,18 @@ public final class ReceiverScheduler {
     /** Deadline duration for blocked heads, partials, decoding and application. */
     public static final long TIMEOUT_NANOS = 10000000000L;
 
+    /**
+     * Signals that the shared node budget could not carry an allocation right now. The owner must
+     * withhold and retry later (13.12): it is not a protocol failure, so nothing latches and the
+     * decode deadline keeps running from the first attempt.
+     */
+    static final class RetryLater extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+        RetryLater() {
+            super("node receive budget cannot carry this allocation yet (13.12)");
+        }
+    }
+
     /** Decodes only an eligible record, reserving output before allocation and reporting decoded(). */
     public interface Decoder {
         /**
@@ -60,6 +80,13 @@ public final class ReceiverScheduler {
          * classification. The identity of {@code envelope} is the decode token. Callbacks may
          * complete inline or later on the same executor. {@code insideBundle} is true only for
          * CONTROL records following a decoded OPEN and preceding its decoded CLOSE.</p>
+         *
+         * <p>{@link #reserveDecoded} may refuse ({@link RetryLater}) when the shared node budget
+         * cannot carry an allocation yet. A decode that is refused that way owns the cleanup of
+         * everything it allocated for this attempt: it must release it before it lets the refusal
+         * propagate, because the entry stays undecoded and the scheduler reruns the decoder from
+         * its start. A decoder that keeps what it allocated leaks it and charges the same output
+         * again on every attempt.</p>
          */
         void decode(Envelope envelope, boolean insideBundle, long now);
     }
@@ -117,6 +144,10 @@ public final class ReceiverScheduler {
         boolean decodeReserved;
         long headSince;
         boolean head;
+        /** First attempt of this entry's current decode, or -1 while it has none (13.12). */
+        long decodeSince = -1;
+        /** Bytes the current decode attempt reserved, released if that attempt is refused. */
+        long decodeReservedBytes;
         Entry(Envelope envelope, long bytes) {
             this.envelope = envelope;
             this.bytes = bytes;
@@ -133,6 +164,7 @@ public final class ReceiverScheduler {
 
     private final Decoder decoder;
     private final Handler handler;
+    private final ReceiveBudget node;
     private final List<ArrayDeque<Entry>> queues = new ArrayList<ArrayDeque<Entry>>();
     private final Map<Partial, Boolean> partials = new IdentityHashMap<Partial, Boolean>();
     private final long[] received = new long[3];
@@ -143,7 +175,6 @@ public final class ReceiverScheduler {
     private long auxiliaryBytes;
     private Delivery outstanding;
     private Entry decoding;
-    private long decodingSince;
     private long outstandingSince;
     private long pumpNow;
     private boolean pumping;
@@ -158,11 +189,21 @@ public final class ReceiverScheduler {
 
     /** Creates an empty receiving direction with separate decoding and application callbacks. */
     public ReceiverScheduler(Decoder decoder, Handler handler) {
+        this(decoder, handler, ReceiveBudget.unlimited());
+    }
+
+    /**
+     * As {@link #ReceiverScheduler(Decoder, Handler)} with the node budget of 13.12 every retained
+     * byte is additionally reserved against; {@link ReceiveBudget#unlimited()} for an owner that
+     * enforces no node budget.
+     */
+    public ReceiverScheduler(Decoder decoder, Handler handler, ReceiveBudget node) {
         if (decoder == null || handler == null) {
             throw new IllegalArgumentException("decoder/handler");
         }
         this.decoder = decoder;
         this.handler = handler;
+        this.node = node == null ? ReceiveBudget.unlimited() : node;
         for (int i = 0; i < 3; i++) {
             queues.add(new ArrayDeque<Entry>());
         }
@@ -174,8 +215,14 @@ public final class ReceiverScheduler {
         }
     }
 
-    /** Re-raises an ordering failure as is; any other exception is fatal and latches. */
+    /**
+     * Re-raises an ordering failure as is; a node-budget refusal passes through so the owner can
+     * withhold and retry; any other exception is fatal and latches.
+     */
     private OrderingException escape(RuntimeException ex) {
+        if (ex instanceof RetryLater) {
+            throw (RetryLater) ex;
+        }
         if (ex instanceof OrderingException) {
             return (OrderingException) ex;
         }
@@ -239,16 +286,87 @@ public final class ReceiverScheduler {
         }
     }
 
+    /**
+     * Reserves retained bytes against the shared node budget (13.12), before the per-connection
+     * accounting moves. A refusal is fatal for this connection only: the bytes have already
+     * arrived or are already granted and cannot be evicted, so {@code 0x11} closes it while every
+     * other connection keeps its reservation.
+     */
+    private void debitNode(long size) {
+        if (size > 0 && !node.tryReserve(size)) {
+            throw new OrderingException("node receive budget exhausted (13.12)");
+        }
+    }
+
+    /** Gives retained bytes back to the node budget once they are gone. */
+    private void creditNode(long size) {
+        if (size > 0) {
+            node.release(size);
+        }
+    }
+
+    /**
+     * Query only, 13.12 node budget: true when the node could still carry {@code additionalBytes}.
+     * The owner withholds QUIC receive credit ("the lane stops reading") exactly as it does for
+     * the per-connection budget, instead of starting bytes it could never charge. It reads
+     * {@link ReceiveBudget#available()}, so it reserves nothing and can never make another
+     * connection's real reservation fail; a real reservation that a concurrent connection wins
+     * the race for follows the fatal {@code 0x11} path, never another connection's data.
+     */
+    public boolean nodeCreditAvailable(long additionalBytes) {
+        return additionalBytes <= 0 || node.available() >= additionalBytes;
+    }
+
+    /**
+     * Releases every retained charge back to the node budget and drops all state. The owner calls
+     * this exactly once when the connection closes: nothing this connection held may stay charged
+     * to a budget other connections share. Not usable afterwards.
+     */
+    public void releaseAll() {
+        long released = 0;
+        for (Partial p : partials.keySet()) {
+            released += p.bytes;
+        }
+        for (ArrayDeque<Entry> q : queues) {
+            for (Entry e : q) {
+                released += e.bytes;
+            }
+        }
+        partials.clear();
+        for (ArrayDeque<Entry> q : queues) {
+            q.clear();
+        }
+        bytes = 0;
+        count = 0;
+        auxiliaryBytes = 0;
+        auxiliaryCount = 0;
+        decoding = null;
+        outstanding = null;
+        ended = true;
+        creditNode(released);
+    }
+
     /** Reserves a record slot and positive retained byte count at the first received byte. */
     public Partial reservePartial(Lane lane, long size, long now) {
+        return reservePartial(lane, size, 0, now, now);
+    }
+
+    /**
+     * As {@link #reservePartial(Lane, long, long)} with {@code prepaidBytes} already reserved
+     * against the node budget (a record grant) and the record's first byte seen at
+     * {@code startedAt}, so the incomplete-record timer runs from that byte.
+     */
+    public Partial reservePartial(Lane lane, long size, long prepaidBytes, long startedAt, long now) {
         enter();
         try {
             checkDeadlines(now);
-            if (ended || lane == null || size <= 0 || !laneOpen(lane)) {
+            if (ended || lane == null || size <= 0 || prepaidBytes < 0 || prepaidBytes > size
+                    || !laneOpen(lane)) {
                 throw new OrderingException("invalid partial");
             }
             budget(lane, size, 1);
-            Partial p = new Partial(lane, size, now);
+            debitNode(size - prepaidBytes);
+            Partial p = new Partial(lane, size, startedAt);
             partials.put(p, Boolean.TRUE);
             account(lane, size, 1);
             return p;
@@ -259,6 +377,11 @@ public final class ReceiverScheduler {
 
     /** Debits more bytes before retaining another fragment; the first-byte timer is unchanged. */
     public void growPartial(Partial p, long additionalBytes, long now) {
+        growPartial(p, additionalBytes, 0, now);
+    }
+
+    /** As {@link #growPartial(Partial, long, long)} with part of the growth already reserved. */
+    public void growPartial(Partial p, long additionalBytes, long prepaidBytes, long now) {
         enter();
         try {
             checkDeadlines(now);
@@ -266,7 +389,11 @@ public final class ReceiverScheduler {
             if (!laneOpen(p.lane)) {
                 throw new OrderingException("partial beyond END");
             }
+            if (prepaidBytes < 0 || prepaidBytes > additionalBytes) {
+                throw new OrderingException("invalid prepaid growth");
+            }
             budget(p.lane, additionalBytes, 0);
+            debitNode(additionalBytes - prepaidBytes);
             p.bytes += additionalBytes;
             account(p.lane, additionalBytes, 0);
         } catch (RuntimeException ex) {
@@ -282,6 +409,7 @@ public final class ReceiverScheduler {
             requirePartial(p);
             partials.remove(p);
             account(p.lane, -p.bytes, -1);
+            creditNode(p.bytes);
         } catch (RuntimeException ex) {
             throw escape(ex);
         }
@@ -298,6 +426,27 @@ public final class ReceiverScheduler {
         offer(e, e.wireBytes(), now);
     }
 
+    /**
+     * As {@link #offer(Envelope, long, long)} with {@code prepaidBytes} already reserved against
+     * the node budget by the caller, so an adapter that can withhold never turns a node refusal
+     * into a protocol failure.
+     */
+    public void offer(Envelope e, long retainedBytes, long prepaidBytes, long now) {
+        enter();
+        try {
+            checkDeadlines(now);
+            validate(e, retainedBytes);
+            if (prepaidBytes < 0 || prepaidBytes > retainedBytes) {
+                throw new OrderingException("invalid prepaid admission");
+            }
+            budget(e.lane(), retainedBytes, 1);
+            debitNode(retainedBytes - prepaidBytes);
+            enqueue(e, retainedBytes, now);
+        } catch (RuntimeException ex) {
+            throw escape(ex);
+        }
+    }
+
     /** Admits opaque wire bytes only; no bundle classification or decompression is needed. */
     public void offer(Envelope e, long retainedBytes, long now) {
         enter();
@@ -305,6 +454,7 @@ public final class ReceiverScheduler {
             checkDeadlines(now);
             validate(e, retainedBytes);
             budget(e.lane(), retainedBytes, 1);
+            debitNode(retainedBytes);
             enqueue(e, retainedBytes, now);
         } catch (RuntimeException ex) {
             throw escape(ex);
@@ -321,8 +471,16 @@ public final class ReceiverScheduler {
                 throw new OrderingException("partial lane mismatch");
             }
             validate(e, retainedBytes);
+            // 13.12: the entry carries exactly its own charge. The partial's reservation moves to
+            // the entry (plus any growth, minus any surplus the parser had charged), so the entry
+            // is charged for as long as it is queued and applied() credits the same amount back.
             if (retainedBytes > p.bytes) {
                 budget(p.lane, retainedBytes - p.bytes, 0);
+                // The node budget takes the growth before the entry is queued, so the transfer can
+                // never look free to another connection.
+                debitNode(retainedBytes - p.bytes);
+            } else if (retainedBytes < p.bytes) {
+                creditNode(p.bytes - retainedBytes);
             }
             partials.remove(p);
             account(p.lane, -p.bytes, -1);
@@ -463,6 +621,23 @@ public final class ReceiverScheduler {
         return null;
     }
 
+    /**
+     * Gives back everything the current decode attempt reserved and resets the entry's decode
+     * state, so the next attempt starts from the entry's own wire charge again (13.12). The entry
+     * stays queued and undecoded; only what this attempt added goes back.
+     */
+    private void releaseDecodeAttempt(Entry entry) {
+        long reserved = entry.decodeReservedBytes;
+        if (reserved > 0) {
+            entry.bytes -= reserved;
+            account(entry.envelope.lane(), -reserved, 0);
+            creditNode(reserved);
+        }
+        entry.decodeReservedBytes = 0;
+        entry.decodeReserved = false;
+        entry.uncompressed = 0;
+    }
+
     private void pump(long now) {
         // An inline applied() may advance time while the non-recursive drain is active.
         pumpNow = now;
@@ -484,10 +659,23 @@ public final class ReceiverScheduler {
                 }
                 if (next.decode != null) {
                     decoding = next.decode;
-                    decodingSince = pumpNow;
+                    if (decoding.decodeSince < 0) {
+                        // This entry's own first attempt. A retry of the same entry keeps it, so the
+                        // 13.12 decode deadline runs from the first attempt; a later entry starts
+                        // its own, and a successful decode clears it.
+                        decoding.decodeSince = pumpNow;
+                    }
                     try {
                         decoder.decode(decoding.envelope,
                                 receivingBundle && decoding.envelope.lane() == Lane.CONTROL, pumpNow);
+                    } catch (RetryLater retry) {
+                        // 13.12: the node budget refused this attempt's allocation. Give this
+                        // attempt's own reservations back before the entry waits: the decoder is
+                        // rerun from its start, so keeping them would charge the same output again on
+                        // every retry and drain the budget.
+                        releaseDecodeAttempt(decoding);
+                        decoding = null;
+                        return;
                     } catch (RuntimeException ex) {
                         throw fatal(ex);
                     }
@@ -528,7 +716,13 @@ public final class ReceiverScheduler {
                 throw new OrderingException("decoded bundle bounds");
             }
             budget(envelope.lane(), additionalRetainedBytes, 0);
+            if (additionalRetainedBytes > 0 && !node.tryReserve(additionalRetainedBytes)) {
+                // 13.12: the bytes are about to be allocated, not yet received, so the owner can
+                // wait for node space instead of failing the connection.
+                throw new RetryLater();
+            }
             decoding.bytes += additionalRetainedBytes;
+            decoding.decodeReservedBytes += additionalRetainedBytes;
             decoding.uncompressed = totalUncompressedBytes;
             decoding.decodeReserved = true;
             account(envelope.lane(), additionalRetainedBytes, 0);
@@ -590,7 +784,24 @@ public final class ReceiverScheduler {
             decoding.decoded = new Envelope(envelope.lane(), envelope.kind(), envelope.sequence(),
                     envelope.dependencies(), envelope.bodyLength(), body, classification,
                     changesStateCompressionOrActivation);
+            // The decode is done: its deadline and the attempt's reservation tally both reset, so
+            // they cannot reach a later entry.
+            decoding.decodeSince = -1;
+            decoding.decodeReservedBytes = 0;
             decoding = null;
+            pump(now);
+        } catch (RuntimeException ex) {
+            throw escape(ex);
+        }
+    }
+
+    /**
+     * Retries the head that a node-budget refusal left undecoded (13.12). The owner calls this from
+     * its tick while such a refusal is pending; nothing else about the queue state changes.
+     */
+    public void retry(long now) {
+        enter();
+        try {
             pump(now);
         } catch (RuntimeException ex) {
             throw escape(ex);
@@ -608,6 +819,7 @@ public final class ReceiverScheduler {
             for (Envelope e : outstanding.records()) {
                 Entry entry = queues.get(lane.ordinal()).remove();
                 account(lane, -entry.bytes, -1);
+                creditNode(entry.bytes);
                 if (e.kind() == Envelope.Kind.END) {
                     ended = true;
                 }
@@ -625,8 +837,16 @@ public final class ReceiverScheduler {
     public void checkDeadlines(long now) {
         enter();
         try {
-            if (decoding != null && now - decodingSince >= TIMEOUT_NANOS) {
-                throw new OrderingException("uncompleted decode timeout");
+            // 13.12: every entry with an active decode deadline, whether that decode is still
+            // running or was refused before any allocation. A refused entry is queued, undecoded and
+            // eligible, so it is not a "blocked head" and no retry of it may ever come: its deadline
+            // has to be enforced here and cannot wait for another attempt to check it.
+            for (ArrayDeque<Entry> q : queues) {
+                for (Entry entry : q) {
+                    if (entry.decodeSince >= 0 && now - entry.decodeSince >= TIMEOUT_NANOS) {
+                        throw new OrderingException("uncompleted decode timeout");
+                    }
+                }
             }
             if (receivingBundle && now - bundleStarted >= TIMEOUT_NANOS) {
                 throw new OrderingException("missing bundle close timeout");
