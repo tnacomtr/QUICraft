@@ -86,15 +86,6 @@ class LaneSessionTest {
             rig.clientGame.applyOnOtherThread = true;
             rig.serverGame.applyOnOtherThread = true;
             rig.activateBoth();
-            // Both sessions must have their auxiliary lanes open before lane traffic starts: a
-            // record that arrives while a lane is still being set up is refused (13.3).
-            assertTrue(LaneRig.await(() -> {
-                try {
-                    return LaneRig.lanesOpened(rig.client) && LaneRig.lanesOpened(rig.server);
-                } catch (Exception e) {
-                    return false;
-                }
-            }, 10000), "both sessions opened their auxiliary lanes");
             rig.server.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "spawn"));
             rig.server.send(PLAY, LaneRig.MOVE, LaneRig.frame(LaneRig.MOVE, "move"));
             rig.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "block"));
@@ -133,7 +124,7 @@ class LaneSessionTest {
         LaneRig.Config clientOnly = new LaneRig.Config();
         clientOnly.serverSession = false;
         try (LaneRig rig = LaneRig.start(clientOnly)) {
-            rig.client.activate(null);
+            rig.activateClient();
             QuicStreamChannel four = rig.serverRawStreams.poll(10, TimeUnit.SECONDS);
             assertEquals(4, four.streamId());
             assertTrue(LaneRig.await(() -> rig.serverRawBytes.get(0).snapshot().length >= 2, 10000));
@@ -194,7 +185,7 @@ class LaneSessionTest {
         config.serverSession = false;
         config.options.clientMaxStreamsBidi = 4;
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.client.activate(null);
+            rig.activateClient();
             QuicChannel serverConnection = rig.net.serverConnection.get(10, TimeUnit.SECONDS);
             QuicStreamChannel one = serverConnection.createStream(
                     io.netty.handler.codec.quic.QuicStreamType.BIDIRECTIONAL,
@@ -226,7 +217,7 @@ class LaneSessionTest {
     @Test
     void streamFourBeforeTheServersActivationIsFatalAndNotBuffered() throws Exception {
         try (LaneRig rig = LaneRig.start()) {
-            rig.client.activate(null);
+            rig.activateClient();
             closedWith(rig.serverGame, 0x11, false);
             closedWith(rig.clientGame, 0x11, true);
             assertEquals(0, rig.serverGame.deliveries.size());
@@ -241,9 +232,37 @@ class LaneSessionTest {
             sleep(400);
             assertEquals(0, rig.clientGame.packetCount(), "nothing is delivered before the client's activation");
             assertFalse(rig.clientGame.closed.isDone());
-            rig.client.activate(null);
+            rig.activateClient();
             assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() == 1, 10000));
             assertEquals("early", rig.clientGame.labels().get(0));
+        }
+    }
+
+    @Test
+    void aControlRecordReadBeforeTheClientsActivationIsDeliveredFromTheLeftover() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activate(rig.server, null);
+            byte[] frame = LaneRig.frame(LaneRig.SPAWN, "early-control");
+            // 12.12: the server may start records right after queuing SERVER_SWITCH, so this record
+            // can reach the client while stream 0 still belongs to the code that precedes activation.
+            rig.server.send(PLAY, LaneRig.SPAWN, frame);
+            int wire = 1 + RecordCodec.HEADER_LENGTH + frame.length;
+            assertTrue(LaneRig.await(() -> rig.earlyControlRetained() >= wire, 10000),
+                    "the pre-activation owner read the record: " + rig.earlyControlRetained());
+            assertEquals(0, rig.clientGame.packetCount(), "nothing is delivered before the client's activation");
+            assertFalse(rig.clientGame.closed.isDone());
+            // Activation hands what that owner read over as the leftover, so the record is parsed
+            // rather than lost: a lost CONTROL record would hold the whole lane set behind its
+            // fence (13.5) until the 13.12 blocked-head deadline.
+            rig.activateClient();
+            assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() == 1, 10000),
+                    "the record is parsed from the activation leftover: " + rig.clientGame.deliveries);
+            assertEquals("early-control", rig.clientGame.labels().get(0));
+            rig.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "after"));
+            assertTrue(LaneRig.await(() -> rig.clientGame.packetCount() == 2, 10000),
+                    "the fence is satisfied and the next record follows");
+            assertFalse(rig.clientGame.closed.isDone());
+            assertFalse(rig.serverGame.closed.isDone());
         }
     }
 
@@ -255,7 +274,7 @@ class LaneSessionTest {
                 LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(20));
         try (LaneRig rig = LaneRig.start(config)) {
             long start = System.nanoTime();
-            rig.client.activate(null);
+            rig.activateClient();
             closedWith(rig.clientGame, 0x11, false);
             assertTrue(System.nanoTime() - start >= TimeUnit.MILLISECONDS.toNanos(350), "not before the deadline");
             sawClose(rig.net.serverSawClose, 0x11);
@@ -282,7 +301,7 @@ class LaneSessionTest {
         try (LaneRig rig = LaneRig.start()) {
             byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, "leftover"));
             rig.activate(rig.server, java.nio.ByteBuffer.wrap(record));
-            rig.client.activate(null);
+            rig.activateClient();
             assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() == 1, 10000));
             assertEquals("leftover", rig.serverGame.labels().get(0));
             assertFalse(rig.serverGame.closed.isDone());
@@ -936,7 +955,7 @@ class LaneSessionTest {
         try (LaneRig rig = LaneRig.start(config)) {
             LegacyControlOwner bridge = new LegacyControlOwner();
             rig.clientControl.pipeline().addLast(bridge);
-            rig.client.activate(null);
+            rig.activateClient();
             // The raw server answers both preambles so the client's two lanes open.
             LaneLoopback.write(rig.serverRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 1);
             QuicChannel server = rig.net.serverConnection.get(10, TimeUnit.SECONDS);
@@ -1079,7 +1098,7 @@ class LaneSessionTest {
         config.clientTiming = new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
                 TimeUnit.MILLISECONDS.toNanos(400), TimeUnit.MILLISECONDS.toNanos(20));
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.client.activate(null);
+            rig.activateClient();
             long start = System.nanoTime();
             rig.client.end();
             closedWith(rig.clientGame, 0x0, false);
@@ -1095,7 +1114,7 @@ class LaneSessionTest {
         config.clientTiming = new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
                 TimeUnit.MILLISECONDS.toNanos(400), TimeUnit.MILLISECONDS.toNanos(20));
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.client.activate(null);
+            rig.activateClient();
             // A raw server opens both of its directions, so no open deadline keeps the tick alive.
             LaneLoopback.write(rig.serverRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 1);
             QuicChannel serverConnection = rig.net.serverConnection.get(10, TimeUnit.SECONDS);
@@ -1310,7 +1329,7 @@ class LaneSessionTest {
         config.deferClientGame = true;
         try (LaneRig rig = LaneRig.start(config)) {
             rig.server.activate(null);
-            rig.client.activate(null);
+            rig.activateClient();
             rig.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "buffered"));
             assertTrue(LaneRig.await(() -> node.reserved() > 0, 10000),
                     "the unparsed chunk is charged while it is held: " + node.reserved());
