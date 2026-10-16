@@ -673,12 +673,12 @@ public final class LaneSession {
         controlChannel.pipeline().addFirst(new ControlCloseGuard());
         takeOverStreamZero(control);
         if (leftover != null) {
-            // 13.12: the leftover is a read chunk like any other, charged to the node budget while
-            // it is held and released when it is consumed. If the node cannot carry bytes that
-            // already arrived, this one connection closes; another connection's data is never
-            // evicted.
+            // 13.12: the leftover is bytes that already arrived under an admission. Refusing them
+            // would end an honest connection for a purely local reason, so they are charged as an
+            // admitted overdraft that is released like any other chunk when consumed. Node pressure
+            // then withholds further reads and credit, never this connection.
             try {
-                chargeChunk(leftover.readableBytes());
+                node.forceReserve(leftover.readableBytes());
             } catch (Throwable t) {
                 leftover.release();
                 throw t;

@@ -98,7 +98,7 @@ class LaneSessionTest {
                     && rig.serverGame.packetCount() == 1, 10000),
                     "client=" + rig.clientGame.packetCount() + rig.clientGame.deliveries.toString()
                             + " " + rig.clientGame.closed.getNow(null) + " server=" + rig.serverGame.packetCount()
-                            + " " + rig.serverGame.closed.getNow(null));
+                            + " " + rig.serverGame.closed.getNow(null) + " " + rig.serverGame.closeCause);
             List<Lane> lanes = new ArrayList<>();
             synchronized (rig.clientGame.deliveries) {
                 for (LaneRig.Delivered d : rig.clientGame.deliveries) {
@@ -127,7 +127,7 @@ class LaneSessionTest {
             Arrays.fill(payload, (byte) 'a');
             rig.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, payload));
             assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() >= 1, 20000),
-                    "the 100 KiB serverbound record arrived: " + rig.serverGame.closed.getNow(null));
+                    "the 100 KiB serverbound record arrived: " + rig.serverGame.closed.getNow(null) + " " + rig.serverGame.closeCause);
             List<String> labels = rig.serverGame.labels();
             assertEquals(payload.length, labels.get(0).length(), "the whole record arrived");
             assertTrue(labels.get(0).chars().allMatch(c -> c == 'a'), "the record arrived intact");
@@ -387,6 +387,44 @@ class LaneSessionTest {
                 "no byte was released that was never reserved");
     }
 
+    @Test
+    void anActivationLeftoverIsAdmittedEvenWhenTheNodeBudgetIsExhausted() throws Exception {
+        // The idle value of an activated session with nothing to carry, as the reference.
+        ReceiveBudget reference = ReceiveBudget.bounded(512 * 1024);
+        LaneRig.Config referenceConfig = new LaneRig.Config();
+        referenceConfig.nodeBudget = reference;
+        long idle;
+        try (LaneRig rig = LaneRig.start(referenceConfig)) {
+            rig.activate(rig.server, null);
+            rig.activateClient();
+            assertTrue(LaneRig.await(() -> reference.reserved() > 0, 10000));
+            sleep(500);
+            idle = reference.reserved();
+        }
+        StrictBudget node = new StrictBudget(512 * 1024);
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        final long expectedIdle = idle;
+        try (LaneRig rig = LaneRig.start(config)) {
+            long held = node.available();
+            assertTrue(node.tryReserve(held));
+            assertEquals(0, node.available());
+            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, "leftover"));
+            rig.activate(rig.server, java.nio.ByteBuffer.wrap(record));
+            rig.activateClient();
+            sleep(300);
+            assertFalse(rig.serverGame.closed.isDone(), "bytes that already arrived are never refused locally");
+            assertTrue(node.reserved() >= held + record.length, "the leftover is carried as an overdraft: " + node.reserved());
+            node.release(held);
+            assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() == 1, 10000));
+            assertTrue(LaneRig.await(() -> node.reserved() == expectedIdle, 10000),
+                    "accounting returns to the idle value " + expectedIdle + ": " + node.reserved() + " " + rig.serverGame.closed.getNow(null) + " " + rig.serverGame.closeCause);
+            assertFalse(rig.serverGame.closed.isDone(), () -> String.valueOf(rig.serverGame.closed.getNow(null)));
+        }
+        assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000), "closing releases every charge: " + node.reserved());
+        assertEquals(0, node.releasesWithoutReservation);
+    }
+
     /** A bounded budget that counts releases of bytes it never reserved. */
     private static final class StrictBudget extends ReceiveBudget {
         private final ReceiveBudget delegate;
@@ -404,6 +442,13 @@ class LaneSessionTest {
                 return true;
             }
             return false;
+        }
+
+        @Override
+        public boolean forceReserve(long bytes) {
+            delegate.forceReserve(bytes);
+            reserved.addAndGet(bytes);
+            return true;
         }
 
         @Override
@@ -1838,7 +1883,7 @@ class LaneSessionTest {
             assertTrue(LaneRig.await(() -> node.reserved() > 0, 10000),
                     "the unparsed chunk is charged while it is held: " + node.reserved()
                             + " client=" + rig.clientGame.closed.getNow(null)
-                            + " server=" + rig.serverGame.closed.getNow(null));
+                            + " server=" + rig.serverGame.closed.getNow(null) + " " + rig.serverGame.closeCause);
             sleep(300);
             assertEquals(0, rig.clientGame.packetCount(), "nothing is delivered before the game is bound");
             assertEquals(0, LaneRig.snapshot(rig.client)[0], "nothing is parsed before the game is bound");
