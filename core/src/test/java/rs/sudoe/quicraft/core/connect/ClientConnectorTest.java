@@ -254,6 +254,9 @@ class ClientConnectorTest {
         assertTrue(attempt.cancel(false));
         assertTrue(p.quic.isCancelled(), "the QUIC attempt is cancelled");
         p.tcp.complete("late");
+        // The race attaches its close listener on the scheduler thread after the platform's TCP
+        // connect returns, so the close can land just after complete() here.
+        await("the late TCP connection to be closed", () -> !p.tcpClosed.isEmpty());
         assertEquals(java.util.Collections.singletonList("late"), p.tcpClosed);
     }
 
