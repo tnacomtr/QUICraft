@@ -35,10 +35,15 @@ import rs.sudoe.quicraft.core.profile.ServerProfile;
  *     share proportional to its weight. Ties go REALTIME, then CHUNK, then CONTROL. REALTIME is also
  *     limited to {@link #MAX_REALTIME_BURST} consecutive picks while another class is ready.</li>
  * <li>Chunk streams are served round-robin among shards that are ready and writable.</li>
- * <li>A ready CONTROL head that has waited {@link #AGE_LIMIT} selections is taken regardless of
- *     weights, so small CONTROL traffic keeps progressing under sustained load.</li>
+ * <li>A ready CONTROL head that has waited {@link #AGE_LIMIT} selections since it became the CONTROL
+ *     head is taken regardless of weights, so small CONTROL traffic keeps progressing under sustained
+ *     load. The age never starts at offer time, so a deep CONTROL backlog cannot make every head
+ *     "aged" and starve REALTIME.</li>
  * <li>A record offered with {@code bundleContinues} keeps stream 0 open until the closing record is
  *     fully written: the next selection must be the following bundle record.</li>
+ * <li>While a bundle is open, the skip, burst and aging bounds are suspended: the whole bundle is one
+ *     CONTROL scheduling unit (13.15), so nothing else is selected until its closing record is
+ *     written.</li>
  * </ul>
  *
  * <p>Thread-safe through its monitor. Weights, burst and aging constants are benchmark policy
@@ -55,8 +60,10 @@ public final class SendScheduler {
     public static final int AGE_LIMIT = 32;
     /**
      * Selections that may pass over a ready, writable CHUNK before it is taken. Each CHUNK keeps its
-     * own count, so a ready, writable chunk is selected by the ninth selection after it was last
-     * picked, whatever REALTIME, CONTROL or promoted load runs (13.20).
+     * own count. With one starved shard, a ready, writable chunk is selected by the ninth selection
+     * after it was last picked, whatever REALTIME, CONTROL or promoted load runs. With several shards
+     * starved at once the bound is {@code MAX_CHUNK_SKIPS + N - 1} selections, where N is the number
+     * of CHUNK shards (13.20).
      */
     public static final int MAX_CHUNK_SKIPS = 8;
 
@@ -170,8 +177,12 @@ public final class SendScheduler {
             throw new IllegalArgumentException("out-of-order offer");
         }
         offered.put(stream, record.sequence());
-        queues.computeIfAbsent(stream, key -> new ArrayDeque<Item>()).addLast(
-                new Item(record, bytes, bundleContinues, selections));
+        ArrayDeque<Item> queue = queues.computeIfAbsent(stream, key -> new ArrayDeque<Item>());
+        Item item = new Item(record, bytes, bundleContinues, selections);
+        if (queue.isEmpty()) {
+            item.headSince = selections;
+        }
+        queue.addLast(item);
         queuedRecords++;
         queuedBytes += bytes;
     }
@@ -284,12 +295,13 @@ public final class SendScheduler {
     }
 
     /**
-     * The ready, writable CONTROL head that has waited {@link #AGE_LIMIT} selections, or null. It is
-     * checked before prerequisite promotion, so a sustained promoted load cannot pass it (13.20).
+     * The ready, writable CONTROL head that has waited {@link #AGE_LIMIT} selections since it became
+     * the head, or null. It is checked before prerequisite promotion, so a sustained promoted load
+     * cannot pass it (13.20).
      */
     private Item agedControl(IntPredicate writable) {
         Item control = usableFront(CONTROL, writable);
-        return control != null && selections - control.enqueuedAt >= AGE_LIMIT ? control : null;
+        return control != null && selections - control.headSince >= AGE_LIMIT ? control : null;
     }
 
     private Item choose(IntPredicate writable, Item chunk) {
@@ -384,9 +396,14 @@ public final class SendScheduler {
         item.offset = offset + length;
         queuedBytes -= length;
         if (last) {
-            queues.get(stream).pollFirst();
+            ArrayDeque<Item> queue = queues.get(stream);
+            queue.pollFirst();
             queuedRecords--;
             sent.put(stream, item.record.sequence());
+            if (!queue.isEmpty()) {
+                // The next record becomes the head now; its age starts at this selection (13.20).
+                queue.peekFirst().headSince = selections + 1;
+            }
         }
         int cls = classOf(stream);
         long base = Math.max(classVirtualTime[cls], virtualTime);
@@ -480,14 +497,15 @@ public final class SendScheduler {
         final Record record;
         final int bytes;
         final boolean bundleContinues;
-        final long enqueuedAt;
+        /** Selection count when this record became its stream's head (13.20 aging). */
+        long headSince;
         int offset;
 
-        Item(Record record, int bytes, boolean bundleContinues, long enqueuedAt) {
+        Item(Record record, int bytes, boolean bundleContinues, long headSince) {
             this.record = record;
             this.bytes = bytes;
             this.bundleContinues = bundleContinues;
-            this.enqueuedAt = enqueuedAt;
+            this.headSince = headSince;
         }
     }
 }

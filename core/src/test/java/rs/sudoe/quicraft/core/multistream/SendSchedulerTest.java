@@ -208,6 +208,47 @@ class SendSchedulerTest {
                 "CONTROL record selected at position " + position);
     }
 
+    @Test void deepControlBacklogDoesNotStarveRealtimeAndEachHeadAgesFromBecomingHead() {
+        // 1000 CONTROL records are offered before any selection. Aging must count from when each one
+        // became the CONTROL head, not from its offer, or every head is "aged" after 32 picks and
+        // REALTIME (weight 8 against CONTROL weight 1) gets almost nothing (13.20).
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
+        for (int i = 1; i <= 1000; i++) {
+            scheduler.offer(rec(0, i), 1);
+        }
+        for (int i = 1; i <= 600; i++) {
+            scheduler.offer(rec(1, i), 1);
+        }
+        int realtime = 0;
+        int control = 0;
+        int previousControl = -1;
+        int firstControl = -1;
+        int maxGap = 0;
+        for (int k = 0; k < 500; k++) {
+            int stream = scheduler.pollSelection(ALL).record().streamIndex();
+            if (stream == 1) {
+                realtime++;
+            } else {
+                if (firstControl < 0) {
+                    firstControl = k;
+                }
+                if (previousControl >= 0) {
+                    maxGap = Math.max(maxGap, k - previousControl);
+                }
+                previousControl = k;
+                control++;
+            }
+        }
+        int weightedShare = 500 * 8 / 9;
+        assertTrue(realtime >= weightedShare / 2,
+                "REALTIME share was " + realtime + " of 500, expected at least " + weightedShare / 2);
+        assertTrue(control > 0, "CONTROL must keep progressing");
+        assertTrue(firstControl <= SendScheduler.AGE_LIMIT, "first CONTROL at " + firstControl);
+        // The next head becomes head one selection after the previous CONTROL pick, so it is due at
+        // most AGE_LIMIT selections later: a gap of AGE_LIMIT + 1 between CONTROL picks.
+        assertTrue(maxGap <= SendScheduler.AGE_LIMIT + 1, "largest CONTROL gap was " + maxGap);
+    }
+
     @Test void weightsShareBytesAndREALTIMEStaysWithinItsBurst() {
         SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
         for (int i = 1; i <= 500; i++) {
