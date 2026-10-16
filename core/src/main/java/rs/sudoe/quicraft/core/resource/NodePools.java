@@ -140,8 +140,22 @@ public final class NodePools implements ResourcePools {
 
     /** True when the pool has room, and for budgeted pools the shared node budget has room too. */
     private boolean fits(Pool pool, long bytes) {
-        if (bytes > limits.get(pool) - totals.get(pool)) return false;
-        return !BUDGETED.contains(pool) || bytes <= nodeLimit - budgeted();
+        return fitsAfterRelease(pool, bytes, 0);
+    }
+
+    /**
+     * Whether {@code bytes} would fit if {@code releasable} bytes of {@code pool} were released first. Lets the
+     * caller decide to shed only when shedding can actually make room (the shared budget may be full elsewhere).
+     */
+    public synchronized boolean hasRoom(Pool pool, long bytes, long releasable) {
+        if (pool == null || bytes < 0 || releasable < 0) throw new IllegalArgumentException("room");
+        return fitsAfterRelease(pool, bytes, Math.min(releasable, totals.get(pool)));
+    }
+
+    private boolean fitsAfterRelease(Pool pool, long bytes, long releasable) {
+        if (bytes > limits.get(pool) - (totals.get(pool) - releasable)) return false;
+        if (!BUDGETED.contains(pool)) return true;
+        return bytes <= nodeLimit - (budgeted() - releasable);
     }
 
     /** Combined bytes of the pools that share the node budget. */

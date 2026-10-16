@@ -14,11 +14,13 @@ import java.util.Random;
  * Byte-based, prefix-fair staged admission backed by the PRE_LOGIN pool (protocol.md 12, pre-login block).
  *
  * <p>Staged bytes of each connection are charged to {@link ResourcePools.Pool#PRE_LOGIN}. Fair share is in
- * bytes per source prefix: IPv6 /48 first, then /64 inside it, and IPv4 /24. A reservation is always admitted
- * while the pool has room (work-conserving). When the pool is full, a prefix within its max-min share (pool
- * capacity divided by the number of active broad prefixes) may shed charges of prefixes over their share. Victims
- * are chosen by the broad prefix's excess over its share first, then the narrow prefix's bytes, then least
- * progress, then a seeded random tie-break. A prefix over its share is refused rather than allowed to shed.</p>
+ * bytes per source prefix, computed as hierarchical max-min (water-filling): the pool capacity is split over
+ * the broad prefixes (IPv6 /48, IPv4 /24), and each broad prefix's allocation is split over its narrow prefixes
+ * (IPv6 /64, IPv4 /24). A reservation is always admitted while the pool has room (work-conserving). When the
+ * pool is full, a requester whose narrow prefix is within its allowance may shed charges that are over their
+ * share at either level, including other /64s inside its own full /48. Victims are ordered by broad excess
+ * first, then narrow excess, then least progress, then a seeded random tie-break. A requester over its narrow
+ * allowance is refused rather than allowed to shed. The allocation is computed only on the full-pool path.</p>
  *
  * <p>Promotion from PRE_LOGIN to NODE is atomic, via {@link NodePools#promote}. Thread-safe.</p>
  *
@@ -60,9 +62,8 @@ public final class PreLoginAdmission {
             throw new IllegalArgumentException("owner source prefix changed");
         }
         if (!pools.reserve(ResourcePools.Pool.PRE_LOGIN, owner, bytes)) {
-            long share = share(broad);
-            if (add(prefixBytes(broad), bytes) > share) return false;
-            if (!shedUntilRoom(owner, bytes, share)) return false;
+            if (!snapshot(broad, narrow, bytes).admits(broad, narrow)) return false;
+            if (!shedUntilRoom(owner, broad, narrow, bytes)) return false;
             if (!pools.reserve(ResourcePools.Pool.PRE_LOGIN, owner, bytes)) return false;
         }
         Charge charge = existing;
@@ -122,54 +123,130 @@ public final class PreLoginAdmission {
         return result;
     }
 
-    /** Current max-min share for a broad prefix: capacity divided by active broad prefixes (including this one). */
-    private long share(PrefixKey requester) {
-        int active = broadBytes.containsKey(requester) ? broadBytes.size() : broadBytes.size() + 1;
-        return pools.limit(ResourcePools.Pool.PRE_LOGIN) / Math.max(1, active);
-    }
-
-    private boolean shedUntilRoom(Object requester, long bytes, long share) {
-        while (true) {
-            Charge victim = victim(requester, share);
+    /**
+     * Frees charges of over-share prefixes until {@code bytes} fit, or returns false when no victim is left. Only
+     * the pool's own releasable bytes are counted, so nothing is shed when the shared budget is full elsewhere.
+     */
+    private boolean shedUntilRoom(Object requester, PrefixKey broad, PrefixKey narrow, long bytes) {
+        if (!pools.hasRoom(ResourcePools.Pool.PRE_LOGIN, bytes, pools.reserved(ResourcePools.Pool.PRE_LOGIN))) return false;
+        while (!pools.hasRoom(ResourcePools.Pool.PRE_LOGIN, bytes, 0)) {
+            Charge victim = snapshot(broad, narrow, bytes).victim(requester);
             if (victim == null) return false;
             pools.release(ResourcePools.Pool.PRE_LOGIN, victim.owner, victim.bytes);
             removeBytes(victim, victim.bytes);
             shed.add(victim.owner);
-            if (pools.reserved(ResourcePools.Pool.PRE_LOGIN) + bytes <= pools.limit(ResourcePools.Pool.PRE_LOGIN)) return true;
         }
+        return true;
     }
 
-    /** Selects a charge of an over-share broad prefix: broad excess, narrow bytes, least progress, random. */
-    private Charge victim(Object requester, final long share) {
-        List<Charge> candidates = new ArrayList<Charge>();
-        for (Charge charge : charges.values()) {
-            if (!charge.owner.equals(requester) && charge.bytes > 0 && prefixBytes(charge.broad) > share) candidates.add(charge);
+    /** Hierarchical max-min allocation with the requester's {@code bytes} included in its prefixes' demand. */
+    private Snapshot snapshot(PrefixKey requesterBroad, PrefixKey requesterNarrow, long bytes) {
+        Map<PrefixKey, Long> broadDemand = new HashMap<PrefixKey, Long>(broadBytes);
+        Map<PrefixKey, Map<PrefixKey, Long>> narrowDemand = new HashMap<PrefixKey, Map<PrefixKey, Long>>();
+        for (Charge charge : charges.values()) addTo(narrowDemand, charge.broad, charge.narrow, charge.bytes);
+        addTo(broadDemand, requesterBroad, bytes);
+        addTo(narrowDemand, requesterBroad, requesterNarrow, bytes);
+        long capacity = pools.limit(ResourcePools.Pool.PRE_LOGIN);
+        Map<PrefixKey, Long> broadAlloc = waterFill(broadDemand, capacity);
+        Map<PrefixKey, Map<PrefixKey, Long>> narrowAlloc = new HashMap<PrefixKey, Map<PrefixKey, Long>>();
+        for (Map.Entry<PrefixKey, Map<PrefixKey, Long>> entry : narrowDemand.entrySet()) {
+            narrowAlloc.put(entry.getKey(), waterFill(entry.getValue(), broadAlloc.get(entry.getKey())));
         }
-        if (candidates.isEmpty()) return null;
-        Collections.sort(candidates, new Comparator<Charge>() {
-            @Override public int compare(Charge left, Charge right) {
-                int byExcess = Long.compare(prefixBytes(right.broad) - share, prefixBytes(left.broad) - share);
-                if (byExcess != 0) return byExcess;
-                int byNarrow = Long.compare(narrowBytes(right.narrow), narrowBytes(left.narrow));
-                if (byNarrow != 0) return byNarrow;
-                int byProgress = Long.compare(left.progress, right.progress);
-                if (byProgress != 0) return byProgress;
-                int byRandom = Long.compare(left.tieBreak, right.tieBreak);
-                return byRandom != 0 ? byRandom : Long.compare(left.sequence, right.sequence);
+        return new Snapshot(broadDemand, broadAlloc, narrowDemand, narrowAlloc);
+    }
+
+    private static void addTo(Map<PrefixKey, Map<PrefixKey, Long>> map, PrefixKey broad, PrefixKey narrow, long bytes) {
+        Map<PrefixKey, Long> inside = map.get(broad);
+        if (inside == null) {
+            inside = new HashMap<PrefixKey, Long>();
+            map.put(broad, inside);
+        }
+        addTo(inside, narrow, bytes);
+    }
+
+    private static void addTo(Map<PrefixKey, Long> map, PrefixKey key, long bytes) {
+        Long value = map.get(key);
+        map.put(key, value == null ? bytes : add(value, bytes));
+    }
+
+    /**
+     * Max-min water-filling: in ascending demand order each key gets the smaller of its demand and an equal split
+     * of what remains. Integer division leaves at most a few bytes unallocated, which errs on the strict side.
+     */
+    private static <K> Map<K, Long> waterFill(Map<K, Long> demands, long capacity) {
+        List<Map.Entry<K, Long>> sorted = new ArrayList<Map.Entry<K, Long>>(demands.entrySet());
+        Collections.sort(sorted, new Comparator<Map.Entry<K, Long>>() {
+            @Override public int compare(Map.Entry<K, Long> left, Map.Entry<K, Long> right) {
+                return Long.compare(left.getValue(), right.getValue());
             }
         });
-        return candidates.get(0);
+        Map<K, Long> result = new HashMap<K, Long>();
+        long remaining = Math.max(0, capacity);
+        int left = sorted.size();
+        for (Map.Entry<K, Long> entry : sorted) {
+            long give = Math.min(entry.getValue(), remaining / left);
+            result.put(entry.getKey(), give);
+            remaining -= give;
+            left--;
+        }
+        return result;
+    }
+
+    /** One allocation: broad and narrow demand (requester included) with their max-min allowances. */
+    private final class Snapshot {
+        private final Map<PrefixKey, Long> broadDemand;
+        private final Map<PrefixKey, Long> broadAlloc;
+        private final Map<PrefixKey, Map<PrefixKey, Long>> narrowDemand;
+        private final Map<PrefixKey, Map<PrefixKey, Long>> narrowAlloc;
+
+        Snapshot(Map<PrefixKey, Long> broadDemand, Map<PrefixKey, Long> broadAlloc,
+                 Map<PrefixKey, Map<PrefixKey, Long>> narrowDemand, Map<PrefixKey, Map<PrefixKey, Long>> narrowAlloc) {
+            this.broadDemand = broadDemand;
+            this.broadAlloc = broadAlloc;
+            this.narrowDemand = narrowDemand;
+            this.narrowAlloc = narrowAlloc;
+        }
+
+        /** True when the requester's narrow prefix fits its allowance inside its broad prefix's allocation. */
+        boolean admits(PrefixKey broad, PrefixKey narrow) {
+            return narrowDemand.get(broad).get(narrow) <= narrowAlloc.get(broad).get(narrow);
+        }
+
+        /** Most over-share charge: broad excess first, then narrow excess, least progress, random, then age. */
+        Charge victim(final Object requester) {
+            List<Charge> candidates = new ArrayList<Charge>();
+            for (Charge charge : charges.values()) {
+                if (charge.owner.equals(requester) || charge.bytes == 0) continue;
+                if (broadExcess(charge) > 0 || narrowExcess(charge) > 0) candidates.add(charge);
+            }
+            if (candidates.isEmpty()) return null;
+            Collections.sort(candidates, new Comparator<Charge>() {
+                @Override public int compare(Charge left, Charge right) {
+                    int byBroad = Long.compare(broadExcess(right), broadExcess(left));
+                    if (byBroad != 0) return byBroad;
+                    int byNarrow = Long.compare(narrowExcess(right), narrowExcess(left));
+                    if (byNarrow != 0) return byNarrow;
+                    int byProgress = Long.compare(left.progress, right.progress);
+                    if (byProgress != 0) return byProgress;
+                    int byRandom = Long.compare(left.tieBreak, right.tieBreak);
+                    return byRandom != 0 ? byRandom : Long.compare(left.sequence, right.sequence);
+                }
+            });
+            return candidates.get(0);
+        }
+
+        private long broadExcess(Charge charge) {
+            return broadDemand.get(charge.broad) - broadAlloc.get(charge.broad);
+        }
+
+        private long narrowExcess(Charge charge) {
+            return narrowDemand.get(charge.broad).get(charge.narrow) - narrowAlloc.get(charge.broad).get(charge.narrow);
+        }
     }
 
     private long prefixBytes(PrefixKey broad) {
         Long value = broadBytes.get(broad);
         return value == null ? 0 : value;
-    }
-
-    private long narrowBytes(PrefixKey narrow) {
-        long total = 0;
-        for (Charge charge : charges.values()) if (charge.narrow.equals(narrow)) total = add(total, charge.bytes);
-        return total;
     }
 
     private void removeBytes(Charge charge, long bytes) {

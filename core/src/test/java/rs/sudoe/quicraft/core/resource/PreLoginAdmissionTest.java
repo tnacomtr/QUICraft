@@ -91,4 +91,19 @@ class PreLoginAdmissionTest {
         assertTrue(admission.reserve("q", ip("2001:db8:1::1"), 5));
         assertThrows(IllegalArgumentException.class, () -> admission.reserve("q", ip("2001:db8:9::1"), 5));
     }
+
+    @Test void fullSlash48CannotHideAnotherSlash64InsideItFromItsFairShare() throws Exception {
+        NodePools pools = pools();
+        PreLoginAdmission admission = new PreLoginAdmission(pools, new Random(7));
+        for (int i = 1; i <= 6; i++) assertTrue(admission.reserve("x" + i, ip("2001:db8:1:1::" + i), 10));
+        for (int i = 1; i <= 4; i++) assertTrue(admission.reserve("c" + i, ip("2001:db8:3:1::" + i), 10));
+        assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
+        // Max-min over /48s gives A 60 and C 40. Inside A, the new /64 gets its 20 by shedding over-share /64 bytes.
+        assertTrue(admission.reserve("y", ip("2001:db8:1:2::1"), 20));
+        assertEquals(2, admission.drainShedOwners().size());
+        assertEquals(20, admission.reserved("y"));
+        assertEquals(60, admission.reservedByPrefix(ip("2001:db8:1::9")), "X keeps 40, Y holds 20");
+        assertEquals(40, admission.reservedByPrefix(ip("2001:db8:3::9")));
+        assertTrue(pools.reserved(ResourcePools.Pool.PRE_LOGIN) <= 100);
+    }
 }
