@@ -139,6 +139,8 @@ public final class ReceiverScheduler {
         boolean head;
         /** First attempt of this entry's current decode, or -1 while it has none (13.12). */
         long decodeSince = -1;
+        /** Bytes the current decode attempt reserved, released if that attempt is refused. */
+        long decodeReservedBytes;
         Entry(Envelope envelope, long bytes) {
             this.envelope = envelope;
             this.bytes = bytes;
@@ -612,6 +614,23 @@ public final class ReceiverScheduler {
         return null;
     }
 
+    /**
+     * Gives back everything the current decode attempt reserved and resets the entry's decode
+     * state, so the next attempt starts from the entry's own wire charge again (13.12). The entry
+     * stays queued and undecoded; only what this attempt added goes back.
+     */
+    private void releaseDecodeAttempt(Entry entry) {
+        long reserved = entry.decodeReservedBytes;
+        if (reserved > 0) {
+            entry.bytes -= reserved;
+            account(entry.envelope.lane(), -reserved, 0);
+            creditNode(reserved);
+        }
+        entry.decodeReservedBytes = 0;
+        entry.decodeReserved = false;
+        entry.uncompressed = 0;
+    }
+
     private void pump(long now) {
         // An inline applied() may advance time while the non-recursive drain is active.
         pumpNow = now;
@@ -643,8 +662,11 @@ public final class ReceiverScheduler {
                         decoder.decode(decoding.envelope,
                                 receivingBundle && decoding.envelope.lane() == Lane.CONTROL, pumpNow);
                     } catch (RetryLater retry) {
-                        // 13.12: the node budget refused this decode's allocation. Hold the entry
-                        // undecoded; its own deadline keeps running from the first attempt.
+                        // 13.12: the node budget refused this attempt's allocation. Give this
+                        // attempt's own reservations back before the entry waits: the decoder is
+                        // rerun from its start, so keeping them would charge the same output again on
+                        // every retry and drain the budget.
+                        releaseDecodeAttempt(decoding);
                         decoding = null;
                         return;
                     } catch (RuntimeException ex) {
@@ -693,6 +715,7 @@ public final class ReceiverScheduler {
                 throw new RetryLater();
             }
             decoding.bytes += additionalRetainedBytes;
+            decoding.decodeReservedBytes += additionalRetainedBytes;
             decoding.uncompressed = totalUncompressedBytes;
             decoding.decodeReserved = true;
             account(envelope.lane(), additionalRetainedBytes, 0);
@@ -757,6 +780,7 @@ public final class ReceiverScheduler {
             // The decode is done: its deadline and the attempt's reservation tally both reset, so
             // they cannot reach a later entry.
             decoding.decodeSince = -1;
+            decoding.decodeReservedBytes = 0;
             decoding = null;
             pump(now);
         } catch (RuntimeException ex) {
