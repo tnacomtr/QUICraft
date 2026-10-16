@@ -7,12 +7,12 @@ import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.util.Map;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -52,6 +52,7 @@ public final class LoadClient {
     private final AtomicLong failed = new AtomicLong();
     private final AtomicLong closed = new AtomicLong();
     private final AtomicLong lanesActive = new AtomicLong();
+    private final AtomicLong lanesFailed = new AtomicLong();
     /** Failed dials by normalized cause (root exception class and message, digits folded). */
     private final Map<String, AtomicLong> causes = new ConcurrentHashMap<>();
     private final Queue<Object> held = new ConcurrentLinkedQueue<>();
@@ -192,8 +193,10 @@ public final class LoadClient {
     }
 
     /**
-     * Per v3 connection: counts its close (a refusal by the node budget arrives as one right after
-     * the handshake), then activates its lanes with the idle game when asked.
+     * Per v3 connection: installs the close listener, then activates its lanes with the idle game
+     * when asked. The listener is set before activation and {@code V3ConnectionImpl} keeps it as the
+     * game listener, so a close after activation still reaches it; a close that came before the
+     * listener was set is replayed by {@code setListener}.
      */
     private void onV3Connected(Object connection, boolean lanes) {
         V3Connection v3 = (V3Connection) connection;
@@ -217,17 +220,21 @@ public final class LoadClient {
             v3.activate(IdleLaneGame.INSTANCE, null);
             lanesActive.incrementAndGet();
         } catch (Throwable t) {
-            // Counted as not active in the status line.
+            lanesFailed.incrementAndGet();
         }
     }
 
-    /** The /3 counters: closed, the held count live = connected - closed, and lanes activated. */
+    /**
+     * The /3 counters: closed, the held count live = connected - closed, lanes activated, and lanes
+     * whose activation call threw. A failure inside the event loop is closed by core and is not
+     * visible here.
+     */
     private String v3Fields() {
         if (!v3) {
             return "";
         }
         return " closed=" + closed.get() + " live=" + (connected.get() - closed.get())
-                + " lanes_active=" + lanesActive.get();
+                + " lanes_active=" + lanesActive.get() + " lanes_failed=" + lanesFailed.get();
     }
 
     private void status() {
