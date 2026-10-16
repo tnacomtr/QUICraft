@@ -757,8 +757,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
     the whole QUIC connection with application error `0x10` (binding/activation failure).
      Resource-caused closes instead use `0x12`, including expiry of an activation deadline
      while a local resource refusal prevents progress. Both peers recognize this application
-      code, but only LOCALLY detected resource aborts MUST NOT create/advance §6's failure
-      cache or the re-bind failure backoff, subject to the peer-attribution rule in 13.12.
+      code, but locally detected resource aborts, authenticated peer resource reports (after
+      SERVER_SWITCH verifies) and in-allowance pre-verification peer reports below MUST NOT
+      create/advance §6's failure cache or the re-bind failure backoff, subject to the
+      inbound peer-attribution rule in 13.12.
       Before SERVER_SWITCH verifies, a PEER-sent `0x12` cannot authenticate its resource
       claim. Apply the fixed 60-second resource window below to at most three such reports
       per rolling 10 minutes per logical server; the fourth and subsequent reports in that
@@ -1338,58 +1340,77 @@ position extraction. Those implementations must change together before this revi
      bound also applies. Never abort an honest binding on the first pool refusal while
      other connections retain reclaimable outbound bytes. Never deny honest protected
      inbound reads because another peer stopped reading. Locally detected genuine shared
-      resource aborts do not update the failure cache (12.14); apply the peer-attribution
+      resource aborts do not update the failure cache (12.14); apply the inbound peer-attribution
       exception below before classifying a refusal as resource-caused.
      **Pressure ranking (both pools, separately accounted):** maintain exponentially decayed
      byte-seconds per source IP and authenticated account, not per connection; half-life
      60 seconds provisionally. Integrate retained charged bytes, excluding known local
-     executor-stall intervals. Track progress over a rolling 10-second window per identity:
+     executor-stall intervals and intervals in which the holder was waiting only on OUR
+     refusal of its request (those add no byte-seconds). Track progress over a rolling 10-second window per identity:
      newly received inbound record bytes (including partial records, counted once, not
      retransmissions or copies), outbound bytes acknowledged/released by QUIC (not merely
      handed to it). Rank descending `decayedByteSeconds / (1 + progressBytesPerSecond)`,
      then current retained bytes descending. There is NO strict zero-progress/stalled-first
      tier or 5-second acquisition clock: a short mobile radio stall does not automatically
      outrank every progressing holder, nor can a trickle escape a priority tier. A connection's
-     rank is the worse of its IP/account ranks; within tied identity ranks apply the same
-     score and retained-byte comparison using each connection's own byte-seconds/progress,
-     then oldest current acquisition, then stable connection id. A reconnect starts only
+     rank is the WORST (highest score) of its IP, account and connection-local scores, so a
+     sibling streaming cheap records on the same IP/account cannot shield a stalled holder
+     (the connection-local score uses that connection's own byte-seconds/progress). Ties
+     then compare current retained bytes, then oldest current acquisition, then an
+     internal, non-rotating connection id (a local counter, not a QUIC connection ID). A reconnect starts only
      its new connection-local statistics, never the identity history; no 5-second clock restarts.
      Aggregate across simultaneous connections and retain identity history for 10 minutes
      after last use; reconnects never reset it. Bound each pool's exact history to the
-     configured admission IP/account tracking capacities, plus one shared overflow bucket.
+     configured admission IP/account tracking capacities, plus K=256 overflow buckets
+     per pool, selected by a keyed hash (per-process random secret) of the IPv4 /32,
+     IPv6 /64 or account, so one attacker's identities cannot dominate a single shared
+     bucket. An account association protects an IP entry only while that account has at
+     most 4 IP entries; beyond that the extra IP entries are unprotected.
      Reclaim expired inactive entries first; if full, evict the lowest-score inactive IP
      entry with neither an account association nor a live connection, folding its history
-     into the overflow bucket. Never evict live entries or unexpired account history. If no
-     such slot exists, charge the new identity's history/progress to that shared bucket
+     into its overflow bucket. Never evict live entries or unexpired account history. If no
+     such slot exists, charge the new identity's history/progress to its hashed overflow bucket
      instead of refusing it; count a connection's bytes/progress only once in overflow
-     even if both its IP and account lack exact entries. Its actual IP/account caps still
-     apply independently. Until overflow has no live users and its 10-minute inactive
+     (worst-of rule above applies per identity) even if both its IP and account lack exact entries. Its actual IP/account caps still
+     apply independently. Until its overflow bucket has no live users and its 10-minute inactive
      history expires, identities without an exact entry continue using it even if exact
      slots become free; do not promote them and erase reconnect history. Existing exact
      entries remain separate and protected. Decay bucket history under the same rules.
      The ranking-history table NEVER causes admission/grant refusal or TCP fallback,
      even when all exact entries are protected. Independent rate admission limits
      still apply. All ranking windows/weights are
-     provisional operational defaults: measure then set, including CGNAT fairness and
-     reconnect/trickle attacks. Scores only choose among eligible holders, never protected shares.
+     provisional operational defaults: measure then set, including CGNAT fairness,
+     reconnect/trickle attacks and overflow poisoning (an attacker protecting every exact
+     slot with account-associated IPs and rotating /64s must not make honest newcomers
+     inherit its bad score). Scores only choose among eligible holders, never protected shares.
     Incomplete record/bundle: 10 seconds from first byte on the local monotonic transport
     clock, paused while local executor backpressure prevents reads. Blocked head: 10 seconds
     from becoming head on the executor-active clock. Decode/application dispatch: 10 seconds
     of pre-enqueue active work; FIFO enqueue Q completes that timer, while D still waits for actual
     application (13.10). Executor queue/tick-stall time is excluded at both client and server;
     do not let a >10-second tick stall disconnect every peer. Unrelated network progress
-     restarts none of these clocks. **Peer attribution before resource classification:**
-     a refusal caused only by the requesting peer's own caps or its own retained bytes is
-     peer-attributable, not shared resource exhaustion. In particular this covers a binding
-     connection-local cap, or shared binding caps held exclusively by that peer; do not
-     reclaim unrelated holders or grant the fixed resource retry exception in those cases.
-     If an abort is required (unpausable producer or deadline expiry), close with `0x11`
-     (during binding, `0x10`) when peer-caused, using normal client
-     failure-cache/backoff and existing server peer-attributable handling, including on
-     deadline expiry. Local implementation/producer faults are not evidence of peer fault.
-     When no connection-local cap independently blocks the grant, shared pressure caused
-     by other peers remains `0x12` even when this peer also holds bytes. Apply this distinction
-     to both pools, pending ACK caps and binding queues.
+     restarts none of these clocks. **Peer attribution before resource classification
+     (INBOUND only):** "peer" means this one connection's OWN sent bytes; other
+     connections sharing its IP or account (CGNAT, family accounts) are other peers.
+     An inbound refusal is peer-attributable only when the bytes this connection itself
+     SENT exceed its own legal caps: its connection-local inbound cap, or a shared
+     IP/account/node binding cap whose holders are exclusively this connection's own
+     retained bytes. Do not reclaim unrelated holders or grant the fixed resource retry
+     exception in those cases. If an inbound abort is required (deadline expiry), close
+     with `0x11` (during binding, `0x10`), using normal client failure-cache/backoff and
+     the server's ordinary protocol-violation handling: log one warning per minute per
+     listener with the reason code and no payload, apply no other penalty beyond the
+     independent admission rate limits above. A refusal under an IP or
+     account cap held entirely or partly by other users of that IP/account is never
+     attributable to this connection. Local implementation/producer faults are not
+     evidence of peer fault. When no connection-local cap independently blocks the grant,
+     shared pressure caused by other peers remains `0x12` even when this peer also holds
+     bytes. OUTBOUND queues, the pending-ACK caps and the server binding queue are NEVER
+     peer-attributable: they fill from the local game producer's volume plus an honest
+     slow or lossy link, so their per-connection caps (1024 packets/16 MiB, 128 entries/
+     64 KiB, 32 packets/64 KiB), deadline expiries and unpausable-producer aborts close
+     `0x12`. A peer that stops reading is handled by the outbound 10-second wait and
+     shedding above, never by `0x11`.
      **Deadline precedence:** ANY deadline expiring while
      this node is withholding reads/grants needed for completion due to a LOCAL resource
      refusal closes `0x12`, never peer blame `0x11` (or binding blame `0x10`), except for
@@ -1602,7 +1623,7 @@ position extraction. Those implementations must change together before this revi
       creation, not only after assignment. Moving an ack into the sequenced queue transfers
       its charge, never duplicates it. Backpressure the ack producer at the limit without
       stopping covered-update/fence assignment; if this separation is impossible or the
-      producer cannot pause, resource-abort `0x12` (subject to 13.12's peer-attribution rule),
+      producer cannot pause, resource-abort `0x12` (never peer-attributed, 13.12),
       never silently drop/coalesce or retain unbounded acks, except for the explicit drops
       below. These are provisional measure-then-set limits, not idle reservations.
       A pending ack has a 10-second monotonic transport-clock deadline from creation,
@@ -1709,6 +1730,10 @@ position extraction. Those implementations must change together before this revi
       IP entries or use overflow, protect account/live history, and admit new honest players
       over QUIC without history-based refusal; verify cap accounting remains exact and
       reconnects cannot escape unexpired overflow history when an exact slot becomes free.
+      Poisoning: an attacker keeps every exact slot live and heavy (account-associated IPs,
+      rotating /64s); honest newcomers hashed to other overflow buckets are not shed first
+      because of its score. A sibling connection streaming cheap records on the same
+      IP/account does not shield a stalled holder (worst-of ranking).
       Outbound tests must enforce node/IP/account caps and the same continuous score ranking;
       rotate connections without resetting aggregated progress/history. Under outbound
       contention queue A then B on the same binding cap and a new arrival C: released capacity
@@ -1730,10 +1755,13 @@ position extraction. Those implementations must change together before this revi
       suppression or advance failure/re-bind backoff; unauthenticated peer `0x12` follows
       12.14's bounded allowance then normal non-resource backoff. Fill only a requesting
       peer's own connection cap or a shared cap held exclusively by it, inbound/outbound
-      and during binding: peer-caused refusal/deadline expiry is `0x11`/`0x10` with normal
+      (inbound only), including during binding: peer-caused refusal/deadline expiry is `0x11`/`0x10` with normal
       backoff, never a fixed-window resource exemption or eviction of unrelated peers.
       Contrast other-peer shared exhaustion and a local producer fault, neither blamed on
-      the peer. Emit an ack before its covered updates with a full outbound FIFO:
+      the peer. CGNAT: a refusal under an IP cap held entirely by other users of the same
+      IP is never `0x11`. An honest slow-link client that hits the outbound connection cap
+      (or pending-ACK/binding-queue cap) during a chunk burst closes `0x12` at worst,
+      never `0x11`; a non-reading peer is shed by the outbound wait, not blamed. Emit an ack before its covered updates with a full outbound FIFO:
      update assignment must progress independently, no future/cyclic dependency or client
       `0x11` may result, and the ack follows all covered updates. Test game order A, view/global
       fence V, covered U: assignment is V,U,A, never U,A,V, and all edges point backward.
@@ -1785,7 +1813,7 @@ position extraction. Those implementations must change together before this revi
    elapsed-time budget, and this draft does not change the approved duration.
 5. Approve the new close code `0x12` (resource abort) next to `0x10` (binding/setup failure)
    and `0x11` (peer ordering/protocol violation)? It marks closes caused by the local node's
-   genuine shared resource exhaustion, not peer-attributable self-cap refusals (13.12).
+   genuine shared resource exhaustion, not inbound self-cap refusals attributable to the peer's own sent bytes (13.12).
    Locally detected resource aborts never write a failure-cache entry; before SERVER_SWITCH
    verifies, peer reports remain untrusted and receive only 12.14's bounded retry allowance.
    Close codes are wire format; nothing ships with `0x12` until this is confirmed.
