@@ -34,8 +34,8 @@ public class RoutingTableGameTest implements FabricClientGameTest {
 
     /**
      * Every non-CONTROL route, as {@code direction lane live-id name}. Anything not listed is CONTROL
-     * by default (13.6). REALTIME holds entity-only updates whose entity was spawned on CONTROL
-     * before them (13.8); WORLD holds block, light and biome updates, which depend on the chunk
+     * by default (13.6). REALTIME holds entity updates whose entity was spawned on CONTROL before
+     * them, plus level particles (13.8); WORLD holds block, light and biome updates, which depend on the chunk
      * install fence (13.8, 13.11). The ordering of each lane is tested in core's
      * ShippedRoutingOrderingTest. Teleports, spawns, removals, state changes, keepalive, commands and
      * serverbound packets stay CONTROL and are not listed.

@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.security.MessageDigest;
 import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.Faults;
@@ -24,6 +25,7 @@ import rs.sudoe.quicraft.core.Faults;
 class ShippedRoutingTableTest {
     private static final int PROTOCOL = 775;
     private static final String RESOURCE = RoutingTableLoader.resourcePath(PROTOCOL);
+    private static final Map<Integer, String> PACKET_NAMES = packetNames();
 
     @Test
     void theShippedTableParsesAndIsTheRegistryAnswer() throws Exception {
@@ -57,6 +59,56 @@ class ShippedRoutingTableTest {
             assertFalse(route.lane().isControl(), key + " is listed only when it leaves CONTROL");
             assertEquals(Dependency.LANE, route.dependency(), key.toString());
         }
+    }
+
+    @Test
+    void everyShippedPacketNameHasItsPinnedLane() throws Exception {
+        Faults.set();
+        Map<String, Lane> expected = new LinkedHashMap<String, Lane>();
+        expected.put("animate", Lane.REALTIME);
+        expected.put("hurt_animation", Lane.REALTIME);
+        expected.put("level_particles", Lane.REALTIME);
+        expected.put("move_entity_pos", Lane.REALTIME);
+        expected.put("move_entity_pos_rot", Lane.REALTIME);
+        expected.put("move_minecart_along_track", Lane.REALTIME);
+        expected.put("move_entity_rot", Lane.REALTIME);
+        expected.put("rotate_head", Lane.REALTIME);
+        expected.put("set_entity_data", Lane.REALTIME);
+        expected.put("set_entity_motion", Lane.REALTIME);
+        expected.put("set_equipment", Lane.REALTIME);
+        expected.put("sound_entity", Lane.REALTIME);
+        expected.put("update_attributes", Lane.REALTIME);
+        expected.put("block_changed_ack", Lane.WORLD);
+        expected.put("block_destruction", Lane.WORLD);
+        expected.put("block_entity_data", Lane.WORLD);
+        expected.put("block_event", Lane.WORLD);
+        expected.put("block_update", Lane.WORLD);
+        expected.put("chunks_biomes", Lane.WORLD);
+        expected.put("light_update", Lane.WORLD);
+        expected.put("section_blocks_update", Lane.WORLD);
+
+        RoutingTable table = RoutingTableLoader.loadResource(PROTOCOL);
+        Map<String, Lane> actual = new LinkedHashMap<String, Lane>();
+        for (Map.Entry<RouteKey, Route> entry : table.routes().entrySet()) {
+            RouteKey key = entry.getKey();
+            String name = PACKET_NAMES.get(key.packetId());
+            assertTrue(name != null, "unexpected protocol-775 packet id " + key.packetId());
+            actual.put(name, entry.getValue().lane());
+        }
+        assertEquals(expected, actual, "shipped packet name -> lane assignments changed");
+    }
+
+    private static Map<Integer, String> packetNames() {
+        Map<Integer, String> names = new LinkedHashMap<Integer, String>();
+        names.put(2, "animate"); names.put(42, "hurt_animation"); names.put(47, "level_particles");
+        names.put(53, "move_entity_pos"); names.put(54, "move_entity_pos_rot");
+        names.put(55, "move_minecart_along_track"); names.put(56, "move_entity_rot");
+        names.put(83, "rotate_head"); names.put(99, "set_entity_data"); names.put(101, "set_entity_motion");
+        names.put(102, "set_equipment"); names.put(116, "sound_entity"); names.put(131, "update_attributes");
+        names.put(4, "block_changed_ack"); names.put(5, "block_destruction");
+        names.put(6, "block_entity_data"); names.put(7, "block_event"); names.put(8, "block_update");
+        names.put(13, "chunks_biomes"); names.put(48, "light_update"); names.put(84, "section_blocks_update");
+        return names;
     }
 
     private static byte[] readResource(String path) throws IOException {

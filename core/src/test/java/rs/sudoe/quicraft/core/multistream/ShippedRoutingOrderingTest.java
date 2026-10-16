@@ -87,10 +87,10 @@ class ShippedRoutingOrderingTest {
     /** 13.11: a CONTROL destroy after REALTIME moves cannot overtake the moves. */
     @Test void destroyAfterRealtimeMovesWaitsForEveryMove() {
         SenderSequencer s = new SenderSequencer();
-        Envelope spawn = s.assign(Lane.CONTROL, 1, "add_entity", null, 0);
-        Envelope move1 = s.assign(Lane.REALTIME, 1, "move_entity_pos", null, 0);
-        Envelope move2 = s.assign(Lane.REALTIME, 1, "move_entity_pos", null, 0);
-        Envelope destroy = s.assign(Lane.CONTROL, 1, "remove_entities", null, 0);
+        Envelope spawn = s.assign(laneOf(ADD_ENTITY), 1, "add_entity", null, 0);
+        Envelope move1 = s.assign(laneOf(MOVE_ENTITY_POS), 1, "move_entity_pos", null, 0);
+        Envelope move2 = s.assign(laneOf(MOVE_ENTITY_POS), 1, "move_entity_pos", null, 0);
+        Envelope destroy = s.assign(laneOf(REMOVE_ENTITIES), 1, "remove_entities", null, 0);
         assertArrayEquals(new long[] {1, 2, 0}, destroy.dependencies());
         Harness h = new Harness();
         h.offer(spawn);
