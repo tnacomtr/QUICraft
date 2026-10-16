@@ -46,6 +46,18 @@ public final class TransportConfig {
      */
     public static final long MULTISTREAM_REVERSE_CHUNK_STREAM_DATA = 1;
     /**
+     * Legacy window for the server's server-opened bidi streams while the legacy 3-lane LaneSession is the
+     * {@code /3} implementation: 13.13 says 1 byte, but that LaneSession still sends client-to-server bytes on
+     * its server-opened stream 1, so the one-byte window would stall it. 13.13 says 1 byte; the U8
+     * integration unit switches to the 1-byte value when LaneSession moves to the N+2 design.
+     */
+    public static final long LEGACY_LANE_REVERSE_STREAM_DATA = 8L << 10;
+    /**
+     * True while the legacy 3-lane LaneSession is the {@code /3} implementation, so Codecs applies
+     * {@link #LEGACY_LANE_REVERSE_STREAM_DATA}. The U8 integration unit sets this to false.
+     */
+    static final boolean LEGACY_LANE_SESSION = true;
+    /**
      * /3: the server advertises this much connection credit, i.e. what the client may send (serverbound).
      * It is fixed before N is known and is the staged pre-login exposure (12.13): the server pins both its
      * connection maximum and its stream maxima so quiche never grows them. Pinned by

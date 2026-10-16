@@ -39,8 +39,7 @@ final class Codecs {
             // the ones this endpoint opened. A server grants only the one-byte reverse-CHUNK guard on
             // its own streams, and 8 KiB on the CONTROL and REALTIME streams the client opened (13.13).
             // The client grants 256 KiB on both kinds of stream.
-            localStreamData = server ? TransportConfig.MULTISTREAM_REVERSE_CHUNK_STREAM_DATA
-                    : TransportConfig.MULTISTREAM_MAX_STREAM_WINDOW;
+            localStreamData = server ? serverOpenedStreamData() : TransportConfig.MULTISTREAM_MAX_STREAM_WINDOW;
             remoteStreamData = server ? TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA
                     : TransportConfig.MULTISTREAM_MAX_STREAM_WINDOW;
             maxStreams = server ? TransportConfig.MULTISTREAM_SERVER_MAX_STREAMS_BIDI
@@ -75,6 +74,15 @@ final class Codecs {
             configured.initialCongestionWindowPackets(config.initialCongestionWindowPackets());
         }
         return configured;
+    }
+
+    /**
+     * The server's window on its own bidi streams (13.13 reverse CHUNK): one byte by spec, or the legacy
+     * 8 KiB while {@link TransportConfig#LEGACY_LANE_SESSION} keeps the legacy LaneSession in place.
+     */
+    private static long serverOpenedStreamData() {
+        return TransportConfig.LEGACY_LANE_SESSION ? TransportConfig.LEGACY_LANE_REVERSE_STREAM_DATA
+                : TransportConfig.MULTISTREAM_REVERSE_CHUNK_STREAM_DATA;
     }
 
     private static QuicCongestionControlAlgorithm algorithm(TransportConfig.CongestionControl cc) {
