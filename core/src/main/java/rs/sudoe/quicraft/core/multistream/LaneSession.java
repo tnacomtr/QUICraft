@@ -913,10 +913,8 @@ public final class LaneSession {
             } else if (s.partial == null && s.decoder.hasPartial()) {
                 long size = s.decoder.partialWireBytes();
                 long prepaid = Math.min(size, MAX_RECORD_WIRE - s.recordGrantUsed);
-                long startedAt = s.waitingSince != 0 ? s.waitingSince : now();
-                s.partial = receiver.reservePartial(s.lane, size, prepaid, startedAt, now());
+                s.partial = receiver.reservePartial(s.lane, size, prepaid, s.takeWaitingSince(), now());
                 s.recordGrantUsed += prepaid;
-                s.waitingSince = 0;
                 s.charged = size;
             } else if (s.recordGrantUsed > 0 && !s.recordGranted) {
                 // the record finished; nothing to carry over
@@ -1450,7 +1448,10 @@ public final class LaneSession {
         boolean recordGranted;
         /** How many bytes of the record grant have been transferred to the parser buffer. */
         long recordGrantUsed;
-        /** When this lane first held bytes of a record it could not admit; 0 while it has none. */
+        /**
+         * When this lane first held bytes of a record it could not admit; 0 while it has none. It
+         * moves into the parser reservation ({@link #takeWaitingSince()}) and is cleared there.
+         */
         long waitingSince;
 
         LaneStream(Lane lane) {
@@ -1464,13 +1465,26 @@ public final class LaneSession {
             return lane;
         }
 
+        /**
+         * The moment this lane first waited for bytes it could not admit, consumed once they are
+         * handed to the parser reservation that carries their deadline (13.12). Zero while the lane
+         * is not waiting: a lane that resumed must not be closed later by the wait it recovered
+         * from, so the timestamp is never kept after it has moved.
+         */
+        private long takeWaitingSince() {
+            long waited = waitingSince;
+            waitingSince = 0;
+            return waited != 0 ? waited : now();
+        }
+
         /** The decoder's admission hook: charges the full parser buffer once the length is known. */
         private boolean reserveWire(int wireBytes) {
             int growth = wireBytes - (partial == null ? 0 : (int) charged);
             long prepaid = Math.min(growth, MAX_RECORD_WIRE - recordGrantUsed);
             if (partial == null) {
-                long startedAt = waitingSince != 0 ? waitingSince : now();
-                partial = receiver.reservePartial(lane, wireBytes, prepaid, startedAt, now());
+                // 13.12: whatever this lane waited for these bytes moves into the parser
+                // reservation, whose own deadline takes over from there.
+                partial = receiver.reservePartial(lane, wireBytes, prepaid, takeWaitingSince(), now());
             } else {
                 receiver.growPartial(partial, growth, prepaid, now());
             }

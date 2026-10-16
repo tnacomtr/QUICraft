@@ -1252,6 +1252,62 @@ class LaneSessionTest {
     }
 
     @Test
+    void aLaneThatResumedIsNotClosedByTheWaitItRecoveredFrom() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(6L << 20);
+        AtomicLong clock = new AtomicLong(5_000_000_000L);
+        // The holder keeps ~4.5 MiB of the node budget reserved while it does not apply.
+        LaneRig.Config holder = new LaneRig.Config();
+        holder.nodeBudget = node;
+        LaneRig rigA = LaneRig.start(holder);
+        try {
+            rigA.activateBoth();
+            rigA.clientGame.autoApply = false;
+            for (int i = 0; i < 3; i++) {
+                rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 1_500_000));
+            }
+            assertTrue(LaneRig.await(() -> node.available() < (6L << 20) - 4_000_000L, 30000),
+                    "the holder charged the node budget: " + node.available());
+
+            LaneRig.Config starved = new LaneRig.Config();
+            starved.nodeBudget = node;
+            starved.clientSession = false;
+            starved.serverTiming = new LaneSession.Timing(clock::get, LaneSession.OPEN_TIMEOUT_NANOS,
+                    LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
+            try (LaneRig rigB = LaneRig.start(starved)) {
+                QuicStreamChannel four = openRawServerLanes(rigB);
+                // A whole record with a complete length prefix arrives, but its node record grant
+                // cannot be taken: the lane holds the bytes and waits.
+                byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.MOVE, 200));
+                LaneLoopback.write(four, record);
+                sleep(300);
+                assertTrue(snapshotIs(rigB.server, 0, 0), "nothing is admitted while the grant is refused");
+
+                // The holder gives its bytes back, so the lane resumes and delivers from the bytes it
+                // was already holding: the wait it recovered from is over.
+                for (int i = 0; i < 3; i++) {
+                    final int index = i;
+                    assertTrue(LaneRig.await(() -> rigA.clientGame.deliveries.size() > index, 10000),
+                            "the holder delivered record " + index);
+                    rigA.clientGame.apply(rigA.clientGame.deliveries.get(index));
+                }
+                assertTrue(LaneRig.await(() -> rigB.serverGame.packetCount() == 1, 10000),
+                        "the lane resumes and delivers its record");
+
+                // Past the deadline that wait would have hit: a lane that resumed is healthy, so
+                // nothing may close it (13.12).
+                clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + 1_000_000_000L);
+                sleep(300);
+                assertFalse(rigB.serverGame.closed.isDone(),
+                        "a resumed lane is not closed by the wait it recovered from: "
+                                + rigB.serverGame.closed.getNow(null));
+                assertFalse(rigA.clientGame.closed.isDone(), "the holder is never evicted");
+            }
+        } finally {
+            rigA.close();
+        }
+    }
+
+    @Test
     void waitForANodeGrantThatNeverComesClosesWith0x11AtTheDeadline() throws Exception {
         ReceiveBudget node = ReceiveBudget.bounded(6L << 20);
         AtomicLong clock = new AtomicLong(5_000_000_000L);
