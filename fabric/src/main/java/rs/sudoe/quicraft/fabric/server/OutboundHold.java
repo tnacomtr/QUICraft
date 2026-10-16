@@ -68,6 +68,36 @@ final class OutboundHold {
         heldBytes += unit.bytes();
     }
 
+    /**
+     * Hands over everything 12.13 released from the quiescence queue, whole and in order. The
+     * connection is closing either way when one submission fails, but a unit that was never handed
+     * over still owns its node reservation, so each of those gives its bytes back before the failure
+     * is rethrown: no unit may be stranded outside both this hold and the lane layer (13.12).
+     */
+    void submitAll(List<Object> released) {
+        int next = 0;
+        try {
+            for (; next < released.size(); next++) {
+                submit((OutboundUnit) released.get(next));
+            }
+        } catch (Throwable t) {
+            for (int i = next; i < released.size(); i++) {
+                try {
+                    ((OutboundUnit) released.get(i)).release();
+                } catch (Throwable releaseFailure) {
+                    t.addSuppressed(releaseFailure);
+                }
+            }
+            if (t instanceof RuntimeException) {
+                throw (RuntimeException) t;
+            }
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            throw new IllegalStateException(t);
+        }
+    }
+
     /** The layer became writable: releases held units, in order, while it stays so. */
     void drain() {
         while (!held.isEmpty() && sender.writable()) {

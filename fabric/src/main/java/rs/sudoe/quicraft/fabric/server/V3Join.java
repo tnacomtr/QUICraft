@@ -488,10 +488,10 @@ public final class V3Join {
                 AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
         connection.activate(lanes, protocol, control);
         sinkActive = true;
-        // 12.13: what was queued during the exchange goes out as records, whole units in order.
-        for (Object queued : payloads.releaseQueued()) {
-            outHold.submit((OutboundUnit) queued);
-        }
+        // 12.13: what was queued during the exchange goes out as records, whole units in order. A
+        // submission that fails takes every unit it did not hand over with it and gives their node
+        // reservations back (OutboundHold.submitAll), so a failure here strands none of them.
+        outHold.submitAll(payloads.releaseQueued());
         if (state.failed()) {
             return;
         }
