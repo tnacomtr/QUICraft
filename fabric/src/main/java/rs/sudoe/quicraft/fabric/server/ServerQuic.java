@@ -178,8 +178,8 @@ public final class ServerQuic {
                     : Advertisement.v1(port, identity.fingerprint());
             if (multistream) {
                 QuicraftFabric.LOG.info("QUICraft: multi-stream (/3) enabled: advertising quicraft/3 for {}"
-                        + " protocol number(s); node pending-bytes budget {} (provisional until the"
-                        + " 50,000-connection benchmark, 13.17)",
+                        + " protocol number(s); node pending-bytes budget {} (each /3 connection reserves its"
+                        + " initial receive credit against it; provisional until the 50,000-connection benchmark, 13.17)",
                         Integer.valueOf(MultistreamSwitch.advertisedRouting().size()),
                         Long.valueOf(settings.multistreamNodeBudgetBytes()));
             }
@@ -198,8 +198,11 @@ public final class ServerQuic {
     private static QuicServer bindV3(GameHost.HostedSockets sockets, ServerIdentity identity,
             ChannelInitializer<Channel> init, ServerSettings settings) {
         try {
+            // 13.12: the node-wide pending-bytes budget of the owner's setting; /2 has none.
+            TransportConfig config = TransportConfig.builder()
+                    .nodePendingBytes(settings.multistreamNodeBudgetBytes()).build();
             return QuicServer.bind(sockets.hostLoops(), sockets.hostSockets(), identity,
-                    TransportConfig.DEFAULT, stream -> accept(stream, init, sockets.acceptingLoop()),
+                    config, stream -> accept(stream, init, sockets.acceptingLoop()),
                     MultistreamSwitch::tableFor);
         } catch (Throwable t) {
             // docs/protocol.md 12.3: log once and stay on quicraft/2; 0-RTT (12.18) is untouched by

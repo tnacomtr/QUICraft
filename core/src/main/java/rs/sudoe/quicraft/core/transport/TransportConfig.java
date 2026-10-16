@@ -90,6 +90,7 @@ public final class TransportConfig {
     final int ingressInitialsPerSecond;
     final int ingressInitialsPerIpPerSecond;
     final RetryMode retryMode;
+    final long nodePendingBytes;
 
     private TransportConfig(Builder b) {
         this.maxIdleTimeoutMillis = b.maxIdleTimeoutMillis;
@@ -113,6 +114,7 @@ public final class TransportConfig {
         this.ingressInitialsPerIpPerSecond = positiveOr(b.ingressInitialsPerIpPerSecond,
                 DEFAULT_INGRESS_INITIALS_PER_IP);
         this.retryMode = b.retryMode != null ? b.retryMode : DEFAULT_RETRY_MODE;
+        this.nodePendingBytes = Math.max(0L, b.nodePendingBytes);
     }
 
     private static int positiveOr(int value, int fallback) {
@@ -139,6 +141,7 @@ public final class TransportConfig {
         this.ingressInitialsPerSecond = other.ingressInitialsPerSecond;
         this.ingressInitialsPerIpPerSecond = other.ingressInitialsPerIpPerSecond;
         this.retryMode = other.retryMode;
+        this.nodePendingBytes = other.nodePendingBytes;
     }
 
     /**
@@ -229,6 +232,17 @@ public final class TransportConfig {
     public int maxOpenPerIp() {
         return maxOpenPerIp;
     }
+
+    /** The {@code /3} node-wide pending-bytes budget, 0 for none; see {@link Builder#nodePendingBytes(long)}. */
+    public long nodePendingBytes() {
+        return nodePendingBytes;
+    }
+
+    /**
+     * The receive credit a server grants an admitted {@code /3} connection before anything arrives
+     * (13.13: {@code initial_max_data} 256 KiB), which 13.12 reserves against the node budget.
+     */
+    public static final long V3_INITIAL_EXPOSURE_BYTES = 256L * 1024;
 
     /** IP addresses tracked per limiter. System property {@code quicraft.admission.maxTrackedIps}. */
     public int maxTrackedIps() {
@@ -333,6 +347,7 @@ public final class TransportConfig {
         private int ingressInitialsPerSecond = DEFAULT_INGRESS_INITIALS;
         private int ingressInitialsPerIpPerSecond = DEFAULT_INGRESS_INITIALS_PER_IP;
         private RetryMode retryMode = DEFAULT_RETRY_MODE;
+        private long nodePendingBytes;
 
         public Builder maxIdleTimeout(long value, TimeUnit unit) {
             this.maxIdleTimeoutMillis = unit.toMillis(value);
@@ -415,6 +430,18 @@ public final class TransportConfig {
 
         public Builder maxOpenPerIp(int value) {
             this.maxOpenPerIp = value;
+            return this;
+        }
+
+        /**
+         * The node-wide budget, in bytes, for what {@code /3} connections hold in receive and unsend
+         * queues (13.12). Each admitted {@code /3} connection reserves its initial receive-credit
+         * exposure ({@link TransportConfig#V3_INITIAL_EXPOSURE_BYTES}) against it for as long as it is open, and a
+         * connection that does not fit is refused, leaving TCP untouched. Zero (the default) means no
+         * node budget, which is every {@code /2} listener's behaviour.
+         */
+        public Builder nodePendingBytes(long value) {
+            this.nodePendingBytes = value;
             return this;
         }
 

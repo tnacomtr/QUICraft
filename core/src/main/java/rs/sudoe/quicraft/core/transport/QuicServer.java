@@ -474,6 +474,8 @@ public final class QuicServer implements Closeable {
         final java.util.concurrent.atomic.AtomicLong retries = new java.util.concurrent.atomic.AtomicLong();
         /** Token-less attempts and open-connection leases; synchronized, safe from every loop. */
         final ConnectionAdmission admission;
+        /** Bytes reserved by open {@code /3} connections against the node budget (13.12); unused without one. */
+        final java.util.concurrent.atomic.AtomicLong nodeReserved = new java.util.concurrent.atomic.AtomicLong();
         /** The ingress guard's datagram budget, shared by every socket's guard. */
         final ConnectionAdmission ingress;
         /** One instance for every socket's codec: it holds the listener's Retry key. */
@@ -913,7 +915,8 @@ public final class QuicServer implements Closeable {
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
-                        Admitted admitted = Admitted.admit(connection, shared.admission);
+                        Admitted admitted = Admitted.admit(connection, shared.admission, shared.v3 != null
+                                ? shared.nodeReserved : null, shared.config.nodePendingBytes);
                         if (admitted == null) {
                             return;
                         }
@@ -971,6 +974,10 @@ public final class QuicServer implements Closeable {
         private boolean handshakeDone;
         private java.util.concurrent.ScheduledFuture<?> deadline;
 
+        /** Bytes this connection reserved against the node budget, 0 when none. */
+        private long reserved;
+        private java.util.concurrent.atomic.AtomicLong reservedPool;
+
         private Admitted(ConnectionAdmission.Lease lease) {
             this.lease = lease;
         }
@@ -981,7 +988,8 @@ public final class QuicServer implements Closeable {
          * returns null. Runs inside the codec's read (the channel is registered there), where the
          * remote address is already set; fails open.
          */
-        static Admitted admit(QuicChannel connection, ConnectionAdmission admission) {
+        static Admitted admit(QuicChannel connection, ConnectionAdmission admission,
+                java.util.concurrent.atomic.AtomicLong nodeReserved, long nodeBudget) {
             ConnectionAdmission.Lease lease = null;
             try {
                 java.net.SocketAddress remote = connection.remoteSocketAddress();
@@ -1005,6 +1013,23 @@ public final class QuicServer implements Closeable {
                 LOG.log(Level.FINE, "QUIC open-connection check failed; admitting the connection", t);
             }
             Admitted admitted = new Admitted(lease);
+            if (nodeReserved != null && nodeBudget > 0) {
+                // 13.12: the connection's initial receive-credit exposure counts against the node
+                // budget, and one that does not fit is refused (TCP is untouched).
+                long exposure = TransportConfig.V3_INITIAL_EXPOSURE_BYTES;
+                if (nodeReserved.addAndGet(exposure) > nodeBudget) {
+                    nodeReserved.addAndGet(-exposure);
+                    if (lease != null) {
+                        lease.close();
+                    }
+                    LOG.log(Level.FINE, "QUIC /3 connection over the node pending-bytes budget; refusing it");
+                    connection.attr(REFUSED).set(Boolean.TRUE);
+                    Codecs.closeLater(connection, false, CONNECTION_REFUSED);
+                    return null;
+                }
+                admitted.reserved = exposure;
+                admitted.reservedPool = nodeReserved;
+            }
             // The Lease keeps its own key; the channel's address is cleared when it is freed.
             connection.closeFuture().addListener(f -> admitted.closed());
             return admitted;
@@ -1050,6 +1075,10 @@ public final class QuicServer implements Closeable {
             }
             if (lease != null) {
                 lease.close();
+            }
+            if (reserved > 0) {
+                reservedPool.addAndGet(-reserved);
+                reserved = 0;
             }
         }
     }
