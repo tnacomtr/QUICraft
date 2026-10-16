@@ -68,8 +68,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         LOGIN, BINDING, ACTIVATING, ACTIVE, FAILED
     }
 
-    /** What the quiescence queue estimates for one held packet: the real size is only known when encoded. */
-    private static final int HELD_ESTIMATE_BYTES = 2048;
+    /** Estimate used by the binding quiescence queue; its bound is independent of the lane queue. */
+    private static final int BINDING_HELD_ESTIMATE_BYTES = 2048;
     /** 12.16: the bounded wait for OFFER on a changed-pin re-bind is twice the RTT, within these. */
     static final long REBIND_WAIT_MIN_MILLIS = 500;
     static final long REBIND_WAIT_MAX_MILLIS = 3000;
@@ -333,8 +333,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     boolean hold(Object packet, ChannelPromise promise) {
         switch (state) {
             case BINDING: {
-                BindingDriver.QueueResult result = payloads.queueOrdinary(new Held(packet, promise),
-                        HELD_ESTIMATE_BYTES);
+                BindingDriver.QueueResult result = payloads.queueOrdinary(new Held(packet, promise, 0),
+                        BINDING_HELD_ESTIMATE_BYTES);
                 if (result == BindingDriver.QueueResult.DROPPED_FAILED) {
                     promise.tryFailure(new ClosedChannelException());
                     return true;
@@ -342,7 +342,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                 return result == BindingDriver.QueueResult.QUEUED;
             }
             case ACTIVATING:
-                deferred.add(new Held(packet, promise));
+                deferred.add(new Held(packet, promise, 0));
                 return true;
             case FAILED:
                 promise.tryFailure(new ClosedChannelException());
@@ -378,14 +378,22 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         if (backlog.isEmpty() && (current == null || current.isWritable())) {
             return false;
         }
+        final int encodedBytes;
+        try {
+            encodedBytes = LaneCodec.encodedFrameSize(channel, (net.minecraft.network.protocol.Packet<?>) packet);
+        } catch (Throwable t) {
+            promise.tryFailure(t);
+            failActive("could not estimate held packet size", LaneSession.CLOSE_INTERNAL_ERROR);
+            return true;
+        }
         if (backlog.size() >= LaneSession.MAX_UNSENT_PACKETS
-                || backlogBytes + HELD_ESTIMATE_BYTES > LaneSession.MAX_UNSENT_BYTES) {
+                || backlogBytes + encodedBytes > LaneSession.MAX_UNSENT_BYTES) {
             promise.tryFailure(new ClosedChannelException());
             failActive("send queue overflow", LaneSession.CLOSE_ORDERING);
             return true;
         }
-        backlog.add(new Held(packet, promise));
-        backlogBytes += HELD_ESTIMATE_BYTES;
+        backlog.add(new Held(packet, promise, encodedBytes));
+        backlogBytes += encodedBytes;
         return true;
     }
 
@@ -399,7 +407,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         boolean wrote = false;
         while (current.isWritable() && !backlog.isEmpty()) {
             Held next = backlog.poll();
-            backlogBytes -= HELD_ESTIMATE_BYTES;
+            backlogBytes -= next.bytes;
             stampSendState();
             ctx.write(next.packet, next.promise);
             wrote = true;
@@ -893,10 +901,12 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private static final class Held {
         final Object packet;
         final ChannelPromise promise;
+        final int bytes;
 
-        Held(Object packet, ChannelPromise promise) {
+        Held(Object packet, ChannelPromise promise, int bytes) {
             this.packet = packet;
             this.promise = promise;
+            this.bytes = bytes;
         }
     }
 

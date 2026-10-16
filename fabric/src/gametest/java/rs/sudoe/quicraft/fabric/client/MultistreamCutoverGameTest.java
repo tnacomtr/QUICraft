@@ -120,6 +120,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             anOversizedBindingPayloadOutsideV3IsDiscardedAsVanillaDoes(table.get());
             outboundPacketsStillPassTheGamesHandlersAndTheProtocolSwitchesSurvive(protocol, table.get());
             writesWaitWhileTheLanesAreFullAndGoOnInOrder(protocol, table.get());
+            largeBlockedPacketsHitTheByteCapBeforeThePacketCap(protocol, table.get());
             acknowledgementsFollowAcceptanceNotTheMainThread(protocol, table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             offlineTestModeNeverAcceptsAChangedPin(protocol, table.get());
@@ -485,6 +486,47 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(rig.awaitCondition(() -> rig.fake.abortCode == 0x11), "the overflow closes with 0x11: "
                     + rig.fake.abortCode);
             check(rig.plan.isFailed(), "and is recorded");
+        }
+    }
+
+    /**
+     * 13.12: 40 KiB payload packets cross the 16 MiB outbound byte cap before the 1024 packet cap.
+     * Charging a fixed 2 KiB per packet would let this retained backlog grow well past that cap.
+     */
+    private static void largeBlockedPacketsHitTheByteCapBeforeThePacketCap(int protocol, RoutingTable table)
+            throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+            check(rig.awaitState(V3Client.State.ACTIVE), "active");
+            rig.client.lanes().onWritabilityChanged(false);
+            check(rig.awaitCondition(() -> !rig.client.lanes().isWritable()), "the lanes stopped taking writes");
+
+            int[] attempted = {0};
+            rig.loop.submit(() -> {
+                // Each payload retains 40 KiB. The exact framed size is measured by the game's
+                // encoder before it is held, so the byte cap crosses at roughly 400 packets.
+                for (int i = 0; i < LaneSession.MAX_UNSENT_PACKETS; i++) {
+                    Packet<?> packet = new net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket(
+                            new rs.sudoe.quicraft.fabric.net.FallbackPayload(new byte[40 * 1024]));
+                    io.netty.channel.ChannelPromise promise = rig.channel.newPromise();
+                    attempted[0]++;
+                    if (!rig.client.holdForLanes(rig.channel.pipeline().firstContext(), packet, promise)) {
+                        throw new AssertionError("a full lane must hold the packet");
+                    }
+                    if (rig.client.state() == V3Client.State.FAILED) {
+                        break;
+                    }
+                }
+            }).get(10, TimeUnit.SECONDS);
+            check(rig.awaitCondition(() -> rig.fake.abortCode == 0x11),
+                    "the 16 MiB queue cap closes with 0x11: " + rig.fake.abortCode);
+            check(rig.client.state() == V3Client.State.FAILED, "the queue failure is recorded");
+            check(attempted[0] < LaneSession.MAX_UNSENT_PACKETS,
+                    "the byte cap, not the 1024 packet cap, ended the run at " + attempted[0]);
         }
     }
 
