@@ -289,22 +289,37 @@ class PreLoginRegistryTest {
     }
 
     @Test
-    void aDeclaredFrameFromAPrefixOverItsShareWaitsWhileItsOwnStagedBytesStayCharged() throws Exception {
+    void twoEquallyChargedPrefixesBothGetDeclaredExtrasFromAnEmptyPool() throws Exception {
+        // 12.13: with room in the pool, equal prefixes must both proceed; a share test that charges the extra
+        // before comparing made every positive extra exceed the share, so both waited until the deadline.
         PreLoginRegistry registry = new PreLoginRegistry(
                 new PreLoginTrackerTest.FakePools().capacity(ResourcePools.Pool.PRE_LOGIN, 64L << 20), 4, new Random(1));
+        Conn a = admit(registry, "a", "192.0.2.10", true, new ArrayList<>());
+        Conn b = admit(registry, "b", "198.51.100.10", true, new ArrayList<>());
+
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, a.entry.chargeDeclaredFrame(900_000, 100));
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, b.entry.chargeDeclaredFrame(900_000, 100),
+                "the second equal prefix proceeds while the pool has room");
+    }
+
+    @Test
+    void aHogPrefixIsHeldBackOnlyWhenThePoolCannotTakeItsDeclaredExtra() throws Exception {
+        // The pool holds the three staged shares plus 500 000 bytes: room for the honest prefix's extra, not for
+        // the hog's 900 100-byte frame. The hog (two connections, over its share) waits; the honest one proceeds.
+        long capacity = 3 * STAGED + 500_000;
+        PreLoginRegistry registry = new PreLoginRegistry(
+                new PreLoginTrackerTest.FakePools().capacity(ResourcePools.Pool.PRE_LOGIN, capacity), 4, new Random(1));
         List<Conn> shed = new ArrayList<>();
-        admit(registry, "a1", "192.0.2.10", true, shed);
-        admit(registry, "a2", "192.0.2.11", true, shed);
-        Conn attacker = admit(registry, "a3", "192.0.2.12", true, shed);
+        Conn hog1 = admit(registry, "h1", "192.0.2.10", true, shed);
+        admit(registry, "h2", "192.0.2.11", true, shed);
         Conn honest = admit(registry, "honest", "198.51.100.5", true, shed);
 
-        assertEquals(PreLoginTracker.ChargeResult.WAIT, attacker.entry.chargeDeclaredFrame(900_000, 100),
-                "the big frame pushes the over-share prefix further over its share: wait");
-        assertEquals(PreLoginTracker.ChargeResult.CHARGED, attacker.entry.chargeDeclaredFrame(10, 0),
-                "a frame inside the staged share needs no extra charge");
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, hog1.entry.chargeDeclaredFrame(900_000, 100),
+                "the pool cannot take the hog's extra: the over-share prefix waits");
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, honest.entry.chargeDeclaredFrame(400_000, 0),
+                "the pool has room for the honest prefix's extra: it proceeds");
         assertTrue(shed.isEmpty(), "waiting for a declared frame never sheds another connection");
-        assertEquals(4, registry.stagedCount());
-        assertFalse(honest.closed);
+        assertEquals(3, registry.stagedCount());
     }
 
     @Test

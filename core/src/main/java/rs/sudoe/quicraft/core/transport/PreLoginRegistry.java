@@ -413,10 +413,12 @@ final class PreLoginRegistry {
                 if (total <= tracker.stagedShare()) {
                     return PreLoginTracker.ChargeResult.CHARGED;
                 }
-                // The extra charge is subject to the same prefix shares as the staged charge, and to the
-                // per-prefix declared-length cap. Waiting never sheds anyone else.
-                if (declaredInFlight(coarse) + total > DEFAULT_DECLARED_BYTES_PER_PREFIX
-                        || overFairShare(coarse, total)) {
+                // The per-prefix declared-length cap always applies, so one prefix holds at most that many bytes
+                // of extra charges. Beyond it, the pool decides: a charge that fits is granted, so an idle or
+                // uncontended pool never makes a prefix wait (fair share is not checked against an empty pool,
+                // which would stall two equally charged prefixes). A charge the pool cannot take waits, and
+                // waiting never sheds anyone else (12.13).
+                if (declaredInFlight(coarse) + total > DEFAULT_DECLARED_BYTES_PER_PREFIX) {
                     return PreLoginTracker.ChargeResult.WAIT;
                 }
                 PreLoginTracker.ChargeResult result = tracker.chargeDeclaredFrame(declaredBytes, framingBytes);
