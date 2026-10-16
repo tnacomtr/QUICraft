@@ -80,14 +80,22 @@ class StreamReceiverTest {
         }
     }
 
-    @Test void realtimeIsServedFirstWhenBothHeadsAreReady() {
+    @Test void realtimeIsServedFirstWhenBothHeadsAreFullAndReady() {
         Fixture f = new Fixture(2);
-        assertAdmitted(f.receiver, rec(0, 1, 0));
-        assertAdmitted(f.receiver, rec(1, 1, 0));
-        assertAdmitted(f.receiver, rec(2, 1, 0));
-        assertEquals(1, f.receiver.nextToEnqueue());
+        long full = ReceiveSlots.BYTES_PER_STREAM;
+        int records = ReceiveSlots.RECORDS_PER_STREAM;
+        // REALTIME, CONTROL and a chunk head each hold a complete slot at its limit.
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
+                f.receiver.offer(rec(1, 1, 0), route(1), full, records).kind());
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
+                f.receiver.offer(rec(0, 1, 0), route(0), full, records).kind());
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
+                f.receiver.offer(rec(2, 1, 0), route(2), full, records).kind());
+        assertEquals(1, f.receiver.nextToEnqueue(), "REALTIME before CONTROL and chunks");
         f.receiver.enqueued(1, 1);
-        assertEquals(0, f.receiver.nextToEnqueue());
+        assertEquals(0, f.receiver.nextToEnqueue(), "CONTROL before the chunk head");
+        f.receiver.enqueued(0, 1);
+        assertEquals(2, f.receiver.nextToEnqueue());
     }
 
     @Test void staleAndFutureEpochsAreViolations() {

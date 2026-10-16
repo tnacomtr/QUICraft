@@ -24,6 +24,33 @@ class ReceiveSlotsTest {
         assertFalse(slots.holdsHead(0));
     }
 
+    @Test void byteSlotAcceptsExactlyTwoMebibytesPlus128AndRejectsOneMore() {
+        assertEquals(2L * 1024 * 1024 + 128, ReceiveSlots.BYTES_PER_STREAM);
+        ReceiveSlots slots = new ReceiveSlots(1);
+        assertFalse(slots.admitHead(0, ReceiveSlots.BYTES_PER_STREAM + 1, 1), "+1 byte must be refused");
+        assertFalse(slots.holdsHead(0));
+        assertTrue(slots.admitHead(0, ReceiveSlots.BYTES_PER_STREAM, 1), "exact byte limit must be accepted");
+        assertEquals(ReceiveSlots.BYTES_PER_STREAM, slots.heldBytes(0));
+    }
+
+    @Test void recordSlotAcceptsExactly128AndRejectsOneMore() {
+        assertEquals(128, ReceiveSlots.RECORDS_PER_STREAM);
+        ReceiveSlots slots = new ReceiveSlots(1);
+        assertFalse(slots.admitHead(1, 1, ReceiveSlots.RECORDS_PER_STREAM + 1), "129 records must be refused");
+        assertFalse(slots.holdsHead(1));
+        assertTrue(slots.admitHead(1, 1, ReceiveSlots.RECORDS_PER_STREAM), "128 records must be accepted");
+        assertEquals(ReceiveSlots.RECORDS_PER_STREAM, slots.heldRecords(1));
+    }
+
+    @Test void workspaceAcceptsExactly8MebibytesAndRejectsOneByteMore() {
+        assertEquals(8L * 1024 * 1024, ReceiveSlots.EXECUTION_WORKSPACE);
+        ReceiveSlots slots = new ReceiveSlots(1);
+        assertFalse(slots.reserveWorkspace(ReceiveSlots.EXECUTION_WORKSPACE + 1));
+        assertEquals(0, slots.workspaceInUse(), "a refused reservation reserves nothing");
+        assertTrue(slots.reserveWorkspace(ReceiveSlots.EXECUTION_WORKSPACE));
+        assertFalse(slots.reserveWorkspace(1));
+    }
+
     @Test void aggregateWireCeilingAtSixChunksIsSixteenMebibytesPlusOneKibibyte() {
         long total = (6 + 2) * ReceiveSlots.BYTES_PER_STREAM;
         assertEquals(16L * 1024 * 1024 + 1024, total);
