@@ -225,7 +225,7 @@ public final class ClientConnect {
         RoutingTable table = RoutingRegistry.forProtocol(protocol)
                 .orElseThrow(() -> new IllegalStateException("no routing table for protocol " + protocol));
         QuicBridgeChannel channel = new QuicBridgeChannel(v3);
-        V3Client client = new V3Client(connection, channel, v3, plan, table, protocol, mode == Mode.QUIC_ONLY, files,
+        V3Client client = new V3Client(connection, channel, loop, v3, plan, table, protocol, mode == Mode.QUIC_ONLY, files,
                 logical.getHost(), logical.getPort(),
                 plan.pinState() == TransportSelection.PinState.CHANGED
                         ? V3Client.oldPin(files, logical.getHost(), logical.getPort())
@@ -292,7 +292,7 @@ public final class ClientConnect {
     }
 
     /** What vanilla's {@code Connection.connect} initializer does (checked per version). */
-    private static void installVanillaPipeline(Channel channel, Connection connection) {
+    static void installVanillaPipeline(Channel channel, Connection connection) {
         try {
             channel.config().setOption(ChannelOption.TCP_NODELAY, true);
         } catch (ChannelException ignored) {

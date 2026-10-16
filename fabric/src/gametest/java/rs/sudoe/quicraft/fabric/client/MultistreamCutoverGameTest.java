@@ -1,0 +1,884 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package rs.sudoe.quicraft.fabric.client;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.EventLoop;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
+import java.io.ByteArrayOutputStream;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.SecureRandom;
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
+import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
+import net.minecraft.SharedConstants;
+import net.minecraft.network.ConnectionProtocol;
+import net.minecraft.network.Connection;
+import net.minecraft.network.PacketDecoder;
+import net.minecraft.network.PacketEncoder;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
+import net.minecraft.network.protocol.common.ClientboundDisconnectPacket;
+import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
+import net.minecraft.network.protocol.configuration.ClientConfigurationPacketListener;
+import net.minecraft.network.protocol.configuration.ConfigurationProtocols;
+import net.minecraft.util.Crypt;
+import rs.sudoe.quicraft.bridge.BoundaryCipherDecoder;
+import rs.sudoe.quicraft.bridge.QuicBridgeChannel;
+import rs.sudoe.quicraft.core.Protocol;
+import rs.sudoe.quicraft.core.binding.BindingSession;
+import rs.sudoe.quicraft.core.binding.BindingStateMachine;
+import rs.sudoe.quicraft.core.connect.ClientConnector;
+import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
+import rs.sudoe.quicraft.core.connect.ConnectionRace;
+import rs.sudoe.quicraft.core.connect.FailureCache;
+import rs.sudoe.quicraft.core.connect.V3Plan;
+import rs.sudoe.quicraft.core.discovery.Advertisement;
+import rs.sudoe.quicraft.core.discovery.AdvertisementCache;
+import rs.sudoe.quicraft.core.multistream.LaneGame;
+import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.RecordCodec;
+import rs.sudoe.quicraft.core.routing.RoutingRegistry;
+import rs.sudoe.quicraft.core.routing.RoutingTable;
+import rs.sudoe.quicraft.core.tls.Fingerprint;
+import rs.sudoe.quicraft.core.tls.ServerIdentity;
+import rs.sudoe.quicraft.core.transport.EarlyFlight;
+import rs.sudoe.quicraft.core.transport.QuicByteStream;
+import rs.sudoe.quicraft.core.transport.V3Connection;
+import rs.sudoe.quicraft.core.connect.TransportSelection;
+import rs.sudoe.quicraft.fabric.Hooks;
+
+/**
+ * The client's {@code quicraft/3} join, played against a scripted server: the real game pipeline
+ * (vanilla handlers, the boundary-aware cipher decoder, the bridge channel), the real
+ * {@link V3Client}, hooks and {@code V3Plan}, and core's real {@link BindingSession} on both ends. Only
+ * the QUIC connection is fake, so the lanes themselves (a {@code LaneSession} needs a QUIC channel)
+ * stop at {@code activate}: the activation leftover is checked, not the records after it.
+ *
+ * <p>It proves the order of docs/protocol.md 12.10 to 12.13 on the client against vanilla's own
+ * cipher and framing: encrypted frames, the switch packets, ciphertext and record bytes arriving
+ * in one read or in 7-byte pieces, and what each failure leaves behind (a retry over TCP with the
+ * user's wording, a recorded failure, no pin). The scripted server has no Minecraft login; the hooks
+ * the login mixins call are called directly (their application is checked in
+ * {@code MultistreamClientGameTest}).</p>
+ */
+public class MultistreamCutoverGameTest implements FabricClientGameTest {
+    private static final String HOST = "mc.example.com";
+    private static final int PORT = 25565;
+
+    @Override
+    public void runTest(ClientGameTestContext context) {
+        Hooks.setFaultInjection(false);
+        int protocol = SharedConstants.getCurrentVersion().protocolVersion();
+        Optional<RoutingTable> table = RoutingRegistry.forProtocol(protocol);
+        if (table.isEmpty()) {
+            // 13.1: no shipped routing table for this game version means /3 is never selected.
+            rs.sudoe.quicraft.fabric.QuicraftFabric.LOG.info(
+                    "QUICraft: no routing table for protocol {}, the cutover harness is skipped", protocol);
+            return;
+        }
+        try {
+            onlineExchange(protocol, table.get(), Integer.MAX_VALUE);
+            onlineExchange(protocol, table.get(), 7);
+            offlineExchange(protocol, table.get());
+            aTamperedFingerprintFallsBackToTcp(protocol, table.get());
+            helloWithoutAuthenticationFallsBack(protocol, table.get());
+            encryptionWithoutAuthenticationFallsBack(protocol, table.get());
+            quicOnlyShowsTheFailureInsteadOfFallingBack(protocol, table.get());
+            aClosedConnectionBeforeActivationFallsBack(protocol, table.get());
+            aServerDisconnectIsNotAMultistreamFailure(protocol, table.get());
+            heldPacketsStayHeldUntilActivation(protocol, table.get());
+            aChangedCertificateIsReboundAndTheNewPinIsNoticed(protocol, table.get());
+            aReboundThatGetsNoOfferFailsAfterTheBoundedWait(protocol, table.get());
+        } catch (Exception e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static void check(boolean condition, String message) {
+        if (!condition) {
+            throw new AssertionError(message);
+        }
+    }
+
+    // --- Scenarios.
+
+    /** 12.10 to 12.13 with a real cipher: the join reaches ACTIVE and the pin is recorded. */
+    private static void onlineExchange(int protocol, RoutingTable table, int chunk) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(chunk);
+
+            check(rig.awaitState(V3Client.State.ACTIVE), "the exchange activated, state " + rig.client.state());
+            check(rig.fake.activated, "core's activate() ran");
+            check(Arrays.equals(rig.server.recordsAfterSwitch, rig.fake.activationLeftover),
+                    "the record bytes right behind SERVER_SWITCH reached activate() untouched (12.13), got "
+                            + Arrays.toString(rig.fake.activationLeftover) + " wanted "
+                            + Arrays.toString(rig.server.recordsAfterSwitch));
+            check(rig.channel.pipeline().get("decrypt") == null, "the boundary decoder removed itself");
+            check(rig.awaitCondition(() -> rig.channel.pipeline().get("encrypt") == null),
+                    "the encrypt handler was removed after CLIENT_SWITCH");
+            check(rig.connection.isEncrypted(), "12.13: the game still knows the login was encrypted");
+            check(rig.channel.pipeline().get(V3Handler.TAIL_NAME) != null, "the lanes' outbound handler is installed");
+            check(rig.plan.isActivated(), "the plan recorded the activation");
+            check(rig.files.pins().pin(HOST, PORT, Collections.emptySet()).isPresent(),
+                    "12.15: an authenticated pin was written");
+            check(Transports.v3State(rig.connection) == V3Client.State.ACTIVE, "F3 would say /3");
+            check(rig.fake.abortCode < 0, "nothing was aborted");
+            check(!Transports.takeRetryOverTcp(rig.connection), "no TCP retry");
+            check(V3Notices.isEmpty(), "nothing to tell the player");
+        }
+    }
+
+    /** 12.19: the explicit offline test profile, no cipher: bytes behind the switch come from the splitter. */
+    private static void offlineExchange(int protocol, RoutingTable table) throws Exception {
+        System.setProperty(V3Client.OFFLINE_TEST_PROPERTY, "true");
+        try (Rig rig = new Rig(protocol, table, false, true)) {
+            rig.login(false, false);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+
+            check(rig.awaitState(V3Client.State.ACTIVE), "the offline exchange activated, state " + rig.client.state());
+            check(Arrays.equals(rig.server.recordsAfterSwitch, rig.fake.activationLeftover),
+                    "the splitter's cumulation behind SERVER_SWITCH reached activate() untouched, got "
+                            + Arrays.toString(rig.fake.activationLeftover));
+            check(rig.files.pins().pin(HOST, PORT, Collections.emptySet()).isEmpty(),
+                    "12.19: offline mode never writes an authenticated pin");
+        } finally {
+            System.clearProperty(V3Client.OFFLINE_TEST_PROPERTY);
+        }
+    }
+
+    /** 12.9: an OFFER for another fingerprint ends in 0x10, a TCP retry, the user's wording and no pin. */
+    private static void aTamperedFingerprintFallsBackToTcp(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.server.fingerprint[0] ^= 1;
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+
+            check(rig.awaitState(V3Client.State.FAILED), "the attempt failed, state " + rig.client.state());
+            rig.expectFallback("channel binding failed");
+        }
+    }
+
+    /** 12.7: Hello without authentication ends the attempt before anything is encrypted. */
+    private static void helloWithoutAuthenticationFallsBack(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            check(!V3Hooks.hello(rig.connection, false), "vanilla's handleHello is cancelled");
+            check(rig.awaitState(V3Client.State.FAILED), "failed");
+            rig.expectFallback("login is not authenticated");
+        }
+    }
+
+    /** 12.7: a LAN login whose session join failed still encrypts; /3 must refuse it at Login Finished. */
+    private static void encryptionWithoutAuthenticationFallsBack(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, false);
+            check(rig.channel.pipeline().get("decrypt") != null
+                    && !(rig.channel.pipeline().get("decrypt") instanceof BoundaryCipherDecoder),
+                    "no cutover was prepared for an unauthenticated login");
+            check(!V3Hooks.loginFinished(rig.connection), "vanilla's handleLoginFinished is cancelled");
+            check(rig.awaitState(V3Client.State.FAILED), "failed");
+            rig.expectFallback("login is encrypted but not authenticated");
+        }
+    }
+
+    /** §4: quic-only never falls back silently; the failure is shown instead. */
+    private static void quicOnlyShowsTheFailureInsteadOfFallingBack(int protocol, RoutingTable table)
+            throws Exception {
+        try (Rig rig = new Rig(protocol, table, true, false)) {
+            check(!V3Hooks.hello(rig.connection, false), "cancelled");
+            check(rig.awaitState(V3Client.State.FAILED), "failed");
+            check(rig.awaitCondition(() -> rig.fake.abortCode == 0x10), "QUIC closed with 0x10: " + rig.fake.abortCode);
+            check(!Transports.takeRetryOverTcp(rig.connection), "quic-only does not retry over TCP");
+            check(V3Notices.isEmpty(), "and does not announce a fallback");
+            check("QUIC multi-stream failed (login is not authenticated)".equals(rig.client.failureText()),
+                    "the disconnect screen says why: " + rig.client.failureText());
+            check(rig.plan.isFailed(), "the failure is still recorded");
+        }
+    }
+
+    /** The peer ends the connection before activation: that is a /3 failure, retried over TCP. */
+    private static void aClosedConnectionBeforeActivationFallsBack(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.fake.closeByPeer();
+
+            check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
+            rig.expectFallback("connection closed before multi-stream was active");
+        }
+    }
+
+    /** A server that kicks the player (a disconnect packet, then close) is not a /3 failure. */
+    private static void aServerDisconnectIsNotAMultistreamFailure(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            byte[] kick = rig.server.encrypted(rig.server.frame(
+                    new ClientboundDisconnectPacket(Component.literal("You are not white-listed"))));
+            rig.fake.inject(kick);
+            rig.awaitCondition(() -> rig.listener.disconnects > 0);
+            rig.fake.closeByPeer();
+            Thread.sleep(300);
+
+            check(rig.client.state() == V3Client.State.BINDING, "still " + rig.client.state());
+            check(!Transports.takeRetryOverTcp(rig.connection), "the kick shows as the kick, not as a retry");
+            check(V3Notices.isEmpty(), "no fallback line");
+        }
+    }
+
+    /** 12.10: ordinary packets are held after CLIENT_PROOF and fail with the connection if it ends. */
+    private static void heldPacketsStayHeldUntilActivation(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            // OFFER -> CLIENT_PROOF only; the client is quiescent from here.
+            rig.deliverServerChunks(Integer.MAX_VALUE);
+            rig.awaitCondition(() -> rig.fake.written.size() > 0);
+            rig.server.onClientBytes(rig.fake.takeWritten());
+            int before = rig.fake.written.size();
+            io.netty.channel.ChannelFuture held = rig.channel.writeAndFlush(
+                    new net.minecraft.network.protocol.common.ServerboundKeepAlivePacket(7L));
+            Thread.sleep(200);
+            check(!held.isDone(), "12.10: the ordinary packet is held, not written");
+            check(rig.fake.written.size() == before, "and nothing reached the wire");
+
+            rig.fake.closeByPeer(); // the attempt ends: the held packet's promise fails with the connection
+            check(rig.awaitState(V3Client.State.FAILED), "failed");
+            check(rig.awaitCondition(held::isDone) && !held.isSuccess(), "the held packet failed with the connection");
+        }
+    }
+
+    /**
+     * 12.16: the advertised fingerprint differs from the pin. The attempt is a full handshake with no
+     * early data, the exchange runs with the new fingerprint, and only then is the pin replaced and
+     * the player told once, naming both.
+     */
+    private static void aChangedCertificateIsReboundAndTheNewPinIsNoticed(int protocol, RoutingTable table)
+            throws Exception {
+        String old = "sha256:" + "11".repeat(32);
+        try (Rig rig = new Rig(protocol, table, false, false, old)) {
+            check(rig.plan.pinState() == TransportSelection.PinState.CHANGED, "a changed pin: " + rig.plan.pinState());
+            check(rig.platform.bypassResumption, "12.16: a full handshake, no resumption");
+            check(rig.files.pins().pin(HOST, PORT, Collections.emptySet()).get().fingerprint().equals(old),
+                    "the old pin stays until the exchange passes");
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+
+            check(rig.awaitState(V3Client.State.ACTIVE), "the re-bind activated, state " + rig.client.state());
+            String fresh = rig.identity.fingerprint().toString();
+            check(rig.files.pins().pin(HOST, PORT, Collections.emptySet()).get().fingerprint().equals(fresh),
+                    "the pin was replaced after SERVER_SWITCH");
+            check(rig.awaitCondition(() -> !V3Notices.isEmpty()), "the player is told");
+            V3Notices.Notice notice = V3Notices.drain().get(0);
+            check("quicraft.notice.rebind".equals(notice.key())
+                    && V3Client.shortFingerprint(old).equals(notice.args()[0])
+                    && V3Client.shortFingerprint(fresh).equals(notice.args()[1]), "naming both: " + notice);
+        }
+    }
+
+    /** 12.16: a re-bind waits for OFFER only twice the RTT (500 ms at least), then fails like any /3 failure. */
+    private static void aReboundThatGetsNoOfferFailsAfterTheBoundedWait(int protocol, RoutingTable table)
+            throws Exception {
+        String old = "sha256:" + "22".repeat(32);
+        try (Rig rig = new Rig(protocol, table, false, false, old)) {
+            rig.login(true, true);
+            long start = System.nanoTime();
+            rig.client.onConfigurationStarted();
+            check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            check(millis >= 450 && millis < 3000, "after the bounded wait, not at the 10 s deadline: " + millis);
+            rig.expectFallback("channel binding failed");
+            check(rig.files.pins().pin(HOST, PORT, Collections.emptySet()).get().fingerprint().equals(old),
+                    "the old pin is kept");
+        }
+    }
+
+    // --- The rig.
+
+    /** Everything one join needs: connector, plan, fake connection, the real pipeline and the scripted server. */
+    private static final class Rig implements AutoCloseable {
+        final int protocol;
+        final RoutingTable table;
+        final NioEventLoopGroup group = new NioEventLoopGroup(1);
+        final EventLoop loop = group.next();
+        final Path dir;
+        final ClientV3State files;
+        final Fake fake = new Fake(loop);
+        final Connection connection = new Connection(PacketFlow.CLIENTBOUND);
+        final ServerIdentity identity;
+        final byte[] secret = new byte[16];
+        final SecretKey key;
+        final ListenerProxy listener = new ListenerProxy();
+        final FakePlatform platform;
+        final String pinned;
+        V3Plan plan;
+        V3Client client;
+        QuicBridgeChannel channel;
+        Server server;
+
+        Rig(int protocol, RoutingTable table, boolean quicOnly, boolean offline) throws Exception {
+            this(protocol, table, quicOnly, offline, null);
+        }
+
+        Rig(int protocol, RoutingTable table, boolean quicOnly, boolean offline, String pinned) throws Exception {
+            V3Notices.clear();
+            this.pinned = pinned;
+            this.protocol = protocol;
+            this.table = table;
+            new SecureRandom().nextBytes(secret);
+            key = new SecretKeySpec(secret, "AES");
+            dir = Files.createTempDirectory("quicraft-cutover");
+            files = ClientV3State.open(dir, Clock.systemUTC());
+            identity = ServerIdentity.generate();
+            platform = new FakePlatform(fake, loop);
+            if (pinned != null) {
+                files.pins().recordPin(HOST, PORT, pinned, Collections.emptySet());
+            }
+
+            AdvertisementCache ads = new AdvertisementCache();
+            InetSocketAddress server = new InetSocketAddress(InetAddress.getLoopbackAddress(), PORT);
+            Advertisement ad = Advertisement.of(Protocol.ALPN_V3, 25570, identity.fingerprint(),
+                    Map.of(protocol, "sha256:" + table.digestHex()));
+            ads.record(ClientConnector.key(server), Optional.of(ad));
+            ClientConnector connector = new ClientConnector(ads, FailureCache.load(dir.resolve("failures.properties")),
+                    new ClientConnector.V3Support(files.pins(), files.rebinds(), files.worker(),
+                            System::currentTimeMillis, protocol, true, true));
+            ClientConnector.Outcome<Object> outcome = connector.connect(server, HOST, PORT,
+                    quicOnly ? Mode.QUIC_ONLY : Mode.AUTO, null, platform).get(10, TimeUnit.SECONDS);
+            check(outcome.quic() == fake && outcome.v3Plan() != null, "the connector selected /3 and dialed it");
+            plan = outcome.v3Plan();
+
+            channel = new QuicBridgeChannel(fake);
+            client = new V3Client(connection, channel, loop, fake, plan, table, protocol, quicOnly, files, HOST, PORT,
+                    plan.pinState() == TransportSelection.PinState.CHANGED
+                            ? V3Client.oldPin(files, HOST, PORT) : CompletableFuture.completedFuture(null));
+            ClientConnect.installVanillaPipeline(channel, connection);
+            channel.pipeline().addBefore("packet_handler", V3Handler.NAME, new V3Handler(client));
+            Transports.quic(connection, fake);
+            Transports.v3(connection, client);
+            loop.register(channel).sync();
+            // The game would be in Login and then Configuration; the harness starts the pipeline in
+            // Configuration, with a recording listener.
+            channel.pipeline().replace("encoder", "encoder", new PacketEncoder<>(ConfigurationProtocols.SERVERBOUND));
+            connection.setupInboundProtocol(ConfigurationProtocols.CLIENTBOUND, listener.proxy());
+            this.server = new Server(this, offline);
+        }
+
+        /** What the login mixins do, in vanilla's order: Hello, S, the session join, then the key. */
+        void login(boolean encrypted, boolean authenticated) throws Exception {
+            if (!encrypted) {
+                check(V3Hooks.loginFinished(connection), "an offline-test login reaches the exchange");
+                return;
+            }
+            check(V3Hooks.hello(connection, true), "Hello with authentication continues");
+            V3Hooks.secret(connection, key);
+            V3Hooks.authenticated(connection, authenticated ? null : Component.literal("session join failed"));
+            // Vanilla's own method: the mixin at its end installs the boundary-aware decoder.
+            connection.setEncryptionKey(Crypt.getCipher(Cipher.DECRYPT_MODE, key),
+                    Crypt.getCipher(Cipher.ENCRYPT_MODE, key));
+            if (authenticated) {
+                check(channel.pipeline().get("decrypt") instanceof BoundaryCipherDecoder,
+                        "the mixin swapped vanilla's decryptor for the boundary decoder");
+                check(V3Hooks.loginFinished(connection), "an authenticated login continues");
+            }
+        }
+
+        /** Plays the exchange until the client is settled; the server's bytes arrive in pieces of {@code chunk}. */
+        void run(int chunk) throws Exception {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (System.nanoTime() < deadline) {
+                deliverServerChunks(chunk);
+                byte[] fromClient = fake.takeWritten();
+                if (fromClient.length > 0) {
+                    server.onClientBytes(fromClient);
+                }
+                V3Client.State state = client.state();
+                if (state == V3Client.State.ACTIVE || state == V3Client.State.FAILED) {
+                    deliverServerChunks(chunk);
+                    return;
+                }
+                Thread.sleep(5);
+            }
+        }
+
+        void deliverServerChunks(int chunk) {
+            byte[] bytes = server.takeOutbound();
+            for (int offset = 0; offset < bytes.length; offset += chunk) {
+                fake.inject(Arrays.copyOfRange(bytes, offset, (int) Math.min((long) bytes.length, (long) offset + chunk)));
+            }
+        }
+
+        boolean awaitState(V3Client.State wanted) throws Exception {
+            return awaitCondition(() -> client.state() == wanted);
+        }
+
+        boolean awaitCondition(BooleanSupplier condition) throws Exception {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (System.nanoTime() < deadline) {
+                if (condition.getAsBoolean()) {
+                    return true;
+                }
+                Thread.sleep(5);
+            }
+            return condition.getAsBoolean();
+        }
+
+        /** The user's decision: 0x10, a fresh TCP join, the exact wording, the failure recorded, no pin. */
+        void expectFallback(String reason) throws Exception {
+            check(awaitCondition(() -> fake.abortCode == 0x10), "QUIC closed with 0x10: " + fake.abortCode);
+            check(Transports.takeRetryOverTcp(connection), "a fresh TCP join is requested");
+            List<V3Notices.Notice> notices = V3Notices.drain();
+            check(notices.size() == 1 && ("QUIC multi-stream failed (" + reason + "), fell back to TCP")
+                    .equals(notices.get(0).literal()), "the player is told, in the user's words: " + notices);
+            check(plan.isFailed(), "the plan recorded the failure");
+            check(client.failureText() == null, "no quic-only failure text");
+            check(awaitCondition(() -> files.pins().pin(HOST, PORT, Collections.emptySet())
+                            .map(p -> p.fingerprint().equals(pinned)).orElse(pinned == null)),
+                    "a failed attempt writes no pin and keeps the old one");
+        }
+
+        @Override
+        public void close() throws Exception {
+            fake.closeByPeer();
+            channel.close();
+            group.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
+            files.close();
+            server.close();
+        }
+    }
+
+    // --- The scripted server.
+
+    private static final class Server {
+        final Rig rig;
+        final boolean offline;
+        final EmbeddedChannel pipe = new EmbeddedChannel();
+        final LaneCodec codec;
+        final Cipher encrypt;
+        final Cipher decrypt;
+        final byte[] fingerprint;
+        BindingSession session;
+        final ByteArrayOutputStream outbound = new ByteArrayOutputStream();
+        final ByteArrayOutputStream inbound = new ByteArrayOutputStream();
+        /** The §13 record bytes the server sends right behind SERVER_SWITCH, unencrypted (12.12). */
+        byte[] recordsAfterSwitch;
+        boolean switched;
+
+        Server(Rig rig, boolean offline) throws Exception {
+            this.rig = rig;
+            this.offline = offline;
+            net.minecraft.network.Connection.configureSerialization(pipe.pipeline(), PacketFlow.SERVERBOUND, false, null);
+            pipe.pipeline().replace("decoder", "decoder", new PacketDecoder<>(ConfigurationProtocols.SERVERBOUND));
+            pipe.pipeline().replace("outbound_config", "encoder", new PacketEncoder<>(ConfigurationProtocols.CLIENTBOUND));
+            codec = new LaneCodec(pipe, rig.table);
+            encrypt = offline ? null : Crypt.getCipher(Cipher.ENCRYPT_MODE, rig.key);
+            decrypt = offline ? null : Crypt.getCipher(Cipher.DECRYPT_MODE, rig.key);
+            fingerprint = rig.plan.fingerprintBytes();
+        }
+
+        void start() {
+            session = new BindingSession(BindingStateMachine.Role.SERVER, rig.fake::exporterValue,
+                    offline ? null : rig.secret, offline ? BindingStateMachine.MODE_OFFLINE : BindingStateMachine.MODE_ONLINE,
+                    rig.protocol, fingerprint, rig.plan.routingDigest(), System::nanoTime, 0, new BindingSessionCallbacks(),
+                    null, null);
+            session.onConfigurationEntered(System.nanoTime());
+        }
+
+        /** One clientbound packet as a complete Minecraft frame, in the server's current protocol. */
+        byte[] frame(Packet<?> packet) {
+            codec.routeOf(packet);
+            ByteBuf out = Unpooled.buffer();
+            codec.encode(packet, out);
+            byte[] bytes = new byte[out.readableBytes()];
+            out.readBytes(bytes);
+            out.release();
+            return bytes;
+        }
+
+        byte[] encrypted(byte[] plain) {
+            return offline ? plain : encrypt.update(plain);
+        }
+
+        synchronized byte[] takeOutbound() {
+            byte[] bytes = outbound.toByteArray();
+            outbound.reset();
+            return bytes;
+        }
+
+        /** The client's bytes: decrypted, split into frames, decoded as serverbound packets. */
+        synchronized void onClientBytes(byte[] bytes) throws Exception {
+            inbound.write(offline ? bytes : decrypt.update(bytes));
+            byte[] all = inbound.toByteArray();
+            int offset = 0;
+            while (true) {
+                int[] length = varInt(all, offset);
+                if (length == null || offset + length[1] + length[0] > all.length) {
+                    break;
+                }
+                ByteBuf frame = Unpooled.wrappedBuffer(all, offset, length[1] + length[0]);
+                offset += length[1] + length[0];
+                LaneGame.Decoded decoded = codec.decode(frame, null, (retained, total) -> { });
+                if (decoded.packet() instanceof ServerboundCustomPayloadPacket p
+                        && p.payload() instanceof rs.sudoe.quicraft.fabric.net.BindingPayload b) {
+                    session.onPayload(b.data());
+                }
+            }
+            inbound.reset();
+            inbound.write(all, offset, all.length - offset);
+        }
+
+        /** {length, bytesUsed} of the VarInt at {@code offset}, or null if it is incomplete. */
+        static int[] varInt(byte[] data, int offset) {
+            int value = 0;
+            for (int i = 0; i < 3; i++) {
+                if (offset + i >= data.length) {
+                    return null;
+                }
+                byte b = data[offset + i];
+                value |= (b & 0x7F) << (7 * i);
+                if ((b & 0x80) == 0) {
+                    return new int[] {value, i + 1};
+                }
+            }
+            return null;
+        }
+
+        void close() {
+            pipe.finishAndReleaseAll();
+        }
+
+        private final class BindingSessionCallbacks implements rs.sudoe.quicraft.core.binding.BindingDriver.Callbacks {
+            @Override
+            public void send(byte[] payload) {
+                byte[] frame = frame(new ClientboundCustomPayloadPacket(
+                        new rs.sudoe.quicraft.fabric.net.BindingPayload(payload)));
+                synchronized (Server.this) {
+                    byte[] wire = encrypted(frame);
+                    outbound.write(wire, 0, wire.length);
+                }
+            }
+
+            @Override
+            public void activateInbound() {
+            }
+
+            @Override
+            public void activateOutbound() {
+                // 12.12: SERVER_SWITCH was the last encrypted packet; records follow, unencrypted.
+                // CONTROL record 1: a keep-alive in configuration, as the next thing a server would send.
+                byte[] keepAlive = frame(new net.minecraft.network.protocol.common.ClientboundKeepAlivePacket(99L));
+                recordsAfterSwitch = RecordCodec.encodeGame(1L, 0L, 0L, 0L, keepAlive);
+                synchronized (Server.this) {
+                    outbound.write(recordsAfterSwitch, 0, recordsAfterSwitch.length);
+                    switched = true;
+                }
+            }
+
+            @Override
+            public void fail(int code, String reason) {
+                throw new AssertionError("the scripted server's own session failed: " + reason);
+            }
+        }
+    }
+
+    // --- Fakes.
+
+    /** A {@link V3Connection} with no QUIC behind it: what the client writes is captured, what the test injects is read. */
+    private static final class Fake implements V3Connection {
+        final EventLoop loop;
+        final ByteArrayOutputStream written = new ByteArrayOutputStream();
+        final byte[] exporter = new byte[32];
+        volatile Listener listener;
+        volatile boolean activated;
+        volatile byte[] activationLeftover;
+        volatile int abortCode = -1;
+        volatile boolean open = true;
+        /** Like core's connection after detachForActivation: later stream data is kept for activate(). */
+        boolean detached;
+        final ByteArrayOutputStream kept = new ByteArrayOutputStream();
+
+        Fake(EventLoop loop) {
+            this.loop = loop;
+            Arrays.fill(exporter, (byte) 0x5A);
+        }
+
+        void inject(byte[] bytes) {
+            loop.execute(() -> {
+                if (detached) {
+                    kept.write(bytes, 0, bytes.length);
+                    return;
+                }
+                Listener l = listener;
+                if (l != null) {
+                    l.onData(ByteBuffer.wrap(bytes));
+                }
+            });
+        }
+
+        void closeByPeer() {
+            loop.execute(() -> {
+                Listener l = listener;
+                open = false;
+                if (l != null) {
+                    l.onClosed(null);
+                }
+            });
+        }
+
+        synchronized byte[] takeWritten() {
+            byte[] bytes = written.toByteArray();
+            written.reset();
+            return bytes;
+        }
+
+        @Override
+        public byte[] exporterValue() {
+            return exporter.clone();
+        }
+
+        @Override
+        public long smoothedRttMillis() {
+            return 20;
+        }
+
+        @Override
+        public void detachForActivation(java.util.function.Consumer<ByteBuffer> leftover) {
+            detached = true; // event loop
+        }
+
+        @Override
+        public void activate(LaneGame game, ByteBuffer controlLeftover) {
+            activated = true;
+            // Core hands the session the application's leftover followed by what it kept since the detach.
+            ByteArrayOutputStream all = new ByteArrayOutputStream();
+            if (controlLeftover != null) {
+                byte[] copy = new byte[controlLeftover.remaining()];
+                controlLeftover.duplicate().get(copy);
+                all.write(copy, 0, copy.length);
+            }
+            byte[] later = kept.toByteArray();
+            all.write(later, 0, later.length);
+            activationLeftover = all.toByteArray();
+        }
+
+        @Override
+        public void activate(LaneGame game, int protocolNumber, ByteBuffer controlLeftover) {
+            activate(game, controlLeftover);
+        }
+
+        @Override
+        public LaneSession session() {
+            return null;
+        }
+
+        @Override
+        public void end() {
+        }
+
+        @Override
+        public void abort(int code) {
+            abortCode = code;
+            closeByPeer();
+        }
+
+        @Override
+        public String alpn() {
+            return Protocol.ALPN_V3;
+        }
+
+        @Override
+        public boolean handshakeComplete() {
+            return true;
+        }
+
+        @Override
+        public InetSocketAddress remoteAddress() {
+            return new InetSocketAddress(InetAddress.getLoopbackAddress(), 25570);
+        }
+
+        @Override
+        public InetSocketAddress localAddress() {
+            return new InetSocketAddress(InetAddress.getLoopbackAddress(), 50000);
+        }
+
+        @Override
+        public void setListener(Listener listener) {
+            this.listener = listener;
+        }
+
+        @Override
+        public synchronized void write(ByteBuffer data) {
+            byte[] bytes = new byte[data.remaining()];
+            data.get(bytes);
+            written.write(bytes, 0, bytes.length);
+        }
+
+        @Override
+        public void flush() {
+        }
+
+        @Override
+        public boolean isWritable() {
+            return true;
+        }
+
+        @Override
+        public void setAutoRead(boolean autoRead) {
+        }
+
+        @Override
+        public void read() {
+        }
+
+        @Override
+        public boolean isOpen() {
+            return open;
+        }
+
+        @Override
+        public void close() {
+            closeByPeer();
+        }
+
+        @Override
+        public CompletableFuture<Map<String, Long>> connectionStats() {
+            return CompletableFuture.completedFuture(Map.of());
+        }
+
+        @Override
+        public void execute(Runnable task) {
+            loop.execute(task);
+        }
+
+        @Override
+        public boolean inEventLoop() {
+            return loop.inEventLoop();
+        }
+    }
+
+    private static final class FakePlatform implements ClientConnector.Platform<Object> {
+        final Fake fake;
+        final EventLoop loop;
+        volatile boolean bypassResumption;
+
+        FakePlatform(Fake fake, EventLoop loop) {
+            this.fake = fake;
+            this.loop = loop;
+        }
+
+        @Override
+        public CompletableFuture<Optional<Advertisement>> queryStatus(InetSocketAddress server) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+
+        @Override
+        public CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint,
+                EarlyFlight early) {
+            CompletableFuture<QuicByteStream> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new UnsupportedOperationException("/2"));
+            return failed;
+        }
+
+        @Override
+        public CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint,
+                EarlyFlight early, TransportSelection.Transport alpn, boolean bypassResumption) {
+            this.bypassResumption = bypassResumption;
+            return CompletableFuture.completedFuture(fake);
+        }
+
+        @Override
+        public ConnectionRace.Tcp<Object> tcp() {
+            return new ConnectionRace.Tcp<Object>() {
+                @Override
+                public CompletableFuture<Object> connect() {
+                    return new CompletableFuture<>(); // never completes: QUIC wins
+                }
+
+                @Override
+                public void close(Object connection) {
+                }
+            };
+        }
+
+        @Override
+        public ScheduledExecutorService scheduler() {
+            return loop;
+        }
+    }
+
+    /** A configuration listener that records disconnects and ignores everything else. */
+    private static final class ListenerProxy {
+        volatile int disconnects;
+
+        ClientConfigurationPacketListener proxy() {
+            return (ClientConfigurationPacketListener) java.lang.reflect.Proxy.newProxyInstance(
+                    ClientConfigurationPacketListener.class.getClassLoader(),
+                    new Class<?>[] {ClientConfigurationPacketListener.class}, (proxy, method, args) -> {
+                        switch (method.getName()) {
+                            case "flow":
+                                return PacketFlow.CLIENTBOUND;
+                            case "protocol":
+                                return ConnectionProtocol.CONFIGURATION;
+                            case "shouldHandleMessage":
+                            case "isAcceptingMessages":
+                                return Boolean.TRUE;
+                            case "handleDisconnect":
+                                disconnects++;
+                                return null;
+                            case "hashCode":
+                                return System.identityHashCode(proxy);
+                            case "equals":
+                                return proxy == args[0];
+                            case "toString":
+                                return "ListenerProxy";
+                            default:
+                                Class<?> type = method.getReturnType();
+                                if (type == boolean.class) {
+                                    return Boolean.FALSE;
+                                }
+                                if (type == int.class || type == long.class) {
+                                    return 0;
+                                }
+                                return null;
+                        }
+                    });
+        }
+    }
+}

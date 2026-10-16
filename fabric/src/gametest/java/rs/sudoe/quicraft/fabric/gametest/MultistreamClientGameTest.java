@@ -70,6 +70,7 @@ public class MultistreamClientGameTest implements FabricClientGameTest {
         }
         aWrongSizedFrameIsRefused();
         v2JoinStillWorksWithMultistreamOn(context, client);
+        aFaultInAnyClientHookNeverStopsAJoin(context, client);
     }
 
     /** The settings screen's multistream button flips the setting and saves it. */
@@ -286,6 +287,30 @@ public class MultistreamClientGameTest implements FabricClientGameTest {
                 check(lines.contains("QUICraft: QUIC (auto)"), "a /2 connection says QUIC, not /3: " + lines);
             }
         } finally {
+            client.setMultistream(false);
+        }
+    }
+
+    /**
+     * CLAUDE.md fault injection, with multistream on: whichever client hook breaks, the join still
+     * reaches play (over TCP or {@code /2}, whichever the broken hook leaves).
+     */
+    private static void aFaultInAnyClientHookNeverStopsAJoin(ClientGameTestContext context, QuicraftClient client) {
+        client.setMode(Mode.AUTO);
+        client.setMultistream(true);
+        try (TestDedicatedServerContext server = GameTests.server(context)) {
+            for (String hook : new String[] {"connect", "multistream state", "early inputs", "status query",
+                    "quic connect", "connect outcome"}) {
+                Hooks.setFaultInjection(hook);
+                try (var connection = server.connect()) {
+                    GameTests.waitForChunks(connection);
+                    check(context.computeOnClient(c -> c.getConnection() != null), "joined with " + hook + " broken");
+                } finally {
+                    Hooks.setFaultInjection(false);
+                }
+            }
+        } finally {
+            Hooks.setFaultInjection(false);
             client.setMultistream(false);
         }
     }

@@ -35,6 +35,11 @@ public final class EarlyJoins {
     public static void starting(Screen parent, ServerAddress address, ServerData data, boolean quickPlay,
             @Nullable TransferState transferState) {
         current = new Request(parent, address, data, quickPlay, transferState);
+        if (tcpOnce == null) {
+            // A join the player started: what an earlier failed join left to say is stale. (The TCP
+            // retry of a failed multi-stream attempt keeps its notice: tcpOnce is set for it.)
+            V3Notices.clear();
+        }
     }
 
     /**

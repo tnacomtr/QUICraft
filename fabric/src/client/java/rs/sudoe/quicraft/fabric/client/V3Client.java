@@ -107,8 +107,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private final List<Held> deferred = new ArrayList<>();
     private GameLanes lanes;
 
-    V3Client(Connection connection, QuicBridgeChannel channel, V3Connection v3, V3Plan plan, RoutingTable table,
-            int protocolNumber, boolean quicOnly, ClientV3State files, String logicalHost, int logicalPort,
+    V3Client(Connection connection, QuicBridgeChannel channel, EventLoop loop, V3Connection v3, V3Plan plan,
+            RoutingTable table, int protocolNumber, boolean quicOnly, ClientV3State files, String logicalHost, int logicalPort,
             CompletableFuture<String> oldFingerprint) {
         this.connection = connection;
         this.channel = channel;
@@ -122,7 +122,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         this.logicalPort = logicalPort;
         this.oldFingerprint = oldFingerprint;
         this.offlineTest = Boolean.getBoolean(OFFLINE_TEST_PROPERTY);
-        this.loop = channel.eventLoop();
+        this.loop = loop; // the channel is not registered yet when this is built
         this.codec = new LaneCodec(channel, table);
     }
 
@@ -520,6 +520,12 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     }
 
     private void cleanUp() {
+        // The held packets first: closing the session drops its quiescence queue.
+        List<Object> held = new ArrayList<>(deferred);
+        deferred.clear();
+        if (payloads != null) {
+            held.addAll(payloads.releaseQueued());
+        }
         try {
             if (session != null) {
                 session.close();
@@ -529,11 +535,6 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         }
         wipe(secret);
         secret = null;
-        List<Object> held = new ArrayList<>(deferred);
-        deferred.clear();
-        if (payloads != null) {
-            held.addAll(payloads.releaseQueued());
-        }
         for (Object o : held) {
             ((Held) o).promise.tryFailure(new ClosedChannelException());
         }
