@@ -864,6 +864,16 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 **Draft v2. Design approved by the user 2026-10-15 (open questions 1-4 as written below); implementation may proceed behind a disabled-by-default flag. Security review is required before any release or enablement.**
 
+### Direction (2026-10-16): planned, not implemented
+
+This subsection records the user's direction for the next revision of `/3`. None of it is implemented yet. Sections 13.1 to 13.17 still describe the current draft. The revision is made in place, because `/3` has never shipped enabled.
+
+1. **Large packets first.** The main goal of multi-stream is to stop large packets (chunk data) from causing head-of-line blocking. The current draft (13.8) keeps chunk installs on the ordered CONTROL stream, which still blocks everything queued behind a large chunk. The planned revision moves chunk data onto N streams sharded by chunk position, with scoped fences, so only the updates that depend on a chunk wait for it. Small-packet lanes come as a second step.
+2. **Send priority.** When several packets are ready, send in this order: (a) latency-sensitive packets that shape how multiplayer feels, such as entity movement and updates; (b) large packets that can block others, such as chunks; (c) other small packets. Chunk loading must not be starved by (a).
+3. **Streams versus CPU.** Carry as many packet types as possible on parallel streams, while keeping server CPU per player in check. CPU per player is measured as streams are added (see `docs/benchmarks.md`, "Planned Phase 5 measurements").
+4. **Chunk stream count.** Negotiated per connection and benchmarked from 1 to 6 streams. The server never exceeds a hard maximum, whatever its settings say.
+5. **Server profiles (planned).** Built-in profiles keyed on the server's hardware: memory given to Java and CPU cores it may use. Each profile sets how many players may connect over `/3` and the maximum number of parallel streams. Every profile value is pushed to the highest the hardware sustains, measured with all of the profile's values running together (they share CPU and memory), taken from `docs/benchmarks.md` runs, not a cautious guess. Custom values are range-checked and checked against each other, and are applied all at once or not at all. Admins may create a custom profile with `/quicraft value set <VARIABLE> <int>` and restore with `/quicraft value restore default` or `/quicraft value restore <profile>`. The first time an admin changes a value, the command warns that changing these values is risky and asks them to proceed with caution. The hard stream cap in item 4 still applies to custom values.
+
 ### Negotiation and stream map
 
 1. **13.1 Version selection.** Keep the advertisement object version `v:1`; a capable,
@@ -968,6 +978,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
    install or reference an entity after its destroy. Dimension/registry changes fence all
    affected lanes. Where a packet's dependency cannot be demonstrated from these rules,
    route it to CONTROL. Stream classification is not permission to omit a predecessor.
+   The planned revision (see "Direction (2026-10-16)" above) moves chunk install off CONTROL
+   onto sharded chunk streams; these fence rules then apply to that lane instead.
 
 ### Sequence barriers, bounds and delivery
 

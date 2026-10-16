@@ -813,3 +813,15 @@ loopback only, transport only; 8 sockets showed no gain over 4 at this rate.
   machine can generate 50k; otherwise the harness runs sharded across two machines.
 - Game-traffic CPU per player on the proxy path is still unmeasured (Phase 9). This test covers
   connection state only, not gameplay.
+
+## Planned Phase 5 measurements
+
+Not run yet. These measurements are planned for the 2026-10-16 direction in `docs/protocol.md`
+§13 ("Direction (2026-10-16)"). Nothing below is a result.
+
+- Head-of-line blocking under loss: chunk-load time and play round-trip on the netem profiles
+  (clean, loss, delay, reorder), comparing TCP, single-stream and chunk streams from 1 to 6.
+- Server CPU per player as each stream is added, on the same hardware and with the same
+  player count.
+- Per-connection memory and peak concurrent players per node. The values in each planned
+  server profile will be taken from these runs, not chosen in advance.
