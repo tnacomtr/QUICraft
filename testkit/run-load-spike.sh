@@ -8,11 +8,19 @@
 #   ./gradlew :testkit:installDist
 #   COUNT=1000 RAMP_RATE=200 HOLD_SEC=20 bash testkit/run-load-spike.sh     # smoke
 #   bash testkit/run-load-spike.sh                                         # 50k, 500/s, 120 s hold
+#   MODE=v3 COUNT=1000 RAMP_RATE=200 HOLD_SEC=20 bash testkit/run-load-spike.sh   # /3 connections
+#   MODE=v3 LANES=1 NODE_BUDGET_MB=1 COUNT=100 RAMP_RATE=50 MAX_FAIL_PCT=100 bash testkit/run-load-spike.sh
 #
 # Env: COUNT, RAMP_RATE, HOLD_SEC, LOAD_BIND, SOURCE_BASE, IDLE_MIN, MAX_RSS_MB, MAX_FAIL_PCT,
 # SESSION_RESUMPTION (1 to allow), SHIPPED_LIMITS (1 measures the shipped admission defaults
 # instead of the raised ones), SOCKETS (SO_REUSEPORT socket count, default 1), LAUNCHER (installed testkit launcher), NO_SCOPE (1 skips
 # systemd-run even when present), MEM_MAX (per-JVM systemd MemoryMax, default 16G), JVM_OPTS.
+# MODE: v2 (default, the /2 listener and source-address dials, one loopback IP per client) or v3
+# (a /3 listener with multi-stream and a node pending-bytes budget of NODE_BUDGET_MB, default 256,
+# and connectV3 dials from one loopback IP). LANES=1 (v3 only) also activates each connection's
+# three lanes with an idle game, without a Minecraft binding proof (transport-level spike only).
+# The client counts a /3 connection the node budget refuses as connected then closed, so the
+# SUMMARY line's live= is the held count; server admitted= is the /3 acceptor count.
 # Each JVM runs under systemd-run --user --scope with MemoryMax when systemd-run exists; otherwise
 # plain java.
 #
@@ -33,6 +41,9 @@ MAX_RSS_MB="${MAX_RSS_MB:-12288}"
 MAX_FAIL_PCT="${MAX_FAIL_PCT:-5}"
 LAUNCHER="${LAUNCHER:-$root/testkit/build/install/quicraft-testkit/bin/quicraft-testkit}"
 JVM_OPTS="${JVM_OPTS:--Xmx8g -XX:MaxDirectMemorySize=8g}"
+MODE="${MODE:-v2}"
+LANES="${LANES:-}"
+NODE_BUDGET_MB="${NODE_BUDGET_MB:-256}"
 MIN_AVAIL_KB=$((8 * 1024 * 1024))
 SAMPLE_SEC=5
 
@@ -136,6 +147,12 @@ sample() {
 server_args=(load-server --bind "$LOAD_BIND" --status-interval 5 --idle-minutes "$IDLE_MIN")
 [[ "${SHIPPED_LIMITS:-0}" == "1" ]] && server_args+=(--shipped-limits)
 [[ -n "${SOCKETS:-}" ]] && server_args+=(--sockets "$SOCKETS")
+case "$MODE" in
+    v2) [[ -z "$LANES" ]] || { echo "LANES needs MODE=v3" >&2; exit 2; } ;;
+    v3) server_args+=(--mode v3 --node-budget-mb "$NODE_BUDGET_MB")
+        [[ -n "$LANES" ]] && server_args+=(--lanes) ;;
+    *) echo "MODE must be v2 or v3, got $MODE" >&2; exit 2 ;;
+esac
 launch "$results/server.log" "${server_args[@]}"
 server_pid="$LAST_PID"
 server_jvm_pid="$(jvm_pid "$results/server.log")"
@@ -163,6 +180,8 @@ client_args=(load-client --remote "$remote" --fingerprint "$fingerprint" --count
     --rate "$RAMP_RATE" --source-base "$SOURCE_BASE" --hold-sec "$HOLD_SEC" --idle-minutes "$IDLE_MIN"
     --status-interval 5 --max-rss-mb "$MAX_RSS_MB" --max-fail-pct "$MAX_FAIL_PCT")
 [[ -n "${SESSION_RESUMPTION:-}" ]] && client_args+=(--session-resumption)
+[[ "$MODE" == v3 ]] && client_args+=(--mode v3)
+[[ -n "$LANES" && "$MODE" == v3 ]] && client_args+=(--lanes)
 launch "$results/client.log" "${client_args[@]}"
 client_pid="$LAST_PID"
 client_jvm_pid="$(jvm_pid "$results/client.log")"

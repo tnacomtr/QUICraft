@@ -8,10 +8,14 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import rs.sudoe.quicraft.core.routing.RoutingTable;
+import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.QuicServer;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
+import rs.sudoe.quicraft.core.transport.V3Connection;
+import rs.sudoe.quicraft.core.transport.V3Listener;
 import rs.sudoe.quicraft.testkit.Args;
 
 /**
@@ -19,9 +23,23 @@ import rs.sudoe.quicraft.testkit.Args;
  * from one box. {@code --shipped-limits} skips the raise, so the spike measures the shipped
  * defaults instead. {@code --sockets N} binds N SO_REUSEPORT sockets, one loop each, as the
  * platforms do with {@code udp-sockets} (core falls back to one outside Linux). Transport only; each accepted stream is held open until the client closes it.
- * Runs until SIGTERM or SIGINT, then closes the listener.
+ *
+ * <p>{@code --mode v3} binds a {@code /3} listener (one test protocol number, {@link #PROTOCOL}) with
+ * multi-stream on and a node pending-bytes budget of {@code --node-budget-mb} MiB. {@code --lanes}
+ * (v3 only) also activates each admitted connection's lanes with the idle game in
+ * {@link IdleLaneGame}, once its handshake is complete. The /3 acceptor gets the connection only
+ * after admission, so its count is the admitted count.
+ *
+ * <p>Runs until SIGTERM or SIGINT, then closes the listener.
  */
 public final class LoadServer {
+    /** The Minecraft protocol number the /3 test table is for; the spike has no real login. */
+    static final int PROTOCOL = 4242;
+    static final RoutingTable TABLE = RoutingTableLoader.parse(
+            "{\"schema\":1,\"protocol\":" + PROTOCOL + ",\"default\":\"control\",\"routes\":[]}");
+    private static final long MIB = 1024L * 1024L;
+    private static final long HANDSHAKE_WAIT_MS = 10_000;
+
     private LoadServer() {}
 
     public static int run(Args args) throws Exception {
@@ -29,13 +47,24 @@ public final class LoadServer {
         int statusSec = args.integer("status-interval", 5);
         int idleMin = args.integer("idle-minutes", 10);
         int sockets = args.integer("sockets", 1);
+        boolean v3 = "v3".equals(args.string("mode", "v2"));
+        boolean lanes = args.flag("lanes");
+        if (!v3 && lanes) {
+            throw new IllegalArgumentException("--lanes needs --mode v3");
+        }
+        int nodeBudgetMb = args.integer("node-budget-mb", 256);
 
         ServerIdentity identity = ServerIdentity.generate();
         TransportConfig.Builder builder = TransportConfig.builder()
                 .maxIdleTimeout(idleMin, TimeUnit.MINUTES);
+        if (v3) {
+            builder.multistream(true).nodePendingBytes(nodeBudgetMb * MIB);
+        }
         if (!args.flag("shipped-limits")) {
             builder.maxOpen(100_000)
-                    .maxOpenPerIp(64)
+                    // v3 spike clients all come from one loopback address (connectV3 has no source
+                    // address), so the per-IP cap must not be the limit being measured.
+                    .maxOpenPerIp(v3 ? 100_000 : 64)
                     .maxTrackedIps(300_000)
                     .globalAttemptsPerSecond(100_000)
                     .perIpAttemptsPerSecond(1_000)
@@ -46,39 +75,54 @@ public final class LoadServer {
         TransportConfig config = builder.build();
 
         AtomicLong accepted = new AtomicLong();
+        AtomicLong lanesActive = new AtomicLong();
         Set<QuicByteStream> open = ConcurrentHashMap.newKeySet();
-        QuicServer server = QuicServer.bind(bind, sockets, identity, config, stream -> {
-            accepted.incrementAndGet();
-            open.add(stream);
-            stream.setListener(new QuicByteStream.Listener() {
-                @Override
-                public void onData(java.nio.ByteBuffer data) {
-                    // Clients send nothing; nothing to drain.
+        QuicServer server;
+        if (v3) {
+            V3Listener listener = protocol -> protocol == PROTOCOL ? TABLE : null;
+            server = QuicServer.bind(bind, sockets, identity, config, stream -> {
+                accepted.incrementAndGet();
+                if (lanes) {
+                    activateWhenHandshaken((V3Connection) stream, lanesActive);
                 }
+            }, listener);
+        } else {
+            server = QuicServer.bind(bind, sockets, identity, config, stream -> {
+                accepted.incrementAndGet();
+                open.add(stream);
+                stream.setListener(new QuicByteStream.Listener() {
+                    @Override
+                    public void onData(java.nio.ByteBuffer data) {
+                        // Clients send nothing; nothing to drain.
+                    }
 
-                @Override
-                public void onWritabilityChanged(boolean writable) {}
+                    @Override
+                    public void onWritabilityChanged(boolean writable) {}
 
-                @Override
-                public void onClosed(Throwable cause) {
-                    open.remove(stream);
-                }
+                    @Override
+                    public void onClosed(Throwable cause) {
+                        open.remove(stream);
+                    }
+                });
+                stream.setAutoRead(true);
             });
-            stream.setAutoRead(true);
-        });
+        }
 
         InetSocketAddress local = server.localAddress();
         System.out.println("PID " + ProcessHandle.current().pid());
         System.out.println("BOUND " + local.getAddress().getHostAddress() + " " + local.getPort());
         System.out.println("FINGERPRINT " + identity.fingerprint());
         System.out.println("SOCKETS requested=" + sockets);
+        System.out.println("MODE " + (v3 ? "v3 node_budget_mb=" + nodeBudgetMb + " lanes=" + lanes : "v2"));
 
         Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "load-server-status");
             t.setDaemon(true);
             return t;
         }).scheduleAtFixedRate(() -> System.out.println("STAT connections=" + accepted.get()
-                + " streams=" + open.size() + " rss_mb=" + ProcStats.rssMb() + " threads=" + ProcStats.threads()
+                + (v3 ? " admitted=" + accepted.get() + " lanes_active=" + lanesActive.get()
+                        : " streams=" + open.size())
+                + " rss_mb=" + ProcStats.rssMb() + " threads=" + ProcStats.threads()
                 + " cpu_ticks=" + ProcStats.cpuTicks()), statusSec, statusSec, TimeUnit.SECONDS);
 
         CountDownLatch stop = new CountDownLatch(1);
@@ -96,6 +140,30 @@ public final class LoadServer {
         System.out.println("CLOSED connections=" + accepted.get());
         closed.countDown();
         return 0;
+    }
+
+    /**
+     * Activates a /3 connection's lanes once its handshake is complete (activation fails closed
+     * before that, 12.7). The poll runs on its own virtual thread so the acceptor returns at once.
+     * Failures are counted as not active; the connection is left as it is.
+     */
+    private static void activateWhenHandshaken(V3Connection connection, AtomicLong lanesActive) {
+        Thread.ofVirtual().start(() -> {
+            try {
+                long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_WAIT_MS);
+                while (!connection.handshakeComplete()) {
+                    if (System.nanoTime() > deadline) {
+                        return;
+                    }
+                    Thread.sleep(10);
+                }
+                connection.detachForActivation(leftover -> { });
+                connection.activate(IdleLaneGame.INSTANCE, PROTOCOL, null);
+                lanesActive.incrementAndGet();
+            } catch (Throwable t) {
+                // Left unactivated; the count shows how many did not get their lanes.
+            }
+        });
     }
 
     /** Parses {@code host:port} with a numeric or resolvable host; the last colon splits. */

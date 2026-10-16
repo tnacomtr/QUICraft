@@ -6,6 +6,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -15,11 +16,13 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.transport.EarlyFlight;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.QuicClient;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
+import rs.sudoe.quicraft.core.transport.V3Connection;
 import rs.sudoe.quicraft.testkit.Args;
 
 /**
@@ -28,6 +31,12 @@ import rs.sudoe.quicraft.testkit.Args;
  *
  * <p>The source-address connect is package-private in core ({@code QuicClient.connect(local,
  * remote, fingerprint, config, early)}), so it is reached reflectively here; core is not changed.
+ *
+ * <p>{@code --mode v3} dials with {@code QuicClient.connectV3} (public API, no source address, so
+ * every connection comes from the default loopback address). A /3 connection the server refuses at
+ * admission still completes the handshake and is then closed, so the client counts a connection as
+ * held only until its close arrives: {@code live} = connected minus closed. {@code --lanes} also
+ * activates the lanes with the idle game once connected.
  */
 public final class LoadClient {
     private static final long ATTEMPT_TIMEOUT_SEC = 30;
@@ -37,11 +46,20 @@ public final class LoadClient {
     private final AtomicLong started = new AtomicLong();
     private final AtomicLong connected = new AtomicLong();
     private final AtomicLong failed = new AtomicLong();
-    private final Queue<QuicByteStream> held = new ConcurrentLinkedQueue<>();
+    private final AtomicLong closed = new AtomicLong();
+    private final AtomicLong lanesActive = new AtomicLong();
+    private final Queue<Object> held = new ConcurrentLinkedQueue<>();
     private final CountDownLatch allDone;
+    private final boolean v3;
 
-    private LoadClient(int count) {
+    private LoadClient(int count, boolean v3) {
         this.allDone = new CountDownLatch(count);
+        this.v3 = v3;
+    }
+
+    /** Starts one dial; the future completes with the connection. */
+    private interface Dial {
+        CompletableFuture<?> start() throws Throwable;
     }
 
     public static int run(Args args) throws Exception {
@@ -56,17 +74,23 @@ public final class LoadClient {
         long maxRssMb = args.integer("max-rss-mb", 12288);
         int maxFailPct = args.integer("max-fail-pct", 5);
         boolean resumption = args.flag("session-resumption");
+        boolean v3 = "v3".equals(args.string("mode", "v2"));
+        boolean lanes = args.flag("lanes");
         if (count < 1 || (sourceBase >>> 24) != 127) {
             throw new IllegalArgumentException("need --count >= 1 and a 127/8 --source-base");
+        }
+        if (!v3 && lanes) {
+            throw new IllegalArgumentException("--lanes needs --mode v3");
         }
 
         TransportConfig config = TransportConfig.builder()
                 .maxIdleTimeout(idleMin, TimeUnit.MINUTES)
                 .sessionResumption(resumption)
                 .build();
-        MethodHandle connectFrom = connectFromLocal();
-        LoadClient load = new LoadClient(count);
+        MethodHandle connectFrom = v3 ? null : connectFromLocal();
+        LoadClient load = new LoadClient(count, v3);
         System.out.println("PID " + ProcessHandle.current().pid());
+        System.out.println("MODE " + (v3 ? "v3 lanes=" + lanes : "v2"));
 
         ScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "load-client-monitor");
@@ -87,9 +111,17 @@ public final class LoadClient {
                     LockSupport.parkNanos(wait);
                 }
             }
-            InetSocketAddress local = new InetSocketAddress(longToIpv4(sourceBase + i + 1), 0);
             load.started.incrementAndGet();
-            Thread.ofVirtual().start(() -> load.attempt(connectFrom, local, remote, fingerprint, config));
+            if (v3) {
+                Dial dial = () -> QuicClient.connectV3(remote, fingerprint, LoadServer.TABLE, config, null, false);
+                Consumer<Object> hook = connection -> load.onV3Connected(connection, lanes);
+                Thread.ofVirtual().start(() -> load.attempt(dial, hook));
+            } else {
+                InetSocketAddress local = new InetSocketAddress(longToIpv4(sourceBase + i + 1), 0);
+                Dial dial = () -> (CompletableFuture<?>) connectFrom.invoke(local, remote, fingerprint, config,
+                        (EarlyFlight) null);
+                Thread.ofVirtual().start(() -> load.attempt(dial, null));
+            }
         }
 
         load.allDone.await();
@@ -97,20 +129,21 @@ public final class LoadClient {
         Thread.sleep(TimeUnit.SECONDS.toMillis(holdSec));
         monitor.shutdownNow();
         System.out.println("SUMMARY started=" + load.started.get() + " connected=" + load.connected.get()
-                + " failed=" + load.failed.get() + " rss_mb=" + ProcStats.rssMb());
+                + " failed=" + load.failed.get() + load.v3Fields() + " rss_mb=" + ProcStats.rssMb());
         return 0;
     }
 
     /** One attempt on its own virtual thread. Failures are counted, never retried. */
-    private void attempt(MethodHandle connectFrom, InetSocketAddress local, InetSocketAddress remote,
-            Fingerprint fingerprint, TransportConfig config) {
+    private void attempt(Dial dial, Consumer<Object> onConnected) {
         try {
-            @SuppressWarnings("unchecked")
-            CompletableFuture<QuicByteStream> future = (CompletableFuture<QuicByteStream>) connectFrom
-                    .invoke(local, remote, fingerprint, config, (EarlyFlight) null);
+            CompletableFuture<?> future = dial.start();
             try {
-                held.add(future.get(ATTEMPT_TIMEOUT_SEC, TimeUnit.SECONDS));
+                Object connection = future.get(ATTEMPT_TIMEOUT_SEC, TimeUnit.SECONDS);
+                held.add(connection);
                 connected.incrementAndGet();
+                if (onConnected != null) {
+                    onConnected.accept(connection);
+                }
             } catch (java.util.concurrent.TimeoutException e) {
                 future.cancel(true);
                 failed.incrementAndGet();
@@ -122,12 +155,51 @@ public final class LoadClient {
         }
     }
 
+    /**
+     * Per v3 connection: counts its close (a refusal by the node budget arrives as one right after
+     * the handshake), then activates its lanes with the idle game when asked.
+     */
+    private void onV3Connected(Object connection, boolean lanes) {
+        V3Connection v3 = (V3Connection) connection;
+        v3.setListener(new QuicByteStream.Listener() {
+            @Override
+            public void onData(ByteBuffer data) {}
+
+            @Override
+            public void onWritabilityChanged(boolean writable) {}
+
+            @Override
+            public void onClosed(Throwable cause) {
+                closed.incrementAndGet();
+            }
+        });
+        if (!lanes) {
+            return;
+        }
+        try {
+            v3.detachForActivation(leftover -> { });
+            v3.activate(IdleLaneGame.INSTANCE, null);
+            lanesActive.incrementAndGet();
+        } catch (Throwable t) {
+            // Counted as not active in the status line.
+        }
+    }
+
+    /** The /3 counters: closed, the held count live = connected - closed, and lanes activated. */
+    private String v3Fields() {
+        if (!v3) {
+            return "";
+        }
+        return " closed=" + closed.get() + " live=" + (connected.get() - closed.get())
+                + " lanes_active=" + lanesActive.get();
+    }
+
     private void status() {
         long s = started.get();
         long c = connected.get();
         long f = failed.get();
         System.out.println("STAT started=" + s + " connected=" + c + " failed=" + f + " active=" + (s - c - f)
-                + " rss_mb=" + ProcStats.rssMb() + " threads=" + ProcStats.threads() + " cpu_ticks="
+                + v3Fields() + " rss_mb=" + ProcStats.rssMb() + " threads=" + ProcStats.threads() + " cpu_ticks="
                 + ProcStats.cpuTicks());
     }
 
