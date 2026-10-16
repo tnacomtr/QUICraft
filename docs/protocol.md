@@ -808,7 +808,8 @@ share; a prefix over its fair share loses that protection, and session-server ca
 prefix are capped (profile value). The global validated-attempt budget (§11) is shared the same
 way: when it is exhausted, an honest token-bearing Initial from a prefix within its fair share is
 admitted by refusing attempts from prefixes over their share, never dropped while some prefix
-exceeds its share. Online Login Success..activation is charged to logged-in accounting and is never
+exceeds its share. A shed victim's bytes stay charged until its close is confirmed; the newcomer is granted only
+from confirmed bytes, and no second victim is chosen while pending sheds cover the deficit. Online Login Success..activation is charged to logged-in accounting and is never
 shed as pre-login. Offline connections remain staged and charged to the pre-login pool until `/3`
 activation, even after Login Success. A shed closes before Login Success and client retries TCP.
 
@@ -1561,7 +1562,7 @@ position extraction. Those implementations must change together before this revi
      byte-seconds as identity history per source IP and per authenticated account (plus
      connection-local statistics that live only as long as that connection, see below);
      half-life 60 seconds provisionally. Integrate retained charged bytes, excluding only
-     known local executor-stall intervals. Retained bytes ALWAYS accrue byte-seconds, also
+     known local executor-stall intervals. The decay dt uses the same stall-excluded effective clock as integration. Retained bytes ALWAYS accrue byte-seconds, also
      while the holder waits on OUR refusal of its request, so a holder that keeps asking for
      refused grants cannot freeze its score while keeping its bytes. During such a refused
      wait, and only for an INBOUND requester's own incomplete-record bytes while our refusal
@@ -1636,6 +1637,14 @@ position extraction. Those implementations must change together before this revi
      bounded, not per identity); that precondition is DDoS-sized and the table never
      refuses admission, so the damage is limited to which eligible holder is reclaimed
      first, never to protected shares.
+     Under churn beyond the continuity table's bound (the exact IP and account tracking
+     capacities), the oldest overflowed identities can lose bucket continuity. When the
+     table is full it drops, in order: the oldest record that is no longer sticky (past
+     the 10-minute history window, its bucket idle, and no live connection of its own),
+     else the oldest record whose bucket still has live users, else the oldest record, so
+     the bound always holds. A record with a live connection of its own stays sticky
+     however long that connection's charge stays unchanged. Like poisoning, this is DDoS-sized and affects only the
+     shedding order.
      The ranking-history table NEVER causes admission/grant refusal or TCP fallback,
      even when all exact entries are protected. Independent rate admission limits
      still apply. All ranking windows/weights are
