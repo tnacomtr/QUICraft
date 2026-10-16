@@ -266,6 +266,22 @@ class ReceiverDecodeTest {
         assertEquals(0, h.scheduler.pendingBytes(), "nothing is retained after both records");
     }
 
+    @Test void aRefusedDecodeExpiresOnItsOwnDeadlineWithoutARetry() {
+        // Room for the wire charge only, so the decode itself is always refused; the entry stays
+        // queued, undecoded and eligible. Nothing retries it, so this deadline check is the only
+        // thing that can end it (13.12).
+        ReceiveBudget node = ReceiveBudget.bounded(35);
+        final ReceiverScheduler[] self = new ReceiverScheduler[1];
+        ReceiverScheduler scheduler = new ReceiverScheduler((envelope, insideBundle, now) -> {
+            self[0].reserveDecoded(envelope, 1, 1, now);
+            self[0].decoded(envelope, Envelope.Bundle.NONE, false, "decoded", now);
+        }, delivery -> { }, node);
+        self[0] = scheduler;
+        scheduler.offer(raw(Lane.CONTROL, 1, 0, 0, 0), 0);
+        scheduler.checkDeadlines(T - 1);
+        fails(() -> scheduler.checkDeadlines(T));
+    }
+
     @Test void aRefusedSecondReservationIsNotKeptForTheRetry() {
         // A decoder that reserves twice per attempt: 300 bytes, then 500. The node budget carries
         // the first call of an attempt but not the second until the holder frees its space, so every

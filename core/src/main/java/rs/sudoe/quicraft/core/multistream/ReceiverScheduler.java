@@ -830,9 +830,16 @@ public final class ReceiverScheduler {
     public void checkDeadlines(long now) {
         enter();
         try {
-            if (decoding != null && decoding.decodeSince >= 0
-                    && now - decoding.decodeSince >= TIMEOUT_NANOS) {
-                throw new OrderingException("uncompleted decode timeout");
+            // 13.12: every entry with an active decode deadline, whether that decode is still
+            // running or was refused before any allocation. A refused entry is queued, undecoded and
+            // eligible, so it is not a "blocked head" and no retry of it may ever come: its deadline
+            // has to be enforced here and cannot wait for another attempt to check it.
+            for (ArrayDeque<Entry> q : queues) {
+                for (Entry entry : q) {
+                    if (entry.decodeSince >= 0 && now - entry.decodeSince >= TIMEOUT_NANOS) {
+                        throw new OrderingException("uncompleted decode timeout");
+                    }
+                }
             }
             if (receivingBundle && now - bundleStarted >= TIMEOUT_NANOS) {
                 throw new OrderingException("missing bundle close timeout");
