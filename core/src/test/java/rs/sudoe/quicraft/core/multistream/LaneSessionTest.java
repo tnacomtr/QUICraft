@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
@@ -1317,6 +1318,39 @@ class LaneSessionTest {
         } finally {
             rigA.close();
         }
+    }
+
+    @Test
+    void aRefusedOversizedChunkStillReturnsItsReadGrant() throws Exception {
+        // Room for the lane's read grant and 1024 bytes more, so the excess of an oversized chunk
+        // cannot be charged and the lane fails closed.
+        ReceiveBudget node = ReceiveBudget.bounded(LaneSession.READ_CHUNK + 1024);
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        config.clientSession = false;
+        try (LaneRig rig = LaneRig.start(config)) {
+            openRawServerLanes(rig);
+            assertTrue(LaneRig.await(() -> node.reserved() == LaneSession.READ_CHUNK, 10000),
+                    "the lane holds its read grant before the read: " + node.reserved());
+            feedChunk(rig.server, Lane.CONTROL, LaneSession.READ_CHUNK + 1025);
+            closedWith(rig.serverGame, 0x11, false);
+            sawClose(rig.net.clientSawClose, 0x11);
+            assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
+                    "closing returns every charge, the read grant included: " + node.reserved());
+        }
+    }
+
+    /**
+     * Feeds a lane's handler one chunk of {@code bytes} directly, on the session's event loop: the
+     * lane's allocator caps a transport read at {@link LaneSession#READ_CHUNK}, so the oversized
+     * chunk 13.12's guard is about is only reachable by handing the handler the bytes itself.
+     */
+    private static void feedChunk(LaneSession session, Lane lane, int bytes) throws Exception {
+        QuicStreamChannel channel = LaneRig.channelOf(session, lane);
+        session.eventLoop().submit(() -> {
+            channel.pipeline().fireChannelRead(channel.alloc().buffer(bytes).writeZero(bytes));
+            return null;
+        }).get(10, TimeUnit.SECONDS);
     }
 
     @Test

@@ -1554,12 +1554,15 @@ public final class LaneSession {
             try {
                 if (granted) {
                     // 13.12: the read was granted in advance, so this chunk's bytes are already
-                    // reserved; only the part the chunk did not use goes back.
+                    // reserved. Take the chunk's own charge first and give the grant up only once
+                    // that has succeeded: a refusal has to leave the READ_CHUNK reservation owned by
+                    // this lane, or closing cannot return it and the node budget leaks it.
+                    if (bytes > READ_CHUNK) {
+                        chargeChunk(bytes - READ_CHUNK);
+                    }
                     granted = false;
                     if (bytes < READ_CHUNK) {
                         node.release(READ_CHUNK - bytes);
-                    } else if (bytes > READ_CHUNK) {
-                        chargeChunk(bytes - READ_CHUNK);
                     }
                 } else {
                     // A chunk can only arrive without a grant if it was read before this rule, as a
