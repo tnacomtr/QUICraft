@@ -711,7 +711,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
      available or 10 seconds of local monotonic transport time elapse from first refusal,
      whichever comes first. The existing activation deadline still wins if earlier. Queue
      overflow, an unpausable producer, or expiry while resource-blocked closes with `0x12`
-     (resource abort), not a binding-validation failure or a failure-cache entry (12.14), unless the peer made zero ACK/stream progress for the whole deadline (transport failure, 13.12).
+     (resource abort), not a binding-validation failure or a failure-cache entry (12.14), unless the client detects a dead path (zero-progress transport failure, 13.12).
      Never take another connection's inbound share. Reserving the full binding queue per
      idle connection would require at least 65536 additional payload bytes, exceeding the
      entire 24576-byte idle receive target even before packet metadata; shed-then-retry
@@ -761,7 +761,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
       SERVER_SWITCH verifies) and in-allowance pre-verification peer reports below MUST NOT
       create/advance §6's failure cache or the re-bind failure backoff; peer-attributable
       inbound aborts (13.12) close `0x11`/`0x10` and use normal backoff, and the
-      zero-progress transport-failure case in 13.12 does advance §6's failure cache.
+      client-detected zero-progress transport-failure case in 13.12 (including a peer `0x12`
+      received while the client's own ack-eliciting data sat unACKed for the deadline) does
+      advance §6's failure cache (and, during binding, the non-resource join-retry schedule below).
       Before SERVER_SWITCH verifies, a PEER-sent `0x12` cannot authenticate its resource
       claim. Apply the fixed 60-second resource window below to at most three such reports
       per rolling 10 minutes per logical server; the fourth and subsequent reports in that
@@ -775,8 +777,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
      and use the same fresh join-time TCP retry and chat notice below. For non-resource
      failures, client records §6's failure-cache entry for the attempted address/port/fingerprint;
     activation failure overrides a previous handshake success and is cleared only by a
-    later successful activation for that key. Server logs a reason code and rate-limits
-    to one warning per minute per listener; client logs once per failed attempt. Logs contain
+    later successful activation for that key. Server logs a reason code under the single
+    rate-limit rule in 13.12 (per remote IP and per-listener ceiling, "suppressed N" summary); client logs once per failed attempt. Logs contain
     no secrets, exporter values, tags or payload dumps. Do not retry cipher-off or continue
     half-switched. **Join-time TCP retry (user decision 2026-10-16).** A failure before
     activation completes (any of the above, a handshake or ALPN failure, or any exception in
@@ -1289,6 +1291,8 @@ position extraction. Those implementations must change together before this revi
     and log a warning, never fail startup or refuse admission over it.
     No speculative decode or second executing record. Count game-executor-queued data too;
     release charges only on actual completion, returning to the admission share when idle.
+    Bytes held only because OUR executor/game has not yet released them are local-node
+    exposure, never evidence against the peer (peer attribution, below).
     Refusing an excess grant withholds/retries that operation without parser advancement;
     it MUST NOT refuse protected reads or start a resource timeout on an in-share connection.
      Configure the inbound excess pool separately: provisional node default 64 MiB,
@@ -1311,7 +1315,8 @@ position extraction. Those implementations must change together before this revi
     connection, or let a node-refusal timer expire it, to make room for another's excess.
      A refused excess operation has a 10-second monotonic transport-clock resource-wait
      deadline, with NO executor-stall exclusion; expiry closes only that excess requester
-     with `0x12`. Pressure selection uses byte ownership over time, not whether a
+     with `0x12` (never `0x11` while any of its bytes wait on our executor, see below).
+     Pressure selection uses byte ownership over time, not whether a
     record crossed a game-handler boundary. Rate-limit admissions independently to defeat
     many-connection attacks; the share protects admitted peers, not unlimited admissions.
     Conservative server receive ceiling is `24 KiB + E`, with E bounded by
@@ -1345,8 +1350,8 @@ position extraction. Those implementations must change together before this revi
      inbound reads because another peer stopped reading. Locally detected genuine shared
       resource aborts do not update the failure cache (12.14); apply the inbound peer-attribution
       exception below before classifying a refusal as resource-caused.
-      An outbound/pending-ACK/binding-queue abort with zero peer ACK/stream progress for the
-      whole deadline is instead a transport failure that advances the failure cache (below).
+      A client-detected outbound/pending-ACK/binding-queue abort on a dead path is instead a
+      transport failure that advances the failure cache (zero-progress definition, below).
      **Pressure ranking (both pools, separately accounted):** keep exponentially decayed
      byte-seconds as identity history per source IP and per authenticated account (plus
      connection-local statistics that live only as long as that connection, see below);
@@ -1355,9 +1360,10 @@ position extraction. Those implementations must change together before this revi
      while the holder waits on OUR refusal of its request, so a holder that keeps asking for
      refused grants cannot freeze its score while keeping its bytes. During such a refused
      wait, and only for an INBOUND requester's own incomplete-record bytes while our refusal
-     blocks that record's progress (a wait that ends at 10 seconds), suspend just the
-     progress-rate penalty: the denominator below uses the progress rate measured before
-     the wait began for that window. Never exclude outbound retained or unacked bytes from
+     blocks that record's progress (a wait that ends at 10 seconds), the CONNECTION-LOCAL
+     progress rate is max(live rate, rate over the 10 seconds before the first refusal),
+     excluding the wait interval; with no prior history use the live rate. IP and account
+     identity scores are unchanged by this. Never exclude outbound retained or unacked bytes from
      byte-seconds or progress accounting. Track progress over a rolling 10-second window per identity:
      newly received inbound record bytes (including partial records, counted once, not
      retransmissions or copies), outbound bytes acknowledged/released by QUIC (not merely
@@ -1381,10 +1387,10 @@ position extraction. Those implementations must change together before this revi
      the IPv6 /48 (not /64: a /48 holds 65536 /64s, so rotating /64s cannot spread one
      attacker across buckets) or the account. For overflow-bucket accounting an IPv6
      address maps to its /48; exact IP entries and the admission IP caps keep their own
-     keying. An account association protects an IP entry only while that account has at
-     most 4 IP entries; the account's 4 MOST RECENTLY USED IP entries stay protected and
-     older ones are unprotected. In offline mode accounts are unauthenticated names, so
-     this protection gives no anti-Sybil value there.
+     keying. An account association protects an IP entry: the account's 4 MOST RECENTLY
+     USED IP entries stay protected and older ones are unprotected. In offline mode
+     accounts are unauthenticated names, so this protection gives no anti-Sybil value
+     there, and rotating names can pick a fresh overflow bucket each time.
      Reclaim expired inactive entries first; if full, evict the lowest-score inactive IP
      entry with neither a protecting account association nor a live connection, folding its history
      into its overflow bucket. Never evict live entries or unexpired account history. If no
@@ -1399,10 +1405,13 @@ position extraction. Those implementations must change together before this revi
      history. Existing exact entries remain separate and protected. Decay bucket history
      under the same rules. **Overflow rank:** an identity served by an overflow bucket does
      NOT inherit the bucket's full score. Its identity-level score is
-     `connLocal + min(bucketScore, connLocal)`: the connection-local score plus a share of
-     the bucket score bounded by that connection's own local score, so an honest newcomer
-     is at most doubled by a poisoned bucket and a connection with no retained bytes gets
-     no share. The worst-of rule above then applies to this value. **Residual limit,
+     `connLocal + share` with
+     `share = min(bucketScore, max(connLocal, bucketScore / max(1, liveIdentitiesInBucket)))`
+     (`liveIdentitiesInBucket` = distinct identities with a live connection charged to that
+     bucket, counting this one). A newcomer thus gets at most an equal per-identity share
+     of its bucket's score, and a reconnecting attacker cannot zero its share by cycling
+     connections (its connection-local score restarts but the bucket's does not). The
+     worst-of rule above then applies to this value. **Residual limit,
      stated honestly:** an attacker spanning all K buckets that has also filled every exact
      slot still degrades overflow reconnect-history fairness (bucket history is shared and
      bounded, not per identity); that precondition is DDoS-sized and the table never
@@ -1425,19 +1434,23 @@ position extraction. Those implementations must change together before this revi
      restarts none of these clocks. **Peer attribution before resource classification
      (INBOUND only):** "peer" means this one connection's OWN sent bytes; other
      connections sharing its IP or account (CGNAT, family accounts) are other peers.
-     An inbound refusal is peer-attributable only when this connection's retained plus
-     requested bytes exceed E (or its own legal connection-local inbound cap, if higher
-     after the clamp above), or a shared IP/account/node binding cap whose holders are
-     exclusively this connection's own retained bytes AND that cap is >= E. A refusal
+     The per-connection inbound cap is E from above, or the configured caller-local cap
+     if higher after the startup clamp. An inbound refusal is peer-attributable only when
+     this connection's retained EXCESS bytes, excluding bytes held solely because our
+     executor/game has not released them, plus the requested bytes exceed that cap, or a shared IP/account/node binding cap whose holders are
+     exclusively this connection's own retained bytes AND that cap is >= E. A refusal while ANY of
+     this connection's bytes wait on our executor/game is never peer-attributable and closes
+     `0x12` (an honest peer's second legal record during our tick stall is not blamed). A refusal
      under any cap that is below what one legal serverbound record needs (a
      misconfiguration the startup clamp should have prevented) is a local fault, never
      peer-attributable, and closes `0x12`. Do not reclaim unrelated holders or grant the fixed resource retry
      exception in those cases. If an inbound abort is required (deadline expiry), close
      with `0x11` (during binding, `0x10`), using normal client failure-cache/backoff and
-     the server's ordinary protocol-violation handling: log at most one warning per minute
-     per remote IP (IPv4 /32, IPv6 /64; a bounded set of tracked prefixes, oldest evicted)
-     including the remote address and the reason code but no payload, and apply no other
-     penalty beyond the independent admission rate limits above. A refusal under an IP or
+     the server's ordinary protocol-violation handling: server failure warnings (this and
+     12.14) follow ONE rule: at most one warning per minute per remote IP (IPv4 /32, IPv6
+     /64; a bounded set of tracked prefixes, oldest evicted) AND at most 10 warning lines per
+     minute per listener in total, then one "suppressed N" summary line per minute. Lines
+     carry the remote address and the reason code but no payload. Apply no other penalty beyond the independent admission rate limits above. A refusal under an IP or
      account cap held entirely or partly by other users of that IP/account is never
      attributable to this connection. Local implementation/producer faults are not
      evidence of peer fault. When no connection-local cap independently blocks the grant,
@@ -1447,13 +1460,21 @@ position extraction. Those implementations must change together before this revi
      slow or lossy link, so their per-connection caps (1024 packets/16 MiB, 128 entries/
      64 KiB, 32 packets/64 KiB), deadline expiries and unpausable-producer aborts close
      `0x12`. A peer that stops reading is handled by the outbound 10-second wait and
-     shedding above, never by `0x11`. **Zero-progress exception:** if the peer made ZERO
-     ACK and stream progress for the whole deadline of such an outbound/pending-ACK/binding-queue
-     abort (no QUIC ACK advancing the send buffers and no received stream bytes), the abort
-     is classified as a TRANSPORT failure (the UDP path died after the handshake), not a
-     resource abort: it still closes with the same wire code but writes/advances section 6's
-     failure cache exactly like a QUIC idle timeout, so the next join falls back to TCP.
-     Shared-pool `0x12` aborts never do this.
+     shedding above, never by `0x11`. **Zero-progress exception (dead path):** a path counts
+     as dead only if (a) ack-eliciting packets were outstanding for the WHOLE deadline of the
+     outbound/pending-ACK/binding-queue abort, with the waiting side REQUIRED to send
+     PING/PTO probes during it so the path is actually tested, AND (b) no authenticated
+     packet of any kind arrived from the peer in that time. A closed peer flow-control
+     window with a live peer, or no data in flight, is NOT zero progress. Classification
+     and the section 6 failure-cache write are CLIENT-LOCAL only: the abort keeps its wire
+     code but the client advances the cache like an idle timeout, so the next join uses
+     TCP. A server-detected case affects only server logging, never a cache. A full
+     blackhole reaches TCP through the client's own idle timeout (section 5 step 5, already
+     a failure). Asymmetric case: a client that receives a peer `0x12` while its own
+     ack-eliciting data has been unACKed for at least the deadline treats that close as a
+     transport failure (cache advanced). A zero-progress abort during binding uses the
+     12.14 join-retry limiter's non-resource exponential schedule. Shared-pool `0x12`
+     aborts on a live path never do this.
      **Deadline precedence:** ANY deadline expiring while
      this node is withholding reads/grants needed for completion due to a LOCAL resource
      refusal closes `0x12`, never peer blame `0x11` (or binding blame `0x10`), except for
@@ -1779,21 +1800,31 @@ position extraction. Those implementations must change together before this revi
       outbound retained bytes are never excluded.
       Poisoning: an attacker keeps every exact slot live and heavy (account-associated IPs,
       rotating /64s inside one /48, and spanning all K=256 buckets); honest newcomers in
-      overflow are ranked by `connLocal + min(bucketScore, connLocal)` (at most doubled, zero
-      share with no retained bytes), not by the full bucket score, so they are not shed
-      first because of it. Assert the IP-vs-account bucket rule (account bucket if
+      overflow are ranked by `connLocal + share` (at most the equal per-identity share of
+      the bucket score, or connLocal if higher), not by the full bucket score, so they are
+      not shed first because of it; reconnect cycling in overflow keeps a nonzero share.
+      Many sub-E connections from one /48 are shed first under pressure (no `0x11` needed). Assert the IP-vs-account bucket rule (account bucket if
       authenticated, else IP bucket), IPv6 /48 keying, and that the 4 most recently used
       IP entries of an account stay protected.
       Misconfiguration: a caller-local or sole-holder excess cap below E is clamped up to E
       with a warning at startup (never a startup failure); an honest peer under such a
       cap is not blamed `0x11`, and a refusal is peer-attributable only when this
-      connection's retained plus requested bytes exceed E. The peer-attributable warning log
-      is rate-limited per remote IP (IPv4 /32, IPv6 /64, bounded set, oldest evicted),
-      carries the remote address and no payload.
-      Post-handshake UDP blackhole: an established QUIC connection whose peer makes zero
-      ACK/stream progress for the whole outbound/pending-ACK/binding-queue deadline closes
-      as a transport failure, the failure cache advances, and the next join uses TCP;
-      the same abort with ACK progress (a shared-pool `0x12`) does not touch the cache. A sibling connection streaming cheap records on the same
+      connection's retained excess (excluding bytes held only by our executor) plus
+      requested bytes exceed its per-connection cap. A tick stall >10 s with two large
+      legal records from one honest peer closes `0x12`, not `0x11`, with no backoff. The
+      server failure warning log is limited per remote IP (IPv4 /32, IPv6 /64, bounded
+      set, oldest evicted) and to 10 lines/minute per listener with one "suppressed N"
+      summary per minute; it carries the remote address and no payload.
+      Post-handshake UDP blackhole: on an established client connection with ack-eliciting
+      data outstanding (PING/PTO probes sent) for the whole deadline and no authenticated
+      packet from the peer, the abort is a transport failure: the client's cache advances
+      and the next join uses TCP; a zero-progress abort during binding follows the 12.14
+      non-resource join-retry schedule. Negative: a live peer that is not reading
+      (flow-control blocked) and a quiesced client with no data in flight after
+      CLIENT_SWITCH write no cache entry; the same abort with live-path ACKs (a
+      shared-pool `0x12`) does not touch the cache; a server-detected case only logs; a
+      client receiving a peer `0x12` after its own data sat unACKed for the deadline
+      treats it as a transport failure. A sibling connection streaming cheap records on the same
       IP/account does not shield a stalled holder (worst-of ranking).
       Outbound tests must enforce node/IP/account caps and the same continuous score ranking;
       rotate connections without resetting aggregated progress/history. Under outbound
@@ -1875,9 +1906,10 @@ position extraction. Those implementations must change together before this revi
 5. Approve the new close code `0x12` (resource abort) next to `0x10` (binding/setup failure)
    and `0x11` (peer ordering/protocol violation)? It marks closes caused by the local node's
    genuine shared resource exhaustion, not inbound self-cap refusals attributable to the peer's own sent bytes (13.12).
-   An outbound/pending-ACK/binding-queue abort where the peer made zero ACK/stream progress
-   for the whole deadline is a transport failure (dead UDP path): it keeps the same wire
-   code but advances section 6's failure cache like an idle timeout (13.12).
+   A client-detected abort on a dead path (ack-eliciting data outstanding, with probes, for
+   the whole deadline and no authenticated packet from the peer) is a transport failure: it
+   keeps the same wire code but advances section 6's failure cache like an idle timeout
+   (13.12); a server-detected case only logs.
    Locally detected resource aborts never write a failure-cache entry; before SERVER_SWITCH
    verifies, peer reports remain untrusted and receive only 12.14's bounded retry allowance.
    Close codes are wire format; nothing ships with `0x12` until this is confirmed.
