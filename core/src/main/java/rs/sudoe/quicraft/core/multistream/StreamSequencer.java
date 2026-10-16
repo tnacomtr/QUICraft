@@ -375,6 +375,10 @@ public final class StreamSequencer {
         if (interaction && (!serverbound || fence != Fence.ORDINARY_CONTROL || stream != CONTROL)) {
             throw new IllegalArgumentException("interaction route");
         }
+        // Chunk routes and CHUNK fences exist only clientbound; there is no serverbound chunk scope (13.18).
+        if (serverbound && (fence == Fence.CHUNK || stream >= FIRST_CHUNK)) {
+            throw new IllegalArgumentException("serverbound chunk route");
+        }
         if (kind != 0 && (fence != Fence.CHUNK || stream != FIRST_CHUNK)) {
             throw new IllegalArgumentException("join route");
         }

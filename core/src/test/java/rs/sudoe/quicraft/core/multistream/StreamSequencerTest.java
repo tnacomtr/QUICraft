@@ -119,6 +119,19 @@ class StreamSequencerTest {
                 () -> new StreamSequencer(1, true).assign(1, REALTIME, NONE, true));
     }
 
+    @Test void serverboundDirectionRejectsChunkFencesRoutesAndJoins() {
+        // Chunk routes are clientbound only (13.18), the same way interaction and epoch are restricted.
+        StreamSequencer serverbound = new StreamSequencer(1, true);
+        assertThrows(IllegalArgumentException.class, () -> serverbound.assign(2, CHUNK, NONE, false));
+        assertThrows(IllegalArgumentException.class, () -> serverbound.assign(0, CHUNK, NONE, false));
+        assertThrows(IllegalArgumentException.class,
+                () -> serverbound.assign(2, StreamSequencer.Fence.ORDINARY_CONTROL, NONE, false));
+        assertThrows(IllegalArgumentException.class, () -> serverbound.assignJoin(2, NONE));
+        assertEquals(pairs(), deps(serverbound.assign(1, REALTIME, NONE, false)), "non-chunk routes still work");
+        assertEquals(pairs(), deps(new StreamSequencer(1).assign(2, CHUNK, NONE, false)),
+                "clientbound chunk routes are unchanged");
+    }
+
     @Test void serverboundRealtimeEncodesTheLaterOfGlobalAndControl() {
         StreamSequencer serverbound = new StreamSequencer(1, true);
         serverbound.assign(1, REALTIME, NONE, false);
