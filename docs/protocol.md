@@ -772,9 +772,11 @@ if the charge cannot be made it waits non-fatally under the deadline, never `0x1
 total-byte limit. `/3` 0-RTT tickets carry the listener limits; never reduce remembered 0-RTT limits.
 Staging changes nothing on the wire. Every `/3` connection gets the listener limits of §13.13
 from its first packet: 24 KiB connection credit, 8 KiB on client-opened bidi directions (CONTROL,
-REALTIME), one byte on reverse-CHUNK guards, uni limits zero, and every maximum pinned equal to
-its initial window by netty/0005, so quiche never grows a window. Credit advances only as the
-server reads, and stream windows bound what quiche can buffer, so a staged connection's native
+REALTIME), one byte on reverse-CHUNK guards, uni limits zero. netty/0005 pins the connection
+and CONTROL/REALTIME maxima equal to their initial windows, so quiche never grows them; the
+reverse-CHUNK guards stay at one byte because their first byte closes the connection before any
+replenishment (§13.13). Credit advances only as the server reads, and stream windows bound what
+quiche can buffer, so a staged connection's native
 exposure is at most `2*8 KiB + N` bytes whatever its connection credit; everything past that is
 bounded by stopping reads at the cap above. Charge that full native exposure (not a smaller
 staged credit) to the pre-login pool. Promotion (online mode: Login Success, after
@@ -1405,8 +1407,9 @@ position extraction. Those implementations must change together before this revi
     state/window is about 40 KiB, separately charged as connection memory outside the 24 KiB
     receive share. Vanilla already pays this cost per compressed connection. These two
      reservations total about 64 KiB per logged-in compressed connection. The staged
-     pre-login reservation must cover full advertised credit, read buffers, native exposure,
-     and measured QUIC/TLS state; its cost is unknown until measured. Benchmark 50,000 staged
+     pre-login reservation must cover native stream exposure (at most `2*8 KiB + N`, which the
+     stream windows bound below the 24 KiB connection credit; 12.13), read buffers, and measured
+     QUIC/TLS state, crypto and 0-RTT buffering; its cost is unknown until measured. Benchmark 50,000 staged
      connections on top of 50,000 logged-in players, including churn. At 50,000 logged-in compressed connections the
     receive shares total 1,228,800,000 bytes (about 1.14 GiB), inflater reservations total
     2,048,000,000 bytes (about 1.91 GiB), and the combined admission total is 3,276,800,000
