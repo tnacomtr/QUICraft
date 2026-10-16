@@ -24,7 +24,7 @@ abstract class DiscardedPayloadMixin {
             Hooks.enter("fallback codec");
             if (FallbackPayload.TYPE.id().equals(id)) {
                 cir.setReturnValue((StreamCodec) FallbackPayload.<T>codec(maxPayloadSize));
-            } else if (ServerBindingPayload.TYPE.id().equals(id)) {
+            } else if (ServerBindingPayload.handles(id)) {
                 cir.setReturnValue((StreamCodec) ServerBindingPayload.<T>codec(maxPayloadSize));
             }
         } catch (Throwable t) {
