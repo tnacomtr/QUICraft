@@ -290,6 +290,35 @@ class ReceiverDecodeTest {
         assertEquals(0, node.reserved());
     }
 
+    @Test void aDecodeLargerThanTheWholeNodeBudgetFailsLocallyInsteadOfWaiting() {
+        ReceiveBudget node = ReceiveBudget.bounded(1000);
+        final ReceiverScheduler[] self = new ReceiverScheduler[1];
+        ReceiverScheduler scheduler = new ReceiverScheduler((envelope, insideBundle, now) -> {
+            self[0].reserveDecoded(envelope, 2000, 2000, now);
+            self[0].decoded(envelope, Envelope.Bundle.NONE, false, "decoded", now);
+        }, delivery -> { }, node);
+        self[0] = scheduler;
+        RuntimeException failure = assertThrows(RuntimeException.class,
+                () -> scheduler.offer(raw(Lane.CONTROL, 1, 0, 0, 0), 0));
+        assertFalse(failure instanceof OrderingException, "a local failure is never peer misconduct (0x11)");
+    }
+
+    @Test void aBlockedHeadIsPausedOnlyByTheLaneCarryingItsMissingPredecessor() {
+        // CONTROL 1 waits for REALTIME 1, which never arrives.
+        ReceiverScheduler other = new ReceiverScheduler((e, b, n) -> { }, d -> { });
+        other.offer(raw(Lane.CONTROL, 1, 0, 1, 0), 0);
+        other.receiveBlocked(Lane.WORLD, true, 0);
+        fails(() -> other.checkDeadlines(T));
+
+        ReceiverScheduler own = new ReceiverScheduler((e, b, n) -> { }, d -> { });
+        own.offer(raw(Lane.CONTROL, 1, 0, 1, 0), 0);
+        own.receiveBlocked(Lane.REALTIME, true, 0);
+        own.checkDeadlines(2 * T);
+        own.receiveBlocked(Lane.REALTIME, false, 2 * T);
+        own.checkDeadlines(3 * T - 1);
+        fails(() -> own.checkDeadlines(3 * T));
+    }
+
     @Test void aRefusedSecondReservationIsNotKeptForTheRetry() {
         // A decoder that reserves twice per attempt: 300 bytes, then 500. The node budget carries
         // the first call of an attempt but not the second until the holder frees its space, so every
@@ -322,7 +351,7 @@ class ReceiverDecodeTest {
         node.release(200);
         scheduler.retry(2_000_000_000L);
         assertEquals(1, deliveries.size(), "the record is delivered once the retry fits");
-        assertEquals(5, attempts[0], "the offer and each retry ran the decoder once");
+        assertEquals(2, attempts[0], "the refused attempt is not rerun until the node can carry its 800 bytes (13.12)");
         assertEquals(e.wireBytes() + 800, node.reserved(),
                 "exactly one decode's reservations stay charged");
         assertEquals(e.wireBytes() + 800, scheduler.pendingBytes());
@@ -366,7 +395,7 @@ class ReceiverDecodeTest {
                 "every refused attempt gave its own reservations back");
         node.release(200);
         scheduler.retry(2_000_000_000L);
-        assertEquals(3, attempts[0], "the offer and each retry ran the decoder once");
+        assertEquals(2, attempts[0], "the refused attempt is not rerun until the node can carry its 800 bytes (13.12)");
         assertEquals(1, deliveries.size(), "the record is delivered by the successful attempt");
         assertEquals(e.wireBytes() + 800, node.reserved(), "exactly one decode stays charged");
         ByteBuf delivered = (ByteBuf) deliveries.get(0).records().get(0).body();

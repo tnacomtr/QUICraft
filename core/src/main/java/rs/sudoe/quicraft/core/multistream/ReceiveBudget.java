@@ -111,6 +111,15 @@ public abstract class ReceiveBudget {
      */
     public abstract long available();
 
+    /**
+     * The most this budget can ever carry, or {@link Long#MAX_VALUE} for one without a capacity. A
+     * request above it can never succeed however long the caller waits, so it is a local failure and
+     * not a wait (13.12).
+     */
+    public long capacity() {
+        return Long.MAX_VALUE;
+    }
+
     private static void require(long bytes) {
         if (bytes < 0) {
             throw new IllegalArgumentException("negative byte count: " + bytes);
@@ -176,6 +185,11 @@ public abstract class ReceiveBudget {
         public long available() {
             long free = capacity - reserved.get();
             return free < 0 ? 0 : free;
+        }
+
+        @Override
+        public long capacity() {
+            return capacity;
         }
     }
 }

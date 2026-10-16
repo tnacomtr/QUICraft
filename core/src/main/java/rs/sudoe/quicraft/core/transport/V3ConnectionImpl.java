@@ -90,6 +90,8 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     // Event loop only.
     private final ArrayDeque<ByteBuffer> kept = new ArrayDeque<ByteBuffer>();
+    /** Bytes in {@link #kept}. */
+    private int keptBytes;
     /** A peer stream seen before the session exists: the client's WORLD stream (13.3). */
     private final List<QuicStreamChannel> early = new ArrayList<QuicStreamChannel>(1);
     private boolean gateOpen;
@@ -465,10 +467,32 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         if (!detached && gateOpen && kept.isEmpty() && l != null) {
             l.onData(data);
         } else {
-            ByteBuffer copy = ByteBuffer.allocate(data.remaining());
-            copy.put(data).flip();
-            kept.add(copy);
+            keep(data);
         }
+    }
+
+    /**
+     * Keeps bytes for the game or for the session's activation leftover. After the detach stream 0
+     * is no longer read, so only a read already in flight can still land here, one 16 KiB chunk. The
+     * bytes later become the session's admitted overdraft (13.12), so they are bounded here: more
+     * than {@link LaneSession#MAX_KEPT_AFTER_DETACH} can only mean a local read-control fault, and
+     * the connection closes with the internal-error code, never 0x11, because the peer cannot make
+     * this larger.
+     */
+    private void keep(ByteBuffer data) {
+        if (detached && keptBytes + data.remaining() > LaneSession.MAX_KEPT_AFTER_DETACH) {
+            LOG.log(Level.FINE, "stream 0 delivered more than {0} bytes after the detach; closing",
+                    LaneSession.MAX_KEPT_AFTER_DETACH);
+            discarding = true;
+            kept.clear();
+            keptBytes = 0;
+            Codecs.closeLater(connection, true, Protocol.CLOSE_INTERNAL_ERROR);
+            return;
+        }
+        ByteBuffer copy = ByteBuffer.allocate(data.remaining());
+        copy.put(data).flip();
+        keptBytes += copy.remaining();
+        kept.add(copy);
     }
 
     @Override
@@ -551,6 +575,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         while (!kept.isEmpty() && (autoRead || readRequested)) {
             readRequested = false;
             ByteBuffer next = kept.poll();
+            keptBytes -= next.remaining();
             try {
                 l.onData(next);
             } catch (Throwable t) {
@@ -583,6 +608,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
             public void run() {
                 discarding = true;
                 kept.clear();
+                keptBytes = 0;
                 gateOpen = true;
                 drain();
             }
@@ -693,6 +719,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         }
         ByteBuffer b;
         while ((b = kept.poll()) != null) {
+            keptBytes -= b.remaining();
             try {
                 sink.accept(b);
             } catch (Throwable t) {
@@ -728,6 +755,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         }
         ByteBuffer leftover = combine(controlLeftover, kept);
         kept.clear();
+        keptBytes = 0;
         // The session installs itself first in stream 0's pipeline and drives reads itself.
         LaneSession started = new LaneSession(connection, role, control, resolved, game, node);
         session = started;

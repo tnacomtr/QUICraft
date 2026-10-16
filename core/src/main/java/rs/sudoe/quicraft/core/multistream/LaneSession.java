@@ -115,6 +115,29 @@ public final class LaneSession {
     static final int READ_CHUNK = 16 * 1024;
     static final int READ_CHUNK_MIN = 4 * 1024;
     static final int READ_SENTINEL = 1024;
+    /**
+     * 13.12: the most one connection may wait on its own node (a refused parser allocation or a
+     * refused decode allocation, with a deadline paused meanwhile), summed over its lifetime, before
+     * it is closed. The pause is what stops a local shortage from being blamed on the peer, and this
+     * bound is what stops the pause from being a way to hold slots for ever. The close is the
+     * internal-error code (0x2): it is the node's lack of room, not the peer's misconduct. This is
+     * meant to become 0x12 (resource abort) once the owner approves that code; until then it stays
+     * 0x2 and no new code is invented here.
+     */
+    static final long LOCAL_WAIT_CAP_NANOS = 30_000_000_000L;
+    /**
+     * The most activation leftover (the game's bytes past the switch packet plus what stream 0 kept
+     * after the detach) one session takes as an admitted overdraft. A read delivers at most one 16 KiB
+     * chunk and stream 0 stops reading at the detach, so an honest leftover is a few chunks; more is
+     * a local invariant failure (0x2). The peer cannot make it larger, so this is not a protocol limit
+     * the peer has to know.
+     */
+    public static final int MAX_ACTIVATION_LEFTOVER = 64 * 1024;
+    /**
+     * The most stream 0 may keep after the detach (13.12): half the leftover bound, leaving the rest
+     * for the game's own bytes past the switch packet. See {@link #MAX_ACTIVATION_LEFTOVER}.
+     */
+    public static final int MAX_KEPT_AFTER_DETACH = MAX_ACTIVATION_LEFTOVER / 2;
     /** The smallest record on the wire: length prefix, kind, sequence and three dependencies. */
     private static final int MAX_RECORD_WIRE = 4 + RecordCodec.MAX_RECORD_LENGTH;
     private static final int CONTROL_STREAM_ID = 0;
@@ -182,8 +205,12 @@ public final class LaneSession {
     private boolean activated;
     private long activatedAt;
     private boolean closed;
-    /** A node-budget refusal withheld at least one lane: the tick retries and clears it. */
+    /** A node-budget refusal withheld at least one lane or decode: the tick retries and clears it. */
     private boolean withheldForNode;
+    /** When this connection's current local wait began, or -1; see {@link #LOCAL_WAIT_CAP_NANOS}. */
+    private long localWaitSince = -1;
+    /** Local wait time already finished, counted against {@link #LOCAL_WAIT_CAP_NANOS}. */
+    private long localWaitTotal;
     private boolean processing;
     private boolean reprocess;
     private boolean draining;
@@ -676,13 +703,22 @@ public final class LaneSession {
             // 13.12: the leftover is bytes that already arrived under an admission. Refusing them
             // would end an honest connection for a purely local reason, so they are charged as an
             // admitted overdraft that is released like any other chunk when consumed. Node pressure
-            // then withholds further reads and credit, never this connection.
+            // then withholds further reads and credit, never this connection. The overdraft is small
+            // by construction (one read chunk per stream-0 read that was in flight), and the bound is
+            // checked: a leftover beyond it is a local invariant failure, not peer misconduct.
+            int size = leftover.readableBytes();
+            if (size > MAX_ACTIVATION_LEFTOVER) {
+                leftover.release();
+                throw new IllegalStateException("the activation leftover of " + size
+                        + " bytes exceeds the " + MAX_ACTIVATION_LEFTOVER + " byte overdraft bound (13.12)");
+            }
             try {
-                node.forceReserve(leftover.readableBytes());
+                node.forceReserve(size);
             } catch (Throwable t) {
                 leftover.release();
                 throw t;
             }
+            control.chunkCharged(leftover, size);
             control.inbound.add(leftover);
         }
         Lane mine = role == Role.CLIENT ? Lane.REALTIME : Lane.WORLD;
@@ -888,9 +924,10 @@ public final class LaneSession {
      * largest legal record, so a conformant peer's record can always complete (13.12: never fatal
      * for a legal record); otherwise reading waits and QUIC flow control pushes back. The same
      * amount must fit the per-connection budget. The shared node budget is taken before the parser
-     * allocation ({@link LaneStream#reserveWire}) and before each read ({@link LaneStream#grantRead}),
-     * each of which withholds this lane instead of failing it and is remembered in
-     * {@link #withheldForNode} so the tick retries once other connections have released space.
+     * allocation ({@link LaneStream#reserveWire}), which withholds this lane instead of failing it
+     * and is remembered in {@link #withheldForNode} so the tick retries once other connections have
+     * released space. Reads never wait for the node: each lane owns a reserved floor
+     * ({@link LaneStream#grantRead}).
      */
     private boolean credit(Lane lane) {
         if (lane == Lane.CONTROL) {
@@ -900,15 +937,26 @@ public final class LaneSession {
         return receiver.auxiliaryCreditAvailable(MAX_RECORD_WIRE, 1);
     }
 
+    /**
+     * One parse pass over a lane. The lane counts as locally blocked only if this very pass retried a
+     * parser allocation that the node refused (13.12): whatever else ends the pass (no credit, no
+     * bytes, a closed connection) leaves the lane unblocked, so a wait that stopped being local
+     * stops pausing the deadlines the same pass.
+     */
     private void consume(LaneStream s) throws MultistreamProtocolException {
+        s.refusedThisPass = false;
+        consumePass(s);
+        if (!closed) {
+            s.markBlocked(s.refusedThisPass);
+        }
+    }
+
+    private void consumePass(LaneStream s) throws MultistreamProtocolException {
         if (!s.readable) {
             return;
         }
         while (!closed) {
-            if (!s.reservePrefix()) {
-                noteWaiting(s, true);
-                break;
-            }
+            s.reservePrefix();
             if (!s.nextBuffer() && !s.decoder.awaitingAdmission()) {
                 break;
             }
@@ -958,7 +1006,7 @@ public final class LaneSession {
         // The rest of a record whose length is known, or of a preamble, already holds its charge.
         // A bare, still incomplete length prefix holds almost nothing, so it needs credit again.
         if (!s.fin && !s.readPending && !s.hasUnparsed() && s.channel != null
-                && !s.decoder.awaitingAdmission() && s.reservePrefix()
+                && !s.decoder.awaitingAdmission()
                 && (s.midRecord() || !s.opened || credit(s.lane)) && s.grantRead()) {
             s.readPending = true;
             s.channel.read();
@@ -1283,8 +1331,9 @@ public final class LaneSession {
     }
 
     private boolean streamOverdue(LaneStream s, long t) {
-        return (s == null || !s.opened) && t - activatedAt
-                - (s == null ? 0 : s.localWaitNanos(t)) >= timing.openTimeoutNanos;
+        // Reads never wait for the node (every lane owns a read floor), so a stream that has not
+        // opened is the peer's doing and its deadline is never paused.
+        return (s == null || !s.opened) && t - activatedAt >= timing.openTimeoutNanos;
     }
 
     /**
@@ -1328,13 +1377,24 @@ public final class LaneSession {
             if (withheldForNode) {
                 // 13.12: another connection may have released node space since the refusal, so
                 // retry the withheld lanes and the undecoded head before checking deadlines.
-                // process() and retry() set the flag again when the node is still too full.
+                // process() and retry() set the flag again when the node is still too full, and a
+                // lane that no longer retries a refusal is unblocked by its own pass.
                 withheldForNode = false;
                 process();
                 if (closed) {
                     return;
                 }
                 receiver.retry(t);
+                if (receiver.decodeBlocked()) {
+                    // A decode that is waiting for room is not rerun until the room is there, so
+                    // the next tick has to look again whether or not a rerun refused it.
+                    withheldForNode = true;
+                }
+            }
+            if (localWaitExceeded(t)) {
+                fail(CLOSE_INTERNAL_ERROR, "the node withheld this connection's allocations for "
+                        + "longer than " + LOCAL_WAIT_CAP_NANOS / 1_000_000_000L + " seconds in total (13.12)", null);
+                return;
             }
             if (firstRecordByteBlocked(t)) {
                 fail(CLOSE_ORDERING, "the first bytes of a record were blocked for too long (13.12)", null);
@@ -1443,6 +1503,25 @@ public final class LaneSession {
     }
 
     /**
+     * Accumulates the time this connection has spent in a local wait (a lane retrying a refused
+     * parser allocation, or a decode waiting for node space) and reports whether it passed
+     * {@link #LOCAL_WAIT_CAP_NANOS}. Measured at tick resolution; time with no local wait is free.
+     */
+    private boolean localWaitExceeded(long t) {
+        boolean waiting = receiver.decodeBlocked();
+        for (LaneStream s : streams) {
+            waiting |= s != null && s.localBlockedSince >= 0;
+        }
+        if (waiting && localWaitSince < 0) {
+            localWaitSince = t;
+        } else if (!waiting && localWaitSince >= 0) {
+            localWaitTotal += t - localWaitSince;
+            localWaitSince = -1;
+        }
+        return localWaitTotal + (localWaitSince < 0 ? 0 : t - localWaitSince) >= LOCAL_WAIT_CAP_NANOS;
+    }
+
+    /**
      * 13.12: a lane that has held bytes of a record it could not admit for {@link
      * ReceiverScheduler#TIMEOUT_NANOS} closes the connection with 0x11, exactly like an incomplete
      * record whose first byte was parsed. The deadline starts when the lane first waited, so a
@@ -1532,44 +1611,63 @@ public final class LaneSession {
         boolean preambleWritten;
         /** The record in progress has announced its length, so its full size is charged. */
         boolean lengthKnown;
-        /** The allocator and outstanding grant always have the same bound, even while idle. */
+        /**
+         * 13.12: every lane owns a reserved read floor for its whole life, taken once without
+         * waiting (at most three floors per connection, {@link #floorBytes}). A read never needs
+         * fresh node bytes: it is capped at the floor plus whatever growth the node grants right
+         * now, so a read, and with it a preamble or the rest of a record, is never refused by node
+         * pressure and no deadline waits on one.
+         */
+        boolean floorHeld;
+        /** The allocator's read bound is set: {@link #grantedBytes} (floor plus growth) may arrive. */
         boolean granted;
         int grantedBytes;
+        /** The part of {@link #grantedBytes} above the floor, reserved from the node while granted. */
+        int growthHeld;
         int nextReadBytes = READ_CHUNK_MIN;
         long lastReadAt;
+        /** Node bytes that were reserved fresh for a chunk still held, released with it; floor bytes are not. */
+        final java.util.IdentityHashMap<ByteBuf, Integer> chunkFresh =
+                new java.util.IdentityHashMap<ByteBuf, Integer>();
         final boolean receiveSentinel;
         /**
          * When this lane first held bytes of a record it could not admit; 0 while it has none. It
          * moves into the parser reservation ({@link #takeWaitingSince()}) and is cleared there.
          */
         long waitingSince;
-        boolean nodeReadBlocked;
-        boolean nodeParserBlocked;
+        /** Set by {@link #reserveWire} when the node refused the parser allocation in the current pass. */
+        boolean refusedThisPass;
+        /** Since when the lane has been retrying a refused parser allocation, or -1. */
         long localBlockedSince = -1;
-        long localPausedNanos;
 
-        long localWaitNanos(long t) {
-            return localPausedNanos + (localBlockedSince < 0 ? 0 : t - localBlockedSince);
-        }
-
-        void nodeBlocked(boolean parser, boolean blocked) {
-            if (parser) {
-                nodeParserBlocked = blocked;
-            } else {
-                nodeReadBlocked = blocked;
+        /**
+         * The lane's local-wait state at the end of a pass: blocked exactly while that pass retried a
+         * refused parser allocation. The clock is read only on a transition.
+         */
+        void markBlocked(boolean blocked) {
+            if (blocked == (localBlockedSince >= 0)) {
+                return;
             }
-            boolean any = nodeParserBlocked || nodeReadBlocked;
             long t = now();
-            if (any && localBlockedSince < 0) {
+            if (blocked) {
                 localBlockedSince = t;
                 receiver.receiveBlocked(lane, true, t);
-            } else if (!any && localBlockedSince >= 0) {
+            } else {
                 if (waitingSince != 0) {
                     waitingSince += t - Math.max(waitingSince, localBlockedSince);
                 }
-                localPausedNanos += t - localBlockedSince;
                 localBlockedSince = -1;
                 receiver.receiveBlocked(lane, false, t);
+            }
+        }
+
+        int floorBytes() {
+            return receiveSentinel ? READ_SENTINEL : READ_CHUNK_MIN;
+        }
+
+        void chunkCharged(ByteBuf chunk, int fresh) {
+            if (fresh > 0) {
+                chunkFresh.put(chunk, fresh);
             }
         }
 
@@ -1604,10 +1702,10 @@ public final class LaneSession {
             int growth = wireBytes - (partial == null ? 0 : (int) charged);
             if (!node.tryReserve(growth)) {
                 withheldForNode = true;
-                nodeBlocked(true, true);
+                refusedThisPass = true;
                 return false;
             }
-            nodeBlocked(true, false);
+            refusedThisPass = false;
             try {
                 if (partial == null) {
                     // The exact parser allocation owns this charge, not a speculative record grant.
@@ -1625,22 +1723,22 @@ public final class LaneSession {
             return true;
         }
 
-        /** Charge the tiny split length prefix too; a refusal never advances another read. */
-        boolean reservePrefix() {
+        /**
+         * Charges the split length prefix (at most five bytes) as an admitted overdraft: the bytes
+         * already arrived, and a lane that stalls on half a prefix must hold a partial whose
+         * deadline nothing local can pause. The growth is bounded by the prefix, so the overdraft
+         * per lane is a few bytes.
+         */
+        void reservePrefix() {
             if (lengthKnown || !decoder.hasPartial()) {
-                return true;
+                return;
             }
             int size = decoder.partialWireBytes();
             int growth = size - (int) charged;
             if (growth == 0) {
-                return true;
+                return;
             }
-            if (!node.tryReserve(growth)) {
-                withheldForNode = true;
-                nodeBlocked(true, true);
-                return false;
-            }
-            nodeBlocked(true, false);
+            node.forceReserve(growth);
             try {
                 if (partial == null) {
                     partial = receiver.reservePartial(lane, size, growth, takeWaitingSince(), now());
@@ -1653,7 +1751,6 @@ public final class LaneSession {
             }
             charged = size;
             waitingSince = 0;
-            return true;
         }
 
         boolean sentinel() {
@@ -1661,10 +1758,11 @@ public final class LaneSession {
         }
 
         void shrinkIdleGrant(long t) {
-            if (granted && grantedBytes > READ_CHUNK_MIN && t - lastReadAt >= TimeUnit.SECONDS.toNanos(1)) {
-                int excess = grantedBytes - READ_CHUNK_MIN;
-                grantedBytes = READ_CHUNK_MIN;
-                nextReadBytes = READ_CHUNK_MIN;
+            if (granted && growthHeld > 0 && t - lastReadAt >= TimeUnit.SECONDS.toNanos(1)) {
+                int excess = growthHeld;
+                growthHeld = 0;
+                grantedBytes = floorBytes();
+                nextReadBytes = floorBytes();
                 ReadGrantAllocator.limit(channel, grantedBytes);
                 node.release(excess);
             }
@@ -1676,47 +1774,62 @@ public final class LaneSession {
         }
 
         /**
-         * Takes the node read grant for the next {@code channel.read()} (13.12/13.13). The bytes a
-         * read can deliver are reserved before the read, so no legal record's chunk is ever fatal
-         * at the node level; a refusal withholds the read instead (non-fatal) and is retried by the
-         * tick. The arriving chunk converts the grant into the chunk's charge, and the unused part
-         * goes back.
+         * Sets the bound of the next {@code channel.read()} (13.12/13.13). The lane's floor is its own
+         * reservation, taken once and never refused, so the read can always be issued: it is capped
+         * at the floor plus the growth the node grants right now, and a refused growth means a
+         * smaller read, never a wait. The arriving chunk is paid from the floor and, above it, from
+         * that growth; the unused growth goes back.
          */
         boolean grantRead() {
             if (granted) {
                 return true;
             }
-            int size = sentinel() ? READ_SENTINEL : nextReadBytes;
-            if (!node.tryReserve(size)) {
-                withheldForNode = true;
-                nodeBlocked(false, true);
-                return false;
+            if (!floorHeld) {
+                node.forceReserve(floorBytes());
+                floorHeld = true;
             }
-            nodeBlocked(false, false);
+            int growth = (receiveSentinel ? floorBytes() : nextReadBytes) - floorBytes();
+            if (growth > 0 && !node.tryReserve(growth)) {
+                growth = 0;
+            }
             granted = true;
-            grantedBytes = size;
-            ReadGrantAllocator.limit(channel, size);
+            growthHeld = growth;
+            grantedBytes = floorBytes() + growth;
+            ReadGrantAllocator.limit(channel, grantedBytes);
             return true;
         }
 
-        /** Gives an unused read grant back: the lane stopped reading or the session closed. */
+        /** Gives the unused growth of a read bound back: the session closed. */
         void releaseGrant() {
             if (granted) {
                 granted = false;
-                node.release(grantedBytes);
+                int growth = growthHeld;
+                growthHeld = 0;
+                node.release(growth);
+            }
+        }
+
+        /** Gives the lane's floor back, once, when the session closes. */
+        void releaseFloor() {
+            if (floorHeld) {
+                floorHeld = false;
+                node.release(floorBytes());
             }
         }
 
         /**
          * Releases one chunk that was charged when it arrived and is now consumed or discarded:
-         * gives its bytes back to the node budget and frees it. A chunk's reader index never moves
-         * while it is parsed (the decoder works on a {@code nioBuffer} view), so the amount
-         * released is exactly the amount charged. The buffer is freed even when the release fails:
-         * nothing else will ever free it, so a throwing release must not leak it.
+         * gives back the fresh node bytes reserved for it (none when the lane's floor paid for it)
+         * and frees it. A chunk's reader index never moves while it is parsed (the decoder works on
+         * a {@code nioBuffer} view). The buffer is freed even when the release fails: nothing else
+         * will ever free it, so a throwing release must not leak it.
          */
         void releaseChunk(ByteBuf chunk) {
             try {
-                node.release(chunk.readableBytes());
+                Integer fresh = chunkFresh.remove(chunk);
+                if (fresh != null) {
+                    node.release(fresh);
+                }
             } finally {
                 chunk.release();
             }
@@ -1752,6 +1865,7 @@ public final class LaneSession {
          */
         void releaseInbound() {
             quietly(this::releaseGrant, "read grant");
+            quietly(this::releaseFloor, "read floor");
             ByteBuf queued;
             while ((queued = inbound.poll()) != null) {
                 final ByteBuf chunk = queued;
@@ -1795,27 +1909,36 @@ public final class LaneSession {
             }
             int bytes = buf.readableBytes();
             try {
+                int fresh;
                 if (granted) {
-                    // 13.12: the read was granted in advance, so this chunk's bytes are already
-                    // reserved. Take the chunk's own charge first and give the grant up only once
-                    // that has succeeded: a refusal has to leave the current reservation owned by
-                    // this lane, or closing cannot return it and the node budget leaks it.
-                    if (bytes > grantedBytes) {
-                        chargeChunk(bytes - grantedBytes);
+                    // 13.12: the read was bounded in advance, so its bytes are already paid for: by
+                    // the lane's floor up to its size, by the growth reserved for this read above it.
+                    // The allocator caps a read at grantedBytes, so more is a local invariant
+                    // violation (0x2, never 0x11); the extra is charged here and a refusal fails.
+                    // Everything is taken before anything is given up, so a refusal leaves the
+                    // reservations owned by this lane for the close to return.
+                    int extra = bytes > grantedBytes ? bytes - grantedBytes : 0;
+                    if (extra > 0) {
+                        chargeChunk(extra);
                     }
+                    int usedGrowth = Math.min(growthHeld, Math.max(0, bytes - floorBytes()));
+                    fresh = usedGrowth + extra;
                     nextReadBytes = bytes == grantedBytes ? Math.min(READ_CHUNK, grantedBytes * 2)
                             : Math.max(READ_CHUNK_MIN, grantedBytes / 2);
                     lastReadAt = now();
                     granted = false;
-                    if (bytes < grantedBytes) {
-                        node.release(grantedBytes - bytes);
+                    int unusedGrowth = growthHeld - usedGrowth;
+                    growthHeld = 0;
+                    if (unusedGrowth > 0) {
+                        node.release(unusedGrowth);
                     }
                 } else {
-                    // A chunk can only arrive without a grant if it was read before this rule, as a
-                    // session's activation leftover does: charge it, and close only if bytes that
-                    // already arrived cannot fit (13.12).
+                    // A chunk can only arrive without a bound if it was read before this rule:
+                    // charge it, and close only if bytes that already arrived cannot fit (13.12).
                     chargeChunk(bytes);
+                    fresh = bytes;
                 }
+                chunkCharged(buf, fresh);
             } catch (Throwable t) {
                 buf.release();
                 failFrom(t);

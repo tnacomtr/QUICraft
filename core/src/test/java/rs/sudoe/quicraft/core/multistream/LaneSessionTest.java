@@ -1444,6 +1444,105 @@ class LaneSessionTest {
         }
     }
 
+    private static LaneRig.Config clockedRawServer(ReceiveBudget node, AtomicLong clock) {
+        LaneRig.Config config = rawServerConfig(node);
+        config.serverTiming = new LaneSession.Timing(clock::get, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
+        return config;
+    }
+
+    @Test
+    void aWaitThatClearedLeavesThePeersStallToItsOwnDeadline() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(512 * 1024);
+        AtomicLong clock = new AtomicLong(5_000_000_000L);
+        try (LaneRig rig = LaneRig.start(clockedRawServer(node, clock))) {
+            openRawServerLanes(rig);
+            long held = node.available();
+            assertTrue(node.tryReserve(held));
+            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, 200_000));
+            LaneLoopback.write(rig.clientControl, Arrays.copyOfRange(record, 0, 100));
+            sleep(300);
+            clock.addAndGet(5_000_000_000L);
+            sleep(100);
+            assertFalse(rig.serverGame.closed.isDone(), "the local wait pauses the deadline");
+            node.release(held);
+            assertTrue(LaneRig.await(() -> snapshotIs(rig.server, 0, 1) && node.available() < 330_000, 10000),
+                    "the allocation was granted once the node had room: " + node.available());
+            // The peer now stalls with the rest of the record unsent: its own deadline runs again,
+            // from the moment the local wait ended.
+            clock.addAndGet(9_000_000_000L);
+            sleep(200);
+            assertFalse(rig.serverGame.closed.isDone(), "not yet 10 seconds after the wait ended");
+            clock.addAndGet(2_000_000_000L);
+            closedWith(rig.serverGame, 0x11, false);
+        }
+    }
+
+    @Test
+    void peersThatStallInsideChargedRecordsAreClosedWhileTheNodeIsFullAndHonestConnectionsRecover() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(6L << 20);
+        AtomicLong clock = new AtomicLong(5_000_000_000L);
+        try (LaneRig attacker = LaneRig.start(clockedRawServer(node, clock));
+                LaneRig honest = LaneRig.start(clockedRawServer(node, clock))) {
+            openRawServerLanes(attacker);
+            openRawServerLanes(honest);
+            byte[] big = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, 1_500_000));
+            LaneLoopback.write(attacker.clientControl, Arrays.copyOfRange(big, 0, 200));
+            assertTrue(LaneRig.await(() -> snapshotIs(attacker.server, 0, 1), 10000), "the record is charged");
+            sleep(300);
+            // The node fills up (other connections), then the attacker sends one more fragment and
+            // stalls: its next read must not depend on fresh node bytes.
+            long held = node.available();
+            assertTrue(node.tryReserve(held));
+            LaneLoopback.write(attacker.clientControl, Arrays.copyOfRange(big, 200, 400));
+            sleep(300);
+            byte[] ok = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, 500_000));
+            LaneLoopback.write(honest.clientControl, ok);
+            sleep(300);
+            assertEquals(0, honest.serverGame.packetCount(), "the honest record waits for node room");
+            clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + 1_000_000_000L);
+            closedWith(attacker.serverGame, 0x11, false);
+            assertTrue(LaneRig.await(() -> honest.serverGame.packetCount() == 1, 30000),
+                    "the honest connection recovers when the attacker's charge is released: "
+                            + honest.serverGame.closed.getNow(null));
+            assertFalse(honest.serverGame.closed.isDone());
+            node.release(held);
+        }
+    }
+
+    @Test
+    void aConnectionWaitingOnItsNodeForLongerThanTheCapClosesLocallyNotWith0x11() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(512 * 1024);
+        AtomicLong clock = new AtomicLong(5_000_000_000L);
+        try (LaneRig rig = LaneRig.start(clockedRawServer(node, clock))) {
+            openRawServerLanes(rig);
+            long held = node.available();
+            assertTrue(node.tryReserve(held));
+            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, 200_000));
+            LaneLoopback.write(rig.clientControl, Arrays.copyOfRange(record, 0, 100));
+            sleep(300);
+            clock.addAndGet(20_000_000_000L);
+            sleep(300);
+            assertFalse(rig.serverGame.closed.isDone(), "within the cap the wait only pauses the deadline");
+            clock.addAndGet(11_000_000_000L);
+            closedWith(rig.serverGame, LaneSession.CLOSE_INTERNAL_ERROR, false);
+            node.release(held);
+        }
+        assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000), "closing returns every charge");
+    }
+
+    @Test
+    void anActivationLeftoverBeyondTheOverdraftBoundIsALocalFailure() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(1 << 20);
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        try (LaneRig rig = LaneRig.start(config)) {
+            rig.activate(rig.server, java.nio.ByteBuffer.wrap(new byte[64 * 1024 + 1]));
+            closedWith(rig.serverGame, LaneSession.CLOSE_INTERNAL_ERROR, false);
+        }
+        assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000), "nothing stays charged");
+    }
+
     @Test
     void locallyWithheldPreamblesCanOpenAfterTheOpenDeadline() throws Exception {
         ReceiveBudget node = ReceiveBudget.bounded(512 * 1024);
