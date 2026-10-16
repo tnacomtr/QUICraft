@@ -9,7 +9,7 @@ import rs.sudoe.quicraft.core.binding.BindingMessage;
 
 /**
  * The {@code quicraft:binding} configuration payload of docs/protocol.md 12.8 as raw bytes; core's
- * {@code BindingMessage} validates the exact 103-byte layout. It exists only so the bytes survive
+ * {@code BindingMessage} validates the exact 104-byte layout. It exists only so the bytes survive
  * decoding (vanilla drops the bytes of unknown payloads): an adapter pipeline handler takes it
  * off the wire on the connection's event loop, so no packet listener, mod or plugin ever sees one.
  */

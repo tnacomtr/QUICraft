@@ -9,7 +9,7 @@ import java.security.NoSuchAlgorithmException;
  * The binding transcript, docs/protocol.md §12.7:
  *
  * <pre>
- * T = SHA256("quicraft/3 binding v2" || u32(protocol_number) || u8(mode) || F || R)
+ * T = SHA256("quicraft/3 binding v2" || u32(protocol_number) || u8(mode) || F || R || u8(N))
  * </pre>
  *
  * {@code mode} is 1 for online and 0 for offline; {@code F} is the SHA-256 of the leaf certificate
@@ -24,6 +24,12 @@ public final class BindingTranscript {
 
     /** Computes {@code T} for the given inputs. {@code mode} is 1 for online and 0 for offline. */
     public static byte[] compute(int protocolNumber, int mode, byte[] fingerprint, byte[] routing) {
+        return compute(protocolNumber, mode, fingerprint, routing, 1);
+    }
+
+    /** Computes T including the selected shard count (12.7). */
+    public static byte[] compute(int protocolNumber, int mode, byte[] fingerprint, byte[] routing, int n) {
+        if (n < 1 || n > 6) throw new IllegalArgumentException("shard count must be 1..6");
         checkMode(mode);
         checkDigest(fingerprint, "fingerprint");
         checkDigest(routing, "routing");
@@ -37,6 +43,7 @@ public final class BindingTranscript {
             digest.update((byte) mode);
             digest.update(fingerprint);
             digest.update(routing);
+            digest.update((byte) n);
             return digest.digest();
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 is required by every Java platform", e);

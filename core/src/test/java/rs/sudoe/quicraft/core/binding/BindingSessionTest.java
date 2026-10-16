@@ -203,7 +203,7 @@ class BindingSessionTest {
         // two messages from the client and three from the server.
         assertEquals(2, client.adapter.sent.size());
         assertEquals(3, server.adapter.sent.size());
-        assertArrayEquals(ZEROS, Arrays.copyOfRange(server.adapter.sent.get(0), 71, 103),
+        assertArrayEquals(ZEROS, Arrays.copyOfRange(server.adapter.sent.get(0), 72, 104),
                 "OFFER's tag is all zeros");
     }
 
@@ -218,7 +218,7 @@ class BindingSessionTest {
         assertTrue(client.session.isActivated());
         assertTrue(server.session.isActivated());
         for (byte[] payload : server.adapter.sent) {
-            assertArrayEquals(ZEROS, Arrays.copyOfRange(payload, 71, 103), "12.19: mode 0 tags are zeros");
+            assertArrayEquals(ZEROS, Arrays.copyOfRange(payload, 72, 104), "12.19: mode 0 tags are zeros");
         }
     }
 
@@ -256,10 +256,10 @@ class BindingSessionTest {
         byte[] offer = BindingMessage.offer(BindingTestData.MODE_ONLINE,
                 BindingTestData.PROTOCOL_NUMBER, F, R).encode();
 
-        byte[] shortPayload = Arrays.copyOf(offer, 102);
+        byte[] shortPayload = Arrays.copyOf(offer, 103);
         assertBindingFailure(shortPayload);
 
-        byte[] trailing = Arrays.copyOf(offer, 104);
+        byte[] trailing = Arrays.copyOf(offer, 105);
         assertBindingFailure(trailing);
 
         byte[] badVersion = offer.clone();
@@ -592,7 +592,7 @@ class BindingSessionTest {
         assertNull(secretOf(endpoint.session), "and its copy of S is gone");
         assertEquals(-1, endpoint.adapter.failCode,
                 "a dead channel needs no 0x10: nothing is reported");
-        assertDoesNotThrow(() -> endpoint.session.onPayload(new byte[103]));
+        assertDoesNotThrow(() -> endpoint.session.onPayload(new byte[104]));
     }
 
     /** Reads the session's private copy of {@code S}, so a wipe is asserted and not assumed. */
@@ -687,7 +687,7 @@ class BindingSessionTest {
     void aFailureReasonCarriesNoSecretMaterial() {
         Endpoint endpoint = client();
         endpoint.session.onConfigurationEntered(ENTERED);
-        endpoint.session.onPayload(new byte[103]);
+        endpoint.session.onPayload(new byte[104]);
         assertEquals(Protocol.CLOSE_BINDING_FAILURE, endpoint.adapter.failCode);
         String reason = endpoint.adapter.failReason;
         assertFalse(reason.contains(BindingTestData.hex(S)), "no shared secret");
