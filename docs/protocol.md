@@ -1621,8 +1621,11 @@ position extraction. Those implementations must change together before this revi
       blocked record is complete or held in excess.
        **Repeated unseen-prerequisite closes (the only resource-close failure-cache write):**
        per (address,fingerprint), regardless of which direction carried the prerequisite, the
-       client counts ONLY (a) received closes carrying exactly the `unseen-prerequisite`
-       reason phrase and (b) its own blocked-head timer expiries under the same conditions
+       client counts ONLY (a) received application CONNECTION_CLOSE frames (type `0x1d`) with
+       the local/resource code and exactly the `unseen-prerequisite` reason phrase, received
+       while `/3` is active after SERVER_SWITCH has verified (the phrase on any other frame
+       type, error code or connection state is ignored, and that close follows 12.14's
+       pre-verification rules), and (b) its own blocked-head timer expiries under the same conditions
        (no recorded stall time consumed, nothing locally withheld). Generic resource closes,
        pool refusals and shedding never count and never write the cache. After two counted
        events within 10 minutes the client writes a failure-cache entry at the SHORTEST
@@ -1811,7 +1814,8 @@ position extraction. Those implementations must change together before this revi
      backoff entry is written. Negative tests: two generic resource closes (shedding) within
      10 minutes write no entry and the third attempt still uses QUIC; an expiry whose wait
      consumed recorded tick-stall time closes without the phrase; an existing longer
-     non-resource entry is not shortened. Verify the server warning is rate-limited per IP under the existing limits.
+     non-resource entry is not shortened; the phrase on a pre-handshake, pre-verification or
+     transport-type (`0x1c`) close is not counted. Verify the server warning is rate-limited per IP under the existing limits.
      Phase 5
     requires measured loss improvement over TCP AND single-stream and security review;
     this draft makes no performance or completed-review claim.
