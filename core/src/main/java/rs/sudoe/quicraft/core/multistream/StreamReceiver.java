@@ -3,9 +3,10 @@ package rs.sudoe.quicraft.core.multistream;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.function.LongSupplier;
-
 
 /**
  * Receiver-side ordering policy for the N+2 streams of one direction (protocol.md 13.10, 13.12,
@@ -17,8 +18,14 @@ import java.util.function.LongSupplier;
  *   <li>{@code Q} (enqueued): set when a validated, ready head is handed to the executor. It only
  *       drives timeout accounting; it never releases a dependency, frees a slot or changes epochs.</li>
  *   <li>{@code D} (applied): set after the game's serial handler has applied the unit. Only D
- *       releases dependencies, frees the stream's slot and advances the epoch at a boundary.</li>
+ *       releases dependencies, frees the stream's slot and, for a transition record, advances the
+ *       receive epoch by exactly one (13.18).</li>
  * </ul>
+ *
+ * <p>A head's blocked-head timer runs only while the head is dependency-blocked (13.10): it starts
+ * when a head is admitted blocked, and stops once the head becomes ready or reaches Q. Locally
+ * withheld prerequisites are recorded per (stream, sequence) and only matter for the expiring head's
+ * own prerequisite chain.
  *
  * <p>Protocol violations are returned as {@link ReceiveClose} values with code 0x11, never thrown.
  * Refusals (a stream already holds its head) are returned as {@link Admission#busy()}. Nothing here
@@ -31,6 +38,9 @@ public final class StreamReceiver {
     private static final int KIND_END = RecordCodec.KIND_END;
     private static final int KIND_ACK_JOIN = 2;
     private static final int KIND_BATCH_JOIN = 3;
+    /** Largest epoch value on the wire: minimal signed-31-bit VarInt (13.4, 13.18). */
+    private static final long MAX_EPOCH = 2147483647L;
+    private static final int SEQUENCE_BITS = 40;
 
     /** Injected checks the policy cannot make alone: shard placement and fence validation (13.10, 13.18). */
     public interface Validator {
@@ -106,10 +116,10 @@ public final class StreamReceiver {
     private final ReceiveSlots slots;
     private final Validator validator;
     private final LongSupplier clock;
+    private final Set<Long> withheld = new HashSet<Long>();
     private long epoch;
-    private long boundaryEpoch;
-    private boolean boundaryPending;
-    private boolean locallyWithheld;
+    private boolean transitionPending;
+    private boolean stalled;
 
     /**
      * @param chunks negotiated chunk count N, 1..6
@@ -169,26 +179,28 @@ public final class StreamReceiver {
         if (closesCycle(record)) {
             return Admission.violation("provable dependency cycle through stream " + stream);
         }
-        if (head[stream] != null) {
-            return Admission.busy();
-        }
         if (wireBytes > ReceiveSlots.BYTES_PER_STREAM || recordCount > ReceiveSlots.RECORDS_PER_STREAM
                 || recordCount < 0 || wireBytes < 0) {
             return Admission.violation("unit exceeds the stream slot on stream " + stream);
         }
+        if (head[stream] != null) {
+            return Admission.busy();
+        }
         if (!slots.admitHead(stream, wireBytes, recordCount)) {
             return Admission.busy();
         }
-        BlockedHeadTimer timer = new BlockedHeadTimer(clock, true);
-        Unit unit = new Unit(record, route, timer);
+        Unit unit = new Unit(record, route, new BlockedHeadTimer(clock, true));
         head[stream] = unit;
         admitted[stream] = record.sequence();
         if (route.epochChange()) {
-            boundaryPending = true;
-            boundaryEpoch = record.epoch();
+            transitionPending = true;
         }
-        locallyWithheld = false;
-        timer.start();
+        if (!ready(unit)) {
+            unit.timer.start();
+            if (stalled) {
+                unit.timer.stallStarted();
+            }
+        }
         return Admission.admitted();
     }
 
@@ -237,7 +249,7 @@ public final class StreamReceiver {
 
     /**
      * Records that the game's serial handler applied the enqueued head (D). Releases the stream's slot,
-     * commits D and, for an epoch-boundary record, opens the new epoch (13.18).
+     * commits D and, for a transition record, advances the epoch by exactly one (13.18).
      */
     public void applied(int stream, long sequence) {
         Unit unit = currentHead(stream, sequence);
@@ -247,36 +259,43 @@ public final class StreamReceiver {
         head[stream] = null;
         applied[stream] = sequence;
         slots.releaseHead(stream);
+        withheld.removeIf(key -> (key >>> SEQUENCE_BITS) == stream && (key & SEQUENCE_MASK) <= sequence);
         if (unit.route.epochChange()) {
-            epoch = unit.record.epoch();
-            boundaryPending = false;
+            epoch = epoch + 1;
+            transitionPending = false;
         }
+        stopTimersOfReadyHeads();
     }
 
     /**
-     * Checks every held head whose blocked-head timer has expired (13.10, 13.12). Returns the 0x12
-     * close to send, or null. A head expires only before its Q commit.
+     * Checks every held head that is dependency-blocked and not yet at Q whose timer has expired
+     * (13.10, 13.12). Returns the 0x12 close to send, or null. A ready head never expires.
      */
     public ReceiveClose expiredWait() {
         for (int stream = 0; stream < streams; stream++) {
             Unit unit = head[stream];
-            if (unit != null && !unit.enqueued && unit.timer.expired()) {
-                return ReceiveClose.blockedExpiry(unit.timer.stallConsumed(), locallyWithheld);
+            if (unit != null && !unit.enqueued && !ready(unit) && unit.timer.expired()) {
+                return ReceiveClose.blockedExpiry(unit.timer.stallConsumed(), chainWithheld(unit.record));
             }
         }
         return null;
     }
 
     /**
-     * Records that a prerequisite was withheld locally (node pool, read grant or decode refusal). It
-     * blocks the 0x12 phrase for the current wait (13.12).
+     * Records that a prerequisite record was withheld locally (node pool, read grant or decode refusal).
+     * It blocks the 0x12 phrase only for an expiring head whose prerequisite chain includes it (13.12).
      */
-    public void markLocallyWithheld() {
-        locallyWithheld = true;
+    public void markLocallyWithheld(int stream, long sequence) {
+        checkStream(stream);
+        withheld.add(key(stream, sequence));
     }
 
-    /** Forwards a recorded game-executor tick stall to every running blocked-head timer (LaneGame). */
+    /**
+     * Forwards a recorded game-executor tick stall (LaneGame). Heads admitted while it continues start
+     * excluded too, until {@link #stallEnded()} (13.10).
+     */
     public void stallStarted() {
+        stalled = true;
         for (Unit unit : head) {
             if (unit != null) {
                 unit.timer.stallStarted();
@@ -286,6 +305,7 @@ public final class StreamReceiver {
 
     /** Forwards the end of a recorded game-executor tick stall (LaneGame). */
     public void stallEnded() {
+        stalled = false;
         for (Unit unit : head) {
             if (unit != null) {
                 unit.timer.stallEnded();
@@ -305,12 +325,12 @@ public final class StreamReceiver {
         return enqueued[stream];
     }
 
-    /** Returns the current epoch of this direction, starting at 0 (13.18). */
+    /** Returns the current receive epoch of this direction, starting at 0 (13.18). */
     public long epoch() {
         return epoch;
     }
 
-    /** Returns the epoch-boundary record slot, reserving decoded workspace for execution (13.12). */
+    /** Reserves decoded workspace before allocation; false means fail closed (13.12). */
     public boolean reserveWorkspace(long bytes) {
         return slots.reserveWorkspace(bytes);
     }
@@ -325,22 +345,35 @@ public final class StreamReceiver {
         return slots;
     }
 
+    /**
+     * Epoch rules (13.18). A transition record carries the OLD epoch and advances it on apply; it may
+     * not overlap another pending transition. Other records may be at the current epoch or at exactly
+     * one ahead (early arrival, opaque until the transition applies); anything further is future.
+     */
     private Admission checkEpoch(Record record, ReceiveRoute route) {
         long recordEpoch = record.epoch();
+        if (recordEpoch < 0 || recordEpoch > MAX_EPOCH) {
+            return Admission.violation("epoch " + recordEpoch + " outside the signed-31-bit range");
+        }
         if (recordEpoch < epoch) {
             return Admission.violation("stale epoch " + recordEpoch + " < " + epoch);
         }
-        if (recordEpoch == epoch) {
-            return route.epochChange() ? Admission.violation("epoch boundary does not advance the epoch") : null;
+        if (route.epochChange()) {
+            if (recordEpoch != epoch) {
+                return Admission.violation("transition must carry the old epoch " + epoch);
+            }
+            if (transitionPending) {
+                return Admission.violation("second transition before the first applied");
+            }
+            if (epoch == MAX_EPOCH) {
+                return Admission.violation("epoch exhausted");
+            }
+            return null;
         }
-        if (recordEpoch != epoch + 1) {
+        if (recordEpoch > epoch + 1) {
             return Admission.violation("future epoch " + recordEpoch);
         }
-        if (route.epochChange()) {
-            return boundaryPending ? Admission.violation("second epoch boundary before the first applied") : null;
-        }
-        return boundaryPending && boundaryEpoch == recordEpoch ? null
-                : Admission.violation("future epoch " + recordEpoch + " without a boundary");
+        return null;
     }
 
     private Admission checkRoute(int stream, Record record, ReceiveRoute route) {
@@ -401,17 +434,22 @@ public final class StreamReceiver {
     }
 
     /**
-     * Provable-cycle check (13.10). Starting from the candidate's explicit dependencies, follows the
-     * chain of waits: an unresolved dependency on stream t at sequence q waits on every earlier record
-     * of t, and on t's held head when it is reached. A cycle exists iff the chain reaches the
-     * candidate's own stream at or beyond the candidate's sequence. Absent records are not proof of
-     * impossibility and never close the connection here.
+     * Provable-cycle check (13.10): a cycle exists iff the candidate's wait chain reaches its own stream
+     * at or beyond the candidate's sequence. Absent records are not proof of impossibility.
      */
     private boolean closesCycle(Record candidate) {
+        return chainReach(candidate)[candidate.streamIndex()] >= candidate.sequence();
+    }
+
+    /**
+     * Returns, for each stream, the highest sequence that the wait chain of {@code root} depends on.
+     * Dependencies and the implicit own-stream chain below them are followed through held heads.
+     */
+    private long[] chainReach(Record root) {
         long[] reach = new long[streams];
         boolean[] expanded = new boolean[streams];
         Deque<Record> work = new ArrayDeque<Record>();
-        work.add(candidate);
+        work.add(root);
         while (!work.isEmpty()) {
             Record node = work.poll();
             for (Record.Dependency dependency : node.dependencies()) {
@@ -421,22 +459,38 @@ public final class StreamReceiver {
                     continue;
                 }
                 reach[t] = q;
-                if (t == candidate.streamIndex() && q >= candidate.sequence()) {
-                    return true;
-                }
                 if (head[t] != null && !expanded[t]) {
                     expanded[t] = true;
                     work.add(head[t].record);
                 }
             }
         }
+        return reach;
+    }
+
+    /**
+     * Reports whether any prerequisite on the root's chain was withheld locally: the root itself, or a
+     * withheld (stream, sequence) that the chain depends on and that is not yet applied.
+     */
+    private boolean chainWithheld(Record root) {
+        if (withheld.contains(key(root.streamIndex(), root.sequence()))) {
+            return true;
+        }
+        long[] reach = chainReach(root);
+        for (Long entry : withheld) {
+            int t = (int) (entry >>> SEQUENCE_BITS);
+            long x = entry & SEQUENCE_MASK;
+            if (x > applied[t] && x <= reach[t]) {
+                return true;
+            }
+        }
         return false;
     }
 
-    /** A head is ready when every dependency is at or below D and the epoch has opened (13.10, 13.18). */
+    /** A head is ready when the transition it needs has executed and every dependency is at or below D. */
     private boolean ready(Unit unit) {
         Record record = unit.record;
-        if (record.epoch() > epoch && !unit.route.epochChange()) {
+        if (record.epoch() > epoch) {
             return false;
         }
         for (Record.Dependency dependency : record.dependencies()) {
@@ -446,6 +500,21 @@ public final class StreamReceiver {
         }
         return true;
     }
+
+    /** Stops the blocked-head timer of every held head that has become ready (13.10). */
+    private void stopTimersOfReadyHeads() {
+        for (Unit unit : head) {
+            if (unit != null && !unit.enqueued && ready(unit)) {
+                unit.timer.stop();
+            }
+        }
+    }
+
+    private static long key(int stream, long sequence) {
+        return ((long) stream << SEQUENCE_BITS) | sequence;
+    }
+
+    private static final long SEQUENCE_MASK = (1L << SEQUENCE_BITS) - 1;
 
     private Unit currentHead(int stream, long sequence) {
         checkStream(stream);
