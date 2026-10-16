@@ -431,9 +431,11 @@ public final class LaneSession {
 
     /**
      * Test hook: true once this session has both of its auxiliary lanes open (13.3), i.e. the
-     * peer's preamble has been parsed on each; call on the loop. A test that drives a lane must
-     * wait for this, because a peer-created stream can otherwise arrive during activation and be
-     * refused with 0x11.
+     * peer's preamble has been parsed on each; call on the loop.
+     *
+     * <p>Nothing on the CONTROL lane needs this: 12.12 lets a server start records right after its
+     * own activation, and a record read before this session activates is handed over as the
+     * activation leftover (12.13, 13.14), not refused. It is only about the auxiliary lanes.
      */
     boolean auxiliaryLanesOpened() {
         return activated && !awaitingPeerStreams();
