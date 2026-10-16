@@ -529,6 +529,30 @@ class LaneSessionTest {
         return four;
     }
 
+    /**
+     * Fills {@code node} the way a peer's data does: {@code count} whole records written raw into a
+     * (session-less client) rig's REALTIME lane, where the receiver holds them because its game
+     * never applies them. Nothing here goes through a sender, so the charge is exactly the retained
+     * records, whatever the node budget does on the send side of other connections.
+     */
+    private static LaneRig holdRawRecords(ReceiveBudget node, int frameBytes, int count) throws Exception {
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        config.clientSession = false;
+        config.serverTiming = new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
+        LaneRig rig = LaneRig.start(config);
+        rig.serverGame.autoApply = false;
+        openRawServerLanes(rig);
+        for (int i = 1; i <= count; i++) {
+            // CONTROL records have no unprovided auxiliary predecessor, and each carries the
+            // previous CONTROL sequence as its own dependency.
+            LaneLoopback.write(rig.clientControl,
+                    RecordCodec.encodeGame(i, i - 1, 0, 0, LaneRig.frame(LaneRig.SPAWN, frameBytes)));
+        }
+        return rig;
+    }
+
     // --- Ordering over real streams (13.9-13.11).
 
     @Test
@@ -1331,14 +1355,8 @@ class LaneSessionTest {
             QuicStreamChannel four = openRawServerLanes(rigB);
 
             // Another connection of the same node holds space, so the record grant cannot be taken.
-            LaneRig.Config holder = new LaneRig.Config();
-            holder.nodeBudget = node;
-            try (LaneRig rigA = LaneRig.start(holder)) {
-                rigA.activateBoth();
-                rigA.clientGame.autoApply = false;
-                for (int i = 0; i < 3; i++) {
-                    rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 1_500_000));
-                }
+            LaneRig holder = holdRawRecords(node, 1_500_000, 3);
+            try {
                 assertTrue(LaneRig.await(() -> node.available() < (6L << 20) - 4_000_000L, 30000),
                         "the holder charged the node budget: " + node.available());
                 // The starved lane never gets to parse its first prefix byte; 13.12's deadline still
@@ -1350,7 +1368,9 @@ class LaneSessionTest {
                 clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + 1_000_000_000L);
                 closedWith(rigB.serverGame, 0x11, false);
                 sawClose(rigB.net.clientSawClose, 0x11);
-                assertFalse(rigA.clientGame.closed.isDone(), "the holder is never evicted");
+                assertFalse(holder.serverGame.closed.isDone(), "the holder is never evicted");
+            } finally {
+                holder.close();
             }
         }
     }
@@ -1367,16 +1387,10 @@ class LaneSessionTest {
             LaneLoopback.write(four, record[0]);
             assertTrue(LaneRig.await(() -> snapshotIs(rigB.server, 0, 1), 10000), "the record started");
 
-            LaneRig.Config holder = new LaneRig.Config();
-            holder.nodeBudget = node;
-            LaneRig rigA = LaneRig.start(holder);
+            // A second connection of the same node holds the remaining space (13.12); what it takes
+            // is what its peer's records keep, never a send-side charge of its own.
+            LaneRig holder = holdRawRecords(node, 1_900_000, 2);
             try {
-                rigA.activateBoth();
-                rigA.clientGame.autoApply = false;
-                // rigB's record boundary already holds a MAX_RECORD_WIRE grant, so this fills the rest.
-                for (int i = 0; i < 2; i++) {
-                    rigA.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, 1_900_000));
-                }
                 assertTrue(LaneRig.await(() -> node.available() < 800_000L, 8000),
                         "the node is nearly full: " + node.available());
                 // The rest of the legal record arrives with almost no node space left: the grant
@@ -1385,13 +1399,50 @@ class LaneSessionTest {
                 assertTrue(LaneRig.await(() -> rigB.serverGame.packetCount() == 1, 30000),
                         "a legal record is admitted from its own grant");
                 assertFalse(rigB.serverGame.closed.isDone(), "node contention is not fatal for a legal record");
-                assertFalse(rigA.clientGame.closed.isDone(), "the holder is never evicted");
+                assertFalse(holder.serverGame.closed.isDone(), "the holder is never evicted");
             } finally {
-                rigA.close();
+                holder.close();
             }
         } finally {
             rigB.close();
         }
+    }
+
+    @Test
+    void stalledSendQueuesOnTwoConnectionsShareTheNodeBudgetAndReleaseItOnClose() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(1L << 20);
+        LaneRig.Config firstConfig = new LaneRig.Config();
+        firstConfig.nodeBudget = node;
+        LaneRig.Config secondConfig = new LaneRig.Config();
+        secondConfig.nodeBudget = node;
+        LaneRig first = LaneRig.start(firstConfig);
+        LaneRig second = LaneRig.start(secondConfig);
+        try {
+            first.activateBoth();
+            second.activateBoth();
+            first.client.holdWrites(Lane.CONTROL);
+            second.client.holdWrites(Lane.CONTROL);
+            assertTrue(LaneRig.await(() -> node.reserved() > 0, 10000));
+            long baseline = node.reserved();
+
+            first.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, 700_000));
+            long queuedRecordBytes = RecordCodec.encodeGame(1, 0, 0, 0,
+                    LaneRig.frame(LaneRig.SPAWN, 700_000)).length;
+            assertTrue(LaneRig.await(() -> node.reserved() >= baseline + queuedRecordBytes, 10000),
+                    "the stalled send stays charged at its record wire size: baseline=" + baseline
+                            + ", expected=" + queuedRecordBytes + ", actual=" + node.reserved()
+                            + ", closed=" + first.clientGame.closed.getNow(null));
+
+            second.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, 700_000));
+            closedWith(second.clientGame, 0x11, false);
+            assertTrue(node.reserved() > baseline,
+                    "the first connection's stalled send remains reserved after the second is refused");
+        } finally {
+            first.close();
+            second.close();
+        }
+        assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
+                "both lane sessions release receive and send reservations on close: " + node.reserved());
     }
 
     @Test

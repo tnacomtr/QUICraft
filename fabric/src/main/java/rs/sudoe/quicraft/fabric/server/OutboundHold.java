@@ -121,11 +121,12 @@ final class OutboundHold {
     }
 
     private void dispatch(OutboundUnit unit) {
-        try {
-            send(unit);
-        } finally {
-            unit.release();
-        }
+        // The lane layer charges these bytes to the same node budget itself as soon as it accepts
+        // them, so the hold gives its own reservation up first (13.12): holding both would count the
+        // same bytes twice and could refuse a send that fits. A send that then fails leaves nothing
+        // retained here, so nothing has to be given back.
+        unit.release();
+        send(unit);
     }
 
     private void send(OutboundUnit unit) {
