@@ -19,7 +19,7 @@ public interface LaneGame {
     default void onExecutorTickStallEnd() { }
 
     /** Record applied watermark signal: Q is enqueued, D is applied (13.10, 13.12). */
-    default void onRecordAppliedSignal(Lane lane, long sequence, boolean applied) { }
+    default void onRecordAppliedSignal(int logicalStream, long sequence, boolean applied) { }
 
     /**
      * Decodes one dependency-eligible GAME body: exactly one Minecraft VarInt-length frame,
