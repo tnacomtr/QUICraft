@@ -107,9 +107,61 @@ class AckJoinTrackerTest {
         acks.assignedPending(9L, 2, 1);
 
         acks.create(2, 4, 0);
-        assertEquals(0, acks.expire(AckJoinTracker.DEADLINE_NANOS - 1));
-        assertEquals(1, acks.expire(AckJoinTracker.DEADLINE_NANOS));
-        assertEquals(2, acks.droppedCount());
+        assertEquals(0, acks.expire(AckJoinTracker.DEADLINE_NANOS - 1, 0, null).size());
+        assertEquals(1, acks.expire(AckJoinTracker.DEADLINE_NANOS, 0, null).size(),
+                "the fully covered ack resolves at its deadline instead of being dropped");
+        assertEquals(1, acks.droppedCount());
+        assertEquals(0, acks.pendingCount());
+    }
+
+    @Test void deadlineResolvesCompleteAcksAndDropsOnlyUnassignedOnes() {
+        AckJoinTracker acks = new AckJoinTracker();
+        acks.create(1, 4, 100);
+        acks.coverPending(1, 50L);
+        acks.assignedPending(50L, 3, 6);
+        acks.create(2, 4, 100);
+        acks.coverPending(2, 51L);
+        long deadline = 100 + AckJoinTracker.DEADLINE_NANOS;
+        List<AckJoinTracker.Ready> ready = acks.expire(deadline, 4, null);
+        assertEquals(1, ready.size(), "the complete ack is resolved at the deadline");
+        assertEquals(1L, ready.get(0).id());
+        assertEquals(expect(0, 4, 3, 6), pairs(ready.get(0).dependencies()));
+        assertEquals(1, acks.droppedCount(), "only the unassigned ack is dropped");
+        assertEquals(0, acks.pendingCount());
+        assertEquals(0, acks.pendingBytes());
+    }
+
+    @Test void completeAckResolvesAtTheDeadlineThroughTake() {
+        AckJoinTracker acks = new AckJoinTracker();
+        acks.create(7, 4, 0);
+        acks.coverPending(7, 70L);
+        acks.assignedPending(70L, 2, 9);
+        AckJoinTracker.Ready ready = acks.take(7, AckJoinTracker.DEADLINE_NANOS, 0, null);
+        assertNotNull(ready, "complete coverage is not discarded by the deadline");
+        assertEquals(0, acks.droppedCount());
+    }
+
+    @Test void ackProducerIsBackpressuredByFifoLimitAndResumesAfterRelease() {
+        AckJoinTracker acks = new AckJoinTracker();
+        StreamSequencer sequencer = new StreamSequencer(2);
+        // Outbound FIFO stalled: every covered update is queued but not yet assigned to the wire.
+        long token = 0;
+        int refused = -1;
+        for (int i = 1; i <= AckJoinTracker.MAX_ENTRIES + 1; i++) {
+            if (!acks.create(i, 1, 0)) {
+                refused = i;
+                break;
+            }
+            acks.coverPending(i, ++token);
+        }
+        assertEquals(AckJoinTracker.MAX_ENTRIES + 1, refused, "the producer is refused at the limit");
+        // Assignment of covered updates proceeds independently of the pending acks.
+        Record update = sequencer.assign(2, StreamSequencer.Fence.CHUNK, new byte[0], false);
+        assertEquals(1, update.sequence());
+        acks.assignedPending(1L, 2, update.sequence());
+        // Releasing one ack (its covered updates are now assigned) lets the producer resume.
+        assertNotNull(acks.take(1, 1, 0, null));
+        assertTrue(acks.create(refused, 1, 0), "the producer resumes after a release");
     }
 
     @Test void transitionSettlesCompleteAcksAndDropsTheRest() {
@@ -123,7 +175,7 @@ class AckJoinTrackerTest {
         acks.assignedPending(78L, 2, 5);
         Record.Dependency[] superset = new Record.Dependency[] {
             new Record.Dependency(0, 1), new Record.Dependency(2, 5)};
-        List<AckJoinTracker.Ready> settled = acks.settleForTransition(1, 2, superset);
+        List<AckJoinTracker.Ready> settled = acks.settleForTransition(2, superset);
         List<Long> ids = new ArrayList<Long>();
         for (AckJoinTracker.Ready ready : settled) {
             ids.add(ready.id());

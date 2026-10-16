@@ -157,9 +157,10 @@ public final class AckJoinTracker {
 
     /**
      * Resolves a ready ack and releases its charge, so the caller can sequence it. Returns null
-     * while coverage is unresolved; drops the ack, counted, once it has expired. The result carries
-     * the ack's frontier plus the CONTROL frontier snapshot at the logical point, which 13.19 takes
-     * conservatively. An inexact ack uses {@code safeSuperset} (see
+     * while coverage is unresolved. An ack whose coverage is complete resolves even after its
+     * deadline; an unresolved ack past its deadline is dropped, counted, and returns null. The result
+     * carries the ack's frontier plus the CONTROL frontier snapshot at the logical point, which 13.19
+     * takes conservatively. An inexact ack uses {@code safeSuperset} (see
      * {@link StreamSequencer#safeSupersetDependencies()}).
      */
     public synchronized Ready take(long id, long nowNanos, long controlFrontier,
@@ -168,14 +169,14 @@ public final class AckJoinTracker {
         if (value == null) {
             return null;
         }
-        if (expired(value, nowNanos)) {
-            drop(id, value);
-            return null;
-        }
         if (!value.unassigned.isEmpty()) {
+            if (expired(value, nowNanos)) {
+                drop(id, value);
+            }
             return null;
         }
         Record.Dependency[] result = resolve(value, controlFrontier, safeSuperset);
+        forgetWaiters(id, value);
         pending.remove(id);
         bytes -= value.size;
         return new Ready(id, result);
@@ -184,15 +185,14 @@ public final class AckJoinTracker {
     /**
      * Settles every pending ack at a protocol-state, epoch or disconnect transition (13.19). Acks
      * whose coverage is complete are returned as ready so the caller can sequence them in the old
-     * state and epoch. The others, and any expired ack, are dropped and counted. Every entry is
-     * removed; nothing carries across the transition.
+     * state and epoch. The others are dropped and counted. Every entry is removed; nothing carries
+     * across the transition.
      */
-    public synchronized List<Ready> settleForTransition(long nowNanos, long controlFrontier,
-            Record.Dependency[] safeSuperset) {
+    public synchronized List<Ready> settleForTransition(long controlFrontier, Record.Dependency[] safeSuperset) {
         List<Ready> ready = new ArrayList<Ready>();
         for (Map.Entry<Long, Pending> entry : new ArrayList<Map.Entry<Long, Pending>>(pending.entrySet())) {
             Pending value = entry.getValue();
-            if (!expired(value, nowNanos) && value.unassigned.isEmpty()) {
+            if (value.unassigned.isEmpty()) {
                 ready.add(new Ready(entry.getKey(), resolve(value, controlFrontier, safeSuperset)));
             } else {
                 droppedCount++;
@@ -204,20 +204,29 @@ public final class AckJoinTracker {
         return ready;
     }
 
-    /** Drops every ack whose deadline has passed, counted, and returns how many were dropped (13.19). */
-    public synchronized int expire(long nowNanos) {
-        int dropped = 0;
+    /**
+     * Settles the acks whose deadline has passed (13.19). Complete ones are returned as ready to be
+     * sequenced in the current state; the still-unassigned ones are dropped and counted. Acks that
+     * have not reached their deadline are untouched.
+     */
+    public synchronized List<Ready> expire(long nowNanos, long controlFrontier, Record.Dependency[] safeSuperset) {
+        List<Ready> ready = new ArrayList<Ready>();
         for (Iterator<Map.Entry<Long, Pending>> it = pending.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<Long, Pending> entry = it.next();
-            if (expired(entry.getValue(), nowNanos)) {
-                forgetWaiters(entry.getKey(), entry.getValue());
-                bytes -= entry.getValue().size;
-                it.remove();
-                droppedCount++;
-                dropped++;
+            Pending value = entry.getValue();
+            if (!expired(value, nowNanos)) {
+                continue;
             }
+            if (value.unassigned.isEmpty()) {
+                ready.add(new Ready(entry.getKey(), resolve(value, controlFrontier, safeSuperset)));
+            } else {
+                droppedCount++;
+            }
+            forgetWaiters(entry.getKey(), value);
+            bytes -= value.size;
+            it.remove();
         }
-        return dropped;
+        return ready;
     }
 
     /** Charged bytes of pending acks, to be charged to the outbound pool (13.19). */
