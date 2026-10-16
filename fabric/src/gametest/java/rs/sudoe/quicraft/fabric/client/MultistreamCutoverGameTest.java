@@ -103,6 +103,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
                     "QUICraft: no routing table for protocol {}, the cutover harness is skipped", protocol);
             return;
         }
+        ClientConnect.setProtocolOverrideForTests(protocol);
         try {
             onlineExchange(protocol, table.get(), Integer.MAX_VALUE);
             onlineExchange(protocol, table.get(), 7);
@@ -120,6 +121,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             anOversizedBindingPayloadOutsideV3IsDiscardedAsVanillaDoes(table.get());
             outboundPacketsStillPassTheGamesHandlersAndTheProtocolSwitchesSurvive(protocol, table.get());
             writesWaitWhileTheLanesAreFullAndGoOnInOrder(protocol, table.get());
+            aBlockedTerminalWriteRunsTheEncoderTransitionOnceAndInOrder(protocol, table.get());
             largeBlockedPacketsHitTheByteCapBeforeThePacketCap(protocol, table.get());
             acknowledgementsFollowAcceptanceNotTheMainThread(protocol, table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
@@ -134,6 +136,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             aReboundThatGetsNoOfferFailsAfterTheBoundedWait(protocol, table.get());
         } catch (Exception e) {
             throw new AssertionError(e);
+        } finally {
+            ClientConnect.setProtocolOverrideForTests(0);
         }
     }
 
@@ -490,8 +494,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
     }
 
     /**
-     * 13.12: 40 KiB payload packets cross the 16 MiB outbound byte cap before the 1024 packet cap.
-     * Charging a fixed 2 KiB per packet would let this retained backlog grow well past that cap.
+     * 13.12: 40 KiB payload frames cross the 16 MiB outbound byte cap before the 1024 frame cap.
      */
     private static void largeBlockedPacketsHitTheByteCapBeforeThePacketCap(int protocol, RoutingTable table)
             throws Exception {
@@ -507,16 +510,14 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
 
             int[] attempted = {0};
             rig.loop.submit(() -> {
-                // Each payload retains 40 KiB. The exact framed size is measured by the game's
-                // encoder before it is held, so the byte cap crosses at roughly 400 packets.
+                // Encoding and compression happen once on the normal pipeline path; Sink queues
+                // the final 40 KiB frame, whose exact bytes are charged against the cap.
                 for (int i = 0; i < LaneSession.MAX_UNSENT_PACKETS; i++) {
                     Packet<?> packet = new net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket(
                             new rs.sudoe.quicraft.fabric.net.FallbackPayload(new byte[40 * 1024]));
-                    io.netty.channel.ChannelPromise promise = rig.channel.newPromise();
                     attempted[0]++;
-                    if (!rig.client.holdForLanes(rig.channel.pipeline().firstContext(), packet, promise)) {
-                        throw new AssertionError("a full lane must hold the packet");
-                    }
+                    rig.channel.write(packet);
+                    rig.channel.flush();
                     if (rig.client.state() == V3Client.State.FAILED) {
                         break;
                     }
@@ -527,6 +528,49 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(rig.client.state() == V3Client.State.FAILED, "the queue failure is recorded");
             check(attempted[0] < LaneSession.MAX_UNSENT_PACKETS,
                     "the byte cap, not the 1024 packet cap, ended the run at " + attempted[0]);
+        }
+    }
+
+    /** The terminal packet must cross the real encoder while the lane frame queue is blocked. */
+    private static void aBlockedTerminalWriteRunsTheEncoderTransitionOnceAndInOrder(int protocol,
+            RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+            check(rig.awaitState(V3Client.State.ACTIVE), "active");
+            List<String> sent = java.util.Collections.synchronizedList(new ArrayList<>());
+            rig.client.useLaneSend((state, id, frame) -> sent.add(state + ":" + id + ":" + frame.length));
+            rig.client.lanes().onWritabilityChanged(false);
+            check(rig.awaitCondition(() -> !rig.client.lanes().isWritable()), "the lanes stopped taking writes");
+
+            io.netty.channel.ChannelFuture terminal = rig.channel.writeAndFlush(
+                    ServerboundFinishConfigurationPacket.INSTANCE);
+            check(rig.awaitCondition(() -> rig.channel.pipeline().get("outbound_config") != null),
+                    "the terminal encoder ran and swapped exactly as on TCP: " + rig.channel.pipeline().names());
+            check(!terminal.isDone(), "the encoded frame is queued while the lanes are blocked");
+            check(sent.isEmpty(), "the lane send waits for writability");
+
+            rig.connection.setupOutboundProtocol(ConfigurationProtocols.SERVERBOUND);
+            io.netty.channel.ChannelFuture later = rig.channel.writeAndFlush(new ServerboundKeepAlivePacket(77L));
+            check(rig.awaitCondition(() -> rig.channel.pipeline().get("encoder") instanceof PacketEncoder),
+                    "the new protocol encoder is installed");
+            check(!later.isDone(), "the next encoded frame is queued behind the terminal frame");
+
+            rig.client.lanes().onWritabilityChanged(true);
+            check(rig.awaitCondition(() -> sent.size() == 2), "both queued frames drained: " + sent);
+            check(terminal.isSuccess() && later.isSuccess(), "promises complete when frames reach lane session");
+            check(sent.get(0).startsWith("CONFIGURATION:"), "terminal frame keeps the old state: " + sent);
+            check(sent.get(1).startsWith("CONFIGURATION:"), "later frame uses the new configured encoder: " + sent);
+            check(rig.client.encodedFramesObserved() == 2,
+                    "one actual encoder output per write, with no speculative re-encoding: "
+                            + rig.client.encodedFramesObserved());
+            check(rig.client.framedFramesObserved() == 2,
+                    "one final framing/compression pass per encoder output: "
+                            + rig.client.framedFramesObserved());
+            check(rig.client.state() == V3Client.State.ACTIVE, "still active after transition");
         }
     }
 
@@ -824,6 +868,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             } finally {
                 Hooks.setFaultInjection(false);
             }
+            check(Hooks.wasFaultInjected("v3 setup"), "the v3 setup injection actually fired");
             check(rig.awaitCondition(promise::isDone), "the screen's future completes");
             check(!attached[0], "nothing stayed attached");
             check(rig.awaitCondition(() -> !second.open), "the QUIC connection was closed");
@@ -859,6 +904,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             } finally {
                 Hooks.setFaultInjection(false);
             }
+            check(Hooks.wasFaultInjected("v3 published"), "the post-publication injection actually fired");
             check(rig.awaitCondition(promise::isDone), "the fallback future completes");
             check(promise.isSuccess() && tcpJoins[0] == 1, "the same connection can join over TCP");
             check(!Transports.isQuic(reused), "the abandoned /3 transport is removed");

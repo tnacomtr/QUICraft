@@ -7,9 +7,12 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.embedded.EmbeddedChannel;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestDedicatedServerContext;
@@ -303,10 +306,20 @@ public class MultistreamClientGameTest implements FabricClientGameTest {
         try (TestDedicatedServerContext server = GameTests.server(context)) {
             for (String hook : new String[] {"connect", "multistream state", "early inputs", "status query",
                     "quic connect", "connect outcome"}) {
+                int port = server.computeOnServer(s -> s.getPort());
+                client.connector().advertisements().record(new InetSocketAddress(InetAddress.getLoopbackAddress(), port),
+                        Optional.empty());
+                try {
+                    client.connector().advertisements().record(new InetSocketAddress(InetAddress.getByName("::1"), port),
+                            Optional.empty());
+                } catch (java.net.UnknownHostException e) {
+                    throw new AssertionError(e);
+                }
                 Hooks.setFaultInjection(hook);
                 try (var connection = server.connect()) {
                     GameTests.waitForChunks(connection);
                     check(context.computeOnClient(c -> c.getConnection() != null), "joined with " + hook + " broken");
+                    check(Hooks.wasFaultInjected(hook), "fault injection actually fired for " + hook);
                 } finally {
                     Hooks.setFaultInjection(false);
                 }

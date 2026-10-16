@@ -66,11 +66,11 @@ public final class QuicraftClient implements ClientModInitializer {
      * created: the join then takes the ordinary path. Shares both caches with {@link #connector()}.
      */
     public synchronized ClientConnector multistreamConnector() {
-        if (multistreamConnector != null) {
-            return multistreamConnector;
-        }
         try {
             Hooks.enter("multistream state");
+            if (multistreamConnector != null) {
+                return multistreamConnector;
+            }
             ClientV3State state = ClientV3State.open(configDir, Clock.systemUTC());
             ClientConnector.V3Support support = new ClientConnector.V3Support(state.pins(), state.rebinds(),
                     state.worker(), System::currentTimeMillis,
@@ -80,6 +80,7 @@ public final class QuicraftClient implements ClientModInitializer {
             multistreamConnector = new ClientConnector(advertisements, failures, support);
         } catch (Throwable t) {
             Hooks.failed("multistream state", t);
+            return null;
         }
         return multistreamConnector;
     }

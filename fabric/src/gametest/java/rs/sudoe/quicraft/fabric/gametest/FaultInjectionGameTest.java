@@ -28,6 +28,7 @@ public class FaultInjectionGameTest implements FabricClientGameTest {
                 check(!GameTests.connectedOverQuic(context), "joined over TCP");
                 PlaySession.run(context, server, connection);
             }
+            check(Hooks.faultInjectedCount() > 0, "at least one fault injection actually fired");
         } finally {
             Hooks.setFaultInjection(false);
         }

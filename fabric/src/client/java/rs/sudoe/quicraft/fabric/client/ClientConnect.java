@@ -58,7 +58,19 @@ import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
  * the winner; cancelling it (the Cancel button) abandons the attempt.
  */
 public final class ClientConnect {
+    /** Client gametest only: aligns the test routing table with the protocol under test. */
+    private static volatile int testProtocolOverride;
+
     private ClientConnect() {}
+
+    static void setProtocolOverrideForTests(int protocol) {
+        testProtocolOverride = protocol;
+    }
+
+    private static int currentProtocolNumber() {
+        int override = testProtocolOverride;
+        return override != 0 ? override : SharedConstants.getCurrentVersion().protocolVersion();
+    }
 
     public static ChannelFuture connect(InetSocketAddress address, EventLoopGroupHolder holder, Connection connection,
             Supplier<ChannelFuture> vanilla) {
@@ -227,7 +239,7 @@ public final class ClientConnect {
         QuicBridgeChannel channel = null;
         V3Client client = null;
         try {
-            int protocol = SharedConstants.getCurrentVersion().protocolVersion();
+            int protocol = currentProtocolNumber();
             RoutingTable table = RoutingRegistry.forProtocol(protocol)
                     .orElseThrow(() -> new IllegalStateException("no routing table for protocol " + protocol));
             channel = new QuicBridgeChannel(v3);
@@ -374,7 +386,7 @@ public final class ClientConnect {
         public CompletableFuture<Optional<Advertisement>> queryStatus(InetSocketAddress server) {
             Hooks.enter("status query"); // a throw here counts as "no advertisement": TCP
             return StatusQuery.query(loop, new ReflectiveChannelFactory<>(holder.channelCls()), server,
-                    address.getHostString(), SharedConstants.getCurrentVersion().protocolVersion())
+                    address.getHostString(), currentProtocolNumber())
                     .thenApply(Advertisement::extract);
         }
 
@@ -401,7 +413,7 @@ public final class ClientConnect {
             CompletableFuture<QuicByteStream> result = new CompletableFuture<>();
             try {
                 Hooks.enter("quic connect"); // a throw here is a QUIC failure: TCP wins the race
-                int protocol = SharedConstants.getCurrentVersion().protocolVersion();
+                int protocol = currentProtocolNumber();
                 RoutingTable table = RoutingRegistry.forProtocol(protocol).orElseThrow(
                         () -> new IllegalStateException("no routing table for protocol " + protocol));
                 CompletableFuture<V3Connection> dial = GameHost.connectV3(loop,
