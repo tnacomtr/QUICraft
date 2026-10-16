@@ -8,7 +8,6 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
-import io.netty.channel.FixedRecvByteBufAllocator;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
 import io.netty.handler.codec.quic.QuicChannel;
 import io.netty.handler.codec.quic.QuicConnectionCloseEvent;
@@ -114,6 +113,8 @@ public final class LaneSession {
     public static final long END_LINGER_NANOS = 10_000_000_000L;
     /** The largest chunk one read delivers; bounds the unparsed bytes held per stream. */
     static final int READ_CHUNK = 16 * 1024;
+    static final int READ_CHUNK_MIN = 4 * 1024;
+    static final int READ_SENTINEL = 1024;
     /** The smallest record on the wire: length prefix, kind, sequence and three dependencies. */
     private static final int MAX_RECORD_WIRE = 4 + RecordCodec.MAX_RECORD_LENGTH;
     private static final int CONTROL_STREAM_ID = 0;
@@ -632,8 +633,7 @@ public final class LaneSession {
     }
 
     /**
-     * Checks a lane's outstanding record grant against a lane that wants to start a record, and
-     * records when the lane first waited so 13.12's incomplete-record deadline can close it.
+     * Records when a lane first waited so 13.12's incomplete-record deadline can close it.
      */
     private void noteWaiting(LaneStream s, boolean withheld) {
         if (withheld && s.waitingSince == 0) {
@@ -886,8 +886,8 @@ public final class LaneSession {
      * Whether a new record may be started on {@code lane}. An auxiliary record needs room for the
      * largest legal record, so a conformant peer's record can always complete (13.12: never fatal
      * for a legal record); otherwise reading waits and QUIC flow control pushes back. The same
-     * amount must fit the per-connection budget. The shared node budget is taken before the record
-     * starts ({@link LaneStream#reserveRecord}) and before each read ({@link LaneStream#grantRead}),
+     * amount must fit the per-connection budget. The shared node budget is taken before the parser
+     * allocation ({@link LaneStream#reserveWire}) and before each read ({@link LaneStream#grantRead}),
      * each of which withholds this lane instead of failing it and is remembered in
      * {@link #withheldForNode} so the tick retries once other connections have released space.
      */
@@ -904,7 +904,11 @@ public final class LaneSession {
             return;
         }
         while (!closed) {
-            if (!s.nextBuffer()) {
+            if (!s.reservePrefix()) {
+                noteWaiting(s, true);
+                break;
+            }
+            if (!s.nextBuffer() && !s.decoder.awaitingAdmission()) {
                 break;
             }
             if (s.preamble != null && !s.opened) {
@@ -924,29 +928,23 @@ public final class LaneSession {
                 // bytes already read buffered (they stay charged) and stop reading until bindGame().
                 break;
             }
-            boolean atBoundary = s.partial == null && !s.decoder.hasPartial();
+            if (s.sentinel()) {
+                throw new MultistreamProtocolException(CLOSE_ORDERING, "13.6", "record on unused serverbound lane");
+            }
             if (!s.midRecord() && !credit(s.lane)) {
                 // 13.12: the per-connection budget has no room for this record (or its growth), so
                 // the lane waits; the wait starts its incomplete-record deadline.
                 noteWaiting(s, true);
                 break;
             }
-            if (atBoundary && !s.recordGranted && !s.reserveRecord()) {
+            RecordCodec.Record record = s.decoder.next(s.current == null
+                    ? ByteBuffer.allocate(0) : s.current, true);
+            if (s.decoder.awaitingAdmission()) {
                 noteWaiting(s, true);
                 break;
             }
-            RecordCodec.Record record = s.decoder.next(s.current);
             if (record != null) {
                 admit(s, record);
-            } else if (s.partial == null && s.decoder.hasPartial()) {
-                long size = s.decoder.partialWireBytes();
-                long prepaid = Math.min(size, MAX_RECORD_WIRE - s.recordGrantUsed);
-                s.partial = receiver.reservePartial(s.lane, size, prepaid, s.takeWaitingSince(), now());
-                s.recordGrantUsed += prepaid;
-                s.charged = size;
-            } else if (s.recordGrantUsed > 0 && !s.recordGranted) {
-                // the record finished; nothing to carry over
-                s.recordGrantUsed = 0;
             }
         }
         if (closed) {
@@ -959,6 +957,7 @@ public final class LaneSession {
         // The rest of a record whose length is known, or of a preamble, already holds its charge.
         // A bare, still incomplete length prefix holds almost nothing, so it needs credit again.
         if (!s.fin && !s.readPending && !s.hasUnparsed() && s.channel != null
+                && !s.decoder.awaitingAdmission() && s.reservePrefix()
                 && (s.midRecord() || !s.opened || credit(s.lane)) && s.grantRead()) {
             s.readPending = true;
             s.channel.read();
@@ -1315,6 +1314,11 @@ public final class LaneSession {
         }
         try {
             long t = now();
+            for (LaneStream s : streams) {
+                if (s != null) {
+                    s.shrinkIdleGrant(t);
+                }
+            }
             if (withheldForNode) {
                 // 13.12: another connection may have released node space since the refusal, so
                 // retry the withheld lanes and the undecoded head before checking deadlines.
@@ -1522,12 +1526,12 @@ public final class LaneSession {
         boolean preambleWritten;
         /** The record in progress has announced its length, so its full size is charged. */
         boolean lengthKnown;
-        /** An outstanding node read grant of {@link LaneSession#READ_CHUNK} for the next read. */
+        /** The allocator and outstanding grant always have the same bound, even while idle. */
         boolean granted;
-        /** An outstanding node record grant of {@link LaneSession#MAX_RECORD_WIRE} for this record. */
-        boolean recordGranted;
-        /** How many bytes of the record grant have been transferred to the parser buffer. */
-        long recordGrantUsed;
+        int grantedBytes;
+        int nextReadBytes = READ_CHUNK_MIN;
+        long lastReadAt;
+        final boolean receiveSentinel;
         /**
          * When this lane first held bytes of a record it could not admit; 0 while it has none. It
          * moves into the parser reservation ({@link #takeWaitingSince()}) and is cleared there.
@@ -1536,6 +1540,9 @@ public final class LaneSession {
 
         LaneStream(Lane lane) {
             this.lane = lane;
+            this.receiveSentinel = role == Role.SERVER && lane != Lane.CONTROL
+                    && table.routes().entrySet().stream().noneMatch(e ->
+                            e.getKey().direction() == Direction.SERVERBOUND && e.getValue().lane() == lane);
             this.preamble = lane == Lane.CONTROL ? null : new AuxPreamble.Parser();
             this.preambleWritten = lane == Lane.CONTROL;
             this.decoder = new RecordCodec.Decoder(lane == Lane.CONTROL, this::reserveWire);
@@ -1560,20 +1567,68 @@ public final class LaneSession {
         /** The decoder's admission hook: charges the full parser buffer once the length is known. */
         private boolean reserveWire(int wireBytes) {
             int growth = wireBytes - (partial == null ? 0 : (int) charged);
-            long prepaid = Math.min(growth, MAX_RECORD_WIRE - recordGrantUsed);
-            if (partial == null) {
-                // 13.12: whatever this lane waited for these bytes moves into the parser
-                // reservation, whose own deadline takes over from there.
-                partial = receiver.reservePartial(lane, wireBytes, prepaid, takeWaitingSince(), now());
-            } else {
-                receiver.growPartial(partial, growth, prepaid, now());
+            if (!node.tryReserve(growth)) {
+                withheldForNode = true;
+                return false;
             }
-            recordGrantUsed += prepaid;
+            try {
+                if (partial == null) {
+                    // The exact parser allocation owns this charge, not a speculative record grant.
+                    partial = receiver.reservePartial(lane, wireBytes, growth, takeWaitingSince(), now());
+                } else {
+                    receiver.growPartial(partial, growth, growth, now());
+                }
+            } catch (RuntimeException ex) {
+                node.release(growth);
+                throw ex;
+            }
             charged = wireBytes;
             lengthKnown = true;
-            // 13.12: the record's real size is known, so the rest of its grant goes back.
-            releaseRecordGrant();
+            waitingSince = 0;
             return true;
+        }
+
+        /** Charge the tiny split length prefix too; a refusal never advances another read. */
+        boolean reservePrefix() {
+            if (lengthKnown || !decoder.hasPartial()) {
+                return true;
+            }
+            int size = decoder.partialWireBytes();
+            int growth = size - (int) charged;
+            if (growth == 0) {
+                return true;
+            }
+            if (!node.tryReserve(growth)) {
+                withheldForNode = true;
+                return false;
+            }
+            try {
+                if (partial == null) {
+                    partial = receiver.reservePartial(lane, size, growth, takeWaitingSince(), now());
+                } else {
+                    receiver.growPartial(partial, growth, growth, now());
+                }
+            } catch (RuntimeException ex) {
+                node.release(growth);
+                throw ex;
+            }
+            charged = size;
+            waitingSince = 0;
+            return true;
+        }
+
+        boolean sentinel() {
+            return receiveSentinel;
+        }
+
+        void shrinkIdleGrant(long t) {
+            if (granted && grantedBytes > READ_CHUNK_MIN && t - lastReadAt >= TimeUnit.SECONDS.toNanos(1)) {
+                int excess = grantedBytes - READ_CHUNK_MIN;
+                grantedBytes = READ_CHUNK_MIN;
+                nextReadBytes = READ_CHUNK_MIN;
+                ReadGrantAllocator.limit(channel, grantedBytes);
+                node.release(excess);
+            }
         }
 
         /** A record in progress whose whole parser buffer is already charged. */
@@ -1592,49 +1647,22 @@ public final class LaneSession {
             if (granted) {
                 return true;
             }
-            if (!node.tryReserve(READ_CHUNK)) {
+            int size = sentinel() ? READ_SENTINEL : nextReadBytes;
+            if (!node.tryReserve(size)) {
                 withheldForNode = true;
                 return false;
             }
             granted = true;
+            grantedBytes = size;
+            ReadGrantAllocator.limit(channel, size);
             return true;
-        }
-
-        /**
-         * Reserves the record grant for this lane (13.12): {@link LaneSession#MAX_RECORD_WIRE}
-         * before the record's first byte is consumed. A refusal withholds the lane instead of
-         * failing it, so the owner retries from its tick once another connection frees space.
-         */
-        boolean reserveRecord() {
-            if (recordGranted) {
-                return true;
-            }
-            if (!node.tryReserve(MAX_RECORD_WIRE)) {
-                withheldForNode = true;
-                return false;
-            }
-            recordGranted = true;
-            recordGrantUsed = 0;
-            return true;
-        }
-
-        /** Returns whatever is left of the record grant once the record's real size is known. */
-        void releaseRecordGrant() {
-            if (recordGranted) {
-                recordGranted = false;
-                long unused = MAX_RECORD_WIRE - recordGrantUsed;
-                recordGrantUsed = 0;
-                if (unused > 0) {
-                    node.release(unused);
-                }
-            }
         }
 
         /** Gives an unused read grant back: the lane stopped reading or the session closed. */
         void releaseGrant() {
             if (granted) {
                 granted = false;
-                node.release(READ_CHUNK);
+                node.release(grantedBytes);
             }
         }
 
@@ -1683,7 +1711,6 @@ public final class LaneSession {
          */
         void releaseInbound() {
             quietly(this::releaseGrant, "read grant");
-            quietly(this::releaseRecordGrant, "record grant");
             ByteBuf queued;
             while ((queued = inbound.poll()) != null) {
                 final ByteBuf chunk = queued;
@@ -1714,7 +1741,7 @@ public final class LaneSession {
         void attach(QuicStreamChannel ch) {
             channel = ch;
             ch.config().setAutoRead(false);
-            ch.config().setRecvByteBufAllocator(new FixedRecvByteBufAllocator(READ_CHUNK).maxMessagesPerRead(1));
+            ReadGrantAllocator.install(ch);
         }
 
         @Override
@@ -1730,14 +1757,17 @@ public final class LaneSession {
                 if (granted) {
                     // 13.12: the read was granted in advance, so this chunk's bytes are already
                     // reserved. Take the chunk's own charge first and give the grant up only once
-                    // that has succeeded: a refusal has to leave the READ_CHUNK reservation owned by
+                    // that has succeeded: a refusal has to leave the current reservation owned by
                     // this lane, or closing cannot return it and the node budget leaks it.
-                    if (bytes > READ_CHUNK) {
-                        chargeChunk(bytes - READ_CHUNK);
+                    if (bytes > grantedBytes) {
+                        chargeChunk(bytes - grantedBytes);
                     }
+                    nextReadBytes = bytes == grantedBytes ? Math.min(READ_CHUNK, grantedBytes * 2)
+                            : Math.max(READ_CHUNK_MIN, grantedBytes / 2);
+                    lastReadAt = now();
                     granted = false;
-                    if (bytes < READ_CHUNK) {
-                        node.release(READ_CHUNK - bytes);
+                    if (bytes < grantedBytes) {
+                        node.release(grantedBytes - bytes);
                     }
                 } else {
                     // A chunk can only arrive without a grant if it was read before this rule, as a

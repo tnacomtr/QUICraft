@@ -95,6 +95,7 @@ public final class LaneLoopback implements AutoCloseable {
                         @Override
                         protected void initChannel(QuicStreamChannel stream) {
                             stream.config().setAutoRead(false);
+                            rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
                             options.serverSink.accept(stream);
                         }
                     })
@@ -120,6 +121,7 @@ public final class LaneLoopback implements AutoCloseable {
                         @Override
                         protected void initChannel(QuicStreamChannel stream) {
                             stream.config().setAutoRead(false);
+                            rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
                             options.clientSink.accept(stream);
                         }
                     })
@@ -147,7 +149,14 @@ public final class LaneLoopback implements AutoCloseable {
 
     /** Opens a bidirectional stream from the client; the handler is its first pipeline entry. */
     public QuicStreamChannel clientStream(io.netty.channel.ChannelHandler handler) throws Exception {
-        return clientConnection.createStream(QuicStreamType.BIDIRECTIONAL, handler).get(10, TimeUnit.SECONDS);
+        return clientConnection.createStream(QuicStreamType.BIDIRECTIONAL,
+                new ChannelInitializer<QuicStreamChannel>() {
+                    @Override
+                    protected void initChannel(QuicStreamChannel stream) {
+                        rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
+                        stream.pipeline().addLast(handler);
+                    }
+                }).get(10, TimeUnit.SECONDS);
     }
 
     public QuicStreamChannel clientStream() throws Exception {

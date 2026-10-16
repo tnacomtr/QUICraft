@@ -954,6 +954,7 @@ public final class QuicServer implements Closeable {
                             return;
                         }
                         if (shared.v3 != null) {
+                            rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
                             // /3 (13.3): stream 0 is CONTROL, the client's stream 4 is REALTIME, and
                             // any other stream is fatal 0x11.
                             if (stream.streamId() == 0) {

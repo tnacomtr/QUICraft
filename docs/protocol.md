@@ -1037,6 +1037,16 @@ This subsection records the user's direction for the next revision of `/3`. None
     exposure against that budget, and refuse new QUIC admissions when the reservation
     cannot fit (leave TCP untouched). Debit further credit/allocations before granting
     them; release reservations only when credit exposure or retained bytes are gone.
+    Pending application reads start at 4 KiB, grow on full reads to 16 KiB, and shrink on
+    short reads or after one idle second; their cached allocator handle MUST enforce the
+    current grant before each read. Serverbound auxiliary lanes absent from the routing
+    table instead hold 1 KiB sentinel reads and reject any post-preamble data with `0x11`.
+    Thus an activated idle server connection with the shipped table reserves 30 KiB:
+    the separate 24 KiB quiche-unread admission share plus 4 + 1 + 1 KiB read grants.
+    Do not reserve a maximum-sized record at its boundary: charge the exact parser
+    allocation only once its length is known, withholding allocation and further reads
+    non-fatally if it cannot fit. A partial record's remaining allocation is thereby
+    charged before its next read; complete buffered records need no speculative grant.
     No allocation or advertised receive credit may overcommit this node budget. Record
     the configured budget and admission behavior in the 13.17 scale benchmark.
 
