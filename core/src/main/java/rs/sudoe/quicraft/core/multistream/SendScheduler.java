@@ -18,24 +18,25 @@ import rs.sudoe.quicraft.core.profile.ServerProfile;
  *
  * <p>Rules:
  * <ul>
- * <li>Each logical stream is a FIFO. Only the head of a stream can be selected, so a record is
- *     never sent before its own predecessor and bytes on one stream are never reordered.</li>
- * <li>A head is ready when every explicit dependency has already been selected (sent).</li>
+ * <li>Each logical stream is a FIFO. Only the head of a stream can be written, so a record is never
+ *     sent before its own predecessor and bytes on one stream are never reordered.</li>
+ * <li>A head is ready when every explicit dependency has been fully written (its last slice
+ *     selected).</li>
+ * <li>Records are written in slices of at most {@link #QUANTUM_BYTES}. Between two slices of one
+ *     record, other streams may be selected, so a large record never blocks a REALTIME record for
+ *     more than one quantum. Inside a bundle run, stream 0 stays open (13.15).</li>
  * <li>Urgent records (REALTIME, and ACK_JOIN or BATCH_JOIN) whose prerequisites are unsent promote
  *     the earliest ready prerequisite chain instead of filling QUIC with dependents.</li>
- * <li>Fair selection: each class (CONTROL, REALTIME, CHUNK) has a virtual time advanced by
- *     bytes divided by its profile weight. The lowest one wins, so each runnable class gets a
- *     share proportional to its weight. REALTIME is also limited to {@link #MAX_REALTIME_BURST}
- *     consecutive picks while another class is ready.</li>
+ * <li>Fair selection: each class (REALTIME, CHUNK, CONTROL) has a virtual time advanced by the
+ *     slice bytes divided by its profile weight. The lowest one wins, so each runnable class gets a
+ *     share proportional to its weight. Ties go REALTIME, then CHUNK, then CONTROL. REALTIME is also
+ *     limited to {@link #MAX_REALTIME_BURST} consecutive picks while another class is ready.</li>
  * <li>Chunk streams are served round-robin among shards that are ready and writable.</li>
  * <li>A ready CONTROL head that has waited {@link #AGE_LIMIT} selections is taken regardless of
  *     weights, so small CONTROL traffic keeps progressing under sustained load.</li>
- * <li>A record offered with {@code bundleContinues} keeps stream 0 open: the next selection must
- *     be the following bundle member, so the bundle stays one contiguous CONTROL run (13.15).</li>
+ * <li>A record offered with {@code bundleContinues} keeps stream 0 open until the closing record is
+ *     fully written: the next selection must be the following bundle record.</li>
  * </ul>
- *
- * <p>Selections account at most {@link #QUANTUM_BYTES} per transport write. A record already
- * selected is written in full; the transport must not preempt a partially written record.
  *
  * <p>Thread-safe through its monitor. Weights, burst and aging constants are benchmark policy
  * (13.20), not negotiated data.
@@ -53,9 +54,9 @@ public final class SendScheduler {
     private static final int CONTROL = LogicalStream.CONTROL;
     private static final int REALTIME = LogicalStream.REALTIME;
     private static final int FIRST_CHUNK = 2;
-    private static final int CLASS_CHUNK = 0;
-    private static final int CLASS_CONTROL = 1;
-    private static final int CLASS_REALTIME = 2;
+    private static final int CLASS_REALTIME = 0;
+    private static final int CLASS_CHUNK = 1;
+    private static final int CLASS_CONTROL = 2;
 
     private final int realtimeWeight;
     private final int chunkWeight;
@@ -74,14 +75,20 @@ public final class SendScheduler {
     private int queuedRecords;
     private long queuedBytes;
 
-    /** One selected record and its write accounting (13.20). */
+    /** One write slice of a selected record and its accounting (13.20). */
     public static final class Selection {
         private final Record record;
         private final int bytes;
+        private final int offset;
+        private final int length;
+        private final boolean last;
 
-        private Selection(Record record, int bytes) {
+        private Selection(Record record, int bytes, int offset, int length, boolean last) {
             this.record = record;
             this.bytes = bytes;
+            this.offset = offset;
+            this.length = length;
+            this.last = last;
         }
 
         /** The selected record, whose stream order is unchanged. */
@@ -94,9 +101,24 @@ public final class SendScheduler {
             return bytes;
         }
 
-        /** The byte count charged to one transport write, capped at {@link #QUANTUM_BYTES}. */
+        /** Byte offset of this slice within the record. */
+        public int offset() {
+            return offset;
+        }
+
+        /** Bytes of this slice, at most {@link #QUANTUM_BYTES}. */
+        public int length() {
+            return length;
+        }
+
+        /** Whether this slice completes the record. */
+        public boolean last() {
+            return last;
+        }
+
+        /** The byte count charged to this transport write, equal to {@link #length()}. */
         public int quantumBytes() {
-            return Math.min(bytes, QUANTUM_BYTES);
+            return length;
         }
     }
 
@@ -149,7 +171,7 @@ public final class SendScheduler {
     }
 
     /**
-     * Selects the next record to write, or returns null when nothing is ready and writable.
+     * Selects the next write slice, or returns null when nothing is ready and writable.
      *
      * @param writable reports whether a logical stream can accept bytes now, including connection
      *                 level writability; unwritable streams are never selected (13.20)
@@ -179,7 +201,7 @@ public final class SendScheduler {
         return chosen == null ? null : select(chosen);
     }
 
-    /** Records queued and not yet selected (13.20). */
+    /** Records queued and not yet fully selected (13.20). */
     public synchronized int size() {
         return queuedRecords;
     }
@@ -201,8 +223,14 @@ public final class SendScheduler {
         }
         Item chunk = chunkCandidate(writable);
         Item realtime = usableFront(REALTIME, writable);
+        boolean others = chunk != null || control != null;
         List<Item> candidates = new ArrayList<Item>(3);
         List<Integer> classes = new ArrayList<Integer>(3);
+        // Order is the tie-break: REALTIME, then CHUNK, then CONTROL (13.20).
+        if (realtime != null && (!others || realtimeRun < MAX_REALTIME_BURST)) {
+            candidates.add(realtime);
+            classes.add(CLASS_REALTIME);
+        }
         if (chunk != null) {
             candidates.add(chunk);
             classes.add(CLASS_CHUNK);
@@ -210,10 +238,6 @@ public final class SendScheduler {
         if (control != null) {
             candidates.add(control);
             classes.add(CLASS_CONTROL);
-        }
-        if (realtime != null && (candidates.isEmpty() || realtimeRun < MAX_REALTIME_BURST)) {
-            candidates.add(realtime);
-            classes.add(CLASS_REALTIME);
         }
         if (candidates.isEmpty()) {
             return null;
@@ -271,26 +295,36 @@ public final class SendScheduler {
         return null;
     }
 
+    /** Selects the next slice of the head record on the item's stream. */
     private Selection select(Item item) {
         int stream = item.record.streamIndex();
-        ArrayDeque<Item> queue = queues.get(stream);
-        queue.pollFirst();
-        queuedRecords--;
-        queuedBytes -= item.bytes;
-        sent.put(stream, item.record.sequence());
+        int offset = item.offset;
+        int length = Math.min(item.bytes - offset, QUANTUM_BYTES);
+        boolean last = offset + length == item.bytes;
+        item.offset = offset + length;
+        queuedBytes -= length;
+        if (last) {
+            queues.get(stream).pollFirst();
+            queuedRecords--;
+            sent.put(stream, item.record.sequence());
+        }
         int cls = classOf(stream);
         long base = Math.max(classVirtualTime[cls], virtualTime);
         virtualTime = base;
-        classVirtualTime[cls] = base + (long) Math.max(1, item.bytes) * 1024L / weightOf(cls);
+        classVirtualTime[cls] = base + (long) Math.max(1, length) * 1024L / weightOf(cls);
         realtimeRun = cls == CLASS_REALTIME ? realtimeRun + 1 : 0;
         if (cls == CLASS_CHUNK) {
             lastChunk = stream;
         }
         if (stream == CONTROL) {
-            bundleOpen = item.bundleContinues;
+            if (offset == 0 && item.bundleContinues) {
+                bundleOpen = true;
+            } else if (last) {
+                bundleOpen = item.bundleContinues;
+            }
         }
         selections++;
-        return new Selection(item.record, item.bytes);
+        return new Selection(item.record, item.bytes, offset, length, last);
     }
 
     private long effectiveTime(int cls) {
@@ -361,6 +395,7 @@ public final class SendScheduler {
         final int bytes;
         final boolean bundleContinues;
         final long enqueuedAt;
+        int offset;
 
         Item(Record record, int bytes, boolean bundleContinues, long enqueuedAt) {
             this.record = record;

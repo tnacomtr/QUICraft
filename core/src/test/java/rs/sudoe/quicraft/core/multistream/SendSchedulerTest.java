@@ -151,12 +151,59 @@ class SendSchedulerTest {
         assertTrue(realtime >= 300, "REALTIME share was " + realtime + " of 450");
     }
 
+    @Test void largeRecordIsWrittenInQuantumSlicesThatSumToItsSize() {
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
+        scheduler.offer(rec(0, 1), 2_000_000);
+        int slices = 0;
+        long total = 0;
+        SendScheduler.Selection selection;
+        int expectedOffset = 0;
+        while (true) {
+            selection = scheduler.pollSelection(ALL);
+            assertNotNull(selection);
+            assertEquals(2_000_000, selection.bytes());
+            assertEquals(expectedOffset, selection.offset());
+            assertTrue(selection.length() <= SendScheduler.QUANTUM_BYTES);
+            expectedOffset += selection.length();
+            total += selection.length();
+            slices++;
+            if (selection.last()) {
+                break;
+            }
+        }
+        assertEquals(31, slices, "ceil(2 000 000 / 65 536)");
+        assertEquals(2_000_000L, total);
+        assertEquals(0, scheduler.size());
+        assertEquals(0, scheduler.queuedBytes());
+    }
+
+    @Test void largeChunkRecordDoesNotBlockRealtimeForMoreThanOneQuantum() {
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
+        scheduler.offer(rec(2, 1), 2_000_000);
+        assertEquals("2:1", name(scheduler.pollSelection(ALL)), "first slice of the chunk record");
+        scheduler.offer(rec(1, 1), 100);
+        SendScheduler.Selection next = scheduler.pollSelection(ALL);
+        assertEquals("1:1", name(next), "REALTIME goes before the next chunk slice");
+        assertTrue(next.last());
+    }
+
+    @Test void equalVirtualTimesPreferRealtimeThenChunkThenControl() {
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
+        scheduler.offer(rec(0, 1), 1);
+        scheduler.offer(rec(2, 1), 1);
+        scheduler.offer(rec(1, 1), 1);
+        assertEquals("1:1", name(scheduler.pollSelection(ALL)));
+        assertEquals("2:1", name(scheduler.pollSelection(ALL)));
+        assertEquals("0:1", name(scheduler.pollSelection(ALL)));
+    }
+
     @Test void quantumIsCappedAndOversizedOrMisplacedOffersAreRejected() {
         SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
         scheduler.offer(rec(0, 1), 2_000_000);
         SendScheduler.Selection selection = scheduler.pollSelection(ALL);
         assertEquals(2_000_000, selection.bytes());
         assertEquals(SendScheduler.QUANTUM_BYTES, selection.quantumBytes());
+        assertFalse(selection.last());
         assertThrows(IllegalArgumentException.class,
                 () -> scheduler.offer(rec(0, 2), SendScheduler.MAX_RECORD_BYTES + 1));
         assertThrows(IllegalArgumentException.class, () -> scheduler.offer(rec(0, 2), -1));
@@ -179,7 +226,9 @@ class SendSchedulerTest {
         scheduler.offer(rec(0, 1), 1, true);
         scheduler.offer(rec(0, 2), 1, true);
         scheduler.offer(rec(1, 1), 1);
+        scheduler.offer(rec(1, 2), 1);
         scheduler.offer(rec(2, 1), 1);
+        scheduler.offer(rec(2, 2), 1);
         List<String> first = drain(scheduler, ALL);
         int open = first.indexOf("0:1");
         assertTrue(open >= 0 && first.size() > open + 1 && first.get(open + 1).equals("0:2"),
@@ -240,7 +289,8 @@ class SendSchedulerTest {
             assertTrue(++spins < 2_000_000, "scheduler made no progress");
             if (offered < records.size() && random.nextInt(100) < 55) {
                 Record record = records.get(offered);
-                scheduler.offer(record, 1 + random.nextInt(5000), continues.get(offered));
+                int size = random.nextInt(10) == 0 ? 100_000 + random.nextInt(400_000) : 1 + random.nextInt(5000);
+                scheduler.offer(record, size, continues.get(offered));
                 offered++;
                 continue;
             }
@@ -251,14 +301,18 @@ class SendSchedulerTest {
                 continue;
             }
             Record record = selection.record();
-            assertEquals(sent[record.streamIndex()] + 1, record.sequence(), "per-stream order");
-            for (Record.Dependency dependency : record.dependencies()) {
-                assertTrue(sent[dependency.streamIndex()] >= dependency.sequence(),
-                        "sent " + record.streamIndex() + ":" + record.sequence()
-                                + " before prerequisite " + dependency.streamIndex() + ":" + dependency.sequence());
+            if (selection.offset() == 0) {
+                assertEquals(sent[record.streamIndex()] + 1, record.sequence(), "per-stream order");
+                for (Record.Dependency dependency : record.dependencies()) {
+                    assertTrue(sent[dependency.streamIndex()] >= dependency.sequence(),
+                            "sent " + record.streamIndex() + ":" + record.sequence()
+                                    + " before prerequisite " + dependency.streamIndex() + ":" + dependency.sequence());
+                }
             }
-            sent[record.streamIndex()] = record.sequence();
-            selected++;
+            if (selection.last()) {
+                sent[record.streamIndex()] = record.sequence();
+                selected++;
+            }
         }
         assertEquals(0, scheduler.size());
     }
