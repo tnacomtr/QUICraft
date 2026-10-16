@@ -107,7 +107,7 @@ Spectrum and similar) relay the ping, advertisement included, but drop UDP. The 
 4. The Minecraft handshake goes **only** over the winner. The loser is closed at once: QUIC with
    `CONNECTION_CLOSE` error `NO_ERROR`, TCP with a normal close.
 5. A QUIC loss or failure is recorded in the failure cache (§6), except `/3` resource aborts
-   under 12.14 (with the authenticated unseen-prerequisite exception in 13.12). Losing to TCP after the head
+   under 12.14, including pre-login sheds (a `/3` `0x12` received before Login Success, 12.13) (with the authenticated unseen-prerequisite exception in 13.12). Losing to TCP after the head
    start counts as a failure.
 
 Known limit (Netty 4.2.19, verified in `QuicLoopbackTest`): when the server rejects the
@@ -139,7 +139,8 @@ idea: derive H from the RTT the server-list ping already measured.
 - Key: (resolved IP, QUIC port, advertised fingerprint). `/3` additionally enforces the
   fingerprint-independent logical-server join-retry limiter in 12.14; rotating addresses,
   advertised ports or fingerprints cannot reset that limiter. Resource aborts (`0x12`)
-  get only the failure-cache exceptions specified in 12.14; unauthenticated peer claims
+  get only the failure-cache exceptions specified in 12.14 (including the pre-login shed
+  exemption, decided by client state); unauthenticated peer claims
   exceeding its allowance follow normal backoff.
 - After a failure, the client skips QUIC for that key for the backoff period. It starts at
   **1 minute** and doubles with each consecutive failure, up to **1 hour** *(user)*. A successful
@@ -757,9 +758,14 @@ not count toward 12.14's three-per-10-minute unverified-0x12 allowance; retry TC
 Keep shed-caused fallback reports out of the UDP-unreachable hint.
 
 Before login completes, reserve only the staged `/3` share from the separate pre-login pool. Charge
-at first accepted 0-RTT early data, not handshake completion. Maintain a rolling credit: debit before
+the pool at the first accepted Initial (mid-handshake connections included); accepted 0-RTT early
+data is charged on arrival only for its extra buffered bytes. Maintain a rolling credit: debit before
 ownership, cap game-read-but-unconsumed bytes per connection at the staged share, stop reading quiche
-at the cap, and close locally if a declared frame exceeds the pre-login maximum. This cap is not a
+at the cap, and close locally if a declared frame exceeds the pre-login maximum frame size of 1 MiB plus
+framing (the vanilla login plugin answer bound; confirm per supported version). A declared frame
+larger than the staged share is charged at its exact declared length against the pre-login pool
+before further reads, subject to the prefix fair share below, then read in credit-sized steps;
+if the charge cannot be made it waits non-fatally under the deadline, never `0x11`. This cap is not a
 total-byte limit. `/3` 0-RTT tickets carry the staged limits; never reduce remembered 0-RTT limits.
 Staging changes only the server's advertised CONNECTION credit: `initial_max_data = 8 KiB`
 until promotion (online mode: Login Success, after session-server authentication; offline mode: `/3` activation), then MAX_DATA to 24 KiB. Stream windows are unchanged from §13.13: 8 KiB on
@@ -767,7 +773,8 @@ client-opened bidi directions (CONTROL, REALTIME), one byte on reverse-CHUNK gua
 maxima; uni limits remain zero. The client's advertised limits are unchanged. Require a per-connection maximum-window
 setter so quiche auto-growth cannot raise a window before authentication. The current patched
 native sets the maximum window per listener configuration only (`Codecs`), so this needs a
-native change, which is an owner decision before implementation. The pre-login interval
+native change, which is an owner decision before implementation. A server MUST NOT advertise
+`/3` without that setter. The pre-login interval
 (Handshake through Login Success) carries Handshake, Login Start, the online-mode encryption
 request/response and login plugin traffic; `/3` OFFER, proofs and switch messages (fixed
 104-byte binding payloads, 12.8) belong to configuration, after Login Success, and are not
@@ -784,9 +791,14 @@ The `/3` pre-login pool has a hard cap, default 10% of the node budget (profile 
 Require `maxOpen >= logged-in target + pre-login connection cap`, where the pre-login connection cap is the pre-login pool's bytes divided by the staged per-connection reservation; raise `maxOpen`, `maxTrackedIps` and
 `globalAttemptsPerSecond` together from TransportConfig defaults 65536, 131072 and 2000 as needed.
 When global capacity is full, shed pre-login work rather than drop an honest token-bearing Initial.
-Choose a victim by source-prefix fair share first (IPv6 /64, IPv4 /24, only for this choice), then
-least-progressed state, then random; never shed one waiting on the server (hasJoined or platform
-event in flight). Online Login Success..activation is charged to logged-in accounting and is never
+Choose a victim by hierarchical source-prefix fair share first (IPv6 /48 then /64, IPv4 /24; used
+only for this choice), then least-progressed state, then random. A connection waiting on the
+server (hasJoined or platform event in flight) is not shed while its prefix is within its fair
+share; a prefix over its fair share loses that protection, and session-server calls in flight per
+prefix are capped (profile value). The global validated-attempt budget (§11) is shared the same
+way: when it is exhausted, an honest token-bearing Initial from a prefix within its fair share is
+admitted by refusing attempts from prefixes over their share, never dropped while some prefix
+exceeds its share. Online Login Success..activation is charged to logged-in accounting and is never
 shed as pre-login. Offline connections remain staged and charged to the pre-login pool until `/3`
 activation, even after Login Success. A shed closes before Login Success and client retries TCP.
 
@@ -813,7 +825,10 @@ activation, even after Login Success. A shed closes before Login Success and cli
       A pre-login shed (a `/3` close received before Login Success, 12.13) is excluded: it is
       not counted toward the allowance below, writes no failure-cache or re-bind-backoff
       entry and does not start the fixed 60-second window; the client retries TCP for that
-      join only, and the next join tries QUIC as usual.
+      join only, and the next join tries QUIC as usual. Bound: after three consecutive pre-login
+      sheds from one logical server within 10 minutes, the client applies the fixed 60-second
+      resource window (still no failure-cache entry), so a broken or hostile server cannot force
+      a double login on every join.
       Before SERVER_SWITCH verifies, a PEER-sent `0x12` cannot authenticate its resource
       claim. Apply the fixed 60-second resource window below to at most three such reports
       per rolling 10 minutes per logical server; the fourth and subsequent reports in that
@@ -1822,15 +1837,16 @@ position extraction. Those implementations must change together before this revi
 17. **13.17 Acceptance tests.** Pre-login admission (12.13, `/3` only): unit-test shedding order
     (source-prefix fair share, then least progress, then random; never one waiting on the
     server), the 10-second client-wait deadline paused during a slow session server, the
-    30-second hard cap, pool charge from first accepted 0-RTT data, the read-but-unconsumed cap
+    30-second hard cap, pool charge from the first accepted Initial (and extra 0-RTT bytes), a large legal login plugin answer completing via its declared-length charge, the read-but-unconsumed cap
     and oversized declared frame close, and failed window or inflater raises waiting
     non-fatally rather than closing `0x11`. Load harness: on top of 50,000 logged-in players, run
-    50,000 handshake-only connections from many distinct IPv6 /64 and IPv4 /24 prefixes, with
+    50,000 handshake-only connections from many distinct IPv6 /64 (including many /64s inside one /48) and IPv4 /24 prefixes, with
     churn at the raised attempt rate, mid-handshake stalls, Login Start then stall, an
-    offline-mode Login Success flood and a slow session server. Pass only if at least 99% of
+    offline-mode Login Success flood, Encryption Response then hasJoined floods during a slow session server, and validated-attempt floods at the global rate limit. Pass only if at least 99% of
     honest joins get QUIC, honest p99 join time is recorded against the unloaded baseline, no
-    logged-in player is shed for a pre-login one, and no honest Initial is dropped while
-    pre-login work could be shed. Before enablement require golden HKDF/exporter/message/record
+    logged-in player is shed for a pre-login one, no honest Initial is dropped while
+    pre-login work could be shed, and no honest validated Initial is dropped by the global rate
+    limit while some prefix exceeds its fair share. Before enablement require golden HKDF/exporter/message/record
     vectors; wrong/absent exporter and upstream-native tests; all MAC/state/timeout failures;
      switch packets split at every byte and coalesced with following plaintext; changed pins,
     rotation and corrupt storage; full/resumed/accepted and rejected early-data sessions;
