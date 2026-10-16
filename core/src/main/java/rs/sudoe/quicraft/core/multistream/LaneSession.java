@@ -429,18 +429,6 @@ public final class LaneSession {
                 r != null && r.decoder.hasPartial() ? 1 : 0};
     }
 
-    /**
-     * Test hook: true once this session has both of its auxiliary lanes open (13.3), i.e. the
-     * peer's preamble has been parsed on each; call on the loop.
-     *
-     * <p>Nothing on the CONTROL lane needs this: 12.12 lets a server start records right after its
-     * own activation, and a record read before this session activates is handed over as the
-     * activation leftover (12.13, 13.14), not refused. It is only about the auxiliary lanes.
-     */
-    boolean auxiliaryLanesOpened() {
-        return activated && !awaitingPeerStreams();
-    }
-
     /** Test hook: the sender's last-assigned sequences per lane; call on the loop. */
     long[] assignedSequences() {
         return sender.assigned();
@@ -550,7 +538,6 @@ public final class LaneSession {
         if (closed) {
             return;
         }
-        if (cause != null) { cause.printStackTrace(System.out); }
         LOG.log(Level.FINE, "closing multi-stream connection with {0}: {1}", new Object[] {code, why});
         shutdown();
         final int closeCode = code;
@@ -938,8 +925,6 @@ public final class LaneSession {
     }
 
     private void admit(LaneStream s, RecordCodec.Record record) {
-        if (s.lane == Lane.CONTROL) {
-        }
         ReceiverScheduler.Partial partial = s.partial;
         s.partial = null;
         s.charged = 0;
@@ -1152,11 +1137,7 @@ public final class LaneSession {
         LaneStream s = streams[i];
         ArrayDeque<byte[]> queue = out.get(i);
         if (s == null || s.channel == null || !s.preambleWritten || held[i] || queue.isEmpty()) {
-            if (lane == Lane.CONTROL && !queue.isEmpty()) {
-            }
             return false;
-        }
-        if (lane == Lane.CONTROL) {
         }
         int budget = WRITE_QUANTUM;
         boolean wrote = false;
@@ -1640,8 +1621,6 @@ public final class LaneSession {
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             ByteBuf buf = (ByteBuf) msg;
-            if (lane == Lane.CONTROL) {
-            }
             readPending = false;
             if (closed || !buf.isReadable()) {
                 buf.release();
