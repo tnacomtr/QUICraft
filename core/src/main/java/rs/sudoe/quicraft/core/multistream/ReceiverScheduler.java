@@ -151,10 +151,11 @@ public final class ReceiverScheduler {
     /**
      * Transport-local withholding is not evidence of a stalled peer. Event-loop only. A lane is
      * marked here only while it is actually retrying a refused parser allocation (the owner
-     * recomputes that on every pass). Decode blocks live on their queue entries so simultaneous
-     * refusals on different lanes remain independently visible.
+     * recomputes that on every pass). At most the next decodable entry in each lane can be refused;
+     * keep those independently in this lane-sized array so regular deadline checks stay O(lanes).
      */
     private final long[] receiveBlockedSince = {-1, -1, -1};
+    private final Entry[] nodeBlockedByLane = new Entry[Lane.values().length];
     private long bundlePausedSince = -1;
 
     void receiveBlocked(Lane lane, boolean blocked, long now) {
@@ -183,24 +184,17 @@ public final class ReceiverScheduler {
     }
 
     private boolean anyDecodeBlocked() {
-        for (ArrayDeque<Entry> q : queues) {
-            for (Entry entry : q) {
-                if (entry.nodeBlockedSince >= 0) {
-                    return true;
-                }
+        for (Entry entry : nodeBlockedByLane) {
+            if (entry != null) {
+                return true;
             }
         }
         return false;
     }
 
     private boolean decodeBlocked(Lane lane, long upTo) {
-        for (Entry entry : queues.get(lane.ordinal())) {
-            if (entry.nodeBlockedSince >= 0
-                    && Long.compareUnsigned(entry.envelope.sequence(), upTo) <= 0) {
-                return true;
-            }
-        }
-        return false;
+        Entry entry = nodeBlockedByLane[lane.ordinal()];
+        return entry != null && Long.compareUnsigned(entry.envelope.sequence(), upTo) <= 0;
     }
 
     /**
@@ -498,6 +492,7 @@ public final class ReceiverScheduler {
             }
         }
         partials.clear();
+        java.util.Arrays.fill(nodeBlockedByLane, null);
         for (ArrayDeque<Entry> q : queues) {
             q.clear();
         }
@@ -834,6 +829,9 @@ public final class ReceiverScheduler {
                     if (decoding.nodeBlockedSince >= 0) {
                         decoding.decodeSince += pumpNow - Math.max(decoding.decodeSince, decoding.nodeBlockedSince);
                         decoding.nodeBlockedSince = -1;
+                        if (nodeBlockedByLane[decoding.envelope.lane().ordinal()] == decoding) {
+                            nodeBlockedByLane[decoding.envelope.lane().ordinal()] = null;
+                        }
                         updatePauses(pumpNow);
                     }
                     if (decoding.decodeSince < 0) {
@@ -859,6 +857,7 @@ public final class ReceiverScheduler {
                                     + ": it can never be carried (13.12)");
                         }
                         refused.nodeBlockedSince = pumpNow;
+                        nodeBlockedByLane[refused.envelope.lane().ordinal()] = refused;
                         updatePauses(pumpNow);
                         return;
                     } catch (RuntimeException ex) {
@@ -978,6 +977,9 @@ public final class ReceiverScheduler {
             // they cannot reach a later entry.
             decoding.decodeSince = -1;
             decoding.decodeReservedBytes = 0;
+            if (nodeBlockedByLane[envelope.lane().ordinal()] == decoding) {
+                nodeBlockedByLane[envelope.lane().ordinal()] = null;
+            }
             decoding = null;
             pump(now);
         } catch (RuntimeException ex) {
