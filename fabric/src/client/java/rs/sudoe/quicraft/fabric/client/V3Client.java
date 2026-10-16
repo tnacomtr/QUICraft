@@ -191,6 +191,11 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             fail("login is not authenticated");
             return false;
         }
+        if (plan.pinState() == TransportSelection.PinState.CHANGED) {
+            // 12.16: a changed pin is only re-bound by an authenticated login, whatever the test flag says.
+            fail(V3Plan.REBIND_FAILED);
+            return false;
+        }
         onlineMode = false; // 12.19: explicit offline test profile, mode 0
         return true;
     }

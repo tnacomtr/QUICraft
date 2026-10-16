@@ -117,6 +117,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             anOversizedBindingPayloadOutsideV3IsDiscardedAsVanillaDoes(table.get());
             theTailKeepsProtocolSwitchTasksAwayFromTheLanes(table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
+            offlineTestModeNeverAcceptsAChangedPin(protocol, table.get());
             aChangedCertificateIsReboundAndTheNewPinIsNoticed(protocol, table.get());
             aReboundThatGetsNoOfferFailsAfterTheBoundedWait(protocol, table.get());
         } catch (Exception e) {
@@ -390,6 +391,25 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(rig.awaitCondition(() -> !rig.channel.isOpen()), "silence closed the connection, as vanilla does");
         } finally {
             V3Client.readTimeoutMillis = 30_000L;
+        }
+    }
+
+    /**
+     * 12.16: a changed pin is only ever re-bound by an authenticated login. The explicit offline test
+     * flag lets an unencrypted login reach the exchange for a first contact, never for a changed pin:
+     * no lanes, the old pin kept, and the decision-table fallback.
+     */
+    private static void offlineTestModeNeverAcceptsAChangedPin(int protocol, RoutingTable table) throws Exception {
+        System.setProperty(V3Client.OFFLINE_TEST_PROPERTY, "true");
+        String old = "sha256:" + "33".repeat(32);
+        try (Rig rig = new Rig(protocol, table, false, true, old)) {
+            check(rig.plan.pinState() == TransportSelection.PinState.CHANGED, "a changed pin");
+            check(!V3Hooks.loginFinished(rig.connection), "an unauthenticated login is refused for a changed pin");
+            check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
+            rig.expectFallback(V3Plan.REBIND_FAILED);
+            check(!rig.fake.activated, "no lanes were activated");
+        } finally {
+            System.clearProperty(V3Client.OFFLINE_TEST_PROPERTY);
         }
     }
 
