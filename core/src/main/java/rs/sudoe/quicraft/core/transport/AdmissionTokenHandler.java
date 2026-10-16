@@ -108,7 +108,7 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
             return offset;
         }
         try {
-            if (!validated.allowAttempt(address.getAddress()) || !openSlotFree(address)) {
+            if (!validated.allowFairAttempt(address.getAddress()) || !openSlotFree(address)) {
                 return -1;
             }
         } catch (Throwable t) {

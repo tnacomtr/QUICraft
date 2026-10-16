@@ -72,6 +72,16 @@ public final class QuicServer implements Closeable {
     /** Marks a connection refused by the open-connection limits; its streams are ignored. */
     private static final io.netty.util.AttributeKey<Boolean> REFUSED =
             io.netty.util.AttributeKey.valueOf(QuicServer.class, "refused");
+    /** The /3 connection's staged pre-login lifecycle (12.13), see {@link #preLoginStage}. */
+    private static final io.netty.util.AttributeKey<PreLoginStage> PRE_LOGIN =
+            io.netty.util.AttributeKey.valueOf(QuicServer.class, "preLogin");
+    /**
+     * Chunk streams charged for a staged connection. N is not negotiated before OFFER, so every
+     * staged connection is charged for the largest N (13.2): conservative, and at most six streams.
+     */
+    static final int STAGED_LANES = 6;
+    /** How often a staged connection's pre-login deadline is checked (12.13). */
+    private static final long STAGED_CHECK_MILLIS = 1_000;
     /** RFC 9001 §4.8: CRYPTO_ERROR 0x100 + TLS alert handshake_failure (40). */
     private static final int CRYPTO_ERROR_HANDSHAKE_FAILURE = 0x100 + 40;
     /** Most UDP sockets one listener binds; the system property below is capped at this. */
@@ -485,6 +495,8 @@ public final class QuicServer implements Closeable {
          * and every lane session reserves its retained bytes here. Unlimited without a budget.
          */
         final ReceiveBudget nodeBudget;
+        /** /3 staged pre-login admission (12.13); null for /2 or without a resource pool. */
+        final PreLoginRegistry preLogin;
         /** The ingress guard's datagram budget, shared by every socket's guard. */
         final ConnectionAdmission ingress;
         /** One instance for every socket's codec: it holds the listener's Retry key. */
@@ -511,6 +523,8 @@ public final class QuicServer implements Closeable {
             this.nodeBudget = config.nodeBudget != null ? config.nodeBudget
                     : config.nodePendingBytes > 0 ? ReceiveBudget.bounded(config.nodePendingBytes)
                             : ReceiveBudget.unlimited();
+            this.preLogin = v3 != null && config.resourcePools != null
+                    ? new PreLoginRegistry(config.resourcePools) : null;
             this.acceptor = acceptor;
             this.v3 = v3;
             this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
@@ -928,7 +942,7 @@ public final class QuicServer implements Closeable {
                     @Override
                     protected void initChannel(QuicChannel connection) {
                         Admitted admitted = Admitted.admit(connection, shared.admission, shared.v3 != null
-                                ? shared.nodeBudget : null);
+                                ? shared.nodeBudget : null, shared.preLogin, shared.config.preLoginOnline);
                         if (admitted == null) {
                             return;
                         }
@@ -990,6 +1004,9 @@ public final class QuicServer implements Closeable {
         /** Bytes this connection reserved against the node budget, 0 when none. */
         private long reserved;
         private ReceiveBudget reservedPool;
+        /** The staged pre-login charge while the connection is pre-login; null otherwise. */
+        private PreLoginRegistry.Entry staged;
+        private java.util.concurrent.ScheduledFuture<?> stagedCheck;
 
         private Admitted(ConnectionAdmission.Lease lease) {
             this.lease = lease;
@@ -1002,7 +1019,7 @@ public final class QuicServer implements Closeable {
          * remote address is already set; fails open.
          */
         static Admitted admit(QuicChannel connection, ConnectionAdmission admission,
-                ReceiveBudget nodeBudget) {
+                ReceiveBudget nodeBudget, PreLoginRegistry preLogin, boolean online) {
             ConnectionAdmission.Lease lease = null;
             try {
                 java.net.SocketAddress remote = connection.remoteSocketAddress();
@@ -1026,7 +1043,22 @@ public final class QuicServer implements Closeable {
                 LOG.log(Level.FINE, "QUIC open-connection check failed; admitting the connection", t);
             }
             Admitted admitted = new Admitted(lease);
-            if (nodeBudget != null) {
+            if (preLogin != null) {
+                // 12.13: /3 is staged from its first accepted Initial, charged to the pre-login pool
+                // instead of the node budget until promotion (Login Success online, activation offline).
+                PreLoginRegistry.Entry entry = stage(connection, preLogin, online);
+                if (entry == null) {
+                    if (lease != null) {
+                        lease.close();
+                    }
+                    LOG.log(Level.FINE, "QUIC /3 connection refused: the pre-login pool has no room");
+                    connection.attr(REFUSED).set(Boolean.TRUE);
+                    Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
+                    return null;
+                }
+                admitted.staged = entry;
+                connection.attr(PRE_LOGIN).set(entry);
+            } else if (nodeBudget != null) {
                 // 13.12: the connection's initial receive-credit exposure counts against the node
                 // budget, and one that does not fit is refused (TCP is untouched).
                 long exposure = TransportConfig.V3_INITIAL_EXPOSURE_BYTES;
@@ -1047,6 +1079,20 @@ public final class QuicServer implements Closeable {
             return admitted;
         }
 
+        /**
+         * Charges the staged share for this connection, shedding other staged connections under the
+         * fair-share rules (12.13). Null when none can be shed: the caller refuses. A connection without a
+         * source address is refused too, since it cannot be charged to a prefix.
+         */
+        private static PreLoginRegistry.Entry stage(QuicChannel connection, PreLoginRegistry preLogin, boolean online) {
+            java.net.SocketAddress remote = connection.remoteSocketAddress();
+            if (!(remote instanceof InetSocketAddress) || ((InetSocketAddress) remote).getAddress() == null) {
+                return null;
+            }
+            return preLogin.admit(((InetSocketAddress) remote).getAddress(), connection, STAGED_LANES, online,
+                    System::nanoTime, () -> Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE));
+        }
+
         @Override
         public void handlerAdded(ChannelHandlerContext ctx) {
             QuicChannel connection = (QuicChannel) ctx.channel();
@@ -1063,6 +1109,30 @@ public final class QuicServer implements Closeable {
                 // E.g. RejectedExecutionException from a hosted loop shutting down. The handler
                 // stays, so the lease is still confirmed and released.
                 LOG.log(Level.FINE, "scheduling the QUIC handshake deadline failed; this connection has none", t);
+            }
+            if (staged != null) {
+                scheduleStagedCheck(ctx, connection);
+            }
+        }
+
+        /**
+         * §12.13: once a second, closes a still-staged connection whose client-wait deadline or 30 s hard cap
+         * has passed, locally with 0x12. Stops when the connection leaves the pre-login stage.
+         */
+        private void scheduleStagedCheck(ChannelHandlerContext ctx, QuicChannel connection) {
+            try {
+                stagedCheck = ctx.executor().scheduleAtFixedRate(() -> {
+                    if (staged.tracker().state() != PreLoginTracker.State.STAGED) {
+                        stagedCheck.cancel(false);
+                        return;
+                    }
+                    if (staged.expired()) {
+                        stagedCheck.cancel(false);
+                        Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
+                    }
+                }, STAGED_CHECK_MILLIS, STAGED_CHECK_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (Throwable t) {
+                LOG.log(Level.FINE, "scheduling the /3 pre-login deadline failed; this connection has none", t);
             }
         }
 
@@ -1085,6 +1155,12 @@ public final class QuicServer implements Closeable {
             if (deadline != null) {
                 deadline.cancel(false);
             }
+            if (stagedCheck != null) {
+                stagedCheck.cancel(false);
+            }
+            if (staged != null) {
+                staged.close();
+            }
             if (lease != null) {
                 lease.close();
             }
@@ -1093,6 +1169,16 @@ public final class QuicServer implements Closeable {
                 reserved = 0;
             }
         }
+    }
+
+    /**
+     * §12.13: the pre-login lifecycle of a {@code /3} connection, or null for {@code /2} connections and
+     * listeners without a resource pool. The platform calls {@code onLoginSuccess} (online) or
+     * {@code onActivation} (offline) on it, and brackets session-server and platform waits with
+     * {@code pauseClientWait}/{@code resumeClientWait}.
+     */
+    public static PreLoginStage preLoginStage(QuicChannel connection) {
+        return connection.attr(PRE_LOGIN).get();
     }
 
     public InetSocketAddress localAddress() {
