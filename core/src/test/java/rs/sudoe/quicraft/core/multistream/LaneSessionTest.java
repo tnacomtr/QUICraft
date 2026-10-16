@@ -13,6 +13,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
 import io.netty.handler.codec.quic.QuicChannel;
 import io.netty.handler.codec.quic.QuicStreamChannel;
@@ -1443,6 +1445,162 @@ class LaneSessionTest {
         }
         assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
                 "both lane sessions release receive and send reservations on close: " + node.reserved());
+    }
+
+    @Test
+    void anImmediateSendWriteFailureReleasesItsNodeChargeExactlyOnce() throws Exception {
+        assertSendWriteFailureReleasesExactlyOnce(0);
+    }
+
+    @Test
+    void aFailureAfterPartialDrainReleasesItsRemainingNodeChargeExactlyOnce() throws Exception {
+        assertSendWriteFailureReleasesExactlyOnce(1);
+    }
+
+    private static void assertSendWriteFailureReleasesExactlyOnce(int successfulWrites) throws Exception {
+        StrictBudget node = new StrictBudget(4L << 20);
+        LaneRig first = LaneRig.start(configWith(node));
+        LaneRig second = LaneRig.start(configWith(node));
+        try {
+            first.activateBoth();
+            second.activateBoth();
+            long otherReservation = holdControlSend(second, node, 64);
+
+            first.client.holdWrites(Lane.CONTROL);
+            first.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, 200_000));
+            assertTrue(LaneRig.await(() -> node.reserved() > otherReservation, 10000),
+                    "the failing connection first reserves its stalled send");
+            QuicStreamChannel control = LaneRig.channelOf(first.client, Lane.CONTROL);
+            installOnLoop(control, failWritesAfter(successfulWrites));
+
+            first.client.releaseWrites(Lane.CONTROL);
+            closedWith(first.clientGame, 0x11, false);
+            // A repeated close must not revisit charges already settled by the inline write failure.
+            first.client.abort(0x11);
+
+            assertOtherSendIntact(second, node, otherReservation,
+                    "the second connection's reservation survives the failed connection's shutdown");
+            assertEquals(0, node.releasesWithoutReservation,
+                    "no send byte is released twice after " + successfulWrites + " successful writes");
+        } finally {
+            first.close();
+            second.close();
+        }
+        assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
+                "both connections release every reservation: " + node.reserved());
+        assertEquals(0, node.releasesWithoutReservation);
+    }
+
+    @Test
+    void anOversizedBundleReservationIsAtomicAndPreservesTheOtherConnection() throws Exception {
+        StrictBudget node = new StrictBudget(1L << 20);
+        LaneRig first = LaneRig.start(configWith(node));
+        LaneRig second = LaneRig.start(configWith(node));
+        try {
+            first.activateBoth();
+            second.activateBoth();
+            long otherReservation = holdControlSend(second, node, 150_000);
+
+            List<SentPacket> bundle = first.client.sendBundle(
+                    new OutboundPacket(LaneRig.frame(LaneRig.BUNDLE_OPEN, "open")),
+                    Arrays.asList(new OutboundPacket(LaneRig.frame(LaneRig.SPAWN, 400_000)),
+                            new OutboundPacket(LaneRig.frame(LaneRig.SPAWN, 400_000))),
+                    new OutboundPacket(LaneRig.frame(LaneRig.BUNDLE_CLOSE, "close")));
+            closedWith(first.clientGame, 0x11, false);
+
+            for (SentPacket packet : bundle) {
+                assertFalse(packet.isAssigned(), "a bundle refused by the node consumes no sequence");
+            }
+            assertOtherSendIntact(second, node, otherReservation,
+                    "the refused bundle leaves no partial charge and preserves the other connection");
+            assertEquals(0, node.releasesWithoutReservation);
+        } finally {
+            first.close();
+            second.close();
+        }
+        assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000));
+        assertEquals(0, node.releasesWithoutReservation);
+    }
+
+    @Test
+    void aSuccessfulDrainThenRepeatedClosePreservesTheOtherConnectionReservation() throws Exception {
+        StrictBudget node = new StrictBudget(4L << 20);
+        LaneRig first = LaneRig.start(configWith(node));
+        LaneRig second = LaneRig.start(configWith(node));
+        try {
+            first.activateBoth();
+            second.activateBoth();
+            long otherReservation = holdControlSend(second, node, 64);
+            first.client.holdWrites(Lane.CONTROL);
+            first.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, "drain"));
+            assertTrue(LaneRig.await(() -> node.reserved() > otherReservation, 10000));
+
+            first.client.releaseWrites(Lane.CONTROL);
+            assertTrue(LaneRig.await(() -> first.serverGame.packetCount() == 1, 10000));
+            assertTrue(LaneRig.await(() -> {
+                try {
+                    return LaneRig.snapshot(first.client)[3] == 0;
+                } catch (Exception e) {
+                    return false;
+                }
+            }, 10000), "the send queue drained before close");
+            first.client.abort(0x11);
+            first.client.abort(0x11);
+
+            assertOtherSendIntact(second, node, otherReservation,
+                    "drain and repeated close leave the second connection's reservation intact");
+            assertEquals(0, node.releasesWithoutReservation);
+        } finally {
+            first.close();
+            second.close();
+        }
+        assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000));
+        assertEquals(0, node.releasesWithoutReservation);
+    }
+
+    private static LaneRig.Config configWith(ReceiveBudget node) {
+        LaneRig.Config config = new LaneRig.Config();
+        config.nodeBudget = node;
+        return config;
+    }
+
+    private static long holdControlSend(LaneRig rig, ReceiveBudget node, int payloadBytes) throws Exception {
+        rig.client.holdWrites(Lane.CONTROL);
+        long before = node.reserved();
+        byte[] frame = LaneRig.frame(LaneRig.SPAWN, payloadBytes);
+        rig.client.send(PLAY, LaneRig.SPAWN, frame);
+        long wireBytes = RecordCodec.encodeGame(1, 0, 0, 0, frame).length;
+        assertTrue(LaneRig.await(() -> node.reserved() >= before + wireBytes, 10000),
+                "the second connection holds a charged send record");
+        return wireBytes;
+    }
+
+    private static void assertOtherSendIntact(LaneRig other, ReceiveBudget node, long wireBytes, String message)
+            throws Exception {
+        assertTrue(LaneRig.await(() -> {
+            try {
+                return LaneRig.snapshot(other.client)[3] == wireBytes && node.reserved() >= wireBytes;
+            } catch (Exception e) {
+                return false;
+            }
+        }, 10000), message + ": pending=" + java.util.Arrays.toString(LaneRig.snapshot(other.client))
+                + ", node=" + node.reserved() + ", expected send bytes=" + wireBytes);
+    }
+
+    private static ChannelOutboundHandlerAdapter failWritesAfter(int successfulWrites) {
+        return new ChannelOutboundHandlerAdapter() {
+            private int writes;
+
+            @Override
+            public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+                if (++writes <= successfulWrites) {
+                    ctx.write(msg, promise);
+                    return;
+                }
+                io.netty.util.ReferenceCountUtil.release(msg);
+                promise.tryFailure(new java.io.IOException("injected immediate lane write failure"));
+            }
+        };
     }
 
     @Test

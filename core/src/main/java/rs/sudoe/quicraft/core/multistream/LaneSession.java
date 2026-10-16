@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.core.multistream;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
@@ -1225,7 +1226,7 @@ public final class LaneSession {
         int i = lane.ordinal();
         LaneStream s = streams[i];
         ArrayDeque<byte[]> queue = out.get(i);
-        if (s == null || s.channel == null || !s.preambleWritten || held[i] || queue.isEmpty()) {
+        if (closed || s == null || s.channel == null || !s.preambleWritten || held[i] || queue.isEmpty()) {
             return false;
         }
         int budget = WRITE_QUANTUM;
@@ -1240,7 +1241,7 @@ public final class LaneSession {
                 buf.release();
                 throw e;
             }
-            s.channel.write(buf).addListener(s.writeFailed);
+            ChannelFuture write = s.channel.write(buf);
             outOffset[i] += n;
             budget -= n;
             wrote = true;
@@ -1256,6 +1257,13 @@ public final class LaneSession {
             }
             // 13.12: these bytes have reached the stream, so the node no longer carries them.
             creditNode(n);
+            // A failed promise can notify inline here. Settle the corresponding queue offsets and
+            // charge before installing the listener, otherwise shutdown() releases the outstanding
+            // queue and the code below returns to release this same chunk a second time.
+            write.addListener(s.writeFailed);
+            if (closed) {
+                return wrote;
+            }
         }
         if (wrote) {
             s.channel.flush();
