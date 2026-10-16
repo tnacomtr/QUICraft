@@ -10,11 +10,15 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.DatagramChannel;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -119,37 +123,106 @@ class HostedV3DialTest {
             }
         }, socket, new InetSocketAddress(InetAddress.getLoopbackAddress(), 25565), identity.fingerprint(), null,
                 TransportConfig.DEFAULT, null, false));
-        assertTrue(socket.closed, "the supplied hosted socket is released when synchronous validation fails");
+        assertEquals(1, socket.closes.get(), "the supplied hosted socket is closed exactly once when synchronous validation fails");
     }
 
+    @Test
+    void cancelledHostedV3DialClosesTheSuppliedSocketOnce() throws Exception {
+        // Nothing is written to this socket, so the handshake stays pending until the cancel.
+        TrackingSocket socket = new TrackingSocket();
+        CompletableFuture<V3Connection> dial = QuicClient.connectV3(GameHost.loop(clientLoop), socket,
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 25565), identity.fingerprint(), TABLE,
+                TransportConfig.DEFAULT, null, false);
+        // Registration on the loop hands the socket to the channel; the cancel then closes both ways.
+        socket.started.get(10, TimeUnit.SECONDS);
+        assertTrue(dial.cancel(true));
+        drainClientLoop();
+        assertEquals(1, socket.closes.get(), "a cancelled hosted /3 dial closes its socket exactly once");
+    }
+
+    @Test
+    void failedHostedV3DialClosesTheSuppliedSocketOnce() throws Exception {
+        try (QuicServer server = QuicServer.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
+                identity, TransportConfig.DEFAULT, stream -> { },
+                new V3Listener() {
+                    @Override
+                    public RoutingTable tableFor(int protocolNumber) {
+                        return protocolNumber == PROTOCOL ? TABLE : null;
+                    }
+                })) {
+            DatagramChannel channel = new NioDatagramChannel();
+            clientLoop.register(channel).sync();
+            channel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0)).sync();
+            TrackingSocket socket = new TrackingSocket(GameHost.socket(channel));
+            // A different identity's fingerprint: the server's certificate fails the pin.
+            CompletableFuture<V3Connection> dial = QuicClient.connectV3(GameHost.loop(clientLoop), socket,
+                    server.localAddress(), ServerIdentity.generate().fingerprint(), TABLE,
+                    TransportConfig.DEFAULT, null, false);
+            assertThrows(ExecutionException.class, () -> dial.get(10, TimeUnit.SECONDS));
+            drainClientLoop();
+            assertEquals(1, socket.closes.get(), "a failed hosted /3 dial closes its socket exactly once");
+        }
+    }
+
+    /** Returns once the game loop has run everything queued before this call, twice over. */
+    private void drainClientLoop() throws Exception {
+        clientLoop.submit(() -> { }).get(10, TimeUnit.SECONDS);
+        clientLoop.submit(() -> { }).get(10, TimeUnit.SECONDS);
+    }
+
+    /** Counts every close that reaches it; optionally forwards to a real socket. */
     private static final class TrackingSocket implements HostDatagramSocket {
-        volatile boolean closed;
+        final AtomicInteger closes = new AtomicInteger();
+        final CompletableFuture<Void> started = new CompletableFuture<>();
+        private final HostDatagramSocket delegate;
+
+        TrackingSocket() {
+            this(null);
+        }
+
+        TrackingSocket(HostDatagramSocket delegate) {
+            this.delegate = delegate;
+        }
 
         @Override
         public InetSocketAddress localAddress() {
-            return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+            return delegate != null ? delegate.localAddress()
+                    : new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
         }
 
         @Override
         public void start(Receiver receiver) {
+            started.complete(null);
+            if (delegate != null) {
+                delegate.start(receiver);
+            }
         }
 
         @Override
-        public void write(java.nio.ByteBuffer data, InetSocketAddress recipient) {
+        public void write(ByteBuffer data, InetSocketAddress recipient) {
+            if (delegate != null) {
+                delegate.write(data, recipient);
+            }
         }
 
         @Override
         public void flush() {
+            if (delegate != null) {
+                delegate.flush();
+            }
         }
 
         @Override
         public boolean isWritable() {
-            return true;
+            return delegate == null || delegate.isWritable();
         }
 
         @Override
         public void close() {
-            closed = true;
+            closes.incrementAndGet();
+            if (delegate != null) {
+                delegate.close();
+            }
         }
     }
 }
