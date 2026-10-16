@@ -27,12 +27,52 @@ public final class RoutingTable {
     private final byte[] digest;
     private final String digestHex;
     private final Map<RouteKey, Route> routes;
+    private final int schema;
+    private final Map<RouteKey, RouteV2> routesV2;
+    private final Map<String, String> extractors;
+    private final Map<ProtocolState, RouteV2.ServerboundLimits> serverboundLimits;
 
     RoutingTable(int protocolNumber, byte[] digest, Map<RouteKey, Route> routes) {
+        this(protocolNumber, digest, routes, 1, Collections.<RouteKey, RouteV2>emptyMap(),
+                Collections.<String, String>emptyMap(),
+                Collections.<ProtocolState, RouteV2.ServerboundLimits>emptyMap());
+    }
+
+    RoutingTable(int protocolNumber, byte[] digest, Map<RouteKey, Route> routes, int schema,
+                 Map<RouteKey, RouteV2> routesV2, Map<String, String> extractors,
+                 Map<ProtocolState, RouteV2.ServerboundLimits> limits) {
         this.protocolNumber = protocolNumber;
         this.digest = digest.clone();
         this.digestHex = toHex(digest);
         this.routes = Collections.unmodifiableMap(new LinkedHashMap<>(routes));
+        this.schema = schema;
+        this.routesV2 = Collections.unmodifiableMap(new LinkedHashMap<>(routesV2));
+        this.extractors = Collections.unmodifiableMap(new LinkedHashMap<>(extractors));
+        this.serverboundLimits = Collections.unmodifiableMap(new LinkedHashMap<>(limits));
+    }
+
+    /** Resource schema, keeping schema-1 callers distinguishable (13.7). */
+    public int schema() { return schema; }
+
+    /** Reviewed schema-2 entries in resource order (13.7). */
+    public Map<RouteKey, RouteV2> routesV2() { return routesV2; }
+
+    /** Versioned decoder identifiers covered by R (13.7). */
+    public Map<String, String> extractors() { return extractors; }
+
+    /** Reviewed per-state read/decode limits (13.7). */
+    public Map<ProtocolState, RouteV2.ServerboundLimits> serverboundLimits() { return serverboundLimits; }
+
+    /**
+     * Exact schema-2 lookup, defaulting to CONTROL/global without guessing (13.6). A defaulted route
+     * carries its state's accounting identifier, the same one an explicit route in that state gets,
+     * so unknown ids are footprint-bounded like known ones (13.7).
+     */
+    public RouteV2 routeV2For(RouteKey key) {
+        RouteV2 route = routesV2.get(key);
+        if (route != null) return route;
+        RouteV2.ServerboundLimits bound = serverboundLimits.get(key.state());
+        return new RouteV2(null, null, false, bound, bound == null ? null : bound.decodeFootprintBound);
     }
 
     /** The Minecraft protocol number this table is for (13.7). */
@@ -53,18 +93,18 @@ public final class RoutingTable {
         return digestHex;
     }
 
-    /** The route for an exact lookup, or empty when the entry is missing (13.6). */
+    /** Legacy schema-1 lookup; schema 2 uses {@link #routeV2For(RouteKey)} (13.6). */
     public Optional<Route> routeFor(RouteKey key) {
         return Optional.ofNullable(routes.get(key));
     }
 
-    /** The lane for an exact lookup, defaulting to CONTROL for any missing entry (13.6). */
+    /** Legacy schema-1 lane lookup, defaulting to CONTROL for missing entries (13.6). */
     public Lane laneFor(ProtocolState state, Direction direction, int packetId) {
         Route route = routes.get(new RouteKey(protocolNumber, state, direction, packetId));
         return route == null ? Lane.CONTROL : route.lane();
     }
 
-    /** All explicit entries, in resource order. Unmodifiable. */
+    /** All legacy schema-1 entries, in resource order. Unmodifiable (13.7). */
     public Map<RouteKey, Route> routes() {
         return routes;
     }

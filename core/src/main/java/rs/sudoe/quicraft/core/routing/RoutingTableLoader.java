@@ -21,9 +21,18 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import rs.sudoe.quicraft.core.discovery.Json;
+import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
+import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry.Kind;
+import rs.sudoe.quicraft.core.routing.extract.FootprintRegistry;
 
 /**
  * Parses and validates a routing resource (docs/protocol.md 13.6, 13.7).
+ *
+ * <p>Schema 2 uses explicit logical stream roles, reviewed position decoders and per-state
+ * accounting policies. It is exposed through {@link RoutingTable#routesV2()}, never translated
+ * into legacy WORLD lanes. The schema-1 path below remains available for shipped resources.
+ * Primitive decoder/accounting identifiers describe synthetic complete layouts only; game
+ * adapters must add independently reviewed versioned identifiers, not offsets in JSON.
  *
  * <p>A resource is UTF-8 JSON with {@code schema:1}, {@code protocol:<number>}, {@code default} and
  * a list of {@code routes}, each carrying {@code state}, {@code direction}, {@code packet_id},
@@ -55,8 +64,11 @@ import rs.sudoe.quicraft.core.discovery.Json;
  * is added. That parser bounds the decoded text at 1 MiB, which no in-tree table comes close to.
  */
 public final class RoutingTableLoader {
-    /** The only supported resource schema (13.7). */
+    private static final Object JSON_NULL = Json.parseRejectingDuplicateKeys("null");
+    /** Legacy schema retained for shipped resources and mandatory-CONTROL sets (13.7). */
     public static final int SCHEMA_VERSION = 1;
+    /** Current schema, using logical stream roles and explicit fence classes (13.7). */
+    public static final int SCHEMA_VERSION_V2 = 2;
     /** The only defined default lane (13.7). */
     public static final Lane DEFAULT_LANE = Lane.CONTROL;
     /** Classpath directory holding one resource per protocol number, named {@code protocol-<n>.json}. */
@@ -188,6 +200,8 @@ public final class RoutingTableLoader {
             throw new RoutingTableException("13.7: the resource must be a JSON object");
         }
         Map<?, ?> root = (Map<?, ?>) parsed;
+        int selectedSchema = intField(root, SCHEMA_FIELD, "resource");
+        if (selectedSchema == SCHEMA_VERSION_V2) return parseV2(root, bytes, mandatoryControl);
         requireFields(root, ROOT_FIELDS, "resource", "13.7");
 
         int schema = intField(root, SCHEMA_FIELD, "resource");
@@ -247,6 +261,138 @@ public final class RoutingTableLoader {
             index++;
         }
         return new RoutingTable(protocolNumber, sha256(bytes), routes);
+    }
+
+    private static RoutingTable parseV2(Map<?, ?> root, byte[] bytes, Set<RouteKey> mandatory) {
+        requireFields(root, unmodifiableSet("schema", "protocol", "default", "extractors", "routes",
+                "serverboundLimits"), "resource", "13.7");
+        int protocol = intField(root, "protocol", "resource");
+        if (protocol < 1 || !"global".equals(root.get("default")))
+            throw new RoutingTableException("13.7: positive protocol and default global required");
+        Map<String, String> extractors = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : object(root.get("extractors"), "extractors").entrySet()) {
+            if (!(entry.getKey() instanceof String) || ((String) entry.getKey()).isEmpty()
+                    || !(entry.getValue() instanceof String))
+                throw new RoutingTableException("13.7: invalid extractor definition");
+            String identifier = (String) entry.getValue();
+            decoder(identifier);
+            extractors.put((String) entry.getKey(), identifier);
+        }
+        Map<ProtocolState, RouteV2.ServerboundLimits> limits = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : object(root.get("serverboundLimits"), "serverboundLimits").entrySet()) {
+            ProtocolState state;
+            try { state = ProtocolState.of((String) entry.getKey()); }
+            catch (IllegalArgumentException e) { throw new RoutingTableException("13.7: unknown limits state"); }
+            Map<?, ?> value = object(entry.getValue(), "limits");
+            requireFields(value, unmodifiableSet("maxServerboundRecord", "maxServerboundRealtimeRecord",
+                    "maxDecodedFootprint", "ordinaryReadAllowance", "decodeFootprintBound"), "limits", "13.7");
+            int control = positive(value, "maxServerboundRecord", 2097208);
+            int realtime = positive(value, "maxServerboundRealtimeRecord", 510);
+            int decoded = positive(value, "maxDecodedFootprint", 8 * 1024 * 1024);
+            int allowance = positive(value, "ordinaryReadAllowance", 5619);
+            if (allowance < 160) throw new RoutingTableException("13.7: prefix staging does not fit");
+            Object accounting = value.get("decodeFootprintBound");
+            if (!(accounting instanceof String)) throw new RoutingTableException("13.7: accounting must be a string");
+            try { FootprintRegistry.require((String) accounting); }
+            catch (IllegalArgumentException e) { throw new RoutingTableException(e.getMessage()); }
+            limits.put(state, new RouteV2.ServerboundLimits(control, realtime, decoded, allowance, (String) accounting));
+        }
+        // Every state needs limits, not only those with explicit routes: implicit CONTROL/global
+        // default routes (13.6) inherit their state's accounting for unknown packet ids.
+        for (ProtocolState state : ProtocolState.values()) {
+            if (!limits.containsKey(state))
+                throw new RoutingTableException("13.7: missing limits for state " + state.wireName());
+        }
+        Object entries = root.get("routes");
+        if (!(entries instanceof List)) throw new RoutingTableException("13.7: routes must be an array");
+        Map<RouteKey, RouteV2> routes = new LinkedHashMap<>();
+        for (Object entry : (List<?>) entries) {
+            Map<?, ?> value = object(entry, "route");
+            ProtocolState state = stateField(value, "route");
+            Direction direction = directionField(value, "route");
+            boolean serverbound = direction == Direction.SERVERBOUND;
+            Object laneText = value.get("lane");
+            RouteV2.StreamLane lane;
+            if ("control".equals(laneText)) lane = RouteV2.StreamLane.CONTROL;
+            else if ("realtime".equals(laneText)) lane = RouteV2.StreamLane.REALTIME;
+            else if ("chunk".equals(laneText)) lane = RouteV2.StreamLane.CHUNK;
+            else throw new RoutingTableException("13.7: unknown lane");
+            boolean control = lane == RouteV2.StreamLane.CONTROL;
+            Set<String> fields = new HashSet<>(unmodifiableSet("state", "direction", "packet_id", "lane",
+                    "dependency", "position", "epoch_change"));
+            if (serverbound && control) fields.add("ordinarySmall");
+            requireFields(value, fields, "route", "13.7");
+            Dependency dependency;
+            try { dependency = Dependency.of((String) value.get("dependency")); }
+            catch (IllegalArgumentException | ClassCastException e) { throw new RoutingTableException("13.7: unknown dependency"); }
+            boolean join = dependency == Dependency.ACK_JOIN || dependency == Dependency.BATCH_JOIN;
+            boolean valid = control ? dependency == Dependency.GLOBAL || dependency == Dependency.VIEW
+                    || dependency == Dependency.CONTROL || dependency == Dependency.ORDINARY
+                    || (serverbound && dependency == Dependency.INTERACTION)
+                    : dependency == Dependency.LANE || (lane == RouteV2.StreamLane.CHUNK && join);
+            if (!valid || (serverbound && lane == RouteV2.StreamLane.CHUNK)
+                    || (!state.isPlay() && (!control || dependency != Dependency.GLOBAL)))
+                throw new RoutingTableException("13.7: forbidden route tuple");
+            boolean epoch = bool(value, "epoch_change");
+            if (epoch && (serverbound || !control || dependency != Dependency.GLOBAL))
+                throw new RoutingTableException("13.7: epoch_change requires clientbound CONTROL/global");
+            Object positionValue = value.get("position");
+            String position = null;
+            String identifier = null;
+            Kind kind = null;
+            if (positionValue != JSON_NULL) {
+                if (!(positionValue instanceof String) || !extractors.containsKey(positionValue))
+                    throw new RoutingTableException("13.7: unknown position extractor");
+                position = (String) positionValue;
+                identifier = extractors.get(position);
+                kind = decoder(identifier).kind;
+            }
+            if (lane == RouteV2.StreamLane.CHUNK) {
+                if (kind != (join ? Kind.JOIN : Kind.SINGLE))
+                    throw new RoutingTableException("13.7: chunk route requires single position or join");
+            } else if (kind != null && !(control && dependency == Dependency.GLOBAL
+                    && kind == Kind.LIST)) {
+                throw new RoutingTableException("13.7: unexpected position extractor");
+            }
+            RouteV2.ServerboundLimits bound = limits.get(state);
+            if (serverbound && bound == null) throw new RoutingTableException("13.7: missing state limits");
+            Boolean small = serverbound && control ? bool(value, "ordinarySmall") : null;
+            // Without route-specific game size facts, prove the guarantee against the entire
+            // state's bounds. A later reviewed adapter can supply a tighter versioned policy.
+            if (Boolean.TRUE.equals(small) && FootprintRegistry.bound(
+                    bound.decodeFootprintBound, bound.maxServerboundRecord + 5,
+                    bound.maxDecodedFootprint, false) > bound.ordinaryReadAllowance)
+                throw new RoutingTableException("13.7: ordinarySmall guarantee exceeds allowance");
+            RouteKey key = new RouteKey(protocol, state, direction, intField(value, "packet_id", "route"));
+            if (mandatory.contains(key) && (!control || dependency != Dependency.GLOBAL))
+                throw new RoutingTableException("13.7: mandatory CONTROL requires global fence");
+            RouteV2 route = new RouteV2(lane, dependency, identifier, position, epoch, bound,
+                    bound == null ? null : bound.decodeFootprintBound, small);
+            if (routes.put(key, route) != null) throw new RoutingTableException("13.7: duplicate route");
+        }
+        return new RoutingTable(protocol, sha256(bytes), Collections.<RouteKey, Route>emptyMap(), 2,
+                routes, extractors, limits);
+    }
+
+    private static ExtractorRegistry.Decoder decoder(String id) {
+        try { return ExtractorRegistry.decoder(id); }
+        catch (IllegalArgumentException e) { throw new RoutingTableException(e.getMessage()); }
+    }
+
+    private static Map<?, ?> object(Object value, String where) {
+        if (!(value instanceof Map)) throw new RoutingTableException("13.7: " + where + " must be an object");
+        return (Map<?, ?>) value;
+    }
+
+    private static int positive(Map<?, ?> value, String field, int max) {
+        int n = intField(value, field, "limits");
+        if (n < 1 || n > max) throw new RoutingTableException("13.7: invalid " + field);
+        return n;
+    }
+
+    private static boolean bool(Map<?, ?> value, String field) {
+        if (!(value.get(field) instanceof Boolean)) throw new RoutingTableException("13.7: boolean required: " + field);
+        return (Boolean) value.get(field);
     }
 
     /**

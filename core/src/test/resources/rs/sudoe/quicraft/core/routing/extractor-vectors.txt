@@ -1,0 +1,15 @@
+primitive.chunk_xz.v1|010000000000000000|0,0
+primitive.varint_xz.v1|010000|0,0
+primitive.chunk_xz.v1|01ffffffffffffffef|-1,-17
+primitive.varint_xz.v1|01ffffffff0fefffffff0f|-1,-17
+primitive.chunk_xz.v1|01800000007fffffff|-2147483648,2147483647
+primitive.varint_xz.v1|018080808008ffffffff07|-2147483648,2147483647
+primitive.block_position.v1|010000000000000000|0,0
+primitive.block_position.v1|01fffffffffffeffc0|-1,-2
+primitive.block_position.v1|018000001ffffff800|-2097152,2097151
+primitive.section_position.v1|010000000000000000|0,0
+primitive.section_position.v1|01fffffffffeffffff|-1,-17
+primitive.section_position.v1|01800001fffff80000|-2097152,2097151
+primitive.join.v1|01|JOIN
+primitive.chunk_list.v1|0100|
+primitive.chunk_list.v1|0102ffffffffffffffef800000007fffffff|-1,-17;-2147483648,2147483647

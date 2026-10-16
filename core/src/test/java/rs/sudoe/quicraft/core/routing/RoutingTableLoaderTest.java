@@ -133,7 +133,7 @@ class RoutingTableLoaderTest {
 
     @Test
     void rejectsUnsupportedSchema() {
-        assertTrue(reject(EXAMPLE.replace("\"schema\":1", "\"schema\":2")).getMessage().contains("schema"));
+        assertTrue(reject(EXAMPLE.replace("\"schema\":1", "\"schema\":3")).getMessage().contains("schema"));
     }
 
     @Test
