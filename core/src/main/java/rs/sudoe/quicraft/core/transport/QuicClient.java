@@ -669,17 +669,15 @@ public final class QuicClient {
         }
 
         /**
-         * The attempt failed or lost the race. Usually closing the socket is enough: that
-         * force-closes the QUIC channel and fails the connect. (Cancelling Netty's connect future
-         * instead makes QuicChannelBootstrap log an IllegalStateException when it later fails that
-         * future.) After 0-RTT data the server may have started a login on it, so it gets a
-         * CONNECTION_CLOSE first (docs/protocol.md §8, "TCP wins after 0-RTT went out"). quiche
-         * sends one only if the client has received a packet from the server; otherwise the
-         * server's confirmation deadline ends that login.
+         * The attempt failed or lost the race. Once a QUIC channel exists, close it explicitly so
+         * the peer can release the connection instead of waiting for its idle timeout. Closing the
+         * UDP socket alone only force-closes our local channel. Before the client has received any
+         * server packet quiche cannot send an authenticated CONNECTION_CLOSE, so in that case the
+         * server's handshake deadline remains the backstop.
          */
         private void abandon() {
             QuicChannel connection = quic.get();
-            if (connection == null || early == null || !early.sent() || !connection.isOpen()) {
+            if (connection == null || !connection.isOpen()) {
                 udp.close();
                 return;
             }
@@ -988,15 +986,10 @@ public final class QuicClient {
                     });
         }
 
-        /**
-         * The attempt failed or lost the race. Usually closing the socket is enough: that
-         * force-closes the QUIC channel and fails the connect. After 0-RTT data the server may have
-         * started a login on it, so it gets a CONNECTION_CLOSE first (docs/protocol.md §8, "TCP wins
-         * after 0-RTT went out").
-         */
+        /** Closes the peer-visible QUIC connection when possible; UDP close alone is only local. */
         private void abandon() {
             QuicChannel connection = quic.get();
-            if (connection == null || early == null || !early.sent() || !connection.isOpen()) {
+            if (connection == null || !connection.isOpen()) {
                 udp.close();
                 return;
             }

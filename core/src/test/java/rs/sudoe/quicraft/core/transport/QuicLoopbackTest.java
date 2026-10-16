@@ -503,19 +503,24 @@ class QuicLoopbackTest {
     @Test
     void cancellingAConnectAttemptLeavesNothingOpen() throws Exception {
         CompletableFuture<QuicByteStream> accepted = new CompletableFuture<>();
-        try (QuicServer server = Loopback.echoServer(identity, accepted)) {
+        Loopback.Collector collector = new Loopback.Collector();
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity, TransportConfig.DEFAULT, s -> {
+            s.setListener(collector);
+            s.setAutoRead(true);
+            accepted.complete(s);
+        })) {
             CompletableFuture<QuicByteStream> attempt = QuicClient.connect(server.localAddress(),
                     identity.fingerprint(), TransportConfig.DEFAULT);
             attempt.cancel(false);
             assertTrue(attempt.isCancelled());
-            // A stream that would have completed after the cancel must be closed, not leaked.
-            Thread.sleep(500);
-            if (accepted.isDone()) {
-                QuicByteStream serverSide = accepted.get();
-                Loopback.Collector c = new Loopback.Collector();
-                serverSide.setListener(c);
-                assertTrue(c.closed.await(5, TimeUnit.SECONDS) || !serverSide.isOpen(),
+            // A stream that completes after the cancel must be closed, not leaked. Install the
+            // listener before exposing the stream so an already-delivered close cannot be missed.
+            try {
+                accepted.get(500, TimeUnit.MILLISECONDS);
+                assertTrue(collector.closed.await(5, TimeUnit.SECONDS),
                         "a cancelled attempt's connection must be closed");
+            } catch (java.util.concurrent.TimeoutException noStreamAccepted) {
+                // The cancellation may have arrived before the server accepted a QUIC stream.
             }
         }
     }
