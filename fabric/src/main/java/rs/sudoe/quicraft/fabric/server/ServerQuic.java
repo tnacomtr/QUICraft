@@ -240,6 +240,8 @@ public final class ServerQuic {
     public static void stop() {
         ServerQuic s = current;
         current = null;
+        minecraft = null;
+        fingerprintDigest = null;
         if (s != null) {
             try {
                 s.server.close();

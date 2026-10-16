@@ -12,6 +12,7 @@ import java.security.KeyFactory;
 import java.security.SecureRandom;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.concurrent.CompletableFuture;
+import net.minecraft.SharedConstants;
 import java.util.concurrent.TimeUnit;
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
@@ -57,7 +58,6 @@ final class RawV3Client {
         }
     }
 
-    private static final int PROTOCOL = 775;
     private static final int CLIENTBOUND_LOGIN_HELLO = 1;
     private static final int SERVERBOUND_LOGIN_KEY = 1;
     private static final int CLIENTBOUND_LOGIN_COMPRESSION = 3;
@@ -223,7 +223,7 @@ final class RawV3Client {
                 phase = 1;
                 result.events.add("login finished, configuration entered");
                 binding = new BindingSession(BindingStateMachine.Role.CLIENT, connection::exporterValue, secret,
-                        online ? BindingStateMachine.MODE_ONLINE : BindingStateMachine.MODE_OFFLINE, PROTOCOL, fingerprint, table.digest(), System::nanoTime, 0L,
+                        online ? BindingStateMachine.MODE_ONLINE : BindingStateMachine.MODE_OFFLINE, SharedConstants.getProtocolVersion(), fingerprint, table.digest(), System::nanoTime, 0L,
                         new BindingDriver.Callbacks() {
                             @Override
                             public void send(byte[] payload) {
@@ -440,7 +440,7 @@ final class RawV3Client {
     private static byte[] handshake(int port) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         writeVarInt(out, 0);
-        writeVarInt(out, PROTOCOL);
+        writeVarInt(out, SharedConstants.getProtocolVersion());
         writeString(out, "127.0.0.1");
         out.write(port >> 8);
         out.write(port);

@@ -6,14 +6,12 @@ import io.netty.buffer.ByteBufUtil;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
 import io.netty.util.AttributeKey;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
-import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -45,7 +43,7 @@ import rs.sudoe.quicraft.fabric.mixin.CipherBaseAccessor;
 import rs.sudoe.quicraft.fabric.mixin.CipherDecoderAccessor;
 import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
 import rs.sudoe.quicraft.fabric.mixin.PacketEncoderAccessor;
-import rs.sudoe.quicraft.fabric.net.BindingPayload;
+
 import rs.sudoe.quicraft.fabric.net.FrameCodec;
 import rs.sudoe.quicraft.fabric.net.PacketLaneCodec;
 
@@ -352,7 +350,7 @@ public final class V3Join {
         if (self == null) {
             throw new IllegalStateException("no outbound filter to write binding payloads below");
         }
-        lastBindingWrite = self.writeAndFlush(new ClientboundCustomPayloadPacket(new BindingPayload(payload)));
+        lastBindingWrite = self.writeAndFlush(new ClientboundCustomPayloadPacket(new ServerBindingPayload(payload)));
     }
 
     /**
@@ -445,6 +443,12 @@ public final class V3Join {
         // the compression, length and cipher handlers. The filter stays the first handler a write
         // meets and notes the state it is encoded in.
         pipeline.addBefore(ENCODER, SINK, new EncoderSink());
+        // Vanilla's read timeout watches the byte path, which carries no game traffic from here on and
+        // would kick the player after 30 s of "silence". QUIC's idle timeout and the lane session's own
+        // deadlines (13.12, 13.14) take over.
+        if (pipeline.get("timeout") != null) {
+            pipeline.remove("timeout");
+        }
         pipeline.remove(filter);
         filter = new OutboundFilter(true);
         pipeline.addLast(FILTER, filter);
@@ -472,6 +476,12 @@ public final class V3Join {
         boolean activated = phase == Phase.ACTIVE;
         phase = Phase.FAILED;
         hold.fail();
+        byte[] leftoverSecret = secret;
+        secret = null;
+        if (leftoverSecret != null) {
+            // 12.6: erase task-owned copies of S on failure.
+            Arrays.fill(leftoverSecret, (byte) 0);
+        }
         try {
             long now = System.nanoTime();
             long last = LAST_WARNING.get();

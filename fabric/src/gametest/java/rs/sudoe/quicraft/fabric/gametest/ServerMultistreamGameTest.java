@@ -12,6 +12,7 @@ import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestDedicatedServerContext;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.SharedConstants;
 import rs.sudoe.quicraft.bridge.MultistreamSwitch;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
@@ -28,7 +29,9 @@ import rs.sudoe.quicraft.fabric.server.ServerQuic;
 public class ServerMultistreamGameTest implements FabricClientGameTest {
     @Override
     public void runTest(ClientGameTestContext context) {
-        if (!QuicSupport.hasKeyingMaterialExport() || !QuicSupport.hasMaxFlowControlWindows()) {
+        if (!QuicSupport.hasKeyingMaterialExport() || !QuicSupport.hasMaxFlowControlWindows()
+                || MultistreamSwitch.tableFor(SharedConstants.getProtocolVersion()) == null) {
+            // No /3 on this native, or no routing resource for this game version (13.1): TCP only.
             return;
         }
         Hooks.setFaultInjection(false);
@@ -52,7 +55,7 @@ public class ServerMultistreamGameTest implements FabricClientGameTest {
             check(ad != null && "quicraft/3".equals(ad.alpn()), "the server advertises quicraft/3: " + ad);
             RawV3Client.Result result;
             try (RawV3Client.Join join = RawV3Client.start(new InetSocketAddress(InetAddress.getLoopbackAddress(),
-                    ad.port()), ad.fingerprint(), MultistreamSwitch.tableFor(775), 5, false)) {
+                    ad.port()), ad.fingerprint(), MultistreamSwitch.tableFor(SharedConstants.getProtocolVersion()), 5, false)) {
                 // The harness steps the game's ticks only while the test waits for them.
                 for (int tick = 0; tick < 1200 && !join.done.isDone(); tick++) {
                     context.waitTick();

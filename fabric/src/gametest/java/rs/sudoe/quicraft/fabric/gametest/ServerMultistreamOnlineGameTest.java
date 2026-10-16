@@ -14,6 +14,7 @@ import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestDedicatedServerContext;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.SharedConstants;
 import rs.sudoe.quicraft.bridge.MultistreamSwitch;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
@@ -35,7 +36,9 @@ public class ServerMultistreamOnlineGameTest implements FabricClientGameTest {
 
     @Override
     public void runTest(ClientGameTestContext context) {
-        if (!QuicSupport.hasKeyingMaterialExport() || !QuicSupport.hasMaxFlowControlWindows()) {
+        if (!QuicSupport.hasKeyingMaterialExport() || !QuicSupport.hasMaxFlowControlWindows()
+                || MultistreamSwitch.tableFor(SharedConstants.getProtocolVersion()) == null) {
+            // No /3 on this native, or no routing resource for this game version (13.1): TCP only.
             return;
         }
         try {
@@ -83,7 +86,7 @@ public class ServerMultistreamOnlineGameTest implements FabricClientGameTest {
                 RawV3Client.Result result;
                 try (RawV3Client.Join join = RawV3Client.start(new InetSocketAddress(
                         InetAddress.getLoopbackAddress(), ad.port()), ad.fingerprint(),
-                        MultistreamSwitch.tableFor(775), 5, true)) {
+                        MultistreamSwitch.tableFor(SharedConstants.getProtocolVersion()), 5, true)) {
                     for (int tick = 0; tick < 1200 && !join.done.isDone(); tick++) {
                         context.waitTick();
                     }
