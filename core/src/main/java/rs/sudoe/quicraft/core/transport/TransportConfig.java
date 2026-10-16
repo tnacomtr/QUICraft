@@ -2,6 +2,8 @@
 package rs.sudoe.quicraft.core.transport;
 
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
+import rs.sudoe.quicraft.core.profile.ServerProfile;
+import rs.sudoe.quicraft.core.resource.ResourcePools;
 
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -30,32 +32,49 @@ public final class TransportConfig {
 
     /**
      * /3 (docs/protocol.md 13.13): the client advertises this much connection credit, i.e. what the
-     * server may send (clientbound).
+     * server may send (clientbound). The client pins its connection maximum to the same value.
      */
-    public static final long MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA = 16L << 20;
-    /** /3: both bidirectional per-stream initial limits, at both ends. */
+    public static final long MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA = 2L << 20;
+    /**
+     * /3 (13.13): the server's window on client-opened bidirectional streams (CONTROL and REALTIME)
+     * and the largest it may grow to. Pinned by Codecs through netty/0005, so quiche never grows it.
+     */
     public static final long MULTISTREAM_INITIAL_MAX_STREAM_DATA = 8L << 10;
-    /** /3 (13.3): bidirectional streams in use at once: client streams 0 and 4, server stream 1. */
-    public static final int MULTISTREAM_STREAMS = 3;
+    /**
+     * /3 (13.13): the server's window on server-opened bidirectional streams (reverse CHUNK guards).
+     * They carry no valid bytes, so the first byte closes the connection and nothing replenishes them.
+     */
+    public static final long MULTISTREAM_REVERSE_CHUNK_STREAM_DATA = 1;
+    /**
+     * Legacy window for the server's server-opened bidi streams while the legacy 3-lane LaneSession is the
+     * {@code /3} implementation: 13.13 says 1 byte, but that LaneSession still sends client-to-server bytes on
+     * its server-opened stream 1, so the one-byte window would stall it. 13.13 says 1 byte; the U8
+     * integration unit switches to the 1-byte value when LaneSession moves to the N+2 design.
+     */
+    public static final long LEGACY_LANE_REVERSE_STREAM_DATA = 8L << 10;
+    /**
+     * True while the legacy 3-lane LaneSession is the {@code /3} implementation, so Codecs applies
+     * {@link #LEGACY_LANE_REVERSE_STREAM_DATA}. The U8 integration unit sets this to false.
+     */
+    static final boolean LEGACY_LANE_SESSION = true;
     /**
      * /3: the server advertises this much connection credit, i.e. what the client may send (serverbound).
-     * It equals the sum of the three pinned stream windows, the most quiche can hold unread on the
-     * server (a larger connection window is unreachable and would only inflate the node-budget
-     * reservation, 13.12). Pinned by {@code MultistreamTransportConfigTest}.
+     * It is fixed before N is known and is the staged pre-login exposure (12.13): the server pins both its
+     * connection maximum and its stream maxima so quiche never grows them. Pinned by
+     * {@code MultistreamTransportConfigTest}.
      */
-    public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = MULTISTREAM_STREAMS * MULTISTREAM_INITIAL_MAX_STREAM_DATA;
+    public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = 24L << 10;
     /** /3: the server lets the client open streams 0 and 4. */
     public static final int MULTISTREAM_SERVER_MAX_STREAMS_BIDI = 2;
-    /** /3: the client lets the server open stream 1. */
-    public static final int MULTISTREAM_CLIENT_MAX_STREAMS_BIDI = 1;
+    /** /3: the client lets the server open up to six chunk streams; application validation caps N (13.2). */
+    public static final int MULTISTREAM_CLIENT_MAX_STREAMS_BIDI = 6;
     /**
-     * /3 (13.13): the largest auto-tuned stream window quiche may grow to at the client. The server
-     * pins both maxima to its initial serverbound windows. Applied by Codecs, which refuses /3
-     * when the native cannot set them.
+     * /3 (13.13): the client's initial and maximum window on each bidirectional stream. The client pins
+     * its maxima to these values, so its windows never auto-tune beyond the 13.12 reservations.
      */
-    public static final long MULTISTREAM_MAX_STREAM_WINDOW = 4L << 20;
-    /** /3 (13.13): the largest auto-tuned connection window at the client: three streams times the stream maximum. */
-    public static final long MULTISTREAM_MAX_CONNECTION_WINDOW = 12L << 20;
+    public static final long MULTISTREAM_MAX_STREAM_WINDOW = 256L << 10;
+    /** /3 (13.13): the client's initial and maximum connection window: 2 MiB. */
+    public static final long MULTISTREAM_MAX_CONNECTION_WINDOW = 2L << 20;
 
     private static final Logger LOG = Logger.getLogger("QUICraft");
     private static final int MAX_LIMIT = 10_000_000;
@@ -101,6 +120,12 @@ public final class TransportConfig {
     final RetryMode retryMode;
     final long nodePendingBytes;
     final ReceiveBudget nodeBudget;
+    final ResourcePools resourcePools;
+    final boolean preLoginOnline;
+    /** Session-server calls in flight per coarse prefix (12.13): the profile's value, or the default. */
+    final int sessionCallsPerPrefix;
+    /** Declared-length bytes in flight per coarse prefix (12.13): the profile's value, or the default. */
+    final long declaredBytesPerPrefix;
 
     private TransportConfig(Builder b) {
         this.maxIdleTimeoutMillis = b.maxIdleTimeoutMillis;
@@ -120,12 +145,22 @@ public final class TransportConfig {
         this.maxOpen = positiveOr(b.maxOpen, DEFAULT_MAX_OPEN);
         this.maxOpenPerIp = positiveOr(b.maxOpenPerIp, DEFAULT_MAX_OPEN_PER_IP);
         this.maxTrackedIps = positiveOr(b.maxTrackedIps, DEFAULT_MAX_TRACKED_IPS);
+        if (b.serverProfile != null) {
+            // 12.13: maxOpen covers the logged-in target plus the pre-login cap; refused at build time.
+            b.serverProfile.requireOpen(this.maxOpen);
+        }
         this.ingressInitialsPerSecond = positiveOr(b.ingressInitialsPerSecond, DEFAULT_INGRESS_INITIALS);
         this.ingressInitialsPerIpPerSecond = positiveOr(b.ingressInitialsPerIpPerSecond,
                 DEFAULT_INGRESS_INITIALS_PER_IP);
         this.retryMode = b.retryMode != null ? b.retryMode : DEFAULT_RETRY_MODE;
         this.nodePendingBytes = Math.max(0L, b.nodePendingBytes);
         this.nodeBudget = b.nodeBudget;
+        this.resourcePools = b.resourcePools;
+        this.preLoginOnline = b.preLoginOnline;
+        this.sessionCallsPerPrefix = b.serverProfile != null
+                ? b.serverProfile.sessionCallsPerPrefix : ServerProfile.DEFAULT_SESSION_CALLS_PER_PREFIX;
+        this.declaredBytesPerPrefix = b.serverProfile != null
+                ? b.serverProfile.declaredBytesPerPrefix : ServerProfile.DEFAULT_DECLARED_BYTES_PER_PREFIX;
     }
 
     private static int positiveOr(int value, int fallback) {
@@ -154,6 +189,10 @@ public final class TransportConfig {
         this.retryMode = other.retryMode;
         this.nodePendingBytes = other.nodePendingBytes;
         this.nodeBudget = other.nodeBudget;
+        this.resourcePools = other.resourcePools;
+        this.preLoginOnline = other.preLoginOnline;
+        this.sessionCallsPerPrefix = other.sessionCallsPerPrefix;
+        this.declaredBytesPerPrefix = other.declaredBytesPerPrefix;
     }
 
     /**
@@ -367,6 +406,9 @@ public final class TransportConfig {
         private RetryMode retryMode = DEFAULT_RETRY_MODE;
         private long nodePendingBytes;
         private ReceiveBudget nodeBudget;
+        private ResourcePools resourcePools;
+        private boolean preLoginOnline = true;
+        private ServerProfile serverProfile;
 
         public Builder maxIdleTimeout(long value, TimeUnit unit) {
             this.maxIdleTimeoutMillis = unit.toMillis(value);
@@ -467,6 +509,30 @@ public final class TransportConfig {
          */
         public Builder nodeBudget(ReceiveBudget budget) {
             this.nodeBudget = budget;
+            return this;
+        }
+
+        /** Shared staged and logged-in accounting for /3 (§12.13, §13.12). */
+        public Builder resourcePools(ResourcePools pools) {
+            this.resourcePools = pools;
+            return this;
+        }
+
+        /**
+         * The server profile this listener runs under. Build refuses a {@code maxOpen} that cannot cover
+         * the profile's logged-in target plus its pre-login connection cap (12.13).
+         */
+        public Builder serverProfile(ServerProfile profile) {
+            this.serverProfile = profile;
+            return this;
+        }
+
+        /**
+         * /3 (12.13): whether the server runs online mode, where Login Success promotes a staged connection.
+         * Offline connections stay staged until activation. Default true.
+         */
+        public Builder preLoginOnline(boolean online) {
+            this.preLoginOnline = online;
             return this;
         }
 

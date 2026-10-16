@@ -24,14 +24,14 @@ class MultistreamTransportConfigTest {
         assertEquals(16L << 20, TransportConfig.DEFAULT.initialMaxData);
         TransportConfig config = TransportConfig.multistream();
         assertTrue(config.isMultistream());
-        assertEquals(16L << 20, TransportConfig.MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA);
-        assertEquals(3 * (8L << 10), TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA);
+        assertEquals(2L << 20, TransportConfig.MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA);
         assertEquals(24L << 10, TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA);
         assertEquals(8L << 10, TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA);
+        assertEquals(1, TransportConfig.MULTISTREAM_REVERSE_CHUNK_STREAM_DATA);
         assertEquals(2, TransportConfig.MULTISTREAM_SERVER_MAX_STREAMS_BIDI);
-        assertEquals(1, TransportConfig.MULTISTREAM_CLIENT_MAX_STREAMS_BIDI);
-        assertEquals(4L << 20, TransportConfig.MULTISTREAM_MAX_STREAM_WINDOW);
-        assertEquals(12L << 20, TransportConfig.MULTISTREAM_MAX_CONNECTION_WINDOW);
+        assertEquals(6, TransportConfig.MULTISTREAM_CLIENT_MAX_STREAMS_BIDI);
+        assertEquals(256L << 10, TransportConfig.MULTISTREAM_MAX_STREAM_WINDOW);
+        assertEquals(2L << 20, TransportConfig.MULTISTREAM_MAX_CONNECTION_WINDOW);
     }
 
     @Test
@@ -50,9 +50,13 @@ class MultistreamTransportConfigTest {
             QuicChannel server = net.serverConnection.get(10, TimeUnit.SECONDS);
             assertEquals(1, server.createStream(QuicStreamType.BIDIRECTIONAL, new ChannelInboundHandlerAdapter())
                     .get(5, TimeUnit.SECONDS).streamId());
+            // The client grants six server-opened bidi streams (13.13); the transport enforces the cap.
+            for (int i = 0; i < 5; i++) {
+                assertTrue(server.createStream(QuicStreamType.BIDIRECTIONAL,
+                        new ChannelInboundHandlerAdapter()).awaitUninterruptibly().isSuccess());
+            }
             assertFalse(server.createStream(QuicStreamType.BIDIRECTIONAL, new ChannelInboundHandlerAdapter())
-                    .awaitUninterruptibly().isSuccess(),
-                    "a second server stream exceeds initial_max_streams_bidi=1");
+                    .awaitUninterruptibly().isSuccess(), "a seventh server stream exceeds initial_max_streams_bidi=6");
         }
     }
 
@@ -62,10 +66,7 @@ class MultistreamTransportConfigTest {
      */
     @Test
     void theExposureReservationEqualsTheThreePinnedServerStreamWindows() {
-        assertTrue(TransportConfig.V3_INITIAL_EXPOSURE_BYTES
-                >= TransportConfig.MULTISTREAM_STREAMS * TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA);
-        assertEquals(TransportConfig.MULTISTREAM_STREAMS * TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA,
-                TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
+        assertEquals(24L << 10, TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
         assertEquals(TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA,
                 TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
     }
@@ -99,7 +100,7 @@ class MultistreamTransportConfigTest {
         assertEquals(TransportConfig.V3_INITIAL_EXPOSURE_BYTES, field(server, "maxConnectionWindow"));
         assertEquals(8L << 10, field(server, "maxStreamWindow"));
         Object client = Codecs.apply(new io.netty.handler.codec.quic.QuicClientCodecBuilder(), config, false);
-        assertEquals(12L << 20, field(client, "maxConnectionWindow"));
-        assertEquals(4L << 20, field(client, "maxStreamWindow"));
+        assertEquals(2L << 20, field(client, "maxConnectionWindow"));
+        assertEquals(256L << 10, field(client, "maxStreamWindow"));
     }
 }

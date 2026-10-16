@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.core.transport;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.handler.codec.quic.QuicTokenHandler;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.function.LongSupplier;
 import java.util.logging.Level;
@@ -45,6 +46,11 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
     private final TransportConfig.RetryMode mode;
     private final HmacRetryTokenHandler hmac;
     private final java.util.concurrent.atomic.AtomicLong retries;
+    /**
+     * True on a {@code /3} listener: valid-token attempts then share an exhausted window by prefix
+     * (12.13). A {@code /2} listener keeps the released plain limit.
+     */
+    private final boolean fairValidated;
     private boolean forceRetry;
 
     /**
@@ -54,7 +60,16 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
      */
     AdmissionTokenHandler(ConnectionAdmission admission, ConnectionAdmission validated,
             TransportConfig.RetryMode mode, java.util.concurrent.atomic.AtomicLong retries) {
-        this(admission, validated, mode, retries, null, null);
+        this(admission, validated, mode, retries, false, null, null);
+    }
+
+    /**
+     * {@code fairValidated}: the {@code /3} prefix-fair valid-token budget (12.13); false for {@code /2}, which
+     * keeps the released plain limit (§11).
+     */
+    AdmissionTokenHandler(ConnectionAdmission admission, ConnectionAdmission validated,
+            TransportConfig.RetryMode mode, java.util.concurrent.atomic.AtomicLong retries, boolean fairValidated) {
+        this(admission, validated, mode, retries, fairValidated, null, null);
     }
 
     /**
@@ -63,11 +78,12 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
      */
     AdmissionTokenHandler(ConnectionAdmission admission, ConnectionAdmission validated,
             TransportConfig.RetryMode mode, java.util.concurrent.atomic.AtomicLong retries,
-            byte[] key, LongSupplier clock) {
+            boolean fairValidated, byte[] key, LongSupplier clock) {
         this.admission = admission;
         this.validated = validated;
         this.mode = mode;
         this.retries = retries;
+        this.fairValidated = fairValidated;
         this.hmac = key == null || clock == null
                 ? new HmacRetryTokenHandler(() -> forceRetry)
                 : new HmacRetryTokenHandler(key, clock, () -> forceRetry);
@@ -108,13 +124,23 @@ final class AdmissionTokenHandler implements QuicTokenHandler {
             return offset;
         }
         try {
-            if (!validated.allowAttempt(address.getAddress()) || !openSlotFree(address)) {
+            // A /3 listener leaves the open-slot decision to the connection's admission, which sheds a
+            // pre-login victim when the limits are full (12.13). /2 keeps dropping the Initial here.
+            if (!spendValidatedAttempt(address.getAddress()) || (!fairValidated && !openSlotFree(address))) {
                 return -1;
             }
         } catch (Throwable t) {
             LOG.log(Level.FINE, "QUIC admission check failed; admitting the attempt", t);
         }
         return offset;
+    }
+
+    /**
+     * Spends one valid-token attempt. On a {@code /3} listener the budget is prefix-fair when the window is
+     * exhausted; on {@code /2} it is the released plain limit. Package-private so both modes are tested.
+     */
+    boolean spendValidatedAttempt(InetAddress address) {
+        return fairValidated ? validated.allowFairAttempt(address) : validated.allowAttempt(address);
     }
 
     /** Whether a lease for {@code address} would be granted now; takes none. */

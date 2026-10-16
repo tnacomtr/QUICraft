@@ -38,6 +38,8 @@ final class ConnectionAdmission {
     private final LongSupplier clock;
 
     private final Map<InetAddress, IpState> ips = new HashMap<>();
+    /** Attempts this window per coarse source prefix (IPv6 /48, IPv4 /24), for the fair budget. */
+    private final Map<InetAddress, Integer> coarseAttempts = new HashMap<>();
     private long windowStart;
     private int globalAttempts;
     private int open;
@@ -103,13 +105,68 @@ final class ConnectionAdmission {
         if (globalAttempts >= globalAttemptsPerSecond) {
             return false;
         }
-        if (state == null) {
-            state = new IpState();
-            ips.put(key, state);
-        }
         globalAttempts++;
-        state.attempts++;
+        spend(key, address, state);
         return true;
+    }
+
+    /**
+     * Spends one attempt of the validated (token-bearing) budget for {@code address} (docs/protocol.md
+     * 12.13, 11). The per-IP and tracking limits are as in {@link #allowAttempt}. When the global budget
+     * is exhausted, a prefix still within its fair share of the window's attempts is admitted by taking
+     * one attempt from the coarse prefix furthest over its share, never dropping it while some prefix
+     * exceeds its share. A prefix at or over its own share is refused.
+     */
+    synchronized boolean allowFairAttempt(InetAddress address) {
+        Objects.requireNonNull(address, "address");
+        InetAddress key = limitKey(address);
+        InetAddress coarse = PreLoginRegistry.coarsePrefix(address);
+        advance();
+        IpState state = ips.get(key);
+        if (state == null ? ips.size() >= maxTrackedIps : state.attempts >= perIpAttemptsPerSecond) {
+            return false;
+        }
+        if (globalAttempts < globalAttemptsPerSecond) {
+            globalAttempts++;
+            spend(key, address, state);
+            return true;
+        }
+        int active = coarseAttempts.size() + (coarseAttempts.containsKey(coarse) ? 0 : 1);
+        int share = globalAttemptsPerSecond / Math.max(1, active);
+        int mine = coarseAttempts.getOrDefault(coarse, 0);
+        if (mine >= share) {
+            return false;
+        }
+        InetAddress victim = null;
+        int victimAttempts = share;
+        for (Map.Entry<InetAddress, Integer> c : coarseAttempts.entrySet()) {
+            if (c.getValue() > victimAttempts) {
+                victim = c.getKey();
+                victimAttempts = c.getValue();
+            }
+        }
+        if (victim == null) {
+            return false;
+        }
+        // The victim's attempt is taken back and reassigned: global consumption stays at the limit.
+        if (victimAttempts == 1) {
+            coarseAttempts.remove(victim);
+        } else {
+            coarseAttempts.put(victim, victimAttempts - 1);
+        }
+        spend(key, address, state);
+        return true;
+    }
+
+    /** Counts one admitted attempt against the address's IP state and its coarse prefix. */
+    private void spend(InetAddress key, InetAddress address, IpState state) {
+        IpState current = state;
+        if (current == null) {
+            current = new IpState();
+            ips.put(key, current);
+        }
+        current.attempts++;
+        coarseAttempts.merge(PreLoginRegistry.coarsePrefix(address), 1, Integer::sum);
     }
 
     /**
@@ -196,6 +253,7 @@ final class ConnectionAdmission {
         }
         windowStart = now;
         globalAttempts = 0;
+        coarseAttempts.clear();
         Iterator<IpState> it = ips.values().iterator();
         while (it.hasNext()) {
             IpState state = it.next();
