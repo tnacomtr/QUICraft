@@ -65,10 +65,13 @@ public final class AckJoinTracker {
      * storing anything, when the entry or byte limit would be exceeded; the caller must then pause
      * the ack producer or resource-abort 0x12, never drop silently.
      *
-     * @throws IllegalArgumentException for a duplicate id or a negative size or clock
+     * <p>The clock is any monotonic origin: {@link System#nanoTime()} may be negative, and only
+     * differences are compared.
+     *
+     * @throws IllegalArgumentException for a duplicate id or a negative size
      */
     public synchronized boolean create(long id, int chargedBytes, long nowNanos) {
-        if (chargedBytes < 0 || nowNanos < 0) {
+        if (chargedBytes < 0) {
             throw new IllegalArgumentException("ack");
         }
         if (pending.containsKey(id)) {
@@ -96,22 +99,31 @@ public final class AckJoinTracker {
     /**
      * Adds a covered update that has not been assigned yet. The ack waits until
      * {@link #assignedPending} or {@link #suppressPending} resolves it (13.19).
+     *
+     * <p>For one update, call this before {@link #assignedPending} or {@link #suppressPending}. A
+     * cover recorded after its update was already resolved would wait until the deadline.
+     *
+     * @return true when the cover was newly recorded as unassigned; false when this ack already
+     *         waited on the same update
      */
-    public synchronized void coverPending(long id, long updateToken) {
+    public synchronized boolean coverPending(long id, long updateToken) {
         Pending value = require(id);
-        if (value.unassigned.add(updateToken)) {
-            Set<Long> ids = waiters.get(updateToken);
-            if (ids == null) {
-                ids = new HashSet<Long>();
-                waiters.put(updateToken, ids);
-            }
-            ids.add(id);
+        if (!value.unassigned.add(updateToken)) {
+            return false;
         }
+        Set<Long> ids = waiters.get(updateToken);
+        if (ids == null) {
+            ids = new HashSet<Long>();
+            waiters.put(updateToken, ids);
+        }
+        ids.add(id);
+        return true;
     }
 
     /**
      * Records the assignment of a covered update in every pending ack that waits on it (13.19).
-     * Tokens that no pending ack waits on are ignored.
+     * Tokens that no pending ack waits on are ignored. Call {@link #coverPending} for the same
+     * update first.
      */
     public synchronized void assignedPending(long updateToken, int stream, long sequence) {
         if (stream < 0 || sequence <= 0) {

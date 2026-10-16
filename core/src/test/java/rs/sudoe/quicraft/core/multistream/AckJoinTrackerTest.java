@@ -196,6 +196,32 @@ class AckJoinTrackerTest {
         assertThrows(IllegalArgumentException.class, () -> acks.take(4, 0, 0, null));
     }
 
+    @Test void negativeClockOriginIsAcceptedAndDeadlineUsesDifferences() {
+        // System.nanoTime() may be negative. Only differences from the creation instant count (13.19).
+        long origin = -20_000_000_000L;
+        AckJoinTracker acks = new AckJoinTracker();
+        assertTrue(acks.create(1, 4, origin));
+        acks.coverPending(1, 10L);
+        assertNull(acks.take(1, origin + AckJoinTracker.DEADLINE_NANOS - 1, 0, null));
+        assertEquals(1, acks.pendingCount(), "not yet at the deadline");
+        assertNull(acks.take(1, origin + AckJoinTracker.DEADLINE_NANOS, 0, null));
+        assertEquals(0, acks.pendingCount(), "unresolved ack dropped at the deadline");
+        assertEquals(1, acks.droppedCount());
+        assertEquals(0, acks.pendingBytes());
+
+        assertTrue(acks.create(2, 4, origin));
+        assertNotNull(acks.take(2, origin, 0, null), "a complete ack resolves at once");
+    }
+
+    @Test void coverPendingReportsWhetherTheCoverWasRecorded() {
+        AckJoinTracker acks = new AckJoinTracker();
+        acks.create(1, 4, 0);
+        assertTrue(acks.coverPending(1, 5L), "first cover is recorded");
+        assertFalse(acks.coverPending(1, 5L), "duplicate cover is not recorded twice");
+        acks.assignedPending(5L, 2, 3);
+        assertNotNull(acks.take(1, 0, 0, null));
+    }
+
     @Test void unknownAcksAreRejectedAndTokensWithoutWaitersAreIgnored() {
         AckJoinTracker acks = new AckJoinTracker();
         assertThrows(IllegalArgumentException.class, () -> acks.coverPending(42, 1L));
