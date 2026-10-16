@@ -746,6 +746,32 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 ### Failure, pins and rotation
 
+**Pre-login admission and deadline.** A QUIC connection is pre-login from handshake completion
+until Minecraft Login Success. This 10-second deadline starts at handshake completion on the
+transport's monotonic clock; it includes online-mode session-server authentication latency, which
+MUST fit within the deadline. This is distinct from 12.14's OFFER-to-activation deadline, which
+starts later and remains an additional bound for `/3` activation. On expiry, close with local
+resource code `0x12`, never peer-misconduct `0x11`.
+
+Before login completes, reserve only the pre-login share from the separate pre-login pool. The
+initial transport limits are `initial_max_data = 8 KiB`,
+`initial_max_stream_data_bidi_local = 8 KiB`, and
+`initial_max_stream_data_bidi_remote = 8 KiB`; uni limits remain zero. Four KiB is insufficient:
+the legal pre-login flight includes handshake/Login Start, online-mode encryption and session
+authentication traffic, and `/3` OFFER/proofs/switch messages with routing digest, whose listed
+variable-length fields can exceed 4 KiB. Eight KiB is the specified initial ceiling and MUST be
+validated against the maximum legal pre-login encodings before enablement. Do not reserve an
+inflater pre-login. At `/3` activation, or at successful login for `/2`, reserve the full 24 KiB
+share from the node budget before raising MAX_DATA and MAX_STREAM_DATA to the full 24 KiB share.
+Reserve the shared 40 KiB inflater only when Minecraft enables compression. If a raise or inflater
+reservation cannot be made, follow existing resource refusal/backpressure rules: wait non-fatally,
+then close locally for resource exhaustion; never close `0x11`.
+
+The pre-login pool has a hard cap, default 10% of the node budget (profile value, to be measured).
+When it is full, close the oldest pre-login connection first with local resource code `0x12`;
+create no failure-cache entry for its client. Pre-login reservations MUST NOT consume budget
+reserved for logged-in players, and logged-in players MUST never be shed to admit pre-login work.
+
 14. **12.14 Fail closed.** Allow 10 seconds from OFFER to activation: the server starts its
     local monotonic clock when enqueueing OFFER, the client when receiving complete OFFER.
     Separately allow 10 seconds from configuration entry to receiving OFFER at the client
@@ -1332,7 +1358,9 @@ position extraction. Those implementations must change together before this revi
     lanes; decoding is serialized and MUST NOT create a second per-lane inflater. Its
     state/window is about 40 KiB, separately charged as connection memory outside the 24 KiB
     receive share. Vanilla already pays this cost per compressed connection. These two
-    reservations total about 64 KiB per admitted connection. At 50,000 connections the
+    reservations total about 64 KiB per logged-in compressed connection. The staged
+    pre-login reservation is only about 4–6 KiB per connection; at 50,000 this is about
+    200–300 MiB. At 50,000 logged-in compressed connections the
     receive shares total 1,228,800,000 bytes (about 1.14 GiB), inflater reservations total
     2,048,000,000 bytes (about 1.91 GiB), and the combined admission total is 3,276,800,000
     bytes (about 3.05 GiB), excluding other subsystems.
@@ -1425,7 +1453,12 @@ position extraction. Those implementations must change together before this revi
     under the reviewed state limits. This peak is on-demand, never a reservation per idle player.
 
     **Shared accounting:** no advertised credit or retained allocation may overcommit the
-    node budget. Before admission, reserve the server's 24 KiB share, not the client's
+     node budget. Before login completes reserve only the staged pre-login share and charge it
+     against the separately capped pre-login pool (12.14). On login success (`/2`) or `/3`
+     activation, reserve the server's full 24 KiB share before increasing transport credit; if
+     reservation is unavailable, apply the non-fatal wait and local/resource-close rules in
+     12.14. Reserve the shared 40 KiB inflater only when Minecraft enables compression, not at
+     admission. Before ordinary post-login admission, reserve the server's 24 KiB share, not the client's
     progress/workspace budget; refuse admission if that share cannot fit, leaving TCP
     untouched. Debit further server buffering before taking ownership of bytes. Release
     credit reservations only when their exposure is gone. Record admission shares, actual
@@ -1436,7 +1469,8 @@ position extraction. Those implementations must change together before this revi
     table instead hold 1 KiB sentinel reads and reject any post-preamble data with `0x11`.
     Thus an activated idle server connection with the currently implemented table (every
     serverbound record on CONTROL) reserves 30 KiB: the separate 24 KiB quiche-unread
-    admission share plus 4 + 1 + 1 KiB read grants (measured in `docs/benchmarks.md`).
+    admission share plus 4 + 1 + 1 KiB read grants (measured in `docs/benchmarks.md`). This
+    post-login accounting does not apply during staged pre-login admission.
     The serverbound dual-lane draft below puts serverbound REALTIME in the table: that lane
     then carries records within its 512-byte wire cap instead of holding a sentinel read,
     its reads come from the 2 KiB REALTIME slice inside the 24 KiB share, and the 40 KiB
@@ -1760,6 +1794,10 @@ position extraction. Those implementations must change together before this revi
     Minecraft malformed-compression and size checks; no dictionary spans streams.
 17. **13.17 Acceptance tests.** Before enablement require golden HKDF/exporter/message/record
     vectors; wrong/absent exporter and upstream-native tests; all MAC/state/timeout failures;
+     unit-test pre-login pool shedding oldest-first, login-deadline expiry and failed window
+     raises waiting non-fatally rather than closing `0x11`. Run the load harness with 50,000
+     handshake-only connections from many source IPs while honest joins continue; pass only if
+     honest joins continue to get QUIC and no logged-in player is shed for a pre-login one.
     switch packets split at every byte and coalesced with following plaintext; changed pins,
     rotation and corrupt storage; full/resumed/accepted and rejected early-data sessions;
     offline/online confusion; v1/new-client/new-server/TCP compatibility; resets on every
@@ -2116,9 +2154,12 @@ position extraction. Those implementations must change together before this revi
 2. Confirm the fixed epoch-mixed 32-bit position hash in 13.18, or choose another before
    implementing golden vectors? This is a wire decision, not administrator configuration.
 3. Confirm the direction-specific receive policy: the client reserves up to 16 MiB + 1 KiB
-   wire and 8 MiB execution, plus 2 MiB native exposure and at most 128 KiB unparsed reads;
-    the server reserves 24 KiB receive capacity plus a shared 40 KiB inflater per connection
-    at admission (about 64 KiB total, 3,276,800,000 bytes/about 3.05 GiB at 50,000), including
+    wire and 8 MiB execution, plus 2 MiB native exposure and at most 128 KiB unparsed reads;
+    the server pre-login staged reservation is about 4–6 KiB per connection (8 KiB initial
+    flow-control ceiling), versus about 64 KiB logged-in idle (24 KiB share plus 40 KiB inflater
+    once compression is enabled). At 50,000, pre-login costs about 200–300 MiB, while logged-in
+    idle costs about 3.05 GiB (3,276,800,000 bytes); the pool cap defaults to 10% of node budget.
+    The 40 KiB inflater is not reserved at admission. Include
     total protected P <= 7667 bytes at N=6 (CONTROL allowance <= 5619 bytes), its 2 KiB
     REALTIME parse/output-copy slice, 512-byte REALTIME wire cap (`record_length <= 510`) and
     1024-byte decoded cap, plus one-byte unused chunk-direction guards. CONTROL excess is
