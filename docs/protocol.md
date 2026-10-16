@@ -1044,9 +1044,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
     window 8 KiB, equal to the initial serverbound windows, so automatic growth is off and the
     exposure is exactly the initial credit the node reserved. The server's connection window equals
     the sum of its three pinned stream windows, the most quiche can hold unread, so each admitted
-    connection reserves 24 KiB against the 13.12 node budget. Client: stream window 4 MiB and
-    connection window 12 MiB, three streams times the stream maximum, since only three streams
-    can hold quiche-unread data. The client's aggregate exposure is therefore the application-held
+    connection reserves 24 KiB against the 13.12 node budget. That reservation covers only unread
+    serverbound stream data; 0-RTT early data and crypto/handshake buffers are not counted in it.
+    Client: stream window 4 MiB and connection window 12 MiB, three streams times the
+    stream maximum, since only three streams can hold quiche-unread data. The client's aggregate exposure is therefore the application-held
     data (the 17 MiB budget of 13.12) plus quiche-unread data bounded by 12 MiB; the initial
     clientbound MAX_DATA credit is not debited from the receiver budget. Automatic growth beyond
     these pins is not allowed. Because the server windows are pinned, a serverbound record
