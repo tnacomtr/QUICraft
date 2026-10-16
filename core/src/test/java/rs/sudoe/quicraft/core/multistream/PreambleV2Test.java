@@ -16,15 +16,15 @@ import org.junit.jupiter.api.Test;
  *
  * <p>Golden vectors, hand-derived:
  * <ul>
- *   <li>no token: {@code VarInt(2)=0x02 || version=0x02 || token_length=0x00}</li>
- *   <li>token: {@code VarInt(18)=0x12 || version=0x02 || token_length=0x10 || 16 token bytes}</li>
+ *   <li>no token: {@code VarInt(4)=0x04 || version=0x02 || token_length=0x00 || 1 || 6}</li>
+ *   <li>token: {@code VarInt(20)=0x14 || version=0x02 || token_length=0x10 || 16 token bytes || 1 || 6}</li>
  * </ul>
  */
 class PreambleV2Test {
-    private static final byte[] NO_TOKEN = {0x02, 0x02, 0x00};
+    private static final byte[] NO_TOKEN = {0x04, 0x02, 0x00, 0x01, 0x06};
     private static final byte[] TOKEN = {
-        (byte) 0x12, 0x02, 0x10,
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+        0x14, 0x02, 0x10,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1, 6};
 
     private static byte[] tokenBytes() {
         byte[] token = new byte[16];
@@ -59,6 +59,41 @@ class PreambleV2Test {
         assertNull(parser.token());
         assertEquals(NO_TOKEN.length, parser.consumed());
         assertEquals(0, data.remaining());
+        assertEquals(1, parser.minShards());
+        assertEquals(6, parser.maxShards());
+        assertEquals(3, parser.select(4, 3));
+    }
+
+    @Test
+    void negotiatesSelectedRangeAndReportsEmptyIntersection() throws Exception {
+        PreambleV2.Parser parser = new PreambleV2.Parser();
+        parser.feed(ByteBuffer.wrap(PreambleV2.encode(null, 4, 6)));
+        assertEquals(4, parser.select(5, 2));
+        assertThrows(MultistreamProtocolException.class, () -> parser.select(3, 3));
+        assertArrayEquals(new byte[] {0x04, 0x02, 0x00, 0x04, 0x04}, PreambleV2.encode(null, 4, 4));
+    }
+
+    /** 13.2: an empty intersection is the typed 0x10 failure, not a clamp outside the offer. */
+    @Test
+    void emptyIntersectionCloses0x10() throws Exception {
+        PreambleV2.Parser parser = new PreambleV2.Parser();
+        parser.feed(ByteBuffer.wrap(PreambleV2.encode(null, 5, 6)));
+        MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class, () -> parser.select(4, 4));
+        assertEquals(0x10, e.closeCode());
+        assertEquals(0x10, MultistreamProtocolException.CLOSE_NO_COMMON_SHARDS);
+    }
+
+    /** 13.2: malformed shard ranges on the wire close with 0x1, never with an unchecked exception. */
+    @Test
+    void malformedWireRangeCloses0x1() {
+        int[][] ranges = {{0, 6}, {1, 7}, {4, 3}, {0, 0}};
+        for (int[] range : ranges) {
+            byte[] wire = {0x04, 0x02, 0x00, (byte) range[0], (byte) range[1]};
+            PreambleV2.Parser parser = new PreambleV2.Parser();
+            MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
+                    () -> parser.feed(ByteBuffer.wrap(wire)), "range " + range[0] + ".." + range[1]);
+            assertEquals(0x1, e.closeCode());
+        }
     }
 
     @Test
@@ -74,9 +109,9 @@ class PreambleV2Test {
     void leavesFollowingBytesWithTheCaller() throws Exception {
         byte[] input = new byte[NO_TOKEN.length + 3];
         System.arraycopy(NO_TOKEN, 0, input, 0, NO_TOKEN.length);
-        input[3] = 0x7f;
-        input[4] = 0x00;
-        input[5] = (byte) 0xaa;
+        input[NO_TOKEN.length] = 0x7f;
+        input[NO_TOKEN.length + 1] = 0x00;
+        input[NO_TOKEN.length + 2] = (byte) 0xaa;
         PreambleV2.Parser parser = new PreambleV2.Parser();
         ByteBuffer data = ByteBuffer.wrap(input);
         assertTrue(parser.feed(data));

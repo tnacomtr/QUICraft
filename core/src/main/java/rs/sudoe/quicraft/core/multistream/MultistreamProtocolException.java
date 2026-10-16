@@ -15,6 +15,8 @@ public final class MultistreamProtocolException extends IOException {
     public static final int CLOSE_PROTOCOL_VIOLATION = 0x1;
     /** Ordering/resource failure: a stream used before activation, a blocked head, a limit. */
     public static final int CLOSE_ORDERING = 0x11;
+    /** No common shard count between the client's offer and the server's configured range (13.2). */
+    public static final int CLOSE_NO_COMMON_SHARDS = 0x10;
 
     private final int closeCode;
 
