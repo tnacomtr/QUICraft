@@ -1014,7 +1014,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
     deliberately favors disconnect over an undetected game desync.
     These are ceilings, not eager allocations. Each listener/node MUST also enforce a
     configured aggregate pending-bytes budget across connections, counting all retained
-    buffers/decoded data above. Reserve each admitted connection's initial receive-credit
+    buffers/decoded data above, including the unparsed transport chunks held before a
+    record claims them. The read chunk a lane has taken but not parsed, at most one
+    `READ_CHUNK` per lane, counts toward that node budget and not toward the per-connection
+    ceilings above. Reserve each admitted connection's initial receive-credit
     exposure against that budget, and refuse new QUIC admissions when the reservation
     cannot fit (leave TCP untouched). Debit further credit/allocations before granting
     them; release reservations only when credit exposure or retained bytes are gone.
@@ -1058,7 +1061,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
     throughput before changing these draft limits, including at the 50,000-player target.
 14. **13.14 Reset and shutdown.** RESET_STREAM, STOP_SENDING, unexpected FIN on any lane,
     failure to open an allowed stream within 10 seconds of activation, or an extra stream
-    terminates the whole connection with `0x11`; never reopen just one lane or remap lost
+    terminates the whole connection with `0x11`; a STOP_SENDING must be detected even on a
+    lane that never writes; never reopen just one lane or remap lost
     packets to CONTROL. Normal close sends a CONTROL disconnect if applicable, then END
     as a full fence after all queued game records. On END delivery the peer closes with
     `0x0`; sender waits at most 10 seconds before closing. A connection close is always
@@ -1070,9 +1074,10 @@ single-socket listener: no dispatcher is installed and the connection id length 
     bytes, further limited by the game's own cap and by 13.12's pending-record cap: the
     whole bundle, both delimiters included, must fit in 1024 records, so at most 1022
     members. A sender that would exceed any of these bounds closes with `0x11` instead of
-    emitting the bundle; missing closing delimiter for 10 seconds or excess bounds at the
-    receiver disconnects. Do not split members onto auxiliary lanes or deliver a
-    partial bundle to game logic. Receiver stages contiguous CONTROL members through the
+    emitting the bundle, assigning no sequence numbers for it; missing closing delimiter
+    for 10 seconds or excess bounds at the receiver disconnects. Do not split members
+    onto auxiliary lanes or deliver a partial bundle to game logic. Receiver stages
+    contiguous CONTROL members through the
     closing delimiter using provisional watermarks for their internal predecessor checks;
     external dependencies must already satisfy the committed watermarks. It commits those
     watermarks only after delivering the whole validated bundle atomically to the game's
