@@ -27,8 +27,9 @@ abstract class ServerConfigurationPacketListenerImplMixin {
             return;
         }
         try {
-            Hooks.enter("binding configuration");
+            // The connection first: a /3 join whose hook fails must still be found and closed (12.14).
             game = ((ServerCommonPacketListenerImplAccessor) (Object) this).quicraft$connection();
+            Hooks.enter("binding configuration");
             V3Join join = V3Join.of(game);
             if (join != null) {
                 // First in the queue: nothing else of the stage starts before activation.

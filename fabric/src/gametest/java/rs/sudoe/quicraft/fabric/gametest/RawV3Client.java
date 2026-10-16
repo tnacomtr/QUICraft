@@ -89,6 +89,8 @@ final class RawV3Client {
     private ProtocolState laneState = ProtocolState.CONFIGURATION;
     private final int playPacketsWanted;
     private final boolean online;
+    /** A join expected to fail: protocol surprises are noted, and only the close ends it. */
+    private boolean lenient;
     private byte[] rawBuffer = new byte[0];
     private byte[] secret;
     private Cipher decryptIn;
@@ -126,8 +128,14 @@ final class RawV3Client {
      */
     static Join start(InetSocketAddress server, Fingerprint fingerprint, RoutingTable table, int playPacketsWanted,
             boolean online) throws Exception {
+        return start(server, fingerprint, table, playPacketsWanted, online, false);
+    }
+
+    static Join start(InetSocketAddress server, Fingerprint fingerprint, RoutingTable table, int playPacketsWanted,
+            boolean online, boolean lenient) throws Exception {
         V3Connection connection = QuicClient.connectV3(server, fingerprint, table, null).get(15, TimeUnit.SECONDS);
         RawV3Client client = new RawV3Client(connection, table, digest(fingerprint), playPacketsWanted, online);
+        client.lenient = lenient;
         connection.setListener(client.new Listener());
         connection.setAutoRead(true);
         client.send(handshake(server.getPort()));
@@ -142,7 +150,7 @@ final class RawV3Client {
             try {
                 byte[] chunk = new byte[data.remaining()];
                 data.get(chunk);
-                if (phase == 2) {
+                if (phase >= 2) {
                     result.events.add("stray stream-0 bytes after activation: " + chunk.length);
                     return;
                 }
@@ -153,6 +161,11 @@ final class RawV3Client {
                 buffer = concat(buffer, decryptIn == null ? chunk : decryptIn.update(chunk));
                 parse();
             } catch (Throwable t) {
+                if (lenient) {
+                    result.events.add("ignored: " + t);
+                    phase = 3;
+                    return;
+                }
                 result.failure = t;
                 done.complete(result);
             }
