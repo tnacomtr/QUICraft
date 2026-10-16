@@ -303,6 +303,38 @@ class ReceiverDecodeTest {
         assertFalse(failure instanceof OrderingException, "a local failure is never peer misconduct (0x11)");
     }
 
+    @Test void oneDecodeResumingDoesNotForgetAnotherLanesLocalWait() {
+        ReceiveBudget node = ReceiveBudget.bounded(1000);
+        assertTrue(node.tryReserve(700));
+        final ReceiverScheduler[] self = new ReceiverScheduler[1];
+        List<ReceiverScheduler.Delivery> deliveries = new ArrayList<>();
+        ReceiverScheduler scheduler = new ReceiverScheduler((envelope, insideBundle, now) -> {
+            long extra = envelope.lane() == Lane.CONTROL ? 100 : 500;
+            self[0].reserveDecoded(envelope, extra, (int) extra, now);
+            self[0].decoded(envelope, Envelope.Bundle.NONE, false, envelope.lane(), now);
+        }, deliveries::add, node);
+        self[0] = scheduler;
+
+        Envelope realtime = raw(Lane.REALTIME, 1, 0, 0, 0);
+        scheduler.offer(realtime, realtime.wireBytes(), 0);
+        assertTrue(scheduler.decodeBlocked(), "REALTIME is locally blocked");
+
+        Envelope control = raw(Lane.CONTROL, 1, 0, 0, 0);
+        scheduler.offer(control, control.wireBytes(), 0);
+        assertTrue(scheduler.decodeBlocked(), "both lane decodes are waiting for node capacity");
+
+        node.release(150);
+        scheduler.retry(1);
+        assertTrue(scheduler.decodeBlocked(), "CONTROL can resume without clearing REALTIME's wait");
+        assertEquals(1, deliveries.size(), "CONTROL resumes and is delivered");
+        scheduler.applied(Lane.CONTROL, 1, 1);
+
+        Envelope dependent = raw(Lane.WORLD, 1, 0, 1, 0);
+        scheduler.offer(dependent, dependent.wireBytes(), 1);
+        scheduler.checkDeadlines(T);
+        assertTrue(scheduler.decodeBlocked(), "the remaining REALTIME refusal remains local");
+    }
+
     @Test void aBlockedHeadIsPausedOnlyByTheLaneCarryingItsMissingPredecessor() {
         // CONTROL 1 waits for REALTIME 1, which never arrives.
         ReceiverScheduler other = new ReceiverScheduler((e, b, n) -> { }, d -> { });
