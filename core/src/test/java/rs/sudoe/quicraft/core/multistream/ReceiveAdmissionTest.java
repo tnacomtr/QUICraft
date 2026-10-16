@@ -8,6 +8,11 @@ class ReceiveAdmissionTest {
     @Test void eachLogicalStreamHasIndependentSlotAndRecords() {
         ReceiveSlots slots = new ReceiveSlots(1);
         for (int stream = 0; stream < 3; stream++) {
+            assertTrue(slots.reserve(stream, ReceiveSlots.BYTES_PER_STREAM));
+            assertFalse(slots.reserve(stream, 1));
+            slots.release(stream, ReceiveSlots.BYTES_PER_STREAM);
+        }
+        for (int stream = 0; stream < 3; stream++) {
             for (int i = 0; i < 128; i++) assertTrue(slots.reserve(stream, 1));
             assertFalse(slots.reserve(stream, 1));
         }
@@ -17,6 +22,8 @@ class ReceiveAdmissionTest {
 
     @Test void serverPartitionProtectsRealtimeWireSlot() {
         ServerReadPartition partition = new ServerReadPartition(6);
+        assertEquals(7667, partition.totalLimit());
+        assertEquals(5619, partition.controlLimit());
         assertTrue(partition.reserve(LogicalStream.REALTIME, 512));
         assertFalse(partition.reserve(LogicalStream.REALTIME, 513));
         assertTrue(partition.reserve(LogicalStream.CONTROL, partition.controlLimit()));

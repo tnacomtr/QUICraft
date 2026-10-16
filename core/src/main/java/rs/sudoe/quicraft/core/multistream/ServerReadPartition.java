@@ -16,7 +16,7 @@ public final class ServerReadPartition {
     /** Builds bounds for negotiated chunk count N, using the P share calculation (13.12). */
     public ServerReadPartition(int chunks) {
         LogicalStream.validateShardCount(chunks);
-        totalLimit = SHARE / (chunks + 2);
+        totalLimit = SHARE - 16 * 1024 - 2 * chunks - 1 - REALTIME_WIRE_CAP;
         controlLimit = Math.max(0, totalLimit - PREFIX - REALTIME_SLICE);
     }
 

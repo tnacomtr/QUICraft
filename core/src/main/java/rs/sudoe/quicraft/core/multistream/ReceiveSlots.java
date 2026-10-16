@@ -19,7 +19,8 @@ public final class ReceiveSlots {
     /** Reserves one head unit against its stream's independent byte and record caps (13.12). */
     public boolean reserve(int stream, long amount) {
         checkStream(stream);
-        if (amount < 0 || bytes[stream] + amount > BYTES_PER_STREAM || records[stream] == RECORDS_PER_STREAM) return false;
+        if (amount < 0 || amount > BYTES_PER_STREAM - bytes[stream]
+                || records[stream] == RECORDS_PER_STREAM) return false;
         bytes[stream] += amount; records[stream]++; return true;
     }
 
