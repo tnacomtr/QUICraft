@@ -101,7 +101,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     private Throwable rawCloseCause;
     private boolean closeDelivered;
     private boolean discarding;
-    private boolean activated;
+    private volatile boolean activated;
 
     /** The client's side: the routing table comes from the dial and a token is stored for it. */
     static V3ConnectionImpl client(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
@@ -376,11 +376,8 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     @Override
     public void write(ByteBuffer data) {
         if (activated) {
-            // 12.11/12.12: after the switch, stream 0 carries records, not Minecraft bytes. The game
-            // must send through the session, so a stray write is dropped rather than corrupting the
-            // record stream.
-            LOG.log(Level.FINE, "dropping a stream-0 write after /3 activation");
-            return;
+            // 12.11/12.12: after the switch, game packets must go through the session.
+            throw new IllegalStateException("Game writes after /3 activation must use the session");
         }
         gameWrote = true;
         if (role == LaneSession.Role.CLIENT) {
