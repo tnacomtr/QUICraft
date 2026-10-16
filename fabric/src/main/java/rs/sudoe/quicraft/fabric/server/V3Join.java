@@ -12,14 +12,16 @@ import io.netty.channel.ChannelPromise;
 import io.netty.util.AttributeKey;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.crypto.Cipher;
 import net.minecraft.SharedConstants;
 import net.minecraft.network.Connection;
+import net.minecraft.network.protocol.BundlePacket;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.server.MinecraftServer;
@@ -34,6 +36,8 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.binding.BindingDriver;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
+import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.transport.V3Connection;
@@ -80,18 +84,13 @@ public final class V3Join {
     private static final long WARN_INTERVAL_NANOS = TimeUnit.MINUTES.toNanos(1);
     private static final AtomicLong LAST_WARNING = new AtomicLong(System.nanoTime() - WARN_INTERVAL_NANOS);
 
-    private enum Phase {
-        NEW, BINDING, ACTIVE, FAILED
-    }
-
     private final QuicBridgeChannel channel;
     private final V3Connection connection;
     private final MinecraftServer server;
     private final byte[] fingerprint;
     private final BindingHold hold = new BindingHold();
-    private final AtomicBoolean failedOnce = new AtomicBoolean();
-    private volatile Phase phase = Phase.NEW;
-    private volatile byte[] secret;
+    private final JoinState state = new JoinState();
+    private final SecretHolder secrets = new SecretHolder();
 
     private BindingPayloads payloads;
     private CipherCutover cutover;
@@ -101,6 +100,13 @@ public final class V3Join {
     private PacketLaneCodec codec;
     /** The protocol state of the packet now in the encoder, set where it enters the pipeline. */
     private ProtocolState outboundState;
+    private BindingSession session;
+    /** The write being encoded right now, which the encoder sink collects into; event loop only. */
+    private OutboundUnit unitInFlight;
+    private ChannelHandlerContext sinkContext;
+    /** True from the moment the lane session exists: the sink submits instead of replaying. */
+    private boolean sinkActive;
+    private OutboundHold outHold;
     private OutboundFilter filter;
     private ChannelFuture lastBindingWrite;
     private ByteBuf remainder;
@@ -118,7 +124,10 @@ public final class V3Join {
     static void attach(QuicBridgeChannel channel, V3Connection connection, MinecraftServer server,
             byte[] fingerprint) {
         try {
-            channel.attr(KEY).set(new V3Join(channel, connection, server, fingerprint));
+            V3Join join = new V3Join(channel, connection, server, fingerprint);
+            channel.attr(KEY).set(join);
+            // Every way a join ends, a held secret, the binding session and a taken-over buffer go.
+            channel.closeFuture().addListener(f -> join.teardown());
         } catch (Throwable t) {
             // No attribute: the connection can never bind, so close it where it stands.
             Hooks.failed("v3 attach", t);
@@ -143,7 +152,8 @@ public final class V3Join {
 
     /** Hook (login): Minecraft's shared secret {@code S} (12.6), kept only until binding starts. */
     public void onSecret(byte[] encoded) {
-        secret = encoded == null ? null : encoded.clone();
+        // The holder zeroes any copy it held before; the caller zeroes the array it passed.
+        secrets.set(encoded);
     }
 
     /**
@@ -206,10 +216,9 @@ public final class V3Join {
     // --- The exchange.
 
     private void start() throws Exception {
-        if (phase != Phase.NEW) {
-            throw new IllegalStateException("binding already started");
+        if (!state.startBinding()) {
+            throw new IllegalStateException("binding already started or failed");
         }
-        phase = Phase.BINDING;
         if (!connection.handshakeComplete()) {
             // 12.7: never start binding before the server's own TLS handshake completed.
             throw new IllegalStateException("the server's TLS handshake is not complete");
@@ -220,8 +229,7 @@ public final class V3Join {
         if (table == null) {
             throw new IllegalStateException("no routing table for protocol " + protocol + " (13.1)");
         }
-        byte[] shared = secret;
-        secret = null;
+        byte[] shared = secrets.take();
         int mode;
         try {
             if (server.usesAuthentication()) {
@@ -242,6 +250,9 @@ public final class V3Join {
             }
             filter = new OutboundFilter(false);
             pipeline.addLast(FILTER, filter);
+            // The encoder's output is collected per write from here on, so the quiescence queue
+            // counts real bytes and a bundle stays whole (12.10, 13.15).
+            pipeline.addBefore(ENCODER, SINK, new EncoderSink());
             if (mode == BindingStateMachine.MODE_ONLINE) {
                 // 12.13: the boundary-aware decoder takes the game's decrypt handler over, with its
                 // cipher, before OFFER goes out.
@@ -249,7 +260,7 @@ public final class V3Join {
                 cutover = CipherCutover.install(pipeline, DECRYPT, ENCRYPT, cipher);
             }
             Forward forward = new Forward();
-            BindingSession session = new BindingSession(BindingStateMachine.Role.SERVER, connection::exporterValue, shared,
+            session = new BindingSession(BindingStateMachine.Role.SERVER, connection::exporterValue, shared,
                     mode, protocol, fingerprint, table.digest(), System::nanoTime, 0L, forward, channel.eventLoop(),
                     channel.eventLoop()::inEventLoop);
             payloads = new BindingPayloads(session, new Platform(), this::sendBindingPayload);
@@ -258,6 +269,9 @@ public final class V3Join {
             if (shared != null) {
                 Arrays.fill(shared, (byte) 0);
             }
+        }
+        if (state.failed()) {
+            return;
         }
         payloads.onConfigurationEntered(System.nanoTime());
     }
@@ -306,6 +320,9 @@ public final class V3Join {
         public void activateInbound() {
             try {
                 Hooks.enter("binding inbound");
+                if (state.failed()) {
+                    return;
+                }
                 // 12.11: the client's final encrypted packet verified; what follows is not ours to
                 // decrypt or decode.
                 if (cutover != null) {
@@ -331,6 +348,9 @@ public final class V3Join {
         public void activateOutbound() {
             try {
                 Hooks.enter("binding outbound");
+                if (state.failed()) {
+                    return;
+                }
                 activateNow();
             } catch (Throwable t) {
                 Hooks.failed("binding outbound", t);
@@ -402,6 +422,11 @@ public final class V3Join {
         }
         handedOver.whenComplete((handed, error) -> {
             try {
+                if (error == null && state.failed()) {
+                    // Failed meanwhile: a failed join moves nowhere, and the buffer is nobody's.
+                    handed.release();
+                    return;
+                }
                 if (error != null) {
                     fail("binding hand-over: " + describe(error), error);
                     return;
@@ -439,10 +464,6 @@ public final class V3Join {
         }
         lanes = new GameLanes(channel, codec, connection::session, ProtocolState.CONFIGURATION, deliverFrom);
         pipeline.addAfter(PACKET_HANDLER, LANE_ACK, new AckHandler());
-        // Outbound: the game's encoder keeps encoding, and its output goes to the session instead of
-        // the compression, length and cipher handlers. The filter stays the first handler a write
-        // meets and notes the state it is encoded in.
-        pipeline.addBefore(ENCODER, SINK, new EncoderSink());
         // Vanilla's read timeout watches the byte path, which carries no game traffic from here on and
         // would kick the player after 30 s of "silence". QUIC's idle timeout and the lane session's own
         // deadlines (13.12, 13.14) take over.
@@ -453,14 +474,68 @@ public final class V3Join {
         filter = new OutboundFilter(true);
         pipeline.addLast(FILTER, filter);
         outboundState = encoderState(pipeline);
-        phase = Phase.ACTIVE;
+        outHold = new OutboundHold(new LaneSender(), LaneSession.MAX_UNSENT_PACKETS, LaneSession.MAX_UNSENT_BYTES);
         connection.activate(lanes, protocol, control);
-        // 12.13: what was queued during the exchange is encoded anew, as records.
-        for (Object packet : payloads.releaseQueued()) {
-            channel.write(packet);
+        sinkActive = true;
+        // 12.13: what was queued during the exchange goes out as records, whole units in order.
+        for (Object queued : payloads.releaseQueued()) {
+            outHold.submit((OutboundUnit) queued);
         }
-        channel.flush();
+        if (state.failed()) {
+            return;
+        }
+        // ACTIVE only now that the cutover is complete: a failure before this is a binding failure
+        // (0x10), and the hold on the configuration stage opens only for a join that got here.
+        if (!state.activate()) {
+            return;
+        }
         hold.release();
+    }
+
+    /** The lane layer as {@link OutboundHold} uses it. */
+    private final class LaneSender implements OutboundHold.Sender {
+        @Override
+        public boolean writable() {
+            GameLanes current = lanes;
+            return current == null || current.isWritable();
+        }
+
+        @Override
+        public void send(ProtocolState packetState, byte[] packet) {
+            try {
+                connection.session().send(packetState, FrameCodec.packetId(packet), codec.outboundFrame(packet));
+            } catch (java.io.IOException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        @Override
+        public void sendBundle(ProtocolState packetState, List<byte[]> packets) {
+            try {
+                List<OutboundPacket> framed = new ArrayList<>();
+                for (byte[] packet : packets) {
+                    framed.add(new OutboundPacket(codec.outboundFrame(packet)));
+                }
+                connection.session().sendBundle(framed.get(0), framed.subList(1, framed.size() - 1),
+                        framed.get(framed.size() - 1));
+            } catch (java.io.IOException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+    }
+
+    /** The connection ended, whichever way: nothing of the join outlives it. */
+    private void teardown() {
+        secrets.wipe();
+        BindingSession current = session;
+        if (current != null) {
+            current.close();
+        }
+        ByteBuf leftover = remainder;
+        remainder = null;
+        if (leftover != null) {
+            leftover.release();
+        }
     }
 
     // --- Failure.
@@ -470,17 +545,15 @@ public final class V3Join {
      * an internal-error close after it. Idempotent.
      */
     void fail(String reason, @Nullable Throwable cause) {
-        if (!failedOnce.compareAndSet(false, true)) {
-            return;
+        int code = state.fail();
+        if (code < 0) {
+            return; // terminal: only the first failure closes
         }
-        boolean activated = phase == Phase.ACTIVE;
-        phase = Phase.FAILED;
         hold.fail();
-        byte[] leftoverSecret = secret;
-        secret = null;
-        if (leftoverSecret != null) {
-            // 12.6: erase task-owned copies of S on failure.
-            Arrays.fill(leftoverSecret, (byte) 0);
+        secrets.wipe();
+        BindingSession current = session;
+        if (current != null) {
+            current.close();
         }
         try {
             long now = System.nanoTime();
@@ -500,7 +573,7 @@ public final class V3Join {
             if (leftover != null) {
                 leftover.release();
             }
-            connection.abort(activated ? Protocol.CLOSE_INTERNAL_ERROR : Protocol.CLOSE_BINDING_FAILURE);
+            connection.abort(code);
         } catch (Throwable t) {
             QuicraftFabric.LOG.debug("QUICraft: closing a failed multi-stream join", t);
         }
@@ -525,9 +598,10 @@ public final class V3Join {
     // --- Pipeline handlers.
 
     /**
-     * Tail-most outbound handler. Before activation it holds ordinary packets back while the exchange
-     * runs (12.10). After activation it notes the state each packet is encoded in and ends the lane
-     * session when the game closes the channel (13.14).
+     * Tail-most outbound handler. It notes the state each packet is encoded in, lets the game's own
+     * pipeline encode it, and then takes what the encoder sink collected as one unit: held back while the
+     * exchange runs (12.10), or handed to the lane layer whole after it. It ends the lane session when
+     * the game closes the channel (13.14).
      */
     private final class OutboundFilter extends ChannelOutboundHandlerAdapter {
         private final boolean active;
@@ -544,40 +618,59 @@ public final class V3Join {
 
         @Override
         public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
-            try {
-                if (!(msg instanceof Packet)) {
-                    // The game's own pipeline-configuration messages (Connection.setupInboundProtocol
-                    // and setupOutboundProtocol) are for its handlers, not for a record.
-                    ctx.write(msg, promise);
-                    return;
-                }
-                if (!active) {
-                    BindingPayloads current = payloads;
-                    if (current != null) {
-                        switch (current.queueOrdinary(msg, QUEUED_PACKET_ESTIMATE)) {
-                            case QUEUED:
-                                promise.trySuccess();
-                                return;
-                            case DROPPED_FAILED:
-                                promise.tryFailure(new IllegalStateException("binding quiescence queue overflow"));
-                                return;
-                            default:
-                                break;
-                        }
-                    }
-                } else {
-                    // The encoder swaps itself out when it writes a terminal packet, so this is where the
-                    // state a packet is sent in can still be read (bundles and split payloads share it).
-                    ProtocolState state = encoderState(ctx.pipeline());
-                    if (state != null) {
-                        outboundState = state;
-                    }
-                }
+            if (!(msg instanceof Packet) || payloads == null) {
+                // The game's own pipeline-configuration messages (Connection.setupInboundProtocol and
+                // setupOutboundProtocol) are for its handlers, not for a record.
                 ctx.write(msg, promise);
+                return;
+            }
+            if (state.failed()) {
+                promise.tryFailure(new java.nio.channels.ClosedChannelException());
+                return;
+            }
+            OutboundUnit unit = new OutboundUnit(msg instanceof BundlePacket);
+            OutboundUnit outer = unitInFlight;
+            try {
+                ProtocolState encoding = encoderState(ctx.pipeline());
+                if (encoding != null) {
+                    // The encoder swaps itself out when it writes a terminal packet, so this is where
+                    // the state a packet is sent in can still be read (bundles and splits share it).
+                    outboundState = encoding;
+                }
+                unitInFlight = unit;
+                try {
+                    // The whole pipeline up to the encoder runs as on TCP (unbundler, Fabric API's
+                    // splitter...); the sink collects what the encoder wrote into this unit.
+                    ctx.write(msg, promise);
+                } finally {
+                    unitInFlight = outer;
+                }
+                if (promise.isDone() && !promise.isSuccess()) {
+                    return; // the encoder refused it: nothing partial goes anywhere
+                }
+                finish(unit);
             } catch (Throwable t) {
                 promise.tryFailure(t);
                 fail("binding outbound filter: " + describe(t), t);
             }
+        }
+
+        private void finish(OutboundUnit unit) {
+            if (unit.isEmpty()) {
+                return;
+            }
+            if (!active) {
+                switch (OutboundQuiescence.offer(payloads.driver(), unit)) {
+                    case QUEUED:
+                        return;
+                    case DROPPED_FAILED:
+                        throw new IllegalStateException("binding quiescence queue overflow");
+                    default:
+                        replay(unit);
+                        return;
+                }
+            }
+            outHold.submit(unit);
         }
 
         @Override
@@ -602,27 +695,55 @@ public final class V3Join {
         return PacketLaneCodec.stateOf(((PacketEncoderAccessor) encoder).quicraft$protocolInfo().id());
     }
 
+    /** The exchange does not hold this unit back: send it down the byte path exactly as TCP would. */
+    private void replay(OutboundUnit unit) {
+        ChannelHandlerContext ctx = sinkContext;
+        for (byte[] packet : unit.packets()) {
+            ctx.write(io.netty.buffer.Unpooled.wrappedBuffer(packet));
+        }
+    }
+
     /**
      * Sits behind the game's encoder, where its output (packet id and payload) would go on to the
-     * compression, length-prefix and cipher handlers. After activation that output is a GAME record
-     * instead (13.4), framed as those handlers would have framed it. The packets before it ran the
-     * game's whole outbound pipeline, so bundles, split payloads and protocol swaps behaved as on TCP.
+     * compression, length-prefix and cipher handlers. During a write that went through the filter it
+     * only collects that output into the write's unit; the filter then holds the unit back (binding
+     * runs) or submits it to the lane layer as GAME records (13.4), whole. Output nobody asked for
+     * through the filter (the binding payloads themselves) goes straight on before activation.
      */
     private final class EncoderSink extends ChannelOutboundHandlerAdapter {
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) {
+            sinkContext = ctx;
+        }
+
         @Override
         public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
             if (!(msg instanceof ByteBuf)) {
                 ctx.write(msg, promise);
                 return;
             }
+            OutboundUnit unit = unitInFlight;
+            if (unit == null && !sinkActive) {
+                ctx.write(msg, promise); // binding payloads and early packets: the byte path as usual
+                return;
+            }
             ByteBuf buffer = (ByteBuf) msg;
             try {
-                byte[] packet = ByteBufUtil.getBytes(buffer);
-                ProtocolState state = outboundState;
-                if (state == null) {
+                if (state.failed()) {
+                    throw new java.nio.channels.ClosedChannelException();
+                }
+                ProtocolState encoding = outboundState;
+                if (encoding == null) {
                     throw new IllegalStateException("no outbound state for an encoded packet");
                 }
-                connection.session().send(state, FrameCodec.packetId(packet), codec.outboundFrame(packet));
+                byte[] packet = ByteBufUtil.getBytes(buffer);
+                if (unit != null) {
+                    unit.add(encoding, packet);
+                } else {
+                    OutboundUnit single = new OutboundUnit(false);
+                    single.add(encoding, packet);
+                    outHold.submit(single);
+                }
                 promise.trySuccess();
             } catch (Throwable t) {
                 promise.tryFailure(t);
@@ -648,19 +769,43 @@ public final class V3Join {
             ctx.fireChannelRead(msg);
         }
 
+        @Override
+        public void channelWritabilityChanged(ChannelHandlerContext ctx) {
+            // The lane layer can take more again: release what the write hold kept back (13.12).
+            try {
+                if (outHold != null && !state.failed()) {
+                    outHold.drain();
+                }
+            } catch (Throwable t) {
+                fail("binding write hold: " + describe(t), t);
+            }
+            ctx.fireChannelWritabilityChanged();
+        }
+
         private void acknowledge(ChannelHandlerContext ctx, GameLanes.Ack ack) {
             try {
-                if (!ctx.channel().isOpen() || lanes.isClosed()) {
+                if (!ctx.channel().isOpen() || lanes.isClosed() || state.failed()) {
                     return;
                 }
-                if (PacketLaneCodec.inboundSwapPending(ctx.pipeline())) {
-                    ctx.executor().schedule(() -> acknowledge(ctx, ack), 1, TimeUnit.MILLISECONDS);
-                    return;
-                }
-                lanes.applied(ack.lane(), ack.sequence());
+                Connection game = ctx.pipeline().get(Connection.class);
+                // Queued behind the packet handlers of what it acknowledges, on the game's own queue:
+                // nothing is credited while one of those still waits for the main thread (13.10). That
+                // also covers a protocol change, which the main thread applies in its handler.
+                AckQueue queue = new AckQueue(task -> schedule(game, task),
+                        (lane, sequence) -> lanes.applied(lane, sequence));
+                queue.acknowledge(ack.lane(), ack.sequence());
             } catch (Throwable t) {
                 fail("binding ack: " + describe(t), t);
             }
+        }
+
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        private void schedule(Connection game, Runnable task) {
+            net.minecraft.network.PacketListener listener = game.getPacketListener();
+            if (listener == null) {
+                throw new IllegalStateException("no packet listener to queue an acknowledgement behind");
+            }
+            server.packetProcessor().scheduleIfPossible(listener, new LaneAckPacket(task));
         }
     }
 }

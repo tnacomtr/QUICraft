@@ -183,6 +183,8 @@ public final class ServerQuic {
                         Integer.valueOf(MultistreamSwitch.advertisedRouting().size()),
                         Long.valueOf(settings.multistreamNodeBudgetBytes()));
             }
+            // Only a /3 listener takes quicraft:binding payloads; with it off the game's codec is vanilla's.
+            ServerBindingPayload.setEnabled(multistream);
             return new ServerQuic(server, advertisement, port, sockets.size());
         } catch (Exception | Error e) {
             // Core closes the sockets it registered; this covers a failure before it did.
@@ -242,6 +244,7 @@ public final class ServerQuic {
         current = null;
         minecraft = null;
         fingerprintDigest = null;
+        ServerBindingPayload.setEnabled(false);
         if (s != null) {
             try {
                 s.server.close();
