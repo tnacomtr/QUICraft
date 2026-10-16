@@ -220,24 +220,61 @@ public final class QuicClient {
     public static CompletableFuture<V3Connection> connectV3(HostLoop loop, HostDatagramSocket socket,
             InetSocketAddress remote, Fingerprint fingerprint, RoutingTable table, TransportConfig config,
             EarlyFlight early, boolean bypassResumption) {
-        if (table == null) {
-            throw new NullPointerException("table");
+        try {
+            if (table == null) {
+                throw new NullPointerException("table");
+            }
+            if (config == null) {
+                throw new NullPointerException("config");
+            }
+            if (socket == null) {
+                throw new NullPointerException("socket");
+            }
+            if (!QuicSupport.hasMaxFlowControlWindows()) {
+                closeHostedSocket(socket);
+                CompletableFuture<V3Connection> unavailable = new CompletableFuture<V3Connection>();
+                unavailable.completeExceptionally(new V3UnavailableException(
+                        "/3 needs QUICraft's patched native that caps quiche's flow-control windows (12.3, 13.13);"
+                                + " fall back to /2 or TCP"));
+                return unavailable;
+            }
+            CompletableFuture<V3Connection> result = connectV3(codec -> {
+                HostedDatagramChannel udp = null;
+                try {
+                    udp = new HostedDatagramChannel(socket);
+                    udp.pipeline().addLast(codec);
+                    return new HostedEventLoop(loop).register(udp);
+                } catch (RuntimeException | Error setupFailure) {
+                    if (udp != null) {
+                        udp.close();
+                    } else {
+                        closeHostedSocket(socket);
+                    }
+                    throw setupFailure;
+                }
+            }, remote, fingerprint, table, config.withMultistream(), early, bypassResumption);
+            // The hosted socket becomes channel-owned on registration, but a failed/cancelled
+            // attempt may fail before the channel factory ever takes ownership of it.
+            result.whenComplete((connection, error) -> {
+                if (error != null || result.isCancelled()) {
+                    closeHostedSocket(socket);
+                }
+            });
+            return result;
+        } catch (RuntimeException | Error setupFailure) {
+            closeHostedSocket(socket);
+            throw setupFailure;
         }
-        if (config == null) {
-            throw new NullPointerException("config");
+    }
+
+    private static void closeHostedSocket(HostDatagramSocket socket) {
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (Throwable ignored) {
+                // Preserve the failed dial as the reported cause; close is best effort.
+            }
         }
-        if (!QuicSupport.hasMaxFlowControlWindows()) {
-            CompletableFuture<V3Connection> unavailable = new CompletableFuture<V3Connection>();
-            unavailable.completeExceptionally(new V3UnavailableException(
-                    "/3 needs QUICraft's patched native that caps quiche's flow-control windows (12.3, 13.13);"
-                            + " fall back to /2 or TCP"));
-            return unavailable;
-        }
-        return connectV3(codec -> {
-            HostedDatagramChannel udp = new HostedDatagramChannel(socket);
-            udp.pipeline().addLast(codec);
-            return new HostedEventLoop(loop).register(udp);
-        }, remote, fingerprint, table, config.withMultistream(), early, bypassResumption);
     }
 
     private static CompletableFuture<V3Connection> connectV3(UdpFactory udpFactory, InetSocketAddress remote,

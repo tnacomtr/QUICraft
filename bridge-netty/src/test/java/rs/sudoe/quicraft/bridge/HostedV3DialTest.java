@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.bridge;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.netty.channel.EventLoop;
@@ -25,6 +26,9 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
+import rs.sudoe.quicraft.core.transport.HostDatagramSocket;
+import rs.sudoe.quicraft.core.transport.HostLoop;
+import rs.sudoe.quicraft.core.transport.QuicClient;
 import rs.sudoe.quicraft.core.transport.QuicServer;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
 import rs.sudoe.quicraft.core.transport.V3Connection;
@@ -93,6 +97,59 @@ class HostedV3DialTest {
             assertTrue(clientLoop.inEventLoop(onLoop.get()), "the exporter ran on the game's loop");
             assertEquals(32, ((byte[]) exported.get()).length);
             client.close();
+        }
+    }
+
+    @Test
+    void synchronousHostedV3SetupFailureClosesTheSuppliedSocket() {
+        TrackingSocket socket = new TrackingSocket();
+        assertThrows(NullPointerException.class, () -> QuicClient.connectV3(new HostLoop() {
+            @Override
+            public boolean inEventLoop(Thread thread) {
+                return false;
+            }
+
+            @Override
+            public void execute(Runnable task) {
+            }
+
+            @Override
+            public Cancellable schedule(Runnable task, long delay, TimeUnit unit) {
+                return () -> true;
+            }
+        }, socket, new InetSocketAddress(InetAddress.getLoopbackAddress(), 25565), identity.fingerprint(), null,
+                TransportConfig.DEFAULT, null, false));
+        assertTrue(socket.closed, "the supplied hosted socket is released when synchronous validation fails");
+    }
+
+    private static final class TrackingSocket implements HostDatagramSocket {
+        volatile boolean closed;
+
+        @Override
+        public InetSocketAddress localAddress() {
+            return new InetSocketAddress(InetAddress.getLoopbackAddress(), 0);
+        }
+
+        @Override
+        public void start(Receiver receiver) {
+        }
+
+        @Override
+        public void write(java.nio.ByteBuffer data, InetSocketAddress recipient) {
+        }
+
+        @Override
+        public void flush() {
+        }
+
+        @Override
+        public boolean isWritable() {
+            return true;
+        }
+
+        @Override
+        public void close() {
+            closed = true;
         }
     }
 }
