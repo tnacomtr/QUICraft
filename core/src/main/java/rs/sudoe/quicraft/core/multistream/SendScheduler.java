@@ -27,8 +27,9 @@ import rs.sudoe.quicraft.core.profile.ServerProfile;
  *     more than one quantum. Inside a bundle run, stream 0 stays open (13.15).</li>
  * <li>Urgent records (REALTIME, and ACK_JOIN or BATCH_JOIN) whose prerequisites are unsent promote
  *     the earliest ready prerequisite chain instead of filling QUIC with dependents.</li>
- * <li>A ready CHUNK passed over {@link #MAX_CHUNK_SKIPS} times in a row is taken next, so chunks
- *     progress under any REALTIME or promoted CONTROL load.</li>
+ * <li>Each ready, writable CHUNK counts the selections that pass it over. Its count resets only when
+ *     that CHUNK is picked. A CHUNK at {@link #MAX_CHUNK_SKIPS} is taken before promotion and before
+ *     round-robin, so chunks progress under any REALTIME, CONTROL or promoted load of other shards.</li>
  * <li>Fair selection: each class (REALTIME, CHUNK, CONTROL) has a virtual time advanced by the
  *     slice bytes divided by its profile weight. The lowest one wins, so each runnable class gets a
  *     share proportional to its weight. Ties go REALTIME, then CHUNK, then CONTROL. REALTIME is also
@@ -53,9 +54,9 @@ public final class SendScheduler {
     /** Selections a ready CONTROL head may wait before it is taken regardless of weight (13.20). */
     public static final int AGE_LIMIT = 32;
     /**
-     * Selections that may pass over a ready CHUNK before it is taken. A ready, writable chunk is
-     * therefore selected by the ninth selection, whatever REALTIME or promoted CONTROL load runs
-     * (13.20).
+     * Selections that may pass over a ready, writable CHUNK before it is taken. Each CHUNK keeps its
+     * own count, so a ready, writable chunk is selected by the ninth selection after it was last
+     * picked, whatever REALTIME, CONTROL or promoted load runs (13.20).
      */
     public static final int MAX_CHUNK_SKIPS = 8;
 
@@ -78,7 +79,8 @@ public final class SendScheduler {
     private long virtualTime;
     private long selections;
     private int realtimeRun;
-    private int chunkSkips;
+    /** Per CHUNK stream: selections passed over while ready and writable, reset when picked (13.20). */
+    private final TreeMap<Integer, Integer> chunkSkips = new TreeMap<Integer, Integer>();
     private int lastChunk = 1;
     private boolean bundleOpen;
     private int queuedRecords;
@@ -196,21 +198,51 @@ public final class SendScheduler {
             }
             return select(next);
         }
-        Item chunk = chunkCandidate(writable);
-        if (chunk != null && chunkSkips >= MAX_CHUNK_SKIPS) {
-            chunkSkips = 0;
-            return select(chunk);
+        Item starved = starvedChunk(writable);
+        if (starved != null) {
+            return pick(starved, writable);
         }
         Item chosen = promotedHead(writable);
         if (chosen == null) {
-            chosen = choose(writable, chunk);
+            chosen = choose(writable, chunkCandidate(writable));
         }
-        if (chunk == null || chosen == null || classOf(chosen.record.streamIndex()) == CLASS_CHUNK) {
-            chunkSkips = 0;
-        } else {
-            chunkSkips++;
+        return chosen == null ? null : pick(chosen, writable);
+    }
+
+    /**
+     * Charges one skip to every other ready, writable CHUNK before {@code item} is selected, then
+     * selects {@code item}. Skips are counted per shard, so a promoted pick of one shard cannot reset
+     * the count of another (13.20).
+     */
+    private Selection pick(Item item, IntPredicate writable) {
+        int picked = item.record.streamIndex();
+        for (Map.Entry<Integer, ArrayDeque<Item>> entry : queues.tailMap(FIRST_CHUNK, true).entrySet()) {
+            int stream = entry.getKey();
+            Item head = entry.getValue().peekFirst();
+            if (stream != picked && head != null && usable(head, writable)) {
+                chunkSkips.put(stream, skipsOf(stream) + 1);
+            }
         }
-        return chosen == null ? null : select(chosen);
+        return select(item);
+    }
+
+    /**
+     * The ready, writable CHUNK that has been passed over {@link #MAX_CHUNK_SKIPS} times and has
+     * been passed over the most, or null. Equal counts go to the shard next in round-robin order
+     * (13.20).
+     */
+    private Item starvedChunk(IntPredicate writable) {
+        Item best = null;
+        int bestSkips = MAX_CHUNK_SKIPS - 1;
+        for (int stream : chunkStreamsInRoundRobinOrder()) {
+            int skips = skipsOf(stream);
+            Item head = front(stream);
+            if (skips > bestSkips && head != null && usable(head, writable)) {
+                best = head;
+                bestSkips = skips;
+            }
+        }
+        return best;
     }
 
     /**
@@ -283,21 +315,29 @@ public final class SendScheduler {
 
     /** Next ready CHUNK[i] after the previously served shard, cyclically (13.20). */
     private Item chunkCandidate(IntPredicate writable) {
-        Item first = null;
-        for (Map.Entry<Integer, ArrayDeque<Item>> entry : queues.tailMap(FIRST_CHUNK, true).entrySet()) {
-            int stream = entry.getKey();
-            Item head = entry.getValue().peekFirst();
-            if (head == null || !usable(head, writable)) {
-                continue;
-            }
-            if (stream > lastChunk) {
+        for (int stream : chunkStreamsInRoundRobinOrder()) {
+            Item head = front(stream);
+            if (head != null && usable(head, writable)) {
                 return head;
             }
-            if (first == null) {
-                first = head;
+        }
+        return null;
+    }
+
+    /** Chunk streams after the last served shard, then the rest, each in ascending order. */
+    private List<Integer> chunkStreamsInRoundRobinOrder() {
+        List<Integer> order = new ArrayList<Integer>();
+        for (Integer stream : queues.tailMap(lastChunk, false).keySet()) {
+            if (stream >= FIRST_CHUNK) {
+                order.add(stream);
             }
         }
-        return first;
+        for (Integer stream : queues.headMap(lastChunk, true).keySet()) {
+            if (stream >= FIRST_CHUNK) {
+                order.add(stream);
+            }
+        }
+        return order;
     }
 
     /**
@@ -345,6 +385,7 @@ public final class SendScheduler {
         realtimeRun = cls == CLASS_REALTIME ? realtimeRun + 1 : 0;
         if (cls == CLASS_CHUNK) {
             lastChunk = stream;
+            chunkSkips.remove(stream);
         }
         if (stream == CONTROL) {
             if (offset == 0 && item.bundleContinues) {
@@ -390,6 +431,11 @@ public final class SendScheduler {
 
     private long sentOf(int stream) {
         Long value = sent.get(stream);
+        return value == null ? 0 : value;
+    }
+
+    private int skipsOf(int stream) {
+        Integer value = chunkSkips.get(stream);
         return value == null ? 0 : value;
     }
 

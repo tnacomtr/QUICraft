@@ -125,6 +125,39 @@ class SendSchedulerTest {
                         + SendScheduler.MAX_CHUNK_SKIPS);
     }
 
+    @Test void starvedChunkIsServedWithinTheBoundWhilePromotionsKeepUrgentPairsFlowing() {
+        // CHUNK[2] (logical 4) stays runnable. The ACK_JOIN on CHUNK[0] (logical 2) waits for CHUNK[1]
+        // (logical 3) record 1200, so it stays the blocked head and every selection is a promotion of
+        // the oldest unsent CHUNK[1] record. Promotions are chunk-class picks, so the old single skip
+        // counter was reset each time and CHUNK[2] was never chosen (13.20).
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
+        for (int i = 1; i <= 1200; i++) {
+            scheduler.offer(rec(3, i), 1);
+        }
+        scheduler.offer(new Record(2, 1, 0,
+                Collections.singletonList(new Record.Dependency(3, 1200)), 1, NONE), 1);
+        for (int i = 1; i <= 2000; i++) {
+            scheduler.offer(rec(4, i), 1);
+        }
+        int gap = 0;
+        int served = 0;
+        for (int step = 1; step <= 1200; step++) {
+            SendScheduler.Selection selection = scheduler.pollSelection(ALL);
+            assertNotNull(selection, "nothing selected at step " + step);
+            if (selection.record().streamIndex() == 4) {
+                served++;
+                gap = 0;
+            } else {
+                gap++;
+                assertTrue(gap <= SendScheduler.MAX_CHUNK_SKIPS,
+                        "CHUNK[2] passed over " + gap + " selections in a row at step " + step
+                                + ", bound is " + SendScheduler.MAX_CHUNK_SKIPS);
+            }
+        }
+        assertTrue(served >= 1200 / (SendScheduler.MAX_CHUNK_SKIPS + 2),
+                "CHUNK[2] was served only " + served + " times in 1200 selections");
+    }
+
     @Test void chunkShardsAreServedRoundRobin() {
         SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
         for (int i = 1; i <= 50; i++) {
