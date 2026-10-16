@@ -14,7 +14,21 @@ public enum Dependency {
     /** CONTROL only: the record fences all lanes (13.5, 13.9). */
     FENCE("fence"),
     /** Auxiliary only: the record is ordered within its lane behind the latest CONTROL (13.9). */
-    LANE("lane");
+    LANE("lane"),
+    /** CONTROL waits for own predecessor and most recent REALTIME record (13.7, 13.9). */
+    INTERACTION("interaction"),
+    /** CONTROL waits for the view frontier (13.5, 13.9). */
+    VIEW("view"),
+    /** Ordinary CONTROL predecessor only (13.5, 13.9). */
+    ORDINARY("ordinary"),
+    /** CONTROL fence before REALTIME progress (13.5, 13.9). */
+    CONTROL("control"),
+    /** CONTROL/view frontier semantics (13.7). */
+    GLOBAL("global"),
+    /** Chunk join dependency class (13.7, 13.19). */
+    ACK_JOIN("ack_join"),
+    /** Batched chunk join dependency class (13.7, 13.19). */
+    BATCH_JOIN("batch_join");
 
     private final String wireName;
 

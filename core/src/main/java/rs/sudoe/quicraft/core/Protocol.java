@@ -50,6 +50,8 @@ public final class Protocol {
      * {@link rs.sudoe.quicraft.core.multistream.MultistreamProtocolException#CLOSE_ORDERING}.
      */
     public static final int CLOSE_ORDERING_FAILURE = 0x11;
+    /** Local resource shedding/refusal close (13.12). */
+    public static final int CLOSE_RESOURCE = 0x12;
 
     private Protocol() {}
 }
