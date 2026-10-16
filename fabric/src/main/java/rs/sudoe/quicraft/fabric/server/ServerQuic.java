@@ -10,6 +10,7 @@ import io.netty.channel.socket.DatagramChannel;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.dedicated.DedicatedServer;
 import net.minecraft.server.dedicated.DedicatedServerProperties;
@@ -28,6 +29,7 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.QuicServer;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
+import rs.sudoe.quicraft.core.transport.V3Connection;
 import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.QuicraftFabric;
 
@@ -41,6 +43,9 @@ public final class ServerQuic {
     private static volatile @Nullable ServerQuic current;
     /** Vanilla's initializer wrapped with the advertiser; also what QUIC channels get. */
     private static volatile @Nullable ChannelInitializer<Channel> initializer;
+    /** What a {@code /3} connection's join needs from the running server (docs/protocol.md 12.7). */
+    private static volatile @Nullable MinecraftServer minecraft;
+    private static volatile byte @Nullable [] fingerprintDigest;
 
     private final QuicServer server;
     private final Advertisement advertisement;
@@ -119,6 +124,8 @@ public final class ServerQuic {
             InetSocketAddress udp = address != null ? new InetSocketAddress(address, quicPort)
                     : new InetSocketAddress(quicPort);
             ServerIdentity identity = ServerIdentity.loadOrCreate(dir);
+            ServerQuic.minecraft = minecraft;
+            fingerprintDigest = MessageDigest.getInstance("SHA-256").digest(identity.certificate().getEncoded());
             current = bind(minecraft, udp, identity, init, settings);
             QuicraftFabric.LOG.info("QUICraft: QUIC listening on UDP {} with {} socket(s) (fingerprint {}); open this "
                     + "UDP port in your firewall", current.server.localAddress(), current.sockets,
@@ -206,6 +213,17 @@ public final class ServerQuic {
 
     private static void accept(QuicByteStream stream, ChannelInitializer<Channel> init, EventLoop loop) {
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
+        if (stream instanceof V3Connection v3) {
+            // A quicraft/3 connection: its join runs the binding exchange once the game reaches
+            // configuration (12.4). Nothing about /2 or TCP changes.
+            MinecraftServer server = minecraft;
+            byte[] digest = fingerprintDigest;
+            if (server != null && digest != null) {
+                V3Join.attach(channel, v3, server, digest);
+            } else {
+                v3.abort(Protocol.CLOSE_BINDING_FAILURE);
+            }
+        }
         channel.pipeline().addLast(init);
         loop.register(channel).addListener(f -> {
             if (!f.isSuccess()) {
