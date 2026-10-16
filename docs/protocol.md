@@ -581,7 +581,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 ## 12. Channel binding, pinning and dropping Minecraft's cipher (Phase 5)
 
-**Draft v2. Design approved by the user 2026-10-15 (open questions 1-4 as written below); implementation may proceed behind a disabled-by-default flag. Security review is required before any release or enablement.**
+**Draft v2 with 2026-10-16 shard-count transcript revision (12.7-12.9). The original binding design was approved 2026-10-15; the revised wire draft remains disabled by default and requires security review before release or enablement.**
 
 ### Scope and capability gate
 
@@ -633,7 +633,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
    obtain `E = TLS-Exporter("EXPORTER-quicraft-binding-v2", context = empty byte string,
    length = 32)` using the RFC 8446 §7.5 normal exporter, with context explicitly supplied
    (JNI `use_context = 1`, context length 0), never the early exporter. Define
-   `T = SHA256("quicraft/3 binding v2" || u32(protocol_number) || u8(mode) || F || R)`.
+   `T = SHA256("quicraft/3 binding v2" || u32(protocol_number) || u8(mode) || F || R || u8(N))`.
+   `N` is the selected chunk shard count (13.2); it is authenticated with the routing digest.
    `mode = 1` requires Hello's `shouldAuthenticate=true`, successful client `joinServer`
    and successful server `hasJoined`; `mode = 0` requires no Minecraft encryption at all.
    Encrypted-but-unauthenticated login MUST never offer `/3` or MUST close it with `0x10`.
@@ -661,7 +662,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 8. **12.8 Plugin-message format.** Use configuration Custom Payload packets on channel
    `quicraft:binding` in both directions, intercepted by the adapter, never delivered to
    ordinary plugins. Payload is exactly `u8(version=2) || u8(kind) || u8(mode) ||
-   u32(protocol_number) || F[32] || R[32] || tag[32]` (103 bytes). There are no optional
+   u32(protocol_number) || F[32] || R[32] || u8(N) || tag[32]` (104 bytes). There are no optional
    fields or trailing bytes. `kind`: 0 OFFER (server), 1 CLIENT_PROOF, 2 SERVER_PROOF,
    3 CLIENT_SWITCH, 4 SERVER_SWITCH. OFFER has an all-zero tag; every other online tag is
    `HMAC-SHA256(K, "quicraft binding v2 message" || u8(kind) || T || E)`.
@@ -678,7 +679,9 @@ single-socket listener: no dispatcher is installed and the connection id length 
    state. Client responds only to a matching OFFER; server sends SERVER_PROOF only after
    verifying CLIENT_PROOF; client sends CLIENT_SWITCH only after verifying SERVER_PROOF;
    server sends SERVER_SWITCH only after verifying CLIENT_SWITCH. Compare all 32 MAC bytes
-   in constant time after exact-length validation. Unknown versions/kinds, duplicates,
+   in constant time after exact-length validation. Every message echoes the same selected
+   `N`, in the client's preamble range and 1..6; a mismatch fails activation with `0x10`.
+   Unknown versions/kinds, duplicates,
    reflection, mismatched metadata, unsolicited payloads or invalid MACs terminate `/3`.
 
 ### Exact cipher and framing cutover
@@ -862,16 +865,18 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 ## 13. Multi-stream (Phase 5)
 
-**Draft v2. Design approved by the user 2026-10-15 (open questions 1-4 as written below); implementation may proceed behind a disabled-by-default flag. Security review is required before any release or enablement.**
+**Revised draft, 2026-10-16. This replaces the unshipped three-lane `/3` draft in place; no old-draft compatibility is required. Implementation remains disabled by default. Security review is required before release or enablement.**
 
-### Direction (2026-10-16): planned, not implemented
+This is spec only. Current `core/multistream` still has the 33-byte three-lane record codec,
+full CONTROL fences and shared auxiliary budget; `core/routing` still uses schema 1 without
+position extraction. Those implementations must change together before this revision can run.
 
-This subsection records the user's direction for the next revision of `/3`. None of it is implemented yet. Sections 13.1 to 13.17 still describe the current draft. The revision is made in place, because `/3` has never shipped enabled.
+### Direction (2026-10-16): specified, not implemented
 
-1. **Large packets first.** The main goal of multi-stream is to stop large packets (chunk data) from causing head-of-line blocking. The current draft (13.8) keeps chunk installs on the ordered CONTROL stream, which still blocks everything queued behind a large chunk. The planned revision moves chunk data onto N streams sharded by chunk position, with scoped fences, so only the updates that depend on a chunk wait for it. Small-packet lanes come as a second step.
-2. **Send priority.** When several packets are ready, send in this order: (a) latency-sensitive packets that shape how multiplayer feels, such as entity movement and updates; (b) large packets that can block others, such as chunks; (c) other small packets. Chunk loading must not be starved by (a).
-3. **Streams versus CPU.** Carry as many packet types as possible on parallel streams, while keeping server CPU per player in check. CPU per player is measured as streams are added (see `docs/benchmarks.md`, "Planned Phase 5 measurements").
-4. **Chunk stream count.** Negotiated per connection and benchmarked from 1 to 6 streams. The server never exceeds a hard maximum, whatever its settings say.
+1. **Large packets first.** Chunk install, updates and forget share one of N position-sharded chunk streams (13.3, 13.8, 13.18). Scoped fences and chunk joins replace full fences on every CONTROL packet (13.5, 13.9, 13.19). Entity storage does not require chunk install before spawn.
+2. **Send priority.** Multiplayer-feel packets first, chunks second, other small packets third, with chunk progress guaranteed by dependency-aware sender scheduling (13.20), not by QUIC priority alone.
+3. **Streams versus CPU.** Routing remains reviewed data (13.7). Measure CPU per player as streams are added, rather than assuming more streams are free (see `docs/benchmarks.md`, "Planned Phase 5 measurements").
+4. **Chunk stream count.** Negotiated per connection (13.2), benchmarked from 1 to 6, with a draft hard cap of 6 justified by dedicated receive reservations (13.12/13.13). Compact headers are in 13.4. Cap/default confirmation is listed below.
 5. **Server profiles (planned).** Built-in profiles keyed on the server's hardware: memory given to Java and CPU cores it may use. Each profile sets how many players may connect over `/3` and the maximum number of parallel streams. Every profile value is pushed to the highest the hardware sustains, measured with all of the profile's values running together (they share CPU and memory), taken from `docs/benchmarks.md` runs, not a cautious guess. Custom values are range-checked and checked against each other, and are applied all at once or not at all. Admins may create a custom profile with `/quicraft value set <VARIABLE> <int>` and restore with `/quicraft value restore default` or `/quicraft value restore <profile>`. The first time an admin changes a value, the command warns that changing these values is risky and asks them to proceed with caution. The hard stream cap in item 4 still applies to custom values.
 
 ### Negotiation and stream map
@@ -898,53 +903,83 @@ This subsection records the user's direction for the next revision of `/3`. None
    matching digest for their protocol to select `/3`; absent/unknown/mismatched entries
    select TCP (a changed pin likewise uses fresh TCP, 12.16). Never guess a routing table.
    OFFER's digest comparison remains authoritative even after an advertisement match.
-2. **13.2 Preamble.** Under `/3` only, stream 0 begins in each direction with exactly
-   `VarInt(length) || u8(version=2) || u8(token_length) || token`; token length is 0 or 16,
-   length exactly 2 or 18. Retain §8's token semantics. Unknown version/length is `0x1`.
-   Following bytes remain the ordinary single-stream Minecraft login/configuration format
-   until 12.11/12.12, then become records. The existing v1 `Preamble`/`PreambleStream` are
-   not extensibility negotiation; `/3` requires a separate version-aware parser and cutover.
-3. **13.3 Stream identities.** Exactly three bidirectional QUIC streams are allowed:
-   stream 0 CONTROL (client opens, both directions), stream 4 REALTIME (client opens,
-   both directions), stream 1 WORLD (server opens, both directions). The latter two open
-   only after the opener activates under §12. This explicitly lifts v1's ban on server-opened
-   streams for `/3` only. No unidirectional streams, datagrams, replacement streams or other
-   ids are permitted. WORLD and REALTIME each start in each direction with
-   `u8(version=2) || u8(type)` where type is 1 REALTIME or 2 WORLD; CONTROL has no second
-   preamble. Only the client may buffer early stream-1 bytes until it validates
-   SERVER_SWITCH, under 13.12's bounds, without delivery. The server MUST treat any
-   stream-4 frame before its own activation (CLIENT_SWITCH validated and SERVER_SWITCH
-   queued) as fatal `0x11`, not buffer it. Stream 4 cannot legitimately precede that point.
-   Adapter note: the server's activation must take effect on the connection's event loop
-   before, or in the same task as, the flush of SERVER_SWITCH. Activating from another thread
-   only queues it, and the client's stream 4 can then arrive first, which is fatal.
+2. **13.2 Preamble and shard negotiation.** Under `/3` only, stream 0 starts in each direction
+   with `VarInt(length) || u8(version=2) || u8(token_length) || token || u8(min_shards) ||
+   u8(max_shards)`. Token length is 0 or 16, length exactly 4 or 20. Retain §8's token
+   semantics; malformed version, length or range closes with `0x1`. The client offers
+   `1 <= min_shards <= max_shards <= 6`; the server replies with its selected `N` in both
+   range fields, within that offer and its configured maximum. An empty intersection fails the
+   connection (`0x10`), never clamps silently outside the offer. The draft client offer is
+   1..6; both the configured maximum and preference must be within 1..6.
+   Select N by clamping the configured preference to the intersection of the client's range
+   and 1..configured_max; the draft preference is 3. Selection is immutable for the
+   connection and echoed/authenticated in §12's exchange.
+   Hardware profiles are local policy, not wire fields; no administrator setting overrides 6.
+   Following bytes use ordinary Minecraft login/configuration framing until §12 cutover.
+   This preamble does not alter `/2` or its version-1 parser. Never negotiate through a game
+   plugin message on `/2`.
+3. **13.3 Stream identities.** There are exactly N+2 bidirectional streams: CONTROL on QUIC
+   id 0 and REALTIME on id 4, both client-opened; CHUNK[i] on id `1+4*i`, server-opened,
+   for `0 <= i < N`. Logical stream indices used in dependencies are CONTROL=0, REALTIME=1,
+   CHUNK[i]=2+i (not QUIC ids). Chunk packets are initially clientbound only; reverse chunk
+   directions still open and send their preambles, but no records are allowed there.
+   Auxiliary streams open only after the opener activates under §12; each direction starts
+   `u8(version=2) || u8(logical_stream_index)`. CONTROL has no second preamble. No other
+   stream ids, replacements, unidirectional streams or datagrams are allowed.
+   The client may buffer early server chunk-stream bytes before validating SERVER_SWITCH,
+   within each stream's reservation (13.12), without parsing game bodies or delivering them.
+   The server rejects pre-activation stream-4 bytes with `0x11`. Server activation must run
+   on the connection event loop before, or in the same task as, flushing SERVER_SWITCH.
 
 ### Records, control and routing data
 
-4. **13.4 Record format.** Each activated stream direction carries repeated
-   `VarInt(record_length) || u8(kind) || u64(sequence) || u64(dep_control) ||
-   u64(dep_realtime) || u64(dep_world) || body`. Length excludes its own VarInt and
-   includes the 33-byte fixed header. Kind 0 is one GAME packet; body is exactly one
-   Minecraft VarInt-length frame including packet id and the negotiated compression wrapper,
-   without CFB8. Kind 1 is END, CONTROL only, with empty body. Reject unknown kinds,
-   trailing bytes, invalid inner lengths or `record_length > 33 + 3 + 2097151`
-   (2097187 bytes): 33 header bytes plus at most a three-byte Minecraft length prefix
-   and 2097151 bytes of framed packet content. Validate this before allocating the body.
-   Sequence starts at 1 independently per stream and direction and increments by exactly
-   one per record, including END; zero dependencies mean no predecessor. No integer wraps.
-5. **13.5 CONTROL semantics.** State transitions (including Finish Configuration and
-   acknowledgements), registry/dimension changes, compression changes, object create/destroy,
-   teleport/respawn, disconnects, and unknown/custom packets MUST use CONTROL. CONTROL is
-   ordered and is a full fence: a control record depends on every record previously assigned
-   in that sending direction on all lanes; every subsequent non-control record depends on
-   that control record. Receivers apply state changes only at delivery, before decoding
-   subsequent dependent packet bodies. Reconfiguration retains the streams and sequences,
-   drains play through a control fence and uses CONTROL exclusively until play resumes.
+4. **13.4 Compact record format.** Each activated direction carries repeated
+   `VarInt(record_length) || u8(kind) || VarInt(sequence) || VarInt(epoch) ||
+   VarInt(dependency_count) || dependency_entries || body`. Each entry is
+   `u8(logical_stream_index) || VarInt(required_sequence)`. Entries are strictly increasing
+   by index, positive sequences, at most N+1 entries, and never name the record's own stream.
+   Own-stream `sequence-1` is implicit. Omit zero components; do not encode duplicate indices.
+   All new VarInts are minimal nonnegative signed-31-bit values (0..2147483647), at most
+   five bytes; sequence starts at 1, increases exactly by one per stream/direction and never
+   resets, including across epochs. Exhaustion closes, never wraps. Epoch is defined in 13.18.
+   Kind 0 GAME has exactly one Minecraft length-prefixed frame, including id and negotiated
+   compression wrapper, without CFB8. Kind 1 END has empty body and is CONTROL/global only.
+   Kinds 2 ACK_JOIN and 3 BATCH_JOIN carry one ordinary GAME frame of the designated packet
+   type (13.19), on a chunk stream only. Reject other kinds and trailing/invalid inner bytes.
+   Length excludes its own prefix. Header maximum is 54 bytes (1+5+5+1+7*6);
+   body maximum is 2097154 (three-byte length plus at most 2097151 content bytes).
+   Reject `record_length > 2097208` before allocating. Including the outer prefix, no
+   record exceeds 2097212 bytes. A low-sequence, low-epoch, zero-explicit-dependency record
+   has a four-byte header, five bytes including a one-byte length; one small dependency
+   adds two bytes. The ~5-byte target is not a constant-size or long-session claim.
+5. **13.5 Scoped CONTROL semantics.** CONTROL stays ordered, but is not itself a fence kind.
+   Each route selects one of these policies, always including its own stream predecessor:
+   - **Global fence:** waits for all previously assigned records on all streams; all later
+     records wait for it. Use for play login, respawn/level replacement, registry and protocol
+     state changes (including start/finish configuration and acknowledgements), compression
+     changes, disconnect, END, and unknown/custom packet ids on either endpoint.
+   - **View gate:** waits for previous CONTROL and REALTIME only, plus the latest global
+     fence. Later chunk records wait for it; it does not wait for earlier chunks. Use for
+     chunk cache center, cache radius and simulation distance before admitting new chunks
+     outside the old view. chunk_batch_start also uses this scope (13.19). A view gate is
+     also a CONTROL fence for later REALTIME.
+   - **Control fence:** waits for previous CONTROL and REALTIME, plus the latest global
+     fence. Later REALTIME waits for it; chunks do not. Use for entity spawn/remove and
+     teleport relations, preserving spawn-before-move, move-before-remove/id reuse, and
+     teleport-before-dependent movement.
+   - **Ordinary CONTROL:** waits for its CONTROL predecessor and latest global fence only.
+     Keepalive and reviewed unrelated control packets MUST NOT fence REALTIME.
+   Reconfiguration globally drains play, retains streams/sequences, and uses CONTROL only
+   until play resumes. Fences/gates take effect after game-handler execution (13.10), not
+   receipt. Scope is per sending direction; game acknowledgements handle cross-direction
+   transitions, never implicit references to reverse-stream sequence numbers.
 6. **13.6 Routing algorithm.** At the sender's original game packet ordering point, assign
    sequences and dependencies before parallel encoding or scheduling. Lookup is by exact
    Minecraft protocol number, protocol state, direction and numeric packet id. Missing entries
-   default to CONTROL, never an inferred category. The receiver checks the selected lane
-   against the same table after dependencies permit decoding; wrong-lane packets disconnect.
+   default to CONTROL/global, never an inferred category. The receiver checks route, kind,
+   shard, epoch and required dependencies against the same table before game delivery;
+   wrong-route packets disconnect with `0x11`. A known packet with a failing position
+   extractor is malformed, not permission to fall back to another lane.
    Unknown protocol numbers disable `/3` before connecting. Check advertised digests under
    13.1 before choosing `/3`; unequal digests in OFFER still fail activation under 12.14
    before entering play, never use a guessed routing table. A post-login routing mismatch
@@ -952,44 +987,71 @@ This subsection records the user's direction for the next revision of `/3`. None
    a changed or falsified advertisement), not as normal compatibility negotiation.
    Runtime packet-id remappers/modded registries require an explicitly
    matching reviewed table or advertise `/2` only.
-7. **13.7 Data resource.** Store routing as UTF-8 JSON data, one resource per protocol number,
-   with `schema:1`, `protocol:<number>`, `default:"control"`, and `routes` entries containing
-   `state`, `direction` (`clientbound`/`serverbound`), `packet_id` (nonnegative integer),
-   `lane` (`control`/`realtime`/`world`) and `dependency` (`fence`/`lane`). Reject duplicates,
-   unknown fields and unsupported schema. Require `fence` for CONTROL and `lane` otherwise;
-   every non-control entry needs ordering tests. `R` is SHA-256 of the exact resource bytes,
-   including whitespace, shipped identically to both peers; no runtime normalization. The
-   following is a synthetic schema example, NOT a mapping for any released Minecraft version:
+7. **13.7 Data resource.** Store routing as UTF-8 JSON, one resource per protocol number,
+   with `schema:2`, `protocol:<number>`, `default:"global"`, `extractors`, and `routes`.
+   Each route has `state`, `direction` (`clientbound`/`serverbound`), `packet_id`, `lane`
+   (`control`/`realtime`/`chunk`), `dependency` (`global`/`view`/`control`/`ordinary`/
+   `lane`/`ack_join`/`batch_join`), `position`, and `epoch_change` (boolean).
+   Position is `null` or the name of a reviewed per-version extractor. `extractors` maps
+   names to versioned adapter decoder identifiers; these are a closed allowlist, not executable
+   scripts or heuristic offsets. Each implementation supplies golden packet bytes for every
+   identifier, including negative coordinates and malformed input. All entries/identifiers
+   are covered by R; no unversioned decoder choice or external file changes routing semantics.
+   An extractor returns one signed-32-bit chunk (x,z), a bounded list for multi-chunk packets,
+   or the special `join` result for joins with no position. Block positions use mathematical
+   floor division by 16, section positions their chunk x/z. Lists obey the game's packet
+   size/count bounds; multi-chunk packets use CONTROL/global, not single-shard guessing.
+   Require a single-position extractor for ordinary chunk routes, `join` for chunk joins,
+   null for other routes except globally routed multi-chunk packets. `lane` is REALTIME or
+   chunk only; global/view/control/ordinary are CONTROL only; joins are chunk only.
+   `epoch_change:true` is CONTROL/global only and matches reviewed level replacement packets.
+   Non-play routes are CONTROL/global. Reject missing/unknown fields, duplicate keys/routes,
+   unsupported schema/identifiers and invalid combinations before offering `/3`.
+   R is SHA-256 of the exact resource bytes, whitespace included, identical at both peers.
+   Mandatory CONTROL data must now enforce the required fence policy too, not merely lane.
+   Every relaxation from global needs ordering tests. Synthetic example, not a game mapping:
 
    ```json
-   {"schema":1,"protocol":12345,"default":"control","routes":[
-     {"state":"play","direction":"clientbound","packet_id":10,"lane":"control","dependency":"fence"},
-     {"state":"play","direction":"clientbound","packet_id":11,"lane":"realtime","dependency":"lane"},
-     {"state":"play","direction":"clientbound","packet_id":12,"lane":"world","dependency":"lane"}
+   {"schema":2,"protocol":12345,"default":"global","extractors":{"chunk":"test.chunk_xz.v1"},"routes":[
+     {"state":"play","direction":"clientbound","packet_id":10,"lane":"control","dependency":"control","position":null,"epoch_change":false},
+     {"state":"play","direction":"clientbound","packet_id":11,"lane":"realtime","dependency":"lane","position":null,"epoch_change":false},
+     {"state":"play","direction":"clientbound","packet_id":12,"lane":"chunk","dependency":"lane","position":"chunk","epoch_change":false}
    ]}
    ```
 
-8. **13.8 Explicit game invariants.** Entity spawn/create and destroy are CONTROL fences;
-   entity movement/metadata may be REALTIME only after the corresponding spawn is delivered,
-   and destroy must wait for all prior updates before id reuse. Chunk install, unload and
-   world reset are CONTROL fences. Block, light and block-entity updates for that chunk
-   MUST share WORLD in original order, or remain CONTROL; they depend on the install fence.
-   No update may pass its chunk
-   install or reference an entity after its destroy. Dimension/registry changes fence all
-   affected lanes. Where a packet's dependency cannot be demonstrated from these rules,
-   route it to CONTROL. Stream classification is not permission to omit a predecessor.
-   The planned revision (see "Direction (2026-10-16)" above) moves chunk install off CONTROL
-   onto sharded chunk streams; these fence rules then apply to that lane instead.
+8. **13.8 Explicit game invariants (26.1.2, protocol 775).** Chunk install, block_update,
+   section_blocks_update, block_entity_data, light_update and forget_level_chunk use the
+   position's CHUNK shard, in original order: install, updates, forget. Never move an update
+   to REALTIME; block/section/block-entity updates before install are lost, and stale light
+   after forget must not overtake it. Multiple positions colliding on a shard share its order.
+   chunks_biomes spans chunks: keep the whole packet CONTROL/global, with its list extractor;
+   it waits for prior installs and later chunk updates wait for it. Do not split/rewrite it.
+   Entity storage is chunk-independent: spawn does not wait for a chunk install; forgetting
+   a chunk does not remove entities. Spawn and entity-data bundles stay whole on CONTROL
+   under 13.15. Entity updates on REALTIME wait for their CONTROL fence; removal waits for
+   earlier REALTIME, not chunk traffic. block_event, level_event, explode and
+   block_destruction need no chunk ordering; reviewed routes may use REALTIME/lane without
+   a chunk dependency. View changes and joins obey 13.5/13.19. Any unproven type remains
+   CONTROL/global, including unknown ids at both sender and receiver.
 
 ### Sequence barriers, bounds and delivery
 
-9. **13.9 Dependency vector.** For each sending direction maintain last-assigned sequences
-   `A[control,realtime,world]`. A non-control record depends on the latest CONTROL and its
-   own lane predecessor; other components default to zero. A CONTROL record depends on
-   the whole previous `A`. The sender MUST additionally include any cross-lane semantic
-   predecessor required by 13.8, taking componentwise maxima. Only already assigned records
-   may be referenced; a record's own-lane dependency is exactly `sequence-1`. These rules
-   make dependencies acyclic. Initial records have zero predecessors as appropriate.
+9. **13.9 Dependency construction.** Maintain A[0..N+1] (last assigned), latest global G,
+   view V and control fence C (CONTROL sequences), independently per sending direction.
+   At one logical game-send ordering point, before parallel encoding/scheduling, start with
+   the implicit own predecessor and the latest G. Add the following component maxima:
+   - Global: all of previous A; then set G to this record.
+   - View: previous A[CONTROL,REALTIME]; then set V and C to this record.
+   - Control fence: previous A[CONTROL,REALTIME]; then set C to this record.
+   - Ordinary CONTROL: nothing further.
+   - REALTIME: latest C.
+   - Ordinary chunk: latest V only. It never waits for unrelated CONTROL or REALTIME.
+   - Chunk join: latest V and the semantic frontier in 13.19.
+   Encode only nonzero cross-stream maxima; own predecessor remains implicit. All edges
+   MUST point to previously assigned records, including joins and bundle units. Never queue
+   a join behind a record that depends on it on its own stream. No post-scheduling discovery
+   of new predecessors is allowed. G/V/C start at zero. Required dependencies may be
+   transitively satisfied by larger same-stream frontiers, but may not be omitted unsafely.
 10. **13.10 Receiver algorithm.** Maintain contiguous delivered watermarks `D` per direction.
     Parse envelopes without decoding game bodies; queue each in lane order. Deliver only a
     lane's head record, only when every dependency is <= the corresponding `D`, and only
@@ -997,117 +1059,113 @@ This subsection records the user's direction for the next revision of `/3`. None
     when bytes arrive or decoding completes). Then advance that lane's `D` and retry heads.
     Serialize delivery on the game connection executor; preserve the vanilla main-thread
     dispatch order for each dependency. No cross-direction dependency is implied: request/
-    response semantics still use the game's application acknowledgements. A record with a
-    future own-lane dependency, skipped sequence or duplicate is a protocol error.
-11. **13.11 Barrier example.** CONTROL spawn sequence 5 followed by REALTIME move sequence 9
-    carries `dep_control=5`, `dep_realtime=8`. If move arrives first, hold it until spawn 5
-    and move 8 have been delivered. A subsequent CONTROL destroy sequence 6 depends on
-    REALTIME 9 (and every prior WORLD record), so cannot overtake that move. CONTROL chunk
-    install 7 followed by WORLD block update 8 carries `dep_control=7`; the update waits
-    for the install even if their bytes arrive out of order. Fault tests
-    MUST withhold each predecessor independently and observe these delivery orders.
-12. **13.12 Memory and timeout.** Per connection, cap pending received records (including
-    partial records, pre-activation auxiliary bytes and decoded-but-undelivered packets)
-    at 1024 records or 16 MiB total wire/retained decoded bytes, whichever comes first.
-    Cap each decompressed packet at 8 MiB or the game's stricter limit. Count parser buffers,
-    staged bundles and decompression output in these budgets, not just complete envelopes.
-    Reserve a further 1 MiB receive budget for CONTROL so blocked auxiliary queues cannot
-    prevent reading small control predecessors; aggregate cap is 17 MiB. Within the 1024
-    pending-record cap, reserve 64 slots exclusively for CONTROL (at most 960 auxiliary
-    records, including partial/pre-activation records). A predecessor
-    larger than the remaining budget disconnects rather than evicting buffered data.
-    Stop granting auxiliary credit
-    before exceeding its budget; if data already received cannot fit, close, never evict
-    a predecessor. Also cap unsent application queues at 1024 packets or 16 MiB and apply
-    backpressure; an unpausable producer over the cap disconnects. A head record blocked on
-    a dependency, incomplete record, or unapplied handler for 10 seconds disconnects with
-    `0x11` (ordering/resource failure). A lane that holds the auxiliary budget while its head waits for a
-    predecessor on the other auxiliary lane (cross-lane starvation) is resolved by this same
-    10 second blocked-head disconnect. Cycles, impossible references, limit violations and
-    parser/ordering errors use the same code; do not skip packets or release a barrier on
-    timeout. Start the incomplete-record timer at its first byte and the blocked-head timer
-    when it becomes head; progress on other lanes does not restart either deadline. This
-    deliberately favors disconnect over an undetected game desync.
-    These are ceilings, not eager allocations. Each listener/node MUST also enforce a
-    configured aggregate pending-bytes budget across connections, counting all retained
-    buffers/decoded data above, including the unparsed transport chunks held before a
-    record claims them. The read chunk a lane has taken but not parsed, at most one
-    `READ_CHUNK` per lane, counts toward that node budget and not toward the per-connection
-    ceilings above. Reserve each admitted connection's initial receive-credit
-    exposure against that budget, and refuse new QUIC admissions when the reservation
-    cannot fit (leave TCP untouched). Debit further credit/allocations before granting
-    them; release reservations only when credit exposure or retained bytes are gone.
-    No allocation or advertised receive credit may overcommit this node budget. Record
-    the configured budget and admission behavior in the 13.17 scale benchmark.
+    response semantics still use the game's application acknowledgements. A record with an
+    invalid index, skipped/duplicate sequence, wrong epoch, excessive dependency list,
+    same-stream entry or known impossible reference is `0x11`. Cross-stream bytes can arrive
+    before a referenced record; absence alone is not proof of impossibility. Track unresolved
+    references, detect cycles as edges become known, and enforce the blocked-head deadline.
+    Validate the decoded packet's required fence/route before execution; a header cannot
+    downgrade an unknown id from global. No speculative game execution or blocked-body
+    decompression. Commit watermarks only after actual serial handler application completes.
+11. **13.11 Barrier example.** CONTROL spawn 5 precedes REALTIME move 9, whose explicit
+    CONTROL dependency is 5 (own predecessor 8 implicit). CONTROL remove 6 waits for REALTIME
+    9, not chunks. CHUNK[0] install 7, update 8 and forget 9 run in that order independently
+    of those entities. A later view gate can execute while chunk 7 is missing, but new chunk
+    records wait for that gate. A respawn/global waits for every old chunk, and new-epoch
+    records wait for respawn execution. Independently withhold every predecessor in tests.
+12. **13.12 Memory, reservations and progress.** Give every active stream a non-borrowable
+    receive slot of B = 2 MiB + 128 bytes and 128 record slots. Admit at most one head
+    scheduling unit (one record or one complete bundle) per stream into application buffering;
+    stop reading that stream until its unit commits. A bundle's total wire size, headers
+    included, must fit B. Parser prefixes, partial records, pre-activation bytes and staged
+    bundle bytes all occupy that stream's slot; no stream can consume another's reserve.
+    At N=6 the six chunks need 12 MiB + 768 bytes; CONTROL and REALTIME reserve another
+    4 MiB + 256 bytes. Thus the old 16 MiB wire target needs 1 KiB explicit framing headroom:
+    aggregate wire ceiling `(N+2)*B <= 16 MiB + 1 KiB`, not a misleading exact 16 MiB claim.
+    A seventh chunk would require at least 18 MiB with the same progress reserves: hard cap 6.
+    At most `128*(N+2) <= 1024` records, including delimiters and partials, are retained.
+    Separately reserve one connection-wide 8 MiB execution workspace for decompression and
+    retained decoded packet/bundle data (or stricter game limits). Only one unit decodes/
+    applies at a time; all copies and decoder scratch must fit this workspace or fail closed.
+    Worst application-held data is therefore 24 MiB + 1 KiB, not 16 MiB; allocations are lazy.
+    Do not decompress other heads while the execution workspace is occupied.
+    **Progress argument:** all edges point backward in logical send order. Among pending
+    stream heads there is an earliest unit whose prerequisites are already applied or earlier
+    heads. Every stream has room to finish receiving its head even when every other slot is
+    full, and an eligible head has its reserved execution workspace. Fair receiving/handler
+    scheduling therefore advances the earliest unit; a blocked join cannot steal the missing
+    predecessor's capacity. This assumes transport progress and a completing game handler,
+    not a malicious or stalled peer. The timer is a failure bound, not the deadlock remedy.
+    Initial/native credit and unparsed read chunks are additional exposure (13.13). Each node
+    MUST reserve aggregate capacity for every admitted connection's progress slots, workspace
+    and transport exposure before admitting it; reserve capacity need not allocate buffers.
+    No credit or retained allocation may overcommit the node budget. Refuse new `/3`
+    admissions if the reservation cannot fit; leave TCP untouched. Release reservations only
+    after credit exposure and retained data are gone. Record this cost at the 50,000-player
+    target; profile values remain unmeasured, not claims that this peak fits every node.
+    Unsent application queues are separately capped at 1024 packets or 16 MiB, with node
+    accounting and backpressure; an unpausable producer overflows with `0x11`.
+    Incomplete record/bundle: 10 seconds from first byte. Blocked head: 10 seconds from
+    becoming head. Decode/application: 10 seconds from starting. Other-stream progress
+    restarts none of these clocks. Timeout, cycles, impossible references, malformed packets,
+    wrong shard/epoch/sequence, oversized units and resource violations close the whole
+    connection with `0x11`; never evict, skip, release a barrier or retry mid-play.
 
 ### Flow control, resets, bundles and compression
 
-13. **13.13 Transport limits.** For clientbound traffic `/3` sets `initial_max_data=16 MiB`
-    and both bidi per-stream initial limits to 8 KiB (grow up to 4 MiB only against budgets).
-    For serverbound traffic use small windows: the server advertises
-    `initial_max_data=24 KiB` (three streams times 8 KiB) and both bidi per-stream initial limits of 8 KiB.
-    These windows may grow only against the budgets below, including while
-    receiving a legal record larger than its initial window. Set
-    `initial_max_streams_bidi=2` at the server (client streams 0 and 4),
-    `=1` at the client (server stream 1), and both uni limits to 0. Never increase MAX_STREAMS;
-    grow MAX_DATA/MAX_STREAM_DATA only against uncommitted bounded receive budget, reserving
-    both CONTROL byte capacity and its 64 record slots as in 13.12, and reclaim that budget
-    after delivery. When granting auxiliary credit, account for outstanding credit as
-    well as retained bytes and both reservations; if record count is not yet known, reserve
-    for the maximum number of minimum-size records that credit can carry, or withhold it.
-    Never extend credit for a record exceeding 13.4's cap; no legal record exceeds 4 MiB.
-    Pin quiche's maximum auto-tuned windows. Server: connection window 24 KiB and stream
-    window 8 KiB, equal to the initial serverbound windows, so automatic growth is off and the
-    exposure is exactly the initial credit the node reserved. The server's connection window equals
-    the sum of its three pinned stream windows, the most quiche can hold unread, so each admitted
-    connection reserves 24 KiB against the 13.12 node budget. That reservation covers only unread
-    serverbound stream data; 0-RTT early data and crypto/handshake buffers are not counted in it.
-    Client: stream window 4 MiB and connection window 12 MiB, three streams times the
-    stream maximum, since only three streams can hold quiche-unread data. The client's aggregate exposure is therefore the application-held
-    data (the 17 MiB budget of 13.12) plus quiche-unread data bounded by 12 MiB; the initial
-    clientbound MAX_DATA credit is not debited from the receiver budget. Automatic growth beyond
-    these pins is not allowed. Because the server windows are pinned, a serverbound record
-    streams at about 8 KiB per round trip per stream: a serverbound record larger than roughly
-    8 KiB x (10 s / RTT) hits the 10 second incomplete-record timer (about 800 KB at a 100 ms
-    RTT). Vanilla serverbound packets are far smaller. Smaller initial serverbound windows MUST remain effective;
-    transport auto-tuning may not silently override them. If the pinned Netty exposes no
-    setters for these maximum windows/growth controls, patch it before enabling `/3`;
-    initial limits alone are insufficient. Account for already granted credit when
-    tightening limits; never promise credit that cannot be honored within the budgets.
-    All other §9 values remain unchanged. Prioritize available
-    CONTROL writes, then round-robin REALTIME and WORLD in at most 64 KiB write quanta;
-    priority must not starve a WORLD predecessor needed by CONTROL. Measure memory and
-    throughput before changing these draft limits, including at the 50,000-player target.
+13. **13.13 Transport limits.** Listener parameters are fixed before N is known. The server
+    allows two client-opened bidi streams, the client six server-opened bidi streams; both
+    uni limits are zero. Never increase MAX_STREAMS. Application validation rejects any
+    server stream index >= N even though transport permits six. The client initially
+    advertises 256 KiB per bidi stream and 2 MiB connection credit; the server advertises
+    8 KiB per bidi stream and 64 KiB connection credit. Pin native maximum receive windows
+    to those same respective values: no auto-tuning to larger windows. As the application reads
+    into its reserved slot, rolling flow control can replenish that stream's pinned window;
+    an incomplete head must continue reading, even while it is dependency-blocked, until its
+    complete frame/unit fits the reserved slot. Do not read ahead into the next unit.
+    This bounds quiche-unread stream exposure by 2 MiB at the client and 64 KiB at the server
+    (8 streams times the pinned window), additional to 13.12. Count one at-most-16-KiB
+    unparsed read chunk per stream separately: at most 128 KiB more, including any suffix
+    beyond a unit boundary. Native transport and read chunk charges may overlap conservatively,
+    never be omitted. Crypto/handshake/0-RTT
+    buffers need separate node admission accounting, not a claim they fit stream credit.
+    Receiving and credit replenishment MUST be fair across all streams; never stop all
+    reads because one shard is full. Reserve the native exposure even for unused permitted
+    streams until the connection closes. If Netty cannot enforce window pins and bounded
+    reads, patch/test it before enabling `/3`; initial values alone are insufficient.
+    These windows trade throughput for a provable memory bound. A clientbound 2 MiB record
+    needs roughly eight window turns; a large serverbound record at 8 KiB per RTT can hit
+    the 10-second timer (about 800 KiB at 100 ms RTT). Benchmark the limits before enablement;
+    increasing windows requires an explicit revised reserve, not silent auto-tuning.
+    All other §9 parameters remain unchanged. Sender policy: 13.20.
 14. **13.14 Reset and shutdown.** RESET_STREAM, STOP_SENDING, unexpected FIN on any lane,
     failure to open an allowed stream within 10 seconds of activation, or an extra stream
     terminates the whole connection with `0x11`; a STOP_SENDING must be detected even on a
     lane that never writes; never reopen just one lane or remap lost
     packets to CONTROL. Normal close sends a CONTROL disconnect if applicable, then END
-    as a full fence after all queued game records. On END delivery the peer closes with
+    as a global fence after all queued game records. On END delivery the peer closes with
     `0x0`; sender waits at most 10 seconds before closing. A connection close is always
     terminal. TCP retry is a new player join, never mid-session recovery.
-15. **13.15 Bundles.** Treat a vanilla bundle (opening delimiter, all members, closing
-    delimiter) as one CONTROL-fenced scheduling unit, keeping its actual packets as separate
-    sequential GAME records, all on CONTROL, with no other game record assigned between
-    them. Buffer before assigning routes, at most 4096 members or 8 MiB total uncompressed
-    bytes, further limited by the game's own cap and by 13.12's pending-record cap: the
-    whole bundle, both delimiters included, must fit in 1024 records, so at most 1022
-    members. A sender that would exceed any of these bounds closes with `0x11` instead of
-    emitting the bundle, assigning no sequence numbers for it; missing closing delimiter
-    for 10 seconds or excess bounds at the receiver disconnects. Do not split members
-    onto auxiliary lanes or deliver a partial bundle to game logic. Receiver stages
-    contiguous CONTROL members through the
-    closing delimiter using provisional watermarks for their internal predecessor checks;
-    external dependencies must already satisfy the committed watermarks. It commits those
-    watermarks only after delivering the whole validated bundle atomically to the game's
-    bundle handler. Auxiliary records may reference sequences of staged CONTROL members
-    as required by 13.9, but may not satisfy those dependencies using provisional
-    watermarks; only committed delivery releases them. Reserve/validate
-    the complete bundle against queue bounds before scheduling it; never interleave an
-    activation, compression change or state transition with a bundle. Such a member makes
-    the bundle invalid rather than changing decoder state partway through it.
+15. **13.15 Bundles.** Keep opening delimiter, all members and closing delimiter as one
+    CONTROL scheduling unit, separate consecutive GAME records, with no intervening logical
+    game sends. A spawn/entity-data bundle is a control fence, not a chunk/global fence.
+    Use the strongest member scope (global > view > control > ordinary), with at least
+    control scope for any bundle. If any member requires global scope, is unknown or is a
+    chunk packet, promote the whole bundle to global; bundle context is the only exception
+    to individual chunk routing. It MUST NOT mix state, epoch, activation or compression
+    changes into a bundle.
+    Buffer completely before assigning sequences; validate total encoded size <= B, at most
+    126 members plus delimiters (128 records), and total decoded/scratch storage <= 8 MiB
+    or stricter game limits. These tighter limits replace the old draft's 1022-member bound;
+    exceeding them closes with `0x11`, never splits a bundle. All external prerequisites
+    attach to the opening record; later members have only their implicit CONTROL predecessor.
+    Later external records depend on the closing record as the fence frontier, never a
+    partially staged member. Receiver uses provisional CONTROL watermarks only inside the
+    bundle, validates the strongest member policy before execution, and commits the closing
+    watermark only after applying the complete bundle atomically to the game's bundle handler.
+    A missing close after 10 seconds, nested delimiter or policy violation closes `0x11`.
 16. **13.16 Compression.** Compression remains per Minecraft packet, not a shared compressed
-    stream. Threshold changes are CONTROL fences; encode the change packet using the old
+    stream. Threshold changes are global fences; encode the change packet using the old
     threshold, subsequent packets using the new one. Receiver applies the new threshold
     after delivering that change and before decoding later dependent GAME bodies. Do not
     decompress a blocked packet using the current threshold speculatively. Keep ordinary
@@ -1122,8 +1180,8 @@ This subsection records the user's direction for the next revision of `/3`. None
     against vanilla with `isEncrypted()` still true; encrypted-but-unauthenticated aborts
     before configuration; pre-activation stream-4 rejection; boundary/max-length records;
     advertised digest mismatch before connect and stale-advertisement OFFER rejection;
-    staged-bundle auxiliary dependencies released only on commit; and CONTROL byte/slot
-    reservations under auxiliary floods, including quiche auto-tuning and node-budget
+    staged-bundle auxiliary dependencies released only on commit; and per-stream byte/slot
+    reservations under chunk floods, including quiche auto-tuning and node-budget
     exhaustion. Verify out-of-u32 protocol rejection, exporter exceptions/wrong lengths,
     PSK-only resumption rejection, ticket-key/certificate rotation, inert binding payloads
     outside `/3` and Velocity's bidirectional stripping. Test failed re-bind close-before-
@@ -1144,14 +1202,119 @@ This subsection records the user's direction for the next revision of `/3`. None
     requires measured loss improvement over TCP AND single-stream and security review;
     this draft makes no performance or completed-review claim.
 
-### DECIDED QUESTIONS (user, 2026-10-15: all four approved as written)
+### Chunk scope, joins and sender policy
+
+18. **13.18 Epoch and position sharding.** Epoch starts at 0 independently per sending
+    direction after activation. A reviewed level-creating/replacing global packet (play login,
+    respawn, including same-dimension level replacement) carries the old epoch; only its
+    serial-handler completion advances that direction's receive epoch by exactly one.
+    Sender advances its assignment epoch immediately after assigning that fence; subsequent
+    records carry the new epoch and depend on it. Start-configuration alone does not create
+    a level or increment epoch. Sequences remain connection-scoped, never restart at epoch
+    boundaries; positions, installed-chunk tracking and batch/update frontiers are keyed by
+    epoch and cleared at level replacement. No old-epoch record can execute after that fence.
+    New-epoch envelopes may arrive early, but remain opaque until their transition dependency
+    executes; reject stale epochs or a future epoch without the corresponding transition
+    once prerequisites are available. Epoch exhaustion closes with `0x11`, never wraps.
+    Serverbound epochs advance only on that direction's reviewed level-change packets;
+    ordinary serverbound acknowledgements do not mirror the clientbound epoch implicitly.
+    Chunk routes in this draft are clientbound, so there is no ambiguous reverse position scope.
+
+    For signed-32-bit chunk coordinates x,z and epoch e, compute using unsigned 32-bit
+    arithmetic (multiplication wraps modulo 2^32):
+    `h = (uint32(x) * 0x9e3779b1) XOR rotl32(uint32(z) * 0x85ebca77, 16) XOR
+    (e * 0xc2b2ae3d)`; then `h = h XOR (h >>> 16)`;
+    `h = h * 0x7feb352d`; `h = h XOR (h >>> 15)`;
+    `h = h * 0x846ca68b`; `h = h XOR (h >>> 16)`.
+    Shard is unsigned `h mod N`. This is a fixed wire rule, not Java's remainder on a signed
+    int or a runtime-selected hash. It need not be cryptographic. No coordinate bytes are
+    duplicated in the header: extract them from the eligible packet and validate its stream
+    before executing it. Invalid coordinates/extraction, wrong shard and invalid epoch are
+    `0x11`. Supply cross-language golden vectors for all N=1..6, negative/extreme coordinates
+    and successive epochs before implementation is accepted. The proposed hash is subject
+    to the explicit user confirmation below, not an implementation choice left unspecified.
+
+19. **13.19 Join records.** Joins live on CHUNK[0], even when their semantic positions hash
+    elsewhere. They have explicit dependencies on the actual covered frontiers, not an
+    estimate based on packet size, most recently installed chunk, or packet sequence field.
+    Their own-stream predecessor is implicit. They never become CONTROL/view/global
+    frontiers merely because they are joins; unrelated CONTROL and REALTIME continue.
+    - **ACK_JOIN (block_changed_ack):** the adapter tracks the causal set of authoritative
+      block/section/block-entity updates covered by the game prediction sequence. At the ack's
+      logical send point, take the maximum sequence of every covered update on each chunk
+      stream, plus the CONTROL frontier covering the relevant action processing. Include
+      the current CONTROL A[0] conservatively, and any globally routed covered updates.
+      Do not emit an ack until every covered update has been assigned. If exact causal
+      coverage cannot be established, use all prior chunk frontiers plus CONTROL as a safe
+      superset; if covered updates could still be unassigned, fail closed rather than guess.
+      The ack's game sequence is not a transport sequence and does not identify one chunk.
+    - **BATCH_JOIN (chunk_batch_finished):** chunk_batch_start is a CONTROL/view gate,
+      so every following chunk install waits for its execution through the latest V,
+      without adding another dependency class. Finished depends on the start and the
+      per-stream maximum of every chunk install in that batch, not just its final stream.
+      Batch completion/rate feedback occurs only after every install's handler completes.
+      Reject nested/unmatched batch markers; an empty batch still depends on its start.
+    Ordinary chunks still depend only on own predecessor, global and view. Later chunks
+    need not wait for a finished join on another shard. A global fence still drains joins,
+    and epochs cannot share a batch.
+    A multi-chunk update remains the global packet in 13.8, not an invented join that later
+    single-chunk updates could overtake. Receiver checks join packet id/kind/CHUNK[0], known
+    coverage and required frontiers before execution. Causal facts unavailable from wire
+    alone remain sender obligations, verified by adapter ordering tests, not claimed as
+    independently provable receiver knowledge. Malformed or known impossible joins close
+    `0x11`; missing prerequisites wait under 13.12, never block CONTROL by moving there.
+
+20. **13.20 Sender scheduling (local policy, not wire format).** The sender SHOULD implement
+    dependency-aware weighted scheduling before bytes enter QUIC: ready latency-sensitive
+    entity movement/updates first, chunk records second, other small packets third. Bound
+    REALTIME bursts, guarantee chunk streams a positive minimum byte share whenever runnable,
+    round-robin among chunk shards, and age other traffic so it also progresses. Promote
+    unsent prerequisites of urgent records, including view/global fences and chunk heads
+    needed by a join, instead of filling QUIC with dependents whose prerequisite is unsent.
+    This policy MUST NOT alter stream order, dependency construction, bundle atomicity or
+    the progress reservations. Backpressure at stream/connection writability must stop
+    unbounded enqueueing into QUIC; cap write quanta at 64 KiB and account for queued bytes.
+    Once bytes enter a stream they cannot be reordered; a partially queued record on one
+    stream cannot be preempted by a later record on that stream. Small CONTROL packets can
+    still wait behind earlier CONTROL; this design does not claim otherwise.
+    Netty 4.2.19's `QuicStreamPriority`/`updatePriority` MAY supplement this policy as hints.
+    Test urgency direction (quiche is expected to send lower values first), incremental
+    behavior and loss/flow-control interactions before relying on hints. No correctness or
+    starvation guarantee may rely on QUIC priority, and it cannot undo already queued bytes.
+    Weight/burst/default tuning is benchmark policy, not negotiated wire data.
+
+    Extend 13.17's acceptance gate with all N=1..6 and offer/range/selected-N transcript
+    tampering; compact-header boundaries/duplicates/excess deps/sequence exhaustion;
+    hash/epoch vectors and late old-dimension data; withheld view gates and chunk installs;
+    missing block/light/forget ordering; chunk-independent spawn/remove; unknown ids promoted
+    to global at both ends; multi-chunk biomes; covered updates across all shards before ack;
+    batch installs before finished/rate feedback; join-cycle rejection; bundle promotion;
+    all slots simultaneously full with each missing prerequisite withheld independently;
+    serial handler delayed after receipt; native-window pins and node admission pressure;
+    and sustained REALTIME load with guaranteed chunk progress and aged CONTROL progress.
+    Measure actual header bytes, per-stream peak buffers, execution workspace, native/unparsed
+    exposure, CPU per player, priority fairness, join latency and chunk-load throughput,
+    comparing TCP and single-stream under every netem profile. No measurements are claimed.
+
+### DECIDED QUESTIONS (historical user approval, 2026-10-15; revisions noted)
 
 1. Approve `/3`, the configuration-stage four-proof/switch exchange after OFFER, and the
    conservative exporter gate even for offline multi-stream tests?
 2. Approve changed-pin handling as: online mode re-binds automatically through channel
    binding (pin replaced only after a passing check, player notified), failure falls back to
    TCP with the pin unchanged?
-3. Approve the three fixed lanes, conservative full CONTROL fences, and exact-byte JSON
-   routing digests as the first reviewable design?
-4. Approve the proposed memory/packet limits and 10-second fail-closed deadlines for
-   benchmarking, particularly their per-node cost at 50,000 concurrent players?
+3. The original three lanes/full CONTROL fences are superseded by the 2026-10-16 direction
+   above. Exact-byte JSON routing digests remain; schema 2 includes extractor definitions.
+4. The original memory/packet limits are superseded by 13.12/13.13's progress reservations.
+   The 10-second fail-closed deadlines remain for benchmarking, including per-node cost.
+
+### Open questions for the user
+
+1. Confirm the proposed hard cap of 6, draft server preference of 3 (client offers 1..6),
+   and immutable per-connection selection in 13.2? Benchmark 1..6 before choosing defaults.
+2. Confirm the fixed epoch-mixed 32-bit position hash in 13.18, or choose another before
+   implementing golden vectors? This is a wire decision, not administrator configuration.
+3. Confirm the explicit worst-case receive reservation: 16 MiB + 1 KiB wire, 8 MiB execution,
+   plus 2 MiB client/64 KiB server native stream exposure and at most 128 KiB unparsed reads?
+   The tighter one-unit-per-stream/bundle limits buy deadlock-free progress but must be
+   benchmarked, particularly at 50,000 connections. Hardware profile values stay planned.
