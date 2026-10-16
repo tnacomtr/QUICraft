@@ -807,7 +807,8 @@ waits. Freed bytes (a release, a promotion, a close or a shed) go first to the w
 address group holds the least pre-login bytes, using the same hierarchical prefixes as shedding
 (IPv6 /48, then /64 within it; IPv4 /24), then to the earlier arrival, then to the lower connection
 id. Each waiting charge that fits is granted in that order, and a larger one that does not fit is
-skipped rather than blocking a smaller one behind it. A waiting charge never sheds, and it keeps the
+skipped rather than blocking a smaller one behind it. Bytes freed by shedding for a newcomer go to
+that newcomer first; the wait set is served once its admission is settled. A waiting charge never sheds, and it keeps the
 client-wait and 30 s hard-cap deadlines; an expired or closed waiter leaves the wait set and its bytes
 are never granted. A refusal stays a local `0x12` close at the deadline, never `0x11`. Choose a victim by hierarchical
 source-prefix fair share first (IPv6 /48 then /64, IPv4 /24; used

@@ -92,22 +92,32 @@ final class PreLoginRegistry {
             Runnable closeConnection) {
         InetAddress coarse = coarsePrefix(source);
         long share = PreLoginTracker.stagedShare(shards);
-        while (true) {
-            PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, owner, shards, online, clock);
-            if (tracker != null) {
-                Entry entry = new Entry(tracker, source, coarse, closeConnection);
-                staged.add(entry);
-                return entry;
+        boolean shedAny = false;
+        try {
+            while (true) {
+                PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, owner, shards, online, clock);
+                if (tracker != null) {
+                    Entry entry = new Entry(tracker, source, coarse, closeConnection);
+                    staged.add(entry);
+                    return entry;
+                }
+                if (overFairShare(coarse, share)) {
+                    return null;
+                }
+                Entry victim = pickVictim();
+                if (victim == null) {
+                    return null;
+                }
+                LOG.log(Level.FINE, "shedding a staged /3 connection under pre-login pool pressure");
+                // Room freed for this newcomer is not offered to waiting declared charges until it is admitted
+                // or refused, so a waiter cannot take it and force a further shed.
+                shed(victim, false);
+                shedAny = true;
             }
-            if (overFairShare(coarse, share)) {
-                return null;
+        } finally {
+            if (shedAny) {
+                drainDeclaredWaiters();
             }
-            Entry victim = pickVictim();
-            if (victim == null) {
-                return null;
-            }
-            LOG.log(Level.FINE, "shedding a staged /3 connection under pre-login pool pressure");
-            shed(victim);
         }
     }
 
@@ -126,7 +136,7 @@ final class PreLoginRegistry {
             return false;
         }
         LOG.log(Level.FINE, "shedding a staged /3 connection to free an open-connection slot");
-        shed(victim);
+        shed(victim, true);
         return true;
     }
 
@@ -169,12 +179,17 @@ final class PreLoginRegistry {
         dropDeclared(entry);
     }
 
-    /** Sheds one victim. Only staged connections are shed; the tracker's state guards that. */
-    private void shed(Entry victim) {
+    /**
+     * Sheds one victim. Only staged connections are shed; the tracker's state guards that. With {@code drain}
+     * false the caller drains the wait set itself once its own admission is settled.
+     */
+    private void shed(Entry victim, boolean drain) {
         staged.remove(victim);
         dropDeclared(victim);
         victim.tracker.onShed();
-        drainDeclaredWaiters();
+        if (drain) {
+            drainDeclaredWaiters();
+        }
         try {
             victim.closeConnection.run();
         } catch (RuntimeException e) {
@@ -605,7 +620,7 @@ final class PreLoginRegistry {
         @Override
         public void onShed() {
             synchronized (PreLoginRegistry.this) {
-                shed(this);
+                shed(this, true);
             }
         }
 

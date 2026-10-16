@@ -410,6 +410,27 @@ class PreLoginRegistryTest {
     }
 
     @Test
+    void roomShedForANewcomerIsNotTakenByAWaiterFirst() throws Exception {
+        // 12.13: bytes freed by shedding for a newcomer serve that newcomer; a waiting declared charge that fits
+        // in them must not take them first and force a second shed.
+        PreLoginTrackerTest.FakePools pools = new PreLoginTrackerTest.FakePools()
+                .capacity(ResourcePools.Pool.PRE_LOGIN, 3 * STAGED + 100);
+        PreLoginRegistry registry = new PreLoginRegistry(pools, 4, new Random(1));
+        List<Conn> shed = new ArrayList<>();
+        // The waiter's charge (STAGED + 100) fits in one shed victim plus the 100-byte slack, but not in the slack.
+        Conn quiet = admit(registry, "quiet", "203.0.113.1", true, shed);
+        admit(registry, "busy1", "198.51.100.1", true, shed);
+        admit(registry, "busy2", "198.51.100.2", true, shed);
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, quiet.entry.chargeDeclaredFrame(STAGED, 100));
+
+        Conn newcomer = admit(registry, "newcomer", "192.0.2.1", true, shed);
+        assertNotNull(newcomer.entry, "the newcomer is admitted");
+        assertEquals(1, shed.size(), "one shed frees exactly the newcomer's room");
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, quiet.entry.chargeDeclaredFrame(STAGED, 100),
+                "the pool is full again, so the waiter keeps waiting");
+    }
+
+    @Test
     void aWaiterThatDoesNotFitDoesNotBlockASmallerLowerPriorityOne() throws Exception {
         // 12.13 wait set: the quiet prefix (higher priority) needs more than the freed room, so it is skipped
         // and the busy prefix's smaller charge, which fits, is granted in the same pass.
