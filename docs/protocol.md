@@ -1000,28 +1000,31 @@ position extraction. Those implementations must change together before this revi
 3. **13.3 Stream identities.** There are exactly N+2 bidirectional streams: CONTROL on QUIC
    id 0 and REALTIME on id 4, both client-opened; CHUNK[i] on id `1+4*i`, server-opened,
    for `0 <= i < N`. Logical stream indices used in dependencies are CONTROL=0, REALTIME=1,
-   CHUNK[i]=2+i (not QUIC ids). All serverbound packets use CONTROL. The reverse auxiliary
-   REALTIME direction sends its preamble but no records. Reverse CHUNK[i] directions send
+   CHUNK[i]=2+i (not QUIC ids). Serverbound REALTIME (client-to-server on client-opened QUIC id 4) carries reviewed, latency-sensitive, order-tolerant input after its preamble and activation; all other serverbound packets use CONTROL. Reverse CHUNK[i] directions send
    no preamble and no records: their one byte of guard credit exists only to detect a
-   violation. Neither auxiliary direction needs an application receive slot at the server.
+   violation. The server has a protected application receive slot for serverbound REALTIME (13.12); reverse CHUNK directions need none.
    Auxiliary streams open only after the opener activates under §12; each used direction starts
    `u8(version=2) || u8(logical_stream_index)`. CONTROL has no second preamble. No other
    stream ids, replacements, unidirectional streams or datagrams are allowed.
 
-   **To investigate (not yet normative): serverbound multiplexing.** This revision sends
-   every serverbound packet on CONTROL, because player input is small and its order is
-   part of game logic: movement before the dig, use-item or attack that depends on that
-   position, container clicks in sequence, and the signed-chat message chain. A single
-   lane still means one lost serverbound packet delays all later input. Investigate
-   carrying latency-sensitive serverbound packets (movement and rotation, keepalive and
-   pong replies, possibly swing/animation) on the REALTIME client-to-server direction,
-   with the same dependency records as clientbound traffic: an interaction, dig, use or
-   container packet names the latest REALTIME movement it depends on, so the server
-   never applies it before that position. Measure first: serverbound HOL delay under
-   each netem profile with the current single lane, then the gain, the server-side
-   cost and any anti-cheat effect of the split (movement validation sees the same
-   order). Adopting it changes the wire format (13.3 and 13.8) and needs the owner's
-   sign-off; until then the reverse REALTIME direction stays preamble-only.
+   **Serverbound lane policy (owner decision, 2026-10-16).** REALTIME is limited to
+   player movement/rotation/on-ground state, vehicle movement, player input state,
+   swing/animation, keepalive and pong replies. Keepalive belongs on REALTIME because
+   latency measurement and liveness benefit from avoiding unrelated CONTROL loss; its
+   own-stream order remains intact. Everything else is CONTROL: chat and signed-chat
+   chain, commands, interactions (use item, use item on, interact/attack entity, dig/player
+   action), container clicks/close, teleport confirm, client commands including respawn,
+   settings/configuration/state changes, plugin messages, resource-pack status, and every
+   unproven type. Exact packet ids exist only in reviewed routing data; default is CONTROL.
+   A serverbound CONTROL interaction-type record depends on the latest preceding
+   serverbound REALTIME sequence. Serverbound REALTIME depends on the latest serverbound
+   CONTROL fence only, never each ordinary CONTROL record. This keeps interaction ordering
+   while ordinary CONTROL loss cannot stall movement. Own-stream predecessor is implicit.
+   If CONTROL interaction is lost, a later movement may be applied before that earlier
+   interaction: reach/validity checks then run at a position at most one loss-recovery later
+   than vanilla ordering. Adapters MUST leave vanilla anti-cheat validation unchanged.
+   Measure movement-validation false positives and serverbound HOL delay before/after for
+   each netem profile. This is the normative /3 policy, not an investigation item.
    The client may buffer early server chunk-stream bytes before validating SERVER_SWITCH,
    within each stream's reservation (13.12), without parsing game bodies or delivering them.
    The server rejects pre-activation stream-4 bytes with `0x11`. Server activation must run
@@ -1122,7 +1125,7 @@ position extraction. Those implementations must change together before this revi
     maximum bounded-prefix staging needed before classification. Check all limits and
     accounting identifiers into R with boundary vectors, as for position extractors.
    Require `maxServerboundRecord <= 2097208`, decoded footprint <= 8 MiB, and
-   `P + 16 KiB + 2*6 + 1 <= 24 KiB` (13.12/13.13). Missing/unreviewed limits or an ordinary
+   `P + 16 KiB + 2*6 + 1 + 512 <= 24 KiB` (13.12/13.13). Missing/unreviewed limits or an ordinary
    packet footprint that cannot fit P disable `/3`; never relabel keepalive as large to pass.
    Reject a play record exceeding its state's maxServerboundRecord immediately after its
    length prefix, before allocating/buffering its body; enforce the state limit elsewhere too.
@@ -1133,10 +1136,7 @@ position extraction. Those implementations must change together before this revi
     its decoded id is not marked ordinarySmall. An ordinarySmall guarantee that cannot
     be met is a local resource-review error disabling `/3`, not honest-peer misconduct.
    `epoch_change:true` is clientbound CONTROL/global only and matches reviewed level replacement packets.
-   Non-play routes are CONTROL/global. Every serverbound route MUST be CONTROL; reject a
-   serverbound REALTIME or chunk route before offering `/3`. Serverbound records have no
-   explicit cross-stream dependencies, since that direction uses only CONTROL; a nonzero
-   serverbound dependency_count or a serverbound auxiliary record closes with `0x11`.
+   Non-play routes are CONTROL/global. Serverbound REALTIME routes are play-only and restricted to the reviewed latency-sensitive allowlist. Interaction-type CONTROL routes carry the latest REALTIME dependency; ordinary CONTROL routes do not. REALTIME records may depend only on the latest CONTROL fence, plus their implicit own-stream predecessor. Reject other lane/dependency combinations with `0x11`; serverbound chunk routes remain forbidden.
    Reject missing/unknown fields, duplicate keys/routes,
    unsupported schema/identifiers and invalid combinations before offering `/3`.
    R is SHA-256 of the exact resource bytes, whitespace included, identical at both peers.
@@ -1154,7 +1154,7 @@ position extraction. Those implementations must change together before this revi
 
    The currently shipped 26.1.2 table (the 3-lane baseline, before chunk shards are implemented) (`protocol-775.json`, protocol 775) routes clientbound play packets only:
    entity movement, metadata, animation and motion, plus level particles, to REALTIME, and block, light, block-entity and
-   biome updates to WORLD. Everything else, including every serverbound packet, stays CONTROL. Its
+   biome updates to WORLD. Serverbound play routing follows the REALTIME allowlist and dependency rules above; all other serverbound packets stay CONTROL. Its
    packet ids are pinned to the live game by `RoutingTableGameTest`, and each route's ordering by
    `ShippedRoutingOrderingTest`.
 
@@ -1171,7 +1171,14 @@ position extraction. Those implementations must change together before this revi
    earlier REALTIME, not chunk traffic. block_event, level_event, explode and
    block_destruction need no chunk ordering; reviewed routes may use REALTIME/lane without
    a chunk dependency. View changes and joins obey 13.5/13.19. Any unproven type remains
-   CONTROL/global, including unknown ids at both sender and receiver.
+    CONTROL/global, including unknown ids at both sender and receiver. Serverbound
+    movement/vehicle/input/animation/keepalive/pong use REALTIME only when explicitly
+    reviewed. Interaction-type CONTROL records depend on the latest preceding REALTIME
+    record; ordinary CONTROL does not. REALTIME waits for CONTROL fences (including
+    applicable teleport, respawn/client-command, state/configuration and vehicle
+    mount/dismount transitions), never ordinary CONTROL. This permits loss recovery on
+    independent lanes without relaxing vanilla anti-cheat validation; all unproven packet
+    types remain CONTROL/global.
 
 ### Sequence barriers, bounds and delivery
 
@@ -1184,7 +1191,8 @@ position extraction. Those implementations must change together before this revi
      include the previous BATCH_JOIN frontier as an explicit semantic dependency (13.19).
    - Control fence: previous A[CONTROL,REALTIME]; then set C to this record.
    - Ordinary CONTROL: nothing further.
-   - REALTIME: latest C.
+   - Serverbound interaction-type CONTROL: latest serverbound REALTIME A[1]; ordinary serverbound CONTROL omits this edge.
+   - REALTIME: latest C. In serverbound direction this is the latest CONTROL fence, not ordinary CONTROL.
    - Ordinary chunk: latest V only. It never waits for unrelated CONTROL or REALTIME.
    - Chunk join: latest V and the semantic frontier in 13.19.
    Encode only nonzero cross-stream maxima; own predecessor remains implicit. All edges
@@ -1262,23 +1270,24 @@ position extraction. Those implementations must change together before this revi
     reserve capacity need not allocate buffers. These are client receive reservations,
     NOT reservations imposed on the server for every connected player.
 
-    **Serverbound (server receives):** all packets use one ordered CONTROL direction, so
-    there is no cross-stream prerequisite and no need for per-stream progress slots or a
-    pre-reserved large execution workspace. Reserve only 24 KiB per admitted connection for
-    native exposure plus protected small reads (13.13). Idle connections retain no
+    **Serverbound (server receives):** CONTROL and REALTIME are separately ordered. Reserve 24 KiB per admitted connection for native exposure, protected CONTROL small reads, a non-borrowable 512-byte REALTIME record slot, and guard-read copies (13.13). Idle connections retain no
     partial/read/decode buffers
     and hold no more than this admission share against the receive budget. This figure is
     not total connection memory: QUIC metadata, crypto/handshake and other subsystems remain
     separately accounted. At 50,000 idle connections the receive admission shares total
     1,228,800,000 bytes (about 1.14 GiB), not a multi-MiB workspace per player.
-    Admit at most one serverbound record, bounded by the state's reviewed serverboundLimits,
-    the game's serverbound packet limits and 13.4. Let L be that state's maximum wire record
+    Admit at most one serverbound record per lane, bounded by the state's reviewed serverboundLimits, the game's packet limits and 13.4; execute at most one record at a time. Let L be that state's maximum wire record
     including its outer prefix, F its maxDecodedFootprint and P its ordinaryReadAllowance.
-    Reserve P non-refusable bytes inside the 24 KiB share for one entire ordinary small
-    record's read/parser/decode footprint. Neither another connection nor this connection's
+     Reserve P non-refusable bytes inside the 24 KiB share for one entire ordinary small
+     CONTROL record's read/parser/decode footprint. Reserve a separate, non-borrowable
+     512-byte complete-record slot for serverbound REALTIME. This hard per-record cap
+     accommodates movement, rotation, vehicle/input state, animation and keepalive records;
+     exact maximum encodings must be checked against every selected routing table before
+     `/3` is offered. A REALTIME record whose complete wire size (including the outer prefix) exceeds 512 bytes is peer
+     misconduct and closes `0x11`, like other inbound self-cap violations. Neither another connection nor this connection's
     outbound queue may borrow it. Native exposure is bounded by 16 KiB + N guard bytes,
-    plus at most N+1 one-byte guard-read copies: hence `16 KiB + 2*N + 1 + P <= 24 KiB`.
-    This partition requires the asymmetric auxiliary credit in 13.13; simply reserving
+    plus at most N+1 one-byte guard-read copies: hence `16 KiB + 2*N + 1 + P + 512 <= 24 KiB`.
+     This partition requires the asymmetric auxiliary credit in 13.13; simply reserving
     24 KiB of native credit AND calling that same memory a protected read allowance is invalid.
     Read calls grant at most `min(16 KiB, remaining charged capacity, remaining unit bytes)`;
     reserve the entire grant BEFORE invoking read, and return unused grant afterwards.
@@ -1542,10 +1551,10 @@ position extraction. Those implementations must change together before this revi
     (CONTROL and REALTIME), but only one byte on server-opened bidi directions (reverse
     CHUNK streams, which carry no valid bytes). Pin server stream maximum windows at
     8 KiB and its connection maximum at 24 KiB; client maxima equal its initial windows.
-    No auxiliary guard read may replenish credit: its first byte closes the connection
+    No reverse-CHUNK guard read may replenish credit: its first byte closes the connection
     on the event loop before any further credit/send work. Thus the reverse chunk windows
     never grow beyond one byte on a live connection; the valid serverbound native exposure
-    is at most `2*8 KiB + N`, leaving P and guard-read capacity inside the 24 KiB share.
+    is at most `2*8 KiB + N`, leaving P, the 512-byte REALTIME record slot and guard-read capacity inside the 24 KiB share.
     This is a least-privilege change to UNUSED chunk directions, not a reduction of CONTROL's
     8 KiB or the server's 24 KiB connection credit. Test initial and rolling exposure,
     including invalid bytes coalesced on all guards, before enablement. As the application
@@ -1556,8 +1565,8 @@ position extraction. Those implementations must change together before this revi
     Client native exposure is 2 MiB. Server native plus protected-read capacity fits the
     24 KiB share as derived above; neither is an additional admission charge.
     Client: count one at-most-16-KiB unparsed read chunk per stream separately, at most
-    128 KiB more. Server: at most one 16 KiB CONTROL read suffix charged under E and N+1
-     one-byte auxiliary guard reads inside the protected share; in-share CONTROL grants
+    128 KiB more. Server: at most one 16 KiB CONTROL read suffix charged under E, one 512-byte
+     REALTIME slot, and N+1 one-byte CHUNK guard reads inside the protected share; in-share CONTROL grants
      shrink to the pre-reserved footprint within remaining P rather than requiring an
      excess-pool allocation. Before classification, read only bounded prefixes as in 13.12. Include
     suffixes beyond a unit boundary. Native transport and read charges may overlap conservatively,
@@ -1565,19 +1574,19 @@ position extraction. Those implementations must change together before this revi
     buffers need separate node admission accounting, not a claim they fit stream credit.
     Client receiving and credit replenishment MUST be fair across all streams; never stop
     all reads because one shard is full. The server may stop CONTROL reads on a node-budget
-    excess refusal as in 13.12, but not for protected reads. After the REALTIME preamble,
-    keep a one-byte pending guard read there and on every reverse CHUNK direction (no
-    CHUNK preamble); charge each guard BEFORE its read call within the share. Parse the
-    REALTIME preamble one byte at a time, validating and releasing each byte before the
-    next read, using that same one-byte guard charge. Any byte after it (or any CHUNK byte) is
-    immediately `0x11`, not left unread in the native window. Keep the respective exposure reserved
+    excess refusal as in 13.12, but not for protected reads. Parse the REALTIME preamble
+    one byte at a time from reserved capacity, validating and releasing each byte before
+    the next read. After activation, receive serverbound REALTIME records within its
+    512-byte protected slot (including framing); oversized records close `0x11` before
+    body allocation. Keep a one-byte pending guard read on every reverse CHUNK direction
+    (no CHUNK preamble), charge before read, and close `0x11` on any CHUNK byte. Keep the respective exposure reserved
     until connection close; unused streams do not multiply the server's 24 KiB aggregate.
     Maximum-window pins are provided by the project's existing, tested Netty patch
     `natives/patches/netty/0005-max-flow-control-windows.patch` (netty/0005); no further native
     patch is planned. Retest pins and bounded reads for these revised limits before enabling
     `/3`; initial values alone are insufficient.
     These windows trade throughput for a provable memory bound. A clientbound 2 MiB record
-    needs roughly eight window turns; a large serverbound record at 8 KiB per RTT can hit
+     needs roughly eight window turns; a large serverbound CONTROL record at 8 KiB per RTT can hit
     the 10-second timer (about 800 KiB at 100 ms RTT). Benchmark the limits before enablement;
     increasing windows requires an explicit revised reserve, not silent auto-tuning.
     All other §9 parameters remain unchanged. Sender policy: 13.20.
@@ -1586,8 +1595,9 @@ position extraction. Those implementations must change together before this revi
     terminates the whole connection with `0x11`, subject to 13.12's local-resource deadline
     precedence. Reads of the preamble/first bytes needed to identify EVERY allowed stream
     MUST use reserved connection capacity, never a refusable pool grant: the server's
-    one-byte REALTIME preamble/guard charge and CONTROL prefix slice inside its existing
-    24 KiB share, and the client's reserved per-stream slots. No extra idle bytes are needed.
+    REALTIME preamble capacity and CONTROL prefix slice inside its existing 24 KiB share,
+    followed by its protected 512-byte record slot after activation, and the client's reserved
+    per-stream slots. No extra idle bytes are needed.
     If a local grant is nevertheless withheld and this deadline expires, close `0x12`,
     not `0x11`, and log a reserve-accounting defect. A STOP_SENDING must be detected even on a
     lane that never writes; never reopen just one lane or remap lost
@@ -1657,7 +1667,13 @@ position extraction. Those implementations must change together before this revi
     configured node budget, admission reservations/refusals, retained and native memory,
     peak pending bytes/records, CONTROL progress, latency and throughput under auxiliary
     pressure; show the budgets hold without relying on TCP for the target QUIC population.
-    Run full-play desync assertions under every testkit netem profile. Phase 5
+     Run full-play desync assertions under every testkit netem profile. Exercise serverbound
+     REALTIME activation/records, 512-byte wire-cap boundary and oversize rejection, CONTROL
+     interaction dependency on preceding REALTIME, REALTIME's fence-only CONTROL dependency,
+     ordinary CONTROL loss not stalling movement, and lost-interaction movement-before-action
+     behavior. Measure serverbound HOL delay before/after and movement-validation false positives
+     under each netem profile; verify adapters preserve vanilla anti-cheat validation unchanged.
+     Phase 5
     requires measured loss improvement over TCP AND single-stream and security review;
     this draft makes no performance or completed-review claim.
 
@@ -1799,7 +1815,7 @@ position extraction. Those implementations must change together before this revi
     batch installs before finished/rate feedback; join-cycle rejection; bundle promotion;
     all slots simultaneously full with each missing prerequisite withheld independently;
     serial handler delayed after receipt; native-window pins and node admission pressure;
-    all-serverbound-CONTROL routing, 24 KiB idle server receive shares, non-fatal node-budget
+    serverbound dual-lane routing/dependencies and 512-byte REALTIME caps, 24 KiB idle server receive shares, non-fatal node-budget
     read/allocation refusals followed by recovery or timeout, release of active buffers back
     to the idle share, and sustained REALTIME load with guaranteed chunk progress and aged
     CONTROL progress.
@@ -1930,7 +1946,7 @@ position extraction. Those implementations must change together before this revi
    binding (pin replaced only after a passing check, player notified), failure falls back to
    TCP with the pin unchanged?
 3. The original three lanes/full CONTROL fences are superseded by the 2026-10-16 direction
-   above. Exact-byte JSON routing digests remain; schema 2 includes extractor definitions.
+   above. The owner decided serverbound dual-lane routing on 2026-10-16 (13.3). Exact-byte JSON routing digests remain; schema 2 includes extractor definitions.
 4. The original memory/packet limits are superseded by 13.12/13.13's progress reservations.
    The 10-second fail-closed deadlines remain for benchmarking, including per-node cost.
 
@@ -1943,10 +1959,7 @@ position extraction. Those implementations must change together before this revi
 3. Confirm the direction-specific receive policy: the client reserves up to 16 MiB + 1 KiB
    wire and 8 MiB execution, plus 2 MiB native exposure and at most 128 KiB unparsed reads;
    the server reserves only 24 KiB per idle connection, including a reviewed protected small
-   read allowance and one-byte unused chunk-direction guards, charging larger active CONTROL
-   buffering to a capped inbound excess pool separate from outbound queues (13.12/13.13)?
-   Client progress and server capacity must be
-   benchmarked separately, including 50,000 server connections. Hardware profiles stay planned.
+    read allowance, 512-byte protected serverbound REALTIME slot and one-byte unused chunk-direction guards, charging larger active CONTROL buffering to a capped inbound excess pool separate from outbound queues (13.12/13.13)? The server remains 24 KiB per idle connection. Confirm the 512-byte cap against packet encodings and benchmark admission at 50,000 connections. Hardware profiles stay planned.
 4. Should the pre-enqueue decode/dispatch executor-active work budget be raised above the
    approved 10 seconds? Executor waits and tick stalls are excluded; after FIFO enqueue
    there is no transport application timeout. This is not a comparison with the keepalive's
