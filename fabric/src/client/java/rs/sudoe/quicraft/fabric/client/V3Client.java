@@ -384,7 +384,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         if (current == null || state != State.ACTIVE) {
             return;
         }
-        while (current.isWritable() && !backlog.isEmpty()) {
+        // Re-checked per frame: a send can fail the client, and nothing may go out after that.
+        while (state == State.ACTIVE && current.isWritable() && !backlog.isEmpty()) {
             QueuedFrame next = backlog.poll();
             backlogBytes -= next.frame.length;
             sendFrame(next);
