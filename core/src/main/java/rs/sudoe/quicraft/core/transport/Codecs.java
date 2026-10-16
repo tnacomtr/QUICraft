@@ -26,7 +26,8 @@ final class Codecs {
             builder.relaxedLossThreshold(config.relaxedLossThreshold);
         }
         long maxData = config.initialMaxData;
-        long maxStreamData = config.initialMaxStreamData;
+        long localStreamData = config.initialMaxStreamData;
+        long remoteStreamData = config.initialMaxStreamData;
         // v1: exactly one client-opened bidirectional stream; the server opens none.
         int maxStreams = server ? 1 : 0;
         if (config.multistream) {
@@ -34,7 +35,14 @@ final class Codecs {
             // the client and stream 1 from the server.
             maxData = server ? TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA
                     : TransportConfig.MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA;
-            maxStreamData = TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA;
+            // "local" and "remote" are relative to this endpoint (RFC 9000 18.2): "local" streams are
+            // the ones this endpoint opened. A server grants only the one-byte reverse-CHUNK guard on
+            // its own streams, and 8 KiB on the CONTROL and REALTIME streams the client opened (13.13).
+            // The client grants 256 KiB on both kinds of stream.
+            localStreamData = server ? TransportConfig.MULTISTREAM_REVERSE_CHUNK_STREAM_DATA
+                    : TransportConfig.MULTISTREAM_MAX_STREAM_WINDOW;
+            remoteStreamData = server ? TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA
+                    : TransportConfig.MULTISTREAM_MAX_STREAM_WINDOW;
             maxStreams = server ? TransportConfig.MULTISTREAM_SERVER_MAX_STREAMS_BIDI
                     : TransportConfig.MULTISTREAM_CLIENT_MAX_STREAMS_BIDI;
         }
@@ -55,8 +63,8 @@ final class Codecs {
         B configured = builder
                 .maxIdleTimeout(config.maxIdleTimeoutMillis, TimeUnit.MILLISECONDS)
                 .initialMaxData(maxData)
-                .initialMaxStreamDataBidirectionalLocal(maxStreamData)
-                .initialMaxStreamDataBidirectionalRemote(maxStreamData)
+                .initialMaxStreamDataBidirectionalLocal(localStreamData)
+                .initialMaxStreamDataBidirectionalRemote(remoteStreamData)
                 .initialMaxStreamDataUnidirectional(0)
                 .initialMaxStreamsBidirectional(maxStreams)
                 .initialMaxStreamsUnidirectional(0)

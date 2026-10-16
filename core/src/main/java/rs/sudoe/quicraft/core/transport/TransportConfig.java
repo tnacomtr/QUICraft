@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core.transport;
 
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
+import rs.sudoe.quicraft.core.resource.ResourcePools;
 
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
@@ -30,31 +31,36 @@ public final class TransportConfig {
 
     /**
      * /3 (docs/protocol.md 13.13): the client advertises this much connection credit, i.e. what the
-     * server may send (clientbound).
+     * server may send (clientbound). The client pins its connection maximum to the same value.
      */
     public static final long MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA = 2L << 20;
-    /** /3: both bidirectional per-stream initial limits, at both ends. */
+    /**
+     * /3 (13.13): the server's window on client-opened bidirectional streams (CONTROL and REALTIME)
+     * and the largest it may grow to. Pinned by Codecs through netty/0005, so quiche never grows it.
+     */
     public static final long MULTISTREAM_INITIAL_MAX_STREAM_DATA = 8L << 10;
-    /** /3 (13.3): bidirectional streams in use at once: client streams 0 and 4, server stream 1. */
-    public static final int MULTISTREAM_STREAMS = 2;
+    /**
+     * /3 (13.13): the server's window on server-opened bidirectional streams (reverse CHUNK guards).
+     * They carry no valid bytes, so the first byte closes the connection and nothing replenishes them.
+     */
+    public static final long MULTISTREAM_REVERSE_CHUNK_STREAM_DATA = 1;
     /**
      * /3: the server advertises this much connection credit, i.e. what the client may send (serverbound).
-     * It equals the sum of the three pinned stream windows, the most quiche can hold unread on the
-     * server (a larger connection window is unreachable and would only inflate the node-budget
-     * reservation, 13.12). Pinned by {@code MultistreamTransportConfigTest}.
+     * It is fixed before N is known and is the staged pre-login exposure (12.13): the server pins both its
+     * connection maximum and its stream maxima so quiche never grows them. Pinned by
+     * {@code MultistreamTransportConfigTest}.
      */
     public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = 24L << 10;
     /** /3: the server lets the client open streams 0 and 4. */
     public static final int MULTISTREAM_SERVER_MAX_STREAMS_BIDI = 2;
-    /** /3: the client lets the server open stream 1. */
+    /** /3: the client lets the server open up to six chunk streams; application validation caps N (13.2). */
     public static final int MULTISTREAM_CLIENT_MAX_STREAMS_BIDI = 6;
     /**
-     * /3 (13.13): the largest auto-tuned stream window quiche may grow to at the client. The server
-     * pins both maxima to its initial serverbound windows. Applied by Codecs, which refuses /3
-     * when the native cannot set them.
+     * /3 (13.13): the client's initial and maximum window on each bidirectional stream. The client pins
+     * its maxima to these values, so its windows never auto-tune beyond the 13.12 reservations.
      */
     public static final long MULTISTREAM_MAX_STREAM_WINDOW = 256L << 10;
-    /** /3 (13.13): the largest auto-tuned connection window at the client: three streams times the stream maximum. */
+    /** /3 (13.13): the client's initial and maximum connection window: 2 MiB. */
     public static final long MULTISTREAM_MAX_CONNECTION_WINDOW = 2L << 20;
 
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -101,6 +107,8 @@ public final class TransportConfig {
     final RetryMode retryMode;
     final long nodePendingBytes;
     final ReceiveBudget nodeBudget;
+    final ResourcePools resourcePools;
+    final boolean preLoginOnline;
 
     private TransportConfig(Builder b) {
         this.maxIdleTimeoutMillis = b.maxIdleTimeoutMillis;
@@ -126,6 +134,8 @@ public final class TransportConfig {
         this.retryMode = b.retryMode != null ? b.retryMode : DEFAULT_RETRY_MODE;
         this.nodePendingBytes = Math.max(0L, b.nodePendingBytes);
         this.nodeBudget = b.nodeBudget;
+        this.resourcePools = b.resourcePools;
+        this.preLoginOnline = b.preLoginOnline;
     }
 
     private static int positiveOr(int value, int fallback) {
@@ -154,6 +164,8 @@ public final class TransportConfig {
         this.retryMode = other.retryMode;
         this.nodePendingBytes = other.nodePendingBytes;
         this.nodeBudget = other.nodeBudget;
+        this.resourcePools = other.resourcePools;
+        this.preLoginOnline = other.preLoginOnline;
     }
 
     /**
@@ -367,6 +379,8 @@ public final class TransportConfig {
         private RetryMode retryMode = DEFAULT_RETRY_MODE;
         private long nodePendingBytes;
         private ReceiveBudget nodeBudget;
+        private ResourcePools resourcePools;
+        private boolean preLoginOnline = true;
 
         public Builder maxIdleTimeout(long value, TimeUnit unit) {
             this.maxIdleTimeoutMillis = unit.toMillis(value);
@@ -467,6 +481,21 @@ public final class TransportConfig {
          */
         public Builder nodeBudget(ReceiveBudget budget) {
             this.nodeBudget = budget;
+            return this;
+        }
+
+        /** Shared staged and logged-in accounting for /3 (§12.13, §13.12). */
+        public Builder resourcePools(ResourcePools pools) {
+            this.resourcePools = pools;
+            return this;
+        }
+
+        /**
+         * /3 (12.13): whether the server runs online mode, where Login Success promotes a staged connection.
+         * Offline connections stay staged until activation. Default true.
+         */
+        public Builder preLoginOnline(boolean online) {
+            this.preLoginOnline = online;
             return this;
         }
 
