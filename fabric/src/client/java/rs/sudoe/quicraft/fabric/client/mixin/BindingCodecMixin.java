@@ -10,6 +10,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import rs.sudoe.quicraft.fabric.Hooks;
+import rs.sudoe.quicraft.fabric.client.DecodeContext;
 import rs.sudoe.quicraft.fabric.net.BindingPayload;
 
 /**
@@ -19,14 +20,32 @@ import rs.sudoe.quicraft.fabric.net.BindingPayload;
  */
 @Mixin(DiscardedPayload.class)
 abstract class BindingCodecMixin {
-    @Inject(method = "codec", at = @At("HEAD"), cancellable = true)
+    @Inject(method = "codec", at = @At("RETURN"), cancellable = true)
     @SuppressWarnings({"unchecked", "rawtypes"})
     private static <T extends FriendlyByteBuf> void quicraft$bindingCodec(Identifier id, int maxPayloadSize,
             CallbackInfoReturnable<StreamCodec<T, DiscardedPayload>> cir) {
         try {
             Hooks.enter("binding codec");
             if (BindingPayload.TYPE.id().equals(id)) {
-                cir.setReturnValue((StreamCodec) BindingPayload.<T>codec());
+                StreamCodec<T, DiscardedPayload> vanilla = cir.getReturnValue();
+                StreamCodec<T, BindingPayload> binding = BindingPayload.codec();
+                // Vanilla's own codec unless a /3 exchange is waiting for the payload: then over-long
+                // bytes must not fail a join that would otherwise have discarded them (12.8).
+                cir.setReturnValue((StreamCodec) new StreamCodec<T, Object>() {
+                    @Override
+                    public Object decode(T buf) {
+                        return DecodeContext.bindingExpected() ? binding.decode(buf) : vanilla.decode(buf);
+                    }
+
+                    @Override
+                    public void encode(T buf, Object payload) {
+                        if (payload instanceof BindingPayload) {
+                            binding.encode(buf, (BindingPayload) payload);
+                        } else {
+                            vanilla.encode(buf, (DiscardedPayload) payload);
+                        }
+                    }
+                });
             }
         } catch (Throwable t) {
             Hooks.failed("binding codec", t);

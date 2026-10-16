@@ -61,6 +61,7 @@ import rs.sudoe.quicraft.core.discovery.AdvertisementCache;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
 import rs.sudoe.quicraft.core.multistream.RecordCodec;
+import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
@@ -113,6 +114,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             aClosedConnectionBeforeActivationFallsBack(protocol, table.get());
             aServerDisconnectIsNotAMultistreamFailure(protocol, table.get());
             heldPacketsStayHeldUntilActivation(protocol, table.get());
+            anOversizedBindingPayloadOutsideV3IsDiscardedAsVanillaDoes(table.get());
             theTailKeepsProtocolSwitchTasksAwayFromTheLanes(table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             aChangedCertificateIsReboundAndTheNewPinIsNoticed(protocol, table.get());
@@ -288,6 +290,42 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             rig.fake.closeByPeer(); // the attempt ends: the held packet's promise fails with the connection
             check(rig.awaitState(V3Client.State.FAILED), "failed");
             check(rig.awaitCondition(held::isDone) && !held.isSuccess(), "the held packet failed with the connection");
+        }
+    }
+
+    /**
+     * 12.8: outside a /3 exchange a quicraft:binding payload does nothing at all. A join on TCP or
+     * /2 (no multi-stream handler in its pipeline) decodes even an over-long one exactly as vanilla
+     * does, by discarding its bytes, instead of failing the decode.
+     */
+    private static void anOversizedBindingPayloadOutsideV3IsDiscardedAsVanillaDoes(RoutingTable table)
+            throws Exception {
+        EmbeddedChannel server = new EmbeddedChannel();
+        EmbeddedChannel client = new EmbeddedChannel();
+        try {
+            net.minecraft.network.Connection.configureSerialization(server.pipeline(), PacketFlow.SERVERBOUND, false,
+                    null);
+            server.pipeline().replace("outbound_config", "encoder",
+                    new PacketEncoder<>(ConfigurationProtocols.CLIENTBOUND));
+            net.minecraft.network.Connection.configureSerialization(client.pipeline(), PacketFlow.CLIENTBOUND, false,
+                    null);
+            client.pipeline().replace("inbound_config", "decoder",
+                    new PacketDecoder<>(ConfigurationProtocols.CLIENTBOUND));
+            LaneCodec serverCodec = new LaneCodec(server, table);
+            ByteBuf frame = Unpooled.buffer();
+            Packet<?> packet = new ClientboundCustomPayloadPacket(
+                    new rs.sudoe.quicraft.fabric.net.BindingPayload(new byte[500]));
+            serverCodec.routeOf(packet);
+            serverCodec.encode(packet, frame);
+
+            LaneGame.Decoded decoded = new LaneCodec(client, table).decode(frame, ProtocolState.CONFIGURATION,
+                    (retained, total) -> { });
+            check(decoded.packet() instanceof ClientboundCustomPayloadPacket p
+                    && p.payload() instanceof net.minecraft.network.protocol.common.custom.DiscardedPayload,
+                    "vanilla discards the bytes: " + decoded.packet());
+        } finally {
+            server.finishAndReleaseAll();
+            client.finishAndReleaseAll();
         }
     }
 
@@ -580,6 +618,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             net.minecraft.network.Connection.configureSerialization(pipe.pipeline(), PacketFlow.SERVERBOUND, false, null);
             pipe.pipeline().replace("decoder", "decoder", new PacketDecoder<>(ConfigurationProtocols.SERVERBOUND));
             pipe.pipeline().replace("outbound_config", "encoder", new PacketEncoder<>(ConfigurationProtocols.CLIENTBOUND));
+            // The scripted server takes part in the exchange, so binding payloads decode for it too.
+            pipe.pipeline().addLast("binding_gate", new BindingGate());
             codec = new LaneCodec(pipe, rig.table);
             encrypt = offline ? null : Crypt.getCipher(Cipher.ENCRYPT_MODE, rig.key);
             decrypt = offline ? null : Crypt.getCipher(Cipher.DECRYPT_MODE, rig.key);
@@ -688,6 +728,15 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             public void fail(int code, String reason) {
                 throw new AssertionError("the scripted server's own session failed: " + reason);
             }
+        }
+    }
+
+    /** Stands in for a /3 server pipeline: a binding payload is part of its exchange. */
+    private static final class BindingGate extends io.netty.channel.ChannelInboundHandlerAdapter
+            implements DecodeContext.Gate {
+        @Override
+        public boolean expectsBinding() {
+            return true;
         }
     }
 

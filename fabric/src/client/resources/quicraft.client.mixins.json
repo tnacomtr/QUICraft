@@ -16,6 +16,7 @@
     "DebugEntryTpsMixin",
     "JoinMultiplayerScreenMixin",
     "PacketDecoderAccessor",
+    "PacketDecoderContextMixin",
     "PacketEncoderAccessor",
     "ServerStatusPingerMixin"
   ],

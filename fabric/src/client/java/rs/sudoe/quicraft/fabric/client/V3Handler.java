@@ -30,7 +30,7 @@ import rs.sudoe.quicraft.fabric.net.BindingPayload;
  * <p><b>Outbound.</b> Ordinary packets are held while the exchange pauses them (12.10), and until the
  * lanes are active after it. Anything else, such as the game's own protocol-switch tasks, passes.</p>
  */
-final class V3Handler extends ChannelDuplexHandler {
+final class V3Handler extends ChannelDuplexHandler implements DecodeContext.Gate {
     static final String NAME = "quicraft_v3";
     static final String TAIL_NAME = "quicraft_v3_tail";
 
@@ -50,6 +50,13 @@ final class V3Handler extends ChannelDuplexHandler {
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
         this.context = ctx;
+    }
+
+    /** Whether a {@code quicraft:binding} payload arriving now is part of this join's exchange. */
+    @Override
+    public boolean expectsBinding() {
+        V3Client.State state = client.state();
+        return state == V3Client.State.LOGIN || state == V3Client.State.BINDING;
     }
 
     void deliveryQueued() {
