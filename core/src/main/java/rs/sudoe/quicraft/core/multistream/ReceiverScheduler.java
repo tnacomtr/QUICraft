@@ -137,6 +137,8 @@ public final class ReceiverScheduler {
         boolean decodeReserved;
         long headSince;
         boolean head;
+        /** First attempt of this entry's current decode, or -1 while it has none (13.12). */
+        long decodeSince = -1;
         Entry(Envelope envelope, long bytes) {
             this.envelope = envelope;
             this.bytes = bytes;
@@ -164,7 +166,6 @@ public final class ReceiverScheduler {
     private long auxiliaryBytes;
     private Delivery outstanding;
     private Entry decoding;
-    private long decodingSince;
     private long outstandingSince;
     private long pumpNow;
     private boolean pumping;
@@ -173,8 +174,6 @@ public final class ReceiverScheduler {
     /** The admitted END, kept so auxiliary records it depends on can still arrive. */
     private Envelope endAdmitted;
     private boolean receivingBundle;
-    /** First moment a decode was refused by the node budget; 0 while none is waiting. */
-    private long decodeRefusedSince;
     private long bundleStarted;
     private int bundleMembers;
     private long bundleUncompressed;
@@ -334,7 +333,6 @@ public final class ReceiverScheduler {
         auxiliaryCount = 0;
         decoding = null;
         outstanding = null;
-        decodeRefusedSince = 0;
         ended = true;
         creditNode(released);
     }
@@ -635,20 +633,19 @@ public final class ReceiverScheduler {
                 }
                 if (next.decode != null) {
                     decoding = next.decode;
-                    if (decodingSince == 0 || next.decode != decoding) {
-                        decodingSince = pumpNow;
+                    if (decoding.decodeSince < 0) {
+                        // This entry's own first attempt. A retry of the same entry keeps it, so the
+                        // 13.12 decode deadline runs from the first attempt; a later entry starts
+                        // its own, and a successful decode clears it.
+                        decoding.decodeSince = pumpNow;
                     }
                     try {
                         decoder.decode(decoding.envelope,
                                 receivingBundle && decoding.envelope.lane() == Lane.CONTROL, pumpNow);
                     } catch (RetryLater retry) {
                         // 13.12: the node budget refused this decode's allocation. Hold the entry
-                        // undecoded and remember when the attempt started, so the existing decode
-                        // deadline still closes the connection if it can never proceed.
+                        // undecoded; its own deadline keeps running from the first attempt.
                         decoding = null;
-                        if (decodeRefusedSince == 0) {
-                            decodeRefusedSince = pumpNow;
-                        }
                         return;
                     } catch (RuntimeException ex) {
                         throw fatal(ex);
@@ -754,10 +751,12 @@ public final class ReceiverScheduler {
                     throw new OrderingException("unexpected bundle member/delimiter");
                 }
             }
-            decodeRefusedSince = 0;
             decoding.decoded = new Envelope(envelope.lane(), envelope.kind(), envelope.sequence(),
                     envelope.dependencies(), envelope.bodyLength(), body, classification,
                     changesStateCompressionOrActivation);
+            // The decode is done: its deadline and the attempt's reservation tally both reset, so
+            // they cannot reach a later entry.
+            decoding.decodeSince = -1;
             decoding = null;
             pump(now);
         } catch (RuntimeException ex) {
@@ -807,10 +806,8 @@ public final class ReceiverScheduler {
     public void checkDeadlines(long now) {
         enter();
         try {
-            if (decoding != null && now - decodingSince >= TIMEOUT_NANOS) {
-                throw new OrderingException("uncompleted decode timeout");
-            }
-            if (decodeRefusedSince != 0 && now - decodeRefusedSince >= TIMEOUT_NANOS) {
+            if (decoding != null && decoding.decodeSince >= 0
+                    && now - decoding.decodeSince >= TIMEOUT_NANOS) {
                 throw new OrderingException("uncompleted decode timeout");
             }
             if (receivingBundle && now - bundleStarted >= TIMEOUT_NANOS) {

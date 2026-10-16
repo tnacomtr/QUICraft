@@ -246,6 +246,26 @@ class ReceiverDecodeTest {
         assertTrue(h.deliveries.get(0).isBundle());
     }
 
+    @Test void aSecondRecordDecodedLongAfterTheFirstIsNotOnTheFirstsDeadline() {
+        Harness h = new Harness();
+        // A clock that never starts at zero, like the monotonic clock a session injects.
+        long t0 = 1_000_000_000L;
+        h.scheduler.offer(raw(Lane.CONTROL, 1, 0, 0, 0), t0);
+        h.finish(Envelope.Bundle.NONE, 1, 1, false, t0);
+        h.apply(t0);
+        // A successful decode must not leave its start time behind: a later, healthy record decodes
+        // and applies more than one deadline after it (13.12).
+        long later = t0 + T + 1;
+        h.scheduler.checkDeadlines(later);
+        h.scheduler.offer(raw(Lane.CONTROL, 2, 1, 0, 0), later);
+        h.finish(Envelope.Bundle.NONE, 1, 1, false, later);
+        assertEquals(1, h.deliveries.size(), "the second record is delivered");
+        assertEquals(2, h.deliveries.get(0).sequence());
+        h.apply(later);
+        h.scheduler.checkDeadlines(2 * T + t0);
+        assertEquals(0, h.scheduler.pendingBytes(), "nothing is retained after both records");
+    }
+
     @Test void closingDecodedBundleDoesNotPermitDecodingTheFollowingControlBeforeCommit() {
         Harness h = new Harness();
         h.scheduler.offer(raw(Lane.CONTROL, 1, 0, 0, 0), 0);
