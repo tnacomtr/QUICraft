@@ -208,6 +208,11 @@ public final class LaneSession {
      * loop. The game may be bound before or after {@link #activate}.
      */
     public LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
+                       LaneGame game, ReceiveBudget node) {
+        this(connection, role, control, table, game, node, Timing.DEFAULT);
+    }
+
+    public LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
                        ReceiveBudget node) {
         this(connection, role, control, table, null, node, Timing.DEFAULT);
     }

@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 /**
@@ -65,6 +66,36 @@ class V3NodeBudgetTest {
                     V3ConnectionTest.TABLE, null).get(10, TimeUnit.SECONDS);
             assertTrue(await(() -> accepted.get() == 2, 5_000), "a closed connection returned its reservation");
             third.close();
+        }
+    }
+
+    @Test
+    void anInjectedBudgetIsSharedByTheListenerAndGivesEveryByteBackWhenConnectionsClose() throws Exception {
+        assumeTrue(QuicSupport.hasMaxFlowControlWindows() && QuicSupport.hasKeyingMaterialExport(),
+                "/3 needs QUICraft's patched native (12.2, 12.3, 13.13)");
+        AtomicInteger accepted = new AtomicInteger();
+        // The platform's own send-side reservations would share this very instance.
+        ReceiveBudget budget = ReceiveBudget.bounded(TransportConfig.V3_INITIAL_EXPOSURE_BYTES + 1024);
+        TransportConfig config = TransportConfig.builder().nodeBudget(budget).build();
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity, config,
+                stream -> accepted.incrementAndGet(), protocol -> V3ConnectionTest.TABLE)) {
+            assertTrue(server.nodeBudget() == budget, "the listener enforces the injected instance");
+            V3Connection first = QuicClient.connectV3(server.localAddress(), identity.fingerprint(),
+                    V3ConnectionTest.TABLE, null).get(10, TimeUnit.SECONDS);
+            assertTrue(await(() -> accepted.get() == 1, 5_000), "the first connection fits");
+            assertEquals(TransportConfig.V3_INITIAL_EXPOSURE_BYTES, budget.reserved(), "its credit is reserved");
+
+            try {
+                V3Connection second = QuicClient.connectV3(server.localAddress(), identity.fingerprint(),
+                        V3ConnectionTest.TABLE, null).get(10, TimeUnit.SECONDS);
+                assertTrue(await(() -> !second.isOpen(), 5_000), "the second, over the shared budget, ends");
+            } catch (java.util.concurrent.ExecutionException refusedAtHandshake) {
+                // Also a refusal.
+            }
+            assertEquals(1, accepted.get(), "the second connection was refused");
+
+            first.close();
+            assertTrue(await(() -> budget.reserved() == 0, 5_000), "teardown returned every byte: " + budget.reserved());
         }
     }
 
