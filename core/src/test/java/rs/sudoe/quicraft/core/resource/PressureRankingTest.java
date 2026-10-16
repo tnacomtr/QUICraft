@@ -261,4 +261,18 @@ class PressureRankingTest {
         r.connect("one", ip("192.0.2.80"), null, 0);
         assertFalse(r.score("one", 0) < 0);
     }
+
+    @Test void overflowConnectionLivingPastTheWindowKeepsItsBucketAcrossReconnect() throws Exception {
+        PressureRanking r = new PressureRanking(60_000, 1, 10, SECRET);
+        r.connect("c1", ip("192.0.2.50"), null, 0);
+        InetAddress guest = ip("192.0.2.51");
+        r.connect("c2", guest, null, 0);
+        int bucket = r.bucketFor(guest);
+        // The overflow connection lives 700 s, longer than the 10-minute retention counted from admission.
+        r.disconnect("c2", 700 * S);
+        r.disconnect("c1", 700 * S);
+        r.connect("c3", guest, null, 701 * S);
+        r.setRetained("c3", 1000, 701 * S);
+        assertEquals(1000, r.bucketBytes(bucket), "the reconnect is charged to its bucket, not a fresh exact entry");
+    }
 }

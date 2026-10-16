@@ -126,6 +126,8 @@ public final class PressureRanking {
         IdentityHistory ipExact = exactIp(ip, nowNanos, eff);
         IdentityHistory accountExact = account == null ? null : exactAccount(account, nowNanos, eff);
         Connection c = new Connection(connection, new IdentityHistory(halfLifeNanos, nowNanos, eff), nowNanos);
+        c.addr = ip;
+        c.acct = account;
 
         if (ipExact == null && account != null && accountExact == null) {
             // Both identities overflowed: one charge, to the account bucket, read by both (13.12).
@@ -172,6 +174,7 @@ public final class PressureRanking {
         if (c == null) return;
         refusedWaiters.remove(c);
         if (c.bytes != 0) setBytesInternal(c, 0, nowNanos, effStall(nowNanos));
+        touchContinuity(c, nowNanos);
         for (IdentityHistory target : c.charged) target.liveDelta(-1);
         if (c.liveBucket >= 0) {
             Map<Object, Integer> live = bucketLive.get(c.liveBucket);
@@ -286,6 +289,18 @@ public final class PressureRanking {
         c.local.addBytes(delta, now, eff);
         for (IdentityHistory target : c.charged) target.addBytes(delta, now, eff);
         c.bytes = bytes;
+        if (delta != 0) touchContinuity(c, now);
+    }
+
+    /**
+     * Refreshes the last-use time of a connection's overflowed identities (13.12): the 10-minute retention counts
+     * from last use, so a long-lived overflow connection keeps its continuity record while its charge changes.
+     */
+    private void touchContinuity(Connection c, long now) {
+        if (c.ip != null && c.ip.bucket >= 0 && overflowMemory.containsKey(c.addr)) overflowMemory.put(c.addr, now);
+        if (c.account != null && c.account.bucket >= 0 && c.acct != null && accountOverflow.containsKey(c.acct)) {
+            accountOverflow.put(c.acct, now);
+        }
     }
 
     /** Returns the exact IP entry, or null when the identity is served by its overflow bucket. */
@@ -476,6 +491,8 @@ public final class PressureRanking {
         final List<IdentityHistory> charged = new ArrayList<IdentityHistory>(2);
         Read ip;
         Read account;
+        InetAddress addr;
+        String acct;
         int liveBucket = -1;
         Object liveKey;
         long bytes;
