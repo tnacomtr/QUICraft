@@ -116,6 +116,15 @@ public final class RebindState {
      */
     public static final long STALE_ATTEMPT_MILLIS = 30_000L;
 
+    /** 12.14's fixed resource window: one QUIC attempt per minute, with no doubling. */
+    public static final long RESOURCE_WINDOW_MILLIS = 60_000L;
+    /** 12.14's rolling interval for pre-verification reports and pre-login sheds: ten minutes. */
+    public static final long REPORT_INTERVAL_MILLIS = 600_000L;
+    /** 12.14: at most three pre-verification peer {@code 0x12} reports per interval get the window. */
+    public static final int REPORT_ALLOWANCE = 3;
+    /** 12.14 and 12.13: three consecutive pre-login sheds within the interval start the window. */
+    public static final int SHED_BOUND = 3;
+
     /** Section 6's first backoff: one minute. */
     static final long INITIAL_BACKOFF_MILLIS = 60_000L;
     /** Section 6's longest backoff: one hour. */
@@ -155,6 +164,12 @@ public final class RebindState {
         int failures;
         long blockedUntil;
         Attempt active;
+        /** End of 12.14's fixed resource window, 0 when there is none. */
+        long resourceUntil;
+        /** 12.14: the last three pre-verification peer {@code 0x12} report times, oldest first. */
+        final List<Long> reports = new ArrayList<>();
+        /** 12.14: the consecutive pre-login shed times, oldest first, at most {@link #SHED_BOUND}. */
+        final List<Long> sheds = new ArrayList<>();
 
         Entry(String host, int port) {
             this.host = host;
@@ -164,6 +179,23 @@ public final class RebindState {
         boolean hasNotice(String fingerprint) {
             for (Notice notice : notices) {
                 if (notice.fingerprint.equals(fingerprint)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * Whether this entry holds 12.14 resource state that a success, a reconnect or an endpoint
+         * change must not reset: a running fixed window or a report inside the rolling interval.
+         * Pre-login sheds are not kept for this, because a success ends a run of consecutive sheds.
+         */
+        boolean holdsResourceState(long now) {
+            if (resourceUntil > now) {
+                return true;
+            }
+            for (Long report : reports) {
+                if (within(report, now)) {
                     return true;
                 }
             }
@@ -181,11 +213,14 @@ public final class RebindState {
         private final String host;
         private final int port;
         final long startedAt;
+        /** The window before this attempt stored its provisional failure window. */
+        final long previousBlockedUntil;
 
-        private Attempt(String host, int port, long startedAt) {
+        private Attempt(String host, int port, long startedAt, long previousBlockedUntil) {
             this.host = host;
             this.port = port;
             this.startedAt = startedAt;
+            this.previousBlockedUntil = previousBlockedUntil;
         }
 
         /** The normalized logical host this attempt belongs to. */
@@ -311,7 +346,7 @@ public final class RebindState {
             }
             touch(mapKey, entry);
         }
-        Attempt attempt = new Attempt(key.host(), key.port(), now);
+        Attempt attempt = new Attempt(key.host(), key.port(), now, entry.blockedUntil);
         entry.active = attempt;
         // The window a failure would set, stored before the attempt starts: a crash or a game exit
         // mid-attempt must not allow an immediate re-bind on the next launch.
@@ -358,13 +393,218 @@ public final class RebindState {
             }
             return true;
         }
-        entries.remove(mapKey);
-        noticeCount -= entry.notices.size();
+        succeed(mapKey, entry, clock.getAsLong());
         if (!persist()) {
             disabled = true;
             return false;
         }
         return true;
+    }
+
+    /**
+     * Ends {@code attempt} without counting it as a failure, for a {@code /3} resource close
+     * (docs/protocol.md 12.14): a locally detected resource abort, an authenticated peer report, a
+     * pre-verification report inside the allowance, or a pre-login shed must not create or advance
+     * the re-bind failure backoff. The provisional failure window {@link #tryBeginAttempt(String,
+     * int, long)} stored is put back to what it was before the attempt, and the failure count is
+     * left alone, so a resource close never extends a non-resource window nor resets one.
+     *
+     * @return false when the token was not the active attempt, or when the change could not be
+     *     persisted, which disables the state
+     */
+    public synchronized boolean releaseAttempt(Attempt attempt) {
+        if (attempt == null || disabled) {
+            return false;
+        }
+        String mapKey = PinKey.mapKey(PinKey.of(attempt.host(), attempt.port()));
+        Entry entry = entries.get(mapKey);
+        if (entry == null || entry.active != attempt) {
+            return false;
+        }
+        entry.active = null;
+        entry.blockedUntil = attempt.previousBlockedUntil;
+        if (!persist()) {
+            disabled = true;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Whether a {@code /3} join to this logical server must use TCP without a QUIC login now
+     * (docs/protocol.md 12.14): its fixed 60-second resource window is running, or this state
+     * cannot be read or written, in which case 12.14 chooses TCP before QUIC login. A query: it
+     * changes nothing.
+     */
+    public synchronized boolean resourceWindowActive(String host, int port, long now) {
+        PinKey key = PinKey.of(host, port);
+        if (disabled) {
+            return true;
+        }
+        Entry entry = entries.get(PinKey.mapKey(key));
+        return entry != null && Math.min(entry.resourceUntil, now + RESOURCE_WINDOW_MILLIS) > now;
+    }
+
+    /**
+     * Starts 12.14's fixed 60-second resource window for this logical server, for a locally
+     * detected resource abort or an authenticated peer resource report after SERVER_SWITCH. The
+     * window is fixed: it never doubles, never touches the failure count and never shortens or
+     * lengthens the re-bind failure window.
+     *
+     * @return false when the state is disabled, has no room for this server, or could not be written
+     */
+    public synchronized boolean startResourceWindow(String host, int port) {
+        PinKey key = PinKey.of(host, port);
+        if (disabled) {
+            return false;
+        }
+        long now = clock.getAsLong();
+        Entry entry = entryFor(key, now);
+        if (entry == null) {
+            return false;
+        }
+        entry.resourceUntil = now + RESOURCE_WINDOW_MILLIS;
+        if (!persist()) {
+            disabled = true;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Records a peer-sent {@code 0x12} received before SERVER_SWITCH verified, after Login Success
+     * (docs/protocol.md 12.14). The decision uses only the reports retained before this one: fewer
+     * than {@link #REPORT_ALLOWANCE} inside the rolling ten minutes means the report is within the
+     * allowance, and the fixed resource window starts. This report is then retained either way, so
+     * reports treated like {@code 0x10} still count; the last three are kept, and successes,
+     * reconnects and endpoint or fingerprint changes do not reset them.
+     *
+     * @return true when the report is within the allowance; false when it is not, or when the state
+     *     cannot record it (fail closed: the caller treats it like {@code 0x10})
+     */
+    public synchronized boolean recordPeerResourceReport(String host, int port) {
+        PinKey key = PinKey.of(host, port);
+        if (disabled) {
+            return false;
+        }
+        long now = clock.getAsLong();
+        Entry entry = entryFor(key, now);
+        if (entry == null) {
+            return false;
+        }
+        int prior = 0;
+        for (Long report : entry.reports) {
+            if (within(report, now)) {
+                prior++;
+            }
+        }
+        boolean allowed = prior < REPORT_ALLOWANCE;
+        entry.reports.add(now);
+        while (entry.reports.size() > REPORT_ALLOWANCE) {
+            entry.reports.remove(0);
+        }
+        if (allowed) {
+            entry.resourceUntil = now + RESOURCE_WINDOW_MILLIS;
+        }
+        if (!persist()) {
+            disabled = true;
+            return false;
+        }
+        return allowed;
+    }
+
+    /**
+     * Records a pre-login shed: a {@code /3} {@code 0x12} received before Login Success
+     * (docs/protocol.md 12.13, 12.14). A shed writes no failure-cache or re-bind entry and is not a
+     * pre-verification report. Only after {@link #SHED_BOUND} consecutive sheds within ten minutes
+     * does the fixed 60-second resource window start, so a broken or hostile server cannot force a
+     * double login on every join.
+     *
+     * @return true when this shed started the resource window
+     */
+    public synchronized boolean recordPreLoginShed(String host, int port) {
+        PinKey key = PinKey.of(host, port);
+        if (disabled) {
+            return false;
+        }
+        long now = clock.getAsLong();
+        Entry entry = entryFor(key, now);
+        if (entry == null) {
+            return false;
+        }
+        entry.sheds.add(now);
+        while (entry.sheds.size() > SHED_BOUND) {
+            entry.sheds.remove(0);
+        }
+        int recent = 0;
+        for (Long shed : entry.sheds) {
+            if (within(shed, now)) {
+                recent++;
+            }
+        }
+        boolean window = recent >= SHED_BOUND;
+        if (window) {
+            entry.resourceUntil = now + RESOURCE_WINDOW_MILLIS;
+        }
+        if (!persist()) {
+            disabled = true;
+            return false;
+        }
+        return window;
+    }
+
+    /**
+     * Ends a run of consecutive pre-login sheds (12.14): any {@code /3} outcome that is not a shed,
+     * such as a successful activation, calls this. Nothing is written when there is no run.
+     */
+    public synchronized void resetPreLoginSheds(String host, int port) {
+        PinKey key = PinKey.of(host, port);
+        if (disabled) {
+            return;
+        }
+        Entry entry = entries.get(PinKey.mapKey(key));
+        if (entry == null || entry.sheds.isEmpty()) {
+            return;
+        }
+        entry.sheds.clear();
+        if (!persist()) {
+            disabled = true;
+        }
+    }
+
+    /** The entry for {@code key}, created (with room made) when missing; null when there is no room. */
+    private Entry entryFor(PinKey key, long now) {
+        String mapKey = PinKey.mapKey(key);
+        Entry entry = entries.get(mapKey);
+        if (entry != null) {
+            touch(mapKey, entry);
+            return entry;
+        }
+        if (!makeRoom(now)) {
+            return null;
+        }
+        entry = new Entry(key.host(), key.port());
+        entries.put(mapKey, entry);
+        return entry;
+    }
+
+    /**
+     * A success: the failure window and any run of pre-login sheds end. The entry goes, unless it
+     * still holds 12.14 resource state, which a success must not reset; then only its window clears.
+     */
+    private void succeed(String mapKey, Entry entry, long now) {
+        entry.failures = 0;
+        entry.blockedUntil = 0;
+        entry.sheds.clear();
+        if (!entry.holdsResourceState(now)) {
+            entries.remove(mapKey);
+            noticeCount -= entry.notices.size();
+        }
+    }
+
+    /** Whether {@code time} lies in the rolling ten minutes before {@code now}; a future time does. */
+    private static boolean within(long time, long now) {
+        return now - time < REPORT_INTERVAL_MILLIS;
     }
 
     /**
@@ -392,12 +632,13 @@ public final class RebindState {
         if (entry == null) {
             return;
         }
-        if (live(entry, clock.getAsLong())) {
+        long now = clock.getAsLong();
+        if (live(entry, now)) {
             entry.failures = 0;
             entry.blockedUntil = 0;
+            entry.sheds.clear();
         } else {
-            entries.remove(mapKey);
-            noticeCount -= entry.notices.size();
+            succeed(mapKey, entry, now);
         }
         if (!persist()) {
             disabled = true;
@@ -442,8 +683,17 @@ public final class RebindState {
             if (entry == null || entry.active != null) {
                 continue;
             }
-            entries.remove(mapKey);
-            noticeCount -= entry.notices.size();
+            if (entry.holdsResourceState(clock.getAsLong())) {
+                // 12.14's resource state is not reset by an endpoint change, so it outlives the pin:
+                // only the backoff window and the notice history go.
+                entry.failures = 0;
+                entry.blockedUntil = 0;
+                noticeCount -= entry.notices.size();
+                entry.notices.clear();
+            } else {
+                entries.remove(mapKey);
+                noticeCount -= entry.notices.size();
+            }
             removed++;
         }
         if (removed == 0) {
@@ -613,12 +863,34 @@ public final class RebindState {
                         StrictJson.instant(noticeFields.get("lastNoticed"), "lastNoticed")));
             }
             noticeCount += entry.notices.size();
+            // 12.14's resource state: optional, so a file written before it existed still loads.
+            if (fields.containsKey("resourceUntil")) {
+                entry.resourceUntil = Math.min(
+                        StrictJson.instant(fields.get("resourceUntil"), "resourceUntil").toEpochMilli(),
+                        clock.getAsLong() + RESOURCE_WINDOW_MILLIS);
+            }
+            readTimes(fields, "reports", REPORT_ALLOWANCE, entry.reports);
+            readTimes(fields, "sheds", SHED_BOUND, entry.sheds);
             if (entries.put(PinKey.mapKey(key), entry) != null) {
                 throw new IllegalArgumentException("re-bind state repeats a server");
             }
         }
         if (noticeCount > maxFingerprintsTotal) {
             throw new IllegalArgumentException("re-bind state holds more than " + maxFingerprintsTotal + " notices");
+        }
+    }
+
+    /** Reads an optional array of at most {@code max} timestamps into {@code into}. */
+    private static void readTimes(Map<String, Object> fields, String name, int max, List<Long> into) {
+        if (!fields.containsKey(name)) {
+            return;
+        }
+        List<Object> times = StrictJson.array(fields.get(name), name);
+        if (times.size() > max) {
+            throw new IllegalArgumentException("re-bind state has too many " + name + " for one server");
+        }
+        for (Object time : times) {
+            into.add(StrictJson.instant(time, name).toEpochMilli());
         }
     }
 
@@ -652,12 +924,24 @@ public final class RebindState {
         if (entries.size() < maxEntries) {
             return true;
         }
+        // Prefer an entry without 12.14 resource state, so a report allowance is not reset by
+        // capacity while another entry could go; an entry with a live attempt never goes.
         String victim = null;
+        String fallback = null;
         for (Map.Entry<String, Entry> candidate : entries.entrySet()) {
-            if (!live(candidate.getValue(), now)) {
+            if (live(candidate.getValue(), now)) {
+                continue;
+            }
+            if (!candidate.getValue().holdsResourceState(now)) {
                 victim = candidate.getKey();
                 break;
             }
+            if (fallback == null) {
+                fallback = candidate.getKey();
+            }
+        }
+        if (victim == null) {
+            victim = fallback;
         }
         if (victim == null) {
             return false;
@@ -781,6 +1065,20 @@ public final class RebindState {
         }
     }
 
+    private static void appendTimes(StringBuilder sb, String name, List<Long> times) {
+        if (times.isEmpty()) {
+            return;
+        }
+        sb.append(",\"").append(name).append("\":[");
+        for (int i = 0; i < times.size(); i++) {
+            if (i > 0) {
+                sb.append(',');
+            }
+            sb.append(StrictJson.quotedInstant(Instant.ofEpochMilli(times.get(i))));
+        }
+        sb.append(']');
+    }
+
     private String encodeJson() {
         StringBuilder sb = new StringBuilder(1024 + 256 * entries.size());
         sb.append("{\"version\":").append(SCHEMA_VERSION).append(",\"servers\":[");
@@ -806,7 +1104,15 @@ public final class RebindState {
                 sb.append(",\"lastNoticed\":").append(StrictJson.quotedInstant(notice.lastNoticed));
                 sb.append('}');
             }
-            sb.append("]}");
+            sb.append(']');
+            // 12.14's resource state, written only when present so older entries keep their form.
+            if (entry.resourceUntil != 0) {
+                sb.append(",\"resourceUntil\":")
+                        .append(StrictJson.quotedInstant(Instant.ofEpochMilli(entry.resourceUntil)));
+            }
+            appendTimes(sb, "reports", entry.reports);
+            appendTimes(sb, "sheds", entry.sheds);
+            sb.append('}');
         }
         return sb.append("]}").toString();
     }
