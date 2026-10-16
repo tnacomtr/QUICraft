@@ -808,7 +808,8 @@ share; a prefix over its fair share loses that protection, and session-server ca
 prefix are capped (profile value). The global validated-attempt budget (§11) is shared the same
 way: when it is exhausted, an honest token-bearing Initial from a prefix within its fair share is
 admitted by refusing attempts from prefixes over their share, never dropped while some prefix
-exceeds its share. Online Login Success..activation is charged to logged-in accounting and is never
+exceeds its share. A shed victim's bytes stay charged until its close is confirmed; the newcomer is granted only
+from confirmed bytes, and no second victim is chosen while pending sheds cover the deficit. Online Login Success..activation is charged to logged-in accounting and is never
 shed as pre-login. Offline connections remain staged and charged to the pre-login pool until `/3`
 activation, even after Login Success. A shed closes before Login Success and client retries TCP.
 
