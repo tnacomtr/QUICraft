@@ -54,7 +54,10 @@ crashing the game.
 - Port: `QuicPort.choose` (shared with Velocity): the game port, or with `enable-query` on the
   same port (`query.port`), the alternative port (default game port + 1).
 - Files in `config/quicraft/`: `server.properties` (`enabled`, `port`, `alternative-port`,
-  `udp-sockets`: `auto` or 1..64 SO_REUSEPORT sockets on the game's worker loops, Linux only),
+  `udp-sockets`: `auto` or 1..64 SO_REUSEPORT sockets on the game's worker loops, Linux only;
+  `multistream`, off by default, which offers `quicraft/3` and advertises it only where the native
+  and a shipped routing resource allow it, and `multistream-node-budget-bytes`, the 13.12 node
+  budget, provisional until the 13.17 benchmark),
   `quic-key.pem` and `quic-cert.pem` (the identity; keep them, clients remember the fingerprint).
 
 ### Client

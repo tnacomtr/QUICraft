@@ -63,13 +63,13 @@ class MultistreamSwitchTest {
         Map<Integer, String> routing = MultistreamSwitch.advertisedRouting();
 
         assertEquals(1, routing.size(), "one shipped placeholder today: " + routing);
-        for (int protocol : MultistreamSwitch.SHIPPED_PROTOCOLS) {
-            String digest = routing.get(Integer.valueOf(protocol));
+        for (Integer protocol : MultistreamSwitch.shippedProtocols()) {
+            String digest = routing.get(protocol);
             assertTrue(digest != null, "protocol " + protocol + " must be advertised");
             // 13.1: lowercase "sha256:" followed by 64 hex digits, the digest of the exact bytes.
             assertTrue(digest.matches("sha256:[0-9a-f]{64}"), digest);
-            assertEquals("sha256:" + RoutingRegistry.forProtocol(protocol).get().digestHex(), digest,
-                    "the advertisement must carry the resource digest, and only what is loaded");
+            assertEquals("sha256:" + RoutingRegistry.forProtocol(protocol.intValue()).get().digestHex(),
+                    digest, "the advertisement must carry the resource digest, and only what is loaded");
         }
         assertEquals(Integer.valueOf(775), routing.keySet().iterator().next(),
                 "the 26.x placeholder protocol number (docs/version-matrix.md)");

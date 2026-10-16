@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.bridge;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
@@ -43,7 +45,8 @@ public final class MultistreamSwitch {
      * the 26.x placeholder today, the version spread's tables later. A number without a resource is
      * not advertised, and 13.1 then sends that client to TCP.
      */
-    public static final int[] SHIPPED_PROTOCOLS = {775};
+    private static final List<Integer> SHIPPED_PROTOCOLS =
+            Collections.unmodifiableList(Arrays.asList(Integer.valueOf(775)));
 
     /** Why {@code /3} is on or off, with the one line to log for it. */
     public enum Reason {
@@ -118,13 +121,18 @@ public final class MultistreamSwitch {
      */
     public static Map<Integer, String> advertisedRouting() {
         Map<Integer, String> routing = new LinkedHashMap<Integer, String>();
-        for (int protocol : SHIPPED_PROTOCOLS) {
-            RoutingTable table = tableFor(protocol);
+        for (Integer protocol : SHIPPED_PROTOCOLS) {
+            RoutingTable table = tableFor(protocol.intValue());
             if (table != null) {
-                routing.put(Integer.valueOf(protocol), "sha256:" + table.digestHex());
+                routing.put(protocol, "sha256:" + table.digestHex());
             }
         }
         return Collections.unmodifiableMap(routing);
+    }
+
+    /** The protocol numbers a routing resource ships for, the ones an advertisement can name. */
+    public static List<Integer> shippedProtocols() {
+        return SHIPPED_PROTOCOLS;
     }
 
     /**
