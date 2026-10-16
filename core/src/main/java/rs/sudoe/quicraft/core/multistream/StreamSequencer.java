@@ -23,6 +23,7 @@ public final class StreamSequencer {
         long previous=assigned[stream];
         if(previous==Long.MAX_VALUE) throw new IllegalStateException("sequence overflow");
         long[] deps=new long[assigned.length]; deps[stream]=previous;
+        if (global > 0) deps[0] = Math.max(deps[0], global);
         switch(fence) {
             case GLOBAL: case VIEW:
                 for(int i=0;i<assigned.length;i++) deps[i]=Math.max(deps[i],assigned[i]);
@@ -31,7 +32,7 @@ public final class StreamSequencer {
                 deps[0]=Math.max(deps[0],assigned[0]);
                 deps[1]=Math.max(deps[1],assigned[1]);
                 break;
-            case REALTIME: deps[0]=Math.max(deps[0],control); if(serverboundInteraction) deps[0]=Math.max(deps[0],global); break;
+            case REALTIME: deps[0]=Math.max(deps[0],Math.max(global,control)); break;
             case CHUNK: if(view>0) deps[0]=Math.max(deps[0],view); break;
             default: if(serverboundInteraction && stream==0) deps[1]=assigned[1];
         }

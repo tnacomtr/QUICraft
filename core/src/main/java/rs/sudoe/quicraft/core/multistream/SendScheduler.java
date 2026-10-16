@@ -20,6 +20,8 @@ public final class SendScheduler {
     /** Selects the next dependency-ready item, with age and stream-class weighting (13.20). */
     public synchronized Record poll(long[] delivered){
         if(delivered==null)return null;
+        Item promoted=promotedPrerequisite(delivered);
+        if(promoted!=null) { queue.remove(promoted); return promoted.record; }
         Item urgent=null;
         for(Item i:queue) if(ready(i.record,delivered) && i.record.streamIndex()==1 && (urgent==null||i.created<urgent.created)) urgent=i;
         Item best=null;
@@ -38,6 +40,16 @@ public final class SendScheduler {
     /** Returns pending item count for bounded external queue management (13.20). */
     public synchronized int size(){return queue.size();}
     private long score(Item i){int stream=i.record.streamIndex();long weight=stream==1?realtimeWeight:stream>=2?chunkWeight:controlWeight;long age=clock-i.created;long priority=stream==1?3:stream>=2?2:1;return priority*1_000_000L+weight*1024L+Math.min(age,1_000_000L);}
+    private Item promotedPrerequisite(long[] delivered){
+        for(Item urgent:queue){
+            if(urgent.record.streamIndex()!=1 && urgent.record.kind()!=2)continue;
+            for(Record.Dependency dependency:urgent.record.dependencies()){
+                if(dependency.streamIndex()>=delivered.length||delivered[dependency.streamIndex()]>=dependency.sequence())continue;
+                for(Item candidate:queue)if(candidate.record.streamIndex()==dependency.streamIndex()&&candidate.record.sequence()<=dependency.sequence()&&ready(candidate.record,delivered))return candidate;
+            }
+        }
+        return null;
+    }
     private int chunkRank(Item i){return (i.record.streamIndex()-lastChunk+6)%6;}
     private boolean ready(Record r,long[] d){if(d==null||r.streamIndex()>=d.length)return false;for(Record.Dependency x:r.dependencies())if(x.streamIndex()>=d.length||d[x.streamIndex()]<x.sequence())return false;return true;}
     private static final class Item{final Record record;final int bytes;final long created;Item(Record r,int b,long c){record=r;bytes=b;created=c;}}
