@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.CopyOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -21,16 +22,27 @@ import java.util.Properties;
  * connections only.
  */
 public final class ProfileStore {
+    /** Moves the temporary file over the override file. Package-private so tests can inject a failing move. */
+    interface FileMover {
+        void move(Path source, Path target, CopyOption... options) throws IOException;
+    }
+
     private final Path file;
     private final ServerProfile defaults;
+    private final FileMover mover;
 
     /**
      * @param file the override file, created on first save
      * @param defaults the profile used when no override exists, and by {@link #restoreDefaults()}
      */
     public ProfileStore(Path file, ServerProfile defaults) {
+        this(file, defaults, Files::move);
+    }
+
+    ProfileStore(Path file, ServerProfile defaults, FileMover mover) {
         this.file = Objects.requireNonNull(file, "file");
         this.defaults = Objects.requireNonNull(defaults, "defaults");
+        this.mover = Objects.requireNonNull(mover, "mover");
         defaults.validate();
     }
 
@@ -86,10 +98,13 @@ public final class ProfileStore {
             try (OutputStream out = Files.newOutputStream(temp)) {
                 p.store(out, "QUICraft server profile");
             }
+            // No non-atomic fallback: a plain replace can leave a half-written profile after a crash. The
+            // temporary file is deleted below and the old override stays in place.
             try {
-                Files.move(temp, absolute, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                mover.move(temp, absolute, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             } catch (AtomicMoveNotSupportedException unsupported) {
-                Files.move(temp, absolute, StandardCopyOption.REPLACE_EXISTING);
+                throw new IOException("the filesystem cannot replace " + absolute + " atomically; profile not saved",
+                        unsupported);
             }
         } finally {
             Files.deleteIfExists(temp);

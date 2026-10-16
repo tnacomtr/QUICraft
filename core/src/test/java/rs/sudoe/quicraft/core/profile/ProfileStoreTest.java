@@ -78,6 +78,26 @@ class ProfileStoreTest {
     }
 
     @Test
+    void aFilesystemWithoutAtomicMoveFailsTheSaveAndKeepsTheOldFile() throws IOException {
+        Path file = dir.resolve("profile.properties");
+        new ProfileStore(file, ServerProfileTest.valid()).save(other());
+        byte[] before = Files.readAllBytes(file);
+
+        ProfileStore.FileMover refusesAtomic = (source, target, options) -> {
+            throw new java.nio.file.AtomicMoveNotSupportedException(source.toString(), target.toString(), "test");
+        };
+        ProfileStore store = new ProfileStore(file, ServerProfileTest.valid(), refusesAtomic);
+        IOException e = assertThrows(IOException.class, () -> store.save(ServerProfileTest.valid()));
+        assertTrue(e.getMessage().contains("atomically"), "the message says why the save failed");
+
+        assertTrue(java.util.Arrays.equals(before, Files.readAllBytes(file)), "the old override is untouched");
+        try (Stream<Path> leftovers = Files.list(dir)) {
+            assertEquals(1, leftovers.count(), "the temporary file is deleted after the failed move");
+        }
+        assertSame(other(), new ProfileStore(file, ServerProfileTest.valid()).load());
+    }
+
+    @Test
     void restoreDefaultsRemovesTheOverrideAndIsIdempotent() throws IOException {
         Path file = dir.resolve("profile.properties");
         ServerProfile defaults = ServerProfileTest.valid();
