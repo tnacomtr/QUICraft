@@ -31,15 +31,21 @@ abstract class ServerLoginPacketListenerImplMixin {
             target = "Lnet/minecraft/network/protocol/login/ServerboundKeyPacket;getSecretKey(Ljava/security/PrivateKey;)Ljavax/crypto/SecretKey;"))
     private SecretKey quicraft$secret(ServerboundKeyPacket packet, PrivateKey key) throws CryptException {
         SecretKey secret = packet.getSecretKey(key);
+        byte[] encoded = null;
         try {
             Hooks.enter("binding secret");
             V3Join join = V3Join.of(connection);
             if (join != null) {
-                join.onSecret(secret.getEncoded());
+                encoded = secret.getEncoded();
+                join.onSecret(encoded);
             }
         } catch (Throwable t) {
             Hooks.failed("binding secret", t);
             // A /3 join without its secret closes with 0x10 when binding starts; TCP never gets here.
+        } finally {
+            if (encoded != null) {
+                java.util.Arrays.fill(encoded, (byte) 0); // the join kept its own copy (12.6)
+            }
         }
         return secret;
     }
