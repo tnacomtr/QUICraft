@@ -259,24 +259,65 @@ class V3PlanCloseTest {
         assertTrue(c.failures.allows(c.address, QUIC_PORT, c.fingerprint));
     }
 
-    @Test
-    void everyNonMatchingCloseKeepsItsOwnClassificationAndWritesNoUnseenEntry() {
-        CloseEvent[] negatives = {
+    /** The closes that must never count as unseen-prerequisite events, each with its own reason. */
+    private static CloseEvent[] negatives() {
+        return new CloseEvent[] {
             peer(false, Protocol.CLOSE_RESOURCE, UNSEEN), // transport close 0x1c
             peer(true, 0x13, UNSEEN), // wrong code
             peer(true, Protocol.CLOSE_RESOURCE, "unseen".getBytes(StandardCharsets.US_ASCII)), // wrong phrase
             peer(true, Protocol.CLOSE_RESOURCE, new byte[0]), // no phrase
             CloseEvent.blockedHeadExpiry(true), // stall-affected or withheld
         };
-        for (CloseEvent negative : negatives) {
+    }
+
+    @Test
+    void everyNonMatchingCloseKeepsItsOwnClassificationAndWritesNoUnseenEntry() {
+        for (CloseEvent negative : negatives()) {
             Client c = new Client();
             for (int i = 0; i < 3; i++) {
                 c.active().closed(Phase.PLAY, negative, null);
+                // Checked straight after the close: a wrongly written shortest-step entry would
+                // still be live here, and would be long expired after any advance of the clock.
+                assertTrue(c.failures.allows(c.address, QUIC_PORT, c.fingerprint),
+                        "no shortest-step entry right after " + negative.kind() + " close " + (i + 1));
+                assertFalse(V3Plan.classify(negative, true, true, true) == CloseClass.UNSEEN_PREREQUISITE,
+                        "and it is not classified as an unseen-prerequisite event: " + negative.kind());
                 c.advance(MINUTE + SECOND);
             }
-            assertTrue(c.failures.allows(c.address, QUIC_PORT, c.fingerprint),
-                    "no shortest-step entry for " + negative.kind());
         }
+    }
+
+    @Test
+    void aNonMatchingCloseNeverPairsWithALaterValidOne() {
+        for (CloseEvent negative : negatives()) {
+            Client c = new Client();
+            c.active().closed(Phase.PLAY, negative, null);
+            assertTrue(c.failures.allows(c.address, QUIC_PORT, c.fingerprint));
+            c.advance(MINUTE);
+            // The first valid event: a counted event, but the negative must not have been one.
+            c.active().closed(Phase.PLAY, unseenClose(), null);
+            assertTrue(c.failures.allows(c.address, QUIC_PORT, c.fingerprint),
+                    "one valid event after " + negative.kind() + " is still only one counted event");
+            c.advance(MINUTE);
+            // The second valid event pairs with the first, not with the negative.
+            c.active().closed(Phase.PLAY, unseenClose(), null);
+            assertFalse(c.failures.allows(c.address, QUIC_PORT, c.fingerprint),
+                    "two valid events pair after " + negative.kind());
+        }
+    }
+
+    @Test
+    void anUnseenCloseBeforeServerSwitchNeverPairsWithALaterValidOne() {
+        Client c = new Client();
+        V3Plan early = c.join();
+        early.loginSucceeded();
+        early.closed(Phase.JOINING, unseenClose(), null);
+        assertTrue(c.failures.allows(c.address, QUIC_PORT, c.fingerprint),
+                "a pre-verification unseen-prerequisite close is not counted");
+        c.advance(MINUTE);
+        c.active().closed(Phase.PLAY, unseenClose(), null);
+        assertTrue(c.failures.allows(c.address, QUIC_PORT, c.fingerprint),
+                "so the first counted event is this one, and it writes nothing");
     }
 
     @Test
