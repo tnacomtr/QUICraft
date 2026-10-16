@@ -13,6 +13,8 @@ import io.netty.channel.DefaultChannelConfig;
 import io.netty.channel.EventLoop;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
+import java.util.concurrent.CompletableFuture;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 
 /**
@@ -68,6 +70,12 @@ public final class QuicBridgeChannel extends AbstractChannel {
     private boolean closeWhenDrained;
     /** Event loop only: a read() is outstanding while auto-read is off. */
     private boolean readRequested;
+    /** Event loop only: the stream was handed to a lane session, so this channel never touches it. */
+    private boolean handedOver;
+    /** Event loop only: a {@link #handOver} waiting for its ordering guarantee. */
+    private PendingHandOver pendingHandOver;
+    /** Event loop only: the zero-byte marker write of a {@link #handOver}; see {@link #doWrite}. */
+    private ByteBuf handOverMarker;
 
     public QuicBridgeChannel(Channel parent, QuicByteStream stream) {
         super(parent);
@@ -152,8 +160,17 @@ public final class QuicBridgeChannel extends AbstractChannel {
     @Override
     protected void doClose() throws Exception {
         open = false;
+        if (pendingHandOver != null) {
+            // Nothing will drain now, so the caller must be told, and the leftover it would have
+            // owned is released here.
+            failHandOver(new ClosedChannelException());
+        }
         releaseHeld();
-        stream.close();
+        if (!handedOver) {
+            stream.close();
+        }
+        // After handOver the lane session alone ends stream 0 (13.14): closing this channel is the
+        // game's pipeline going away, not a FIN or CONNECTION_CLOSE 0x0 on a stream we no longer own.
     }
 
     /**
@@ -163,6 +180,10 @@ public final class QuicBridgeChannel extends AbstractChannel {
      */
     @Override
     protected void doBeginRead() throws Exception {
+        if (handedOver) {
+            // The lane session reads stream 0 now, not this channel (12.10).
+            return;
+        }
         if (!config.isAutoRead()) {
             readRequested = true;
         }
@@ -181,6 +202,18 @@ public final class QuicBridgeChannel extends AbstractChannel {
 
     /** Event loop only. */
     private void onIncoming(ByteBuf data) {
+        if (handedOver) {
+            // The lane session owns stream 0. A byte arriving here means the caller handed the
+            // stream over without stopping it first (12.10): dropping it would silently corrupt the
+            // record stream, so this fails closed instead.
+            data.release();
+            IllegalStateException tooLate = new IllegalStateException(
+                    "stream 0 delivered data after it was handed to the lane session; stop it first"
+                            + " (12.10, 12.13)");
+            pipeline().fireExceptionCaught(tooLate);
+            unsafe().close(voidPromise());
+            return;
+        }
         if (!isOpen()) {
             data.release();
             return;
@@ -227,6 +260,10 @@ public final class QuicBridgeChannel extends AbstractChannel {
 
     /** Resumes a stream paused for held data, and completes a close that waited for it. */
     private void afterDelivery() {
+        if (handedOver) {
+            // The stream belongs to the lane session: never resume reading it.
+            return;
+        }
         if (pausedForHeld && heldBytes < HELD_LOW) {
             pausedForHeld = false;
             if (config.isAutoRead()) {
@@ -245,8 +282,133 @@ public final class QuicBridgeChannel extends AbstractChannel {
         return heldBytes;
     }
 
+    /**
+     * The {@code /3} cutover of docs/protocol.md 12.11/12.12, 13.2 and 13.14: hands stream 0 to a
+     * {@link rs.sudoe.quicraft.core.multistream.LaneSession}, so the lane session becomes its only
+     * owner and this channel stops being the game's transport.
+     *
+     * <p>Call it on this channel's event loop, at the byte boundary of the peer's final switch
+     * packet, after this side's own switch packet was written to the pipeline. It does four
+     * things:</p>
+     *
+     * <ul>
+     *   <li><b>Ordering.</b> The returned future completes only once every write submitted before
+     *       this call has been handed to the stream, in order, and can never complete earlier. A
+     *       message still queued because the stream was not writable therefore holds the future
+     *       back until it drains, instead of letting a record overtake the switch packet that was
+     *       queued first. It completes exceptionally when the channel closes first, and the
+     *       {@code controlLeftover} buffer is released in that case, so the caller must not release
+     *       it when the future fails.</li>
+     *   <li><b>No more reading.</b> The stream stops delivering (auto-read off) and nothing already
+     *       held here reaches the pipeline, so no byte the lane session owns is consumed twice.</li>
+     *   <li><b>The bytes already read.</b> Everything this channel read from the stream but the game
+     *       pipeline has not consumed, plus what the caller passes in {@code frameCumulation}, comes
+     *       back as one {@code controlLeftover} buffer that the caller owns and must release. The
+     *       bytes are in wire order: {@code frameCumulation} was read from the stream before the
+     *       bytes still held here (12.13). A ByteBuf the caller hands in is copied, not consumed:
+     *       the caller keeps ownership of its own buffer.</li>
+     *   <li><b>Detachment.</b> Closing this channel no longer closes the stream, so the lane
+     *       session alone ends stream 0: no FIN and no {@code CONNECTION_CLOSE} {@code 0x0} on a
+     *       stream it owns (13.14, plan gap G15). Later writes submitted to this channel fail
+     *       rather than reach the stream behind the session's back.</li>
+     * </ul>
+     *
+     * @param frameCumulation what the caller still holds undecoded, typically the frame decoder's
+     *     own cumulation; its bytes are copied and it stays the caller's. Null means none
+     * @return a future completed with the {@code controlLeftover} buffer (refCnt 1, caller-owned),
+     *     already complete when nothing was queued
+     * @throws IllegalStateException off the event loop, or on a second call
+     */
+    public CompletableFuture<ByteBuf> handOver(ByteBuf frameCumulation) {
+        if (!eventLoop().inEventLoop()) {
+            throw new IllegalStateException("handOver must run on the channel's event loop (12.10)");
+        }
+        if (handedOver) {
+            throw new IllegalStateException("stream 0 was already handed over");
+        }
+        handedOver = true;
+        // (b) Nothing more is read from stream 0, and nothing already held is delivered: from here
+        // on those bytes belong to the lane session, not to the game pipeline.
+        stream.setAutoRead(false);
+        readRequested = false;
+        // (c) One buffer, in wire order: what the caller still holds undecoded first, then what this
+        // channel read but has not delivered (12.13).
+        int cumulative = frameCumulation == null ? 0 : frameCumulation.readableBytes();
+        ByteBuf leftover = alloc().buffer(cumulative + (int) Math.min(heldBytes, Integer.MAX_VALUE));
+        try {
+            if (cumulative > 0) {
+                leftover.writeBytes(frameCumulation, frameCumulation.readerIndex(), cumulative);
+            }
+            ByteBuf heldBuffer;
+            while ((heldBuffer = held.poll()) != null) {
+                leftover.writeBytes(heldBuffer);
+                heldBuffer.release();
+            }
+        } catch (Throwable t) {
+            leftover.release();
+            throw t;
+        }
+        heldBytes = 0;
+        PendingHandOver pending = new PendingHandOver(leftover);
+        pendingHandOver = pending;
+        // (d) A zero-byte write appended after every write submitted before it. It carries the
+        // ordering guarantee: doWrite walks the outbound buffer in order, so this promise can only
+        // succeed once everything queued earlier reached the stream. It also makes the unwritable
+        // case observable: the marker stays queued with the rest until the stream drains.
+        ChannelPromise marker = newPromise();
+        marker.addListener(future -> {
+            if (future.isSuccess()) {
+                completeHandOver();
+            } else {
+                failHandOver(future.cause());
+            }
+        });
+        if (!isOpen()) {
+            marker.tryFailure(new ClosedChannelException());
+            return pending.result;
+        }
+        handOverMarker = alloc().buffer(0);
+        unsafe().write(handOverMarker, marker);
+        unsafe().flush();
+        return pending.result;
+    }
+
+    /** Event loop only: the marker reached the stream's write path, so every earlier write did too. */
+    private void completeHandOver() {
+        PendingHandOver pending = pendingHandOver;
+        if (pending == null) {
+            return;
+        }
+        pendingHandOver = null;
+        if (!pending.result.complete(pending.leftover)) {
+            // The caller gave up on the future, so nobody will own the leftover.
+            pending.leftover.release();
+        }
+    }
+
+    /** Event loop only: the hand-over cannot be honoured, so the caller gets nothing to own. */
+    private void failHandOver(Throwable cause) {
+        PendingHandOver pending = pendingHandOver;
+        if (pending == null) {
+            return;
+        }
+        pendingHandOver = null;
+        pending.leftover.release();
+        pending.result.completeExceptionally(cause != null ? cause : new ClosedChannelException());
+    }
+
+    /** One {@link #handOver} that is still waiting for the writes queued before it. */
+    private static final class PendingHandOver {
+        final CompletableFuture<ByteBuf> result = new CompletableFuture<>();
+        final ByteBuf leftover;
+
+        PendingHandOver(ByteBuf leftover) {
+            this.leftover = leftover;
+        }
+    }
+
     private boolean canDeliver() {
-        return config.isAutoRead() || readRequested;
+        return !handedOver && (config.isAutoRead() || readRequested);
     }
 
     /** The first slice runs later in this loop pass; see {@link #SLICE_BYTES}. */
@@ -258,6 +420,10 @@ public final class QuicBridgeChannel extends AbstractChannel {
     }
 
     private void deliverSlice() {
+        if (handedOver) {
+            delivering = false;
+            return;
+        }
         if (!isOpen()) {
             delivering = false;
             releaseHeld();
@@ -299,6 +465,20 @@ public final class QuicBridgeChannel extends AbstractChannel {
             Object msg = in.current();
             if (msg == null) {
                 break;
+            }
+            if (msg == handOverMarker) {
+                // The marker of handOver (see there): every write queued before it was handed to the
+                // stream in this same pass, so its promise completes the hand-over now.
+                in.remove();
+                handOverMarker = null;
+                continue;
+            }
+            if (handedOver && handOverMarker == null) {
+                // Submitted after the hand-over: the lane session owns stream 0, so a raw byte here
+                // would corrupt the record stream (13.4).
+                in.remove(new IllegalStateException(
+                        "stream 0 was handed to the lane session; writes go through it now"));
+                continue;
             }
             if (!stream.isWritable()) {
                 break; // resumed by StreamListener.onWritabilityChanged
