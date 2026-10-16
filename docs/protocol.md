@@ -1434,8 +1434,14 @@ position extraction. Those implementations must change together before this revi
     short reads or after one idle second; their cached allocator handle MUST enforce the
     current grant before each read. Serverbound auxiliary lanes absent from the routing
     table instead hold 1 KiB sentinel reads and reject any post-preamble data with `0x11`.
-    Thus an activated idle server connection with the shipped table reserves 30 KiB:
-    the separate 24 KiB quiche-unread admission share plus 4 + 1 + 1 KiB read grants.
+    Thus an activated idle server connection with the currently implemented table (every
+    serverbound record on CONTROL) reserves 30 KiB: the separate 24 KiB quiche-unread
+    admission share plus 4 + 1 + 1 KiB read grants (measured in `docs/benchmarks.md`).
+    The serverbound dual-lane draft below puts serverbound REALTIME in the table: that lane
+    then carries records within its 512-byte wire cap instead of holding a sentinel read,
+    its reads come from the 2 KiB REALTIME slice inside the 24 KiB share, and the 40 KiB
+    shared inflater is reserved at admission as well (about 64 KiB; open question 3).
+    Sentinel reads remain only for lanes the table leaves out.
     Do not reserve a maximum-sized record at its boundary: charge the exact parser
     allocation only once its length is known, withholding allocation and further reads
     non-fatally if it cannot fit. A partial record's remaining allocation is thereby
