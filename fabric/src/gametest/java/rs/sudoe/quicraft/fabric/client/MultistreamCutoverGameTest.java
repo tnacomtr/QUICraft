@@ -124,6 +124,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             offlineTestModeNeverAcceptsAChangedPin(protocol, table.get());
             theSharedSecretIsWipedOnEveryTerminalPath(protocol, table.get());
+            theSecretCaptureAndTheWipeAreOneCriticalSection(protocol, table.get());
             aCancelDuringBindingEndsTheSession(protocol, table.get());
             aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), false);
             aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), true);
@@ -653,6 +654,57 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(zeroed(retained), "wiped by the successful exchange");
             rig.channel.close().sync();
             check(zeroed(retained), "and still after the game closes");
+        }
+    }
+
+    /**
+     * 12.6: capturing S and wiping it are one critical section each. A capture that slips between
+     * the check and the store of the other would leave a live copy of S after the close, and a
+     * capture that replaces an earlier one would leave the replaced copy live too. The capture here
+     * clones megabytes, so a close landing anywhere inside it is likely on every iteration.
+     */
+    private static void theSecretCaptureAndTheWipeAreOneCriticalSection(int protocol, RoutingTable table)
+            throws Exception {
+        // A second capture replaces the first: the replaced copy is a live copy of S, so it is wiped.
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            V3Hooks.secret(rig.connection, rig.key);
+            byte[] first = rig.client.retainedSecret();
+            check(first != null && !zeroed(first), "the first capture is the retained secret");
+            V3Hooks.secret(rig.connection, rig.key);
+            byte[] second = rig.client.retainedSecret();
+            check(second != null && second != first, "the second capture replaced it");
+            check(zeroed(first), "the replaced copy is wiped");
+            check(!zeroed(second), "while the retained one is the real secret");
+        }
+        // A capture racing the close of the connection, many times over.
+        for (int iteration = 0; iteration < 20; iteration++) {
+            try (Rig rig = new Rig(protocol, table, false, false)) {
+                byte[] material = new byte[1 << 20];
+                new SecureRandom().nextBytes(material);
+                List<byte[]> seen = Collections.synchronizedList(new ArrayList<>());
+                java.util.concurrent.atomic.AtomicBoolean capturing = new java.util.concurrent.atomic.AtomicBoolean(true);
+                Thread capture = new Thread(() -> {
+                    while (capturing.get()) {
+                        rig.client.onSecret(material);
+                        byte[] live = rig.client.retainedSecret();
+                        if (live != null) {
+                            seen.add(live);
+                        }
+                    }
+                }, "secret capture");
+                capture.setDaemon(true);
+                capture.start();
+                Thread.sleep(20); // so a capture is inside its clone when the close lands
+                rig.channel.close().sync();
+                capturing.set(false);
+                capture.join(10_000);
+                check(!capture.isAlive(), "the capture loop stopped");
+                check(rig.client.retainedSecret() == null,
+                        "the close ends the capture: a live copy of S survived iteration " + iteration);
+                for (byte[] copy : seen) {
+                    check(zeroed(copy), "and every copy the capture made was wiped, iteration " + iteration);
+                }
+            }
         }
     }
 

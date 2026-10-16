@@ -97,6 +97,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private volatile @Nullable String failureText;
 
     // Login capture (set by the login hooks).
+    /** {@link #onSecret} and {@link #wipeSecret} are one critical section each: see there. */
+    private final Object secretLock = new Object();
     private volatile byte[] secret;
     private volatile boolean secretClosed;
     private volatile boolean authenticated;
@@ -194,7 +196,9 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     /** Tests: the retained secret itself (not a copy), to check that it was wiped. */
     byte[] retainedSecret() {
-        return secret;
+        synchronized (secretLock) {
+            return secret;
+        }
     }
 
     V3Plan plan() {
@@ -212,19 +216,34 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         return true;
     }
 
-    /** The 16-byte shared secret S that vanilla generated (12.4). */
+    /**
+     * The 16-byte shared secret S that vanilla generated (12.4). One critical section with
+     * {@link #wipeSecret}: a capture either happens before the wipe (and the wipe then owns its
+     * copy) or is refused and wipes its own, so no capture can slip past a close and leave a live
+     * copy of S behind (12.6).
+     */
     void onSecret(byte[] shared) {
-        if (secretClosed) {
-            return; // the join already ended or the exchange has its copy: nothing may capture S now
+        byte[] stored = shared == null ? null : shared.clone();
+        byte[] replaced;
+        synchronized (secretLock) {
+            if (secretClosed) {
+                wipe(stored);
+                return;
+            }
+            replaced = secret;
+            secret = stored;
         }
-        secret = shared == null ? null : shared.clone();
+        wipe(replaced);
     }
 
-    /** Wipes the retained secret and refuses any later capture (12.6): called on every way the join ends. */
+    /** Wipes the retained secret and refuses any later capture (12.6), atomically with capture. */
     private void wipeSecret() {
-        secretClosed = true;
-        byte[] retained = secret;
-        secret = null;
+        byte[] retained;
+        synchronized (secretLock) {
+            secretClosed = true;
+            retained = secret;
+            secret = null;
+        }
         wipe(retained);
     }
 
