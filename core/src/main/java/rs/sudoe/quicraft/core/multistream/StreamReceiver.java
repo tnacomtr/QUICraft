@@ -227,6 +227,10 @@ public final class StreamReceiver {
             return Admission.violation("unit closes at " + closingSequence + " but holds " + recordCount
                     + " records from " + record.sequence() + " on stream " + stream);
         }
+        if (closingSequence != record.sequence()
+                && (stream != LogicalStream.CONTROL || direction == Direction.SERVERBOUND)) {
+            return Admission.violation("multi-record unit outside clientbound CONTROL (13.15) on stream " + stream);
+        }
         Admission epochCheck = checkEpoch(record);
         if (epochCheck != null) {
             return epochCheck;
@@ -517,18 +521,18 @@ public final class StreamReceiver {
 
     /**
      * Returns true when a transition for the current epoch is pending (validated, not yet applied) or can
-     * still be admitted: an unvalidated head at the current epoch might turn out to be one (13.18).
+     * still be admitted: an unvalidated clientbound CONTROL head at the current epoch might turn out to be one
+     * (13.18). Transitions are CONTROL-only and never serverbound, so no other head counts.
      */
     private boolean transitionReachable() {
         if (transitionPending) {
             return true;
         }
-        for (Unit unit : head) {
-            if (unit != null && !unit.validated && unit.record.epoch() == epoch) {
-                return true;
-            }
+        if (direction == Direction.SERVERBOUND) {
+            return false;
         }
-        return false;
+        Unit control = head[LogicalStream.CONTROL];
+        return control != null && !control.validated && control.record.epoch() == epoch;
     }
 
     /**
@@ -542,6 +546,9 @@ public final class StreamReceiver {
         }
         if (direction == Direction.SERVERBOUND) {
             return ReceiveClose.peerViolation("serverbound transition route (13.18)");
+        }
+        if (record.streamIndex() != LogicalStream.CONTROL) {
+            return ReceiveClose.peerViolation("transition route outside CONTROL on stream " + record.streamIndex());
         }
         if (record.epoch() != epoch) {
             return ReceiveClose.peerViolation("transition must carry the old epoch " + epoch);

@@ -111,13 +111,13 @@ class StreamReceiverTest {
         Fixture f = new Fixture(2);
         long full = ReceiveSlots.BYTES_PER_STREAM;
         int records = ReceiveSlots.RECORDS_PER_STREAM;
-        // REALTIME, CONTROL and a chunk head each hold a complete slot at its limit.
+        // REALTIME, CONTROL and a chunk head each hold a complete slot at its byte limit (only CONTROL bundles span records).
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(1, 1, 0), records, full, records).kind());
+                f.receiver.offer(rec(1, 1, 0), 1, full, 1).kind());
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
                 f.receiver.offer(rec(0, 1, 0), records, full, records).kind());
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(2, 1, 0), records, full, records).kind());
+                f.receiver.offer(rec(2, 1, 0), 1, full, 1).kind());
         assertEquals(1, f.receiver.nextToEnqueue(), "REALTIME before CONTROL and chunks");
         enqueue(f.receiver, 1, 1);
         assertEquals(0, f.receiver.nextToEnqueue(), "CONTROL before the chunk head");
@@ -272,6 +272,29 @@ class StreamReceiverTest {
         assertViolation(f.receiver.offer(rec(0, 1, 0), 0, 300, 1));
         assertViolation(f.receiver.offer(rec(0, 1, 0), 1, 300, 0));
         assertAdmitted(f.receiver, rec(0, 1, 0));
+    }
+
+    @Test void multiRecordUnitOutsideClientboundControlIsAViolation() {
+        Fixture f = new Fixture(2);
+        assertViolation(f.receiver.offer(rec(1, 1, 0), 3, 300, 3));
+        Fixture g = new Fixture(2);
+        assertViolation(g.receiver.offer(rec(2, 1, 0), 2, 200, 2));
+        StreamReceiver rx = new StreamReceiver(2, Direction.SERVERBOUND, (s, r, route) -> true, () -> 0L);
+        assertViolation(rx.offer(rec(0, 1, 0), 3, 300, 3));
+    }
+
+    @Test void aBlockedNonControlHeadIsNoTransitionPath() {
+        Fixture f = new Fixture(2);
+        // REALTIME head at epoch 0 waits on a CONTROL record that never comes; it can never be a transition.
+        assertAdmitted(f.receiver, rec(1, 1, 0, dep(0, 1)));
+        assertViolation(offer(f.receiver, rec(2, 1, 1)));
+    }
+
+    @Test void transitionRouteOnAChunkHeadIsAViolation() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0));
+        assertClose(f.receiver.validateEligible(2,
+                new ReceiveRoute(ReceiveRoute.Lane.CHUNK, Dependency.ORDINARY, null, true, false)));
     }
 
     @Test void admissionNeverRunsTheBodyValidatorAndAnEligibleHeadRunsItExactlyOnce() {
@@ -482,7 +505,8 @@ class StreamReceiverTest {
         for (int s = 0; s < 8; s++) {
             Record r = s == blocked ? rec(s, 1, 0, dep(prereq, 1)) : rec(s, 1, 0);
             assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                    f.receiver.offer(r, records, full, records).kind(), "stream " + s + " prereq " + prereq);
+                    s == 0 ? f.receiver.offer(r, records, full, records).kind() : f.receiver.offer(r, 1, full, 1).kind(),
+                    "stream " + s + " prereq " + prereq);
         }
         if (locallyWithheld) {
             f.receiver.markLocallyWithheld(prereq, 1);
