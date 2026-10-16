@@ -37,11 +37,18 @@ public final class V3Hooks {
         if (client == null) {
             return;
         }
+        byte[] encoded = null;
         try {
             Hooks.enter("v3 secret");
-            client.onSecret(key.getEncoded());
+            encoded = key.getEncoded();
+            client.onSecret(encoded);
         } catch (Throwable t) {
             failed("v3 secret", client, t);
+        } finally {
+            // The encoding is a temporary copy of S (12.6): never left behind.
+            if (encoded != null) {
+                java.util.Arrays.fill(encoded, (byte) 0);
+            }
         }
     }
 

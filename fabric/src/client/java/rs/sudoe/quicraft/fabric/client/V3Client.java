@@ -94,6 +94,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     // Login capture (set by the login hooks).
     private volatile byte[] secret;
+    private volatile boolean secretClosed;
     private volatile boolean authenticated;
     private volatile boolean encrypted;
     private volatile boolean onlineMode;
@@ -144,6 +145,11 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         return failureText;
     }
 
+    /** Tests: the retained secret itself (not a copy), to check that it was wiped. */
+    byte[] retainedSecret() {
+        return secret;
+    }
+
     V3Plan plan() {
         return plan;
     }
@@ -161,7 +167,18 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     /** The 16-byte shared secret S that vanilla generated (12.4). */
     void onSecret(byte[] shared) {
+        if (secretClosed) {
+            return; // the join already ended or the exchange has its copy: nothing may capture S now
+        }
         secret = shared == null ? null : shared.clone();
+    }
+
+    /** Wipes the retained secret and refuses any later capture (12.6): called on every way the join ends. */
+    private void wipeSecret() {
+        secretClosed = true;
+        byte[] retained = secret;
+        secret = null;
+        wipe(retained);
     }
 
     /** The session-server join result: true only when the join was authenticated (12.7). */
@@ -227,8 +244,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                     onlineMode ? BindingStateMachine.MODE_ONLINE : BindingStateMachine.MODE_OFFLINE, protocolNumber,
                     plan.fingerprintBytes(), plan.routingDigest(), System::nanoTime, offerWaitNanos, this, loop,
                     loop::inEventLoop);
-            wipe(secret);
-            secret = null;
+            wipeSecret();
             payloads = new BindingPayloads(session, this, this);
             payloads.onConfigurationEntered(System.nanoTime());
         } catch (Throwable t) {
@@ -276,6 +292,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     /** The bridge channel went inactive. */
     void channelClosed() {
+        wipeSecret();
         if (state == State.ACTIVE || state == State.FAILED || serverDisconnected || closingByGame) {
             return;
         }
@@ -284,6 +301,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     /** The game closes the channel (the player leaves, or the game disconnects). */
     void closing() {
+        wipeSecret();
         closingByGame = true;
         if (state == State.ACTIVE && !ended) {
             ended = true;
@@ -575,8 +593,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         } catch (Throwable ignored) {
             // The connection is closing anyway.
         }
-        wipe(secret);
-        secret = null;
+        wipeSecret();
         for (Object o : held) {
             ((Held) o).promise.tryFailure(new ClosedChannelException());
         }

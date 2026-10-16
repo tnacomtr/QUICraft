@@ -118,6 +118,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             theTailKeepsProtocolSwitchTasksAwayFromTheLanes(table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             offlineTestModeNeverAcceptsAChangedPin(protocol, table.get());
+            theSharedSecretIsWipedOnEveryTerminalPath(protocol, table.get());
             aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), false);
             aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), true);
             aChangedCertificateIsReboundAndTheNewPinIsNoticed(protocol, table.get());
@@ -393,6 +394,99 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(rig.awaitCondition(() -> !rig.channel.isOpen()), "silence closed the connection, as vanilla does");
         } finally {
             V3Client.readTimeoutMillis = 30_000L;
+        }
+    }
+
+    /** A key whose encoding is one array we can look at afterwards. */
+    private static final class WatchedKey implements SecretKey {
+        private static final long serialVersionUID = 1L;
+        final byte[] encoded;
+
+        WatchedKey(byte[] encoded) {
+            this.encoded = encoded;
+        }
+
+        @Override
+        public String getAlgorithm() {
+            return "AES";
+        }
+
+        @Override
+        public String getFormat() {
+            return "RAW";
+        }
+
+        @Override
+        public byte[] getEncoded() {
+            return encoded;
+        }
+    }
+
+    private static boolean zeroed(byte[] bytes) {
+        for (byte b : bytes) {
+            if (b != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 12.6: S exists only as long as the exchange needs it. The temporary copy of the encoding is
+     * wiped at once, and the retained one on every way the join can end: success, failure, the
+     * player cancelling, the server kicking, the game closing. A capture after the end is refused.
+     */
+    private static void theSharedSecretIsWipedOnEveryTerminalPath(int protocol, RoutingTable table)
+            throws Exception {
+        // The temporary: wiped right after the hook, while the retained clone is real.
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            byte[] encoded = rig.secret.clone();
+            V3Hooks.secret(rig.connection, new WatchedKey(encoded));
+            check(zeroed(encoded), "the temporary encoding is wiped");
+            byte[] retained = rig.client.retainedSecret();
+            check(retained != null && !zeroed(retained), "while the retained one is the real secret");
+        }
+        // Failure before the exchange starts (an unauthenticated session join).
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            V3Hooks.hello(rig.connection, true);
+            V3Hooks.secret(rig.connection, rig.key);
+            byte[] retained = rig.client.retainedSecret();
+            V3Hooks.authenticated(rig.connection, Component.literal("no"));
+            rig.connection.setEncryptionKey(Crypt.getCipher(Cipher.DECRYPT_MODE, rig.key),
+                    Crypt.getCipher(Cipher.ENCRYPT_MODE, rig.key));
+            check(!V3Hooks.loginFinished(rig.connection), "refused");
+            check(rig.awaitCondition(() -> zeroed(retained)), "wiped on failure");
+            V3Hooks.secret(rig.connection, rig.key);
+            check(rig.client.retainedSecret() == null, "a late capture is refused after the end");
+        }
+        // The player cancels while logging in.
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            V3Hooks.secret(rig.connection, rig.key);
+            byte[] retained = rig.client.retainedSecret();
+            rig.channel.close().sync();
+            check(rig.awaitCondition(() -> zeroed(retained)), "wiped when the game closes the channel early");
+        }
+        // The server kicks the player (a disconnect packet, then the close).
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            V3Hooks.secret(rig.connection, rig.key);
+            byte[] retained = rig.client.retainedSecret();
+            rig.fake.inject(rig.server.frame(new ClientboundDisconnectPacket(Component.literal("bye"))));
+            rig.awaitCondition(() -> rig.listener.disconnects > 0);
+            rig.fake.closeByPeer();
+            check(rig.awaitCondition(() -> zeroed(retained)), "wiped when the server ends the connection");
+        }
+        // Success: the exchange takes its copy and the retained one is wiped at the start.
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            byte[] retained = rig.client.retainedSecret();
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+            check(rig.awaitState(V3Client.State.ACTIVE), "active");
+            check(zeroed(retained), "wiped by the successful exchange");
+            rig.channel.close().sync();
+            check(zeroed(retained), "and still after the game closes");
         }
     }
 
