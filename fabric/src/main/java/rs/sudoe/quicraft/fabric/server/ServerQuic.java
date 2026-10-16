@@ -16,8 +16,10 @@ import net.minecraft.server.dedicated.DedicatedServerProperties;
 import net.minecraft.server.network.EventLoopGroupHolder;
 import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.bridge.GameHost;
+import rs.sudoe.quicraft.bridge.MultistreamSwitch;
 import rs.sudoe.quicraft.bridge.QuicBridgeChannel;
 import rs.sudoe.quicraft.bridge.status.StatusAdvertising;
+import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.connect.FallbackReport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
@@ -117,7 +119,7 @@ public final class ServerQuic {
             InetSocketAddress udp = address != null ? new InetSocketAddress(address, quicPort)
                     : new InetSocketAddress(quicPort);
             ServerIdentity identity = ServerIdentity.loadOrCreate(dir);
-            current = bind(minecraft, udp, identity, init, settings.udpSockets());
+            current = bind(minecraft, udp, identity, init, settings);
             QuicraftFabric.LOG.info("QUICraft: QUIC listening on UDP {} with {} socket(s) (fingerprint {}); open this "
                     + "UDP port in your firewall", current.server.localAddress(), current.sockets,
                     identity.fingerprint());
@@ -129,23 +131,76 @@ public final class ServerQuic {
     }
 
     private static ServerQuic bind(MinecraftServer minecraft, InetSocketAddress udp, ServerIdentity identity,
-            ChannelInitializer<Channel> init, int udpSockets) throws Exception {
+            ChannelInitializer<Channel> init, ServerSettings settings) throws Exception {
         // The group vanilla's TCP listener runs on; QUIC players share its loops, one UDP socket
         // per loop with SO_REUSEPORT so the server's QUIC work spreads over several of them
         // (docs/protocol.md §11). bindHosted fails safe: one socket wherever several are not
         // possible, and only a failure to bind the first one throws.
         EventLoopGroupHolder holder = EventLoopGroupHolder.remote(minecraft.useNativeTransport());
         ChannelFactory<? extends DatagramChannel> datagrams = GameHost.datagramChannelsLike(holder.channelCls());
-        GameHost.HostedSockets sockets = GameHost.bindHosted(holder.eventLoopGroup(), udpSockets, udp, datagrams);
+        GameHost.HostedSockets sockets = GameHost.bindHosted(holder.eventLoopGroup(), settings.udpSockets(), udp,
+                datagrams);
         try {
-            QuicServer server = QuicServer.bind(sockets.hostLoops(), sockets.hostSockets(), identity,
-                    TransportConfig.DEFAULT, stream -> accept(stream, init, sockets.acceptingLoop()));
-            return new ServerQuic(server, Advertisement.v1(server.localAddress().getPort(), identity.fingerprint()),
-                    server.localAddress().getPort(), sockets.size());
+            // The disabled-by-default /3 switch (12.1, 12.3, 13.1, 13.13). Off, or missing any
+            // prerequisite, is today's quicraft/2 listener and advertisement, unchanged.
+            MultistreamSwitch.Reason decision = MultistreamSwitch.probe(settings.multistream());
+            boolean multistream = false;
+            QuicServer server = null;
+            if (decision.isEnabled()) {
+                server = bindV3(sockets, identity, init, settings);
+                multistream = server != null;
+                if (server == null) {
+                    // The failed bind closed the sockets it had registered, so bind them again for
+                    // the /2 listener rather than leaving the server without QUIC at all.
+                    sockets = GameHost.bindHosted(holder.eventLoopGroup(), settings.udpSockets(), udp, datagrams);
+                }
+            } else if (settings.multistream()) {
+                // Once per start, never a failure: 12.3's false capability probe is an ordinary
+                // compatibility condition.
+                QuicraftFabric.LOG.info("QUICraft: multi-stream is unavailable here: {}", decision.message());
+            }
+            if (server == null) {
+                final GameHost.HostedSockets bound = sockets;
+                server = QuicServer.bind(bound.hostLoops(), bound.hostSockets(), identity,
+                        TransportConfig.DEFAULT, stream -> accept(stream, init, bound.acceptingLoop()));
+            }
+            int port = server.localAddress().getPort();
+            Advertisement advertisement = multistream
+                    ? Advertisement.of(Protocol.ALPN_V3, port, identity.fingerprint(),
+                            MultistreamSwitch.advertisedRouting())
+                    : Advertisement.v1(port, identity.fingerprint());
+            if (multistream) {
+                QuicraftFabric.LOG.info("QUICraft: multi-stream (/3) enabled: advertising quicraft/3 for {}"
+                        + " protocol number(s); node pending-bytes budget {} (provisional until the"
+                        + " 50,000-connection benchmark, 13.17)",
+                        Integer.valueOf(MultistreamSwitch.advertisedRouting().size()),
+                        Long.valueOf(settings.multistreamNodeBudgetBytes()));
+            }
+            return new ServerQuic(server, advertisement, port, sockets.size());
         } catch (Exception | Error e) {
             // Core closes the sockets it registered; this covers a failure before it did.
             sockets.close();
             throw e;
+        }
+    }
+
+    /**
+     * The {@code /3}-only listener (13.1), or null when it cannot be bound: a failure here is never
+     * the end of QUIC on this server, it is today's {@code /2} listener instead.
+     */
+    private static QuicServer bindV3(GameHost.HostedSockets sockets, ServerIdentity identity,
+            ChannelInitializer<Channel> init, ServerSettings settings) {
+        try {
+            return QuicServer.bind(sockets.hostLoops(), sockets.hostSockets(), identity,
+                    TransportConfig.DEFAULT, stream -> accept(stream, init, sockets.acceptingLoop()),
+                    MultistreamSwitch::tableFor);
+        } catch (Throwable t) {
+            // docs/protocol.md 12.3: log once and stay on quicraft/2; 0-RTT (12.18) is untouched by
+            // this path either way, because the transport's own early-data setting is unchanged.
+            QuicraftFabric.LOG.warn("QUICraft: the multi-stream listener could not be bound ({});"
+                    + " advertising quicraft/2 instead", t.toString());
+            QuicraftFabric.LOG.debug("QUICraft: multi-stream bind failure", t);
+            return null;
         }
     }
 

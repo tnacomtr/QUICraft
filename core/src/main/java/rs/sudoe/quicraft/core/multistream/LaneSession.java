@@ -307,6 +307,22 @@ public final class LaneSession {
         run(() -> doApplied(lane, sequence));
     }
 
+    /**
+     * The lane the routing table assigns to one outbound packet of this connection (13.6): the same
+     * lookup {@link #send} does, without submitting anything, so a game can validate its own routing
+     * answer before a packet is sequenced. A missing entry is CONTROL, never an inferred category.
+     *
+     * <p>Safe from any thread: the table is immutable and never changes for a connection. A packet
+     * this answers CONTROL for is not thereby safe to send as REALTIME or WORLD; the answer is
+     * authoritative and a disagreement is a 13.6 routing error.</p>
+     */
+    public Lane outboundLane(ProtocolState state, int packetId) {
+        if (state == null) {
+            throw new IllegalArgumentException("state");
+        }
+        return table.laneFor(state, sendDirection, packetId);
+    }
+
     /** True while the unsent queue is below its backpressure mark. Readable from any thread. */
     public boolean isWritable() {
         return writable;
