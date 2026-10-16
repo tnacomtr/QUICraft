@@ -21,19 +21,20 @@ class PreLoginAdmissionTest {
         return new NodePools(1000, 0, 0, 10, false, 0);
     }
 
-    @Test void promotionIsAtomicAndRefusedWhileNodeIsFull() throws Exception {
+    @Test void promotionIsAtomicAndKeepsTheSharedNodeBudget() throws Exception {
         NodePools pools = pools();
         PreLoginAdmission admission = new PreLoginAdmission(pools, new Random(1));
         assertTrue(admission.reserve("a", ip("2001:db8:1::1"), 60));
-        assertTrue(pools.reserve(ResourcePools.Pool.NODE, "full", 1000));
-        assertFalse(admission.promote("a", 60));
+        // The pre-login charge is part of the node budget, so a full-budget reserve is refused while it is held.
+        assertFalse(pools.reserve(ResourcePools.Pool.NODE, "full", 1000));
+        assertTrue(pools.reserve(ResourcePools.Pool.NODE, "other", 940));
         assertEquals(60, admission.reserved("a"));
         assertEquals(60, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
-        pools.release(ResourcePools.Pool.NODE, "full", 1000);
         assertTrue(admission.promote("a", 60));
         assertEquals(0, admission.reserved("a"));
         assertEquals(0, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
         assertEquals(60, pools.reserved(ResourcePools.Pool.NODE, "a"));
+        assertEquals(1000, pools.reserved(ResourcePools.Pool.NODE));
     }
 
     @Test void manyIpsInOneSlash48CannotStarveAnotherSlash48() throws Exception {

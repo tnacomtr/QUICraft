@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core.resource;
 
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -26,6 +27,12 @@ public final class NodePools implements ResourcePools {
     private final Map<Pool, Long> limits = new EnumMap<Pool, Long>(Pool.class);
     private final Map<Pool, Long> totals = new EnumMap<Pool, Long>(Pool.class);
     private final Map<Pool, Map<Object, Long>> charges = new EnumMap<Pool, Map<Object, Long>>(Pool.class);
+    /**
+     * Pools that share the node budget (protocol.md 12 pre-login block and 13.12 shared accounting): their
+     * combined totals never exceed {@code nodeLimit}. Inbound excess and outbound have their own caps.
+     */
+    private static final EnumSet<Pool> BUDGETED = EnumSet.of(Pool.NODE, Pool.INFLATER, Pool.PRE_LOGIN);
+    private final long nodeLimit;
     private final long connectionExcess;
     private final boolean reserveDeflaterAtAdmission;
 
@@ -47,6 +54,7 @@ public final class NodePools implements ResourcePools {
         nonnegative(outboundLimit, "outboundLimit");
         if (preLoginPercent < 0 || preLoginPercent > 100) throw new IllegalArgumentException("preLoginPercent");
         if (connectionExcess < 0) throw new IllegalArgumentException("connectionExcess");
+        this.nodeLimit = nodeLimit;
         this.connectionExcess = connectionExcess;
         this.reserveDeflaterAtAdmission = reserveDeflaterAtAdmission;
         limits.put(Pool.NODE, nodeLimit);
@@ -89,7 +97,7 @@ public final class NodePools implements ResourcePools {
     /** Reserves bytes atomically, returning false (and changing nothing) if the pool cannot take them. */
     @Override public synchronized boolean reserve(Pool pool, Object owner, long bytes) {
         check(pool, owner, bytes);
-        if (bytes > limits.get(pool) - totals.get(pool)) return false;
+        if (!fits(pool, bytes)) return false;
         Map<Object, Long> map = charges.get(pool);
         map.put(owner, value(map, owner) + bytes);
         totals.put(pool, totals.get(pool) + bytes);
@@ -119,13 +127,28 @@ public final class NodePools implements ResourcePools {
         Map<Object, Long> source = charges.get(from);
         Long old = source.get(owner);
         if (old == null || bytes > old) throw new IllegalStateException("promotion exceeds reservation");
-        if (bytes > limits.get(to) - totals.get(to)) return false;
+        // A move inside the node budget keeps the budget total; only a move into it can overcommit.
+        boolean entersBudget = BUDGETED.contains(to) && !BUDGETED.contains(from);
+        if (entersBudget ? !fits(to, bytes) : bytes > limits.get(to) - totals.get(to)) return false;
         if (bytes == old) source.remove(owner); else source.put(owner, old - bytes);
         totals.put(from, totals.get(from) - bytes);
         Map<Object, Long> target = charges.get(to);
         target.put(owner, value(target, owner) + bytes);
         totals.put(to, totals.get(to) + bytes);
         return true;
+    }
+
+    /** True when the pool has room, and for budgeted pools the shared node budget has room too. */
+    private boolean fits(Pool pool, long bytes) {
+        if (bytes > limits.get(pool) - totals.get(pool)) return false;
+        return !BUDGETED.contains(pool) || bytes <= nodeLimit - budgeted();
+    }
+
+    /** Combined bytes of the pools that share the node budget. */
+    private long budgeted() {
+        long total = 0;
+        for (Pool pool : BUDGETED) total += totals.get(pool);
+        return total;
     }
 
     private static long value(Map<Object, Long> map, Object owner) {

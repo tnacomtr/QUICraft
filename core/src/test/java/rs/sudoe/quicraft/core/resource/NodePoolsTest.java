@@ -35,13 +35,14 @@ class NodePoolsTest {
     }
 
     @Test void refusedPromotionLeavesBothPoolsUnchanged() {
-        NodePools pools = new NodePools(1000, 0, 0, 10, false, 0);
-        assertTrue(pools.reserve(ResourcePools.Pool.NODE, "full", 1000));
-        assertTrue(pools.reserve(ResourcePools.Pool.PRE_LOGIN, "a", 100));
-        assertFalse(pools.promote(ResourcePools.Pool.PRE_LOGIN, ResourcePools.Pool.NODE, "a", 100));
-        assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN, "a"));
-        assertEquals(100, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
-        assertEquals(1000, pools.reserved(ResourcePools.Pool.NODE));
+        // PRE_LOGIN to NODE never changes the shared total, so a refusal needs a source outside the budget.
+        NodePools pools = new NodePools(1000, 1000, 0, 10, false, 0);
+        assertTrue(pools.reserve(ResourcePools.Pool.NODE, "full", 900));
+        assertTrue(pools.reserve(ResourcePools.Pool.INBOUND_EXCESS, "a", 150));
+        assertFalse(pools.promote(ResourcePools.Pool.INBOUND_EXCESS, ResourcePools.Pool.NODE, "a", 150));
+        assertEquals(150, pools.reserved(ResourcePools.Pool.INBOUND_EXCESS, "a"));
+        assertEquals(150, pools.reserved(ResourcePools.Pool.INBOUND_EXCESS));
+        assertEquals(900, pools.reserved(ResourcePools.Pool.NODE));
     }
 
     @Test void successfulPromotionMovesTheWholeChargeAtomically() {
@@ -104,5 +105,26 @@ class NodePoolsTest {
         for (Thread t : threads) t.join();
         assertEquals(initial, pools.reserved(ResourcePools.Pool.PRE_LOGIN) + pools.reserved(ResourcePools.Pool.NODE));
         assertEquals(0, pools.reserved(ResourcePools.Pool.PRE_LOGIN));
+    }
+
+    @Test void budgetedPoolsShareOneNodeBudgetNotEachAlone() {
+        NodePools pools = new NodePools(1000, 0, 0, 10, true, 0);
+        assertTrue(pools.reserve(ResourcePools.Pool.NODE, "node", 900));
+        // INFLATER alone has 1000 bytes of room, but the node budget only has 100 left (protocol.md 13.12).
+        assertFalse(pools.reserve(ResourcePools.Pool.INFLATER, "inflater", 200));
+        assertEquals(0, pools.reserved(ResourcePools.Pool.INFLATER));
+        assertTrue(pools.reserve(ResourcePools.Pool.INFLATER, "inflater", 100));
+        assertFalse(pools.reserve(ResourcePools.Pool.PRE_LOGIN, "pre", 1));
+    }
+
+    @Test void promotionKeepsTheSharedTotalAndNodeRoomIsCheckedAfterIt() {
+        NodePools pools = new NodePools(1000, 0, 0, 10, false, 0);
+        assertTrue(pools.reserve(ResourcePools.Pool.INFLATER, "inflater", 900));
+        assertTrue(pools.reserve(ResourcePools.Pool.PRE_LOGIN, "pre", 100));
+        assertFalse(pools.reserve(ResourcePools.Pool.NODE, "node", 1), "budget is full across pools");
+        assertTrue(pools.promote(ResourcePools.Pool.PRE_LOGIN, ResourcePools.Pool.NODE, "pre", 100));
+        assertEquals(100, pools.reserved(ResourcePools.Pool.NODE, "pre"));
+        assertEquals(1000, pools.reserved(ResourcePools.Pool.NODE) + pools.reserved(ResourcePools.Pool.INFLATER)
+                + pools.reserved(ResourcePools.Pool.PRE_LOGIN));
     }
 }
