@@ -122,6 +122,21 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     /** The protocol the packet being written is sent in, stamped at the tail before the encoder swaps. */
     private ProtocolState sendState = ProtocolState.CONFIGURATION;
     private LaneSend laneSend;
+    /**
+     * What may be accepted but not yet run on the main thread before acknowledgements are held back.
+     * Provisional: the 13.17 benchmark sets the real numbers.
+     */
+    static final int MAX_UNRUN_PACKETS = 256;
+    static final long MAX_UNRUN_BYTES = 1L << 20;
+    private final Object accounting = new Object();
+    private long unrunPackets;
+    private long unrunBytes;
+    private GameLanes.Ack heldAck;
+    /** Event loop only: packets fired since the last acknowledgement. */
+    private long deliveredPackets;
+    private final java.util.concurrent.atomic.AtomicLong decodedBytes = new java.util.concurrent.atomic.AtomicLong();
+    private volatile java.util.function.Consumer<Runnable> mainThread = this::onGamePacketQueue;
+    private volatile AckSink ackSink = (lane, sequence) -> lanes.applied(lane, sequence);
 
     V3Client(Connection connection, QuicBridgeChannel channel, EventLoop loop, V3Connection v3, V3Plan plan,
             RoutingTable table, int protocolNumber, boolean quicOnly, ClientV3State files, String logicalHost, int logicalPort,
@@ -139,7 +154,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         this.oldFingerprint = oldFingerprint;
         this.offlineTest = Boolean.getBoolean(OFFLINE_TEST_PROPERTY);
         this.loop = loop; // the channel is not registered yet when this is built
-        this.codec = new LaneCodec(channel, table);
+        this.codec = new LaneCodec(channel, table, decodedBytes::addAndGet);
     }
 
     /** Where an encoded packet goes: the lane session in production, a recorder in tests. */
@@ -427,40 +442,105 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     }
 
     /**
-     * The game applied everything up to this delivery (13.10): acknowledge from the game's main
-     * thread, queued behind the packets on the queue that applies them ({@link AckPacket}).
+     * 13.10: the game's serial handler has ACCEPTED a delivery, which is when this runs: the packets
+     * were fired through the pipeline and {@code Connection.channelRead0} returned for each (handled
+     * inline, or queued first-in-first-out for the main thread). Acknowledging now, not when the main
+     * thread has run them, is what lets the lane scheduler (one outstanding delivery at a time) go on
+     * at network speed instead of at the frame rate.
+     *
+     * <p>What is accepted but not yet run is counted ({@link #unrunPackets}, {@link #unrunBytes}); a
+     * marker queued behind the packets on the game's own packet queue ({@link AckPacket}) takes them
+     * off the count when it runs. Only while the count is over the bound is the acknowledgement held
+     * back, until the main thread has caught up: that is the backpressure on a game that cannot keep up.</p>
      */
     void acknowledge(GameLanes.Ack ack) {
-        Lane lane = ack.lane();
-        long sequence = ack.sequence();
+        final long packets = deliveredPackets;
+        deliveredPackets = 0;
+        final long bytes = decodedBytes.getAndSet(0);
         final V3Handler watcher = handler;
+        boolean hold;
+        synchronized (accounting) {
+            unrunPackets += packets;
+            unrunBytes += bytes;
+            hold = overBound();
+            if (hold) {
+                heldAck = ack;
+            }
+        }
         if (watcher != null) {
             watcher.deliveryQueued();
         }
-        Runnable apply = () -> {
-            if (watcher != null) {
-                watcher.deliveryApplied();
-            }
-            try {
-                GameLanes current = lanes;
-                if (current != null && !current.isClosed()) {
-                    current.applied(lane, sequence);
+        try {
+            mainThread.accept(() -> {
+                GameLanes.Ack release = null;
+                synchronized (accounting) {
+                    unrunPackets -= packets;
+                    unrunBytes -= bytes;
+                    if (heldAck != null && !overBound()) {
+                        release = heldAck;
+                        heldAck = null;
+                    }
                 }
-            } catch (Throwable t) {
-                fail(t);
-            }
-        };
+                if (watcher != null) {
+                    watcher.deliveryApplied();
+                }
+                if (release != null) {
+                    applyAck(release);
+                }
+            });
+        } catch (RejectedExecutionException closing) {
+            return; // the game is shutting down; nothing is left to acknowledge
+        }
+        if (!hold) {
+            applyAck(ack);
+        }
+    }
+
+    /** Production: behind the packets already queued for the main thread. */
+    private void onGamePacketQueue(Runnable marker) {
         Minecraft minecraft = Minecraft.getInstance();
         PacketListener listener = connection.getPacketListener();
         if (listener == null) {
-            minecraft.execute(apply);
-            return;
+            minecraft.execute(marker);
+        } else {
+            minecraft.packetProcessor().scheduleIfPossible(listener, new AckPacket(marker));
         }
+    }
+
+    private boolean overBound() {
+        return unrunPackets > MAX_UNRUN_PACKETS || unrunBytes > MAX_UNRUN_BYTES;
+    }
+
+    private void applyAck(GameLanes.Ack ack) {
         try {
-            minecraft.packetProcessor().scheduleIfPossible(listener, new AckPacket(apply));
-        } catch (RejectedExecutionException closing) {
-            // The game is shutting down; nothing is left to acknowledge.
+            GameLanes current = lanes;
+            if (current != null && !current.isClosed()) {
+                ackSink.accept(ack.lane(), ack.sequence());
+            }
+        } catch (Throwable t) {
+            fail(t);
         }
+    }
+
+    /** A decoded game packet is being fired into the game (counted for the next acknowledgement). */
+    void packetDelivered() {
+        deliveredPackets++;
+    }
+
+    /** Tests: where acknowledgements run, and how the game's main thread is asked to run a marker. */
+    void useAcknowledgement(java.util.function.Consumer<Runnable> mainThread, AckSink sink) {
+        this.mainThread = mainThread;
+        this.ackSink = sink;
+    }
+
+    /** Tests: bytes the codec decoded since the last acknowledgement. */
+    void noteDecodedBytes(long bytes) {
+        decodedBytes.addAndGet(bytes);
+    }
+
+    /** What an acknowledgement does: tell the lane session the game applied up to a sequence. */
+    interface AckSink {
+        void accept(Lane lane, long sequence);
     }
 
     // --- BindingDriver.Callbacks and PayloadSender.

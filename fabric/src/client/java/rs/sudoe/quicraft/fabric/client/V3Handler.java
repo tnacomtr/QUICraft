@@ -100,8 +100,12 @@ final class V3Handler extends ChannelDuplexHandler implements DecodeContext.Gate
         lastRead = System.nanoTime();
         try {
             if (msg instanceof GameLanes.Ack) {
+                // Everything before it was fired through packet_handler already: it is accepted.
                 client.acknowledge((GameLanes.Ack) msg);
                 return;
+            }
+            if (msg instanceof Packet && client.state() == V3Client.State.ACTIVE) {
+                client.packetDelivered();
             }
             if (msg instanceof ClientboundCustomPayloadPacket) {
                 Object payload = ((ClientboundCustomPayloadPacket) msg).payload();

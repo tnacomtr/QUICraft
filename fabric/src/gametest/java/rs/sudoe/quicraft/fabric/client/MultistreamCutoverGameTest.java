@@ -120,6 +120,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             anOversizedBindingPayloadOutsideV3IsDiscardedAsVanillaDoes(table.get());
             outboundPacketsStillPassTheGamesHandlersAndTheProtocolSwitchesSurvive(protocol, table.get());
             writesWaitWhileTheLanesAreFullAndGoOnInOrder(protocol, table.get());
+            acknowledgementsFollowAcceptanceNotTheMainThread(protocol, table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             offlineTestModeNeverAcceptsAChangedPin(protocol, table.get());
             theSharedSecretIsWipedOnEveryTerminalPath(protocol, table.get());
@@ -379,6 +380,59 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             rig.connection.send(new ServerboundKeepAlivePacket(2L));
             check(rig.awaitCondition(() -> sent.size() == 3), "and packets flow again: " + sent);
             check(rig.fake.abortCode < 0 && rig.client.state() == V3Client.State.ACTIVE, "nothing failed");
+        }
+    }
+
+    /**
+     * 13.10: a delivery is acknowledged once the game's serial handler accepted it, not when the main
+     * thread has run it, so a burst completes at network speed even if the main thread never runs.
+     * Only a backlog over the bound (256 packets or 1 MiB accepted but not run) holds the
+     * acknowledgement, until the main thread has caught up.
+     */
+    private static void acknowledgementsFollowAcceptanceNotTheMainThread(int protocol, RoutingTable table)
+            throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+            check(rig.awaitState(V3Client.State.ACTIVE), "active");
+            List<Runnable> mainThread = java.util.Collections.synchronizedList(new ArrayList<>());
+            List<Long> acked = java.util.Collections.synchronizedList(new ArrayList<>());
+            rig.client.useAcknowledgement(mainThread::add, (lane, sequence) -> acked.add(sequence));
+
+            // A burst of 100 deliveries; the main thread never runs.
+            for (long i = 1; i <= 100; i++) {
+                rig.deliver(i, 0);
+            }
+            check(acked.size() == 100, "every delivery was acknowledged without a main-thread run: " + acked.size());
+            check(mainThread.size() == 100, "and one marker per delivery waits behind the packets");
+
+            // Over the bound: the 257th accepted-but-unrun packet is held.
+            for (long i = 101; i <= 256; i++) {
+                rig.deliver(i, 0);
+            }
+            check(acked.size() == 256, "up to the bound: " + acked.size());
+            rig.deliver(257, 0);
+            check(acked.size() == 256, "over it the acknowledgement is held: " + acked.size());
+
+            // The main thread catches up: the held acknowledgement is released.
+            List<Runnable> run = new ArrayList<>(mainThread);
+            mainThread.clear();
+            for (Runnable marker : run) {
+                marker.run();
+            }
+            check(acked.size() == 257 && acked.get(256) == 257L, "released when the backlog drained: " + acked.size());
+
+            // The byte bound holds too: one delivery that decoded 2 MiB.
+            rig.client.noteDecodedBytes(2 << 20);
+            rig.deliver(258, 0);
+            check(acked.size() == 257, "over the byte bound it is held: " + acked.size());
+            for (Runnable marker : new ArrayList<>(mainThread)) {
+                marker.run();
+            }
+            check(acked.size() == 258, "and released after the drain: " + acked.size());
         }
     }
 
@@ -840,6 +894,24 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
                     new InetSocketAddress(InetAddress.getLoopbackAddress(), PORT), HOST, PORT, Mode.AUTO, null, tcp)
                     .get(10, TimeUnit.SECONDS);
             check(next.tcp() != null && next.quic() == null, "the next join uses TCP");
+        }
+
+        /** One delivery as the lanes fire it: a game packet, then the acknowledgement marker (on the loop). */
+        void deliver(long sequence, int ignored) throws Exception {
+            loop.submit(() -> {
+                io.netty.channel.ChannelHandlerContext before = channel.pipeline().context("hackfix");
+                before.fireChannelRead(new net.minecraft.network.protocol.common.ClientboundKeepAlivePacket(sequence));
+                try {
+                    java.lang.reflect.Constructor<rs.sudoe.quicraft.bridge.GameLanes.Ack> ctor =
+                            rs.sudoe.quicraft.bridge.GameLanes.Ack.class.getDeclaredConstructor(
+                                    rs.sudoe.quicraft.core.routing.Lane.class, long.class, boolean.class);
+                    ctor.setAccessible(true);
+                    before.fireChannelRead(ctor.newInstance(rs.sudoe.quicraft.core.routing.Lane.CONTROL, sequence,
+                            false));
+                } catch (ReflectiveOperationException e) {
+                    throw new AssertionError(e);
+                }
+            }).get(10, TimeUnit.SECONDS);
         }
 
         boolean awaitState(V3Client.State wanted) throws Exception {

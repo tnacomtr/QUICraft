@@ -48,6 +48,7 @@ public final class LaneCodec implements GameLanes.Codec {
 
     private final Channel channel;
     private final RoutingTable table;
+    private final java.util.function.LongConsumer decodedBytes;
     /** Between {@code routeOf}, which encodes, and {@code encode}, which hands the bytes over. */
     private Packet<?> encodedPacket;
     private byte[] encodedFrame;
@@ -55,8 +56,14 @@ public final class LaneCodec implements GameLanes.Codec {
     private boolean inBundle;
 
     public LaneCodec(Channel channel, RoutingTable table) {
+        this(channel, table, null);
+    }
+
+    /** {@code decodedBytes} is told the wire size of every frame decoded (for the main-thread backlog bound). */
+    LaneCodec(Channel channel, RoutingTable table, java.util.function.LongConsumer decodedBytes) {
         this.channel = channel;
         this.table = table;
+        this.decodedBytes = decodedBytes;
     }
 
     // --- Inbound.
@@ -72,6 +79,9 @@ public final class LaneCodec implements GameLanes.Codec {
         PacketDecoderAccessor decoder = (PacketDecoderAccessor) decoderContext.handler();
         ProtocolState state = stateOf(decoder.quicraft$protocolInfo().id());
 
+        if (decodedBytes != null) {
+            decodedBytes.accept(frame.readableBytes());
+        }
         int length = VarInt.read(frame);
         if (length < 0 || length != frame.readableBytes()) {
             throw new IOException("a GAME body must be exactly one frame (13.4), length " + length + " of "
