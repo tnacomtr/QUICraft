@@ -12,6 +12,15 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
  * {@link LaneSession#applied} when its serial handler has applied the packet (13.10).
  */
 public interface LaneGame {
+    /** Executor tick stall began; implementations may record timer-exclusion intervals (13.10). */
+    default void onExecutorTickStallStart() { }
+
+    /** Executor tick stall ended (13.10). */
+    default void onExecutorTickStallEnd() { }
+
+    /** Record applied watermark signal: Q is enqueued, D is applied (13.10, 13.12). */
+    default void onRecordAppliedSignal(Lane lane, long sequence, boolean applied) { }
+
     /**
      * Decodes one dependency-eligible GAME body: exactly one Minecraft VarInt-length frame,
      * including the packet id and the negotiated compression wrapper, without CFB8 (13.4).
