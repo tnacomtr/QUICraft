@@ -970,7 +970,7 @@ This subsection records the user's direction for the next revision of `/3`. None
    ```
 
    The shipped 26.1.2 table (`protocol-775.json`, protocol 775) routes clientbound play packets only:
-   entity-only movement, metadata, animation and motion to REALTIME, and block, light, block-entity and
+   entity movement, metadata, animation and motion, plus level particles, to REALTIME, and block, light, block-entity and
    biome updates to WORLD. Everything else, including every serverbound packet, stays CONTROL. Its
    packet ids are pinned to the live game by `RoutingTableGameTest`, and each route's ordering by
    `ShippedRoutingOrderingTest`.
