@@ -240,7 +240,7 @@ class BindingStateMachineTest {
 
         // Every later call that would use a tag fails.
         assertThrows(IllegalStateException.class, server::start);
-        assertEquals(BindingFailure.ALREADY_SETTLED, server.receive(new byte[103]).failure());
+        assertEquals(BindingFailure.ALREADY_SETTLED, server.receive(new byte[104]).failure());
     }
 
     @Test
@@ -332,6 +332,31 @@ class BindingStateMachineTest {
 
         assertEquals(BindingFailure.WRONG_MODE,
                 onlineClient.receive(offlineServer.start().message().encode()).failure());
+    }
+
+    /** 12.8/12.9: a peer that selected a different N fails the exchange with WRONG_SHARD_COUNT. */
+    @Test
+    void wrongShardCountFails() {
+        BindingStateMachine server = machine(BindingStateMachine.server(BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, 2, F, R));
+        BindingStateMachine client = machine(BindingStateMachine.client(BindingTestData.exporter(E), S,
+                BindingTestData.MODE_ONLINE, BindingTestData.PROTOCOL_NUMBER, 3, F, R));
+
+        assertEquals(BindingFailure.WRONG_SHARD_COUNT,
+                client.receive(server.start().message().encode()).failure());
+    }
+
+    /** 12.8: N is inside the 104-byte payload and is authenticated through T, so a tampered N never matches. */
+    @Test
+    void tamperedShardCountByteIsRejectedBeforeTheTag() {
+        BindingStateMachine server = onlineServer();
+        BindingStateMachine client = onlineClient();
+        byte[] offer = server.start().message().encode();
+        assertEquals(104, offer.length);
+        assertEquals(1, offer[71] & 0xff, "N is at offset 71");
+
+        offer[71] = 2;
+        assertEquals(BindingFailure.WRONG_SHARD_COUNT, client.receive(offer).failure());
     }
 
     @Test
@@ -445,7 +470,7 @@ class BindingStateMachineTest {
         assertTrue(server.start().isSend());
         byte[] clientProof = message(BindingKind.CLIENT_PROOF, BindingTestData.MODE_OFFLINE,
                 BindingTestData.PROTOCOL_NUMBER, BindingTags.zeros()).encode();
-        clientProof[71] = 1;
+        clientProof[72] = 1; // first tag byte (offset 72 after the N byte at 71)
         assertEquals(BindingFailure.BAD_TAG, server.receive(clientProof).failure());
     }
 

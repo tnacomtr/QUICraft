@@ -9,15 +9,23 @@ import java.util.List;
 
 /**
  * The Phase 5 record format (docs/protocol.md 13.4):
- * {@code VarInt(record_length) || u8(kind) || u64(sequence) || u64(dep_control) ||
- * u64(dep_realtime) || u64(dep_world) || body}. The length excludes its own VarInt and
- * includes the 33-byte fixed header. Kind 0 GAME carries exactly one Minecraft VarInt-length
- * frame; kind 1 END is empty and CONTROL-only. u64 fields are unsigned and compared with
- * {@link Long#compareUnsigned}.
+ * The legacy fixed-header codec remains below for {@link LaneSession}. New callers use
+ * {@link #encodeRecord(Record)} and {@link #decodeRecord(byte[], int)}, which implement the
+ * compact /3 format in §13.4.
  */
 public final class RecordCodec {
+    /** Maximum compact /3 header size (§13.4). */
+    public static final int COMPACT_MAX_HEADER = 54;
+    /** Maximum compact record_length, checked before copying the body (§13.4). */
+    public static final int COMPACT_MAX_RECORD_LENGTH = 2097208;
+    /** At most N+1 = 7 sparse dependencies per record (13.4). */
+    public static final int MAX_COMPACT_DEPENDENCIES = 7;
     public static final int KIND_GAME = 0;
     public static final int KIND_END = 1;
+    /** Kind 2 ACK_JOIN: one GAME frame of the designated packet, on a chunk stream (13.4, 13.19). */
+    public static final int KIND_ACK_JOIN = 2;
+    /** Kind 3 BATCH_JOIN: one GAME frame of the designated packet, on a chunk stream (13.4, 13.19). */
+    public static final int KIND_BATCH_JOIN = 3;
 
     /** kind (1) + four unsigned 64-bit fields (32). */
     public static final int HEADER_LENGTH = 33;
@@ -32,6 +40,159 @@ public final class RecordCodec {
     private static final byte[] NO_BODY = new byte[0];
 
     private RecordCodec() {}
+
+    /** Encodes the compact /3 wire record described in §13.4. */
+    public static byte[] encodeRecord(rs.sudoe.quicraft.core.multistream.Record record) {
+        if (record == null) throw new NullPointerException("record");
+        if (record.streamIndex() > 7) throw new IllegalArgumentException("logical stream index");
+        ByteArrayOutputStream header = new ByteArrayOutputStream();
+        header.write(record.kind());
+        VarInt.write(header, checked31(record.sequence(), "sequence"));
+        VarInt.write(header, checked31(record.epoch(), "epoch"));
+        List<rs.sudoe.quicraft.core.multistream.Record.Dependency> deps = record.dependencies();
+        if (deps.size() > MAX_COMPACT_DEPENDENCIES) throw new IllegalArgumentException("too many dependencies");
+        VarInt.write(header, deps.size());
+        int previous = -1;
+        for (rs.sudoe.quicraft.core.multistream.Record.Dependency dep : deps) {
+            if (dep.streamIndex() > 7 || dep.streamIndex() <= previous || dep.streamIndex() == record.streamIndex())
+                throw new IllegalArgumentException("duplicate, unordered or self dependency");
+            previous = dep.streamIndex(); header.write(dep.streamIndex());
+            VarInt.write(header, checked31(dep.sequence(), "dependency sequence"));
+        }
+        byte[] payload = record.payload();
+        try {
+            validateCompactBody(record.streamIndex(), record.kind(), payload);
+        } catch (MultistreamProtocolException e) {
+            throw new IllegalArgumentException(e.getMessage(), e);
+        }
+        int length = header.size() + payload.length;
+        if (header.size() > COMPACT_MAX_HEADER || length > COMPACT_MAX_RECORD_LENGTH)
+            throw new IllegalArgumentException("compact record too large");
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        VarInt.write(out, length); out.write(header.toByteArray(), 0, header.size());
+        out.write(payload, 0, payload.length); return out.toByteArray();
+    }
+
+    /**
+     * Decodes one complete compact /3 record (13.4). The bytes must be exactly one record: a
+     * short, oversize or trailing input is rejected. Delegates to {@link CompactDecoder}, so the
+     * same length rules apply as on a stream.
+     */
+    public static rs.sudoe.quicraft.core.multistream.Record decodeRecord(byte[] wire, int streamIndex)
+            throws MultistreamProtocolException {
+        if (wire == null) throw new NullPointerException("wire");
+        ByteBuffer in = ByteBuffer.wrap(wire);
+        rs.sudoe.quicraft.core.multistream.Record record = new CompactDecoder(streamIndex).next(in);
+        if (record == null || in.hasRemaining()) throw compactError("record is not exactly one record");
+        return record;
+    }
+
+    /**
+     * Streaming decoder for one direction's compact /3 records (13.4). {@link #next} consumes
+     * bytes and returns at most one complete record per call, or null while more bytes are
+     * needed. {@code record_length} is checked against {@link #COMPACT_MAX_RECORD_LENGTH} before
+     * the record buffer is allocated, so an oversize prefix never allocates.
+     */
+    public static final class CompactDecoder {
+        private final int streamIndex;
+        private final VarInt.Reader length = new VarInt.Reader(CLOSE_CODE, "13.4");
+        private int recordLength = -1;
+        private byte[] frame;
+        private int filled;
+
+        /** @param streamIndex the logical index the bytes arrived on, 0..7 (13.3). */
+        public CompactDecoder(int streamIndex) {
+            if (streamIndex < 0 || streamIndex > 7) throw new IllegalArgumentException("logical stream index");
+            this.streamIndex = streamIndex;
+        }
+
+        /** Consumes bytes from {@code in} and returns one complete record, or null if more are needed. */
+        public rs.sudoe.quicraft.core.multistream.Record next(ByteBuffer in) throws MultistreamProtocolException {
+            if (recordLength < 0) {
+                while (!length.done()) {
+                    if (!in.hasRemaining()) return null;
+                    length.feed(in.get() & 0xff);
+                }
+                int declared = length.value();
+                if (declared > COMPACT_MAX_RECORD_LENGTH) {
+                    throw compactError("record_length " + declared + " > " + COMPACT_MAX_RECORD_LENGTH);
+                }
+                if (declared < 4) throw compactError("record_length " + declared + " < 4");
+                recordLength = declared;
+                frame = new byte[declared];
+            }
+            int n = Math.min(recordLength - filled, in.remaining());
+            in.get(frame, filled, n);
+            filled += n;
+            if (filled < recordLength) return null;
+            rs.sudoe.quicraft.core.multistream.Record record = parseCompact(frame, streamIndex);
+            recordLength = -1;
+            frame = null;
+            filled = 0;
+            length.reset();
+            return record;
+        }
+    }
+
+    /** Parses one complete record body (everything after the length prefix), 13.4. */
+    private static rs.sudoe.quicraft.core.multistream.Record parseCompact(byte[] frame, int streamIndex)
+            throws MultistreamProtocolException {
+        int end = frame.length;
+        int[] at = {1};
+        int kind = frame[0] & 255;
+        if (kind > 3) throw compactError("invalid kind " + kind);
+        long seq = readCompact(frame, end, at);
+        long epoch = readCompact(frame, end, at);
+        long countLong = readCompact(frame, end, at);
+        if (seq == 0) throw compactError("record sequence 0");
+        if (countLong > MAX_COMPACT_DEPENDENCIES) throw compactError("dependency count " + countLong);
+        int count = (int) countLong, previous = -1;
+        List<rs.sudoe.quicraft.core.multistream.Record.Dependency> deps = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            if (at[0] >= end) throw compactError("truncated dependency");
+            int index = frame[at[0]++] & 255;
+            long dseq = readCompact(frame, end, at);
+            if (index > 7 || index <= previous || index == streamIndex || dseq == 0) {
+                throw compactError("invalid dependency");
+            }
+            previous = index;
+            deps.add(new rs.sudoe.quicraft.core.multistream.Record.Dependency(index, dseq));
+        }
+        if (at[0] > COMPACT_MAX_HEADER) throw compactError("header over " + COMPACT_MAX_HEADER + " bytes");
+        byte[] payload = Arrays.copyOfRange(frame, at[0], end);
+        validateCompactBody(streamIndex, kind, payload);
+        return new rs.sudoe.quicraft.core.multistream.Record(streamIndex, seq, epoch, deps, kind, payload);
+    }
+
+    private static int checked31(long value, String name) {
+        if (value < 0 || value > 0x7fffffffL) throw new IllegalArgumentException(name + " outside VarInt range");
+        return (int)value;
+    }
+    private static long readCompact(byte[] b, int end, int[] at) throws MultistreamProtocolException {
+        VarInt.Reader r = new VarInt.Reader(CLOSE_CODE,"13.4");
+        while (!r.done()) { if (at[0] >= end) throw compactError("truncated header"); r.feed(b[at[0]++] & 255); }
+        return r.value();
+    }
+    private static MultistreamProtocolException compactError(String message) {
+        return new MultistreamProtocolException(CLOSE_CODE,"13.4",message);
+    }
+
+    /** Validates compact record kind placement and its §13.4 body form. */
+    private static void validateCompactBody(int streamIndex, int kind, byte[] payload)
+            throws MultistreamProtocolException {
+        if (kind == KIND_GAME) {
+            validateBody(KIND_GAME, payload, true);
+        } else if (kind == KIND_END) {
+            if (streamIndex != LogicalStream.CONTROL) throw compactError("END outside CONTROL");
+            if (payload.length != 0) throw compactError("END body");
+        } else if (kind == 2 || kind == 3) {
+            // 13.19: joins live on CHUNK[0] only.
+            if (streamIndex != 2) throw compactError("join outside CHUNK[0]");
+            validateBody(KIND_GAME, payload, true);
+        } else {
+            throw compactError("invalid kind");
+        }
+    }
 
     /** One decoded record. The body excludes the fixed header. */
     public static final class Record {

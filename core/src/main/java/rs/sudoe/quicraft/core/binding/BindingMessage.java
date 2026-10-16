@@ -4,14 +4,14 @@ package rs.sudoe.quicraft.core.binding;
 import java.util.Arrays;
 
 /**
- * The exact 103-byte binding payload of docs/protocol.md §12.8, on the {@code quicraft:binding}
+ * The exact 104-byte binding payload of docs/protocol.md §12.8, on the {@code quicraft:binding}
  * configuration custom payload:
  *
  * <pre>
- * u8(version = 2) || u8(kind) || u8(mode) || u32(protocol_number) || F[32] || R[32] || tag[32]
+ * u8(version = 2) || u8(kind) || u8(mode) || u32(protocol_number) || F[32] || R[32] || u8(N) || tag[32]
  * </pre>
  *
- * There are no optional fields and no trailing bytes: anything other than exactly 103 bytes is
+ * There are no optional fields and no trailing bytes: anything other than exactly 104 bytes is
  * rejected. {@code u32} is unsigned big-endian; hashes, MACs and tags are raw bytes. Nothing here
  * logs or formats secret material.
  */
@@ -19,27 +19,30 @@ public final class BindingMessage {
     /** The only accepted version byte. */
     public static final int VERSION = 2;
     /** The exact payload length. */
-    public static final int ENCODED_LENGTH = 103;
+    public static final int ENCODED_LENGTH = 104;
 
     private static final int OFFSET_KIND = 1;
     private static final int OFFSET_MODE = 2;
     private static final int OFFSET_PROTOCOL = 3;
     private static final int OFFSET_F = 7;
     private static final int OFFSET_R = 39;
-    private static final int OFFSET_TAG = 71;
+    private static final int OFFSET_N = 71;
+    private static final int OFFSET_TAG = 72;
 
     private final BindingKind kind;
     private final int mode;
     private final int protocolNumber;
+    private final int shardCount;
     private final byte[] fingerprint;
     private final byte[] routing;
     private final byte[] tag;
 
     private BindingMessage(BindingKind kind, int mode, int protocolNumber,
-                           byte[] fingerprint, byte[] routing, byte[] tag) {
+                           int shardCount, byte[] fingerprint, byte[] routing, byte[] tag) {
         this.kind = kind;
         this.mode = mode;
         this.protocolNumber = protocolNumber;
+        this.shardCount = shardCount;
         this.fingerprint = fingerprint;
         this.routing = routing;
         this.tag = tag;
@@ -48,16 +51,23 @@ public final class BindingMessage {
     /** Builds a message from its fields, validating their shape. */
     public static BindingMessage of(BindingKind kind, int mode, int protocolNumber,
                                     byte[] fingerprint, byte[] routing, byte[] tag) {
+        return of(kind, mode, protocolNumber, 1, fingerprint, routing, tag);
+    }
+
+    /** Builds a message authenticated for negotiated shard count N (12.8). */
+    public static BindingMessage of(BindingKind kind, int mode, int protocolNumber, int shardCount,
+                                    byte[] fingerprint, byte[] routing, byte[] tag) {
         if (kind == null) {
             throw new IllegalArgumentException("kind is required");
         }
         checkMode(mode);
         checkProtocolNumber(protocolNumber);
+        checkShardCount(shardCount);
         checkDigest(fingerprint, "fingerprint");
         checkDigest(routing, "routing");
         checkDigest(tag, "tag");
         return new BindingMessage(kind, mode, protocolNumber,
-                fingerprint.clone(), routing.clone(), tag.clone());
+                shardCount, fingerprint.clone(), routing.clone(), tag.clone());
     }
 
     /** Builds an OFFER, whose tag is always 32 zero bytes. */
@@ -88,16 +98,21 @@ public final class BindingMessage {
                 | ((payload[OFFSET_PROTOCOL + 1] & 0xFF) << 16)
                 | ((payload[OFFSET_PROTOCOL + 2] & 0xFF) << 8)
                 | (payload[OFFSET_PROTOCOL + 3] & 0xFF);
+        int shardCount = payload[OFFSET_N] & 0xff;
+        try { checkShardCount(shardCount); } catch (IllegalArgumentException e) {
+            throw new BindingFormatException(BindingFailure.WRONG_SHARD_COUNT);
+        }
         return new BindingMessage(
                 kind,
                 mode,
                 protocolNumber,
+                shardCount,
                 Arrays.copyOfRange(payload, OFFSET_F, OFFSET_F + 32),
                 Arrays.copyOfRange(payload, OFFSET_R, OFFSET_R + 32),
                 Arrays.copyOfRange(payload, OFFSET_TAG, OFFSET_TAG + 32));
     }
 
-    /** Encodes to the exact 103-byte payload. */
+    /** Encodes to the exact 104-byte payload. */
     public byte[] encode() {
         byte[] payload = new byte[ENCODED_LENGTH];
         payload[0] = (byte) VERSION;
@@ -109,6 +124,7 @@ public final class BindingMessage {
         payload[OFFSET_PROTOCOL + 3] = (byte) protocolNumber;
         System.arraycopy(fingerprint, 0, payload, OFFSET_F, 32);
         System.arraycopy(routing, 0, payload, OFFSET_R, 32);
+        payload[OFFSET_N] = (byte) shardCount;
         System.arraycopy(tag, 0, payload, OFFSET_TAG, 32);
         return payload;
     }
@@ -124,6 +140,9 @@ public final class BindingMessage {
     public int protocolNumber() {
         return protocolNumber;
     }
+
+    /** Negotiated chunk shard count (12.8). */
+    public int shardCount() { return shardCount; }
 
     public byte[] fingerprint() {
         return fingerprint.clone();
@@ -147,6 +166,10 @@ public final class BindingMessage {
         if (mode != 0 && mode != 1) {
             throw new IllegalArgumentException("mode must be 0 (offline) or 1 (online)");
         }
+    }
+
+    private static void checkShardCount(int n) {
+        if (n < 1 || n > 6) throw new IllegalArgumentException("shard count must be 1..6");
     }
 
     /**

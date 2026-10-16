@@ -7,7 +7,7 @@ package rs.sudoe.quicraft.core.binding;
  * logs instead of any message contents. No reason carries secret material.
  */
 public enum BindingFailure {
-    /** Payload was not exactly 103 bytes (truncated or trailing bytes, §12.8). */
+    /** Payload was not exactly 104 bytes (truncated or trailing bytes, §12.8). */
     BAD_LENGTH(1),
     /** Version byte was not 2 (§12.8). */
     BAD_VERSION(2),
@@ -32,7 +32,9 @@ public enum BindingFailure {
     /** The exporter value could not be obtained or was not 32 bytes (§12.3, §12.14). */
     EXPORTER_ERROR(12),
     /** A message arrived after the exchange had already settled (§12.9). */
-    ALREADY_SETTLED(13);
+    ALREADY_SETTLED(13),
+    /** Negotiated shard count was outside 1..6 or did not match the transcript. */
+    WRONG_SHARD_COUNT(14);
 
     private final int code;
 

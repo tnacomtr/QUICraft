@@ -51,6 +51,7 @@ public final class BindingStateMachine {
     private final Role role;
     private final int mode;
     private final int protocolNumber;
+    private final int shardCount;
     private final byte[] fingerprint;
     private final byte[] routing;
 
@@ -64,14 +65,16 @@ public final class BindingStateMachine {
     private BindingFailure failure;
 
     private BindingStateMachine(Role role, byte[] exporterValue, byte[] minecraftSecret,
-                                int mode, int protocolNumber, byte[] fingerprint, byte[] routing) {
-        validateArguments(minecraftSecret, mode, protocolNumber, fingerprint, routing);
+                                int mode, int protocolNumber, int shardCount, byte[] fingerprint, byte[] routing) {
+        validateArguments(minecraftSecret, mode, protocolNumber, shardCount, fingerprint, routing);
         if (exporterValue == null || exporterValue.length != EXPORTER_LENGTH) {
             throw new IllegalArgumentException("exporter value must be exactly 32 raw bytes");
         }
         this.role = role;
         this.mode = mode;
         this.protocolNumber = protocolNumber;
+        if (shardCount < 1 || shardCount > 6) throw new IllegalArgumentException("shard count must be 1..6");
+        this.shardCount = shardCount;
         this.fingerprint = fingerprint.clone();
         this.routing = routing.clone();
         this.expected = role == Role.CLIENT ? BindingKind.OFFER : null;
@@ -81,43 +84,55 @@ public final class BindingStateMachine {
     /**
      * A client-side machine. The next inbound message must be OFFER.
      *
+     * <p>Defaults the negotiated shard count to N=1 (12.8); a /3 caller must use the overload that takes N.
      * @return a machine, or {@link BindingFailure#EXPORTER_ERROR} when the exporter value cannot be
      *     obtained
      */
     public static BindingMachineResult client(ExporterSource exporter, byte[] minecraftSecret,
                                               int mode, int protocolNumber,
                                               byte[] fingerprint, byte[] routing) {
-        return build(Role.CLIENT, exporter, minecraftSecret, mode, protocolNumber, fingerprint,
-                routing);
+        return client(exporter, minecraftSecret, mode, protocolNumber, 1, fingerprint, routing);
+    }
+
+    /** Builds a client machine bound to negotiated N (12.7). */
+    public static BindingMachineResult client(ExporterSource exporter, byte[] secret, int mode,
+            int protocolNumber, int shardCount, byte[] fingerprint, byte[] routing) {
+        return build(Role.CLIENT, exporter, secret, mode, protocolNumber, shardCount, fingerprint, routing);
     }
 
     /**
      * A server-side machine. The first action is {@link #start()}, which yields OFFER.
      *
+     * <p>Defaults the negotiated shard count to N=1 (12.8); a /3 caller must use the overload that takes N.
      * @return a machine, or {@link BindingFailure#EXPORTER_ERROR} when the exporter value cannot be
      *     obtained
      */
     public static BindingMachineResult server(ExporterSource exporter, byte[] minecraftSecret,
                                               int mode, int protocolNumber,
                                               byte[] fingerprint, byte[] routing) {
-        return build(Role.SERVER, exporter, minecraftSecret, mode, protocolNumber, fingerprint,
-                routing);
+        return server(exporter, minecraftSecret, mode, protocolNumber, 1, fingerprint, routing);
+    }
+
+    /** Builds a server machine bound to negotiated N (12.7). */
+    public static BindingMachineResult server(ExporterSource exporter, byte[] secret, int mode,
+            int protocolNumber, int shardCount, byte[] fingerprint, byte[] routing) {
+        return build(Role.SERVER, exporter, secret, mode, protocolNumber, shardCount, fingerprint, routing);
     }
 
     private static BindingMachineResult build(Role role, ExporterSource exporter,
                                               byte[] minecraftSecret, int mode, int protocolNumber,
-                                              byte[] fingerprint, byte[] routing) {
+                                              int shardCount, byte[] fingerprint, byte[] routing) {
         if (exporter == null) {
             throw new IllegalArgumentException("exporter is required");
         }
         // Local misuse stays an exception; only the exporter itself can fail at run time.
-        validateArguments(minecraftSecret, mode, protocolNumber, fingerprint, routing);
+        validateArguments(minecraftSecret, mode, protocolNumber, shardCount, fingerprint, routing);
         byte[] exporterValue = export(exporter);
         if (exporterValue == null) {
             return BindingMachineResult.failed(BindingFailure.EXPORTER_ERROR);
         }
         return BindingMachineResult.ok(new BindingStateMachine(role, exporterValue, minecraftSecret,
-                mode, protocolNumber, fingerprint, routing));
+                mode, protocolNumber, shardCount, fingerprint, routing));
     }
 
     /**
@@ -147,7 +162,7 @@ public final class BindingStateMachine {
     }
 
     private static void validateArguments(byte[] minecraftSecret, int mode, int protocolNumber,
-                                          byte[] fingerprint, byte[] routing) {
+                                           int shardCount, byte[] fingerprint, byte[] routing) {
         if (mode != MODE_OFFLINE && mode != MODE_ONLINE) {
             throw new IllegalArgumentException("mode must be 0 (offline) or 1 (online)");
         }
@@ -159,6 +174,9 @@ public final class BindingStateMachine {
         }
         checkDigest(fingerprint, "fingerprint");
         checkDigest(routing, "routing");
+        if (shardCount < 1 || shardCount > 6) {
+            throw new IllegalArgumentException("shard count must be 1..6");
+        }
         if (mode == MODE_ONLINE && (minecraftSecret == null || minecraftSecret.length != 16)) {
             throw new IllegalArgumentException("online mode needs Minecraft's 16-byte shared secret");
         }
@@ -170,7 +188,7 @@ public final class BindingStateMachine {
      * zeros (docs/protocol.md §12.19) and no key is derived.
      */
     private void deriveTags(byte[] exporterValue, byte[] minecraftSecret) {
-        byte[] transcript = BindingTranscript.compute(protocolNumber, mode, fingerprint, routing);
+        byte[] transcript = BindingTranscript.compute(protocolNumber, mode, fingerprint, routing, shardCount);
         byte[] secretCopy = minecraftSecret == null ? null : minecraftSecret.clone();
         byte[] key = null;
         try {
@@ -260,6 +278,9 @@ public final class BindingStateMachine {
         if (message.protocolNumber() != protocolNumber) {
             return settleFailed(BindingFailure.WRONG_PROTOCOL);
         }
+        if (message.shardCount() != shardCount) {
+            return settleFailed(BindingFailure.WRONG_SHARD_COUNT);
+        }
         if (!MessageDigest.isEqual(fingerprint, message.fingerprint())) {
             return settleFailed(BindingFailure.WRONG_FINGERPRINT);
         }
@@ -312,13 +333,13 @@ public final class BindingStateMachine {
     }
 
     private BindingMessage offer() {
-        return BindingMessage.of(BindingKind.OFFER, mode, protocolNumber, fingerprint, routing,
+        return BindingMessage.of(BindingKind.OFFER, mode, protocolNumber, shardCount, fingerprint, routing,
                 tags[BindingKind.OFFER.code()]);
     }
 
     /** Builds a message carrying this endpoint's precomputed tag for {@code kind}. */
     private BindingMessage sendable(BindingKind kind) {
-        return BindingMessage.of(kind, mode, protocolNumber, fingerprint, routing, tags[kind.code()]);
+        return BindingMessage.of(kind, mode, protocolNumber, shardCount, fingerprint, routing, tags[kind.code()]);
     }
 
     private BindingResult settleFailed(BindingFailure reason) {

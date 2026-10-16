@@ -28,7 +28,7 @@ class AuxPreambleTest {
     @Test
     void encodeRejectsOtherTypes() {
         assertThrows(IllegalArgumentException.class, () -> AuxPreamble.encode(0));
-        assertThrows(IllegalArgumentException.class, () -> AuxPreamble.encode(3));
+        assertThrows(IllegalArgumentException.class, () -> AuxPreamble.encode(8));
     }
 
     @Test
@@ -65,8 +65,19 @@ class AuxPreambleTest {
     @Test
     void rejectsBadType() {
         assertClose(new byte[] {0x02, 0x00});
-        assertClose(new byte[] {0x02, 0x03});
+        assertClose(new byte[] {0x02, 0x08});
         assertClose(new byte[] {0x02, (byte) 0xff});
+    }
+
+    /** 13.3: CHUNK[i] is logical index 2+i, so every index from 2 to 7 is a legal auxiliary stream. */
+    @Test
+    void acceptsEveryChunkLogicalIndex() throws Exception {
+        for (int index = 2; index <= 7; index++) {
+            AuxPreamble.Parser parser = new AuxPreamble.Parser();
+            assertTrue(parser.feed(ByteBuffer.wrap(AuxPreamble.encode(index))));
+            assertEquals(index, parser.logicalStreamIndex());
+        }
+        assertArrayEquals(new byte[] {0x02, 0x07}, AuxPreamble.encode(7));
     }
 
     private static void assertClose(byte[] bytes) {

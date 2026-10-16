@@ -8,7 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import java.util.Arrays;
 import org.junit.jupiter.api.Test;
 
-/** Structural encode/decode validation of the 103-byte payload, docs/protocol.md §12.8. */
+/** Structural encode/decode validation of the 104-byte payload, docs/protocol.md §12.8. */
 class BindingMessageTest {
     private static final byte[] F = BindingTestData.hex(BindingTestData.F_HEX);
     private static final byte[] R = BindingTestData.hex(BindingTestData.R_HEX);
@@ -30,14 +30,15 @@ class BindingMessageTest {
     @Test
     void layoutIsVersionKindModeProtocolThenDigests() throws Exception {
         byte[] payload = BindingMessage.offer(1, 775, F, R).encode();
-        assertEquals(103, payload.length);
+        assertEquals(104, payload.length);
         assertEquals(2, payload[0] & 0xFF, "version");
         assertEquals(0, payload[1] & 0xFF, "kind OFFER");
         assertEquals(1, payload[2] & 0xFF, "mode online");
         assertArrayEquals(new byte[]{0x00, 0x00, 0x03, 0x07}, Arrays.copyOfRange(payload, 3, 7), "u32 protocol");
         assertArrayEquals(F, Arrays.copyOfRange(payload, 7, 39), "F");
         assertArrayEquals(R, Arrays.copyOfRange(payload, 39, 71), "R");
-        assertArrayEquals(new byte[32], Arrays.copyOfRange(payload, 71, 103), "OFFER tag is zeros");
+        assertEquals(1, payload[71] & 0xff, "N");
+        assertArrayEquals(new byte[32], Arrays.copyOfRange(payload, 72, 104), "OFFER tag is zeros");
     }
 
     @Test
@@ -47,9 +48,20 @@ class BindingMessageTest {
                 () -> BindingMessage.decode(payload)).reason());
     }
 
+    /** 12.8: u8(N) must be 1..6; a payload carrying 0 or 7 is a typed format failure. */
+    @Test
+    void rejectsShardCountOutsideOneToSix() {
+        for (int bad : new int[] {0, 7, 255}) {
+            byte[] payload = BindingMessage.offer(1, 775, F, R).encode();
+            payload[71] = (byte) bad;
+            assertEquals(BindingFailure.WRONG_SHARD_COUNT, assertThrows(BindingFormatException.class,
+                    () -> BindingMessage.decode(payload)).reason(), "N=" + bad);
+        }
+    }
+
     @Test
     void rejectsTrailingByte() {
-        byte[] payload = Arrays.copyOf(BindingMessage.offer(1, 775, F, R).encode(), 104);
+        byte[] payload = Arrays.copyOf(BindingMessage.offer(1, 775, F, R).encode(), 105);
         assertEquals(BindingFailure.BAD_LENGTH, assertThrows(BindingFormatException.class,
                 () -> BindingMessage.decode(payload)).reason());
     }
