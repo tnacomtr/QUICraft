@@ -48,6 +48,7 @@ public final class Main {
                   transport-summarize  medians and bootstrap CIs of QUIC minus TCP
                   latency      in-process loopback ping-pong: TCP vs QUIC vs QUIC through the bridge
                   load-server  many-connection load spike: real QuicServer, admission limits raised unless --shipped-limits
-                  load-client  many-connection load spike: real QuicClient, one loopback source IP per connection""");
+                  load-client  many-connection load spike: real QuicClient, one loopback source IP per connection
+                               (--mode v3 for /3: load-server binds /3 with --node-budget-mb, --lanes activates lanes)""");
     }
 }
