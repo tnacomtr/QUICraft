@@ -1609,3 +1609,7 @@ position extraction. Those implementations must change together before this revi
    approved 10 seconds? Executor waits and tick stalls are excluded; after FIFO enqueue
    there is no transport application timeout. This is not a comparison with the keepalive's
    elapsed-time budget, and this draft does not change the approved duration.
+5. Approve the new close code `0x12` (resource abort) next to `0x10` (binding/setup failure)
+   and `0x11` (peer ordering/protocol violation)? It marks closes caused by the local node's
+   own resource limits so they never blame the peer and never write a failure-cache entry.
+   Close codes are wire format; nothing ships with `0x12` until this is confirmed.
