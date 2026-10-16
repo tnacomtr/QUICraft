@@ -94,11 +94,11 @@ class StreamReceiverTest {
         int records = ReceiveSlots.RECORDS_PER_STREAM;
         // REALTIME, CONTROL and a chunk head each hold a complete slot at its limit.
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(1, 1, 0), route(1), full, records).kind());
+                f.receiver.offer(rec(1, 1, 0), records, route(1), full, records).kind());
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(0, 1, 0), route(0), full, records).kind());
+                f.receiver.offer(rec(0, 1, 0), records, route(0), full, records).kind());
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                f.receiver.offer(rec(2, 1, 0), route(2), full, records).kind());
+                f.receiver.offer(rec(2, 1, 0), records, route(2), full, records).kind());
         assertEquals(1, f.receiver.nextToEnqueue(), "REALTIME before CONTROL and chunks");
         f.receiver.enqueued(1, 1);
         assertEquals(0, f.receiver.nextToEnqueue(), "CONTROL before the chunk head");
@@ -220,6 +220,34 @@ class StreamReceiverTest {
         assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
                 f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
         assertAdmitted(f.receiver, rec(2, 1, 1));
+    }
+
+    @Test void bundleAdvancesTheFrontierToItsClosingSequenceOnEnqueueAndApply() {
+        Fixture f = new Fixture(2);
+        // CONTROL bundle: opener at 1, one member at 2, closer at 3, admitted as one unit.
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
+                f.receiver.offer(rec(0, 1, 0), 3, route(0), 300, 3).kind());
+        assertEquals(0, f.receiver.nextToEnqueue());
+        // A later record on the same stream must open at closing + 1, not at opening + 1.
+        assertViolation(offer(f.receiver, rec(0, 2, 0)));
+        // A dependency on the bundle's closing sequence waits for the whole bundle to apply.
+        assertAdmitted(f.receiver, rec(1, 1, 0, dep(0, 3)));
+        f.receiver.enqueued(0, 1);
+        assertEquals(3, f.receiver.enqueuedWatermark(0));
+        assertEquals(-1, f.receiver.nextToEnqueue(), "closing sequence is not applied yet");
+        f.receiver.applied(0, 1);
+        assertEquals(3, f.receiver.appliedWatermark(0));
+        assertEquals(1, f.receiver.nextToEnqueue(), "dependency on the closer is released by apply");
+        // The next CONTROL unit opens at 4.
+        assertAdmitted(f.receiver, rec(0, 4, 0));
+    }
+
+    @Test void unitWithAWrongRecordCountOrClosingSequenceIsAViolation() {
+        Fixture f = new Fixture(2);
+        assertViolation(f.receiver.offer(rec(0, 1, 0), 3, route(0), 300, 2));
+        assertViolation(f.receiver.offer(rec(0, 1, 0), 0, route(0), 300, 1));
+        assertViolation(f.receiver.offer(rec(0, 1, 0), 1, route(0), 300, 0));
+        assertAdmitted(f.receiver, rec(0, 1, 0));
     }
 
     @Test void serverboundReceiverRejectsEveryChunkStreamRecord() {
@@ -405,7 +433,7 @@ class StreamReceiverTest {
         for (int s = 0; s < 8; s++) {
             Record r = s == blocked ? rec(s, 1, 0, dep(prereq, 1)) : rec(s, 1, 0);
             assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                    f.receiver.offer(r, route(s), full, records).kind(), "stream " + s + " prereq " + prereq);
+                    f.receiver.offer(r, records, route(s), full, records).kind(), "stream " + s + " prereq " + prereq);
         }
         if (locallyWithheld) {
             f.receiver.markLocallyWithheld(prereq, 1);

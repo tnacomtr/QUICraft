@@ -101,15 +101,19 @@ public final class StreamReceiver {
 
     /** One admitted head unit and its per-stream state. */
     private static final class Unit {
+        /** The opening record; its sequence identifies the unit and its dependencies gate it. */
         final Record record;
+        /** Sequence of the last record of the unit; equals the opener's for a single record. */
+        final long closing;
         final ReceiveRoute route;
         final BlockedHeadTimer timer;
         boolean enqueued;
         /** Sticky for the current wait: some prerequisite on the chain was withheld locally (13.12). */
         boolean chainWasWithheld;
 
-        Unit(Record record, ReceiveRoute route, BlockedHeadTimer timer) {
+        Unit(Record record, long closing, ReceiveRoute route, BlockedHeadTimer timer) {
             this.record = record;
+            this.closing = closing;
             this.route = route;
             this.timer = timer;
         }
@@ -165,15 +169,37 @@ public final class StreamReceiver {
     }
 
     /**
-     * Offers one fully parsed head unit (one record or one complete bundle) for admission (13.10).
+     * Offers one single-record head unit for admission (13.10). Shorthand for
+     * {@link #offer(Record, long, ReceiveRoute, long, int)} with closing sequence equal to the record's own.
      *
      * @param record decoded envelope; its body stays opaque here
      * @param route the route the integration decoded from the packet id
      * @param wireBytes total wire size of the unit, prefixes included, charged to the stream slot
-     * @param recordCount records in the unit, including delimiters and partials
+     * @param recordCount must be 1 for a single record
      * @return ADMITTED, BUSY, or VIOLATION with a 0x11 close
      */
     public Admission offer(Record record, ReceiveRoute route, long wireBytes, int recordCount) {
+        if (record == null) {
+            throw new IllegalArgumentException("record and route are required");
+        }
+        return offer(record, record.sequence(), route, wireBytes, recordCount);
+    }
+
+    /**
+     * Offers one scheduling unit for admission (13.10, 13.15). A unit is one record or one complete
+     * bundle: its members occupy consecutive sequences from the opening record's sequence through
+     * {@code closingSequence}, and only the opener carries external dependencies. Admission advances
+     * the stream's frontier to the closing sequence, so the next unit must open at closing + 1.
+     *
+     * @param record the opening record; its body stays opaque here
+     * @param closingSequence sequence of the last record of the unit, equal to the opener's for one record
+     * @param route the route the integration decoded from the packet id
+     * @param wireBytes total wire size of the unit, prefixes included, charged to the stream slot
+     * @param recordCount records in the unit, delimiters included; must equal closing - opening + 1
+     * @return ADMITTED, BUSY, or VIOLATION with a 0x11 close
+     */
+    public Admission offer(Record record, long closingSequence, ReceiveRoute route, long wireBytes,
+            int recordCount) {
         if (record == null || route == null) {
             throw new IllegalArgumentException("record and route are required");
         }
@@ -189,6 +215,10 @@ public final class StreamReceiver {
         }
         if (record.sequence() != admitted[stream] + 1) {
             return Admission.violation("skipped or duplicate sequence on stream " + stream);
+        }
+        if (closingSequence < record.sequence() || closingSequence - record.sequence() + 1 != recordCount) {
+            return Admission.violation("unit closes at " + closingSequence + " but holds " + recordCount
+                    + " records from " + record.sequence() + " on stream " + stream);
         }
         Admission epochCheck = checkEpoch(record, route);
         if (epochCheck != null) {
@@ -226,9 +256,9 @@ public final class StreamReceiver {
         if (!slots.admitHead(stream, wireBytes, recordCount)) {
             return Admission.busy();
         }
-        Unit unit = new Unit(record, route, new BlockedHeadTimer(clock, true));
+        Unit unit = new Unit(record, closingSequence, route, new BlockedHeadTimer(clock, true));
         head[stream] = unit;
-        admitted[stream] = record.sequence();
+        admitted[stream] = closingSequence;
         if (route.epochChange()) {
             transitionPending = true;
         }
@@ -268,7 +298,8 @@ public final class StreamReceiver {
     }
 
     /**
-     * Records that the head with this sequence was handed to the game executor (Q). It must be ready.
+     * Records that the head unit opening at {@code sequence} was handed to the game executor (Q). It must
+     * be ready. Q advances to the unit's closing sequence, so a bundle is enqueued as a whole (13.15).
      * Stops its blocked-head timer: after Q no transport application timeout applies (13.10).
      */
     public void enqueued(int stream, long sequence) {
@@ -281,12 +312,13 @@ public final class StreamReceiver {
         }
         unit.enqueued = true;
         unit.timer.stop();
-        enqueued[stream] = sequence;
+        enqueued[stream] = unit.closing;
     }
 
     /**
-     * Records that the game's serial handler applied the enqueued head (D). Releases the stream's slot,
-     * commits D and, for a transition record, advances the epoch by exactly one (13.18).
+     * Records that the game's serial handler applied the enqueued head unit opening at {@code sequence} (D).
+     * Releases the stream's slot, commits D to the unit's closing sequence and, for a transition record,
+     * advances the epoch by exactly one (13.18).
      */
     public void applied(int stream, long sequence) {
         Unit unit = currentHead(stream, sequence);
@@ -295,9 +327,9 @@ public final class StreamReceiver {
         }
         rememberWithheldChains();
         head[stream] = null;
-        applied[stream] = sequence;
+        applied[stream] = unit.closing;
         slots.releaseHead(stream);
-        withheld.removeIf(key -> (key >>> SEQUENCE_BITS) == stream && (key & SEQUENCE_MASK) <= sequence);
+        withheld.removeIf(key -> (key >>> SEQUENCE_BITS) == stream && (key & SEQUENCE_MASK) <= unit.closing);
         if (unit.route.epochChange()) {
             epoch = epoch + 1;
             transitionPending = false;
