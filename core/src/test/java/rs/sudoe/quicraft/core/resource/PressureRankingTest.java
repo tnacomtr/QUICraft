@@ -200,6 +200,31 @@ class PressureRankingTest {
                 "the evicted identity reads its folded history from its bucket");
     }
 
+    @Test void overflowChurnDoesNotEraseAnEvictedIdentitysBucketContinuity() throws Exception {
+        PressureRanking r = new PressureRanking(60_000, 2, 10, SECRET);
+        r.connect("c1", ip("192.0.2.90"), null, 0);
+        r.setRetained("c1", 100, 0);
+        r.disconnect("c1", 10 * S);
+        r.connect("c2", ip("192.0.2.91"), null, 10 * S);
+        r.connect("c3", ip("192.0.2.92"), null, 10 * S);
+        // .90 is evicted into its bucket. Live exact holders keep the map full, so the next overflowing identities
+        // push .90's continuity record out of the bounded memory.
+        r.connect("c5", ip("192.0.2.93"), null, 10 * S);
+        r.connect("c6", ip("192.0.2.94"), null, 10 * S);
+        r.connect("c7", ip("192.0.2.95"), null, 10 * S);
+        r.disconnect("c5", 10 * S);
+        r.disconnect("c6", 10 * S);
+        r.disconnect("c7", 10 * S);
+        r.disconnect("c2", 10 * S);
+        r.disconnect("c3", 10 * S);
+        // Exact slots are free now, but the trimmed record must still send .90 to its bucket, not a fresh entry.
+        r.connect("c4", ip("192.0.2.90"), null, 11 * S);
+        double bucketScore = r.bucketScore(r.bucketFor(ip("192.0.2.90")), 11 * S);
+        assertTrue(bucketScore > 0, "the evicted history is folded into its bucket");
+        assertTrue(r.score("c4", 11 * S) >= bucketScore - 1e-9,
+                "a reconnect after overflow churn inherits at least its live bucket score");
+    }
+
     @Test void refusedWaitFloorDoesNotApplyToAConnectionYoungerThanTheWindow() throws Exception {
         PressureRanking plain = new PressureRanking(60_000, 100, 100, SECRET);
         PressureRanking floored = new PressureRanking(60_000, 100, 100, SECRET);

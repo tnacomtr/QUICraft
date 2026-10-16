@@ -43,6 +43,12 @@ public final class PressureRanking {
     private final Map<String, Long> accountOverflow = new LinkedHashMap<String, Long>(16, 0.75f, true);
     /** Connections currently in a refused wait, whose refused-wait floor lifts their identities (13.12). */
     private final Set<Connection> refusedWaiters = new HashSet<Connection>();
+    /**
+     * Last-served time of the continuity records trimmed from the bounded maps, per overflow bucket (13.12). A
+     * trimmed identity keeps its bucket through this bounded fold instead of falling back to a fresh exact entry.
+     */
+    private final Long[] foldedIpServed = new Long[OVERFLOW];
+    private final Long[] foldedAccountServed = new Long[OVERFLOW];
     private final IdentityHistory[] buckets = new IdentityHistory[OVERFLOW];
     private final List<Map<Object, Integer>> bucketLive = new ArrayList<Map<Object, Integer>>(OVERFLOW);
     private final Map<Object, Connection> connections = new HashMap<Object, Connection>();
@@ -286,9 +292,16 @@ public final class PressureRanking {
     private IdentityHistory exactIp(InetAddress ip, long now, long eff) {
         IdentityHistory existing = ips.get(ip);
         if (existing != null) return existing;
+        int bucket = PrefixKey.overflow(ip).bucket(secret);
         Long remembered = overflowMemory.get(ip);
-        if (remembered != null && stickyOverflow(remembered, PrefixKey.overflow(ip).bucket(secret), now)) {
+        if (remembered != null && stickyOverflow(remembered, bucket, now)) {
             overflowMemory.put(ip, now);
+            return null;
+        }
+        // A record trimmed from the bounded memory folds into its bucket: the reconnect still reads that bucket.
+        Long folded = foldedIpServed[bucket];
+        if (remembered == null && folded != null && stickyOverflow(folded, bucket, now)) {
+            fold(foldedIpServed, bucket, now);
             return null;
         }
         if (ips.size() >= maxTrackedIps && !makeIpRoom(now, eff)) {
@@ -305,9 +318,15 @@ public final class PressureRanking {
     private IdentityHistory exactAccount(String account, long now, long eff) {
         IdentityHistory existing = accounts.get(account);
         if (existing != null) return existing;
+        int bucket = PrefixKey.accountBucket(secret, account);
         Long remembered = accountOverflow.get(account);
-        if (remembered != null && stickyOverflow(remembered, PrefixKey.accountBucket(secret, account), now)) {
+        if (remembered != null && stickyOverflow(remembered, bucket, now)) {
             accountOverflow.put(account, now);
+            return null;
+        }
+        Long folded = foldedAccountServed[bucket];
+        if (remembered == null && folded != null && stickyOverflow(folded, bucket, now)) {
+            fold(foldedAccountServed, bucket, now);
             return null;
         }
         if (accounts.size() >= maxTrackedAccounts) {
@@ -334,10 +353,17 @@ public final class PressureRanking {
 
     private void trimAccountOverflow() {
         while (accountOverflow.size() > maxTrackedAccounts) {
-            Iterator<String> oldest = accountOverflow.keySet().iterator();
-            oldest.next();
+            Iterator<Map.Entry<String, Long>> oldest = accountOverflow.entrySet().iterator();
+            Map.Entry<String, Long> entry = oldest.next();
+            fold(foldedAccountServed, PrefixKey.accountBucket(secret, entry.getKey()), entry.getValue());
             oldest.remove();
         }
+    }
+
+    /** Keeps the latest last-served time of a bucket's folded continuity records. */
+    private static void fold(Long[] folded, int bucket, long servedNanos) {
+        Long previous = folded[bucket];
+        if (previous == null || servedNanos > previous) folded[bucket] = servedNanos;
     }
 
     /** Frees one exact IP slot: expired entries first, then fold the lowest-score unprotected inactive entry. */
@@ -405,8 +431,9 @@ public final class PressureRanking {
 
     private void trimOverflowMemory() {
         while (overflowMemory.size() > maxTrackedIps) {
-            Iterator<InetAddress> oldest = overflowMemory.keySet().iterator();
-            oldest.next();
+            Iterator<Map.Entry<InetAddress, Long>> oldest = overflowMemory.entrySet().iterator();
+            Map.Entry<InetAddress, Long> entry = oldest.next();
+            fold(foldedIpServed, PrefixKey.overflow(entry.getKey()).bucket(secret), entry.getValue());
             oldest.remove();
         }
     }
