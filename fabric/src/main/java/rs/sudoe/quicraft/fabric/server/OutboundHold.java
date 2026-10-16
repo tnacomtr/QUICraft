@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.fabric.server;
 
 import java.util.ArrayDeque;
 import java.util.List;
+import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 
 /**
@@ -25,6 +26,7 @@ final class OutboundHold {
         void sendBundle(ProtocolState state, List<byte[]> packets);
     }
 
+    private final ReceiveBudget node;
     private final Sender sender;
     private final int maxUnits;
     private final long maxBytes;
@@ -32,6 +34,12 @@ final class OutboundHold {
     private long heldBytes;
 
     OutboundHold(Sender sender, int maxUnits, long maxBytes) {
+        this(sender, maxUnits, maxBytes, ReceiveBudget.unlimited());
+    }
+
+    /** As above; held units are also reserved against the node budget until they are sent or dropped. */
+    OutboundHold(Sender sender, int maxUnits, long maxBytes, ReceiveBudget node) {
+        this.node = node;
         this.sender = sender;
         this.maxUnits = maxUnits;
         this.maxBytes = maxBytes;
@@ -45,6 +53,9 @@ final class OutboundHold {
         if (held.isEmpty() && sender.writable()) {
             dispatch(unit);
             return;
+        }
+        if (!unit.reserve(node)) {
+            throw new IllegalStateException("the node budget refused " + unit.bytes() + " held bytes (13.12)");
         }
         if (held.size() + 1 > maxUnits || heldBytes + unit.bytes() > maxBytes) {
             // An unpausable producer over the cap disconnects (13.12), here as in the layer.
@@ -67,7 +78,24 @@ final class OutboundHold {
         return held.size();
     }
 
+    /** The connection ended: every held unit gives its reservation back. */
+    void teardown() {
+        for (OutboundUnit unit : held) {
+            unit.release();
+        }
+        held.clear();
+        heldBytes = 0;
+    }
+
     private void dispatch(OutboundUnit unit) {
+        try {
+            send(unit);
+        } finally {
+            unit.release();
+        }
+    }
+
+    private void send(OutboundUnit unit) {
         if (unit.bundle() && unit.packets().size() >= 2) {
             sender.sendBundle(unit.state(), unit.packets());
             return;

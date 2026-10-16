@@ -38,6 +38,7 @@ import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
 import rs.sudoe.quicraft.core.multistream.OutboundPacket;
+import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.transport.V3Connection;
@@ -89,6 +90,7 @@ public final class V3Join {
     private final MinecraftServer server;
     private final byte[] fingerprint;
     private final BindingHold hold = new BindingHold();
+    private final ReceiveBudget node;
     private final JoinState state = new JoinState();
     private final SecretHolder secrets = new SecretHolder();
 
@@ -107,11 +109,16 @@ public final class V3Join {
     /** True from the moment the lane session exists: the sink submits instead of replaying. */
     private boolean sinkActive;
     private OutboundHold outHold;
+    private AckBacklog backlog;
+    private final java.util.ArrayDeque<Long> decodedSizes = new java.util.ArrayDeque<>();
+    private boolean retryScheduled;
     private OutboundFilter filter;
     private ChannelFuture lastBindingWrite;
     private ByteBuf remainder;
 
-    private V3Join(QuicBridgeChannel channel, V3Connection connection, MinecraftServer server, byte[] fingerprint) {
+    private V3Join(QuicBridgeChannel channel, V3Connection connection, MinecraftServer server, byte[] fingerprint,
+            ReceiveBudget node) {
+        this.node = node;
         this.channel = channel;
         this.connection = connection;
         this.server = server;
@@ -122,9 +129,9 @@ public final class V3Join {
 
     /** Hook (listener accept): marks a bridge channel as a {@code /3} connection. Never throws. */
     static void attach(QuicBridgeChannel channel, V3Connection connection, MinecraftServer server,
-            byte[] fingerprint) {
+            byte[] fingerprint, ReceiveBudget node) {
         try {
-            V3Join join = new V3Join(channel, connection, server, fingerprint);
+            V3Join join = new V3Join(channel, connection, server, fingerprint, node);
             channel.attr(KEY).set(join);
             // Every way a join ends, a held secret, the binding session and a taken-over buffer go.
             channel.closeFuture().addListener(f -> join.teardown());
@@ -456,6 +463,7 @@ public final class V3Join {
         }
         ChannelPipeline pipeline = channel.pipeline();
         codec = new PacketLaneCodec(pipeline);
+        codec.onDecoded(size -> decodedSizes.add(Long.valueOf(size)));
         // Inbound: decoded records re-enter the game's pipeline right behind the frame splitter, as
         // the frames TCP would have delivered, so every handler after it runs as usual.
         ChannelHandlerContext deliverFrom = pipeline.context(SPLITTER);
@@ -474,7 +482,10 @@ public final class V3Join {
         filter = new OutboundFilter(true);
         pipeline.addLast(FILTER, filter);
         outboundState = encoderState(pipeline);
-        outHold = new OutboundHold(new LaneSender(), LaneSession.MAX_UNSENT_PACKETS, LaneSession.MAX_UNSENT_BYTES);
+        outHold = new OutboundHold(new LaneSender(), LaneSession.MAX_UNSENT_PACKETS, LaneSession.MAX_UNSENT_BYTES,
+                node);
+        backlog = new AckBacklog((lane, sequence) -> lanes.applied(lane, sequence), this::offerBehindHandlers, node,
+                AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
         connection.activate(lanes, protocol, control);
         sinkActive = true;
         // 12.13: what was queued during the exchange goes out as records, whole units in order.
@@ -524,9 +535,26 @@ public final class V3Join {
         }
     }
 
+    /** Gives every byte the join still retains back to the node's budget; safe to call more than once. */
+    private void discardRetained() {
+        BindingPayloads current = payloads;
+        if (current != null) {
+            OutboundQuiescence.discard(current.releaseQueued());
+        }
+        OutboundHold holding = outHold;
+        if (holding != null) {
+            holding.teardown();
+        }
+        AckBacklog pending = backlog;
+        if (pending != null) {
+            pending.teardown();
+        }
+    }
+
     /** The connection ended, whichever way: nothing of the join outlives it. */
     private void teardown() {
         secrets.wipe();
+        discardRetained();
         BindingSession current = session;
         if (current != null) {
             current.close();
@@ -551,6 +579,7 @@ public final class V3Join {
         }
         hold.fail();
         secrets.wipe();
+        discardRetained();
         BindingSession current = session;
         if (current != null) {
             current.close();
@@ -660,7 +689,7 @@ public final class V3Join {
                 return;
             }
             if (!active) {
-                switch (OutboundQuiescence.offer(payloads.driver(), unit)) {
+                switch (OutboundQuiescence.offer(payloads.driver(), unit, node)) {
                     case QUEUED:
                         return;
                     case DROPPED_FAILED:
@@ -755,9 +784,10 @@ public final class V3Join {
     }
 
     /**
-     * After the game's packet handler: acknowledges each delivery (13.10). The ack follows the
-     * handler having accepted the packets; for a protocol-changing packet it waits until the game has
-     * applied the change, because the next records are decoded with the new protocol.
+     * After the game's packet handler: acknowledges each delivery (13.10) once the game accepted it
+     * (see {@link AckBacklog}: the work accepted but not yet run is bounded and accounted). For a
+     * protocol-changing packet it waits until the game has applied the change, because the next
+     * records are decoded with the new protocol.
      */
     private final class AckHandler extends ChannelDuplexHandler {
         @Override
@@ -787,25 +817,56 @@ public final class V3Join {
                 if (!ctx.channel().isOpen() || lanes.isClosed() || state.failed()) {
                     return;
                 }
-                Connection game = ctx.pipeline().get(Connection.class);
-                // Queued behind the packet handlers of what it acknowledges, on the game's own queue:
-                // nothing is credited while one of those still waits for the main thread (13.10). That
-                // also covers a protocol change, which the main thread applies in its handler.
-                AckQueue queue = new AckQueue(task -> schedule(game, task),
-                        (lane, sequence) -> lanes.applied(lane, sequence));
-                queue.acknowledge(ack.lane(), ack.sequence());
+                if (PacketLaneCodec.inboundSwapPending(ctx.pipeline())) {
+                    // The protocol change the packet asked for is not applied yet; the next record would
+                    // be decoded with the old one.
+                    ctx.executor().schedule(() -> acknowledge(ctx, ack), 1, TimeUnit.MILLISECONDS);
+                    return;
+                }
+                Long size = decodedSizes.poll();
+                backlog.delivered(ack.lane(), ack.sequence(), 1, size == null ? 0 : size.longValue());
+                scheduleRetry(ctx);
             } catch (Throwable t) {
                 fail("binding ack: " + describe(t), t);
             }
         }
 
-        @SuppressWarnings({"unchecked", "rawtypes"})
-        private void schedule(Connection game, Runnable task) {
-            net.minecraft.network.PacketListener listener = game.getPacketListener();
-            if (listener == null) {
-                throw new IllegalStateException("no packet listener to queue an acknowledgement behind");
+        /** While a not-accepting listener holds acknowledgements back, try its queue again shortly. */
+        private void scheduleRetry(ChannelHandlerContext ctx) {
+            if (retryScheduled || !backlog.hasBlocked()) {
+                return;
             }
-            server.packetProcessor().scheduleIfPossible(listener, new LaneAckPacket(task));
+            retryScheduled = true;
+            ctx.executor().schedule(() -> {
+                retryScheduled = false;
+                try {
+                    if (ctx.channel().isOpen() && !state.failed()) {
+                        backlog.retry();
+                        scheduleRetry(ctx);
+                    }
+                } catch (Throwable t) {
+                    fail("binding ack retry: " + describe(t), t);
+                }
+            }, 1, TimeUnit.MILLISECONDS);
         }
+    }
+
+    /**
+     * The game's serial queue of packet handlers: a marker queued here runs on the main thread right
+     * after the handlers queued before it. False while the listener does not accept messages.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private boolean offerBehindHandlers(Runnable task) {
+        Connection game = channel.pipeline().get(Connection.class);
+        net.minecraft.network.PacketListener listener = game == null ? null : game.getPacketListener();
+        if (listener == null) {
+            return false;
+        }
+        LaneAckPacket marker = new LaneAckPacket(task);
+        if (!listener.shouldHandleMessage(marker)) {
+            return false;
+        }
+        server.packetProcessor().scheduleIfPossible(listener, marker);
+        return true;
     }
 }

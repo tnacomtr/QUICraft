@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.fabric.server;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 
 /**
@@ -18,6 +19,7 @@ final class OutboundUnit {
     private final List<byte[]> packets = new ArrayList<>();
     private ProtocolState state;
     private long bytes;
+    private ReceiveBudget reservedAgainst;
 
     OutboundUnit(boolean bundle) {
         this.bundle = bundle;
@@ -40,6 +42,30 @@ final class OutboundUnit {
 
     List<byte[]> packets() {
         return Collections.unmodifiableList(packets);
+    }
+
+    /**
+     * Reserves this unit's real size against the node's budget (13.12) for as long as the platform
+     * retains it; a second call does nothing. False when the budget refuses.
+     */
+    boolean reserve(ReceiveBudget budget) {
+        if (reservedAgainst != null) {
+            return true;
+        }
+        if (!budget.tryReserve(bytes)) {
+            return false;
+        }
+        reservedAgainst = budget;
+        return true;
+    }
+
+    /** Gives the reservation back; a second call, or a unit that reserved nothing, does nothing. */
+    void release() {
+        ReceiveBudget budget = reservedAgainst;
+        if (budget != null) {
+            reservedAgainst = null;
+            budget.release(bytes);
+        }
     }
 
     boolean isEmpty() {

@@ -75,6 +75,12 @@ public final class PacketLaneCodec implements GameLanes.Codec {
 
     private final ChannelPipeline pipeline;
     private final Access access;
+    private java.util.function.LongConsumer decodedSizes = size -> { };
+
+    /** Reports each decoded packet's uncompressed size, in decode order (what its delivery will weigh). */
+    public void onDecoded(java.util.function.LongConsumer listener) {
+        this.decodedSizes = listener;
+    }
 
     public PacketLaneCodec(ChannelPipeline pipeline) {
         this(pipeline, MIXINS);
@@ -113,6 +119,7 @@ public final class PacketLaneCodec implements GameLanes.Codec {
             uncompressed[0] = total;
         });
         int id = FrameCodec.packetId(packet);
+        decodedSizes.accept(packet.length);
         // What the game's decompress handler takes after the frame splitter: a stored packet when
         // compression is on, the bare packet when it is not. Inflating happened once, above.
         ByteBuf forPipeline = compressed

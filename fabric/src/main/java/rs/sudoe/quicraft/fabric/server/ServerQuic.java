@@ -24,6 +24,7 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.connect.FallbackReport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
+import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.discovery.QuicPort;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
@@ -46,6 +47,8 @@ public final class ServerQuic {
     /** What a {@code /3} connection's join needs from the running server (docs/protocol.md 12.7). */
     private static volatile @Nullable MinecraftServer minecraft;
     private static volatile byte @Nullable [] fingerprintDigest;
+    /** The node's receive budget (13.12), shared by the listener's lane sessions and this platform's send-side queues. */
+    private static volatile @Nullable ReceiveBudget nodeBudget;
 
     private final QuicServer server;
     private final Advertisement advertisement;
@@ -201,8 +204,9 @@ public final class ServerQuic {
             ChannelInitializer<Channel> init, ServerSettings settings) {
         try {
             // 13.12: the node-wide pending-bytes budget of the owner's setting; /2 has none.
-            TransportConfig config = TransportConfig.builder()
-                    .nodePendingBytes(settings.multistreamNodeBudgetBytes()).build();
+            ReceiveBudget budget = ReceiveBudget.bounded(settings.multistreamNodeBudgetBytes());
+            nodeBudget = budget;
+            TransportConfig config = TransportConfig.builder().nodeBudget(budget).build();
             return QuicServer.bind(sockets.hostLoops(), sockets.hostSockets(), identity,
                     config, stream -> accept(stream, init, sockets.acceptingLoop()),
                     MultistreamSwitch::tableFor);
@@ -223,8 +227,9 @@ public final class ServerQuic {
             // configuration (12.4). Nothing about /2 or TCP changes.
             MinecraftServer server = minecraft;
             byte[] digest = fingerprintDigest;
+            ReceiveBudget budget = nodeBudget;
             if (server != null && digest != null) {
-                V3Join.attach(channel, v3, server, digest);
+                V3Join.attach(channel, v3, server, digest, budget != null ? budget : ReceiveBudget.unlimited());
             } else {
                 v3.abort(Protocol.CLOSE_BINDING_FAILURE);
             }
@@ -244,6 +249,7 @@ public final class ServerQuic {
         current = null;
         minecraft = null;
         fingerprintDigest = null;
+        nodeBudget = null;
         ServerBindingPayload.setEnabled(false);
         if (s != null) {
             try {

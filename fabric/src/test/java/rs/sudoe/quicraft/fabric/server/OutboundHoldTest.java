@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.binding.BindingDriver;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
+import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 
 /**
@@ -136,14 +137,70 @@ class OutboundHoldTest {
         assertTrue(session.isQuiescent());
 
         // Three 3 MiB units are three packets: a flat 1 KiB each would never get near the 8 MiB bound.
-        assertEquals(BindingDriver.QueueResult.QUEUED, OutboundQuiescence.offer(session, unit(false, 3 << 20)));
-        assertEquals(BindingDriver.QueueResult.QUEUED, OutboundQuiescence.offer(session, unit(false, 3 << 20)));
-        assertEquals(BindingDriver.QueueResult.DROPPED_FAILED, OutboundQuiescence.offer(session, unit(false, 3 << 20)),
+        assertEquals(BindingDriver.QueueResult.QUEUED, OutboundQuiescence.offer(session, unit(false, 3 << 20), ReceiveBudget.unlimited()));
+        assertEquals(BindingDriver.QueueResult.QUEUED, OutboundQuiescence.offer(session, unit(false, 3 << 20), ReceiveBudget.unlimited()));
+        assertEquals(BindingDriver.QueueResult.DROPPED_FAILED, OutboundQuiescence.offer(session, unit(false, 3 << 20), ReceiveBudget.unlimited()),
                 "9 MiB of real bytes crosses 12.10's 8 MiB bound");
     }
 
     @Test
     void aUnitsSizeIsTheSumOfItsEncodedPackets() {
         assertEquals(30, unit(true, 10, 15, 5).bytes());
+    }
+
+    @Test
+    void heldAndQueuedUnitsAreReservedAgainstTheNodeBudgetAndEveryPathGivesThemBack() {
+        ReceiveBudget node = ReceiveBudget.bounded(1000);
+        Lanes lanes = new Lanes();
+        lanes.writable = false;
+        OutboundHold hold = new OutboundHold(lanes, 16, 1 << 20, node);
+
+        hold.submit(unit(false, 300));
+        hold.submit(unit(true, 100, 100));
+        assertEquals(500, node.reserved(), "held units are reserved at their real size");
+        assertThrows(IllegalStateException.class, () -> hold.submit(unit(false, 600)), "the node refuses the rest");
+        assertEquals(500, node.reserved());
+
+        lanes.writable = true;
+        hold.drain();
+        assertEquals(0, node.reserved(), "sending gives the bytes back");
+
+        lanes.writable = false;
+        hold.submit(unit(false, 200));
+        assertEquals(200, node.reserved());
+        hold.teardown();
+        assertEquals(0, node.reserved(), "teardown gives back what was still held");
+    }
+
+    @Test
+    void theQuiescenceQueueReservesWhileQueuedAndEveryPathReleases() {
+        ReceiveBudget node = ReceiveBudget.bounded(10 << 20);
+        BindingSession session = new BindingSession(BindingStateMachine.Role.SERVER, () -> new byte[32], null,
+                BindingStateMachine.MODE_OFFLINE, 775, new byte[32], new byte[32], System::nanoTime, 0L,
+                new BindingDriver.Callbacks() {
+                    @Override
+                    public void send(byte[] payload) { }
+
+                    @Override
+                    public void activateOutbound() { }
+
+                    @Override
+                    public void activateInbound() { }
+
+                    @Override
+                    public void fail(int code, String reason) { }
+                }, null, null);
+        session.onConfigurationEntered(System.nanoTime());
+
+        assertEquals(BindingDriver.QueueResult.QUEUED, OutboundQuiescence.offer(session, unit(false, 1000), node));
+        assertEquals(BindingDriver.QueueResult.QUEUED, OutboundQuiescence.offer(session, unit(false, 2000), node));
+        assertEquals(3000, node.reserved());
+
+        OutboundQuiescence.discard(session.releaseQueued());
+        assertEquals(0, node.reserved(), "teardown of a join that never activated returns everything");
+
+        // A unit that overflows the queue is not left reserved.
+        assertEquals(BindingDriver.QueueResult.DROPPED_FAILED, OutboundQuiescence.offer(session, unit(false, 9 << 20), node));
+        assertEquals(0, node.reserved());
     }
 }
