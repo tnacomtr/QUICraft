@@ -1007,6 +1007,21 @@ position extraction. Those implementations must change together before this revi
    Auxiliary streams open only after the opener activates under §12; each used direction starts
    `u8(version=2) || u8(logical_stream_index)`. CONTROL has no second preamble. No other
    stream ids, replacements, unidirectional streams or datagrams are allowed.
+
+   **To investigate (not yet normative): serverbound multiplexing.** This revision sends
+   every serverbound packet on CONTROL, because player input is small and its order is
+   part of game logic: movement before the dig, use-item or attack that depends on that
+   position, container clicks in sequence, and the signed-chat message chain. A single
+   lane still means one lost serverbound packet delays all later input. Investigate
+   carrying latency-sensitive serverbound packets (movement and rotation, keepalive and
+   pong replies, possibly swing/animation) on the REALTIME client-to-server direction,
+   with the same dependency records as clientbound traffic: an interaction, dig, use or
+   container packet names the latest REALTIME movement it depends on, so the server
+   never applies it before that position. Measure first: serverbound HOL delay under
+   each netem profile with the current single lane, then the gain, the server-side
+   cost and any anti-cheat effect of the split (movement validation sees the same
+   order). Adopting it changes the wire format (13.3 and 13.8) and needs the owner's
+   sign-off; until then the reverse REALTIME direction stays preamble-only.
    The client may buffer early server chunk-stream bytes before validating SERVER_SWITCH,
    within each stream's reservation (13.12), without parsing game bodies or delivering them.
    The server rejects pre-activation stream-4 bytes with `0x11`. Server activation must run
