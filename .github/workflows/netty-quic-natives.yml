@@ -141,8 +141,9 @@ jobs:
       - run: ./gradlew -Pquicraft.patchedNatives=all ${{ runner.os == 'macOS' && '-Pquicraft.skipRttTimingTests' || '' }} :core:test :core:shadedTest :core:checkShadedNotices
       - uses: actions/upload-artifact@v7
         if: matrix.native == 'linux-x86_64'
+      # Not named netty-quic-*: a slower verify job downloading that pattern would pick it up.
         with:
-          name: netty-quic-repo-all
+          name: quicraft-natives-repo-all
           path: natives/build/out/repo/
       - uses: actions/upload-artifact@v7
         if: failure()
