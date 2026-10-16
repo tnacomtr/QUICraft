@@ -116,7 +116,7 @@ class LaneSessionTest {
         LaneRig.Config serverOnly = new LaneRig.Config();
         serverOnly.clientSession = false;
         try (LaneRig rig = LaneRig.start(serverOnly)) {
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             QuicStreamChannel one = rig.clientRawStreams.poll(10, TimeUnit.SECONDS);
             assertEquals(1, one.streamId());
             assertTrue(LaneRig.await(() -> rig.clientRawBytes.get(0).snapshot().length >= 2, 10000));
@@ -173,7 +173,7 @@ class LaneSessionTest {
         config.clientSession = false;
         config.options.serverMaxStreamsUni = 4;
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             LaneLoopback.write(rig.net.clientUniStream(), (byte) 2, (byte) 1);
             closedWith(rig.serverGame, 0x11, false);
             sawClose(rig.net.clientSawClose, 0x11);
@@ -228,7 +228,7 @@ class LaneSessionTest {
     @Test
     void aClientHoldsEarlyStreamOneBytesUndeliveredUntilItsOwnActivation() throws Exception {
         try (LaneRig rig = LaneRig.start()) {
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             rig.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "early"));
             sleep(400);
             assertEquals(0, rig.clientGame.packetCount(), "nothing is delivered before the client's activation");
@@ -290,7 +290,7 @@ class LaneSessionTest {
                 LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(20));
         try (LaneRig rig = LaneRig.start(config)) {
             long start = System.nanoTime();
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             closedWith(rig.serverGame, 0x11, false);
             assertTrue(System.nanoTime() - start >= TimeUnit.MILLISECONDS.toNanos(350), "not before the deadline");
             sawClose(rig.net.clientSawClose, 0x11);
@@ -412,7 +412,7 @@ class LaneSessionTest {
         config.nodeBudget = node;
         config.clientSession = false;
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             // 13.12/13.13: the bytes a read can carry are reserved before the read, so no legal
             // record's chunk can be refused at the node level.
             assertTrue(LaneRig.await(() -> node.available() <= capacity - LaneSession.READ_CHUNK, 10000),
@@ -475,7 +475,7 @@ class LaneSessionTest {
         config.serverTiming = new LaneSession.Timing(clock::get, LaneSession.OPEN_TIMEOUT_NANOS,
                 LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             QuicStreamChannel one = rig.clientRawStreams.poll(10, TimeUnit.SECONDS);
             LaneLoopback.write(one, (byte) 2, (byte) 2);
             QuicStreamChannel four = rig.net.clientStream();
@@ -521,7 +521,7 @@ class LaneSessionTest {
 
     /** Activates a raw-server rig and answers both preambles, returning the raw REALTIME stream. */
     private static QuicStreamChannel openRawServerLanes(LaneRig rig) throws Exception {
-        rig.server.activate(null);
+        rig.activate(rig.server, null);
         LaneLoopback.write(rig.clientRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 2);
         QuicStreamChannel four = rig.net.clientStream();
         LaneLoopback.write(four, (byte) 2, (byte) 1);
@@ -796,7 +796,7 @@ class LaneSessionTest {
         LaneRig.Config config = new LaneRig.Config();
         config.clientSession = false;
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             LaneLoopback.write(rig.clientRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 2);
             QuicStreamChannel four = rig.net.clientStream();
             byte[] frame = LaneRig.frame(LaneRig.MOVE, "r");
@@ -822,7 +822,7 @@ class LaneSessionTest {
         LaneRig.Config config = new LaneRig.Config();
         config.clientSession = false;
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             QuicStreamChannel world = rig.clientRawStreams.poll(10, TimeUnit.SECONDS);
             LaneLoopback.write(world, (byte) 2, (byte) 2);
             QuicStreamChannel realtime = rig.net.clientStream();
@@ -1362,11 +1362,13 @@ class LaneSessionTest {
         config.nodeBudget = node;
         config.deferClientGame = true;
         try (LaneRig rig = LaneRig.start(config)) {
-            rig.server.activate(null);
+            rig.activate(rig.server, null);
             rig.activateClient();
             rig.server.send(PLAY, LaneRig.BLOCK, LaneRig.frame(LaneRig.BLOCK, "buffered"));
             assertTrue(LaneRig.await(() -> node.reserved() > 0, 10000),
-                    "the unparsed chunk is charged while it is held: " + node.reserved());
+                    "the unparsed chunk is charged while it is held: " + node.reserved()
+                            + " client=" + rig.clientGame.closed.getNow(null)
+                            + " server=" + rig.serverGame.closed.getNow(null));
             sleep(300);
             assertEquals(0, rig.clientGame.packetCount(), "nothing is delivered before the game is bound");
             assertEquals(0, LaneRig.snapshot(rig.client)[0], "nothing is parsed before the game is bound");
