@@ -106,7 +106,8 @@ Spectrum and similar) relay the ping, advertisement included, but drop UDP. The 
    unreachable, any exception) starts TCP immediately, without waiting for H.
 4. The Minecraft handshake goes **only** over the winner. The loser is closed at once: QUIC with
    `CONNECTION_CLOSE` error `NO_ERROR`, TCP with a normal close.
-5. A QUIC loss or failure is recorded in the failure cache (§6). Losing to TCP after the head
+5. A QUIC loss or failure is recorded in the failure cache (§6), except `/3` resource aborts
+   under 12.14. Losing to TCP after the head
    start counts as a failure.
 
 Known limit (Netty 4.2.19, verified in `QuicLoopbackTest`): when the server rejects the
@@ -135,7 +136,11 @@ idea: derive H from the RTT the server-list ping already measured.
 
 ## 6. Failure cache
 
-- Key: (resolved IP, QUIC port, advertised fingerprint).
+- Key: (resolved IP, QUIC port, advertised fingerprint). `/3` additionally enforces the
+  fingerprint-independent logical-server join-retry limiter in 12.14; rotating addresses,
+  advertised ports or fingerprints cannot reset that limiter. Resource aborts (`0x12`)
+  get only the failure-cache exceptions specified in 12.14; unauthenticated peer claims
+  exceeding its allowance follow normal backoff.
 - After a failure, the client skips QUIC for that key for the backoff period. It starts at
   **1 minute** and doubles with each consecutive failure, up to **1 hour** *(user)*. A successful
   QUIC connection removes the entry.
@@ -581,7 +586,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 ## 12. Channel binding, pinning and dropping Minecraft's cipher (Phase 5)
 
-**Draft v2. Design approved by the user 2026-10-15 (open questions 1-4 as written below); implementation may proceed behind a disabled-by-default flag. Security review is required before any release or enablement.**
+**Draft v2 with 2026-10-16 shard-count transcript revision (12.7-12.9). The original binding design was approved 2026-10-15; the revised wire draft remains disabled by default and requires security review before release or enablement.**
 
 ### Scope and capability gate
 
@@ -610,14 +615,18 @@ single-socket listener: no dispatcher is installed and the connection id length 
    error after `/3` selection is fatal, not permission to continue cipher-off or to silently
    renegotiate that connection. A false capability probe is an ordinary compatibility
    condition, logged once at INFO, not a binding failure.
+   Advertise/offer `/3` only for online mode, except when both test endpoints explicitly set
+   `-Dquicraft.multistream.offlineTest=true` (default false). That flag logs a prominent WARN
+   at startup and every offline `/3` activation: test-only, unauthenticated, not for production.
 
 ### Cryptographic inputs and messages
 
 4. **12.4 Login prerequisite.** Keep the vanilla RSA exchange, 16-byte Minecraft shared
    secret `S`, AES/CFB8, Mojang hash inputs and session authentication unchanged. Begin binding
    only in configuration state, after successful online authentication and TLS handshake
-   confirmation on both ends. Hold Finish Configuration until activation completes. The
-   server terminating Minecraft login and the QUIC endpoint must be the same trusted
+   confirmation on both ends. OFFER MUST be the first server message in configuration;
+   hold all ordinary configuration messages, including Finish Configuration, until activation.
+   The server terminating Minecraft login and the QUIC endpoint must be the same trusted
    component; forwarding a secret to an unrelated endpoint is not supported.
 5. **12.5 Encoding.** In these sections `||` is byte concatenation; quoted cryptographic
    strings are US-ASCII without a terminating NUL. `u8`, `u32` and `u64` are unsigned
@@ -633,7 +642,8 @@ single-socket listener: no dispatcher is installed and the connection id length 
    obtain `E = TLS-Exporter("EXPORTER-quicraft-binding-v2", context = empty byte string,
    length = 32)` using the RFC 8446 §7.5 normal exporter, with context explicitly supplied
    (JNI `use_context = 1`, context length 0), never the early exporter. Define
-   `T = SHA256("quicraft/3 binding v2" || u32(protocol_number) || u8(mode) || F || R)`.
+   `T = SHA256("quicraft/3 binding v2" || u32(protocol_number) || u8(mode) || F || R || u8(N))`.
+   `N` is the selected chunk shard count (13.2); it is authenticated with the routing digest.
    `mode = 1` requires Hello's `shouldAuthenticate=true`, successful client `joinServer`
    and successful server `hasJoined`; `mode = 0` requires no Minecraft encryption at all.
    Encrypted-but-unauthenticated login MUST never offer `/3` or MUST close it with `0x10`.
@@ -661,12 +671,14 @@ single-socket listener: no dispatcher is installed and the connection id length 
 8. **12.8 Plugin-message format.** Use configuration Custom Payload packets on channel
    `quicraft:binding` in both directions, intercepted by the adapter, never delivered to
    ordinary plugins. Payload is exactly `u8(version=2) || u8(kind) || u8(mode) ||
-   u32(protocol_number) || F[32] || R[32] || tag[32]` (103 bytes). There are no optional
+   u32(protocol_number) || F[32] || R[32] || u8(N) || tag[32]` (104 bytes). There are no optional
    fields or trailing bytes. `kind`: 0 OFFER (server), 1 CLIENT_PROOF, 2 SERVER_PROOF,
    3 CLIENT_SWITCH, 4 SERVER_SWITCH. OFFER has an all-zero tag; every other online tag is
    `HMAC-SHA256(K, "quicraft binding v2 message" || u8(kind) || T || E)`.
    Distinct kinds provide direction and phase separation. No bare tag is a valid packet.
-   `protocol_number` MUST be in unsigned 32-bit range (0..4294967295); reject values outside
+   `protocol_number` MUST be in u31 range (0..2147483647), encoded in the existing four-byte
+   u32 field with its high bit zero; this same range applies to routing resources, lookup,
+   advertisements and all messages. Reject values outside
    that range before encoding, never truncate or wrap. The transport MUST catch exporter
    errors (including native exceptions) and wrong-length values (anything other than 32
    bytes) and close `/3` with `0x10`, never allow an exception to bypass fail-closed handling.
@@ -678,16 +690,33 @@ single-socket listener: no dispatcher is installed and the connection id length 
    state. Client responds only to a matching OFFER; server sends SERVER_PROOF only after
    verifying CLIENT_PROOF; client sends CLIENT_SWITCH only after verifying SERVER_PROOF;
    server sends SERVER_SWITCH only after verifying CLIENT_SWITCH. Compare all 32 MAC bytes
-   in constant time after exact-length validation. Unknown versions/kinds, duplicates,
+   in constant time after exact-length validation. Every message echoes the same selected
+   `N`, in the client's preamble range and 1..6; a mismatch fails activation with `0x10`.
+   Unknown versions/kinds, duplicates,
    reflection, mismatched metadata, unsolicited payloads or invalid MACs terminate `/3`.
 
 ### Exact cipher and framing cutover
 
-10. **12.10 Quiescence.** Before sending OFFER, the server drains all previously queued
-    outbound configuration packets. On receiving OFFER the client drains its earlier writes
+10. **12.10 Quiescence.** Before sending OFFER, the server drains earlier login writes,
+    never sends ordinary configuration packets ahead of OFFER, and holds configuration
+    producers at the state boundary. On receiving OFFER the client drains its earlier writes
     before CLIENT_PROOF. Thereafter both pause ordinary outbound game packets and state
-    changes, queueing at most 256 packets or 8 MiB per endpoint (whichever is reached first;
-    overflow disconnects). Binding packets alone may bypass that queue. Earlier inbound game
+    changes. Client queue: at most 256 packets or 8 MiB. Server queue: at most 32 packets or
+    64 KiB, charged before enqueueing to the isolated outbound node pool in 13.12, not its
+    protected inbound shares; these are protocol queue caps, not game packet-size claims.
+     Prefer producer backpressure over accumulating configuration data. On a refused server
+     binding-queue charge, first shed outbound pressure victims under 13.12 and atomically
+     retry the charge from the reclaimed capacity before serving new charges. Backpressure
+     the producer without enqueueing uncharged bytes while waiting; retry until capacity is
+     available or 10 seconds of local monotonic transport time elapse from first refusal,
+     whichever comes first. The existing activation deadline still wins if earlier. Queue
+     overflow, an unpausable producer, or expiry while resource-blocked closes with `0x12`
+     (resource abort), not a binding-validation failure or a failure-cache entry (12.14), unless the client detects a dead path (zero-progress transport failure, 13.12).
+     Never take another connection's inbound share. Reserving the full binding queue per
+     idle connection would require at least 65536 additional payload bytes, exceeding the
+     entire 24576-byte idle receive target even before packet metadata; shed-then-retry
+     preserves that target without imposing an idle outbound reservation.
+     Binding packets alone may bypass that queue. Earlier inbound game
     packets remain legal until the peer's final switch packet. No other streams may carry
     bytes before activation. Cutover and pipeline changes execute on the connection event loop.
 11. **12.11 Client-to-server boundary.** CLIENT_SWITCH is the last complete Minecraft-framed,
@@ -717,28 +746,73 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 ### Failure, pins and rotation
 
-14. **12.14 Fail closed.** At each endpoint, allow 10 seconds total from entering configuration
-    to activation, using a monotonic clock; a missing OFFER also expires this deadline.
-    Any validation/exporter error, timeout, premature close or queue overflow closes
+14. **12.14 Fail closed.** Allow 10 seconds from OFFER to activation: the server starts its
+    local monotonic clock when enqueueing OFFER, the client when receiving complete OFFER.
+    Separately allow 10 seconds from configuration entry to receiving OFFER at the client
+     (the shorter re-bind wait in 12.16 still applies). An ordinary configuration message
+     received by the CLIENT before OFFER is immediately `0x10`, not permission to extend
+     the missing-OFFER wait. The server MAY receive the client's legal early configuration
+     writes (such as brand and client information) before OFFER/CLIENT_PROOF under 12.10.
+     Any validation/exporter error, timeout or premature close closes
     the whole QUIC connection with application error `0x10` (binding/activation failure).
-    Client records §6's failure-cache entry for the attempted address/port/fingerprint;
+     Resource-caused closes instead use `0x12`, including expiry of an activation deadline
+     while a local resource refusal prevents progress. Both peers recognize this application
+      code, but locally detected resource aborts, authenticated peer resource reports (after
+      SERVER_SWITCH verifies) and in-allowance pre-verification peer reports below MUST NOT
+      create/advance §6's failure cache or the re-bind failure backoff; peer-attributable
+      inbound aborts (13.12) close `0x11`/`0x10` and use normal backoff, and the
+      client-detected zero-progress transport-failure case in 13.12 (including a peer `0x12`
+      received while the client's own ack-eliciting data sat unACKed for the fixed 10 seconds; shortest step, 13.12) does
+      advance §6's failure cache (and, during binding, the non-resource join-retry schedule below).
+      Before SERVER_SWITCH verifies, a PEER-sent `0x12` cannot authenticate its resource
+      claim. Apply the fixed 60-second resource window below to at most three such reports
+      per rolling 10 minutes per logical server; the fourth and subsequent reports in that
+      interval are treated like `0x10` for failure-cache/re-bind-backoff and retry limiting.
+      Retain the last three report timestamps, including reports treated as `0x10`; decide
+      from prior reports in the window before recording the current one. Persist them
+      with the logical-host limiter below (also shared with 12.16);
+      success, reconnects and endpoint/fingerprint changes do not reset them. This allowance
+      never shortens an existing non-resource window. After verification a peer resource
+      report also avoids failure-cache/re-bind-backoff updates. They still close fail-closed, log the resource reason,
+     and use the same fresh join-time TCP retry and chat notice below. For non-resource
+     failures, client records §6's failure-cache entry for the attempted address/port/fingerprint;
     activation failure overrides a previous handshake success and is cleared only by a
-    later successful activation for that key. Server logs a reason code and rate-limits
-    to one warning per minute per listener; client logs once per failed attempt. Logs contain
+    later successful activation for that key. Server logs a reason code under the single
+    rate-limit rule in 13.12 (per remote IP and per-listener ceiling, "suppressed N" summary); client logs once per failed attempt. Logs contain
     no secrets, exporter values, tags or payload dumps. Do not retry cipher-off or continue
     half-switched. **Join-time TCP retry (user decision 2026-10-16).** A failure before
     activation completes (any of the above, a handshake or ALPN failure, or any exception in
-    QUICraft code) closes QUIC first (with `0x10` where a connection exists) and then starts a
+     QUICraft code) closes QUIC first (with `0x10`, or `0x12` for resources, where a connection exists) and then starts a
     fresh vanilla TCP join in the same attempt: a new Login Start and, when online, a new
     Mojang session join. Never transfer old login state or `S`. `quic-only` fails instead.
     The client writes "QUIC multi-stream failed (<reason>), fell back to TCP" to its log and
     shows it in chat once the TCP join reaches play; `<reason>` is a short human-readable
-    cause and never contains secrets. The failure-cache entry above still applies, so later
-    joins go straight to TCP during the backoff. Rationale: the retry only reaches vanilla
+     cause and never contains secrets. Independently of §6's endpoint-failure cache, persist
+     a join-retry limiter keyed by (normalized logical host, original logical TCP port),
+     exactly as in 12.16, ignoring fingerprint, resolved IP and advertised QUIC port. Reserve
+     one possible automatic retry before starting a `/3` join; successful activation releases
+      it. A failed non-resource attempt consumes it and starts §6's exponential schedule for this limiter;
+     during that window start joins directly over TCP (`quic-only` fails instead), without another QUIC login/session
+      join. For a locally detected resource abort (or an authenticated peer report after
+      SERVER_SWITCH, or a pre-verification report within the allowance above), instead use
+      a fixed 60-second window: at most one QUIC attempt and
+      its automatic TCP retry per minute per logical server, with NO doubling and no
+      increase of any existing non-resource exponent. Resource aborts cannot extend a
+      non-resource window beyond its original expiry. This bounds extra login attempts,
+      not endpoint trust; it does not modify failure-cache entries or pins. No new wire
+      message is needed: a short honest server-pressure episode avoids exponential TCP
+      suppression, while unauthenticated claims buy only three fixed-window exceptions
+      per 10 minutes, not unlimited exemption from normal backoff. These counts/windows
+      are provisional measure-then-set retry policy. The first
+      join after this short window attempts QUIC again; TCP is not a scale-capacity remedy.
+      Use 12.16's 4096-entry bound, active-entry protection and atomic persistence;
+     if limiter state cannot be read/written or safely reserved, choose TCP before QUIC login.
+     Thus rotating fingerprints cannot multiply the extra Mojang `joinServer` calls.
+     Rationale: the retry only reaches vanilla
     TCP with Minecraft's own encryption, which an attacker can already force by stripping the
     advertisement (§7); the security review MUST confirm this. A failure
     after activation (during play) is not retried: the disconnect screen shows the reason and
-    the next join uses TCP under §6. Pre-login racing and compatibility fallback remain §5
+     the next join consults §6 (resource aborts do not add an entry). Pre-login racing and compatibility fallback remain §5
     behavior.
 15. **12.15 Pin persistence.** Only the client, after valid SERVER_SWITCH in online mode,
     records an authenticated pin. Store in its config directory `quicraft/pins-v2.json`,
@@ -778,15 +852,18 @@ single-socket listener: no dispatcher is installed and the connection id length 
     trusts F': it leaves the pin unchanged, records §6's failure-cache entry and re-bind
     backoff, and joins over fresh vanilla TCP directly (`quic-only` fails), never `/2`;
     `0x10` is sent only when a `/3` connection exists. Any failure after connection creation (binding,
-    exporter error, timeout, write failure) closes with `0x10`, leaves the pin
-    unchanged, records §6's failure-cache entry, and uses 12.14's join-time TCP retry:
-    close the failed QUIC connection first with `0x10`, then start a fresh vanilla TCP join
+     exporter error, timeout, write failure) closes with `0x10` (resource aborts use `0x12`
+      and the cache/backoff exceptions are exactly those in 12.14), leaves the pin unchanged,
+      applies 12.14's local/authenticated/bounded-unauthenticated distinction
+      to §6's failure cache and re-bind backoff, and uses 12.14's
+     join-time TCP retry and logical-server limiter:
+     close the failed QUIC connection first, then start a fresh vanilla TCP join
     with a new Login Start and a new Mojang session join (when online). Never transfer old
     login state or `S`. `quic-only` instead fails. Wait for OFFER at most twice the measured QUIC handshake RTT,
     clamped to 500 ms..3 s, from entering configuration (use the transport's measured RTT
     at handshake confirmation); this replaces 12.14's 10-second
-    missing-OFFER wait for re-binding only. The total activation deadline remains 10 seconds.
-    At most one automatic attempt per persisted re-bind backoff window: use §6's exponential
+    missing-OFFER wait for re-binding only. The OFFER-to-activation deadline remains 10 seconds.
+     At most one automatic attempt per persisted non-resource re-bind backoff window: use §6's exponential
     schedule but key it exactly like the pin (normalized logical host, logical port),
     ignoring fingerprint so rotating fingerprints cannot reset it. During backoff use TCP.
     Replace the pin and discard the logical server's old tickets/tokens/recorded flights
@@ -811,6 +888,11 @@ single-socket listener: no dispatcher is installed and the connection id length 
     no mode-0 exchange is allowed for this re-bind. Deleting a pin before it expires still
     requires explicit player confirmation. Offline-mode pins
     (Phase 9 TOFU) are out of scope here and keep an explicit-action rotation.
+    If a pinned server advertises `/2`, a different fingerprint still triggers the same
+    deduplicated changed-fingerprint notice. Re-binding cannot run on `/2`: retain the pin,
+    use fresh TCP under the pre-connect precedence above, and record re-bind backoff.
+    An unchanged fingerprint with a `/2` advertisement uses normal `/2` compatibility,
+    with no changed-fingerprint notice and no authenticated-pin update.
 
 ### Resumption, offline mode and threat model
 
@@ -862,16 +944,18 @@ single-socket listener: no dispatcher is installed and the connection id length 
 
 ## 13. Multi-stream (Phase 5)
 
-**Draft v2. Design approved by the user 2026-10-15 (open questions 1-4 as written below); implementation may proceed behind a disabled-by-default flag. Security review is required before any release or enablement.**
+**Revised draft, 2026-10-16. This replaces the unshipped three-lane `/3` draft in place; no old-draft compatibility is required. Implementation remains disabled by default. Security review is required before release or enablement.**
 
-### Direction (2026-10-16): planned, not implemented
+This is spec only. Current `core/multistream` still has the 33-byte three-lane record codec,
+full CONTROL fences and shared auxiliary budget; `core/routing` still uses schema 1 without
+position extraction. Those implementations must change together before this revision can run.
 
-This subsection records the user's direction for the next revision of `/3`. None of it is implemented yet. Sections 13.1 to 13.17 still describe the current draft. The revision is made in place, because `/3` has never shipped enabled.
+### Direction (2026-10-16): specified, not implemented
 
-1. **Large packets first.** The main goal of multi-stream is to stop large packets (chunk data) from causing head-of-line blocking. The current draft (13.8) keeps chunk installs on the ordered CONTROL stream, which still blocks everything queued behind a large chunk. The planned revision moves chunk data onto N streams sharded by chunk position, with scoped fences, so only the updates that depend on a chunk wait for it. Small-packet lanes come as a second step.
-2. **Send priority.** When several packets are ready, send in this order: (a) latency-sensitive packets that shape how multiplayer feels, such as entity movement and updates; (b) large packets that can block others, such as chunks; (c) other small packets. Chunk loading must not be starved by (a).
-3. **Streams versus CPU.** Carry as many packet types as possible on parallel streams, while keeping server CPU per player in check. CPU per player is measured as streams are added (see `docs/benchmarks.md`, "Planned Phase 5 measurements").
-4. **Chunk stream count.** Negotiated per connection and benchmarked from 1 to 6 streams. The server never exceeds a hard maximum, whatever its settings say.
+1. **Large packets first.** Chunk install, updates and forget share one of N position-sharded chunk streams (13.3, 13.8, 13.18). Scoped fences and chunk joins replace full fences on every CONTROL packet (13.5, 13.9, 13.19). Entity storage does not require chunk install before spawn.
+2. **Send priority.** Multiplayer-feel packets first, chunks second, other small packets third, with chunk progress guaranteed by dependency-aware sender scheduling (13.20), not by QUIC priority alone.
+3. **Streams versus CPU.** Routing remains reviewed data (13.7). Measure CPU per player as streams are added, rather than assuming more streams are free (see `docs/benchmarks.md`, "Planned Phase 5 measurements").
+4. **Chunk stream count.** Negotiated per connection (13.2), benchmarked from 1 to 6, with a draft hard cap of 6 justified by dedicated receive reservations (13.12/13.13). Compact headers are in 13.4. Cap/default confirmation is listed below.
 5. **Server profiles (planned).** Built-in profiles keyed on the server's hardware: memory given to Java and CPU cores it may use. Each profile sets how many players may connect over `/3` and the maximum number of parallel streams. Every profile value is pushed to the highest the hardware sustains, measured with all of the profile's values running together (they share CPU and memory), taken from `docs/benchmarks.md` runs, not a cautious guess. Custom values are range-checked and checked against each other, and are applied all at once or not at all. Admins may create a custom profile with `/quicraft value set <VARIABLE> <int>` and restore with `/quicraft value restore default` or `/quicraft value restore <profile>`. The first time an admin changes a value, the command warns that changing these values is risky and asks them to proceed with caution. The hard stream cap in item 4 still applies to custom values.
 
 ### Negotiation and stream map
@@ -889,7 +973,7 @@ This subsection records the user's direction for the next revision of `/3`. None
    Add optional advertisement field `routing` containing an object mapping decimal unsigned
    protocol-number strings to lowercase `sha256:` hex routing-resource digests (13.7).
    `routing` holds at most 64 entries. Each key is a decimal unsigned protocol number with no
-   sign and no leading zero except `"0"`, at most 10 digits, fitting a signed 32-bit int; each
+   sign and no leading zero except `"0"`, at most 10 digits, in 0..2147483647; each
    value is exactly `sha256:` followed by 64 lowercase hex digits. Any malformed entry, and more
    than 64 entries, discards the whole member (all-or-nothing), never the rest of the
    advertisement; a client treats a discarded member as absent, which can only select TCP. A server whose response would exceed §1's cap with the member omits the routing object
@@ -898,53 +982,92 @@ This subsection records the user's direction for the next revision of `/3`. None
    matching digest for their protocol to select `/3`; absent/unknown/mismatched entries
    select TCP (a changed pin likewise uses fresh TCP, 12.16). Never guess a routing table.
    OFFER's digest comparison remains authoritative even after an advertisement match.
-2. **13.2 Preamble.** Under `/3` only, stream 0 begins in each direction with exactly
-   `VarInt(length) || u8(version=2) || u8(token_length) || token`; token length is 0 or 16,
-   length exactly 2 or 18. Retain §8's token semantics. Unknown version/length is `0x1`.
-   Following bytes remain the ordinary single-stream Minecraft login/configuration format
-   until 12.11/12.12, then become records. The existing v1 `Preamble`/`PreambleStream` are
-   not extensibility negotiation; `/3` requires a separate version-aware parser and cutover.
-3. **13.3 Stream identities.** Exactly three bidirectional QUIC streams are allowed:
-   stream 0 CONTROL (client opens, both directions), stream 4 REALTIME (client opens,
-   both directions), stream 1 WORLD (server opens, both directions). The latter two open
-   only after the opener activates under §12. This explicitly lifts v1's ban on server-opened
-   streams for `/3` only. No unidirectional streams, datagrams, replacement streams or other
-   ids are permitted. WORLD and REALTIME each start in each direction with
-   `u8(version=2) || u8(type)` where type is 1 REALTIME or 2 WORLD; CONTROL has no second
-   preamble. Only the client may buffer early stream-1 bytes until it validates
-   SERVER_SWITCH, under 13.12's bounds, without delivery. The server MUST treat any
-   stream-4 frame before its own activation (CLIENT_SWITCH validated and SERVER_SWITCH
-   queued) as fatal `0x11`, not buffer it. Stream 4 cannot legitimately precede that point.
-   Adapter note: the server's activation must take effect on the connection's event loop
-   before, or in the same task as, the flush of SERVER_SWITCH. Activating from another thread
-   only queues it, and the client's stream 4 can then arrive first, which is fatal.
+2. **13.2 Preamble and shard negotiation.** Under `/3` only, stream 0 starts in each direction
+   with `VarInt(length) || u8(version=2) || u8(token_length) || token || u8(min_shards) ||
+   u8(max_shards)`. Token length is 0 or 16, length exactly 4 or 20. Retain §8's token
+   semantics; malformed version, length or range closes with `0x1`. The client offers
+   `1 <= min_shards <= max_shards <= 6`; the server replies with its selected `N` in both
+   range fields, within that offer and its configured maximum. An empty intersection fails the
+   connection (`0x10`), never clamps silently outside the offer. The draft client offer is
+   1..6; both the configured maximum and preference must be within 1..6.
+   Select N by clamping the configured preference to the intersection of the client's range
+   and 1..configured_max; the draft preference is 3. Selection is immutable for the
+   connection and echoed/authenticated in §12's exchange.
+   Hardware profiles are local policy, not wire fields; no administrator setting overrides 6.
+   Following bytes use ordinary Minecraft login/configuration framing until §12 cutover.
+   This preamble does not alter `/2` or its version-1 parser. Never negotiate through a game
+   plugin message on `/2`.
+3. **13.3 Stream identities.** There are exactly N+2 bidirectional streams: CONTROL on QUIC
+   id 0 and REALTIME on id 4, both client-opened; CHUNK[i] on id `1+4*i`, server-opened,
+   for `0 <= i < N`. Logical stream indices used in dependencies are CONTROL=0, REALTIME=1,
+   CHUNK[i]=2+i (not QUIC ids). All serverbound packets use CONTROL. The reverse auxiliary
+   REALTIME direction sends its preamble but no records. Reverse CHUNK[i] directions send
+   no preamble and no records: their one byte of guard credit exists only to detect a
+   violation. Neither auxiliary direction needs an application receive slot at the server.
+   Auxiliary streams open only after the opener activates under §12; each used direction starts
+   `u8(version=2) || u8(logical_stream_index)`. CONTROL has no second preamble. No other
+   stream ids, replacements, unidirectional streams or datagrams are allowed.
+   The client may buffer early server chunk-stream bytes before validating SERVER_SWITCH,
+   within each stream's reservation (13.12), without parsing game bodies or delivering them.
+   The server rejects pre-activation stream-4 bytes with `0x11`. Server activation must run
+   on the connection event loop before, or in the same task as, flushing SERVER_SWITCH.
 
 ### Records, control and routing data
 
-4. **13.4 Record format.** Each activated stream direction carries repeated
-   `VarInt(record_length) || u8(kind) || u64(sequence) || u64(dep_control) ||
-   u64(dep_realtime) || u64(dep_world) || body`. Length excludes its own VarInt and
-   includes the 33-byte fixed header. Kind 0 is one GAME packet; body is exactly one
-   Minecraft VarInt-length frame including packet id and the negotiated compression wrapper,
-   without CFB8. Kind 1 is END, CONTROL only, with empty body. Reject unknown kinds,
-   trailing bytes, invalid inner lengths or `record_length > 33 + 3 + 2097151`
-   (2097187 bytes): 33 header bytes plus at most a three-byte Minecraft length prefix
-   and 2097151 bytes of framed packet content. Validate this before allocating the body.
-   Sequence starts at 1 independently per stream and direction and increments by exactly
-   one per record, including END; zero dependencies mean no predecessor. No integer wraps.
-5. **13.5 CONTROL semantics.** State transitions (including Finish Configuration and
-   acknowledgements), registry/dimension changes, compression changes, object create/destroy,
-   teleport/respawn, disconnects, and unknown/custom packets MUST use CONTROL. CONTROL is
-   ordered and is a full fence: a control record depends on every record previously assigned
-   in that sending direction on all lanes; every subsequent non-control record depends on
-   that control record. Receivers apply state changes only at delivery, before decoding
-   subsequent dependent packet bodies. Reconfiguration retains the streams and sequences,
-   drains play through a control fence and uses CONTROL exclusively until play resumes.
+4. **13.4 Compact record format.** Each activated direction carries repeated
+   `VarInt(record_length) || u8(kind) || VarInt(sequence) || VarInt(epoch) ||
+   VarInt(dependency_count) || dependency_entries || body`. Each entry is
+   `u8(logical_stream_index) || VarInt(required_sequence)`. Entries are strictly increasing
+   by index, positive sequences, at most N+1 entries, and never name the record's own stream.
+   Own-stream `sequence-1` is implicit. Omit zero components; do not encode duplicate indices.
+   All new VarInts are minimal nonnegative signed-31-bit values (0..2147483647), at most
+   five bytes; sequence starts at 1, increases exactly by one per stream/direction and never
+   resets, including across epochs. Exhaustion closes, never wraps. Epoch is defined in 13.18.
+   Kind 0 GAME has exactly one Minecraft length-prefixed frame, including id and negotiated
+   compression wrapper, without CFB8. Kind 1 END has empty body and is CONTROL/global only.
+   Kinds 2 ACK_JOIN and 3 BATCH_JOIN carry one ordinary GAME frame of the designated packet
+   type (13.19), on a chunk stream only. Reject other kinds and trailing/invalid inner bytes.
+   Length excludes its own prefix. Header maximum is 54 bytes (1+5+5+1+7*6);
+   body maximum is 2097154 (three-byte length plus at most 2097151 content bytes).
+   Reject `record_length > 2097208` before allocating. Including the outer prefix, no
+   record exceeds 2097212 bytes. A low-sequence, low-epoch, zero-explicit-dependency record
+   has a four-byte header, five bytes including a one-byte length; one small dependency
+   adds two bytes. The ~5-byte target is not a constant-size or long-session claim.
+5. **13.5 Scoped CONTROL semantics.** CONTROL stays ordered, but is not itself a fence kind.
+   Each route selects one of these policies, always including its own stream predecessor:
+   - **Global fence:** waits for all previously assigned records on all streams; all later
+     records wait for it. Use for play login, respawn/level replacement, registry and protocol
+     state changes (including start/finish configuration and acknowledgements), compression
+     changes, disconnect, END, and unknown/custom packet ids on either endpoint.
+   - **View gate:** waits for previous CONTROL, REALTIME and all chunk frontiers, plus the
+     latest global fence. Later chunk records wait for it. This revised safe rule drains
+     earlier installs before changing the view, including a center moved away and back. Use for
+     chunk cache center, cache radius and simulation distance before admitting new chunks
+     outside the old view. chunk_batch_start also uses this scope (13.19). A view gate is
+     also a CONTROL fence for later REALTIME.
+     This deliberately adds HOL at view changes, not at every CONTROL packet. Center
+     updates are NOT assumed rare: along one axis at speed v blocks/second, one chunk
+     crossing per 16 blocks can mean about v/16 center updates/second; diagonal travel can
+     cross either axis, and teleports/radius changes add gates. These are geometric rates,
+     not measured traffic counts. Measure actual gate frequency and movement/REALTIME
+     stalls before enablement; no claim that this safe rule is free during normal movement.
+   - **Control fence:** waits for previous CONTROL and REALTIME, plus the latest global
+     fence. Later REALTIME waits for it; chunks do not. Use for entity spawn/remove and
+     teleport relations, preserving spawn-before-move, move-before-remove/id reuse, and
+     teleport-before-dependent movement.
+   - **Ordinary CONTROL:** waits for its CONTROL predecessor and latest global fence only.
+     Keepalive and reviewed unrelated control packets MUST NOT fence REALTIME.
+   Reconfiguration globally drains play, retains streams/sequences, and uses CONTROL only
+   until play resumes. Fences/gates take effect after game-handler execution (13.10), not
+   receipt. Scope is per sending direction; game acknowledgements handle cross-direction
+   transitions, never implicit references to reverse-stream sequence numbers.
 6. **13.6 Routing algorithm.** At the sender's original game packet ordering point, assign
    sequences and dependencies before parallel encoding or scheduling. Lookup is by exact
    Minecraft protocol number, protocol state, direction and numeric packet id. Missing entries
-   default to CONTROL, never an inferred category. The receiver checks the selected lane
-   against the same table after dependencies permit decoding; wrong-lane packets disconnect.
+   default to CONTROL/global, never an inferred category. The receiver checks route, kind,
+   shard, epoch and required dependencies against the same table before game delivery;
+   wrong-route packets disconnect with `0x11`. A known packet with a failing position
+   extractor is malformed, not permission to fall back to another lane.
    Unknown protocol numbers disable `/3` before connecting. Check advertised digests under
    13.1 before choosing `/3`; unequal digests in OFFER still fail activation under 12.14
    before entering play, never use a guessed routing table. A post-login routing mismatch
@@ -952,50 +1075,108 @@ This subsection records the user's direction for the next revision of `/3`. None
    a changed or falsified advertisement), not as normal compatibility negotiation.
    Runtime packet-id remappers/modded registries require an explicitly
    matching reviewed table or advertise `/2` only.
-7. **13.7 Data resource.** Store routing as UTF-8 JSON data, one resource per protocol number,
-   with `schema:1`, `protocol:<number>`, `default:"control"`, and `routes` entries containing
-   `state`, `direction` (`clientbound`/`serverbound`), `packet_id` (nonnegative integer),
-   `lane` (`control`/`realtime`/`world`) and `dependency` (`fence`/`lane`). Reject duplicates,
-   unknown fields and unsupported schema. Require `fence` for CONTROL and `lane` otherwise;
-   every non-control entry needs ordering tests. `R` is SHA-256 of the exact resource bytes,
-   including whitespace, shipped identically to both peers; no runtime normalization. The
-   following is a synthetic schema example, NOT a mapping for any released Minecraft version:
+7. **13.7 Data resource.** Store routing as UTF-8 JSON, one resource per protocol number,
+   with `schema:2`, `protocol:<number>`, `default:"global"`, `extractors`, and `routes`.
+   Each route has `state`, `direction` (`clientbound`/`serverbound`), `packet_id`, `lane`
+   (`control`/`realtime`/`chunk`), `dependency` (`global`/`view`/`control`/`ordinary`/
+   `lane`/`ack_join`/`batch_join`), `position`, and `epoch_change` (boolean).
+   Position is `null` or the name of a reviewed per-version extractor. `extractors` maps
+   names to versioned adapter decoder identifiers; these are a closed allowlist, not executable
+   scripts or heuristic offsets. Each implementation supplies golden packet bytes for every
+   identifier, including negative coordinates and malformed input. All entries/identifiers
+   are covered by R; no unversioned decoder choice or external file changes routing semantics.
+   An extractor returns one signed-32-bit chunk (x,z), a bounded list for multi-chunk packets,
+   or the special `join` result for joins with no position. Block positions use mathematical
+   floor division by 16, section positions their chunk x/z. Lists obey the game's packet
+   size/count bounds; multi-chunk packets use CONTROL/global, not single-shard guessing.
+   Require a single-position extractor for ordinary chunk routes, `join` for chunk joins,
+   null for other routes except globally routed multi-chunk packets. `lane` is REALTIME or
+   chunk only; global/view/control/ordinary are CONTROL only; joins are chunk only.
+   Resources also carry `serverboundLimits`, keyed by protocol state. Each entry specifies
+   positive integer `maxServerboundRecord` (record_length, excluding its prefix), `maxDecodedFootprint`
+    (decoded packet plus scratch), and positive integer `ordinaryReadAllowance` P (complete retained wire,
+    parser/read copies and decode footprint of at least one maximum-size ordinary small
+   packet, including keepalive wherever legal). The reviewed ordinary packet set is marked
+   by `ordinarySmall:true/false` on every serverbound route; clientbound routes omit it.
+    Values come from that version's game's serverbound packet limits and reviewed decoder
+    accounting, not guessed Minecraft constants. Each limits entry also specifies
+    `decodeFootprintBound`, a versioned closed-allowlist accounting identifier (not executable
+    code) giving a conservative decoded-output/scratch bound from wire lengths, declared
+    output length and compression state alone. Include parser/read copies in that accounting
+    within F and the one 16 KiB read allowance, never outside E. P must also cover the
+    maximum bounded-prefix staging needed before classification. Check all limits and
+    accounting identifiers into R with boundary vectors, as for position extractors.
+   Require `maxServerboundRecord <= 2097208`, decoded footprint <= 8 MiB, and
+   `P + 16 KiB + 2*6 + 1 <= 24 KiB` (13.12/13.13). Missing/unreviewed limits or an ordinary
+   packet footprint that cannot fit P disable `/3`; never relabel keepalive as large to pass.
+   Reject a play record exceeding its state's maxServerboundRecord immediately after its
+   length prefix, before allocating/buffering its body; enforce the state limit elsewhere too.
+    Oversized decoded data or an invalid compression declaration is `0x11`. `ordinarySmall`
+    is a reviewed resource guarantee, not a peer-supplied flag or permission to use P:
+    any legal record whose pre-inflate footprint fits remaining P may use it, including
+    routes marked false or unknown ids. Never close a legal small record merely because
+    its decoded id is not marked ordinarySmall. An ordinarySmall guarantee that cannot
+    be met is a local resource-review error disabling `/3`, not honest-peer misconduct.
+   `epoch_change:true` is clientbound CONTROL/global only and matches reviewed level replacement packets.
+   Non-play routes are CONTROL/global. Every serverbound route MUST be CONTROL; reject a
+   serverbound REALTIME or chunk route before offering `/3`. Serverbound records have no
+   explicit cross-stream dependencies, since that direction uses only CONTROL; a nonzero
+   serverbound dependency_count or a serverbound auxiliary record closes with `0x11`.
+   Reject missing/unknown fields, duplicate keys/routes,
+   unsupported schema/identifiers and invalid combinations before offering `/3`.
+   R is SHA-256 of the exact resource bytes, whitespace included, identical at both peers.
+   Mandatory CONTROL data must now enforce the required fence policy too, not merely lane.
+   Every relaxation from global needs ordering tests. Synthetic route-shape fragment only
+   (not a complete selectable resource or a game mapping; reviewed serverboundLimits omitted):
 
    ```json
-   {"schema":1,"protocol":12345,"default":"control","routes":[
-     {"state":"play","direction":"clientbound","packet_id":10,"lane":"control","dependency":"fence"},
-     {"state":"play","direction":"clientbound","packet_id":11,"lane":"realtime","dependency":"lane"},
-     {"state":"play","direction":"clientbound","packet_id":12,"lane":"world","dependency":"lane"}
+   {"schema":2,"protocol":12345,"default":"global","extractors":{"chunk":"test.chunk_xz.v1"},"routes":[
+     {"state":"play","direction":"clientbound","packet_id":10,"lane":"control","dependency":"control","position":null,"epoch_change":false},
+     {"state":"play","direction":"clientbound","packet_id":11,"lane":"realtime","dependency":"lane","position":null,"epoch_change":false},
+     {"state":"play","direction":"clientbound","packet_id":12,"lane":"chunk","dependency":"lane","position":"chunk","epoch_change":false}
    ]}
    ```
 
-   The shipped 26.1.2 table (`protocol-775.json`, protocol 775) routes clientbound play packets only:
+   The currently shipped 26.1.2 table (the 3-lane baseline, before chunk shards are implemented) (`protocol-775.json`, protocol 775) routes clientbound play packets only:
    entity movement, metadata, animation and motion, plus level particles, to REALTIME, and block, light, block-entity and
    biome updates to WORLD. Everything else, including every serverbound packet, stays CONTROL. Its
    packet ids are pinned to the live game by `RoutingTableGameTest`, and each route's ordering by
    `ShippedRoutingOrderingTest`.
 
-8. **13.8 Explicit game invariants.** Entity spawn/create and destroy are CONTROL fences;
-   entity movement/metadata may be REALTIME only after the corresponding spawn is delivered,
-   and destroy must wait for all prior updates before id reuse. Chunk install, unload and
-   world reset are CONTROL fences. Block, light and block-entity updates for that chunk
-   MUST share WORLD in original order, or remain CONTROL; they depend on the install fence.
-   No update may pass its chunk
-   install or reference an entity after its destroy. Dimension/registry changes fence all
-   affected lanes. Where a packet's dependency cannot be demonstrated from these rules,
-   route it to CONTROL. Stream classification is not permission to omit a predecessor.
-   The planned revision (see "Direction (2026-10-16)" above) moves chunk install off CONTROL
-   onto sharded chunk streams; these fence rules then apply to that lane instead.
+8. **13.8 Explicit game invariants (26.1.2, protocol 775).** Chunk install, block_update,
+   section_blocks_update, block_entity_data, light_update and forget_level_chunk use the
+   position's CHUNK shard, in original order: install, updates, forget. Never move an update
+   to REALTIME; block/section/block-entity updates before install are lost, and stale light
+   after forget must not overtake it. Multiple positions colliding on a shard share its order.
+   chunks_biomes spans chunks: keep the whole packet CONTROL/global, with its list extractor;
+   it waits for prior installs and later chunk updates wait for it. Do not split/rewrite it.
+   Entity storage is chunk-independent: spawn does not wait for a chunk install; forgetting
+   a chunk does not remove entities. Spawn and entity-data bundles stay whole on CONTROL
+   under 13.15. Entity updates on REALTIME wait for their CONTROL fence; removal waits for
+   earlier REALTIME, not chunk traffic. block_event, level_event, explode and
+   block_destruction need no chunk ordering; reviewed routes may use REALTIME/lane without
+   a chunk dependency. View changes and joins obey 13.5/13.19. Any unproven type remains
+   CONTROL/global, including unknown ids at both sender and receiver.
 
 ### Sequence barriers, bounds and delivery
 
-9. **13.9 Dependency vector.** For each sending direction maintain last-assigned sequences
-   `A[control,realtime,world]`. A non-control record depends on the latest CONTROL and its
-   own lane predecessor; other components default to zero. A CONTROL record depends on
-   the whole previous `A`. The sender MUST additionally include any cross-lane semantic
-   predecessor required by 13.8, taking componentwise maxima. Only already assigned records
-   may be referenced; a record's own-lane dependency is exactly `sequence-1`. These rules
-   make dependencies acyclic. Initial records have zero predecessors as appropriate.
+9. **13.9 Dependency construction.** Maintain A[0..N+1] (last assigned), latest global G,
+   view V and control fence C (CONTROL sequences), independently per sending direction.
+   At one logical game-send ordering point, before parallel encoding/scheduling, start with
+   the implicit own predecessor and the latest G. Add the following component maxima:
+   - Global: all of previous A; then set G to this record.
+   - View: all previous A; then set V and C to this record. For chunk_batch_start also
+     include the previous BATCH_JOIN frontier as an explicit semantic dependency (13.19).
+   - Control fence: previous A[CONTROL,REALTIME]; then set C to this record.
+   - Ordinary CONTROL: nothing further.
+   - REALTIME: latest C.
+   - Ordinary chunk: latest V only. It never waits for unrelated CONTROL or REALTIME.
+   - Chunk join: latest V and the semantic frontier in 13.19.
+   Encode only nonzero cross-stream maxima; own predecessor remains implicit. All edges
+   MUST point to previously assigned records, including joins and bundle units. Never queue
+   a join behind a record that depends on it on its own stream. No post-scheduling discovery
+   of new predecessors is allowed. G/V/C start at zero. Required dependencies may be
+   transitively satisfied by larger same-stream frontiers, but may not be omitted unsafely.
 10. **13.10 Receiver algorithm.** Maintain contiguous delivered watermarks `D` per direction.
     Parse envelopes without decoding game bodies; queue each in lane order. Deliver only a
     lane's head record, only when every dependency is <= the corresponding `D`, and only
@@ -1003,120 +1184,431 @@ This subsection records the user's direction for the next revision of `/3`. None
     when bytes arrive or decoding completes). Then advance that lane's `D` and retry heads.
     Serialize delivery on the game connection executor; preserve the vanilla main-thread
     dispatch order for each dependency. No cross-direction dependency is implied: request/
-    response semantics still use the game's application acknowledgements. A record with a
-    future own-lane dependency, skipped sequence or duplicate is a protocol error.
-11. **13.11 Barrier example.** CONTROL spawn sequence 5 followed by REALTIME move sequence 9
-    carries `dep_control=5`, `dep_realtime=8`. If move arrives first, hold it until spawn 5
-    and move 8 have been delivered. A subsequent CONTROL destroy sequence 6 depends on
-    REALTIME 9 (and every prior WORLD record), so cannot overtake that move. CONTROL chunk
-    install 7 followed by WORLD block update 8 carries `dep_control=7`; the update waits
-    for the install even if their bytes arrive out of order. Fault tests
-    MUST withhold each predecessor independently and observe these delivery orders.
-12. **13.12 Memory and timeout.** Per connection, cap pending received records (including
-    partial records, pre-activation auxiliary bytes and decoded-but-undelivered packets)
-    at 1024 records or 16 MiB total wire/retained decoded bytes, whichever comes first.
-    Cap each decompressed packet at 8 MiB or the game's stricter limit. Count parser buffers,
-    staged bundles and decompression output in these budgets, not just complete envelopes.
-    Reserve a further 1 MiB receive budget for CONTROL so blocked auxiliary queues cannot
-    prevent reading small control predecessors; aggregate cap is 17 MiB. Within the 1024
-    pending-record cap, reserve 64 slots exclusively for CONTROL (at most 960 auxiliary
-    records, including partial/pre-activation records). A predecessor
-    larger than the remaining budget disconnects rather than evicting buffered data.
-    Stop granting auxiliary credit
-    before exceeding its budget; if data already received cannot fit, close, never evict
-    a predecessor. Also cap unsent application queues at 1024 packets or 16 MiB and apply
-    backpressure; an unpausable producer over the cap disconnects. A head record blocked on
-    a dependency, incomplete record, or unapplied handler for 10 seconds disconnects with
-    `0x11` (ordering/resource failure). A lane that holds the auxiliary budget while its head waits for a
-    predecessor on the other auxiliary lane (cross-lane starvation) is resolved by this same
-    10 second blocked-head disconnect. Cycles, impossible references, limit violations and
-    parser/ordering errors use the same code; do not skip packets or release a barrier on
-    timeout. Start the incomplete-record timer at its first byte and the blocked-head timer
-    when it becomes head; progress on other lanes does not restart either deadline. This
-    deliberately favors disconnect over an undetected game desync.
-    These are ceilings, not eager allocations. Each listener/node MUST also enforce a
-    configured aggregate pending-bytes budget across connections, counting all retained
-    buffers/decoded data above, including the unparsed transport chunks held before a
-    record claims them. The read chunk a lane has taken but not parsed, at most one
-    `READ_CHUNK` per lane, counts toward that node budget and not toward the per-connection
-    ceilings above. Reserve each admitted connection's initial receive-credit
-    exposure against that budget, and refuse new QUIC admissions when the reservation
-    cannot fit (leave TCP untouched). Debit further credit/allocations before granting
-    them; release reservations only when credit exposure or retained bytes are gone.
-    No allocation or advertised receive credit may overcommit this node budget. Record
-    the configured budget and admission behavior in the 13.17 scale benchmark.
+    response semantics still use the game's application acknowledgements. A record with an
+    invalid index, skipped/duplicate sequence, wrong epoch, excessive dependency list,
+    same-stream entry or known impossible reference is `0x11`. Cross-stream bytes can arrive
+    before a referenced record; absence alone is not proof of impossibility. Track unresolved
+    references, detect cycles as edges become known, and enforce the blocked-head deadline.
+    Validate the decoded packet's required fence/route before execution; a header cannot
+    downgrade an unknown id from global. No speculative game execution or blocked-body
+    decompression. Commit dependency watermarks D only after actual serial handler application
+    completes. Separately track FIFO-enqueued watermark Q for timeout accounting only:
+    successful enqueue of a validated eligible unit commits it for the application timer,
+    but Q MUST NOT release dependencies, reuse receive/workspace capacity or change epochs.
+     Each endpoint uses its local monotonic transport clock for network/incomplete/resource
+     waits (only the incomplete-read pause expressly specified in 13.12 applies), and its
+     local executor-active clock for blocked-head/decode/application work. Here and below
+     "executor" means the game's serial/main-thread executor, NOT the Netty event loop.
+     Resource waits do not exclude executor stalls; no resource wait starts for an operation
+     blocked solely on that local executor rather than a refused excess/outbound grant.
+    Executor-active time excludes intervals waiting for the game executor to run, including
+    prerequisites already queued there and a handler suspended by a main-thread/tick stall.
+    Track the enqueue/completion acknowledgements and stall intervals on each endpoint;
+    while one unit is FIFO-enqueued or stalled in that executor, pause the dependent-head
+    timers and backpressure further reads. Retain/charge queued data until actual completion.
+    Decode/dispatch work actually running BEFORE Q still consumes its 10-second allowance;
+    a decoder busy loop is not an excluded scheduling wait. After Q there is no transport
+    application timeout on that unit; local game-handler watchdogs are separate from `0x11`.
+    Heads waiting on that unit remain paused until D commits. Never classify local game
+    execution/stalls as peer misconduct or release dependencies early to evade a stall.
+11. **13.11 Barrier example.** CONTROL spawn 5 precedes REALTIME move 9, whose explicit
+    CONTROL dependency is 5 (own predecessor 8 implicit). CONTROL remove 6 waits for REALTIME
+    9, not chunks. CHUNK[0] install 7, update 8 and forget 9 run in that order independently
+    of those entities. A later view gate waits for missing chunk 7 (and its prior chunk
+    frontier), and new chunk records wait for that gate. A respawn/global waits for every
+    old chunk, and new-epoch
+    records wait for respawn execution. Independently withhold every predecessor in tests.
+12. **13.12 Direction-specific memory, reservations and progress.**
+    **Clientbound (client receives):** give every active stream a non-borrowable
+    receive slot of B = 2 MiB + 128 bytes and 128 record slots. Admit at most one head
+    scheduling unit (one record or one complete bundle) per stream into application buffering;
+    stop reading that stream until its unit commits. A bundle's total wire size, headers
+    included, must fit B. Parser prefixes, partial records, pre-activation bytes and staged
+    bundle bytes all occupy that stream's slot; no stream can consume another's reserve.
+    At N=6 the six chunks need 12 MiB + 768 bytes; CONTROL and REALTIME reserve another
+    4 MiB + 256 bytes. Thus the old 16 MiB wire target needs 1 KiB explicit framing headroom:
+    aggregate wire ceiling `(N+2)*B <= 16 MiB + 1 KiB`, not a misleading exact 16 MiB claim.
+    A seventh chunk would require at least 18 MiB with the same progress reserves: hard cap 6.
+    At most `128*(N+2) <= 1024` records, including delimiters and partials, are retained.
+    Separately reserve one connection-wide 8 MiB execution workspace for decompression and
+    retained decoded packet/bundle data (or stricter game limits). Only one unit decodes/
+    applies at a time; all copies and decoder scratch must fit this workspace or fail closed.
+    Worst application-held data is therefore 24 MiB + 1 KiB, not 16 MiB; allocations are lazy.
+    Do not decompress other heads while the execution workspace is occupied.
+    **Progress argument:** all edges point backward in logical send order. Among pending
+    stream heads there is an earliest unit whose prerequisites are already applied or earlier
+    heads. Every stream has room to finish receiving its head even when every other slot is
+    full, and an eligible head has its reserved execution workspace. Fair receiving/handler
+    scheduling therefore advances the earliest unit; a blocked join cannot steal the missing
+    predecessor's capacity. This assumes transport progress and a completing game handler,
+    not a malicious or stalled peer. The timer is a failure bound, not the deadlock remedy.
+    Client native credit and unparsed read chunks are additional exposure (13.13). The
+    client reserves capacity for its progress slots, workspace and transport exposure;
+    reserve capacity need not allocate buffers. These are client receive reservations,
+    NOT reservations imposed on the server for every connected player.
+
+    **Serverbound (server receives):** all packets use one ordered CONTROL direction, so
+    there is no cross-stream prerequisite and no need for per-stream progress slots or a
+    pre-reserved large execution workspace. Reserve only 24 KiB per admitted connection for
+    native exposure plus protected small reads (13.13). Idle connections retain no
+    partial/read/decode buffers
+    and hold no more than this admission share against the receive budget. This figure is
+    not total connection memory: QUIC metadata, crypto/handshake and other subsystems remain
+    separately accounted. At 50,000 idle connections the receive admission shares total
+    1,228,800,000 bytes (about 1.14 GiB), not a multi-MiB workspace per player.
+    Admit at most one serverbound record, bounded by the state's reviewed serverboundLimits,
+    the game's serverbound packet limits and 13.4. Let L be that state's maximum wire record
+    including its outer prefix, F its maxDecodedFootprint and P its ordinaryReadAllowance.
+    Reserve P non-refusable bytes inside the 24 KiB share for one entire ordinary small
+    record's read/parser/decode footprint. Neither another connection nor this connection's
+    outbound queue may borrow it. Native exposure is bounded by 16 KiB + N guard bytes,
+    plus at most N+1 one-byte guard-read copies: hence `16 KiB + 2*N + 1 + P <= 24 KiB`.
+    This partition requires the asymmetric auxiliary credit in 13.13; simply reserving
+    24 KiB of native credit AND calling that same memory a protected read allowance is invalid.
+    Read calls grant at most `min(16 KiB, remaining charged capacity, remaining unit bytes)`;
+    reserve the entire grant BEFORE invoking read, and return unused grant afterwards.
+     Classify BEFORE inflating or decoding a packet id: parse only the bounded envelope,
+     inner length and compression Data Length prefixes using P, with read grants limited
+      to those prefix bytes until the declaration is known. Prefix staging ALWAYS comes
+      from a fixed reserved slice of P, never the excess pool. Reserve 160 bytes of P for
+      staged prefixes and their read/parser copies (54-byte header plus three at-most-5-byte
+      lengths, at most two retained copies = 138 bytes, rounded up to 160);
+      validate this bound against the reviewed envelope/length encodings before enablement.
+      This is a partition of P, not an increase of the 24 KiB idle share.
+      Define footprint as the entire
+     retained wire record (including prefixes), all parser/read copies, plus declared
+     uncompressed output and a conservative reviewed decoder/scratch bound. When compression
+     is disabled or Data Length is zero, use the uncompressed inner payload length instead.
+     The resource's reviewed decodeFootprintBound accounting must compute this bound from lengths/compression
+     state alone, without inspecting a compressed packet id, and include prefix staging.
+     A record is in-share ONLY if that entire footprint fits remaining P; reserve it before
+     further body reads/inflation. Every other record requires refusable excess grants for
+     its footprint before proceeding, even if its wire length alone fits P. Prefix reads
+     fitting P are non-refusable; reject invalid lengths before further allocation. Review
+     P against this conservative calculation for every ordinarySmall route's boundary vectors.
+     In-share reads/decodes, regardless of ordinarySmall marking, cannot be refused by the node pool. This guarantees
+    keepalive progress against OTHER connections' pool consumption, not bypass of a large
+    record ahead of keepalive on this connection's own ordered CONTROL stream or a game stall.
+     Charge all out-of-share partial records/read copies/decode storage to an isolated inbound excess
+    pool before taking bytes or allocating. Per connection, excess is capped at
+    `E = L + F + 16 KiB` (one wire record, one bounded workspace, one read suffix); this
+    is not an idle reserve. Every configured caller-local, per-IP, per-account and
+    sole-holder excess cap MUST be >= E: validate at startup, clamp a lower value UP to E
+    and log a warning, never fail startup or refuse admission over it.
+    No speculative decode or second executing record. Count game-executor-queued data too;
+    release charges only on actual completion, returning to the admission share when idle.
+    Bytes held only because OUR executor/game has not yet released them are local-node
+    exposure, never evidence against the peer (peer attribution, below).
+    Refusing an excess grant withholds/retries that operation without parser advancement;
+    it MUST NOT refuse protected reads or start a resource timeout on an in-share connection.
+     Configure the inbound excess pool separately: provisional node default 64 MiB,
+     per-source-IP default 16 MiB and per-authenticated-account default 16 MiB, each capped by
+     the node limit and each including all retained/queued excess. Enforce all applicable
+     caps before grants; accounts do not replace the IP cap, and pre-authentication uses
+     the IP cap. These are unmeasured operational defaults to benchmark at 50,000 players,
+     not new per-idle reservations; configure each cap to admit at least one reviewed E.
+      Under pressure compute deficits for the node, requester's source IP and authenticated
+      account caps. A victim MUST hold excess whose release relieves at least one currently
+      binding cap; an unrelated IP/account holder is ineligible for a source-cap-only refusal,
+      however high its rank. Recompute all deficits and eligibility after EVERY reclamation;
+      stop reclaiming as soon as the waiting grant fits all caps. This applies to shared-IP
+      (including CGNAT) and account caps as well as the node cap, not just node exhaustion.
+      Use the pressure ranking below. Exclude holders blocked solely by a known local
+      game-executor stall; never substitute an in-share victim. Close selected holders with `0x12`,
+     release their excess, then atomically retry waiting excess grants FIFO before allowing
+     new charges. Skip a still-ineligible wait without blocking grants under unrelated caps;
+     preserve its FIFO position for the next retry. Never reclaim an in-share
+    connection, or let a node-refusal timer expire it, to make room for another's excess.
+     A refused excess operation has a 10-second monotonic transport-clock resource-wait
+     deadline, with NO executor-stall exclusion; expiry closes only that excess requester
+     with `0x12` (never `0x11` while any of its bytes wait on our executor; this is judged at expiry time as well as at refusal time, see below).
+     Pressure selection uses byte ownership over time, not whether a
+    record crossed a game-handler boundary. Rate-limit admissions independently to defeat
+    many-connection attacks; the share protects admitted peers, not unlimited admissions.
+    Conservative server receive ceiling is `24 KiB + E`, with E bounded by
+    `2097212 + 8 MiB + 16 KiB`: at most 10526780 bytes (about 10.04 MiB), usually lower
+    under the reviewed state limits. This peak is on-demand, never a reservation per idle player.
+
+    **Shared accounting:** no advertised credit or retained allocation may overcommit the
+    node budget. Before admission, reserve the server's 24 KiB share, not the client's
+    progress/workspace budget; refuse admission if that share cannot fit, leaving TCP
+    untouched. Debit further server buffering before taking ownership of bytes. Release
+    credit reservations only when their exposure is gone. Record admission shares, actual
+    active peaks and refusals at the 50,000-player target; profile values remain unmeasured.
+     Outbound queues use a separate capped node pool, never the inbound pool or its admission
+    shares. Each connection is limited to 1024 packets or 16 MiB unsent data, including
+    binding quiescence bytes and bytes handed to QUIC but not yet released from its send
+     buffers. Backpressure before either cap; an unpausable producer fails `0x12`.
+      Provisional outbound defaults: 256 MiB node, 32 MiB per source IP and 32 MiB per
+      authenticated account, enforcing all applicable caps, including queued binding bytes.
+      Pre-authentication uses IP; account caps supplement, not replace, IP caps. Measure then
+      set these pool sizes/caps at 50,000 players; they are not idle reservations or proven
+      capacity. Use the same binding-cap eligibility/recompute rule as inbound. Shed only
+      outbound byte holders with `0x12`, never a requester holding no outbound bytes.
+      Atomically retry waiting outbound grants FIFO from released capacity before new
+      charges. Skip a still-ineligible wait without blocking grants under unrelated caps;
+      preserve its FIFO position for the next retry, exactly as for inbound excess grants.
+      If no reclaimable holder exists, wait under backpressure for at most 10 seconds on
+     the local monotonic transport
+     clock, without executor-stall exclusion. During binding 12.10/12.14's earlier activation
+     bound also applies. Never abort an honest binding on the first pool refusal while
+     other connections retain reclaimable outbound bytes. Never deny honest protected
+     inbound reads because another peer stopped reading. Locally detected genuine shared
+      resource aborts do not update the failure cache (12.14); apply the inbound peer-attribution
+      exception below before classifying a refusal as resource-caused.
+      A client-detected outbound/pending-ACK/binding-queue abort on a dead path is instead a
+      transport failure that advances the failure cache (zero-progress definition, below).
+     **Pressure ranking (both pools, separately accounted):** keep exponentially decayed
+     byte-seconds as identity history per source IP and per authenticated account (plus
+     connection-local statistics that live only as long as that connection, see below);
+     half-life 60 seconds provisionally. Integrate retained charged bytes, excluding only
+     known local executor-stall intervals. Retained bytes ALWAYS accrue byte-seconds, also
+     while the holder waits on OUR refusal of its request, so a holder that keeps asking for
+     refused grants cannot freeze its score while keeping its bytes. During such a refused
+     wait, and only for an INBOUND requester's own incomplete-record bytes while our refusal
+     blocks that record's progress (a wait that ends at 10 seconds), the CONNECTION-LOCAL
+     progress rate is max(live rate, rate over the 10 seconds before THIS WAIT's first refusal),
+     excluding the wait interval; with no prior history use the live rate (a connection
+     younger than 10 seconds at that first refusal uses the live rate). The same floor,
+     max(live rate, rate over the 10 seconds before THIS WAIT's first refusal), applies to
+     this connection's contribution to its IP/account identity progress during that wait,
+     so the worst-of rule cannot override it through the identity scores. IP and account
+     identity BYTE-SECONDS are unchanged by this. Never exclude outbound retained or unacked bytes from
+     byte-seconds or progress accounting. Track progress over a rolling 10-second window per identity:
+     newly received inbound record bytes (including partial records, counted once, not
+     retransmissions or copies), outbound bytes acknowledged/released by QUIC (not merely
+     handed to it). Rank descending `decayedByteSeconds / (1 + progressBytesPerSecond)`,
+     then this connection's own current retained bytes descending (connection bytes, not
+     identity bytes). There is NO strict zero-progress/stalled-first
+     tier or 5-second acquisition clock: a short mobile radio stall does not automatically
+     outrank every progressing holder, nor can a trickle escape a priority tier. A connection's
+     rank is the WORST (highest score) of its IP, account and connection-local scores, so a
+     sibling streaming cheap records on the same IP/account cannot shield a stalled holder
+     (the connection-local score uses that connection's own byte-seconds/progress and
+     lasts only for the connection's lifetime; identity history is what persists per
+     IP/account). Ties then compare this connection's own current retained bytes, then
+     oldest current acquisition, then an
+     internal, non-rotating connection id (a local counter, not a QUIC connection ID). A reconnect starts only
+     its new connection-local statistics, never the identity history; no 5-second clock restarts.
+     Aggregate across simultaneous connections and retain identity history for 10 minutes
+     after last use; reconnects never reset it. Bound each pool's exact history to the
+     configured admission IP/account tracking capacities, plus K=256 overflow buckets
+     per pool, selected by a keyed hash (per-process random secret) of the IPv4 /32,
+     the IPv6 /48 (not /64: a /48 holds 65536 /64s, so rotating /64s cannot spread one
+     attacker across buckets) or the account. For overflow-bucket accounting an IPv6
+     address maps to its /48; exact IP entries and the admission IP caps keep their own
+     keying. An account association protects an IP entry: the account's 4 MOST RECENTLY
+     USED IP entries stay protected and older ones are unprotected. In offline mode
+     accounts are unauthenticated names, so this protection gives no anti-Sybil value
+     there, and rotating names can pick a fresh overflow bucket each time.
+     Reclaim expired inactive entries first; if full, evict the lowest-score inactive IP
+     entry with neither a protecting account association nor a live connection, folding its history
+     into its overflow bucket. Never evict live entries or unexpired account history. If no
+     such slot exists, charge the new identity's history/progress to its hashed overflow bucket
+     instead of refusing it; count a connection's bytes/progress only once in overflow,
+     even if both its IP and account lack exact entries. If the IP and the account hash to
+     DIFFERENT buckets, charge and read exactly one: the account bucket when the connection
+     is authenticated, else the IP bucket; both identities read that one bucket. Its actual
+     IP/account caps still apply independently. Until its overflow bucket has no live users
+     and its 10-minute inactive history expires, identities without an exact entry continue
+     using it even if exact slots become free; do not promote them and erase reconnect
+     history. Existing exact entries remain separate and protected. Decay bucket history
+     under the same rules. **Overflow rank:** an identity served by an overflow bucket does
+     NOT inherit the bucket's full score. Its identity-level score is
+     `connLocal + share` with
+     `share = min(bucketScore, max(connLocal, bucketScore / max(1, liveIdentitiesInBucket)))`
+     (`liveIdentitiesInBucket` = distinct identities with a live connection charged to that
+     bucket, counting this one; an authenticated connection's IP and account count as ONE
+     identity, the one whose bucket is charged). A newcomer thus gets at most an equal per-identity share
+     of its bucket's score, and a reconnecting attacker cannot zero its share by cycling
+     connections (its connection-local score restarts but the bucket's does not). The
+     worst-of rule above then applies to this value. **Residual limit,
+     stated honestly:** a lone honest newcomer in a bucket poisoned by FOLDED (evicted)
+     history has `liveIdentitiesInBucket` = 1 and can inherit up to the full bucket score;
+     the formula only helps when several live identities share the bucket. The only effect
+     is its place in the `0x12` shedding order (never `0x11`, never TCP fallback or a
+     failure-cache write). `liveIdentitiesInBucket` can also be inflated with cheap idle
+     connections to dilute an attacker's own bucket share; that only lowers shares, the
+     worst-of rule still ranks the attacker's heavy connection, and the cost to the
+     attacker is admission slots. An attacker spanning all K buckets that has also filled every exact
+     slot still degrades overflow reconnect-history fairness (bucket history is shared and
+     bounded, not per identity); that precondition is DDoS-sized and the table never
+     refuses admission, so the damage is limited to which eligible holder is reclaimed
+     first, never to protected shares.
+     The ranking-history table NEVER causes admission/grant refusal or TCP fallback,
+     even when all exact entries are protected. Independent rate admission limits
+     still apply. All ranking windows/weights are
+     provisional operational defaults: measure then set, including CGNAT fairness,
+     reconnect/trickle attacks and overflow poisoning (an attacker protecting every exact
+     slot with account-associated IPs, rotating /64s inside a /48 and spanning all K
+     buckets must not make honest newcomers
+     among several live identities inherit its bad score; a lone newcomer's residual is stated above). Scores only choose among eligible holders, never protected shares.
+    Incomplete record/bundle: 10 seconds from first byte on the local monotonic transport
+    clock, paused while local executor backpressure prevents reads. Blocked head: 10 seconds
+    from becoming head on the executor-active clock. Decode/application dispatch: 10 seconds
+    of pre-enqueue active work; FIFO enqueue Q completes that timer, while D still waits for actual
+    application (13.10). Executor queue/tick-stall time is excluded at both client and server;
+    do not let a >10-second tick stall disconnect every peer. Unrelated network progress
+     restarts none of these clocks. **Peer attribution before resource classification
+     (INBOUND only):** "peer" means this one connection's OWN sent bytes; other
+     connections sharing its IP or account (CGNAT, family accounts) are other peers.
+     The per-connection inbound cap is E from above, or the configured caller-local cap
+     if higher after the startup clamp. An inbound refusal is peer-attributable only when
+     this connection's retained EXCESS bytes, excluding bytes held solely because our
+     executor/game has not released them, plus the requested bytes exceed that cap, or a shared IP/account/node binding cap whose holders are
+     exclusively this connection's own retained bytes AND that cap is >= E. A refusal while ANY of
+     this connection's bytes wait on our executor/game is never peer-attributable and closes
+     `0x12` (an honest peer's second legal record during our tick stall is not blamed). A refusal
+     under any cap that is below what one legal serverbound record needs (a
+     misconfiguration the startup clamp should have prevented) is a local fault, never
+     peer-attributable, and closes `0x12`. Do not reclaim unrelated holders or grant the fixed resource retry
+     exception in those cases. If an inbound abort is required (deadline expiry), close
+     with `0x11` (during binding, `0x10`), using normal client failure-cache/backoff and
+     the server's ordinary protocol-violation handling: server failure warnings (this and
+     12.14) follow ONE rule: the per-IP limit applies first (at most one warning per minute
+     per remote IP: IPv4 /32, IPv6 /64; a bounded set of tracked prefixes, oldest evicted),
+     then the global ceiling of at most 10 warning lines per minute per listener; one
+     "suppressed N" summary line per minute is exempt from that ceiling. Lines
+     carry the remote address and the reason code but no payload. Apply no other penalty beyond the independent admission rate limits above. A refusal under an IP or
+     account cap held entirely or partly by other users of that IP/account is never
+     attributable to this connection. Local implementation/producer faults are not
+     evidence of peer fault. When no connection-local cap independently blocks the grant,
+     shared pressure caused by other peers remains `0x12` even when this peer also holds
+     bytes. OUTBOUND queues, the pending-ACK caps and the server binding queue are NEVER
+     peer-attributable: they fill from the local game producer's volume plus an honest
+     slow or lossy link, so their per-connection caps (1024 packets/16 MiB, 128 entries/
+     64 KiB, 32 packets/64 KiB), deadline expiries and unpausable-producer aborts close
+     `0x12`. A peer that stops reading is handled by the outbound 10-second wait and
+     shedding above, never by `0x11`. Residual, stated honestly: any chatty peer has
+     executor-held bytes, so in practice inbound refusals rarely reach `0x11`; memory stays
+     bounded by the grants, the deadlines, shedding and the admission limits. **Zero-progress exception (dead path):** a path counts
+     as dead only if (a) ack-eliciting packets were outstanding for the WHOLE deadline of the
+     outbound/pending-ACK/binding-queue abort, with the waiting side REQUIRED to send
+     PING/PTO probes during it so the path is actually tested, AND (b) no authenticated
+     packet of any kind arrived from the peer in that time. A closed peer flow-control
+     window, or an idle connection whose probes are ACKed, is NOT zero progress. Classification
+     and the section 6 failure-cache write are CLIENT-LOCAL only: the abort keeps its wire
+     code but the client advances the cache like an idle timeout, so the next join uses
+     TCP. A server-detected case affects only server logging, never a cache. A full
+     blackhole reaches TCP through the client's own idle timeout (section 5 step 5, already
+     a failure). Asymmetric case: a client that receives a peer `0x12` while its own
+     ack-eliciting data has been unACKed for at least a fixed 10 seconds on the client's
+     own monotonic clock treats that close as a transport failure (cache advanced, using the
+     SHORTEST backoff step; it never shortens an existing non-resource window and does not
+     increase the backoff exponent). While waiting for SERVER_SWITCH during binding the client sends
+     PING probes, so a dead client-to-server path always has ack-eliciting data outstanding.
+     Both peers MUST produce QUIC ACKs in the transport, independently of game/tick or
+     executor pressure, so a stalled game thread never looks like a dead path. A zero-progress abort during binding uses the
+     12.14 join-retry limiter's non-resource exponential schedule; this split is deliberate:
+     the asymmetric case's shortest step applies to the failure cache only, never to the limiter. Shared-pool `0x12`
+     aborts on a live path never do this.
+     **Deadline precedence:** ANY deadline expiring while
+     this node is withholding reads/grants needed for completion due to a LOCAL resource
+     refusal closes `0x12`, never peer blame `0x11` (or binding blame `0x10`), except for
+     the peer-attributable refusals just defined. The earlier
+     deadline still wins in time; resource classification wins when causes/timers overlap.
+     In particular, an incomplete timer started by a prefix may expire before the later
+     resource-wait timer; it then closes `0x12`, without extending either 10-second bound.
+     This rule also covers activation, missing-stream/preamble and bundle deadlines.
+     Otherwise timeout, cycles, impossible references, malformed packets,
+     wrong shard/epoch/sequence and oversized units close the whole connection with `0x11`;
+     resource refusals/pressure aborts use `0x12` as specified above, never `0x11` peer blame.
+     Never evict a record, skip, release a barrier or retry mid-play.
 
 ### Flow control, resets, bundles and compression
 
-13. **13.13 Transport limits.** For clientbound traffic `/3` sets `initial_max_data=16 MiB`
-    and both bidi per-stream initial limits to 8 KiB (grow up to 4 MiB only against budgets).
-    For serverbound traffic use small windows: the server advertises
-    `initial_max_data=24 KiB` (three streams times 8 KiB) and both bidi per-stream initial limits of 8 KiB.
-    These windows may grow only against the budgets below, including while
-    receiving a legal record larger than its initial window. Set
-    `initial_max_streams_bidi=2` at the server (client streams 0 and 4),
-    `=1` at the client (server stream 1), and both uni limits to 0. Never increase MAX_STREAMS;
-    grow MAX_DATA/MAX_STREAM_DATA only against uncommitted bounded receive budget, reserving
-    both CONTROL byte capacity and its 64 record slots as in 13.12, and reclaim that budget
-    after delivery. When granting auxiliary credit, account for outstanding credit as
-    well as retained bytes and both reservations; if record count is not yet known, reserve
-    for the maximum number of minimum-size records that credit can carry, or withhold it.
-    Never extend credit for a record exceeding 13.4's cap; no legal record exceeds 4 MiB.
-    Pin quiche's maximum auto-tuned windows. Server: connection window 24 KiB and stream
-    window 8 KiB, equal to the initial serverbound windows, so automatic growth is off and the
-    exposure is exactly the initial credit the node reserved. The server's connection window equals
-    the sum of its three pinned stream windows, the most quiche can hold unread, so each admitted
-    connection reserves 24 KiB against the 13.12 node budget. That reservation covers only unread
-    serverbound stream data; 0-RTT early data and crypto/handshake buffers are not counted in it.
-    Client: stream window 4 MiB and connection window 12 MiB, three streams times the
-    stream maximum, since only three streams can hold quiche-unread data. The client's aggregate exposure is therefore the application-held
-    data (the 17 MiB budget of 13.12) plus quiche-unread data bounded by 12 MiB; the initial
-    clientbound MAX_DATA credit is not debited from the receiver budget. Automatic growth beyond
-    these pins is not allowed. Because the server windows are pinned, a serverbound record
-    streams at about 8 KiB per round trip per stream: a serverbound record larger than roughly
-    8 KiB x (10 s / RTT) hits the 10 second incomplete-record timer (about 800 KB at a 100 ms
-    RTT). Vanilla serverbound packets are far smaller. Smaller initial serverbound windows MUST remain effective;
-    transport auto-tuning may not silently override them. If the pinned Netty exposes no
-    setters for these maximum windows/growth controls, patch it before enabling `/3`;
-    initial limits alone are insufficient. Account for already granted credit when
-    tightening limits; never promise credit that cannot be honored within the budgets.
-    All other §9 values remain unchanged. Prioritize available
-    CONTROL writes, then round-robin REALTIME and WORLD in at most 64 KiB write quanta;
-    priority must not starve a WORLD predecessor needed by CONTROL. Measure memory and
-    throughput before changing these draft limits, including at the 50,000-player target.
+13. **13.13 Transport limits.** Listener parameters are fixed before N is known. The server
+    allows two client-opened bidi streams, the client six server-opened bidi streams; both
+    uni limits are zero. Never increase MAX_STREAMS. Application validation rejects any
+    server stream index >= N even though transport permits six. The client initially
+    advertises 256 KiB per bidi stream and 2 MiB connection credit; the server advertises
+    24 KiB connection credit, preserving the existing per-connection credit and admission
+    share. Server stream credit is asymmetric: 8 KiB on client-opened bidi directions
+    (CONTROL and REALTIME), but only one byte on server-opened bidi directions (reverse
+    CHUNK streams, which carry no valid bytes). Pin server stream maximum windows at
+    8 KiB and its connection maximum at 24 KiB; client maxima equal its initial windows.
+    No auxiliary guard read may replenish credit: its first byte closes the connection
+    on the event loop before any further credit/send work. Thus the reverse chunk windows
+    never grow beyond one byte on a live connection; the valid serverbound native exposure
+    is at most `2*8 KiB + N`, leaving P and guard-read capacity inside the 24 KiB share.
+    This is a least-privilege change to UNUSED chunk directions, not a reduction of CONTROL's
+    8 KiB or the server's 24 KiB connection credit. Test initial and rolling exposure,
+    including invalid bytes coalesced on all guards, before enablement. As the application
+    reads into client-reserved or server-node-charged buffering, rolling flow control can
+    replenish that stream's pinned window;
+    a clientbound incomplete head must continue reading, even while dependency-blocked, until its
+    complete frame/unit fits the reserved slot. Do not read ahead into the next unit.
+    Client native exposure is 2 MiB. Server native plus protected-read capacity fits the
+    24 KiB share as derived above; neither is an additional admission charge.
+    Client: count one at-most-16-KiB unparsed read chunk per stream separately, at most
+    128 KiB more. Server: at most one 16 KiB CONTROL read suffix charged under E and N+1
+     one-byte auxiliary guard reads inside the protected share; in-share CONTROL grants
+     shrink to the pre-reserved footprint within remaining P rather than requiring an
+     excess-pool allocation. Before classification, read only bounded prefixes as in 13.12. Include
+    suffixes beyond a unit boundary. Native transport and read charges may overlap conservatively,
+    never be omitted. Crypto/handshake/0-RTT
+    buffers need separate node admission accounting, not a claim they fit stream credit.
+    Client receiving and credit replenishment MUST be fair across all streams; never stop
+    all reads because one shard is full. The server may stop CONTROL reads on a node-budget
+    excess refusal as in 13.12, but not for protected reads. After the REALTIME preamble,
+    keep a one-byte pending guard read there and on every reverse CHUNK direction (no
+    CHUNK preamble); charge each guard BEFORE its read call within the share. Parse the
+    REALTIME preamble one byte at a time, validating and releasing each byte before the
+    next read, using that same one-byte guard charge. Any byte after it (or any CHUNK byte) is
+    immediately `0x11`, not left unread in the native window. Keep the respective exposure reserved
+    until connection close; unused streams do not multiply the server's 24 KiB aggregate.
+    Maximum-window pins are provided by the project's existing, tested Netty patch
+    `natives/patches/netty/0005-max-flow-control-windows.patch` (netty/0005); no further native
+    patch is planned. Retest pins and bounded reads for these revised limits before enabling
+    `/3`; initial values alone are insufficient.
+    These windows trade throughput for a provable memory bound. A clientbound 2 MiB record
+    needs roughly eight window turns; a large serverbound record at 8 KiB per RTT can hit
+    the 10-second timer (about 800 KiB at 100 ms RTT). Benchmark the limits before enablement;
+    increasing windows requires an explicit revised reserve, not silent auto-tuning.
+    All other §9 parameters remain unchanged. Sender policy: 13.20.
 14. **13.14 Reset and shutdown.** RESET_STREAM, STOP_SENDING, unexpected FIN on any lane,
-    failure to open an allowed stream within 10 seconds of activation, or an extra stream
-    terminates the whole connection with `0x11`; a STOP_SENDING must be detected even on a
+    failure to open/identify an allowed stream within 10 seconds of activation, or an extra stream
+    terminates the whole connection with `0x11`, subject to 13.12's local-resource deadline
+    precedence. Reads of the preamble/first bytes needed to identify EVERY allowed stream
+    MUST use reserved connection capacity, never a refusable pool grant: the server's
+    one-byte REALTIME preamble/guard charge and CONTROL prefix slice inside its existing
+    24 KiB share, and the client's reserved per-stream slots. No extra idle bytes are needed.
+    If a local grant is nevertheless withheld and this deadline expires, close `0x12`,
+    not `0x11`, and log a reserve-accounting defect. A STOP_SENDING must be detected even on a
     lane that never writes; never reopen just one lane or remap lost
     packets to CONTROL. Normal close sends a CONTROL disconnect if applicable, then END
-    as a full fence after all queued game records. On END delivery the peer closes with
+    as a global fence after all queued game records. On END delivery the peer closes with
     `0x0`; sender waits at most 10 seconds before closing. A connection close is always
     terminal. TCP retry is a new player join, never mid-session recovery.
-15. **13.15 Bundles.** Treat a vanilla bundle (opening delimiter, all members, closing
-    delimiter) as one CONTROL-fenced scheduling unit, keeping its actual packets as separate
-    sequential GAME records, all on CONTROL, with no other game record assigned between
-    them. Buffer before assigning routes, at most 4096 members or 8 MiB total uncompressed
-    bytes, further limited by the game's own cap and by 13.12's pending-record cap: the
-    whole bundle, both delimiters included, must fit in 1024 records, so at most 1022
-    members. A sender that would exceed any of these bounds closes with `0x11` instead of
-    emitting the bundle, assigning no sequence numbers for it; missing closing delimiter
-    for 10 seconds or excess bounds at the receiver disconnects. Do not split members
-    onto auxiliary lanes or deliver a partial bundle to game logic. Receiver stages
-    contiguous CONTROL members through the
-    closing delimiter using provisional watermarks for their internal predecessor checks;
-    external dependencies must already satisfy the committed watermarks. It commits those
-    watermarks only after delivering the whole validated bundle atomically to the game's
-    bundle handler. Auxiliary records may reference sequences of staged CONTROL members
-    as required by 13.9, but may not satisfy those dependencies using provisional
-    watermarks; only committed delivery releases them. Reserve/validate
-    the complete bundle against queue bounds before scheduling it; never interleave an
-    activation, compression change or state transition with a bundle. Such a member makes
-    the bundle invalid rather than changing decoder state partway through it.
+15. **13.15 Bundles.** Keep opening delimiter, all members and closing delimiter as one
+    CONTROL scheduling unit, separate consecutive GAME records, with no intervening logical
+    game sends. A spawn/entity-data bundle is a control fence, not a chunk/global fence.
+    Use the strongest member scope (global > view > control > ordinary), with at least
+    control scope for any bundle. If any member requires global scope, is unknown or is a
+    chunk packet, promote the whole bundle to global; bundle context is the only exception
+    to individual chunk routing. It MUST NOT mix state, epoch, activation or compression
+    changes into a bundle.
+    Buffer completely before assigning sequences; validate total encoded size <= B, at most
+    126 members plus delimiters (128 records), and total decoded/scratch storage <= 8 MiB
+    or stricter game limits. These tighter limits replace the old draft's 1022-member bound;
+    exceeding them closes with `0x11`, never splits a bundle. All external prerequisites
+    attach to the opening record; later members have only their implicit CONTROL predecessor.
+    Later external records depend on the closing record as the fence frontier, never a
+    partially staged member. Receiver uses provisional CONTROL watermarks only inside the
+    bundle, validates the strongest member policy before execution, and commits the closing
+    watermark only after applying the complete bundle atomically to the game's bundle handler.
+    A missing close after 10 seconds, nested delimiter or policy violation closes `0x11`.
+    These bundle buffering limits apply clientbound. Serverbound records remain bounded by
+    the game's serverbound packet limits and the single-record admission rules in 13.12.
 16. **13.16 Compression.** Compression remains per Minecraft packet, not a shared compressed
-    stream. Threshold changes are CONTROL fences; encode the change packet using the old
+    stream. Threshold changes are global fences; encode the change packet using the old
     threshold, subsequent packets using the new one. Receiver applies the new threshold
     after delivering that change and before decoding later dependent GAME bodies. Do not
-    decompress a blocked packet using the current threshold speculatively. Keep ordinary
+     decompress a blocked packet using the current threshold speculatively. At the server,
+     check declared output length and the full 13.12 footprint BEFORE inflating; a small
+     compressed wire record declaring up to 8 MiB output is not automatically in-share.
+     Acquire its excess charge first if the footprint exceeds remaining P, and enforce
+     actual output/scratch against the reserved bound while inflating. Keep ordinary
     Minecraft malformed-compression and size checks; no dictionary spans streams.
 17. **13.17 Acceptance tests.** Before enablement require golden HKDF/exporter/message/record
     vectors; wrong/absent exporter and upstream-native tests; all MAC/state/timeout failures;
@@ -1128,18 +1620,22 @@ This subsection records the user's direction for the next revision of `/3`. None
     against vanilla with `isEncrypted()` still true; encrypted-but-unauthenticated aborts
     before configuration; pre-activation stream-4 rejection; boundary/max-length records;
     advertised digest mismatch before connect and stale-advertisement OFFER rejection;
-    staged-bundle auxiliary dependencies released only on commit; and CONTROL byte/slot
-    reservations under auxiliary floods, including quiche auto-tuning and node-budget
-    exhaustion. Verify out-of-u32 protocol rejection, exporter exceptions/wrong lengths,
+    staged-bundle auxiliary dependencies released only on commit; and per-stream byte/slot
+    reservations under chunk floods, including quiche auto-tuning and node-budget
+    exhaustion. Verify out-of-u31 protocol rejection, exporter exceptions/wrong lengths,
     PSK-only resumption rejection, ticket-key/certificate rotation, inert binding payloads
     outside `/3` and Velocity's bidirectional stripping. Test failed re-bind close-before-
     fresh-TCP ordering, new Login Start/session join, bounded OFFER wait, unchanged pin and
     retained (unused) tickets/tokens/recorded flights on failure, failure-cache and re-bind
-    backoff updated on failure (asserted separately), success-only discard of tickets/tokens/
+     backoff updated on non-resource failure (asserted separately), no failure-cache or
+      re-bind-backoff update on locally detected genuine shared-resource `0x12`; peer-sent
+      `0x12` before verified SERVER_SWITCH uses exactly 12.14's bounded allowance, then
+      updates both as `0x10`. Test rotating unauthenticated peers, persistence of the allowance
+      across successes/restarts, and the authenticated resource-report exception; success-only discard of tickets/tokens/
     flights, changed fingerprint with unavailable exporter or missing/mismatched routing
     digest selecting fresh TCP without `/2` or `0x10`, restart-persisted fingerprint-independent
     backoff, notice deduplication/eviction, the join-time TCP retry (close before fresh TCP, log and
-    chat message, failure-cache entry) for every pre-activation failure kind, no retry after
+      chat message, failure-cache entries/exceptions exactly as in 12.14) for every pre-activation failure kind, no retry after
     activation, and, with 0-RTT accepted on `/3`, neither side starting binding before the
     server's TLS handshake completes (12.7).
     Run a 50,000-concurrent-QUIC-connection node benchmark before enablement, recording
@@ -1150,14 +1646,304 @@ This subsection records the user's direction for the next revision of `/3`. None
     requires measured loss improvement over TCP AND single-stream and security review;
     this draft makes no performance or completed-review claim.
 
-### DECIDED QUESTIONS (user, 2026-10-15: all four approved as written)
+### Chunk scope, joins and sender policy
+
+18. **13.18 Epoch and position sharding.** Epoch starts at 0 independently per sending
+    direction after activation. A reviewed level-creating/replacing global packet (play login,
+    respawn, including same-dimension level replacement) carries the old epoch; only its
+    serial-handler completion advances that direction's receive epoch by exactly one.
+    Sender advances its assignment epoch immediately after assigning that fence; subsequent
+    records carry the new epoch and depend on it. Start-configuration alone does not create
+    a level or increment epoch. Sequences remain connection-scoped, never restart at epoch
+    boundaries; positions, installed-chunk tracking and batch/update frontiers are keyed by
+    epoch and cleared at level replacement. No old-epoch record can execute after that fence.
+    New-epoch envelopes may arrive early, but remain opaque until their transition dependency
+    executes; reject stale epochs or a future epoch without the corresponding transition
+    once prerequisites are available. Epoch exhaustion closes with `0x11`, never wraps.
+    Serverbound epoch is always 0: no serverbound route may change epoch, and any nonzero
+    serverbound epoch is `0x11`. Acknowledgements do not mirror the clientbound epoch.
+    Chunk routes in this draft are clientbound, so there is no ambiguous reverse position scope.
+
+    For signed-32-bit chunk coordinates x,z and epoch e, compute using unsigned 32-bit
+    arithmetic (multiplication wraps modulo 2^32):
+    `h = (uint32(x) * 0x9e3779b1) XOR rotl32(uint32(z) * 0x85ebca77, 16) XOR
+    (e * 0xc2b2ae3d)`; then `h = h XOR (h >>> 16)`;
+    `h = h * 0x7feb352d`; `h = h XOR (h >>> 15)`;
+    `h = h * 0x846ca68b`; `h = h XOR (h >>> 16)`.
+    Shard is unsigned `h mod N`. This is a fixed wire rule, not Java's remainder on a signed
+    int or a runtime-selected hash. It need not be cryptographic. No coordinate bytes are
+    duplicated in the header: extract them from the eligible packet and validate its stream
+    before executing it. Invalid coordinates/extraction, wrong shard and invalid epoch are
+    `0x11`. Supply cross-language golden vectors for all N=1..6, negative/extreme coordinates
+    and successive epochs before implementation is accepted. The proposed hash is subject
+    to the explicit user confirmation below, not an implementation choice left unspecified.
+
+19. **13.19 Join records.** Joins live on CHUNK[0], even when their semantic positions hash
+    elsewhere. They have explicit dependencies on the actual covered frontiers, not an
+    estimate based on packet size, most recently installed chunk, or packet sequence field.
+    Their own-stream predecessor is implicit. They never become CONTROL/view/global
+    frontiers merely because they are joins; unrelated CONTROL and REALTIME continue.
+    - **ACK_JOIN (block_changed_ack):** the adapter tracks the causal set of authoritative
+      block/section/block-entity updates covered by the game prediction sequence. At the ack's
+      logical send point, take the maximum sequence of every covered update on each chunk
+      stream, plus the CONTROL frontier covering the relevant action processing. Include
+      the current CONTROL A[0] conservatively, and any globally routed covered updates.
+      Remove intentionally suppressed/not-sent updates from coverage; they have no wire
+      frontier. Delay the ack at the sender until every remaining covered update has been
+      assigned; this sender-local wait is not a reason to close the connection. Assignment
+      MUST proceed independently of the outbound FIFO: retain the pending ack outside the sequenced
+      queues, never let it block assignment/enqueueing of updates it covers, and never
+      publish its sequence/frontier to later records before resolving coverage. Covered
+      updates are ordered before the ack at the logical assignment point even if the game
+      emitted the ack first. On resolution, snapshot only previously assigned frontiers
+      and assign/enqueue the ack after those updates, including on CHUNK[0]. No pending
+      ack or dependent record may reach the client and start a blocked-head timer while
+      coverage is unresolved; an honest client cannot incur `0x11` from this sender wait.
+      Pending, unassigned acks do NOT participate in a global/view/batch fence's drain.
+      Preserve original game order of every non-ACK record: in particular NEVER move a
+      covered update across a view/global/batch fence to satisfy an ack. If the game emits
+      ack A, fence V, then covered update U, assign V then U then A, with A taking current
+      epoch/frontiers and waiting for U (and V through the normal fence rules). This is an
+      explicit sender-local deferral of A, not U-before-V reordering; V cannot depend on
+      the unassigned A. Already assigned joins still drain normally. An adapter must verify
+      that deferring prediction acknowledgements this way preserves its game's semantics;
+      disable `/3` for an unverified version rather than inventing forward edges.
+      Test assignment independence under outbound FIFO backpressure; all edges remain backward.
+      Bound pending ACK storage to 128 entries and 64 KiB per connection, whichever is hit
+      first, charged to the outbound pool and its 1024-packet/16-MiB connection caps from
+      creation, not only after assignment. Moving an ack into the sequenced queue transfers
+      its charge, never duplicates it. Backpressure the ack producer at the limit without
+      stopping covered-update/fence assignment; if this separation is impossible or the
+      producer cannot pause, resource-abort `0x12` (never peer-attributed, 13.12),
+      never silently drop/coalesce or retain unbounded acks, except for the explicit drops
+      below. These are provisional measure-then-set limits, not idle reservations.
+      A pending ack has a 10-second monotonic transport-clock deadline from creation,
+      never extended by other traffic or executor stalls. No later than that deadline, or
+      before ANY protocol-state, epoch or disconnect transition (including graceful disconnect),
+      settle coverage: remove suppressed updates and resolve/enqueue in the old state/epoch
+      using the safe-superset rule below if all remaining covered updates are assigned;
+      otherwise drop the still-unassigned ack and release its charge. Never carry pending
+      ACKs into another state/epoch, synthesize missing updates or publish forward edges.
+      An actual disconnect discards unsent ACKs; resolving does not delay transport close.
+      Dropping a pending ack does not suppress any mandatory game update. This explicit
+      deadline/transition drop is the only drop exception to the storage-limit rule above;
+      count/log it without packet contents. Verify that both bounded deferral and these
+      drops preserve game prediction semantics for the adapter, or disable `/3` for that
+      version. No sender wait alone disconnects an honest client.
+      If exact causal
+      coverage cannot be established, use all prior chunk frontiers plus CONTROL as a safe
+      superset once all non-suppressed covered updates are assigned; otherwise keep the ack
+      pending only until the deadline/transition above, rather than guessing a frontier.
+      The ack's game sequence is not a transport sequence and does not identify one chunk.
+    - **BATCH_JOIN (chunk_batch_finished):** chunk_batch_start is a CONTROL/view gate,
+      so every following chunk install waits for its execution through the latest V,
+      without adding another dependency class. Finished depends on the start and the
+      per-stream maximum of every chunk install in that batch, not just its final stream.
+      Batch completion/rate feedback occurs only after every install's handler completes.
+      Reject nested/unmatched batch markers; an empty batch still depends on its start.
+      Every subsequent chunk_batch_start explicitly depends on the preceding BATCH_JOIN
+      on CHUNK[0], even across empty batches; its installs then depend on that start through
+      V. Assign finished A before start B in logical send order, never behind B installs.
+      This additional backward edge is required even if the view-gate drain currently
+      implies it: batch framing must not depend on a future relaxation of view gates.
+    Ordinary chunks still depend only on own predecessor, global and view; the subsequent
+    batch's view gate carries its preceding-finished dependency. Joins do not themselves
+    become global frontiers. A global fence still drains assigned joins (not pending ACKs),
+    and epochs cannot share a batch.
+    A multi-chunk update remains the global packet in 13.8, not an invented join that later
+    single-chunk updates could overtake. Receiver checks join packet id/kind/CHUNK[0], known
+    coverage and required frontiers before execution. Causal facts unavailable from wire
+    alone remain sender obligations, verified by adapter ordering tests, not claimed as
+    independently provable receiver knowledge. Malformed or known impossible joins close
+    `0x11`; missing prerequisites wait under 13.12, never block CONTROL by moving there.
+
+20. **13.20 Sender scheduling (local policy, not wire format).** The sender SHOULD implement
+    dependency-aware weighted scheduling before bytes enter QUIC: ready latency-sensitive
+    entity movement/updates first, chunk records second, other small packets third. Bound
+    REALTIME bursts, guarantee chunk streams a positive minimum byte share whenever runnable,
+    round-robin among chunk shards, and age other traffic so it also progresses. Promote
+    unsent prerequisites of urgent records, including view/global fences and chunk heads
+    needed by a join, instead of filling QUIC with dependents whose prerequisite is unsent.
+    This policy MUST NOT alter stream order, dependency construction, bundle atomicity or
+    the progress reservations. Backpressure at stream/connection writability must stop
+    unbounded enqueueing into QUIC; cap write quanta at 64 KiB and account for queued bytes.
+    Once bytes enter a stream they cannot be reordered; a partially queued record on one
+    stream cannot be preempted by a later record on that stream. Small CONTROL packets can
+    still wait behind earlier CONTROL; this design does not claim otherwise.
+    Netty 4.2.19's `QuicStreamPriority`/`updatePriority` MAY supplement this policy as hints.
+    Test urgency direction (quiche is expected to send lower values first), incremental
+    behavior and loss/flow-control interactions before relying on hints. No correctness or
+    starvation guarantee may rely on QUIC priority, and it cannot undo already queued bytes.
+    Weight/burst/default tuning is benchmark policy, not negotiated wire data.
+
+    Extend 13.17's acceptance gate with all N=1..6 and offer/range/selected-N transcript
+    tampering; compact-header boundaries/duplicates/excess deps/sequence exhaustion;
+    hash/epoch vectors and late old-dimension data; withheld view gates and chunk installs;
+    missing block/light/forget ordering; chunk-independent spawn/remove; unknown ids promoted
+    to global at both ends; multi-chunk biomes; covered updates across all shards before ack;
+    batch installs before finished/rate feedback; join-cycle rejection; bundle promotion;
+    all slots simultaneously full with each missing prerequisite withheld independently;
+    serial handler delayed after receipt; native-window pins and node admission pressure;
+    all-serverbound-CONTROL routing, 24 KiB idle server receive shares, non-fatal node-budget
+    read/allocation refusals followed by recovery or timeout, release of active buffers back
+    to the idle share, and sustained REALTIME load with guaranteed chunk progress and aged
+    CONTROL progress.
+    Include two consecutive batches with A's install and finished independently withheld,
+    including an empty A or B: no start/install B before finished A commits. Delay an
+    old install while the view center moves away and back; both gates must wait for its
+    frontier. Flood inbound excess with trickled maximum legal records and outbound queues
+    with non-reading clients: in-share keepalives must still read/decode, only excess/queued
+    consumers are pressure victims, and inbound/outbound caps cannot borrow across pools.
+    Assert reviewed length rejection at the prefix, per-call precharging/adaptive grants,
+    guard-byte close without credit growth, and all share/footprint inequalities at N=1..6.
+    Stall each game's executor for >10 seconds, including after FIFO enqueue and while a
+    dependent head waits: Q may advance, D/epochs may not, timers exclude the stall, no
+     connection closes solely for the executor stall, and ordered application resumes.
+     Separately refuse excess/outbound grants across a stall and verify their transport-clock
+     10-second waits do not pause and only resource-blocked requesters/eligible holders close.
+     Test a compressed record whose wire length fits P but declared output does not: refuse
+      shared excess before inflation, retain bounded prefixes, then recover after grant. Test legal
+     small records marked ordinarySmall:false using P without `0x11`, plus invalid declarations
+      and output/scratch overruns. Start an incomplete timer with partial prefix bytes,
+      refuse excess under other-peer shared pressure after classification later, and let the earlier incomplete deadline
+      expire: assert `0x12`, not `0x11`, including simultaneous deadlines and an executor stall.
+      With a tight node pool all allowed stream preambles must still read from reservations;
+      inject an erroneous withheld preamble grant and assert the 13.14 expiry is `0x12`.
+      Verify the fixed prefix slice never charges excess. Exercise node/IP/account excess
+      caps: exhaust an IP/account cap with unrelated higher-ranked holders present; reclaim
+      only holders relieving a binding deficit, recompute after each, stop when the grant
+      fits, and retry waiting grants FIFO before new arrivals (including shared-IP peers).
+      Verify decayed identity-level byte-second/progress ranking: long-held modest trickle
+      versus fresh larger allocation, fast progress versus trickle, partial inbound-record
+      progress, a 5-second radio stall with no strict priority tier, simultaneous connections
+      and reconnects with unchanged IP/account history, connection-local tie-breaking and
+      expiry. Saturate history with rotating IPv6 /64s: reclaim eligible lowest-score inactive
+      IP entries or use overflow, protect account/live history, and admit new honest players
+      over QUIC without history-based refusal; verify cap accounting remains exact and
+      reconnects cannot escape unexpired overflow history when an exact slot becomes free.
+      Refused-grant gaming: a holder that repeatedly triggers refused excess grants while
+      keeping its retained bytes still accrues byte-seconds and keeps (or worsens) its rank;
+      only an inbound requester's own incomplete-record progress penalty is suspended, and
+      outbound retained bytes are never excluded.
+      Poisoning: an attacker keeps every exact slot live and heavy (account-associated IPs,
+      rotating /64s inside one /48, and spanning all K=256 buckets); with several live
+      identities in a bucket, honest newcomers are ranked by `connLocal + share` (at most
+      the equal per-identity share of the bucket score, or connLocal if higher), not by the
+      full bucket score; reconnect cycling in overflow keeps a nonzero share. A lone
+      newcomer in a bucket poisoned by folded history may inherit up to the full bucket
+      score: assert that the only effect is its `0x12` shedding order (never `0x11`, never
+      TCP fallback or a cache write).
+      Many sub-E connections from one /48 are shed first under pressure (no `0x11` needed). Assert the IP-vs-account bucket rule (account bucket if
+      authenticated, else IP bucket), IPv6 /48 keying, and that the 4 most recently used
+      IP entries of an account stay protected.
+      Misconfiguration: a caller-local or sole-holder excess cap below E is clamped up to E
+      with a warning at startup (never a startup failure); an honest peer under such a
+      cap is not blamed `0x11`, and a refusal is peer-attributable only when this
+      connection's retained excess (excluding bytes held only by our executor) plus
+      requested bytes exceed its per-connection cap. A tick stall >10 s with two large
+      legal records from one honest peer closes `0x12`, not `0x11`, with no backoff. The
+      server failure warning log is limited per remote IP (IPv4 /32, IPv6 /64, bounded
+      set, oldest evicted) and to 10 lines/minute per listener with one "suppressed N"
+      summary per minute; it carries the remote address and no payload.
+      Post-handshake UDP blackhole: on an established client connection with ack-eliciting
+      data outstanding (PING/PTO probes sent) for the whole deadline and no authenticated
+      packet from the peer, the abort is a transport failure: the client's cache advances
+      and the next join uses TCP; a zero-progress abort during binding follows the 12.14
+      non-resource join-retry schedule. Negative: a live peer that is not reading
+      (flow-control blocked) and a quiesced client whose PING probes are ACKed (live peer;
+      the abort is a resource abort, whereas a plain activation-deadline expiry is `0x10`
+      and does write the cache per 12.14) write no cache entry; the same abort with live-path ACKs (a
+      shared-pool `0x12`) does not touch the cache; a server-detected case only logs; a
+      client receiving a peer `0x12` after its own data sat unACKed for a fixed 10 seconds
+      treats it as a transport failure with the shortest backoff step; when the loss stops,
+      after the backoff window expires the next join uses QUIC. Floor test: a refused-wait inbound
+      holder's IP/account identity progress also uses the pre-wait floor. A sibling connection streaming cheap records on the same
+      IP/account does not shield a stalled holder (worst-of ranking).
+      Outbound tests must enforce node/IP/account caps and the same continuous score ranking;
+      rotate connections without resetting aggregated progress/history. Under outbound
+      contention queue A then B on the same binding cap and a new arrival C: released capacity
+      grants A then B before C. With A still IP/account-ineligible and unrelated B eligible,
+      grant B without moving A's FIFO position; grant A first when its caps permit.
+     Fill outbound capacity with non-reading peers, then activate an honest connection:
+     shed-then-atomic-retry must succeed without abort/cache/chat notice. Persistent refusal
+     must backpressure then close `0x12` and retry TCP with notice; when the detecting node is
+     the client, never write a failure-cache entry. When the server detects it and the client
+     receives only a pre-verification peer `0x12`, assert fixed-window handling for the first
+     three reports per rolling 10 minutes, then normal failure-cache/backoff updates: honest
+     remote exhaustion is not distinguishable from a forged resource claim, so exceptions
+     are bounded, not authenticated. Verify a brief honest server-pressure episode can retry
+     QUIC after 60 seconds and an attacker cannot obtain unlimited fixed-window exemptions.
+     Rotate fingerprints/IPs/advertised ports for one logical server across restarts
+     and assert the independent join-retry limit still bounds extra session joins, including
+      after resource aborts. Repeated locally detected resource aborts across restarts must
+      permit QUIC again after each fixed 60-second window, never double to hour-long TCP
+      suppression or advance failure/re-bind backoff; unauthenticated peer `0x12` follows
+      12.14's bounded allowance then normal non-resource backoff. Fill only a requesting
+      peer's own connection cap or a shared cap held exclusively by it, inbound,
+      including during binding: peer-caused refusal/deadline expiry is `0x11`/`0x10` with normal
+      backoff, never a fixed-window resource exemption or eviction of unrelated peers.
+      Contrast other-peer shared exhaustion and a local producer fault, neither blamed on
+      the peer. CGNAT: a refusal under an IP cap held entirely by other users of the same
+      IP is never `0x11`. An honest slow-link client that hits the outbound connection cap
+      (or pending-ACK/binding-queue cap) during a chunk burst closes `0x12` at worst,
+      never `0x11`; a non-reading peer is shed by the outbound wait, not blamed. Emit an ack before its covered updates with a full outbound FIFO:
+     update assignment must progress independently, no future/cyclic dependency or client
+      `0x11` may result, and the ack follows all covered updates. Test game order A, view/global
+      fence V, covered U: assignment is V,U,A, never U,A,V, and all edges point backward.
+      Test both ACK pending limits, pool charging before assignment, and inability to pause
+      only the ACK producer: bounded resource abort, never unbounded retention or a cycle.
+      Suppress a covered update and verify it is excluded, not awaited forever. Leave
+      coverage unresolved until the 10-second pending deadline and assert a counted drop,
+      released charge and no client close. For protocol-state, epoch and disconnect
+      transitions test both safe-superset resolution and unresolved-coverage drop; no pending
+      ack crosses the transition, no mandatory update is lost and all emitted edges remain backward.
+      Also test active-work timeouts,
+     CLIENT-only OFFER-first enforcement (server accepts early brand/client-information writes)
+     and both OFFER clocks, server binding-queue/node caps, u31
+    boundaries, offlineTest warnings/default-off, `/2` changed-pin notices and failure-cache
+    bounds on additional Mojang session joins. These are acceptance requirements, not claims
+    that existing implementation passes them.
+    Measure actual header bytes, per-stream peak buffers, execution workspace, native/unparsed
+    exposure, CPU per player, priority fairness, join latency and chunk-load throughput,
+    comparing TCP and single-stream under every netem profile. No measurements are claimed.
+
+### DECIDED QUESTIONS (historical user approval, 2026-10-15; revisions noted)
 
 1. Approve `/3`, the configuration-stage four-proof/switch exchange after OFFER, and the
    conservative exporter gate even for offline multi-stream tests?
 2. Approve changed-pin handling as: online mode re-binds automatically through channel
    binding (pin replaced only after a passing check, player notified), failure falls back to
    TCP with the pin unchanged?
-3. Approve the three fixed lanes, conservative full CONTROL fences, and exact-byte JSON
-   routing digests as the first reviewable design?
-4. Approve the proposed memory/packet limits and 10-second fail-closed deadlines for
-   benchmarking, particularly their per-node cost at 50,000 concurrent players?
+3. The original three lanes/full CONTROL fences are superseded by the 2026-10-16 direction
+   above. Exact-byte JSON routing digests remain; schema 2 includes extractor definitions.
+4. The original memory/packet limits are superseded by 13.12/13.13's progress reservations.
+   The 10-second fail-closed deadlines remain for benchmarking, including per-node cost.
+
+### Open questions for the user
+
+1. Confirm the proposed hard cap of 6, draft server preference of 3 (client offers 1..6),
+   and immutable per-connection selection in 13.2? Benchmark 1..6 before choosing defaults.
+2. Confirm the fixed epoch-mixed 32-bit position hash in 13.18, or choose another before
+   implementing golden vectors? This is a wire decision, not administrator configuration.
+3. Confirm the direction-specific receive policy: the client reserves up to 16 MiB + 1 KiB
+   wire and 8 MiB execution, plus 2 MiB native exposure and at most 128 KiB unparsed reads;
+   the server reserves only 24 KiB per idle connection, including a reviewed protected small
+   read allowance and one-byte unused chunk-direction guards, charging larger active CONTROL
+   buffering to a capped inbound excess pool separate from outbound queues (13.12/13.13)?
+   Client progress and server capacity must be
+   benchmarked separately, including 50,000 server connections. Hardware profiles stay planned.
+4. Should the pre-enqueue decode/dispatch executor-active work budget be raised above the
+   approved 10 seconds? Executor waits and tick stalls are excluded; after FIFO enqueue
+   there is no transport application timeout. This is not a comparison with the keepalive's
+   elapsed-time budget, and this draft does not change the approved duration.
+5. Approve the new close code `0x12` (resource abort) next to `0x10` (binding/setup failure)
+   and `0x11` (peer ordering/protocol violation)? It marks closes caused by the local node's
+   genuine shared resource exhaustion, not inbound self-cap refusals attributable to the peer's own sent bytes (13.12).
+   A client-detected abort on a dead path (ack-eliciting data outstanding, with probes, for
+   the whole deadline and no authenticated packet from the peer; for a peer `0x12`, a fixed
+   10 seconds on the client's own clock) is a transport failure: it
+   keeps the same wire code but advances section 6's failure cache like an idle timeout
+   (13.12); a server-detected case only logs.
+   Locally detected resource aborts never write a failure-cache entry; before SERVER_SWITCH
+   verifies, peer reports remain untrusted and receive only 12.14's bounded retry allowance.
+   Close codes are wire format; nothing ships with `0x12` until this is confirmed.

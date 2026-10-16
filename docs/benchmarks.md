@@ -823,5 +823,8 @@ Not run yet. These measurements are planned for the 2026-10-16 direction in `doc
   (clean, loss, delay, reorder), comparing TCP, single-stream and chunk streams from 1 to 6.
 - Server CPU per player as each stream is added, on the same hardware and with the same
   player count.
+- Compact-header bytes, per-shard/CONTROL/REALTIME buffer peaks, execution and native/read
+  exposure, cross-shard ack/batch join latency, and scheduling fairness under sustained
+  REALTIME load, including all progress reservations occupied (`protocol.md` 13.12-13.20).
 - Per-connection memory and peak concurrent players per node. The values in each planned
   server profile will be taken from these runs, not chosen in advance.
