@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -209,6 +210,123 @@ public final class QuicClient {
         TransportConfig effective = config.withMultistream();
         return connectV3(codec -> new Bootstrap().group(group()).channel(NioDatagramChannel.class).handler(codec)
                 .bind(0), remote, fingerprint, table, effective, early, bypassResumption);
+    }
+
+    /**
+     * As {@link #connectV3(InetSocketAddress, Fingerprint, RoutingTable, TransportConfig,
+     * EarlyFlight, boolean)}, but QUIC runs on the platform's {@code loop} over its {@code socket}
+     * (hosted transport, docs/protocol.md §11), exactly as the hosted {@code /2} dial does: the
+     * connection's event loop is the game's, so the TLS exporter, the binding session's deadlines and
+     * the game channel all run on the one thread 12.10 requires. The socket is closed with the
+     * connection, or when the attempt fails or is cancelled.
+     */
+    public static CompletableFuture<V3Connection> connectV3(HostLoop loop, HostDatagramSocket socket,
+            InetSocketAddress remote, Fingerprint fingerprint, RoutingTable table, TransportConfig config,
+            EarlyFlight early, boolean bypassResumption) {
+        // Every path below closes the socket through this one guard, so it is closed at most once
+        // (the channel's close and the failed-attempt hook can both reach it).
+        OnceClosingSocket guarded = socket == null ? null : new OnceClosingSocket(socket);
+        try {
+            if (table == null) {
+                throw new NullPointerException("table");
+            }
+            if (config == null) {
+                throw new NullPointerException("config");
+            }
+            if (socket == null) {
+                throw new NullPointerException("socket");
+            }
+            if (!QuicSupport.hasMaxFlowControlWindows()) {
+                closeHostedSocket(guarded);
+                CompletableFuture<V3Connection> unavailable = new CompletableFuture<V3Connection>();
+                unavailable.completeExceptionally(new V3UnavailableException(
+                        "/3 needs QUICraft's patched native that caps quiche's flow-control windows (12.3, 13.13);"
+                                + " fall back to /2 or TCP"));
+                return unavailable;
+            }
+            CompletableFuture<V3Connection> result = connectV3(codec -> {
+                HostedDatagramChannel udp = null;
+                try {
+                    udp = new HostedDatagramChannel(guarded);
+                    udp.pipeline().addLast(codec);
+                    return new HostedEventLoop(loop).register(udp);
+                } catch (RuntimeException | Error setupFailure) {
+                    if (udp != null) {
+                        udp.close();
+                    } else {
+                        closeHostedSocket(guarded);
+                    }
+                    throw setupFailure;
+                }
+            }, remote, fingerprint, table, config.withMultistream(), early, bypassResumption);
+            // The hosted socket becomes channel-owned on registration, but a failed/cancelled
+            // attempt may fail before the channel factory ever takes ownership of it.
+            result.whenComplete((connection, error) -> {
+                if (error != null || result.isCancelled()) {
+                    closeHostedSocket(guarded);
+                }
+            });
+            return result;
+        } catch (RuntimeException | Error setupFailure) {
+            closeHostedSocket(guarded);
+            throw setupFailure;
+        }
+    }
+
+    /**
+     * Delegates to the platform socket, but forwards {@link #close} only on the first call: the
+     * platform's close is not documented as idempotent, and a hosted dial can reach close from both
+     * the channel and the attempt's completion hook.
+     */
+    private static final class OnceClosingSocket implements HostDatagramSocket {
+        private final HostDatagramSocket delegate;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        OnceClosingSocket(HostDatagramSocket delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public InetSocketAddress localAddress() {
+            return delegate.localAddress();
+        }
+
+        @Override
+        public void start(Receiver receiver) {
+            delegate.start(receiver);
+        }
+
+        @Override
+        public void write(java.nio.ByteBuffer data, InetSocketAddress recipient) {
+            delegate.write(data, recipient);
+        }
+
+        @Override
+        public void flush() {
+            delegate.flush();
+        }
+
+        @Override
+        public boolean isWritable() {
+            return delegate.isWritable();
+        }
+
+        @Override
+        public void close() {
+            if (closed.compareAndSet(false, true)) {
+                delegate.close();
+            }
+        }
+    }
+
+    private static void closeHostedSocket(HostDatagramSocket socket) {
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (Throwable ignored) {
+                // Preserve the failed dial as the reported cause; close is best effort.
+            }
+        }
     }
 
     private static CompletableFuture<V3Connection> connectV3(UdpFactory udpFactory, InetSocketAddress remote,

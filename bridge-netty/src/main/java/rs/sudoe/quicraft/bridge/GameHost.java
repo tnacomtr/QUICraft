@@ -28,12 +28,14 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
+import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.transport.HostDatagramSocket;
 import rs.sudoe.quicraft.core.transport.HostLoop;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.QuicClient;
 import rs.sudoe.quicraft.core.transport.QuicServer;
+import rs.sudoe.quicraft.core.transport.V3Connection;
 import rs.sudoe.quicraft.core.transport.EarlyFlight;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
 
@@ -461,6 +463,57 @@ public final class GameHost {
             }
             CompletableFuture<QuicByteStream> attempt = QuicClient.connect(loop(loop),
                     socket((DatagramChannel) f.channel()), remote, fingerprint, config, early);
+            result.whenComplete((s, e) -> {
+                if (result.isCancelled()) {
+                    attempt.cancel(false);
+                }
+            });
+            attempt.whenComplete((stream, error) -> {
+                if (error != null) {
+                    result.completeExceptionally(error instanceof CompletionException && error.getCause() != null
+                            ? error.getCause() : error);
+                } else if (!result.complete(stream)) {
+                    stream.close();
+                }
+            });
+        });
+        return result;
+    }
+
+    /**
+     * Opens a {@code quicraft/3} connection hosted on {@code loop} (docs/protocol.md 13.1): as
+     * {@link #connect(EventLoop, ChannelFactory, InetSocketAddress, Fingerprint, TransportConfig,
+     * EarlyFlight)} but through {@link QuicClient#connectV3}, so the result is a
+     * {@link V3Connection} on the game's own event loop. {@code table} is the client's routing table
+     * for its protocol number, {@code bypassResumption} 12.16's full-handshake re-bind.
+     */
+    public static CompletableFuture<V3Connection> connectV3(EventLoop loop,
+            ChannelFactory<? extends DatagramChannel> datagrams, InetSocketAddress remote, Fingerprint fingerprint,
+            RoutingTable table, TransportConfig config, EarlyFlight early, boolean bypassResumption) {
+        CompletableFuture<V3Connection> result = new CompletableFuture<>();
+        InetSocketAddress local;
+        try {
+            local = new InetSocketAddress(InetAddress.getByAddress(
+                    new byte[remote.getAddress() instanceof Inet6Address ? 16 : 4]), 0);
+        } catch (UnknownHostException e) {
+            result.completeExceptionally(e);
+            return result;
+        }
+        ChannelFuture bound = new Bootstrap().group(loop).channelFactory(datagrams)
+                .handler(new ChannelInboundHandlerAdapter()).bind(local);
+        bound.addListener((ChannelFuture f) -> {
+            if (!f.isSuccess()) {
+                f.channel().close();
+                result.completeExceptionally(f.cause());
+                return;
+            }
+            if (result.isDone()) {
+                f.channel().close(); // cancelled while binding
+                return;
+            }
+            CompletableFuture<V3Connection> attempt = QuicClient.connectV3(loop(loop),
+                    socket((DatagramChannel) f.channel()), remote, fingerprint, table, config, early,
+                    bypassResumption);
             result.whenComplete((s, e) -> {
                 if (result.isCancelled()) {
                     attempt.cancel(false);

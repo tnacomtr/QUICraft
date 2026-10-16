@@ -45,6 +45,10 @@ public class AsyncFaultInjectionGameTest implements FabricClientGameTest {
                 try (var connection = server.connect()) {
                     GameTests.waitForChunks(connection);
                     check(!GameTests.connectedOverQuic(context), Arrays.toString(stage) + ": joined over TCP");
+                    for (String hook : stage) {
+                        check(Hooks.wasFaultInjected(hook),
+                                Arrays.toString(stage) + ": fault injection actually fired for " + hook);
+                    }
                 } finally {
                     Hooks.setFaultInjection(false);
                 }

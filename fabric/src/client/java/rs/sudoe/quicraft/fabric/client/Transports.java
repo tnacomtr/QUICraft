@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.client;
 
+import java.lang.ref.WeakReference;
 import java.util.Map;
 import java.util.WeakHashMap;
 import net.minecraft.network.Connection;
 import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.core.connect.FallbackReason;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
+import rs.sudoe.quicraft.core.transport.V3Connection;
 
 /** Per-connection client state: the transport in use and a pending fallback report. */
 public final class Transports {
     private static final Map<Connection, QuicByteStream> QUIC = new WeakHashMap<>();
     private static final Map<Connection, FallbackReason> FALLBACKS = new WeakHashMap<>();
     private static final Map<Connection, Boolean> RETRY_OVER_TCP = new WeakHashMap<>();
+    /** Why a quic-only /3 join failed, for the disconnect screen; read after the pipeline is gone. */
+    private static final Map<Connection, String> V3_FAILURES = new WeakHashMap<>();
+    /** Weak values: the controller holds its connection, which would keep a strong entry alive for ever. */
+    private static final Map<Connection, WeakReference<V3Client>> V3 = new WeakHashMap<>();
 
     private Transports() {}
 
@@ -29,6 +35,41 @@ public final class Transports {
     public static synchronized boolean usedZeroRtt(Connection connection) {
         return QUIC.get(connection) instanceof rs.sudoe.quicraft.core.transport.ClientStream stream
                 && stream.sentEarlyData();
+    }
+
+    static synchronized void v3Failure(Connection connection, String text) {
+        V3_FAILURES.put(connection, text);
+    }
+
+    static synchronized @Nullable String v3Failure(Connection connection) {
+        return V3_FAILURES.get(connection);
+    }
+
+    static synchronized void v3(Connection connection, V3Client client) {
+        V3.put(connection, new WeakReference<>(client));
+    }
+
+    /** Remove a half-published /3 attempt without clearing a newer transport/controller. */
+    static synchronized void rollbackV3(Connection connection, V3Connection stream, V3Client client) {
+        if (QUIC.get(connection) == stream) {
+            QUIC.remove(connection);
+        }
+        WeakReference<V3Client> reference = V3.get(connection);
+        if (reference != null && reference.get() == client) {
+            V3.remove(connection);
+        }
+    }
+
+    /** The multi-stream controller of {@code connection}, or null when it is not a {@code /3} join. */
+    static synchronized @Nullable V3Client v3(Connection connection) {
+        WeakReference<V3Client> reference = V3.get(connection);
+        return reference == null ? null : reference.get();
+    }
+
+    /** Where a {@code /3} connection is, or null on TCP and on {@code /2}. */
+    static V3Client.@Nullable State v3State(Connection connection) {
+        V3Client client = v3(connection);
+        return client == null ? null : client.state();
     }
 
     static synchronized @Nullable QuicByteStream quic(Connection connection) {

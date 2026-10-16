@@ -22,6 +22,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Supplier;
 import net.minecraft.SharedConstants;
+import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.server.network.EventLoopGroupHolder;
@@ -31,12 +32,18 @@ import rs.sudoe.quicraft.bridge.status.StatusQuery;
 import rs.sudoe.quicraft.core.connect.ClientConnector;
 import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 import rs.sudoe.quicraft.core.connect.ConnectionRace;
+import rs.sudoe.quicraft.core.connect.TransportSelection;
+import rs.sudoe.quicraft.core.connect.V3Plan;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
+import rs.sudoe.quicraft.core.routing.RoutingRegistry;
+import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.transport.ClientStream;
 import rs.sudoe.quicraft.core.transport.EarlyFlight;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
+import rs.sudoe.quicraft.core.transport.V3Connection;
+import rs.sudoe.quicraft.core.transport.V3ConnectionImpl;
 import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.QuicraftFabric;
 import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
@@ -51,7 +58,19 @@ import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
  * the winner; cancelling it (the Cancel button) abandons the attempt.
  */
 public final class ClientConnect {
+    /** Client gametest only: aligns the test routing table with the protocol under test. */
+    private static volatile int testProtocolOverride;
+
     private ClientConnect() {}
+
+    static void setProtocolOverrideForTests(int protocol) {
+        testProtocolOverride = protocol;
+    }
+
+    private static int currentProtocolNumber() {
+        int override = testProtocolOverride;
+        return override != 0 ? override : SharedConstants.getCurrentVersion().protocolVersion();
+    }
 
     public static ChannelFuture connect(InetSocketAddress address, EventLoopGroupHolder holder, Connection connection,
             Supplier<ChannelFuture> vanilla) {
@@ -82,8 +101,17 @@ public final class ClientConnect {
         } catch (Throwable t) {
             Hooks.failed("early inputs", t); // no 0-RTT this time
         }
-        CompletableFuture<ClientConnector.Outcome<Channel>> attempt = client.connector()
-                .connect(address, mode, joinInputs, new Platform(address, holder, loop));
+        // The multistream path only when the player turned it on; otherwise the call that existed
+        // before it, untouched (docs/protocol.md 12.1).
+        ServerAddress logical = EarlyJoins.logicalAddress();
+        ClientConnector multistream = client.multistream() && logical != null
+                && ClientV3State.useMultistream(true, true, logical.getHost(), logical.getPort())
+                        ? client.multistreamConnector() : null;
+        ClientV3State files = multistream != null ? client.v3State() : null;
+        CompletableFuture<ClientConnector.Outcome<Channel>> attempt = multistream != null && files != null
+                ? multistream.connect(address, logical.getHost(), logical.getPort(), mode, joinInputs,
+                        new Platform(address, holder, loop))
+                : client.connector().connect(address, mode, joinInputs, new Platform(address, holder, loop));
         promise.addListener(f -> {
             if (f.isCancelled()) {
                 attempt.cancel(false);
@@ -104,7 +132,11 @@ public final class ClientConnect {
             boolean[] attached = {false};
             try {
                 Hooks.enter("connect outcome");
-                if (outcome.quic() != null) {
+                if (outcome.quic() instanceof V3Connection v3 && outcome.v3Plan() != null && files != null) {
+                    QuicraftFabric.LOG.info("QUICraft: connected to {} over QUIC /3{}", v3.remoteAddress(),
+                            v3 instanceof V3ConnectionImpl impl && impl.sentEarlyData() ? " (0-RTT)" : "");
+                    useV3(v3, outcome.v3Plan(), loop, connection, promise, attached, mode, files, logical, vanilla);
+                } else if (outcome.quic() != null) {
                     QuicraftFabric.LOG.info("QUICraft: connected to {} over QUIC{}", outcome.quic().remoteAddress(),
                             outcome.quic() instanceof ClientStream cs && cs.sentEarlyData() ? " (0-RTT)" : "");
                     useQuic(outcome.quic(), loop, connection, promise, attached, mode);
@@ -122,6 +154,11 @@ public final class ClientConnect {
                 if (attached[0]) {
                     promise.tryFailure(withMessage(t));
                 } else {
+                    if (outcome.v3Plan() != null && mode != Mode.QUIC_ONLY) {
+                        // The attempt held the server's re-bind state and is recorded as failed (12.14).
+                        outcome.v3Plan().failed(V3Plan.Phase.JOINING, V3Plan.INTERNAL_ERROR);
+                        QuicraftFabric.LOG.warn("QUICraft: {}", V3Notices.fellBack(V3Plan.INTERNAL_ERROR));
+                    }
                     failed(mode, t, promise, vanilla);
                 }
             }
@@ -188,6 +225,78 @@ public final class ClientConnect {
         });
     }
 
+    /**
+     * A {@code /3} connection won: the vanilla pipeline plus the multi-stream handler in front of
+     * the game's packet handler. From here {@link V3Client} runs the exchange; a failure before the
+     * lanes are active ends in a TCP retry (docs/protocol.md 12.14).
+     */
+    static void useV3(V3Connection v3, V3Plan plan, EventLoop loop, Connection connection,
+            ChannelPromise promise, boolean[] attached, Mode mode, ClientV3State files, ServerAddress logical,
+            Supplier<ChannelFuture> vanilla) {
+        // Transactional: until the pipeline is complete and the channel registered, nothing is attached
+        // to the screen's future, and any failure releases what was built and takes the mode-aware
+        // fallback (docs/protocol.md 12.14).
+        QuicBridgeChannel channel = null;
+        V3Client client = null;
+        try {
+            int protocol = currentProtocolNumber();
+            RoutingTable table = RoutingRegistry.forProtocol(protocol)
+                    .orElseThrow(() -> new IllegalStateException("no routing table for protocol " + protocol));
+            channel = new QuicBridgeChannel(v3);
+            Hooks.enter("v3 setup");
+            client = new V3Client(connection, channel, loop, v3, plan, table, protocol,
+                    mode == Mode.QUIC_ONLY, files, logical.getHost(), logical.getPort(),
+                    plan.pinState() == TransportSelection.PinState.CHANGED
+                            ? V3Client.oldPin(files, logical.getHost(), logical.getPort())
+                            : java.util.concurrent.CompletableFuture.completedFuture(null));
+            installVanillaPipeline(channel, connection);
+            channel.pipeline().addBefore("packet_handler", V3Handler.NAME, new V3Handler(client));
+            Transports.quic(connection, v3);
+            Transports.v3(connection, client);
+            Hooks.enter("v3 published");
+            V3Client controller = client;
+            if (v3 instanceof V3ConnectionImpl impl) {
+                // The game's first flight differed from the 0-RTT one: the connection closes, and the join
+                // starts again over TCP like any other /3 failure before activation.
+                impl.onFirstFlightMismatch(() -> controller.fail("the early data did not match"));
+            }
+            final QuicBridgeChannel registering = channel;
+            attached[0] = true;
+            loop.register(channel).addListener(f -> {
+                if (!f.isSuccess()) {
+                    setupFailed(v3, controller, connection, registering, plan, mode, f.cause(), promise, vanilla);
+                } else if (!promise.trySuccess()) {
+                    registering.close(); // cancelled meanwhile
+                }
+            });
+        } catch (Throwable t) {
+            attached[0] = false;
+            setupFailed(v3, client, connection, channel, plan, mode, t, promise, vanilla);
+        }
+    }
+
+    /** Releases a half-built /3 join and falls back as the mode requires: TCP and a notice, or the error. */
+    private static void setupFailed(V3Connection v3, V3Client client, Connection connection, QuicBridgeChannel channel,
+            V3Plan plan, Mode mode, Throwable cause, ChannelPromise promise, Supplier<ChannelFuture> vanilla) {
+        Transports.rollbackV3(connection, v3, client);
+        try {
+            if (channel != null && channel.isRegistered()) {
+                channel.close();
+            }
+            v3.close();
+        } catch (Throwable ignored) {
+            // Closing is best effort; the connection dies with its owner.
+        }
+        boolean retry = plan.failed(V3Plan.Phase.JOINING, V3Plan.INTERNAL_ERROR);
+        if (retry && mode != Mode.QUIC_ONLY) {
+            QuicraftFabric.LOG.warn("QUICraft: {}", V3Notices.fellBack(V3Plan.INTERNAL_ERROR), cause);
+            failed(mode, cause, promise, vanilla);
+        } else {
+            promise.tryFailure(withMessage(new java.io.IOException(
+                    "QUIC multi-stream failed (" + V3Plan.INTERNAL_ERROR + ")", cause)));
+        }
+    }
+
     private static void useTcp(ClientConnector.Outcome<Channel> outcome, Connection connection,
             ChannelPromise promise, Mode mode, Supplier<ChannelFuture> vanilla) {
         Channel channel = outcome.tcp();
@@ -209,6 +318,12 @@ public final class ClientConnect {
                 if (outcome.fallback() != null) {
                     Transports.fellBack(connection, outcome.fallback());
                 }
+                if (outcome.fallbackMessage() != null) {
+                    // A /3 attempt that failed before the adapter could drive it (12.14): said in the log
+                    // now and in the chat once the join reaches play.
+                    QuicraftFabric.LOG.warn("QUICraft: {}", outcome.fallbackMessage());
+                    V3Notices.fellBackWith(outcome.fallbackMessage());
+                }
                 if (!promise.trySuccess()) {
                     channel.close();
                 }
@@ -224,7 +339,7 @@ public final class ClientConnect {
     }
 
     /** What vanilla's {@code Connection.connect} initializer does (checked per version). */
-    private static void installVanillaPipeline(Channel channel, Connection connection) {
+    static void installVanillaPipeline(Channel channel, Connection connection) {
         try {
             channel.config().setOption(ChannelOption.TCP_NODELAY, true);
         } catch (ChannelException ignored) {
@@ -271,7 +386,7 @@ public final class ClientConnect {
         public CompletableFuture<Optional<Advertisement>> queryStatus(InetSocketAddress server) {
             Hooks.enter("status query"); // a throw here counts as "no advertisement": TCP
             return StatusQuery.query(loop, new ReflectiveChannelFactory<>(holder.channelCls()), server,
-                    address.getHostString(), SharedConstants.getCurrentVersion().protocolVersion())
+                    address.getHostString(), currentProtocolNumber())
                     .thenApply(Advertisement::extract);
         }
 
@@ -287,6 +402,39 @@ public final class ClientConnect {
                 failed.completeExceptionally(t);
                 return failed;
             }
+        }
+
+        @Override
+        public CompletableFuture<QuicByteStream> connectQuic(InetSocketAddress target, Fingerprint fingerprint,
+                EarlyFlight early, TransportSelection.Transport alpn, boolean bypassResumption) {
+            if (alpn != TransportSelection.Transport.V3) {
+                return connectQuic(target, fingerprint, early);
+            }
+            CompletableFuture<QuicByteStream> result = new CompletableFuture<>();
+            try {
+                Hooks.enter("quic connect"); // a throw here is a QUIC failure: TCP wins the race
+                int protocol = currentProtocolNumber();
+                RoutingTable table = RoutingRegistry.forProtocol(protocol).orElseThrow(
+                        () -> new IllegalStateException("no routing table for protocol " + protocol));
+                CompletableFuture<V3Connection> dial = GameHost.connectV3(loop,
+                        GameHost.datagramChannelsLike(holder.channelCls()), target, fingerprint, table,
+                        TransportConfig.DEFAULT, early, bypassResumption);
+                result.whenComplete((stream, error) -> {
+                    if (result.isCancelled()) {
+                        dial.cancel(false);
+                    }
+                });
+                dial.whenComplete((connection, error) -> {
+                    if (error != null) {
+                        result.completeExceptionally(error);
+                    } else if (!result.complete(connection)) {
+                        connection.close();
+                    }
+                });
+            } catch (Throwable t) {
+                result.completeExceptionally(t);
+            }
+            return result;
         }
 
         @Override
