@@ -209,12 +209,32 @@ class StreamSequencerTest {
         assertEquals(bundle.get(2).sequence(), sequencer.globalFrontier());
     }
 
-    @Test void bundleByteCapIsEnforced() {
-        StreamSequencer sequencer = new StreamSequencer(1);
-        byte[] huge = new byte[(int) StreamSequencer.MAX_BUNDLE_BYTES + 1];
+    @Test void bundleEncodedSizeBoundIsTwoMebibytesPlus128AtExactlyAndOneOver() {
+        assertEquals(2L * 1024 * 1024 + 128, StreamSequencer.MAX_BUNDLE_ENCODED_BYTES);
+        StreamSequencer exact = new StreamSequencer(1);
+        byte[] atLimit = new byte[(int) StreamSequencer.MAX_BUNDLE_ENCODED_BYTES];
+        List<Record> accepted = exact.assignBundle(NONE, Collections.singletonList(atLimit),
+                new StreamSequencer.Fence[] {ORDINARY}, NONE);
+        assertEquals(3, accepted.size(), "encoded size equal to B is accepted");
+        StreamSequencer over = new StreamSequencer(1);
+        byte[] oneOver = new byte[(int) StreamSequencer.MAX_BUNDLE_ENCODED_BYTES + 1];
         assertThrows(IllegalArgumentException.class,
-                () -> sequencer.assignBundle(NONE, Collections.singletonList(huge),
+                () -> over.assignBundle(NONE, Collections.singletonList(oneOver),
                         new StreamSequencer.Fence[] {ORDINARY}, NONE));
+        assertEquals(0, over.assigned()[0], "a rejected bundle assigns nothing");
+    }
+
+    @Test void bundleDecodingScratchBoundIsEightMebibytesAtExactlyAndOneOver() {
+        assertEquals(8L * 1024 * 1024, StreamSequencer.MAX_BUNDLE_SCRATCH_BYTES);
+        StreamSequencer sequencer = new StreamSequencer(1);
+        List<Record> accepted = sequencer.assignBundle(NONE, Collections.singletonList(NONE),
+                new StreamSequencer.Fence[] {ORDINARY}, NONE, StreamSequencer.MAX_BUNDLE_SCRATCH_BYTES);
+        assertEquals(3, accepted.size(), "scratch equal to 8 MiB is accepted");
+        assertThrows(IllegalArgumentException.class,
+                () -> sequencer.assignBundle(NONE, Collections.singletonList(NONE),
+                        new StreamSequencer.Fence[] {ORDINARY}, NONE,
+                        StreamSequencer.MAX_BUNDLE_SCRATCH_BYTES + 1));
+        assertEquals(3, sequencer.assigned()[0], "the rejected scratch bundle assigns nothing");
     }
 
     @Test void safeSupersetCoversChunksAndControlButNotRealtime() {

@@ -33,8 +33,10 @@ public final class StreamSequencer {
 
     /** Maximum packets enclosed by one bundle, excluding delimiters (13.15). */
     public static final int MAX_BUNDLE_MEMBERS = 126;
-    /** Maximum total encoded bytes of one bundle, the 8 MiB scratch bound of 13.15. */
-    public static final long MAX_BUNDLE_BYTES = 8L * 1024 * 1024;
+    /** Clientbound bundle receive slot B = 2 MiB + 128 bytes; a bundle's encoded size must fit (13.12). */
+    public static final long MAX_BUNDLE_ENCODED_BYTES = 2L * 1024 * 1024 + 128;
+    /** Maximum total decoding scratch of one bundle, 8 MiB or stricter game limits (13.15). */
+    public static final long MAX_BUNDLE_SCRATCH_BYTES = 8L * 1024 * 1024;
     /** Largest sequence or epoch value: a signed-31-bit VarInt (13.4). Exhaustion closes, never wraps. */
     public static final long MAX_SEQUENCE = Integer.MAX_VALUE;
 
@@ -110,6 +112,24 @@ public final class StreamSequencer {
     }
 
     /**
+     * Assigns one bundle with its decoding scratch equal to its encoded size, the conservative
+     * default when the caller has no separate decoded measure. See
+     * {@link #assignBundle(byte[], List, Fence[], byte[], long, Record.Dependency...)}.
+     */
+    public List<Record> assignBundle(byte[] opening, List<byte[]> members, Fence[] memberScopes,
+            byte[] closing, Record.Dependency... external) {
+        long encoded = (long) opening.length + closing.length;
+        if (members != null) {
+            for (byte[] member : members) {
+                if (member != null) {
+                    encoded += member.length;
+                }
+            }
+        }
+        return assignBundle(opening, members, memberScopes, closing, encoded, external);
+    }
+
+    /**
      * Assigns one bundle as one CONTROL run (13.15): an opening delimiter, every member, then a
      * closing delimiter, consecutively on CONTROL with no other logical send in between. The scope
      * is {@link #bundleScope(Fence...)} of the member scopes. External prerequisites attach to the
@@ -118,11 +138,13 @@ public final class StreamSequencer {
      * partially staged member.
      *
      * @param memberScopes one scope per member, in order
-     * @throws IllegalArgumentException on more than {@link #MAX_BUNDLE_MEMBERS} members, more than
-     *         {@link #MAX_BUNDLE_BYTES} bytes, or a REALTIME member
+     * @param scratchBytes total decoding scratch the bundle needs on the receiver
+     * @throws IllegalArgumentException on more than {@link #MAX_BUNDLE_MEMBERS} members, encoded size
+     *         above {@link #MAX_BUNDLE_ENCODED_BYTES}, scratch above {@link #MAX_BUNDLE_SCRATCH_BYTES},
+     *         or a REALTIME member
      */
     public List<Record> assignBundle(byte[] opening, List<byte[]> members, Fence[] memberScopes,
-            byte[] closing, Record.Dependency... external) {
+            byte[] closing, long scratchBytes, Record.Dependency... external) {
         if (opening == null || closing == null || members == null || memberScopes == null) {
             throw new IllegalArgumentException("bundle");
         }
@@ -136,8 +158,11 @@ public final class StreamSequencer {
             }
             bytes += member.length;
         }
-        if (bytes > MAX_BUNDLE_BYTES) {
-            throw new IllegalArgumentException("bundle bytes");
+        if (bytes > MAX_BUNDLE_ENCODED_BYTES) {
+            throw new IllegalArgumentException("bundle encoded bytes");
+        }
+        if (scratchBytes < 0 || scratchBytes > MAX_BUNDLE_SCRATCH_BYTES) {
+            throw new IllegalArgumentException("bundle scratch");
         }
         Fence scope = bundleScope(memberScopes);
         if (assigned[CONTROL] + members.size() + 2 > MAX_SEQUENCE) {
