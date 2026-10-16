@@ -109,6 +109,19 @@ class V3ConnectionTest {
     }
 
     @Test
+    void activatedConnectionRejectsGameWritesButPreActivationWriteStillWorks() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            pair.client.write(ByteBuffer.wrap(LOGIN_FLIGHT));
+            activate(pair.serverSide, pair.serverGame, 4242);
+            activate(pair.client, pair.clientGame, -1);
+            IllegalStateException failure = assertThrows(IllegalStateException.class,
+                    () -> pair.client.write(ByteBuffer.wrap(LOGIN_FLIGHT)));
+            assertTrue(failure.getMessage().contains("session"));
+        }
+    }
+
+    @Test
     void aTwoClientNeverHandshakesWithAThreeListener() throws Exception {
         requireV3();
         try (QuicServer server = bindServer(connection -> { })) {
