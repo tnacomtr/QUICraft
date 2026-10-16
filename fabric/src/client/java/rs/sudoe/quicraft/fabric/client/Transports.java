@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.client;
 
+import java.lang.ref.WeakReference;
 import java.util.Map;
 import java.util.WeakHashMap;
 import net.minecraft.network.Connection;
@@ -13,7 +14,8 @@ public final class Transports {
     private static final Map<Connection, QuicByteStream> QUIC = new WeakHashMap<>();
     private static final Map<Connection, FallbackReason> FALLBACKS = new WeakHashMap<>();
     private static final Map<Connection, Boolean> RETRY_OVER_TCP = new WeakHashMap<>();
-    private static final Map<Connection, V3Client> V3 = new WeakHashMap<>();
+    /** Weak values: the controller holds its connection, which would keep a strong entry alive for ever. */
+    private static final Map<Connection, WeakReference<V3Client>> V3 = new WeakHashMap<>();
 
     private Transports() {}
 
@@ -33,12 +35,13 @@ public final class Transports {
     }
 
     static synchronized void v3(Connection connection, V3Client client) {
-        V3.put(connection, client);
+        V3.put(connection, new WeakReference<>(client));
     }
 
     /** The multi-stream controller of {@code connection}, or null when it is not a {@code /3} join. */
     static synchronized @Nullable V3Client v3(Connection connection) {
-        return V3.get(connection);
+        WeakReference<V3Client> reference = V3.get(connection);
+        return reference == null ? null : reference.get();
     }
 
     /** Where a {@code /3} connection is, or null on TCP and on {@code /2}. */

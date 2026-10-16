@@ -89,10 +89,12 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
     @Override
     public void runTest(ClientGameTestContext context) {
         Hooks.setFaultInjection(false);
-        int protocol = SharedConstants.getCurrentVersion().protocolVersion();
+        // The protocol number only has to name a shipped routing table: a game version without one
+        // (1.21.11 today) still exercises its own pipeline against the 26.x placeholder's number.
+        int actual = SharedConstants.getCurrentVersion().protocolVersion();
+        int protocol = RoutingRegistry.forProtocol(actual).isPresent() ? actual : 775;
         Optional<RoutingTable> table = RoutingRegistry.forProtocol(protocol);
         if (table.isEmpty()) {
-            // 13.1: no shipped routing table for this game version means /3 is never selected.
             rs.sudoe.quicraft.fabric.QuicraftFabric.LOG.info(
                     "QUICraft: no routing table for protocol {}, the cutover harness is skipped", protocol);
             return;
