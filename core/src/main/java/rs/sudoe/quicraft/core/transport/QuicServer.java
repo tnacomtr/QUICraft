@@ -474,6 +474,8 @@ public final class QuicServer implements Closeable {
         final java.util.concurrent.atomic.AtomicLong retries = new java.util.concurrent.atomic.AtomicLong();
         /** Token-less attempts and open-connection leases; synchronized, safe from every loop. */
         final ConnectionAdmission admission;
+        // TODO(U4b-r3): this is an admission counter only; it moves into the node receive budget of the
+        // lane layer once that merges.
         /** Bytes reserved by open {@code /3} connections against the node budget (13.12); unused without one. */
         final java.util.concurrent.atomic.AtomicLong nodeReserved = new java.util.concurrent.atomic.AtomicLong();
         /** The ingress guard's datagram budget, shared by every socket's guard. */
