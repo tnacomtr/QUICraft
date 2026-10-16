@@ -14,13 +14,13 @@ import net.minecraft.resources.Identifier;
  * covers. This is queued on the same queue, right behind them, and never leaves the process: it is
  * not in any protocol and is never encoded.
  */
-final class AckPacket implements Packet<PacketListener> {
+public final class AckPacket implements Packet<PacketListener> {
     static final PacketType<AckPacket> TYPE = new PacketType<>(PacketFlow.CLIENTBOUND,
             Identifier.parse("quicraft:ack"));
 
     private final Runnable action;
 
-    AckPacket(Runnable action) {
+    public AckPacket(Runnable action) {
         this.action = action;
     }
 

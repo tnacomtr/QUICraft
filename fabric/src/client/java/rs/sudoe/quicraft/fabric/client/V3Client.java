@@ -291,6 +291,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         if (state == State.ACTIVE) {
             state = State.FAILED;
             failureText = "QUIC multi-stream failed (" + e.getMessage() + ")";
+            Transports.v3Failure(connection, failureText);
             QuicraftFabric.LOG.warn("QUICraft: {}; the next join uses TCP", failureText);
             plan.failed(V3Plan.Phase.PLAY, e.getMessage());
         }
@@ -548,6 +549,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             Transports.retryOverTcp(connection);
         } else {
             failureText = "QUIC multi-stream failed (" + reason + ")";
+            Transports.v3Failure(connection, failureText);
             QuicraftFabric.LOG.warn("QUICraft: {}; quic-only never falls back to TCP", failureText);
         }
         cleanUp();

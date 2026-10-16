@@ -35,11 +35,14 @@ import net.minecraft.network.Connection;
 import net.minecraft.network.PacketDecoder;
 import net.minecraft.network.PacketEncoder;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.UnconfiguredPipelineHandler;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.ClientboundDisconnectPacket;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
+import net.minecraft.network.protocol.common.ServerboundKeepAlivePacket;
+import net.minecraft.network.protocol.configuration.ServerboundFinishConfigurationPacket;
 import net.minecraft.network.protocol.configuration.ClientConfigurationPacketListener;
 import net.minecraft.network.protocol.configuration.ConfigurationProtocols;
 import net.minecraft.util.Crypt;
@@ -110,6 +113,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             aClosedConnectionBeforeActivationFallsBack(protocol, table.get());
             aServerDisconnectIsNotAMultistreamFailure(protocol, table.get());
             heldPacketsStayHeldUntilActivation(protocol, table.get());
+            theTailKeepsProtocolSwitchTasksAwayFromTheLanes(table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             aChangedCertificateIsReboundAndTheNewPinIsNoticed(protocol, table.get());
             aReboundThatGetsNoOfferFailsAfterTheBoundedWait(protocol, table.get());
@@ -225,6 +229,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(V3Notices.isEmpty(), "and does not announce a fallback");
             check("QUIC multi-stream failed (login is not authenticated)".equals(rig.client.failureText()),
                     "the disconnect screen says why: " + rig.client.failureText());
+            check("QUIC multi-stream failed (login is not authenticated)".equals(Transports.v3Failure(rig.connection)),
+                    "and the text outlives the controller: " + Transports.v3Failure(rig.connection));
             check(rig.plan.isFailed(), "the failure is still recorded");
         }
     }
@@ -282,6 +288,49 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             rig.fake.closeByPeer(); // the attempt ends: the held packet's promise fails with the connection
             check(rig.awaitState(V3Client.State.FAILED), "failed");
             check(rig.awaitCondition(held::isDone) && !held.isSuccess(), "the held packet failed with the connection");
+        }
+    }
+
+    /**
+     * Once the lanes own the writes, packets go to them and nothing else does: the tasks vanilla
+     * writes to swap its codec handlers (Finish Configuration, then the play protocol) must reach
+     * their handlers instead, or the switch to play would fail.
+     */
+    private static void theTailKeepsProtocolSwitchTasksAwayFromTheLanes(RoutingTable table) throws Exception {
+        EmbeddedChannel channel = new EmbeddedChannel();
+        try {
+            net.minecraft.network.Connection.configureSerialization(channel.pipeline(), PacketFlow.CLIENTBOUND, false,
+                    null);
+            channel.pipeline().replace("inbound_config", "decoder", new PacketDecoder<>(ConfigurationProtocols.CLIENTBOUND));
+            channel.pipeline().replace("encoder", "encoder", new PacketEncoder<>(ConfigurationProtocols.SERVERBOUND));
+            List<Object> lanesSaw = new ArrayList<>();
+            channel.pipeline().addLast("packet_handler", new io.netty.channel.ChannelInboundHandlerAdapter());
+            channel.pipeline().addLast("lanes", new io.netty.channel.ChannelOutboundHandlerAdapter() {
+                @Override
+                public void write(io.netty.channel.ChannelHandlerContext ctx, Object msg,
+                        io.netty.channel.ChannelPromise promise) {
+                    lanesSaw.add(msg);
+                    promise.setSuccess();
+                }
+            });
+            channel.pipeline().addLast("tail", new V3Handler.Tail());
+
+            // A packet goes to the lanes.
+            Packet<?> keepAlive = new ServerboundKeepAlivePacket(5L);
+            channel.writeOutbound(keepAlive);
+            check(lanesSaw.equals(List.of(keepAlive)), "the lanes got the packet: " + lanesSaw);
+
+            // The terminal packet is encoded by the game's own handler (as the lanes' codec does), which
+            // swaps itself out; the game then writes the task that installs the play-side handler.
+            new LaneCodec(channel, table).routeOf(ServerboundFinishConfigurationPacket.INSTANCE);
+            check(channel.pipeline().get("encoder") == null && channel.pipeline().get("outbound_config") != null,
+                    "the encoder swapped itself out");
+            channel.writeOutbound(UnconfiguredPipelineHandler.setupOutboundProtocol(ConfigurationProtocols.SERVERBOUND));
+
+            check(channel.pipeline().get("encoder") instanceof PacketEncoder, "the task reached outbound_config");
+            check(lanesSaw.size() == 1, "and the lanes never saw it: " + lanesSaw);
+        } finally {
+            channel.finishAndReleaseAll();
         }
     }
 

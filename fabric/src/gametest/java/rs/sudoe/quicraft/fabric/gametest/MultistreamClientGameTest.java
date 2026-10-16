@@ -39,6 +39,7 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
 import rs.sudoe.quicraft.fabric.Hooks;
+import rs.sudoe.quicraft.fabric.client.AckPacket;
 import rs.sudoe.quicraft.fabric.client.LaneCodec;
 import rs.sudoe.quicraft.fabric.client.QuicraftClient;
 
@@ -285,6 +286,7 @@ public class MultistreamClientGameTest implements FabricClientGameTest {
                 check(GameTests.connectedOverQuic(context), "joined over QUIC with multistream on");
                 List<String> lines = GameTests.debugServerLines(context);
                 check(lines.contains("QUICraft: QUIC (auto)"), "a /2 connection says QUIC, not /3: " + lines);
+                anAcknowledgementRunsOnTheRenderThreadBehindThePackets(context);
             }
         } finally {
             client.setMultistream(false);
@@ -313,5 +315,37 @@ public class MultistreamClientGameTest implements FabricClientGameTest {
             Hooks.setFaultInjection(false);
             client.setMultistream(false);
         }
+    }
+
+    /**
+     * The lanes acknowledge a delivery through the game's own packet queue (13.10): an
+     * {@link AckPacket} scheduled from a network thread runs on the render thread, after the packets
+     * queued before it, and the live listener accepts it.
+     */
+    private static void anAcknowledgementRunsOnTheRenderThreadBehindThePackets(ClientGameTestContext context) {
+        Thread render = context.computeOnClient(c -> Thread.currentThread());
+        java.util.List<String> order = java.util.Collections.synchronizedList(new ArrayList<>());
+        java.util.concurrent.atomic.AtomicReference<Thread> ranOn = new java.util.concurrent.atomic.AtomicReference<>();
+        context.runOnClient(c -> {
+            var listener = c.getConnection().getConnection().getPacketListener();
+            check(listener != null, "the play listener exists");
+            Thread network = new Thread(() -> {
+                var processor = c.packetProcessor();
+                processor.scheduleIfPossible(listener, new AckPacket(() -> order.add("first")));
+                processor.scheduleIfPossible(listener, new AckPacket(() -> {
+                    order.add("second");
+                    ranOn.set(Thread.currentThread());
+                }));
+            });
+            network.start();
+            try {
+                network.join();
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+        });
+        context.waitTicks(5);
+        check(order.equals(java.util.List.of("first", "second")), "run in order: " + order);
+        check(ranOn.get() == render, "on the render thread: " + ranOn.get());
     }
 }

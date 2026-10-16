@@ -107,8 +107,8 @@ public final class V3Hooks {
      */
     public static DisconnectionDetails disconnectDetails(Connection connection, DisconnectionDetails details) {
         try {
-            V3Client client = Transports.v3(connection);
-            String text = client == null ? null : client.failureText();
+            // Not through the controller: by now nothing but this map need still hold it.
+            String text = Transports.v3Failure(connection);
             if (text != null) {
                 return new DisconnectionDetails(Component.literal(text));
             }

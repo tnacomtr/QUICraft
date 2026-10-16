@@ -14,6 +14,8 @@ public final class Transports {
     private static final Map<Connection, QuicByteStream> QUIC = new WeakHashMap<>();
     private static final Map<Connection, FallbackReason> FALLBACKS = new WeakHashMap<>();
     private static final Map<Connection, Boolean> RETRY_OVER_TCP = new WeakHashMap<>();
+    /** Why a quic-only /3 join failed, for the disconnect screen; read after the pipeline is gone. */
+    private static final Map<Connection, String> V3_FAILURES = new WeakHashMap<>();
     /** Weak values: the controller holds its connection, which would keep a strong entry alive for ever. */
     private static final Map<Connection, WeakReference<V3Client>> V3 = new WeakHashMap<>();
 
@@ -32,6 +34,14 @@ public final class Transports {
     public static synchronized boolean usedZeroRtt(Connection connection) {
         return QUIC.get(connection) instanceof rs.sudoe.quicraft.core.transport.ClientStream stream
                 && stream.sentEarlyData();
+    }
+
+    static synchronized void v3Failure(Connection connection, String text) {
+        V3_FAILURES.put(connection, text);
+    }
+
+    static synchronized @Nullable String v3Failure(Connection connection) {
+        return V3_FAILURES.get(connection);
     }
 
     static synchronized void v3(Connection connection, V3Client client) {
