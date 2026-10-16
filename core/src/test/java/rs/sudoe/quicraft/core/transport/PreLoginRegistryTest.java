@@ -264,4 +264,66 @@ class PreLoginRegistryTest {
         Conn conn = admit(registry, "c", "192.0.2.10", true, new ArrayList<>());
         assertEquals(PreLoginTracker.ChargeResult.WAIT, conn.entry.chargeDeclaredFrame(900_000, 0));
     }
+
+    @Test
+    void aDeclaredFrameCapPerPrefixWaitsWhenItIsHitAndReleasedFramesFreeIt() throws Exception {
+        // A large pool so only the per-prefix declared-length cap (2 MiB) can refuse.
+        PreLoginRegistry registry = new PreLoginRegistry(
+                new PreLoginTrackerTest.FakePools().capacity(ResourcePools.Pool.PRE_LOGIN, 64L << 20), 4, new Random(1));
+        Conn a = admit(registry, "a", "192.0.2.10", true, new ArrayList<>());
+        PreLoginConnection view = a.entry;
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, view.chargeDeclaredFrame(900_000, 100));
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, view.chargeDeclaredFrame(900_000, 100));
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, view.chargeDeclaredFrame(900_000, 100),
+                "the prefix's declared-length cap is hit: wait, never shed");
+
+        Conn other = admit(registry, "other", "192.0.3.10", true, new ArrayList<>());
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, other.entry.chargeDeclaredFrame(900_000, 100),
+                "the cap is per prefix, so another prefix still charges");
+
+        // Once the other prefix leaves, the fair share is the whole pool, so only the cap can refuse.
+        other.entry.close();
+        view.releaseExtra(900_100);
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, view.chargeDeclaredFrame(900_000, 100),
+                "a completed frame frees its declared-length bytes");
+    }
+
+    @Test
+    void aDeclaredFrameFromAPrefixOverItsShareWaitsWhileItsOwnStagedBytesStayCharged() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(
+                new PreLoginTrackerTest.FakePools().capacity(ResourcePools.Pool.PRE_LOGIN, 64L << 20), 4, new Random(1));
+        List<Conn> shed = new ArrayList<>();
+        admit(registry, "a1", "192.0.2.10", true, shed);
+        admit(registry, "a2", "192.0.2.11", true, shed);
+        Conn attacker = admit(registry, "a3", "192.0.2.12", true, shed);
+        Conn honest = admit(registry, "honest", "198.51.100.5", true, shed);
+
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, attacker.entry.chargeDeclaredFrame(900_000, 100),
+                "the big frame pushes the over-share prefix further over its share: wait");
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, attacker.entry.chargeDeclaredFrame(10, 0),
+                "a frame inside the staged share needs no extra charge");
+        assertTrue(shed.isEmpty(), "waiting for a declared frame never sheds another connection");
+        assertEquals(4, registry.stagedCount());
+        assertFalse(honest.closed);
+    }
+
+    @Test
+    void progressRecordedThroughThePreLoginConnectionViewPicksTheShedVictim() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(poolFor(3), 4, new Random(1));
+        List<Conn> shed = new ArrayList<>();
+        Conn slow = admit(registry, "slow", "192.0.2.10", true, shed);
+        Conn fast = admit(registry, "fast", "192.0.2.11", true, shed);
+        Conn third = admit(registry, "third", "192.0.2.12", true, shed);
+        PreLoginConnection slowView = slow.entry;
+        PreLoginConnection fastView = fast.entry;
+        PreLoginConnection thirdView = third.entry;
+        slowView.recordProgress(10);
+        fastView.recordProgress(500);
+        thirdView.recordProgress(500);
+
+        admit(registry, "honest", "198.51.100.5", true, shed);
+        assertEquals(1, shed.size());
+        assertTrue(slow.closed, "the least-progressed connection of the over-share prefix is shed");
+        assertFalse(fast.closed);
+    }
 }

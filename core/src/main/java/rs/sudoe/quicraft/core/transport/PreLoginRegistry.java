@@ -39,6 +39,12 @@ final class PreLoginRegistry {
     /** Default cap on session-server calls in flight per coarse prefix (profile value). */
     static final int DEFAULT_SESSION_CALLS_PER_PREFIX = 4;
 
+    /**
+     * Cap on declared-length bytes in flight per coarse prefix (12.13). UNMEASURED: two maximum-size login
+     * frames. It is a constant until the profile carries it.
+     */
+    static final long DEFAULT_DECLARED_BYTES_PER_PREFIX = 2L * PreLoginTracker.MAX_DECLARED_FRAME_BYTES;
+
     private final ResourcePools pools;
     private final int sessionCallsPerPrefix;
     private final Random random;
@@ -133,6 +139,17 @@ final class PreLoginRegistry {
         } catch (RuntimeException e) {
             LOG.log(Level.FINE, "closing a shed /3 connection failed", e);
         }
+    }
+
+    /** Declared-length bytes in flight for {@code coarse}, over its staged connections. */
+    private long declaredInFlight(InetAddress coarse) {
+        long bytes = 0;
+        for (Entry e : staged) {
+            if (e.coarse.equals(coarse)) {
+                bytes += e.declaredExtra;
+            }
+        }
+        return bytes;
     }
 
     /** True when adding {@code bytes} to {@code coarse}'s pre-login bytes would exceed its fair share. */
@@ -285,6 +302,8 @@ final class PreLoginRegistry {
         private int waitDepth;
         private int sessionCalls;
         private long progress;
+        /** Declared-length charges this connection holds beyond its staged share (12.13 per-prefix cap). */
+        private long declaredExtra;
 
         private Entry(PreLoginTracker tracker, InetAddress source, InetAddress coarse, Runnable closeConnection) {
             this.tracker = tracker;
@@ -302,7 +321,8 @@ final class PreLoginRegistry {
         }
 
         /** Records progress (bytes consumed): the least-progressed connection is shed first. */
-        void recordProgress(long bytes) {
+        @Override
+        public void recordProgress(long bytes) {
             synchronized (PreLoginRegistry.this) {
                 if (bytes > 0) {
                     progress += bytes;
@@ -365,7 +385,26 @@ final class PreLoginRegistry {
         @Override
         public PreLoginTracker.ChargeResult chargeDeclaredFrame(long declaredBytes, long framingBytes) {
             synchronized (PreLoginRegistry.this) {
-                return tracker.chargeDeclaredFrame(declaredBytes, framingBytes);
+                // Validation, oversize and a non-staged connection take the tracker's own answer.
+                if (declaredBytes < 0 || framingBytes < 0 || declaredBytes > PreLoginTracker.MAX_DECLARED_FRAME_BYTES
+                        || tracker.state() != PreLoginTracker.State.STAGED) {
+                    return tracker.chargeDeclaredFrame(declaredBytes, framingBytes);
+                }
+                long total = Math.addExact(declaredBytes, framingBytes);
+                if (total <= tracker.stagedShare()) {
+                    return PreLoginTracker.ChargeResult.CHARGED;
+                }
+                // The extra charge is subject to the same prefix shares as the staged charge, and to the
+                // per-prefix declared-length cap. Waiting never sheds anyone else.
+                if (declaredInFlight(coarse) + total > DEFAULT_DECLARED_BYTES_PER_PREFIX
+                        || overFairShare(coarse, total)) {
+                    return PreLoginTracker.ChargeResult.WAIT;
+                }
+                PreLoginTracker.ChargeResult result = tracker.chargeDeclaredFrame(declaredBytes, framingBytes);
+                if (result == PreLoginTracker.ChargeResult.CHARGED) {
+                    declaredExtra += total;
+                }
+                return result;
             }
         }
 
@@ -379,6 +418,10 @@ final class PreLoginRegistry {
         @Override
         public void releaseExtra(long bytes) {
             synchronized (PreLoginRegistry.this) {
+                // Declared-frame charges are released first, so the per-prefix cap follows completed frames.
+                if (bytes > 0) {
+                    declaredExtra -= Math.min(bytes, declaredExtra);
+                }
                 tracker.releaseExtra(bytes);
             }
         }

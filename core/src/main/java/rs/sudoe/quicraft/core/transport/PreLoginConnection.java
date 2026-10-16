@@ -23,6 +23,12 @@ public interface PreLoginConnection extends PreLoginStage {
     void releaseExtra(long bytes);
 
     /**
+     * Records {@code bytes} of consumed progress. The least-progressed connection in a prefix is shed
+     * first (12.13), so the V3 read path reports every byte it consumes. Ignored once promoted or closed.
+     */
+    void recordProgress(long bytes);
+
+    /**
      * Reserves one session-server call for this connection's coarse prefix (12.13). False when the prefix
      * already has its cap in flight. Pair every true with {@link #endSessionCall()}.
      */
