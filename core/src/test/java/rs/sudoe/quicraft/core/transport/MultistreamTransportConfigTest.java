@@ -25,7 +25,8 @@ class MultistreamTransportConfigTest {
         TransportConfig config = TransportConfig.multistream();
         assertTrue(config.isMultistream());
         assertEquals(16L << 20, TransportConfig.MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA);
-        assertEquals(256L << 10, TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA);
+        assertEquals(3 * (8L << 10), TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA);
+        assertEquals(24L << 10, TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA);
         assertEquals(8L << 10, TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA);
         assertEquals(2, TransportConfig.MULTISTREAM_SERVER_MAX_STREAMS_BIDI);
         assertEquals(1, TransportConfig.MULTISTREAM_CLIENT_MAX_STREAMS_BIDI);
@@ -55,6 +56,20 @@ class MultistreamTransportConfigTest {
         }
     }
 
+    /**
+     * The node-budget reservation (13.12) must never fall below what the server's three pinned stream
+     * windows can hold unread (13.13), and must equal the server's pinned connection window.
+     */
+    @Test
+    void theExposureReservationEqualsTheThreePinnedServerStreamWindows() {
+        assertTrue(TransportConfig.V3_INITIAL_EXPOSURE_BYTES
+                >= TransportConfig.MULTISTREAM_STREAMS * TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA);
+        assertEquals(TransportConfig.MULTISTREAM_STREAMS * TransportConfig.MULTISTREAM_INITIAL_MAX_STREAM_DATA,
+                TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
+        assertEquals(TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA,
+                TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
+    }
+
     private static Object field(Object target, String name) throws Exception {
         Class<?> type = target.getClass();
         while (type != null) {
@@ -80,7 +95,8 @@ class MultistreamTransportConfigTest {
         TransportConfig config = TransportConfig.multistream();
         Object server = Codecs.apply(new io.netty.handler.codec.quic.QuicServerCodecBuilder(), config, true);
         // The server's maxima equal its initial serverbound windows: quiche's auto-growth is off.
-        assertEquals(256L << 10, field(server, "maxConnectionWindow"));
+        assertEquals(TransportConfig.MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA, field(server, "maxConnectionWindow"));
+        assertEquals(TransportConfig.V3_INITIAL_EXPOSURE_BYTES, field(server, "maxConnectionWindow"));
         assertEquals(8L << 10, field(server, "maxStreamWindow"));
         Object client = Codecs.apply(new io.netty.handler.codec.quic.QuicClientCodecBuilder(), config, false);
         assertEquals(12L << 20, field(client, "maxConnectionWindow"));

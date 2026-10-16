@@ -114,6 +114,26 @@ class LaneSessionTest {
         }
     }
 
+    /**
+     * 13.13: the serverbound connection window equals the three pinned 8 KiB stream windows (24 KiB),
+     * so a record far larger than that must still arrive intact. The window replenishes as the server
+     * reads; a connection window that never grew past its first 24 KiB would deadlock here.
+     */
+    @Test
+    void aServerbound100KiBControlRecordArrivesIntactThroughThe24KiBConnectionWindow() throws Exception {
+        try (LaneRig rig = LaneRig.start()) {
+            rig.activateBoth();
+            byte[] payload = new byte[100 * 1024];
+            Arrays.fill(payload, (byte) 'a');
+            rig.client.send(PLAY, LaneRig.SPAWN, LaneRig.frame(LaneRig.SPAWN, payload));
+            assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() >= 1, 20000),
+                    "the 100 KiB serverbound record arrived: " + rig.serverGame.closed.getNow(null));
+            List<String> labels = rig.serverGame.labels();
+            assertEquals(payload.length, labels.get(0).length(), "the whole record arrived");
+            assertTrue(labels.get(0).chars().allMatch(c -> c == 'a'), "the record arrived intact");
+        }
+    }
+
     @Test
     void theServerOpensStreamOneWithTheWorldPreambleAndTheClientStreamFourWithTheRealtimePreamble() throws Exception {
         LaneRig.Config serverOnly = new LaneRig.Config();

@@ -1033,7 +1033,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
 13. **13.13 Transport limits.** For clientbound traffic `/3` sets `initial_max_data=16 MiB`
     and both bidi per-stream initial limits to 8 KiB (grow up to 4 MiB only against budgets).
     For serverbound traffic use small windows: the server advertises
-    `initial_max_data=256 KiB` and both bidi per-stream initial limits of 8 KiB.
+    `initial_max_data=24 KiB` (three streams times 8 KiB) and both bidi per-stream initial limits of 8 KiB.
     These windows may grow only against the budgets below, including while
     receiving a legal record larger than its initial window. Set
     `initial_max_streams_bidi=2` at the server (client streams 0 and 4),
@@ -1044,11 +1044,14 @@ single-socket listener: no dispatcher is installed and the connection id length 
     well as retained bytes and both reservations; if record count is not yet known, reserve
     for the maximum number of minimum-size records that credit can carry, or withhold it.
     Never extend credit for a record exceeding 13.4's cap; no legal record exceeds 4 MiB.
-    Pin quiche's maximum auto-tuned windows. Server: connection window 256 KiB and stream
+    Pin quiche's maximum auto-tuned windows. Server: connection window 24 KiB and stream
     window 8 KiB, equal to the initial serverbound windows, so automatic growth is off and the
-    exposure is exactly the initial credit the node reserved. Client: stream window 4 MiB and
-    connection window 12 MiB, three streams times the stream maximum, since only three streams
-    can hold quiche-unread data. The client's aggregate exposure is therefore the application-held
+    exposure is exactly the initial credit the node reserved. The server's connection window equals
+    the sum of its three pinned stream windows, the most quiche can hold unread, so each admitted
+    connection reserves 24 KiB against the 13.12 node budget. That reservation covers only unread
+    serverbound stream data; 0-RTT early data and crypto/handshake buffers are not counted in it.
+    Client: stream window 4 MiB and connection window 12 MiB, three streams times the
+    stream maximum, since only three streams can hold quiche-unread data. The client's aggregate exposure is therefore the application-held
     data (the 17 MiB budget of 13.12) plus quiche-unread data bounded by 12 MiB; the initial
     clientbound MAX_DATA credit is not debited from the receiver budget. Automatic growth beyond
     these pins is not allowed. Because the server windows are pinned, a serverbound record
