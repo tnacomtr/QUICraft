@@ -26,8 +26,9 @@ import rs.sudoe.quicraft.core.Faults;
  * (13.1, 13.6). An unusable resource is logged once at INFO, because a build that ships a broken
  * table for a protocol it advertises is worth seeing. Nothing here is ever invented at runtime.
  *
- * <p>No production resource ships yet: the tables are added with the version spread, and until then
- * this returns empty for every protocol number, which can only select TCP (13.1).
+ * <p>What ships today is the 26.x placeholder (13.7): one resource per protocol number that routes
+ * every packet to CONTROL, until the real tables land with the version spread. A protocol number
+ * without one still returns empty, which can only select TCP (13.1).
  *
  * <p>Thread-safe. Results, including an empty one, are cached for the lifetime of the process: a
  * classpath resource cannot change while the process runs, and the selection runs on every connect.

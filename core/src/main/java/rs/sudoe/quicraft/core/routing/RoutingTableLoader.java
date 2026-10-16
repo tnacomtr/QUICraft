@@ -27,9 +27,10 @@ import rs.sudoe.quicraft.core.discovery.Json;
  *
  * <p>A resource is UTF-8 JSON with {@code schema:1}, {@code protocol:<number>}, {@code default} and
  * a list of {@code routes}, each carrying {@code state}, {@code direction}, {@code packet_id},
- * {@code lane} and {@code dependency}. No real protocol table ships yet: the spec's synthetic
- * schema example lives in {@code core/src/test/resources} as a fixture, so a shipped jar cannot
- * select it.
+ * {@code lane} and {@code dependency}. What ships in core's main resources is the 26.x placeholder
+ * of 13.7: one resource per protocol number that routes every packet to CONTROL, until the real
+ * tables land with the version spread. The spec's synthetic schema example lives in
+ * {@code core/src/test/resources} as a fixture, so a shipped jar cannot select it.
  *
  * <p>The validator rejects, with the rule it broke in the message: an unsupported {@code schema}; a
  * duplicate route; a repeated JSON member name in any object (13.7, so a duplicate is never
