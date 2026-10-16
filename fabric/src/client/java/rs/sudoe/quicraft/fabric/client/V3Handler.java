@@ -33,6 +33,7 @@ import rs.sudoe.quicraft.fabric.net.BindingPayload;
 final class V3Handler extends ChannelDuplexHandler implements DecodeContext.Gate {
     static final String NAME = "quicraft_v3";
     static final String TAIL_NAME = "quicraft_v3_tail";
+    static final String SINK_NAME = "quicraft_v3_sink";
 
     private final V3Client client;
     private ChannelHandlerContext context;
@@ -164,25 +165,60 @@ final class V3Handler extends ChannelDuplexHandler implements DecodeContext.Gate
         ctx.fireExceptionCaught(cause);
     }
 
+    @Override
+    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
+        try {
+            client.writabilityChanged();
+        } catch (Throwable t) {
+            client.fail(t);
+        }
+        ctx.fireChannelWritabilityChanged();
+    }
+
     /**
-     * The last handler of the pipeline once the lanes are active. {@link GameLanes} sits right in
-     * front of it and takes every packet; the game's own non-packet writes (the tasks that swap the
-     * codec handlers when the protocol changes) must not reach the lanes, so they are written from
-     * the game's packet handler instead, which skips them.
+     * The last handler of the pipeline once the lanes are active. Packets pass it into the game's own
+     * handlers (anything a mod or vanilla put in front of the encoder sees them as it always did),
+     * unless the lanes cannot take more: then they wait here, in order, until they can.
      */
     static final class Tail extends ChannelOutboundHandlerAdapter {
+        private final V3Client client;
+
+        Tail(V3Client client) {
+            this.client = client;
+        }
+
         @Override
         public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+            if (msg instanceof Packet && client.holdForLanes(ctx, msg, promise)) {
+                return;
+            }
             if (msg instanceof Packet) {
-                ctx.write(msg, promise); // on to GameLanes
-                return;
+                client.stampSendState();
             }
-            ChannelHandlerContext packetHandler = ctx.pipeline().context("packet_handler");
-            if (packetHandler == null) {
+            ctx.write(msg, promise);
+        }
+    }
+
+    /**
+     * Sits right behind the game's packet encoder: whatever the encoder wrote (and every handler in
+     * front of it, vanilla's bundle unpacker and any mod's, saw first) is the packet's id and body,
+     * which goes to the lane session instead of stream 0 (13.6). The encoder, its terminal-packet
+     * swap and the handlers that remove themselves with it all run exactly as on TCP.
+     */
+    static final class Sink extends ChannelOutboundHandlerAdapter {
+        private final V3Client client;
+
+        Sink(V3Client client) {
+            this.client = client;
+        }
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+            if (msg instanceof io.netty.buffer.ByteBuf) {
+                client.sendEncoded((io.netty.buffer.ByteBuf) msg, promise);
+            } else {
                 ctx.write(msg, promise);
-                return;
             }
-            packetHandler.write(msg, promise);
         }
     }
 }

@@ -142,11 +142,31 @@ public final class LaneCodec implements GameLanes.Codec {
         // The protocol the packet is sent in, read before the encoder can swap itself out.
         ProtocolState state = stateOf(encoder.quicraft$protocolInfo().id());
         ByteBuf body = channel.alloc().buffer();
-        ByteBuf compressed = null;
-        ByteBuf framed = null;
         try {
             encoder.quicraft$encode(encoderContext, packet, body);
             int packetId = VarInt.read(body.duplicate());
+            encodedFrame = frame(channel, body);
+            encodedPacket = packet;
+            return new GameLanes.Route(state, packetId, table.laneFor(state, Direction.SERVERBOUND, packetId));
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            // The game's own encoder failed; routeOf cannot throw checked exceptions.
+            throw new EncoderException(e);
+        } finally {
+            body.release();
+        }
+    }
+
+    /**
+     * What the encoder wrote (packet id and body) as the GAME record body of 13.4: through the game's
+     * own compression handler if one is installed, behind a VarInt length. Does not release {@code body}.
+     */
+    static byte[] frame(Channel channel, ByteBuf body) throws Exception {
+        ChannelPipeline pipeline = channel.pipeline();
+        ByteBuf compressed = null;
+        ByteBuf framed = null;
+        try {
             ByteBuf payload = body;
             ChannelHandlerContext compressContext = pipeline.context("compress");
             if (compressContext != null && compressContext.handler() instanceof CompressionEncoder) {
@@ -161,16 +181,8 @@ public final class LaneCodec implements GameLanes.Codec {
             framed = channel.alloc().buffer(payload.readableBytes() + 3);
             VarInt.write(framed, payload.readableBytes());
             framed.writeBytes(payload);
-            encodedFrame = ByteBufUtil.getBytes(framed);
-            encodedPacket = packet;
-            return new GameLanes.Route(state, packetId, table.laneFor(state, Direction.SERVERBOUND, packetId));
-        } catch (RuntimeException e) {
-            throw e;
-        } catch (Exception e) {
-            // The game's own encoder failed; routeOf cannot throw checked exceptions.
-            throw new EncoderException(e);
+            return ByteBufUtil.getBytes(framed);
         } finally {
-            body.release();
             if (compressed != null) {
                 compressed.release();
             }

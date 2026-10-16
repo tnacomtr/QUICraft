@@ -21,7 +21,10 @@ import java.util.concurrent.RejectedExecutionException;
 import javax.crypto.Cipher;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.Connection;
+import net.minecraft.network.PacketEncoder;
 import net.minecraft.network.PacketListener;
+import net.minecraft.network.VarInt;
+import rs.sudoe.quicraft.fabric.client.mixin.PacketEncoderAccessor;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.bridge.BindingPayloads;
@@ -112,6 +115,13 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private final List<Held> deferred = new ArrayList<>();
     private GameLanes lanes;
     private V3Handler handler;
+    /** Writes the lanes were too full to take (13.12), in order; the tail's own context drains them. */
+    private final java.util.ArrayDeque<Held> backlog = new java.util.ArrayDeque<>();
+    private long backlogBytes;
+    private ChannelHandlerContext tailContext;
+    /** The protocol the packet being written is sent in, stamped at the tail before the encoder swaps. */
+    private ProtocolState sendState = ProtocolState.CONFIGURATION;
+    private LaneSend laneSend;
 
     V3Client(Connection connection, QuicBridgeChannel channel, EventLoop loop, V3Connection v3, V3Plan plan,
             RoutingTable table, int protocolNumber, boolean quicOnly, ClientV3State files, String logicalHost, int logicalPort,
@@ -130,6 +140,20 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         this.offlineTest = Boolean.getBoolean(OFFLINE_TEST_PROPERTY);
         this.loop = loop; // the channel is not registered yet when this is built
         this.codec = new LaneCodec(channel, table);
+    }
+
+    /** Where an encoded packet goes: the lane session in production, a recorder in tests. */
+    interface LaneSend {
+        void send(ProtocolState state, int packetId, byte[] frame);
+    }
+
+    /** Tests: replaces the lane session as the destination of encoded packets. */
+    void useLaneSend(LaneSend send) {
+        this.laneSend = send;
+    }
+
+    GameLanes lanes() {
+        return lanes;
     }
 
     /** The pipeline handler of this join, set by its constructor. */
@@ -291,6 +315,78 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         return serverDisconnected;
     }
 
+    // --- Outbound after activation.
+
+    /** The protocol the next packet is encoded in, read before the encoder can swap itself out. */
+    void stampSendState() {
+        ChannelHandlerContext encoder = channel.pipeline().context("encoder");
+        if (encoder != null && encoder.handler() instanceof PacketEncoder) {
+            sendState = LaneCodec.stateOf(
+                    ((PacketEncoderAccessor) encoder.handler()).quicraft$protocolInfo().id());
+        }
+    }
+
+    /**
+     * A packet the game writes once the lanes are active. Held (true) while the lanes are not
+     * writable or earlier writes are still waiting, so order is kept; only the spec's caps
+     * (1024 packets or 16 MiB, 13.12) are fatal.
+     */
+    boolean holdForLanes(ChannelHandlerContext ctx, Object packet, ChannelPromise promise) {
+        tailContext = ctx;
+        GameLanes current = lanes;
+        if (backlog.isEmpty() && (current == null || current.isWritable())) {
+            return false;
+        }
+        if (backlog.size() >= LaneSession.MAX_UNSENT_PACKETS
+                || backlogBytes + HELD_ESTIMATE_BYTES > LaneSession.MAX_UNSENT_BYTES) {
+            promise.tryFailure(new ClosedChannelException());
+            failActive("send queue overflow", LaneSession.CLOSE_ORDERING);
+            return true;
+        }
+        backlog.add(new Held(packet, promise));
+        backlogBytes += HELD_ESTIMATE_BYTES;
+        return true;
+    }
+
+    /** The lanes' writability changed: on recovery the held writes go on, in order. */
+    void writabilityChanged() {
+        GameLanes current = lanes;
+        ChannelHandlerContext ctx = tailContext;
+        if (current == null || ctx == null || state != State.ACTIVE) {
+            return;
+        }
+        boolean wrote = false;
+        while (current.isWritable() && !backlog.isEmpty()) {
+            Held next = backlog.poll();
+            backlogBytes -= HELD_ESTIMATE_BYTES;
+            stampSendState();
+            ctx.write(next.packet, next.promise);
+            wrote = true;
+        }
+        if (wrote) {
+            ctx.flush();
+        }
+    }
+
+    /** Encoded by the game's encoder: sent on the lane the routing table names (13.6). */
+    void sendEncoded(ByteBuf body, ChannelPromise promise) {
+        try {
+            if (state != State.ACTIVE) {
+                promise.tryFailure(new ClosedChannelException());
+                return;
+            }
+            int packetId = VarInt.read(body.duplicate());
+            byte[] frame = LaneCodec.frame(channel, body);
+            laneSend.send(sendState, packetId, frame);
+            promise.trySuccess();
+        } catch (Throwable t) {
+            promise.tryFailure(t);
+            fail(t);
+        } finally {
+            body.release();
+        }
+    }
+
     void serverDisconnects() {
         serverDisconnected = true;
     }
@@ -308,6 +404,11 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     void closing() {
         wipeSecret();
         closingByGame = true;
+        Held waiting;
+        while ((waiting = backlog.poll()) != null) {
+            waiting.promise.tryFailure(new ClosedChannelException());
+        }
+        backlogBytes = 0;
         if (state == State.ACTIVE && !ended) {
             ended = true;
             // 13.14: after activation the session ends stream 0, never a bare FIN.
@@ -482,8 +583,12 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         GameLanes started = new GameLanes(channel, codec, v3::session, ProtocolState.CONFIGURATION,
                 DeliveryContext.of(pipeline));
         lanes = started;
-        started.installOutbound();
-        pipeline.addLast(V3Handler.TAIL_NAME, new V3Handler.Tail());
+        laneSend = (state, id, frame) -> v3.session().send(state, id, frame);
+        // Outbound: the game's own encoder runs (with everything in front of it); its output is taken
+        // right behind it and sent as a record. Held writes wait at the tail while the lanes are full.
+        String encoderName = pipeline.get("encoder") != null ? "encoder" : "outbound_config";
+        pipeline.addBefore(encoderName, V3Handler.SINK_NAME, new V3Handler.Sink(this));
+        pipeline.addLast(V3Handler.TAIL_NAME, new V3Handler.Tail(this));
         // The byte path's read timeout (vanilla's "timeout" handler) can no longer see reads.
         if (pipeline.get("timeout") != null) {
             pipeline.remove("timeout");
@@ -594,8 +699,12 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
      * gets a clear reason on the disconnect screen; the QUIC connection is closed.
      */
     void failActive(String reason) {
+        failActive(reason, LaneSession.CLOSE_INTERNAL_ERROR);
+    }
+
+    void failActive(String reason, int code) {
         if (!loop.inEventLoop()) {
-            loop.execute(() -> failActive(reason));
+            loop.execute(() -> failActive(reason, code));
             return;
         }
         if (state != State.ACTIVE) {
@@ -611,7 +720,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             // The bookkeeping fails closed; the connection still has to end.
         }
         cleanUp();
-        v3.abort(LaneSession.CLOSE_INTERNAL_ERROR);
+        v3.abort(code);
     }
 
     /** Nothing was delivered for the read timeout and the game is not busy (see {@link V3Handler}). */
@@ -637,6 +746,11 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         for (Object o : held) {
             ((Held) o).promise.tryFailure(new ClosedChannelException());
         }
+        Held waiting;
+        while ((waiting = backlog.poll()) != null) {
+            waiting.promise.tryFailure(new ClosedChannelException());
+        }
+        backlogBytes = 0;
     }
 
     private static void wipe(byte[] bytes) {

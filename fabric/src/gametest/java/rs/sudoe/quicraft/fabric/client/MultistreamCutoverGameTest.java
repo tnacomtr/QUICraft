@@ -33,9 +33,9 @@ import net.minecraft.SharedConstants;
 import net.minecraft.network.ConnectionProtocol;
 import net.minecraft.network.Connection;
 import net.minecraft.network.PacketDecoder;
+import net.minecraft.network.UnconfiguredPipelineHandler;
 import net.minecraft.network.PacketEncoder;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.UnconfiguredPipelineHandler;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
@@ -118,7 +118,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             aProtocolErrorBeforeActivationFallsBackToTcp(protocol, table.get(), true);
             aHookFailureAfterActivationDisconnectsAndTheNextJoinUsesTcp(protocol, table.get());
             anOversizedBindingPayloadOutsideV3IsDiscardedAsVanillaDoes(table.get());
-            theTailKeepsProtocolSwitchTasksAwayFromTheLanes(table.get());
+            outboundPacketsStillPassTheGamesHandlersAndTheProtocolSwitchesSurvive(protocol, table.get());
+            writesWaitWhileTheLanesAreFullAndGoOnInOrder(protocol, table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             offlineTestModeNeverAcceptsAChangedPin(protocol, table.get());
             theSharedSecretIsWipedOnEveryTerminalPath(protocol, table.get());
@@ -337,45 +338,96 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
     }
 
     /**
-     * Once the lanes own the writes, packets go to them and nothing else does: the tasks vanilla
-     * writes to swap its codec handlers (Finish Configuration, then the play protocol) must reach
-     * their handlers instead, or the switch to play would fail.
+     * After activation a packet still goes through every handler the game and its mods put in front of
+     * the encoder, and the codec swaps (with Fabric API's own handlers removing themselves and
+     * coming back with the next protocol) keep working: no duplicate handler name at the next switch.
      */
-    private static void theTailKeepsProtocolSwitchTasksAwayFromTheLanes(RoutingTable table) throws Exception {
-        EmbeddedChannel channel = new EmbeddedChannel();
-        try {
-            net.minecraft.network.Connection.configureSerialization(channel.pipeline(), PacketFlow.CLIENTBOUND, false,
-                    null);
-            channel.pipeline().replace("inbound_config", "decoder", new PacketDecoder<>(ConfigurationProtocols.CLIENTBOUND));
-            channel.pipeline().replace("encoder", "encoder", new PacketEncoder<>(ConfigurationProtocols.SERVERBOUND));
-            List<Object> lanesSaw = new ArrayList<>();
-            channel.pipeline().addLast("packet_handler", new io.netty.channel.ChannelInboundHandlerAdapter());
-            channel.pipeline().addLast("lanes", new io.netty.channel.ChannelOutboundHandlerAdapter() {
-                @Override
-                public void write(io.netty.channel.ChannelHandlerContext ctx, Object msg,
-                        io.netty.channel.ChannelPromise promise) {
-                    lanesSaw.add(msg);
-                    promise.setSuccess();
-                }
-            });
-            channel.pipeline().addLast("tail", new V3Handler.Tail());
+    private static void outboundPacketsStillPassTheGamesHandlersAndTheProtocolSwitchesSurvive(int protocol,
+            RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+            check(rig.awaitState(V3Client.State.ACTIVE), "active");
+            List<String> sent = java.util.Collections.synchronizedList(new ArrayList<>());
+            rig.client.useLaneSend((state, id, frame) -> sent.add(state + ":" + id));
+            boolean splitter = rig.channel.pipeline().get("fabric:splitter") != null;
+            check(splitter, "Fabric API's splitter is in the pipeline this test is about: "
+                    + rig.channel.pipeline().names());
 
-            // A packet goes to the lanes.
-            Packet<?> keepAlive = new ServerboundKeepAlivePacket(5L);
-            channel.writeOutbound(keepAlive);
-            check(lanesSaw.equals(List.of(keepAlive)), "the lanes got the packet: " + lanesSaw);
+            rig.connection.send(new ServerboundKeepAlivePacket(1L));
+            check(rig.awaitCondition(() -> sent.size() == 1), "a packet reached the lanes: " + sent);
+            check(sent.get(0).startsWith("CONFIGURATION:"), "in the protocol it was sent in: " + sent);
+            List<String> names = rig.channel.pipeline().names();
+            check(names.indexOf(V3Handler.SINK_NAME) == names.indexOf("encoder") - 1,
+                    "the sink is right behind the encoder: " + names);
 
-            // The terminal packet is encoded by the game's own handler (as the lanes' codec does), which
-            // swaps itself out; the game then writes the task that installs the play-side handler.
-            new LaneCodec(channel, table).routeOf(ServerboundFinishConfigurationPacket.INSTANCE);
-            check(channel.pipeline().get("encoder") == null && channel.pipeline().get("outbound_config") != null,
-                    "the encoder swapped itself out");
-            channel.writeOutbound(UnconfiguredPipelineHandler.setupOutboundProtocol(ConfigurationProtocols.SERVERBOUND));
+            // The terminal packet swaps the encoder out and takes the game's own splitter with it ...
+            rig.connection.send(ServerboundFinishConfigurationPacket.INSTANCE);
+            check(rig.awaitCondition(() -> sent.size() == 2), "the terminal packet reached the lanes: " + sent);
+            check(rig.awaitCondition(() -> rig.channel.pipeline().get("outbound_config") != null),
+                    "the encoder swapped itself out: " + rig.channel.pipeline().names());
+            check(rig.channel.pipeline().get("fabric:splitter") == null,
+                    "and the game's own handler went with it: " + rig.channel.pipeline().names());
 
-            check(channel.pipeline().get("encoder") instanceof PacketEncoder, "the task reached outbound_config");
-            check(lanesSaw.size() == 1, "and the lanes never saw it: " + lanesSaw);
-        } finally {
-            channel.finishAndReleaseAll();
+            // ... and the next protocol is installed by the game's own call, handlers and all.
+            rig.connection.setupOutboundProtocol(ConfigurationProtocols.SERVERBOUND);
+            check(rig.channel.pipeline().get("encoder") instanceof PacketEncoder, "the encoder is back");
+            check(rig.channel.pipeline().get("fabric:splitter") != null == splitter, "no duplicate, no loss");
+            rig.connection.send(new ServerboundKeepAlivePacket(2L));
+            check(rig.awaitCondition(() -> sent.size() == 3), "and packets flow again: " + sent);
+            check(rig.fake.abortCode < 0 && rig.client.state() == V3Client.State.ACTIVE, "nothing failed");
+        }
+    }
+
+    /**
+     * 13.12: while the lanes cannot take more, the game's writes wait, in order, and go on when they
+     * can; only the caps are fatal.
+     */
+    private static void writesWaitWhileTheLanesAreFullAndGoOnInOrder(int protocol, RoutingTable table)
+            throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+            check(rig.awaitState(V3Client.State.ACTIVE), "active");
+            List<Long> sent = java.util.Collections.synchronizedList(new ArrayList<>());
+            rig.client.useLaneSend((state, id, frame) -> sent.add((long) (frame[frame.length - 1] & 0xFF)));
+
+            rig.client.lanes().onWritabilityChanged(false);
+            rig.awaitCondition(() -> !rig.client.lanes().isWritable());
+            List<io.netty.channel.ChannelFuture> pending = new ArrayList<>();
+            for (int i = 1; i <= 50; i++) {
+                pending.add(rig.channel.writeAndFlush(new ServerboundKeepAlivePacket(i)));
+            }
+            Thread.sleep(300);
+            check(sent.isEmpty(), "nothing is sent while the lanes are full: " + sent);
+            check(pending.stream().noneMatch(io.netty.util.concurrent.Future::isDone), "and no write completed");
+
+            rig.client.lanes().onWritabilityChanged(true);
+            check(rig.awaitCondition(() -> sent.size() == 50), "they all went on: " + sent.size());
+            check(pending.stream().allMatch(io.netty.util.concurrent.Future::isSuccess), "and completed");
+            List<Long> expected = new ArrayList<>();
+            for (int i = 1; i <= 50; i++) {
+                expected.add((long) i);
+            }
+            check(sent.equals(expected), "in the order they were written: " + sent);
+            check(rig.fake.abortCode < 0 && rig.client.state() == V3Client.State.ACTIVE, "no 0x11, still active");
+
+            // Past the caps it is fatal: 1024 packets.
+            rig.client.lanes().onWritabilityChanged(false);
+            rig.awaitCondition(() -> !rig.client.lanes().isWritable());
+            for (int i = 0; i < 1100; i++) {
+                rig.channel.write(new ServerboundKeepAlivePacket(i));
+            }
+            rig.channel.flush();
+            check(rig.awaitCondition(() -> rig.fake.abortCode == 0x11), "the overflow closes with 0x11: "
+                    + rig.fake.abortCode);
+            check(rig.plan.isFailed(), "and is recorded");
         }
     }
 
@@ -723,7 +775,14 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             loop.register(channel).sync();
             // The game would be in Login and then Configuration; the harness starts the pipeline in
             // Configuration, with a recording listener.
-            channel.pipeline().replace("encoder", "encoder", new PacketEncoder<>(ConfigurationProtocols.SERVERBOUND));
+            // As after the Handshake: no encoder yet, then the game's own calls (with Fabric API's hooks
+            // on them, which add handlers of their own next to the codec handlers).
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!connection.isConnected() && System.nanoTime() < deadline) {
+                Thread.sleep(5); // channelActive reaches the Connection right after the registration
+            }
+            channel.pipeline().replace("encoder", "outbound_config", new UnconfiguredPipelineHandler.Outbound());
+            connection.setupOutboundProtocol(ConfigurationProtocols.SERVERBOUND);
             connection.setupInboundProtocol(ConfigurationProtocols.CLIENTBOUND, listener.proxy());
             this.server = new Server(this, offline);
         }
