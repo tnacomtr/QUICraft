@@ -32,30 +32,30 @@ public final class TransportConfig {
      * /3 (docs/protocol.md 13.13): the client advertises this much connection credit, i.e. what the
      * server may send (clientbound).
      */
-    public static final long MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA = 16L << 20;
+    public static final long MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA = 2L << 20;
     /** /3: both bidirectional per-stream initial limits, at both ends. */
     public static final long MULTISTREAM_INITIAL_MAX_STREAM_DATA = 8L << 10;
     /** /3 (13.3): bidirectional streams in use at once: client streams 0 and 4, server stream 1. */
-    public static final int MULTISTREAM_STREAMS = 3;
+    public static final int MULTISTREAM_STREAMS = 2;
     /**
      * /3: the server advertises this much connection credit, i.e. what the client may send (serverbound).
      * It equals the sum of the three pinned stream windows, the most quiche can hold unread on the
      * server (a larger connection window is unreachable and would only inflate the node-budget
      * reservation, 13.12). Pinned by {@code MultistreamTransportConfigTest}.
      */
-    public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = MULTISTREAM_STREAMS * MULTISTREAM_INITIAL_MAX_STREAM_DATA;
+    public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = 24L << 10;
     /** /3: the server lets the client open streams 0 and 4. */
     public static final int MULTISTREAM_SERVER_MAX_STREAMS_BIDI = 2;
     /** /3: the client lets the server open stream 1. */
-    public static final int MULTISTREAM_CLIENT_MAX_STREAMS_BIDI = 1;
+    public static final int MULTISTREAM_CLIENT_MAX_STREAMS_BIDI = 6;
     /**
      * /3 (13.13): the largest auto-tuned stream window quiche may grow to at the client. The server
      * pins both maxima to its initial serverbound windows. Applied by Codecs, which refuses /3
      * when the native cannot set them.
      */
-    public static final long MULTISTREAM_MAX_STREAM_WINDOW = 4L << 20;
+    public static final long MULTISTREAM_MAX_STREAM_WINDOW = 256L << 10;
     /** /3 (13.13): the largest auto-tuned connection window at the client: three streams times the stream maximum. */
-    public static final long MULTISTREAM_MAX_CONNECTION_WINDOW = 12L << 20;
+    public static final long MULTISTREAM_MAX_CONNECTION_WINDOW = 2L << 20;
 
     private static final Logger LOG = Logger.getLogger("QUICraft");
     private static final int MAX_LIMIT = 10_000_000;

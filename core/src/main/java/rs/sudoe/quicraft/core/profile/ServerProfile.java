@@ -17,6 +17,20 @@ public final class ServerProfile {
         this.queueByteLimit=queueByteLimit; this.controlWeight=controlWeight;
         this.realtimeWeight=realtimeWeight; this.chunkWeight=chunkWeight;
     }
-    /** Validate profile bounds; policy-specific validation remains to be implemented. */
-    public void validate() { throw new UnsupportedOperationException("profile validation pending"); }
+    /** Validate profile bounds and the /3 listener's admission invariant. */
+    public void validate() {
+        if (maxConnections < 1) throw new IllegalArgumentException("maxConnections must be positive");
+        if (maxLanes < 1 || maxLanes > 6) throw new IllegalArgumentException("maxLanes must be in 1..6");
+        if (nodeBudgetBytes < 1) throw new IllegalArgumentException("nodeBudgetBytes must be positive");
+        if (!(preLoginPoolFraction > 0.0 && preLoginPoolFraction < 1.0))
+            throw new IllegalArgumentException("preLoginPoolFraction must be in (0,1)");
+        long preLoginCap = (long) (nodeBudgetBytes * preLoginPoolFraction)
+                / (2L * 8192 + maxLanes + 4096 + 4096);
+        if (maxConnections < maxLanes + preLoginCap)
+            throw new IllegalArgumentException("maxConnections must cover logged-in target plus pre-login cap");
+        if (16 * 1024L + 2L * maxLanes + 1 + 512 > 24 * 1024L)
+            throw new IllegalArgumentException("maxLanes exceeds the 24 KiB receive share");
+        if (queuePacketLimit < 1 || queueByteLimit < 1 || controlWeight < 1 || realtimeWeight < 1 || chunkWeight < 1)
+            throw new IllegalArgumentException("queue limits and weights must be positive");
+    }
 }
