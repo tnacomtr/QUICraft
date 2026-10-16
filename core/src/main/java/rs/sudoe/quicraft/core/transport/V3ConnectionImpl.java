@@ -22,6 +22,7 @@ import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
 import rs.sudoe.quicraft.core.multistream.PreambleV2;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
@@ -110,10 +111,15 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     /** The server's side: the routing table is resolved at activation from {@code listener}. */
     static V3ConnectionImpl server(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
-            V3Listener listener, PreambleHandler handler, boolean handshakeComplete) {
-        return new V3ConnectionImpl(connection, control, raw, LaneSession.Role.SERVER, null, null, null, null, null,
-                listener, handler, handshakeComplete);
+            V3Listener listener, PreambleHandler handler, boolean handshakeComplete, ReceiveBudget node) {
+        V3ConnectionImpl impl = new V3ConnectionImpl(connection, control, raw, LaneSession.Role.SERVER, null, null,
+                null, null, null, listener, handler, handshakeComplete);
+        impl.node = node == null ? ReceiveBudget.unlimited() : node;
+        return impl;
     }
+
+    /** The node's shared receive budget the lane session reserves against (13.12). */
+    private ReceiveBudget node = ReceiveBudget.unlimited();
 
     private V3ConnectionImpl(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
             LaneSession.Role role, RoutingTable table, EarlyCache cache, List<Object> serverKey, String joinInputs,
@@ -723,7 +729,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         ByteBuffer leftover = combine(controlLeftover, kept);
         kept.clear();
         // The session installs itself first in stream 0's pipeline and drives reads itself.
-        LaneSession started = new LaneSession(connection, role, control, resolved, game);
+        LaneSession started = new LaneSession(connection, role, control, resolved, game, node);
         session = started;
         activated = true;
         for (QuicStreamChannel stream : early) {

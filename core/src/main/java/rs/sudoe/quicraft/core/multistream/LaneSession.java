@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.core.multistream;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
@@ -57,6 +58,9 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * against the node's aggregate budget (13.12). While the node budget cannot carry the next read,
  * this lane stops reading, exactly like the per-connection budget; when bytes already received can
  * never be charged, this connection closes with 0x11 and no other connection's data is evicted.
+ * The send queues are charged the same way: a record is reserved when it is accepted and gives its
+ * bytes back as they reach the stream, or when the connection drops them with {@code shutdown}, so
+ * one connection holds its bytes in both directions against one shared budget.
  *
  * <p>Send: records are sequenced at submission, encoded and queued per lane. CONTROL, REALTIME
  * and WORLD each get one write quantum of at most {@link #WRITE_QUANTUM} bytes per round, in that
@@ -64,7 +68,8 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * stream while it is not writable. The unsent queue is capped at {@link #MAX_UNSENT_PACKETS}
  * packets or {@link #MAX_UNSENT_BYTES} bytes; {@link LaneGame#onWritabilityChanged} turns false at
  * three quarters of either and true again at one quarter. Exceeding the cap disconnects (13.12);
- * END alone bypasses the cap. A bundle must fit the cap as a whole, so the game checks
+ * END alone bypasses the cap, though the node budget still has to carry its record like any other.
+ * A bundle must fit the cap as a whole, so the game checks
  * {@link #isWritable()} before submitting a large one.
  *
  * <p>Call {@link #activate} without delay: the peer's 10 second clock for opening its streams
@@ -188,6 +193,8 @@ public final class LaneSession {
     private int nextAux;
     private int unsentPackets;
     private long unsentBytes;
+    /** Bytes of the send queues that are currently reserved against {@link #node} (13.12). */
+    private long queuedNodeBytes;
     private volatile boolean writable = true;
     private LoopTicker ticker;
     private java.lang.reflect.Method streamCapacityMethod;
@@ -207,6 +214,11 @@ public final class LaneSession {
      * stay buffered under the 13.12 limits, and binding resumes parsing on the connection's event
      * loop. The game may be bound before or after {@link #activate}.
      */
+    public LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
+                       LaneGame game, ReceiveBudget node) {
+        this(connection, role, control, table, game, node, Timing.DEFAULT);
+    }
+
     public LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
                        ReceiveBudget node) {
         this(connection, role, control, table, null, node, Timing.DEFAULT);
@@ -595,6 +607,17 @@ public final class LaneSession {
         }
         unsentPackets = 0;
         unsentBytes = 0;
+        // 13.12: whatever the send queues still held gives its node charge back with them. Guarded
+        // like the receive releases above: a broken budget must not skip the rest of the shutdown.
+        long held = queuedNodeBytes;
+        queuedNodeBytes = 0;
+        if (held > 0) {
+            try {
+                node.release(held);
+            } catch (Throwable t) {
+                LOG.log(Level.FINE, "releasing the send queues' node charge failed", t);
+            }
+        }
     }
 
     private void notifyClosed(int code, boolean byPeer, Throwable cause) {
@@ -1017,9 +1040,19 @@ public final class LaneSession {
         }
         List<Envelope> records = sender.endBundle(open.uncompressedBytes(), open.frame().length, open.frame(),
                 close.uncompressedBytes(), close.frame().length, close.frame(), t);
+        List<byte[]> encoded = new ArrayList<byte[]>(records.size());
+        long bundleNodeBytes = 0;
+        for (Envelope e : records) {
+            byte[] record = encode(e, (byte[]) e.body());
+            encoded.add(record);
+            bundleNodeBytes += record.length;
+        }
+        // 13.12/13.15: the whole bundle is charged before any of it is queued, so a bundle the node
+        // cannot carry as a whole leaves nothing queued, nothing charged and no partial bundle.
+        chargeNode(bundleNodeBytes);
         for (int i = 0; i < records.size(); i++) {
             Envelope e = records.get(i);
-            queue(e, (byte[]) e.body());
+            enqueue(e.lane(), encoded.get(i));
             handles.get(i).assign(e.lane(), e.sequence());
         }
         drain();
@@ -1076,10 +1109,13 @@ public final class LaneSession {
         if (closed || endQueued) {
             return;
         }
-        // END bypasses the unsent cap: a full queue must still be able to close gracefully.
+        // END bypasses the unsent cap: a full queue must still be able to close gracefully. The
+        // node budget still has to carry its record, because it is bytes this session retains until
+        // the lane writes them (13.12).
         Envelope e = sender.end(now());
         endRecord = RecordCodec.encodeEnd(e.sequence(), e.dependency(Lane.CONTROL),
                 e.dependency(Lane.REALTIME), e.dependency(Lane.WORLD), true);
+        chargeNode(endRecord.length);
         endQueued = true;
         enqueue(Lane.CONTROL, endRecord);
         drain();
@@ -1087,8 +1123,15 @@ public final class LaneSession {
     }
 
     private void queue(Envelope e, byte[] frame) {
-        enqueue(e.lane(), RecordCodec.encodeGame(e.sequence(), e.dependency(Lane.CONTROL),
-                e.dependency(Lane.REALTIME), e.dependency(Lane.WORLD), frame));
+        byte[] record = encode(e, frame);
+        chargeNode(record.length);
+        enqueue(e.lane(), record);
+    }
+
+    /** One sender envelope as the exact bytes that go on the wire (13.4). */
+    private static byte[] encode(Envelope e, byte[] frame) {
+        return RecordCodec.encodeGame(e.sequence(), e.dependency(Lane.CONTROL),
+                e.dependency(Lane.REALTIME), e.dependency(Lane.WORLD), frame);
     }
 
     private void enqueue(Lane lane, byte[] record) {
@@ -1096,6 +1139,35 @@ public final class LaneSession {
         unsentPackets++;
         unsentBytes += record.length;
         updateWritability();
+    }
+
+    /**
+     * 13.12: charges one record this session is about to retain to the node's aggregate budget, so
+     * the send queues count exactly like the receive side. A refusal is the send-refusal path of
+     * 13.12: the record is not queued and the connection closes with 0x11, rather than letting one
+     * connection's unsent records overrun a budget every connection of the node shares.
+     */
+    private void chargeNode(long bytes) {
+        if (bytes <= 0) {
+            return;
+        }
+        if (!node.tryReserve(bytes)) {
+            throw new OrderingException("the node budget refused " + bytes + " queued bytes (13.12)");
+        }
+        queuedNodeBytes += bytes;
+    }
+
+    /**
+     * Gives back the bytes of a record that has left this session's queues: written to the stream,
+     * or dropped by {@link #shutdown}. The charge is dropped before the release, so a release that
+     * throws cannot free the same bytes twice.
+     */
+    private void creditNode(long bytes) {
+        if (bytes <= 0) {
+            return;
+        }
+        queuedNodeBytes -= bytes;
+        node.release(bytes);
     }
 
     /** 13.12: a producer that overruns the unsent cap disconnects. */
@@ -1154,7 +1226,7 @@ public final class LaneSession {
         int i = lane.ordinal();
         LaneStream s = streams[i];
         ArrayDeque<byte[]> queue = out.get(i);
-        if (s == null || s.channel == null || !s.preambleWritten || held[i] || queue.isEmpty()) {
+        if (closed || s == null || s.channel == null || !s.preambleWritten || held[i] || queue.isEmpty()) {
             return false;
         }
         int budget = WRITE_QUANTUM;
@@ -1169,7 +1241,7 @@ public final class LaneSession {
                 buf.release();
                 throw e;
             }
-            s.channel.write(buf).addListener(s.writeFailed);
+            ChannelFuture write = s.channel.write(buf);
             outOffset[i] += n;
             budget -= n;
             wrote = true;
@@ -1182,6 +1254,15 @@ public final class LaneSession {
                     endWrittenAt = now();
                     armTick();
                 }
+            }
+            // 13.12: these bytes have reached the stream, so the node no longer carries them.
+            creditNode(n);
+            // A failed promise can notify inline here. Settle the corresponding queue offsets and
+            // charge before installing the listener, otherwise shutdown() releases the outstanding
+            // queue and the code below returns to release this same chunk a second time.
+            write.addListener(s.writeFailed);
+            if (closed) {
+                return wrote;
             }
         }
         if (wrote) {

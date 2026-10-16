@@ -10,9 +10,10 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import rs.sudoe.quicraft.fabric.Hooks;
+import rs.sudoe.quicraft.fabric.server.ServerBindingPayload;
 import rs.sudoe.quicraft.fabric.net.FallbackPayload;
 
-/** Unknown custom payloads lose their bytes; quicraft:fallback keeps them (both directions). */
+/** Unknown custom payloads lose their bytes; quicraft:fallback and quicraft:binding keep them (both directions). */
 @Mixin(DiscardedPayload.class)
 abstract class DiscardedPayloadMixin {
     @Inject(method = "codec", at = @At("HEAD"), cancellable = true)
@@ -23,6 +24,8 @@ abstract class DiscardedPayloadMixin {
             Hooks.enter("fallback codec");
             if (FallbackPayload.TYPE.id().equals(id)) {
                 cir.setReturnValue((StreamCodec) FallbackPayload.<T>codec(maxPayloadSize));
+            } else if (ServerBindingPayload.handles(id)) {
+                cir.setReturnValue((StreamCodec) ServerBindingPayload.<T>codec(maxPayloadSize));
             }
         } catch (Throwable t) {
             Hooks.failed("fallback codec", t);

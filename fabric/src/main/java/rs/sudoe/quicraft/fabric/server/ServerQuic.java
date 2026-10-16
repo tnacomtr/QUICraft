@@ -10,6 +10,7 @@ import io.netty.channel.socket.DatagramChannel;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.dedicated.DedicatedServer;
 import net.minecraft.server.dedicated.DedicatedServerProperties;
@@ -23,11 +24,13 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.connect.FallbackReport;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
+import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.discovery.QuicPort;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.QuicByteStream;
 import rs.sudoe.quicraft.core.transport.QuicServer;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
+import rs.sudoe.quicraft.core.transport.V3Connection;
 import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.QuicraftFabric;
 
@@ -41,6 +44,11 @@ public final class ServerQuic {
     private static volatile @Nullable ServerQuic current;
     /** Vanilla's initializer wrapped with the advertiser; also what QUIC channels get. */
     private static volatile @Nullable ChannelInitializer<Channel> initializer;
+    /** What a {@code /3} connection's join needs from the running server (docs/protocol.md 12.7). */
+    private static volatile @Nullable MinecraftServer minecraft;
+    private static volatile byte @Nullable [] fingerprintDigest;
+    /** The node's receive budget (13.12), shared by the listener's lane sessions and this platform's send-side queues. */
+    private static volatile @Nullable ReceiveBudget nodeBudget;
 
     private final QuicServer server;
     private final Advertisement advertisement;
@@ -119,6 +127,8 @@ public final class ServerQuic {
             InetSocketAddress udp = address != null ? new InetSocketAddress(address, quicPort)
                     : new InetSocketAddress(quicPort);
             ServerIdentity identity = ServerIdentity.loadOrCreate(dir);
+            ServerQuic.minecraft = minecraft;
+            fingerprintDigest = MessageDigest.getInstance("SHA-256").digest(identity.certificate().getEncoded());
             current = bind(minecraft, udp, identity, init, settings);
             QuicraftFabric.LOG.info("QUICraft: QUIC listening on UDP {} with {} socket(s) (fingerprint {}); open this "
                     + "UDP port in your firewall", current.server.localAddress(), current.sockets,
@@ -171,11 +181,13 @@ public final class ServerQuic {
                     : Advertisement.v1(port, identity.fingerprint());
             if (multistream) {
                 QuicraftFabric.LOG.info("QUICraft: multi-stream (/3) enabled: advertising quicraft/3 for {}"
-                        + " protocol number(s); node pending-bytes budget {} (provisional until the"
-                        + " 50,000-connection benchmark, 13.17)",
+                        + " protocol number(s); node pending-bytes budget {} (each /3 connection reserves its"
+                        + " initial receive credit against it; provisional until the 50,000-connection benchmark, 13.17)",
                         Integer.valueOf(MultistreamSwitch.advertisedRouting().size()),
                         Long.valueOf(settings.multistreamNodeBudgetBytes()));
             }
+            // Only a /3 listener takes quicraft:binding payloads; with it off the game's codec is vanilla's.
+            ServerBindingPayload.setEnabled(multistream);
             return new ServerQuic(server, advertisement, port, sockets.size());
         } catch (Exception | Error e) {
             // Core closes the sockets it registered; this covers a failure before it did.
@@ -191,8 +203,12 @@ public final class ServerQuic {
     private static QuicServer bindV3(GameHost.HostedSockets sockets, ServerIdentity identity,
             ChannelInitializer<Channel> init, ServerSettings settings) {
         try {
+            // 13.12: the node-wide pending-bytes budget of the owner's setting; /2 has none.
+            ReceiveBudget budget = ReceiveBudget.bounded(settings.multistreamNodeBudgetBytes());
+            nodeBudget = budget;
+            TransportConfig config = TransportConfig.builder().nodeBudget(budget).build();
             return QuicServer.bind(sockets.hostLoops(), sockets.hostSockets(), identity,
-                    TransportConfig.DEFAULT, stream -> accept(stream, init, sockets.acceptingLoop()),
+                    config, stream -> accept(stream, init, sockets.acceptingLoop()),
                     MultistreamSwitch::tableFor);
         } catch (Throwable t) {
             // docs/protocol.md 12.3: log once and stay on quicraft/2; 0-RTT (12.18) is untouched by
@@ -206,6 +222,18 @@ public final class ServerQuic {
 
     private static void accept(QuicByteStream stream, ChannelInitializer<Channel> init, EventLoop loop) {
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
+        if (stream instanceof V3Connection v3) {
+            // A quicraft/3 connection: its join runs the binding exchange once the game reaches
+            // configuration (12.4). Nothing about /2 or TCP changes.
+            MinecraftServer server = minecraft;
+            byte[] digest = fingerprintDigest;
+            ReceiveBudget budget = nodeBudget;
+            if (server != null && digest != null) {
+                V3Join.attach(channel, v3, server, digest, budget != null ? budget : ReceiveBudget.unlimited());
+            } else {
+                v3.abort(Protocol.CLOSE_BINDING_FAILURE);
+            }
+        }
         channel.pipeline().addLast(init);
         loop.register(channel).addListener(f -> {
             if (!f.isSuccess()) {
@@ -219,6 +247,10 @@ public final class ServerQuic {
     public static void stop() {
         ServerQuic s = current;
         current = null;
+        minecraft = null;
+        fingerprintDigest = null;
+        nodeBudget = null;
+        ServerBindingPayload.setEnabled(false);
         if (s != null) {
             try {
                 s.server.close();

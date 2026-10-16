@@ -36,6 +36,7 @@ import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
+import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 /**
@@ -97,6 +98,11 @@ public final class QuicServer implements Closeable {
         this.group = group;
         this.channels = channels;
         this.shared = shared;
+    }
+
+    /** The node's receive budget this listener enforces (13.12); unlimited when none was configured. */
+    public ReceiveBudget nodeBudget() {
+        return shared.nodeBudget;
     }
 
     /** Connections holding an open-connection lease whose handshake hasn't completed, for tests. */
@@ -474,6 +480,11 @@ public final class QuicServer implements Closeable {
         final java.util.concurrent.atomic.AtomicLong retries = new java.util.concurrent.atomic.AtomicLong();
         /** Token-less attempts and open-connection leases; synchronized, safe from every loop. */
         final ConnectionAdmission admission;
+        /**
+         * The node's receive budget (13.12): admission reserves each /3 connection's initial credit here
+         * and every lane session reserves its retained bytes here. Unlimited without a budget.
+         */
+        final ReceiveBudget nodeBudget;
         /** The ingress guard's datagram budget, shared by every socket's guard. */
         final ConnectionAdmission ingress;
         /** One instance for every socket's codec: it holds the listener's Retry key. */
@@ -497,6 +508,9 @@ public final class QuicServer implements Closeable {
         Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor, V3Listener v3)
                 throws Exception {
             this.config = config;
+            this.nodeBudget = config.nodeBudget != null ? config.nodeBudget
+                    : config.nodePendingBytes > 0 ? ReceiveBudget.bounded(config.nodePendingBytes)
+                            : ReceiveBudget.unlimited();
             this.acceptor = acceptor;
             this.v3 = v3;
             this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
@@ -913,7 +927,8 @@ public final class QuicServer implements Closeable {
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
-                        Admitted admitted = Admitted.admit(connection, shared.admission);
+                        Admitted admitted = Admitted.admit(connection, shared.admission, shared.v3 != null
+                                ? shared.nodeBudget : null);
                         if (admitted == null) {
                             return;
                         }
@@ -923,7 +938,7 @@ public final class QuicServer implements Closeable {
                         }
                         connection.pipeline().addLast(admitted,
                                 new Connection(shared.acceptor, shared.tokens, shared.config.earlyData,
-                                        shared.unconfirmed, shared.v3));
+                                        shared.unconfirmed, shared.v3, shared.nodeBudget));
                     }
                 })
                 .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
@@ -971,6 +986,10 @@ public final class QuicServer implements Closeable {
         private boolean handshakeDone;
         private java.util.concurrent.ScheduledFuture<?> deadline;
 
+        /** Bytes this connection reserved against the node budget, 0 when none. */
+        private long reserved;
+        private ReceiveBudget reservedPool;
+
         private Admitted(ConnectionAdmission.Lease lease) {
             this.lease = lease;
         }
@@ -981,7 +1000,8 @@ public final class QuicServer implements Closeable {
          * returns null. Runs inside the codec's read (the channel is registered there), where the
          * remote address is already set; fails open.
          */
-        static Admitted admit(QuicChannel connection, ConnectionAdmission admission) {
+        static Admitted admit(QuicChannel connection, ConnectionAdmission admission,
+                ReceiveBudget nodeBudget) {
             ConnectionAdmission.Lease lease = null;
             try {
                 java.net.SocketAddress remote = connection.remoteSocketAddress();
@@ -1005,6 +1025,22 @@ public final class QuicServer implements Closeable {
                 LOG.log(Level.FINE, "QUIC open-connection check failed; admitting the connection", t);
             }
             Admitted admitted = new Admitted(lease);
+            if (nodeBudget != null) {
+                // 13.12: the connection's initial receive-credit exposure counts against the node
+                // budget, and one that does not fit is refused (TCP is untouched).
+                long exposure = TransportConfig.V3_INITIAL_EXPOSURE_BYTES;
+                if (!nodeBudget.tryReserve(exposure)) {
+                    if (lease != null) {
+                        lease.close();
+                    }
+                    LOG.log(Level.FINE, "QUIC /3 connection over the node pending-bytes budget; refusing it");
+                    connection.attr(REFUSED).set(Boolean.TRUE);
+                    Codecs.closeLater(connection, false, CONNECTION_REFUSED);
+                    return null;
+                }
+                admitted.reserved = exposure;
+                admitted.reservedPool = nodeBudget;
+            }
             // The Lease keeps its own key; the channel's address is cleared when it is freed.
             connection.closeFuture().addListener(f -> admitted.closed());
             return admitted;
@@ -1050,6 +1086,10 @@ public final class QuicServer implements Closeable {
             }
             if (lease != null) {
                 lease.close();
+            }
+            if (reserved > 0) {
+                reservedPool.release(reserved);
+                reserved = 0;
             }
         }
     }
@@ -1154,6 +1194,7 @@ public final class QuicServer implements Closeable {
         private final Unconfirmed unconfirmed;
         /** Non-null enables the {@code /3} stream map of 13.3 on this connection (13.1). */
         private final V3Listener v3;
+        private final ReceiveBudget nodeBudget;
         private final List<ServerStream> waiting = new ArrayList<>(1);
         private final List<V3ConnectionImpl> waitingV3 = new ArrayList<>(1);
         /** The /3 connection of stream 0, if one was offered. */
@@ -1163,7 +1204,8 @@ public final class QuicServer implements Closeable {
         private java.util.concurrent.ScheduledFuture<?> confirmDeadline;
 
         Connection(StreamAcceptor acceptor, EarlyTokens tokens, boolean earlyData, Unconfirmed unconfirmed,
-                V3Listener v3) {
+                V3Listener v3, ReceiveBudget nodeBudget) {
+            this.nodeBudget = nodeBudget;
             this.acceptor = acceptor;
             this.tokens = tokens;
             this.earlyData = earlyData;
@@ -1188,7 +1230,7 @@ public final class QuicServer implements Closeable {
          */
         void offerV3(QuicStreamChannel control) {
             V3ConnectionImpl connection = V3ConnectionImpl.server((QuicChannel) ctx.channel(), control,
-                    new NettyQuicByteStream(control), v3, this::onPreambleV3, handshakeDone);
+                    new NettyQuicByteStream(control), v3, this::onPreambleV3, handshakeDone, nodeBudget);
             v3Connection = connection;
             connection.start();
         }

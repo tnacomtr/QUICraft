@@ -360,6 +360,10 @@ public final class BindingSession implements BindingDriver {
      * stops the self-tick, drops the quiescence queue, wipes the machine's tags and this session's
      * copy of {@code S}, and leaves the session settled, so every later call is a no-op. Idempotent,
      * and never throws.
+     *
+     * <p>Nothing is reported from here, so the caller hands the quiescence queue back (through
+     * {@link #releaseQueued()}) before closing if it still holds reservations; the platform's
+     * teardown does exactly that, and only then closes the session.</p>
      */
     public void close() {
         if (!settled) {
@@ -432,6 +436,11 @@ public final class BindingSession implements BindingDriver {
      * Ends the session with {@code 0x10} (12.14): the adapter closes the whole connection, the
      * machine's precomputed tags are wiped, the quiescence queue is dropped and every later call
      * becomes a no-op. Idempotent, so the first failure wins.
+     *
+     * <p>The adapter is told before this session drops the queue, because the objects in it are the
+     * adapter's: each one carries the bytes it holds, and only the adapter can give those
+     * reservations back (the platform's teardown releases them from this very callback). Clearing
+     * first would strand every reservation still queued when the failure happened.</p>
      */
     private void fail(String reason) {
         if (settled) {
@@ -440,8 +449,6 @@ public final class BindingSession implements BindingDriver {
         settled = true;
         activated = false;
         quiescent = false;
-        queued.clear();
-        queuedBytes = 0;
         stopTicker();
         wipeSecret();
         try {
@@ -457,6 +464,8 @@ public final class BindingSession implements BindingDriver {
             // A callback that throws must not leave the session unsettled or escape into the event
             // loop: the session is already settled, and 12.14's answer is the close it just asked for.
         }
+        queued.clear();
+        queuedBytes = 0;
     }
 
     /**
