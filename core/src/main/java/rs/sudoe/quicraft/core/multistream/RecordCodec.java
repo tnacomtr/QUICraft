@@ -186,7 +186,8 @@ public final class RecordCodec {
             if (streamIndex != LogicalStream.CONTROL) throw compactError("END outside CONTROL");
             if (payload.length != 0) throw compactError("END body");
         } else if (kind == 2 || kind == 3) {
-            if (streamIndex < 2) throw compactError("join outside CHUNK");
+            // 13.19: joins live on CHUNK[0] only.
+            if (streamIndex != 2) throw compactError("join outside CHUNK[0]");
             validateBody(KIND_GAME, payload, true);
         } else {
             throw compactError("invalid kind");

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Independent reference vectors for protocol.md 13.18; run with python3 -I."""
 MASK = 0xffffffff
 

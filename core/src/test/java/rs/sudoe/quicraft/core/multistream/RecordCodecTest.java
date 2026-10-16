@@ -132,6 +132,8 @@ class RecordCodecTest {
         assertCompactRejected(raw(0, 0, 0, 0, 1, 0), 0);                  // sequence 0
         assertCompactRejected(raw(1, 1, 0, 0), 1);                        // END off CONTROL
         assertCompactRejected(raw(2, 1, 0, 0, 1, 0), 0);                  // join off CHUNK
+        assertCompactRejected(raw(2, 1, 0, 0, 1, 0), 3);                  // join on CHUNK[1]
+        assertCompactRejected(raw(3, 1, 0, 0, 1, 0), 7);                  // join on CHUNK[5]
         assertCompactRejected(raw(4, 1, 0, 0, 1, 0), 2);                  // unknown kind
         assertThrows(IllegalArgumentException.class,
                 () -> new RecordCodec.CompactDecoder(9));                 // stream index beyond 7
