@@ -58,7 +58,10 @@ final class OutboundHold {
             throw new IllegalStateException("the node budget refused " + unit.bytes() + " held bytes (13.12)");
         }
         if (held.size() + 1 > maxUnits || heldBytes + unit.bytes() > maxBytes) {
-            // An unpausable producer over the cap disconnects (13.12), here as in the layer.
+            // An unpausable producer over the cap disconnects (13.12), here as in the layer. The
+            // reservation goes back with the rejected unit: this hold never retains it, so leaving
+            // it charged would keep the bytes against the shared node budget for ever.
+            unit.release();
             throw new IllegalStateException("the outbound hold is over its cap (13.12)");
         }
         held.add(unit);
