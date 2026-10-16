@@ -20,23 +20,32 @@ public final class StreamSequencer {
     /** Assigns a payload and sparse safe predecessors according to its fence class (13.9). */
     public Record assign(int stream, Fence fence, byte[] payload, boolean serverboundInteraction) {
         if (stream<0 || stream>=assigned.length || fence==null || payload==null) throw new IllegalArgumentException("record");
-        long seq=++assigned[stream]; if(seq<=0) throw new IllegalStateException("sequence overflow");
-        long[] deps=new long[assigned.length]; deps[stream]=seq-1;
-        if(stream!=LogicalStream.CONTROL && control>0) deps[0]=control;
+        long previous=assigned[stream];
+        if(previous==Long.MAX_VALUE) throw new IllegalStateException("sequence overflow");
+        long[] deps=new long[assigned.length]; deps[stream]=previous;
         switch(fence) {
-            case GLOBAL: for(int i=0;i<assigned.length;i++) deps[i]=Math.max(deps[i],assigned[i]-(i==stream?1:0)); global=seq; break;
-            case VIEW: for(int i=0;i<assigned.length;i++) deps[i]=Math.max(deps[i],assigned[i]-(i==stream?1:0)); view=seq; control=stream==0?seq:control; break;
-            case CONTROL_FENCE: deps[0]=Math.max(deps[0],assigned[0]-(stream==0?1:0)); deps[1]=Math.max(deps[1],assigned[1]); control=seq; break;
-            case REALTIME: if(serverboundInteraction || true) { deps[0]=Math.max(deps[0],Math.max(global,control)); } break;
+            case GLOBAL: case VIEW:
+                for(int i=0;i<assigned.length;i++) deps[i]=Math.max(deps[i],assigned[i]);
+                break;
+            case CONTROL_FENCE:
+                deps[0]=Math.max(deps[0],assigned[0]);
+                deps[1]=Math.max(deps[1],assigned[1]);
+                break;
+            case REALTIME: deps[0]=Math.max(deps[0],control); if(serverboundInteraction) deps[0]=Math.max(deps[0],global); break;
             case CHUNK: if(view>0) deps[0]=Math.max(deps[0],view); break;
             default: if(serverboundInteraction && stream==0) deps[1]=assigned[1];
         }
+        for(int i=0;i<deps.length;i++) if(deps[i]>assigned[i]) throw new IllegalArgumentException("forward dependency");
+        long seq=previous+1; assigned[stream]=seq;
+        if(fence==Fence.GLOBAL) global=seq;
+        if(fence==Fence.VIEW) { view=seq; control=seq; }
+        if(fence==Fence.CONTROL_FENCE) control=seq;
         List<Record.Dependency> sparse=new ArrayList<Record.Dependency>();
         for(int i=0;i<deps.length;i++) if(i!=stream && deps[i]>0) sparse.add(new Record.Dependency(i,deps[i]));
         return new Record(stream,seq,epochs[stream],sparse,0,payload);
     }
     /** Starts a new epoch for the specified stream after an epoch transition (13.18). */
-    public void nextEpoch(int stream) { if(stream<0||stream>=epochs.length) throw new IllegalArgumentException("stream"); epochs[stream]++; assigned[stream]=0; }
+    public void nextEpoch(int stream) { if(stream<0||stream>=epochs.length) throw new IllegalArgumentException("stream"); if(epochs[stream]==Long.MAX_VALUE)throw new IllegalStateException("epoch overflow"); epochs[stream]++; }
     /** Returns an immutable-by-copy sequence frontier (13.9). */
     public long[] assigned() { return assigned.clone(); }
 }
