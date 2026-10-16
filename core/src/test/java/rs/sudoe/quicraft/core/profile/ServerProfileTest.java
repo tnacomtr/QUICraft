@@ -48,6 +48,30 @@ class ServerProfileTest {
     }
 
     @Test
+    void thePerPrefixPreLoginCapsDefaultAndAreRangeChecked() {
+        ServerProfile defaults = valid();
+        assertEquals(4, defaults.sessionCallsPerPrefix, "the session-call cap defaults to 4 (12.13)");
+        assertEquals(2L << 20, defaults.declaredBytesPerPrefix, "the declared-bytes cap defaults to 2 MiB (12.13)");
+        defaults.validate();
+
+        ServerProfile sessions = new ServerProfile(50_000, 6, MIB256, 0.10, 4096, 8L << 20, 8, 4, 2, 1, 2L << 20);
+        sessions.validate();
+        new ServerProfile(50_000, 6, MIB256, 0.10, 4096, 8L << 20, 8, 4, 2, 64, 2L << 20).validate();
+        assertThrows(IllegalArgumentException.class, () -> new ServerProfile(50_000, 6, MIB256, 0.10, 4096,
+                8L << 20, 8, 4, 2, 0, 2L << 20).validate(), "sessionCallsPerPrefix below 1");
+        assertThrows(IllegalArgumentException.class, () -> new ServerProfile(50_000, 6, MIB256, 0.10, 4096,
+                8L << 20, 8, 4, 2, 65, 2L << 20).validate(), "sessionCallsPerPrefix above 64");
+
+        long minimum = ServerProfile.MIN_DECLARED_BYTES_PER_PREFIX;
+        new ServerProfile(50_000, 6, MIB256, 0.10, 4096, 8L << 20, 8, 4, 2, 4, minimum).validate();
+        assertThrows(IllegalArgumentException.class, () -> new ServerProfile(50_000, 6, MIB256, 0.10, 4096,
+                8L << 20, 8, 4, 2, 4, minimum - 1).validate(), "a declared cap that cannot hold one frame");
+        assertThrows(IllegalArgumentException.class, () -> new ServerProfile(50_000, 6, MIB256, 0.10, 4096,
+                8L << 20, 8, 4, 2, 4, ServerProfile.MAX_DECLARED_BYTES_PER_PREFIX + 1).validate(),
+                "a declared cap above the maximum");
+    }
+
+    @Test
     void theListenerRefusesAMaxOpenThatCannotCoverTheProfileAtBuildTime() {
         ServerProfile profile = valid();
         IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,

@@ -67,7 +67,10 @@ public final class ProfileStore {
                 longValue(p, "queueByteLimit"),
                 intValue(p, "controlWeight"),
                 intValue(p, "realtimeWeight"),
-                intValue(p, "chunkWeight"));
+                intValue(p, "chunkWeight"),
+                // Added after the first profile format: an override file without them keeps the defaults.
+                optionalInt(p, "sessionCallsPerPrefix", defaults.sessionCallsPerPrefix),
+                optionalLong(p, "declaredBytesPerPrefix", defaults.declaredBytesPerPrefix));
         value.validate();
         return value;
     }
@@ -88,6 +91,8 @@ public final class ProfileStore {
         p.setProperty("controlWeight", Integer.toString(value.controlWeight));
         p.setProperty("realtimeWeight", Integer.toString(value.realtimeWeight));
         p.setProperty("chunkWeight", Integer.toString(value.chunkWeight));
+        p.setProperty("sessionCallsPerPrefix", Integer.toString(value.sessionCallsPerPrefix));
+        p.setProperty("declaredBytesPerPrefix", Long.toString(value.declaredBytesPerPrefix));
         Path absolute = file.toAbsolutePath();
         Path parent = absolute.getParent();
         if (parent != null) {
@@ -138,6 +143,16 @@ public final class ProfileStore {
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("profile field " + key + " is not an integer", e);
         }
+    }
+
+    /** An optional integer field: the fallback when the key is absent, a named error when it is malformed. */
+    private static int optionalInt(Properties p, String key, int fallback) {
+        return p.getProperty(key) == null ? fallback : intValue(p, key);
+    }
+
+    /** An optional long field: the fallback when the key is absent, a named error when it is malformed. */
+    private static long optionalLong(Properties p, String key, long fallback) {
+        return p.getProperty(key) == null ? fallback : longValue(p, key);
     }
 
     private static double doubleValue(Properties p, String key) {

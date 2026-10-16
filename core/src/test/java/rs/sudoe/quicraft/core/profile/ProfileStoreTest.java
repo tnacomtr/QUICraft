@@ -33,6 +33,8 @@ class ProfileStoreTest {
         assertEquals(expected.controlWeight, actual.controlWeight);
         assertEquals(expected.realtimeWeight, actual.realtimeWeight);
         assertEquals(expected.chunkWeight, actual.chunkWeight);
+        assertEquals(expected.sessionCallsPerPrefix, actual.sessionCallsPerPrefix);
+        assertEquals(expected.declaredBytesPerPrefix, actual.declaredBytesPerPrefix);
     }
 
     @Test
@@ -66,6 +68,44 @@ class ProfileStoreTest {
             assertEquals(1, leftovers.count(), "no temporary file is left behind");
         }
         assertSame(other(), store.load());
+    }
+
+    @Test
+    void thePerPrefixCapsRoundTripThroughTheStore() throws IOException {
+        Path file = dir.resolve("profile.properties");
+        ServerProfile tuned = new ServerProfile(40_000, 3, 128L << 20, 0.05, 2048, 4L << 20, 6, 3, 1, 9, 3L << 20);
+        new ProfileStore(file, ServerProfileTest.valid()).save(tuned);
+
+        ServerProfile restored = new ProfileStore(file, ServerProfileTest.valid()).load();
+        assertSame(tuned, restored);
+        assertEquals(9, restored.sessionCallsPerPrefix);
+        assertEquals(3L << 20, restored.declaredBytesPerPrefix);
+    }
+
+    @Test
+    void aFileWrittenBeforeThePerPrefixCapsLoadsTheDefaultsForThem() throws IOException {
+        Path file = dir.resolve("profile.properties");
+        String oldFormat = "maxConnections=40000\nmaxLanes=3\nnodeBudgetBytes=134217728\npreLoginPoolFraction=0.05\n"
+                + "queuePacketLimit=2048\nqueueByteLimit=4194304\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n";
+        Files.write(file, oldFormat.getBytes(StandardCharsets.UTF_8));
+        ServerProfile defaults = ServerProfileTest.valid();
+
+        ServerProfile loaded = new ProfileStore(file, defaults).load();
+        assertEquals(defaults.sessionCallsPerPrefix, loaded.sessionCallsPerPrefix);
+        assertEquals(defaults.declaredBytesPerPrefix, loaded.declaredBytesPerPrefix);
+        assertEquals(40_000, loaded.maxConnections, "the rest of the old file still loads");
+    }
+
+    @Test
+    void aMalformedPerPrefixCapFailsToLoadAndNamesTheField() throws IOException {
+        Path file = dir.resolve("profile.properties");
+        String text = "maxConnections=40000\nmaxLanes=3\nnodeBudgetBytes=134217728\npreLoginPoolFraction=0.05\n"
+                + "queuePacketLimit=2048\nqueueByteLimit=4194304\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n"
+                + "sessionCallsPerPrefix=many\n";
+        Files.write(file, text.getBytes(StandardCharsets.UTF_8));
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> new ProfileStore(file, ServerProfileTest.valid()).load());
+        assertTrue(e.getMessage().contains("sessionCallsPerPrefix"));
     }
 
     @Test

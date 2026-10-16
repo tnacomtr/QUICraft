@@ -527,7 +527,8 @@ public final class QuicServer implements Closeable {
                     : config.nodePendingBytes > 0 ? ReceiveBudget.bounded(config.nodePendingBytes)
                             : ReceiveBudget.unlimited();
             this.preLogin = v3 != null && config.resourcePools != null
-                    ? new PreLoginRegistry(config.resourcePools) : null;
+                    ? new PreLoginRegistry(config.resourcePools, config.sessionCallsPerPrefix,
+                            config.declaredBytesPerPrefix, new java.util.Random()) : null;
             this.acceptor = acceptor;
             this.v3 = v3;
             this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;

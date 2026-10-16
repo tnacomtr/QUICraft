@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import rs.sudoe.quicraft.core.profile.ServerProfile;
 import rs.sudoe.quicraft.core.resource.ResourcePools;
 
 /**
@@ -36,31 +37,37 @@ import rs.sudoe.quicraft.core.resource.ResourcePools;
 final class PreLoginRegistry {
     private static final Logger LOG = Logger.getLogger("QUICraft");
 
-    /** Default cap on session-server calls in flight per coarse prefix (profile value). */
-    static final int DEFAULT_SESSION_CALLS_PER_PREFIX = 4;
-
-    /**
-     * Cap on declared-length bytes in flight per coarse prefix (12.13). UNMEASURED: two maximum-size login
-     * frames. It is a constant until the profile carries it.
-     */
-    static final long DEFAULT_DECLARED_BYTES_PER_PREFIX = 2L * PreLoginTracker.MAX_DECLARED_FRAME_BYTES;
-
     private final ResourcePools pools;
     private final int sessionCallsPerPrefix;
+    /** Cap on declared-length bytes in flight per coarse prefix (12.13); a profile value. */
+    private final long declaredBytesPerPrefix;
     private final Random random;
     private final Set<Entry> staged = new HashSet<>();
     private final Map<InetAddress, Integer> sessionCalls = new HashMap<>();
 
     PreLoginRegistry(ResourcePools pools) {
-        this(pools, DEFAULT_SESSION_CALLS_PER_PREFIX, new Random());
+        this(pools, ServerProfile.DEFAULT_SESSION_CALLS_PER_PREFIX, ServerProfile.DEFAULT_DECLARED_BYTES_PER_PREFIX,
+                new Random());
     }
 
     PreLoginRegistry(ResourcePools pools, int sessionCallsPerPrefix, Random random) {
+        this(pools, sessionCallsPerPrefix, ServerProfile.DEFAULT_DECLARED_BYTES_PER_PREFIX, random);
+    }
+
+    /**
+     * @param sessionCallsPerPrefix session-server calls in flight per coarse prefix (profile value)
+     * @param declaredBytesPerPrefix declared-length bytes in flight per coarse prefix (profile value)
+     */
+    PreLoginRegistry(ResourcePools pools, int sessionCallsPerPrefix, long declaredBytesPerPrefix, Random random) {
         if (sessionCallsPerPrefix < 1) {
             throw new IllegalArgumentException("sessionCallsPerPrefix must be positive");
         }
+        if (declaredBytesPerPrefix < PreLoginTracker.MAX_DECLARED_FRAME_BYTES) {
+            throw new IllegalArgumentException("declaredBytesPerPrefix must hold one maximum-size frame");
+        }
         this.pools = Objects.requireNonNull(pools, "pools");
         this.sessionCallsPerPrefix = sessionCallsPerPrefix;
+        this.declaredBytesPerPrefix = declaredBytesPerPrefix;
         this.random = Objects.requireNonNull(random, "random");
     }
 
@@ -418,7 +425,7 @@ final class PreLoginRegistry {
                 // uncontended pool never makes a prefix wait (fair share is not checked against an empty pool,
                 // which would stall two equally charged prefixes). A charge the pool cannot take waits, and
                 // waiting never sheds anyone else (12.13).
-                if (declaredInFlight(coarse) + total > DEFAULT_DECLARED_BYTES_PER_PREFIX) {
+                if (declaredInFlight(coarse) + total > declaredBytesPerPrefix) {
                     return PreLoginTracker.ChargeResult.WAIT;
                 }
                 PreLoginTracker.ChargeResult result = tracker.chargeDeclaredFrame(declaredBytes, framingBytes);

@@ -122,6 +122,10 @@ public final class TransportConfig {
     final ReceiveBudget nodeBudget;
     final ResourcePools resourcePools;
     final boolean preLoginOnline;
+    /** Session-server calls in flight per coarse prefix (12.13): the profile's value, or the default. */
+    final int sessionCallsPerPrefix;
+    /** Declared-length bytes in flight per coarse prefix (12.13): the profile's value, or the default. */
+    final long declaredBytesPerPrefix;
 
     private TransportConfig(Builder b) {
         this.maxIdleTimeoutMillis = b.maxIdleTimeoutMillis;
@@ -153,6 +157,10 @@ public final class TransportConfig {
         this.nodeBudget = b.nodeBudget;
         this.resourcePools = b.resourcePools;
         this.preLoginOnline = b.preLoginOnline;
+        this.sessionCallsPerPrefix = b.serverProfile != null
+                ? b.serverProfile.sessionCallsPerPrefix : ServerProfile.DEFAULT_SESSION_CALLS_PER_PREFIX;
+        this.declaredBytesPerPrefix = b.serverProfile != null
+                ? b.serverProfile.declaredBytesPerPrefix : ServerProfile.DEFAULT_DECLARED_BYTES_PER_PREFIX;
     }
 
     private static int positiveOr(int value, int fallback) {
@@ -183,6 +191,8 @@ public final class TransportConfig {
         this.nodeBudget = other.nodeBudget;
         this.resourcePools = other.resourcePools;
         this.preLoginOnline = other.preLoginOnline;
+        this.sessionCallsPerPrefix = other.sessionCallsPerPrefix;
+        this.declaredBytesPerPrefix = other.declaredBytesPerPrefix;
     }
 
     /**

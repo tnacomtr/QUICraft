@@ -289,6 +289,17 @@ class PreLoginRegistryTest {
     }
 
     @Test
+    void theDeclaredBytesCapIsTheProfileValueNotAConstant() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(
+                new PreLoginTrackerTest.FakePools().capacity(ResourcePools.Pool.PRE_LOGIN, 64L << 20), 4,
+                rs.sudoe.quicraft.core.profile.ServerProfile.MIN_DECLARED_BYTES_PER_PREFIX, new Random(1));
+        Conn a = admit(registry, "a", "192.0.2.10", true, new ArrayList<>());
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, a.entry.chargeDeclaredFrame(900_000, 100));
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, a.entry.chargeDeclaredFrame(900_000, 100),
+                "the profile's cap holds one maximum-size frame, so a second one waits");
+    }
+
+    @Test
     void twoEquallyChargedPrefixesBothGetDeclaredExtrasFromAnEmptyPool() throws Exception {
         // 12.13: with room in the pool, equal prefixes must both proceed; a share test that charges the extra
         // before comparing made every positive extra exceed the share, so both waited until the deadline.

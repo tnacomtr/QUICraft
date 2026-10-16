@@ -28,10 +28,40 @@ public final class ServerProfile {
     public final int queuePacketLimit;
     public final long queueByteLimit;
     public final int controlWeight, realtimeWeight, chunkWeight;
+    /** Default cap on session-server calls in flight per coarse source prefix (12.13). */
+    public static final int DEFAULT_SESSION_CALLS_PER_PREFIX = 4;
+    /** Largest accepted session-call cap per coarse source prefix. */
+    public static final int MAX_SESSION_CALLS_PER_PREFIX = 64;
+    /**
+     * Default cap on declared-length bytes in flight per coarse prefix (12.13): two maximum-size login frames.
+     * UNMEASURED.
+     */
+    public static final long DEFAULT_DECLARED_BYTES_PER_PREFIX = 2L * PreLoginTracker.MAX_DECLARED_FRAME_BYTES;
+    /**
+     * Smallest accepted declared-bytes cap: one maximum-size frame plus its framing, so that a single frame
+     * can always be charged. The framing margin is a varint bound (at most 5 bytes) with headroom.
+     */
+    public static final long MIN_DECLARED_BYTES_PER_PREFIX = PreLoginTracker.MAX_DECLARED_FRAME_BYTES + 16;
+    /** Largest accepted declared-bytes cap per coarse prefix. */
+    public static final long MAX_DECLARED_BYTES_PER_PREFIX = 64L << 20;
+    public final int sessionCallsPerPrefix;
+    public final long declaredBytesPerPrefix;
 
+    /** A profile with the default per-prefix pre-login caps (12.13). */
     public ServerProfile(int maxConnections, int maxLanes, long nodeBudgetBytes,
             double preLoginPoolFraction, int queuePacketLimit, long queueByteLimit,
             int controlWeight, int realtimeWeight, int chunkWeight) {
+        this(maxConnections, maxLanes, nodeBudgetBytes, preLoginPoolFraction, queuePacketLimit, queueByteLimit,
+                controlWeight, realtimeWeight, chunkWeight, DEFAULT_SESSION_CALLS_PER_PREFIX,
+                DEFAULT_DECLARED_BYTES_PER_PREFIX);
+    }
+
+    public ServerProfile(int maxConnections, int maxLanes, long nodeBudgetBytes,
+            double preLoginPoolFraction, int queuePacketLimit, long queueByteLimit,
+            int controlWeight, int realtimeWeight, int chunkWeight, int sessionCallsPerPrefix,
+            long declaredBytesPerPrefix) {
+        this.sessionCallsPerPrefix = sessionCallsPerPrefix;
+        this.declaredBytesPerPrefix = declaredBytesPerPrefix;
         this.maxConnections = maxConnections;
         this.maxLanes = maxLanes;
         this.nodeBudgetBytes = nodeBudgetBytes;
@@ -76,6 +106,15 @@ public final class ServerProfile {
         }
         if (controlWeight < 1 || realtimeWeight < 1 || chunkWeight < 1) {
             throw new IllegalArgumentException("queue weights must be positive");
+        }
+        if (sessionCallsPerPrefix < 1 || sessionCallsPerPrefix > MAX_SESSION_CALLS_PER_PREFIX) {
+            throw new IllegalArgumentException("sessionCallsPerPrefix must be in 1.."
+                    + MAX_SESSION_CALLS_PER_PREFIX + ", was " + sessionCallsPerPrefix);
+        }
+        if (declaredBytesPerPrefix < MIN_DECLARED_BYTES_PER_PREFIX
+                || declaredBytesPerPrefix > MAX_DECLARED_BYTES_PER_PREFIX) {
+            throw new IllegalArgumentException("declaredBytesPerPrefix must be in " + MIN_DECLARED_BYTES_PER_PREFIX
+                    + ".." + MAX_DECLARED_BYTES_PER_PREFIX + ", was " + declaredBytesPerPrefix);
         }
     }
 
