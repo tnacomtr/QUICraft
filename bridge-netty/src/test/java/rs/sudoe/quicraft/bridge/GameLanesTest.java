@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterAll;
@@ -55,7 +56,7 @@ class GameLanesTest {
         FakeCodec codec = new FakeCodec();
         FakeSession session = new FakeSession();
         EmbeddedChannel channel = new EmbeddedChannel();
-        GameLanes lanes = new GameLanes(channel, codec, session, ProtocolState.CONFIGURATION, null);
+        GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.CONFIGURATION, null);
 
         lanes.deliver(Lane.CONTROL, 5, Arrays.asList("spawn", "move"), false);
 
@@ -75,7 +76,7 @@ class GameLanesTest {
         loop.register(channel).sync();
         OrderCollector collector = new OrderCollector();
         channel.pipeline().addLast(collector);
-        GameLanes lanes = new GameLanes(channel, codec, session, ProtocolState.PLAY, null);
+        GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.PLAY, null);
 
         // The test thread is not the game channel's event loop.
         lanes.deliver(Lane.CONTROL, 1, Collections.singletonList("first"), false);
@@ -96,7 +97,7 @@ class GameLanesTest {
         loop.register(channel).sync();
         OrderCollector collector = new OrderCollector();
         channel.pipeline().addLast(collector);
-        GameLanes lanes = new GameLanes(channel, codec, session, ProtocolState.PLAY, null);
+        GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.PLAY, null);
 
         lanes.onWritabilityChanged(false);
         collector.await(1);
@@ -120,7 +121,7 @@ class GameLanesTest {
                 seen.set(cause);
             }
         });
-        GameLanes lanes = new GameLanes(channel, codec, session, ProtocolState.PLAY, null);
+        GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.PLAY, null);
 
         lanes.onClosed(LaneSession.CLOSE_ORDERING, false, null);
 
@@ -137,7 +138,7 @@ class GameLanesTest {
     void aNormalEndClosesTheChannelWithoutAnError() {
         FakeCodec codec = new FakeCodec();
         EmbeddedChannel channel = new EmbeddedChannel();
-        GameLanes lanes = new GameLanes(channel, codec, new FakeSession(), ProtocolState.PLAY, null);
+        GameLanes lanes = GameLanes.forTest(channel, codec, new FakeSession(), ProtocolState.PLAY, null);
 
         lanes.onClosed(LaneSession.CLOSE_NORMAL, true, null);
 
@@ -149,9 +150,10 @@ class GameLanesTest {
     void decodeHandsTheFrameAndTheActivationStateToThePlatform() throws Exception {
         FakeCodec codec = new FakeCodec();
         EmbeddedChannel channel = new EmbeddedChannel();
-        GameLanes lanes = new GameLanes(channel, codec, new FakeSession(), ProtocolState.CONFIGURATION, null);
+        GameLanes lanes = GameLanes.forTest(channel, codec, new FakeSession(), ProtocolState.CONFIGURATION, null);
 
-        LaneGame.Decoded decoded = lanes.decode(Lane.CONTROL, 3, new byte[] {4, 5, 6}, false, null);
+        LaneGame.Decoded decoded = lanes.decode(Lane.CONTROL, 3, new byte[] {4, 5, 6}, false,
+                (extra, total) -> {});
 
         assertEquals(ProtocolState.CONFIGURATION, codec.decodeStates.get(0));
         assertArrayEquals(new byte[] {4, 5, 6}, codec.decodedFrames.get(0));
@@ -165,7 +167,7 @@ class GameLanesTest {
     void appliedReachesTheSession() {
         FakeSession session = new FakeSession();
         EmbeddedChannel channel = new EmbeddedChannel();
-        GameLanes lanes = new GameLanes(channel, new FakeCodec(), session, ProtocolState.PLAY, null);
+        GameLanes lanes = GameLanes.forTest(channel, new FakeCodec(), session, ProtocolState.PLAY, null);
 
         lanes.applied(Lane.WORLD, 11);
 
@@ -179,8 +181,9 @@ class GameLanesTest {
         QuicBridgeChannelHandOverTest.FakeStream stream = new QuicBridgeChannelHandOverTest.FakeStream();
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
         loop.register(channel).sync();
-        GameLanes lanes = new GameLanes(channel, codec, session, ProtocolState.PLAY, null);
+        GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.PLAY, null);
         lanes.installOutbound();
+        session.routed = Lane.REALTIME;
         session.assign = Lane.REALTIME;
         codec.routes.put("move", new GameLanes.Route(ProtocolState.PLAY, 42, Lane.REALTIME));
 
@@ -198,16 +201,16 @@ class GameLanesTest {
     }
 
     @Test
-    void aLaneTheRoutingTableDisagreesWithAbortsTheConnection() throws Exception {
+    void aLaneTheRoutingTableDisagreesWithIsRefusedBeforeTheSessionGetsIt() throws Exception {
         FakeCodec codec = new FakeCodec();
         FakeSession session = new FakeSession();
         QuicBridgeChannelHandOverTest.FakeStream stream = new QuicBridgeChannelHandOverTest.FakeStream();
         QuicBridgeChannel channel = new QuicBridgeChannel(stream);
         loop.register(channel).sync();
-        GameLanes lanes = new GameLanes(channel, codec, session, ProtocolState.PLAY, null);
+        GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.PLAY, null);
         lanes.installOutbound();
         // The platform says CONTROL, the session's routing table assigns WORLD.
-        session.assign = Lane.WORLD;
+        session.routed = Lane.WORLD;
         codec.routes.put("spawn", new GameLanes.Route(ProtocolState.PLAY, 7, Lane.CONTROL));
         AtomicReference<Throwable> seen = new AtomicReference<>();
         channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
@@ -224,7 +227,85 @@ class GameLanesTest {
         assertTrue(seen.get() instanceof GameLanes.LaneMismatchException, String.valueOf(seen.get()));
         assertEquals(Collections.singletonList(LaneSession.CLOSE_ORDERING), session.aborted,
                 "13.6/13.14: a routing disagreement is an ordering failure");
+        assertTrue(session.sent.isEmpty(),
+                "13.6: the refusal happens before the session is handed the packet, so it could not "
+                        + "have reached the wire");
         assertEquals(0, stream.writtenBytes().length);
+        channel.close().sync();
+    }
+
+    @Test
+    void aWrongLaneIsStillCaughtWhenTheWriteComesFromAnotherThread() throws Exception {
+        FakeCodec codec = new FakeCodec();
+        FakeSession session = new FakeSession();
+        QuicBridgeChannel channel =
+                new QuicBridgeChannel(new QuicBridgeChannelHandOverTest.FakeStream());
+        loop.register(channel).sync();
+        GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.PLAY, null);
+        lanes.installOutbound();
+        session.routed = Lane.WORLD;
+        codec.routes.put("spawn", new GameLanes.Route(ProtocolState.PLAY, 7, Lane.CONTROL));
+
+        // The test thread is not the game channel's event loop: the write is marshalled there, so
+        // the check still runs instead of being skipped.
+        ChannelFuture write = channel.writeAndFlush("spawn");
+        write.awaitUninterruptibly(5, TimeUnit.SECONDS);
+
+        assertFalse(write.isSuccess());
+        assertTrue(session.sent.isEmpty());
+        assertEquals(Collections.singletonList(LaneSession.CLOSE_ORDERING), session.aborted);
+        channel.close().sync();
+    }
+
+    @Test
+    void theReservationReachesTheCodecBeforeItAllocates() throws Exception {
+        FakeCodec codec = new FakeCodec();
+        EmbeddedChannel channel = new EmbeddedChannel();
+        GameLanes lanes = GameLanes.forTest(channel, codec, new FakeSession(), ProtocolState.PLAY, null);
+        AtomicReference<String> charged = new AtomicReference<>();
+        // 13.12: a codec charges the receive budget before it allocates decompression output, so the
+        // reservation LaneGame hands decode must arrive inside the codec's own call.
+        LaneGame.Reservation reservation = (extra, total) -> charged.set(extra + "/" + total);
+
+        lanes.decode(Lane.CONTROL, 4, new byte[] {1}, false, reservation);
+
+        assertSame(reservation, codec.seenReservation);
+        assertEquals("128/256", charged.get(), "and the codec really charged it (13.12)");
+    }
+
+    @Test
+    void anOffLoopDeliveryIsNotOvertakenByAnOnLoopOne() throws Exception {
+        FakeCodec codec = new FakeCodec();
+        FakeSession session = new FakeSession();
+        QuicBridgeChannel channel =
+                new QuicBridgeChannel(new QuicBridgeChannelHandOverTest.FakeStream());
+        loop.register(channel).sync();
+        OrderCollector collector = new OrderCollector();
+        channel.pipeline().addLast(collector);
+        GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.PLAY, null);
+
+        CountDownLatch inLoop = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<Throwable> loopFailure = new AtomicReference<>();
+        channel.eventLoop().execute(() -> {
+            inLoop.countDown();
+            try {
+                release.await(5, TimeUnit.SECONDS);
+                // A delivery that arrives on the loop while another thread's delivery is still
+                // waiting must not overtake it (13.10).
+                lanes.deliver(Lane.CONTROL, 2, Collections.singletonList("second"), false);
+            } catch (Throwable t) {
+                loopFailure.set(t);
+            }
+        });
+        assertTrue(inLoop.await(5, TimeUnit.SECONDS), "the loop task is running");
+
+        lanes.deliver(Lane.CONTROL, 1, Collections.singletonList("first"), false);
+        release.countDown();
+        collector.await(4);
+        assertEquals(4, collector.seen.size(), String.valueOf(loopFailure.get()));
+        assertEquals(Arrays.asList("first", "ack:CONTROL:1", "second", "ack:CONTROL:2"), collector.seen,
+                "one queue, fired in arrival order, whatever thread each delivery came from");
         channel.close().sync();
     }
 
@@ -234,7 +315,7 @@ class GameLanesTest {
         FakeSession session = new FakeSession();
         QuicBridgeChannel channel = new QuicBridgeChannel(new QuicBridgeChannelHandOverTest.FakeStream());
         loop.register(channel).sync();
-        GameLanes lanes = new GameLanes(channel, codec, session, ProtocolState.PLAY, null);
+        GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.PLAY, null);
         lanes.installOutbound();
         AtomicReference<Throwable> seen = new AtomicReference<>();
         channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
@@ -260,16 +341,21 @@ class GameLanesTest {
         final List<ProtocolState> decodeStates = new ArrayList<>();
         int frameRefCountDuringDecode = -1;
         ByteBuf seenFrame;
+        LaneGame.Reservation seenReservation;
         LaneGame.Decoded next;
 
         @Override
-        public LaneGame.Decoded decode(ByteBuf frame, ProtocolState state) {
+        public LaneGame.Decoded decode(ByteBuf frame, ProtocolState state,
+                LaneGame.Reservation reservation) {
             byte[] bytes = new byte[frame.readableBytes()];
             frame.getBytes(frame.readerIndex(), bytes);
             decodedFrames.add(bytes);
             decodeStates.add(state);
             frameRefCountDuringDecode = frame.refCnt();
             seenFrame = frame;
+            seenReservation = reservation;
+            // As a platform codec must: charge the budget before allocating output (13.12).
+            reservation.reserve(128, 256);
             if (next != null) {
                 return next;
             }
@@ -288,19 +374,27 @@ class GameLanesTest {
         }
     }
 
-    /** The session as the test sees it: what it assigns, what it was sent, what it was told. */
+    /** The session as the test sees it: what it routes, what it was sent, what it was told. */
     static final class FakeSession implements GameLanes.Session {
         final List<String> sent = new ArrayList<>();
         final List<byte[]> frames = new ArrayList<>();
         final List<String> applied = new ArrayList<>();
         final List<Integer> aborted = new ArrayList<>();
+        /** What the routing table answers for the packets this test sends. */
+        volatile Lane routed = Lane.CONTROL;
+        /** What a send would report as the assigned lane. */
         volatile Lane assign;
+
+        @Override
+        public Lane outboundLane(ProtocolState state, int packetId) {
+            return routed;
+        }
 
         @Override
         public Lane send(ProtocolState state, int packetId, byte[] frame) {
             sent.add(state + ":" + packetId);
             frames.add(frame.clone());
-            return assign;
+            return assign != null ? assign : routed;
         }
 
         @Override
