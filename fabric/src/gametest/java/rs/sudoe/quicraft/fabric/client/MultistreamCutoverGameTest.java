@@ -124,6 +124,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             offlineTestModeNeverAcceptsAChangedPin(protocol, table.get());
             theSharedSecretIsWipedOnEveryTerminalPath(protocol, table.get());
+            aCancelDuringBindingEndsTheSession(protocol, table.get());
             aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), false);
             aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), true);
             aChangedCertificateIsReboundAndTheNewPinIsNoticed(protocol, table.get());
@@ -652,6 +653,56 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(zeroed(retained), "wiped by the successful exchange");
             rig.channel.close().sync();
             check(zeroed(retained), "and still after the game closes");
+        }
+    }
+
+    /**
+     * A cancel while the channel binding exchange is running (the Cancel button, a quit) ends the
+     * exchange with the channel: the session's self-tick, its quiescence queue and its key material
+     * go with it, and none of it comes back as a /3 failure or a TCP join the player did not ask
+     * for (12.6, 12.10, 12.14).
+     */
+    private static void aCancelDuringBindingEndsTheSession(int protocol, RoutingTable table) throws Exception {
+        // A cancel after OFFER: ordinary writes were queued in the session by then (12.10), and they
+        // must fail with the connection instead of outliving it.
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            check(rig.awaitState(V3Client.State.BINDING), "the exchange started");
+            rig.server.start();
+            // OFFER -> CLIENT_PROOF only: the client is quiescent from here.
+            rig.deliverServerChunks(Integer.MAX_VALUE);
+            check(rig.awaitCondition(() -> rig.fake.written.size() > 0), "CLIENT_PROOF went out");
+            rig.server.onClientBytes(rig.fake.takeWritten());
+            io.netty.channel.ChannelFuture held = rig.channel.writeAndFlush(
+                    new net.minecraft.network.protocol.common.ServerboundKeepAlivePacket(21L));
+            Thread.sleep(200);
+            check(!held.isDone(), "12.10: the ordinary write is held by the exchange");
+            check(rig.fake.written.size() == 0, "and nothing reached the wire");
+
+            rig.channel.close().sync(); // the player cancels mid-exchange
+            check(rig.awaitCondition(held::isDone) && !held.isSuccess(),
+                    "the cancel releases what the session still held, done " + held.isDone()
+                            + " success " + held.isSuccess());
+            check(rig.fake.abortCode < 0, "no QUIC close was asked for: " + rig.fake.abortCode);
+            check(!Transports.takeRetryOverTcp(rig.connection), "and no TCP join");
+            check(V3Notices.isEmpty(), "and nothing is said to the player");
+        }
+        // A cancel before OFFER, on a changed pin: the session's own offer wait is 500 ms (12.16),
+        // so a session that survived the cancel would fail on its ticker and start a TCP join well
+        // inside this test.
+        String old = "sha256:" + "44".repeat(32);
+        try (Rig rig = new Rig(protocol, table, false, false, old)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            check(rig.awaitState(V3Client.State.BINDING), "the exchange started, state " + rig.client.state());
+
+            rig.channel.close().sync(); // the player cancels
+            Thread.sleep(1200); // past the offer wait: a live session would have failed by now
+            check(!Transports.takeRetryOverTcp(rig.connection), "a cancel is not a /3 failure: no TCP join");
+            check(V3Notices.isEmpty(), "and nothing is said to the player");
+            check(rig.fake.abortCode < 0, "no QUIC close was asked for: " + rig.fake.abortCode);
+            check(!rig.plan.isFailed(), "and nothing is recorded");
         }
     }
 

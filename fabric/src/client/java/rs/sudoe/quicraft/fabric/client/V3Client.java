@@ -105,6 +105,13 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private volatile boolean serverDisconnected;
     private boolean closingByGame;
     private boolean ended;
+    /**
+     * The exchange is over for good and cannot come back: the session ended (its self-tick stopped
+     * and its queue released), its key material wiped, and everything still held here failed with
+     * the connection. Set by {@link #cleanUp} on every way the join ends, so a late activation, a
+     * deadline that fires afterwards, or a TCP retry nobody asked for is suppressed.
+     */
+    private boolean exchangeEnded;
 
     // Binding (event loop).
     private BindingSession session;
@@ -268,8 +275,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     private void enterConfiguration() {
         try {
-            if (state != State.LOGIN) {
-                return;
+            if (state != State.LOGIN || exchangeEnded) {
+                return; // the join was over before the game reached configuration
             }
             state = State.BINDING;
             long offerWaitNanos = 0;
@@ -409,21 +416,25 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     /** The bridge channel went inactive. */
     void channelClosed() {
         wipeSecret();
+        // The channel is gone, so the exchange is over whatever the state: the session closes here
+        // too, and can no longer tick itself into a failure and a TCP join (12.6, 12.14).
+        cleanUp();
         if (state == State.ACTIVE || state == State.FAILED || serverDisconnected || closingByGame) {
             return;
         }
         fail("connection closed before multi-stream was active");
     }
 
-    /** The game closes the channel (the player leaves, or the game disconnects). */
+    /**
+     * The game closes the channel (the player cancels the join, leaves, or the game disconnects).
+     * The attempt is over: the session ends with it (the copy of {@code S} and the key material it
+     * derived, its quiescence queue, its self-tick), so nothing of the exchange survives the
+     * connection and no later deadline can start a TCP join the player did not ask for.
+     */
     void closing() {
         wipeSecret();
         closingByGame = true;
-        Held waiting;
-        while ((waiting = backlog.poll()) != null) {
-            waiting.promise.tryFailure(new ClosedChannelException());
-        }
-        backlogBytes = 0;
+        cleanUp();
         if (state == State.ACTIVE && !ended) {
             ended = true;
             // 13.14: after activation the session ends stream 0, never a bare FIN.
@@ -625,6 +636,11 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             fail("could not take over the connection");
             return;
         }
+        if (exchangeEnded) {
+            // The game closed the channel while the hand-over was in flight: no lanes, no pin.
+            control.release();
+            return;
+        }
         ByteBuffer leftover;
         try {
             leftover = join(control, coreLeftover);
@@ -632,8 +648,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             control.release();
         }
         coreLeftover = null;
-        if (state == State.FAILED) {
-            return;
+        if (state == State.FAILED || exchangeEnded) {
+            return; // the channel was closed in the middle of the hand-over: no pin, no lanes
         }
         CompletableFuture<Boolean> pinned;
         try {
@@ -656,8 +672,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     }
 
     private void startLanes(ByteBuffer leftover) {
-        if (state == State.FAILED) {
-            return;
+        if (state == State.FAILED || exchangeEnded) {
+            return; // the channel was closed before the pin write answered
         }
         ChannelPipeline pipeline = channel.pipeline();
         GameLanes started = new GameLanes(channel, codec, v3::session, ProtocolState.CONFIGURATION,
@@ -753,6 +769,13 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         if (state == State.FAILED) {
             return;
         }
+        if (closingByGame || serverDisconnected) {
+            // The join is already over: the player closed it, or the server ended the connection
+            // itself. Neither is a /3 failure, so nothing is reported and no TCP join is started
+            // (12.14); the session is gone either way.
+            cleanUp();
+            return;
+        }
         state = State.FAILED;
         boolean retry;
         try {
@@ -808,7 +831,15 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         failActive("timed out");
     }
 
+    /**
+     * The exchange is over, whichever way it ended: the session closes (its self-tick stops, its
+     * quiescence queue is released along with its promises, and the tags its machine derived are
+     * wiped), every write still waiting in this controller fails with the connection, and
+     * {@link #exchangeEnded} makes sure nothing of the attempt runs after this. Idempotent, and
+     * never throws.
+     */
     private void cleanUp() {
+        exchangeEnded = true;
         // The held packets first: closing the session drops its quiescence queue.
         List<Object> held = new ArrayList<>(deferred);
         deferred.clear();
