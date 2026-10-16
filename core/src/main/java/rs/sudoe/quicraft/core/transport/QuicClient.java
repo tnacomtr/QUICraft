@@ -52,6 +52,8 @@ public final class QuicClient {
     private static final long MAX_GRACE_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     /** Tests only: a higher floor for the grace period; 0 keeps the specified one. */
     private static volatile long testGraceFloorNanos;
+    /** Tests only: pauses immediately before a successful connect future is completed. */
+    private static volatile Runnable testBeforeConnectCompletion;
     private static volatile EventLoopGroup group;
 
     private QuicClient() {}
@@ -400,6 +402,17 @@ public final class QuicClient {
         testGraceFloorNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0, millis));
     }
 
+    static void setBeforeConnectCompletionForTests(Runnable hook) {
+        testBeforeConnectCompletion = hook;
+    }
+
+    private static void beforeConnectCompletionForTests() {
+        Runnable hook = testBeforeConnectCompletion;
+        if (hook != null) {
+            hook.run();
+        }
+    }
+
     /**
      * What the latest QUIC attempt did about 0-RTT: {@code sent}, or why it sent nothing (no
      * early-data event from TLS, no recorded flight, no early token, ...). For tests and
@@ -662,6 +675,7 @@ public final class QuicClient {
                         stream.start();
                         raw.write(ByteBuffer.wrap(Preamble.encode(null)));
                         raw.flush();
+                        beforeConnectCompletionForTests();
                         if (!result.complete(stream)) {
                             stream.close(); // cancelled meanwhile
                         }
@@ -669,23 +683,21 @@ public final class QuicClient {
         }
 
         /**
-         * The attempt failed or lost the race. Usually closing the socket is enough: that
-         * force-closes the QUIC channel and fails the connect. (Cancelling Netty's connect future
-         * instead makes QuicChannelBootstrap log an IllegalStateException when it later fails that
-         * future.) After 0-RTT data the server may have started a login on it, so it gets a
-         * CONNECTION_CLOSE first (docs/protocol.md §8, "TCP wins after 0-RTT went out"). quiche
-         * sends one only if the client has received a packet from the server; otherwise the
-         * server's confirmation deadline ends that login.
+         * The attempt failed or lost the race. Once a QUIC channel exists, close it explicitly so
+         * the peer can release the connection instead of waiting for its idle timeout. Closing the
+         * UDP socket alone only force-closes our local channel. Before the client has received any
+         * server packet quiche cannot send an authenticated CONNECTION_CLOSE, so in that case the
+         * server's handshake deadline remains the backstop.
          */
         private void abandon() {
             QuicChannel connection = quic.get();
-            if (connection == null || early == null || !early.sent() || !connection.isOpen()) {
+            if (connection == null || !connection.isOpen()) {
                 udp.close();
                 return;
             }
             connection.eventLoop().execute(() -> connection
                     .close(true, Protocol.CLOSE_NORMAL, io.netty.buffer.Unpooled.EMPTY_BUFFER)
-                    // Let the close datagram leave before the socket goes.
+                    // This delay only applies if this listener runs first; closeFuture may close UDP sooner.
                     .addListener(closed -> udp.eventLoop().schedule(() -> udp.close(), 50,
                             java.util.concurrent.TimeUnit.MILLISECONDS)));
         }
@@ -982,27 +994,23 @@ public final class QuicClient {
                         stream.start();
                         raw.write(ByteBuffer.wrap(PreambleV2.encode(null)));
                         raw.flush();
+                        beforeConnectCompletionForTests();
                         if (!result.complete(stream)) {
                             stream.close(); // cancelled meanwhile
                         }
                     });
         }
 
-        /**
-         * The attempt failed or lost the race. Usually closing the socket is enough: that
-         * force-closes the QUIC channel and fails the connect. After 0-RTT data the server may have
-         * started a login on it, so it gets a CONNECTION_CLOSE first (docs/protocol.md §8, "TCP wins
-         * after 0-RTT went out").
-         */
+        /** Closes the peer-visible QUIC connection when possible; UDP close alone is only local. */
         private void abandon() {
             QuicChannel connection = quic.get();
-            if (connection == null || early == null || !early.sent() || !connection.isOpen()) {
+            if (connection == null || !connection.isOpen()) {
                 udp.close();
                 return;
             }
             connection.eventLoop().execute(() -> connection
                     .close(true, Protocol.CLOSE_NORMAL, io.netty.buffer.Unpooled.EMPTY_BUFFER)
-                    // Let the close datagram leave before the socket goes.
+                    // This delay only applies if this listener runs first; closeFuture may close UDP sooner.
                     .addListener(closed -> udp.eventLoop().schedule(() -> udp.close(), 50,
                             java.util.concurrent.TimeUnit.MILLISECONDS)));
         }
