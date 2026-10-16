@@ -801,8 +801,15 @@ Require `maxOpen >= logged-in target + pre-login connection cap`, where the pre-
 When global capacity is full, shed pre-login work rather than drop an honest token-bearing Initial.
 Fair share is measured in pool bytes charged per prefix, not connection count, and counts every
 charge, including declared-length charges. A declared-length charge is also bounded by a per-prefix
-cap (profile value); within that cap it is granted while the pool has room and waits otherwise, so
-two prefixes never hold each other back on an uncontended pool. A waiting charge never sheds. Choose a victim by hierarchical
+cap (profile value). It is granted while the pool has room, so two prefixes never hold each other
+back on an uncontended pool. When the pool is full, or other charges are already waiting, the charge
+waits. Freed bytes (a release, a promotion, a close or a shed) go first to the waiting charge whose
+address group holds the least pre-login bytes, using the same hierarchical prefixes as shedding
+(IPv6 /48, then /64 within it; IPv4 /24), then to the earlier arrival, then to the lower connection
+id. Each waiting charge that fits is granted in that order, and a larger one that does not fit is
+skipped rather than blocking a smaller one behind it. A waiting charge never sheds, and it keeps the
+client-wait and 30 s hard-cap deadlines; an expired or closed waiter leaves the wait set and its bytes
+are never granted. A refusal stays a local `0x12` close at the deadline, never `0x11`. Choose a victim by hierarchical
 source-prefix fair share first (IPv6 /48 then /64, IPv4 /24; used
 only for this choice), then least-progressed state, then random. A connection waiting on the
 server (hasJoined or platform event in flight) is not shed while its prefix is within its fair
