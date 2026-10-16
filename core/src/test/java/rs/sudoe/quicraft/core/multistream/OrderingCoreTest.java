@@ -23,7 +23,7 @@ class OrderingCoreTest {
         assertEquals(0x11, assertThrows(OrderingException.class, action::run).closeCode());
     }
 
-    private static final class Harness {
+    static final class Harness {
         final List<ReceiverScheduler.Delivery> calls = new ArrayList<ReceiverScheduler.Delivery>();
         final List<Envelope> delivered = new ArrayList<Envelope>();
         final Map<Envelope, Integer> decodedSizes = new IdentityHashMap<Envelope, Integer>();

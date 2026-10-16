@@ -37,6 +37,12 @@ Fabric API is not a dependency of the mod. The gametests use it (test-only):
 | 26.2 | 0.161.0+26.2 | 6.x |
 | 26.3 | 0.162.0+26.3 | 6.0.7 |
 
+## /3 routing tables
+
+| Protocol | Game versions | Resource | Routes | Pinned by |
+| --- | --- | --- | --- | --- |
+| 775 | 26.1.2 (the shipped table; other 26.x builds only with their own pinned table) | `core/src/main/resources/rs/sudoe/quicraft/core/routing/protocol-775.json` (+ `-mandatory-control.json`) | 13 REALTIME, 8 WORLD, clientbound play only | `RoutingTableGameTest` (live ids), `ShippedRoutingOrderingTest` |
+
 ## Game and platform Netty versions
 
 From Mojang's version manifest (`piston-meta`) and the platform jars, Oct 2026. Each bridge
