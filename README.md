@@ -115,7 +115,7 @@ Exact version ranges per module: [`docs/version-matrix.md`](docs/version-matrix.
 | 2 | Velocity plugin (single stream) | done ([gate](docs/benchmarks.md)) |
 | 3 | Fabric client + dedicated server for 26.x and 1.21.11 | done ([gate and gaps](docs/benchmarks.md)) |
 | 4 | Public alpha: Retry, admission limits, multi-socket listener, server-owner docs, signed server updater | done (0.1.0-alpha.1) |
-| 5 | Multi-stream on 26.x | |
+| 5 | Multi-stream on 26.x | in progress; the 2026-10-16 direction (large packets first, chunk streams, server profiles) is planned, not implemented ([protocol §13](docs/protocol.md)) |
 | 6–9 | More versions and loaders, Velocity multi-stream, Paper, hardening | |
 
 ## Building
