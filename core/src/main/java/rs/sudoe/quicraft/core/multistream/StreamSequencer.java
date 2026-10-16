@@ -43,6 +43,7 @@ public final class StreamSequencer {
     private static final int CONTROL = LogicalStream.CONTROL;
     private static final int REALTIME = LogicalStream.REALTIME;
     private static final int FIRST_CHUNK = 2;
+    private static final List<Record.Dependency> NO_DEPENDENCIES = Collections.emptyList();
 
     private final int streams;
     private final long[] assigned;
@@ -139,8 +140,9 @@ public final class StreamSequencer {
      *
      * @param memberScopes one scope per member, in order
      * @param scratchBytes total decoding scratch the bundle needs on the receiver
-     * @throws IllegalArgumentException on more than {@link #MAX_BUNDLE_MEMBERS} members, encoded size
-     *         above {@link #MAX_BUNDLE_ENCODED_BYTES}, scratch above {@link #MAX_BUNDLE_SCRATCH_BYTES},
+     * @throws IllegalArgumentException on more than {@link #MAX_BUNDLE_MEMBERS} members, a total /3
+     *         wire size with all record headers above {@link #MAX_BUNDLE_ENCODED_BYTES}, scratch above
+     *         {@link #MAX_BUNDLE_SCRATCH_BYTES},
      *         or a REALTIME member
      */
     public List<Record> assignBundle(byte[] opening, List<byte[]> members, Fence[] memberScopes,
@@ -151,15 +153,10 @@ public final class StreamSequencer {
         if (members.size() > MAX_BUNDLE_MEMBERS || members.size() != memberScopes.length) {
             throw new IllegalArgumentException("bundle members");
         }
-        long bytes = (long) opening.length + closing.length;
         for (byte[] member : members) {
             if (member == null) {
                 throw new IllegalArgumentException("bundle member");
             }
-            bytes += member.length;
-        }
-        if (bytes > MAX_BUNDLE_ENCODED_BYTES) {
-            throw new IllegalArgumentException("bundle encoded bytes");
         }
         if (scratchBytes < 0 || scratchBytes > MAX_BUNDLE_SCRATCH_BYTES) {
             throw new IllegalArgumentException("bundle scratch");
@@ -167,6 +164,20 @@ public final class StreamSequencer {
         Fence scope = bundleScope(memberScopes);
         if (assigned[CONTROL] + members.size() + 2 > MAX_SEQUENCE) {
             throw new IllegalStateException("sequence exhausted");
+        }
+        // Wire size with every header (13.12): the opening record is planned exactly, because its
+        // scope and external dependencies decide its header; members and the closing record are
+        // unconstrained CONTROL records with no dependency entries, so only their sequences vary.
+        Record openingPlan = plan(CONTROL, scope, opening, false, 0, external, false);
+        long bytes = compactWireSize(openingPlan.sequence(), openingPlan.epoch(),
+                openingPlan.dependencies(), opening.length);
+        long sequence = openingPlan.sequence();
+        for (byte[] member : members) {
+            bytes += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, member.length);
+        }
+        bytes += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, closing.length);
+        if (bytes > MAX_BUNDLE_ENCODED_BYTES) {
+            throw new IllegalArgumentException("bundle encoded bytes");
         }
         List<Record> result = new ArrayList<Record>(members.size() + 2);
         result.add(place(CONTROL, scope, opening, false, 0, external));
@@ -250,6 +261,14 @@ public final class StreamSequencer {
 
     private Record place(int stream, Fence fence, byte[] payload, boolean interaction, int kind,
             Record.Dependency[] semantic, boolean unconstrained) {
+        Record record = plan(stream, fence, payload, interaction, kind, semantic, unconstrained);
+        assigned[stream] = record.sequence();
+        return record;
+    }
+
+    /** Builds the record {@link #place} would assign, without moving any sequence or frontier. */
+    private Record plan(int stream, Fence fence, byte[] payload, boolean interaction, int kind,
+            Record.Dependency[] semantic, boolean unconstrained) {
         checkStream(stream);
         if (fence == null || payload == null) {
             throw new IllegalArgumentException("record");
@@ -279,9 +298,29 @@ public final class StreamSequencer {
                 sparse.add(new Record.Dependency(i, deps[i]));
             }
         }
-        Record record = new Record(stream, sequence, epoch, sparse, kind, payload);
-        assigned[stream] = sequence;
-        return record;
+        return new Record(stream, sequence, epoch, sparse, kind, payload);
+    }
+
+    /**
+     * Exact /3 wire size of one record (13.4): VarInt(record_length), kind, VarInt(sequence),
+     * VarInt(epoch), VarInt(dependency_count), one u8 index plus VarInt per dependency, then the body.
+     */
+    static long compactWireSize(long sequence, long epoch, List<Record.Dependency> dependencies,
+            long bodyLength) {
+        long header = 1 + varIntBytes(sequence) + varIntBytes(epoch) + varIntBytes(dependencies.size());
+        for (Record.Dependency dependency : dependencies) {
+            header += 1 + varIntBytes(dependency.sequence());
+        }
+        long recordLength = header + bodyLength;
+        return varIntBytes(recordLength) + recordLength;
+    }
+
+    private static int varIntBytes(long value) {
+        int bytes = 1;
+        for (long rest = value; rest >= 0x80; rest >>>= 7) {
+            bytes++;
+        }
+        return bytes;
     }
 
     /**

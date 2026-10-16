@@ -209,17 +209,25 @@ class StreamSequencerTest {
         assertEquals(bundle.get(2).sequence(), sequencer.globalFrontier());
     }
 
-    @Test void bundleEncodedSizeBoundIsTwoMebibytesPlus128AtExactlyAndOneOver() {
+    @Test void bundleEncodedSizeBoundCountsEveryRecordHeaderAtExactlyAndOneOver() {
         assertEquals(2L * 1024 * 1024 + 128, StreamSequencer.MAX_BUNDLE_ENCODED_BYTES);
+        // Opening (sequence 1), member (sequence 2) and closing (sequence 3) are ORDINARY CONTROL
+        // with no dependency entries. Each record is VarInt(record_length) + kind + VarInt(sequence)
+        // + VarInt(epoch) + VarInt(dependency_count) + body (13.4). The opening and closing records
+        // are 5 bytes of header each (1-byte length prefix). The member body is about 2 MiB, so its
+        // record_length takes a 4-byte VarInt and its header is 8 bytes.
+        long memberHeader = 8;
+        long delimiterHeaders = 5 + 5;
         StreamSequencer exact = new StreamSequencer(1);
-        byte[] atLimit = new byte[(int) StreamSequencer.MAX_BUNDLE_ENCODED_BYTES];
+        byte[] atLimit = new byte[(int) (StreamSequencer.MAX_BUNDLE_ENCODED_BYTES - delimiterHeaders - memberHeader)];
         List<Record> accepted = exact.assignBundle(NONE, Collections.singletonList(atLimit),
                 new StreamSequencer.Fence[] {ORDINARY}, NONE);
-        assertEquals(3, accepted.size(), "encoded size equal to B is accepted");
+        assertEquals(3, accepted.size(), "wire size with headers equal to B is accepted");
         StreamSequencer over = new StreamSequencer(1);
-        byte[] oneOver = new byte[(int) StreamSequencer.MAX_BUNDLE_ENCODED_BYTES + 1];
+        // Payload alone is B - 17 (below the bound), but payload plus headers is B + 1.
+        byte[] headerOnlyOver = new byte[(int) (StreamSequencer.MAX_BUNDLE_ENCODED_BYTES - delimiterHeaders - memberHeader + 1)];
         assertThrows(IllegalArgumentException.class,
-                () -> over.assignBundle(NONE, Collections.singletonList(oneOver),
+                () -> over.assignBundle(NONE, Collections.singletonList(headerOnlyOver),
                         new StreamSequencer.Fence[] {ORDINARY}, NONE));
         assertEquals(0, over.assigned()[0], "a rejected bundle assigns nothing");
     }
