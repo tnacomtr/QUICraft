@@ -814,6 +814,43 @@ loopback only, transport only; 8 sockets showed no gain over 4 at this rate.
 - Game-traffic CPU per player on the proxy path is still unmeasured (Phase 9). This test covers
   connection state only, not gameplay.
 
+## /3 node budget: idle activated connections (2026-10-16)
+
+This test checks the per-connection reservation of the lazy read grants (`protocol.md` 13.12) against the node pending-bytes budget.
+
+**Setup:**
+- Branch `feat/phase5-multistream` at 59aa1e6, same machine as above.
+- Transport level only: `MODE=v3 LANES=1 bash testkit/run-load-spike.sh`.
+  - Each connection activates its three /3 lanes with an idle game and no Minecraft binding proof.
+  - `NODE_BUDGET_MB` sets the budget.
+- One run per row, ramp 50/s for the 1 MiB row and 500/s for the others.
+
+| Node budget | Attempts | Held activated | Not held (failed + closed) | `0x11` closes seen | Server RSS at the end |
+| --- | --- | --- | --- | --- | --- |
+| 1 MiB | 100 | 34 | 66 (22 + 44) | 0 | 160 MiB |
+| 256 MiB (shipped default) | 10,000 | 8,738 | 1,262 (780 + 482) | 0 | 662 MiB |
+| 1 GiB | 10,000 | 10,000 | 0 | 0 | 686 MiB |
+
+Run directories (gitignored):
+- `testkit/results/load-spike-20261016-175523`
+- `testkit/results/load-spike-20261016-175709`
+- `testkit/results/load-spike-20261016-175807`
+
+**Finding:** the held counts match the specified 30 KiB idle reservation exactly:
+- 1 MiB ÷ 30 KiB = 34.
+- 256 MiB ÷ 30 KiB = 8,738.
+
+Before lazy grants, the same 1 MiB run held 17 connections. The 30 KiB reservation is made of:
+- the 24 KiB quiche-unread share;
+- read grants of 4 + 1 + 1 KiB.
+
+Every attempt past the budget was turned away: it either failed to connect or was closed after connecting. No log showed a `0x11` peer-violation close. The harness does not record why a connect failed, so the split between failed and closed is not broken down further.
+
+**Not yet a scale answer:**
+- At 30 KiB, 50,000 activated connections need about 1.43 GiB of node budget.
+- Under the serverbound dual-lane draft, which also reserves a 40 KiB inflater per connection at admission, they need about 3.05 GiB.
+- So the 256 MiB default is a small-server value, not the product ceiling. The per-hardware profiles will set it from measurements.
+
 ## Planned Phase 5 measurements
 
 Not run yet. These measurements are planned for the 2026-10-16 direction in `docs/protocol.md`
