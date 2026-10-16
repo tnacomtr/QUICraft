@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -271,28 +272,33 @@ final class PreLoginRegistry {
     }
 
     /**
-     * A staged connection as the registry sees it. It is also the {@link PreLoginStage} the platform
-     * drives: pausing the client wait around session-server and platform waits makes it waiting, which
-     * protects it while its prefix is within its share.
+     * A staged connection as the registry sees it. It is also the {@link PreLoginConnection} the platform
+     * and the V3 read path drive. Its methods lock the registry, which is the only lock the shedding path
+     * takes, so a shed on another event loop never races a charge or a pause here.
      */
-    final class Entry implements PreLoginStage, AutoCloseable {
+    final class Entry implements PreLoginConnection, AutoCloseable {
         private final PreLoginTracker tracker;
+        private final InetAddress source;
         private final InetAddress coarse;
         private final InetAddress fine;
         private final Runnable closeConnection;
         private int waitDepth;
+        private int sessionCalls;
         private long progress;
 
         private Entry(PreLoginTracker tracker, InetAddress source, InetAddress coarse, Runnable closeConnection) {
             this.tracker = tracker;
+            this.source = source;
             this.coarse = coarse;
             this.fine = finePrefix(source);
             this.closeConnection = Objects.requireNonNull(closeConnection, "closeConnection");
         }
 
-        /** The underlying accounting, for the caller's read and frame charges. */
+        /** The underlying accounting. Package-private: outside code uses the {@link PreLoginConnection} view. */
         PreLoginTracker tracker() {
-            return tracker;
+            synchronized (PreLoginRegistry.this) {
+                return tracker;
+            }
         }
 
         /** Records progress (bytes consumed): the least-progressed connection is shed first. */
@@ -316,7 +322,9 @@ final class PreLoginRegistry {
 
         /** True once the client-wait deadline or the 30 s hard cap has passed. */
         boolean expired() {
-            return tracker.expired();
+            synchronized (PreLoginRegistry.this) {
+                return tracker.expired();
+            }
         }
 
         @Override
@@ -339,14 +347,64 @@ final class PreLoginRegistry {
 
         @Override
         public void onLoginSuccess() {
-            promoteIfNeeded(() -> tracker.onLoginSuccess());
+            promoteIfNeeded(tracker::onLoginSuccess);
         }
 
         @Override
         public void onActivation() {
-            promoteIfNeeded(() -> tracker.onActivation());
+            promoteIfNeeded(tracker::onActivation);
         }
 
+        @Override
+        public boolean retryPromotion() {
+            AtomicBoolean promoted = new AtomicBoolean();
+            promoteIfNeeded(() -> promoted.set(tracker.retryPromotion()));
+            return promoted.get();
+        }
+
+        @Override
+        public PreLoginTracker.ChargeResult chargeDeclaredFrame(long declaredBytes, long framingBytes) {
+            synchronized (PreLoginRegistry.this) {
+                return tracker.chargeDeclaredFrame(declaredBytes, framingBytes);
+            }
+        }
+
+        @Override
+        public boolean chargeEarlyData(long bytes) {
+            synchronized (PreLoginRegistry.this) {
+                return tracker.chargeEarlyData(bytes);
+            }
+        }
+
+        @Override
+        public void releaseExtra(long bytes) {
+            synchronized (PreLoginRegistry.this) {
+                tracker.releaseExtra(bytes);
+            }
+        }
+
+        @Override
+        public boolean tryBeginSessionCall() {
+            synchronized (PreLoginRegistry.this) {
+                if (tracker.state() != PreLoginTracker.State.STAGED || !PreLoginRegistry.this.tryBeginSessionCall(source)) {
+                    return false;
+                }
+                sessionCalls++;
+                return true;
+            }
+        }
+
+        @Override
+        public void endSessionCall() {
+            synchronized (PreLoginRegistry.this) {
+                if (sessionCalls > 0) {
+                    sessionCalls--;
+                    PreLoginRegistry.this.endSessionCall(source);
+                }
+            }
+        }
+
+        /** Sheds this connection under pool pressure (12.13). Only staged connections are ever in the set. */
         @Override
         public void onShed() {
             synchronized (PreLoginRegistry.this) {
@@ -354,10 +412,13 @@ final class PreLoginRegistry {
             }
         }
 
-        /** Releases the connection's charge, from either pool, and stops tracking it. Idempotent. */
+        /** Releases the connection's charge, from either pool, and any session call it still holds. Idempotent. */
         @Override
         public void close() {
             synchronized (PreLoginRegistry.this) {
+                while (sessionCalls > 0) {
+                    endSessionCall();
+                }
                 forget(this);
                 tracker.close();
             }

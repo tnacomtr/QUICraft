@@ -73,7 +73,7 @@ public final class QuicServer implements Closeable {
     private static final io.netty.util.AttributeKey<Boolean> REFUSED =
             io.netty.util.AttributeKey.valueOf(QuicServer.class, "refused");
     /** The /3 connection's staged pre-login lifecycle (12.13), see {@link #preLoginStage}. */
-    private static final io.netty.util.AttributeKey<PreLoginStage> PRE_LOGIN =
+    private static final io.netty.util.AttributeKey<PreLoginConnection> PRE_LOGIN =
             io.netty.util.AttributeKey.valueOf(QuicServer.class, "preLogin");
     /**
      * Chunk streams charged for a staged connection. N is not negotiated before OFFER, so every
@@ -1126,6 +1126,12 @@ public final class QuicServer implements Closeable {
                         stagedCheck.cancel(false);
                         return;
                     }
+                    // 12.13: a promotion that the node budget refused is retried on every tick.
+                    staged.retryPromotion();
+                    if (staged.tracker().state() != PreLoginTracker.State.STAGED) {
+                        stagedCheck.cancel(false);
+                        return;
+                    }
                     if (staged.expired()) {
                         stagedCheck.cancel(false);
                         Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
@@ -1172,12 +1178,13 @@ public final class QuicServer implements Closeable {
     }
 
     /**
-     * §12.13: the pre-login lifecycle of a {@code /3} connection, or null for {@code /2} connections and
+     * §12.13: the pre-login accounting of a {@code /3} connection, or null for {@code /2} connections and
      * listeners without a resource pool. The platform calls {@code onLoginSuccess} (online) or
-     * {@code onActivation} (offline) on it, and brackets session-server and platform waits with
-     * {@code pauseClientWait}/{@code resumeClientWait}.
+     * {@code onActivation} (offline) on it and brackets session-server and platform waits with
+     * {@code pauseClientWait}/{@code resumeClientWait}; the V3 read path charges declared frames and early
+     * data through it.
      */
-    public static PreLoginStage preLoginStage(QuicChannel connection) {
+    public static PreLoginConnection preLoginTracker(QuicChannel connection) {
         return connection.attr(PRE_LOGIN).get();
     }
 

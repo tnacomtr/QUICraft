@@ -205,6 +205,20 @@ class PreLoginTrackerTest {
         assertEquals(0, pools.held(ResourcePools.Pool.PRE_LOGIN));
     }
 
+    @Test
+    void aPromotionTheNodeBudgetRefusedIsRetriedUntilItSucceeds() {
+        FakePools pools = new FakePools().capacity(ResourcePools.Pool.NODE, 1000);
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        assertFalse(tracker.retryPromotion(), "nothing requested yet");
+        tracker.onLoginSuccess();
+        assertFalse(tracker.retryPromotion(), "the node budget is still full");
+        assertEquals(PreLoginTracker.State.STAGED, tracker.state());
+        pools.capacity(ResourcePools.Pool.NODE, TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
+        assertTrue(tracker.retryPromotion(), "a retry succeeds once the node budget frees space");
+        assertEquals(PreLoginTracker.State.PROMOTED, tracker.state());
+        assertEquals(0, pools.held(ResourcePools.Pool.PRE_LOGIN));
+    }
+
     /** A monotonic clock the test moves by hand. */
     private static final class Clock implements LongSupplier {
         private long nanos = 1_000;

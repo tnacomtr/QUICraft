@@ -219,4 +219,49 @@ class PreLoginRegistryTest {
         assertEquals(0, registry.stagedCount());
         assertFalse(offline.closed);
     }
+
+    @Test
+    void aRefusedPromotionStaysStagedAndASecondTryPromotesAfterNodeFrees() throws Exception {
+        PreLoginTrackerTest.FakePools pools = new PreLoginTrackerTest.FakePools()
+                .capacity(ResourcePools.Pool.NODE, 1000);
+        PreLoginRegistry registry = new PreLoginRegistry(pools, 4, new Random(1));
+        Conn conn = admit(registry, "c", "192.0.2.10", true, new ArrayList<>());
+        conn.entry.onLoginSuccess();
+        assertEquals(1, registry.stagedCount(), "still staged: the node share did not fit");
+        assertFalse(conn.entry.retryPromotion());
+        pools.capacity(ResourcePools.Pool.NODE, TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
+        assertTrue(conn.entry.retryPromotion());
+        assertEquals(0, registry.stagedCount(), "promotion leaves the staged set");
+    }
+
+    @Test
+    void theChargeAndSessionSurfaceRefusesAPromotedConnection() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(poolFor(2), 4, new Random(1));
+        Conn conn = admit(registry, "c", "192.0.2.10", true, new ArrayList<>());
+        assertTrue(conn.entry.tryBeginSessionCall());
+        conn.entry.onLoginSuccess();
+        assertFalse(conn.entry.tryBeginSessionCall(), "no session calls once promoted");
+        assertFalse(conn.entry.chargeEarlyData(1));
+        assertEquals(PreLoginTracker.ChargeResult.CHARGED, conn.entry.chargeDeclaredFrame(10, 0),
+                "a frame within the staged share needs no charge");
+    }
+
+    @Test
+    void aSessionCallPerConnectionIsCappedAndClosingReleasesTheOnesItHeld() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(poolFor(2), 2, new Random(1));
+        Conn a = admit(registry, "a", "2001:db8:1:1::1", true, new ArrayList<>());
+        Conn b = admit(registry, "b", "2001:db8:1:2::1", true, new ArrayList<>());
+        assertTrue(a.entry.tryBeginSessionCall());
+        assertTrue(a.entry.tryBeginSessionCall());
+        assertFalse(b.entry.tryBeginSessionCall(), "the /48 cap of two is shared by both connections");
+        a.entry.close();
+        assertTrue(b.entry.tryBeginSessionCall(), "closing a releases the calls it still held");
+    }
+
+    @Test
+    void theRegistryRefusesAChargeWhenThePoolIsFullAndWaitsNonFatally() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(poolFor(1), 4, new Random(1));
+        Conn conn = admit(registry, "c", "192.0.2.10", true, new ArrayList<>());
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, conn.entry.chargeDeclaredFrame(900_000, 0));
+    }
 }

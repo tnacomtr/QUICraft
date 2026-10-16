@@ -74,6 +74,7 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
     private long pausedSince = -1;
     private int pauseDepth;
     private long extra;
+    private boolean promotionRequested;
     private State state = State.STAGED;
 
     private PreLoginTracker(ResourcePools pools, Object owner, int shards, boolean online, LongSupplier clock) {
@@ -211,13 +212,27 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
     @Override
     public void onLoginSuccess() {
         if (online) {
-            promote();
+            requestPromotion();
         }
     }
 
     /** §12.13: activation promotes every connection, offline ones included. */
     @Override
     public void onActivation() {
+        requestPromotion();
+    }
+
+    /**
+     * Retries a requested promotion that could not reserve the node share (12.13: the connection waits
+     * non-fatally while it stays staged; the caller retries on each deadline tick). Returns true once
+     * the connection is promoted. A connection with no request yet, or one already closed, returns false.
+     */
+    public boolean retryPromotion() {
+        return promotionRequested && promote();
+    }
+
+    private void requestPromotion() {
+        promotionRequested = true;
         promote();
     }
 
