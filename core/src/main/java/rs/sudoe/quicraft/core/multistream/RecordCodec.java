@@ -16,6 +16,10 @@ import java.util.List;
  * {@link Long#compareUnsigned}.
  */
 public final class RecordCodec {
+    /** Maximum compact /3 header size (§13.4). */
+    public static final int COMPACT_MAX_HEADER = 54;
+    /** Maximum compact record_length, checked before copying the body (§13.4). */
+    public static final int COMPACT_MAX_RECORD_LENGTH = 2097208;
     public static final int KIND_GAME = 0;
     public static final int KIND_END = 1;
 
@@ -32,6 +36,72 @@ public final class RecordCodec {
     private static final byte[] NO_BODY = new byte[0];
 
     private RecordCodec() {}
+
+    /** Encodes the compact /3 wire record described in §13.4. */
+    public static byte[] encodeRecord(rs.sudoe.quicraft.core.multistream.Record record) {
+        ByteArrayOutputStream header = new ByteArrayOutputStream();
+        VarInt.write(header, checked31(record.sequence(), "sequence"));
+        VarInt.write(header, checked31(record.epoch(), "epoch"));
+        List<rs.sudoe.quicraft.core.multistream.Record.Dependency> deps = record.dependencies();
+        if (deps.size() > 7) throw new IllegalArgumentException("too many dependencies");
+        VarInt.write(header, deps.size());
+        int previous = -1;
+        for (rs.sudoe.quicraft.core.multistream.Record.Dependency dep : deps) {
+            if (dep.streamIndex() <= previous || dep.streamIndex() == record.streamIndex())
+                throw new IllegalArgumentException("duplicate, unordered or self dependency");
+            previous = dep.streamIndex(); header.write(dep.streamIndex());
+            VarInt.write(header, checked31(dep.sequence(), "dependency sequence"));
+        }
+        header.write(record.kind());
+        byte[] payload = record.payload();
+        int length = header.size() + payload.length;
+        if (header.size() > COMPACT_MAX_HEADER || length > COMPACT_MAX_RECORD_LENGTH)
+            throw new IllegalArgumentException("compact record too large");
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        VarInt.write(out, length); out.write(header.toByteArray(), 0, header.size());
+        out.write(payload, 0, payload.length); return out.toByteArray();
+    }
+
+    /** Decodes one complete compact /3 record; rejects trailing bytes and invalid sparse deps (§13.4). */
+    public static rs.sudoe.quicraft.core.multistream.Record decodeRecord(byte[] wire, int streamIndex)
+            throws MultistreamProtocolException {
+        if (wire == null) throw new NullPointerException("wire");
+        VarInt.Reader r = new VarInt.Reader(CLOSE_CODE, "13.4"); int p = 0;
+        while (!r.done()) { if (p >= wire.length) throw compactError("truncated length"); r.feed(wire[p++] & 255); }
+        int len = r.value();
+        if (len > COMPACT_MAX_RECORD_LENGTH) throw compactError("record_length too large");
+        if (len < 4 || wire.length - p != len) throw compactError("invalid record length");
+        int end = p + len;
+        int[] at = {p}; long seq = readCompact(wire, end, at); long epoch = readCompact(wire, end, at);
+        long countLong = readCompact(wire, end, at);
+        if (seq == 0 || countLong > 7) throw compactError("sequence or dependency count");
+        int count = (int) countLong, previous = -1;
+        List<rs.sudoe.quicraft.core.multistream.Record.Dependency> deps = new ArrayList<>();
+        for (int i=0;i<count;i++) {
+            if (at[0] >= end) throw compactError("truncated dependency");
+            int index = wire[at[0]++] & 255; long dseq = readCompact(wire,end,at);
+            if (index <= previous || index == streamIndex || dseq == 0) throw compactError("invalid dependency");
+            previous=index; deps.add(new rs.sudoe.quicraft.core.multistream.Record.Dependency(index,dseq));
+        }
+        if (at[0] >= end) throw compactError("missing kind");
+        int kind = wire[at[0]++] & 255;
+        if (kind > 3 || at[0] - p > COMPACT_MAX_HEADER) throw compactError("invalid kind/header");
+        byte[] payload = Arrays.copyOfRange(wire, at[0], end);
+        return new rs.sudoe.quicraft.core.multistream.Record(streamIndex,seq,epoch,deps,kind,payload);
+    }
+
+    private static int checked31(long value, String name) {
+        if (value < 0 || value > 0x7fffffffL) throw new IllegalArgumentException(name + " outside VarInt range");
+        return (int)value;
+    }
+    private static long readCompact(byte[] b, int end, int[] at) throws MultistreamProtocolException {
+        VarInt.Reader r = new VarInt.Reader(CLOSE_CODE,"13.4");
+        while (!r.done()) { if (at[0] >= end) throw compactError("truncated header"); r.feed(b[at[0]++] & 255); }
+        return r.value();
+    }
+    private static MultistreamProtocolException compactError(String message) {
+        return new MultistreamProtocolException(CLOSE_CODE,"13.4",message);
+    }
 
     /** One decoded record. The body excludes the fixed header. */
     public static final class Record {

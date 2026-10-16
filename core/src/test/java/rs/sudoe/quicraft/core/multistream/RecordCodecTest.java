@@ -30,6 +30,22 @@ import org.junit.jupiter.api.Test;
  * zero dependencies, empty body}.
  */
 class RecordCodecTest {
+
+    @Test
+    void compactRecordRoundTripsSparseDependenciesAndRejectsOversizeBeforeBodyCopy() throws Exception {
+        rs.sudoe.quicraft.core.multistream.Record compact =
+                new rs.sudoe.quicraft.core.multistream.Record(2, 1, 0,
+                        java.util.Collections.emptyList(), 0, new byte[] {1});
+        byte[] wire = RecordCodec.encodeRecord(compact);
+        assertEquals(6, wire.length);
+        rs.sudoe.quicraft.core.multistream.Record decoded = RecordCodec.decodeRecord(wire, 2);
+        assertEquals(1, decoded.sequence());
+        assertEquals(0, decoded.epoch());
+        assertArrayEquals(new byte[] {1}, decoded.payload());
+
+        byte[] oversize = {(byte) 0x88, (byte) 0x80, (byte) 0x80, 1};
+        assertThrows(MultistreamProtocolException.class, () -> RecordCodec.decodeRecord(oversize, 0));
+    }
     private static final byte[] GAME_GOLDEN = {
         0x26, // record_length 38
         0x00, // kind GAME
