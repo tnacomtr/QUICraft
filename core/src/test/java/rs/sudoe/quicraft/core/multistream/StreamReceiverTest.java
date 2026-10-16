@@ -365,6 +365,19 @@ class StreamReceiverTest {
         assertNull(f.receiver.expiredWait().reason());
     }
 
+    @Test void withholdingHistorySurvivesTheWithheldPrerequisiteApplying() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(0, 1), dep(1, 1)));
+        f.receiver.markLocallyWithheld(0, 1);
+        assertAdmitted(f.receiver, rec(0, 1, 0));
+        f.receiver.enqueued(0, 1);
+        f.receiver.applied(0, 1);
+        f.now.set(10 * SEC);
+        ReceiveClose close = f.receiver.expiredWait();
+        assertNotNull(close, "REALTIME 1 is still missing, so the wait expires");
+        assertNull(close.reason(), "CONTROL 1 was withheld during this wait, so no phrase (13.12)");
+    }
+
     @Test void fullSlotsAtSixChunksExpireEveryWithheldPrerequisiteWithItsOwnCode() {
         for (int prereq = 0; prereq < 8; prereq++) {
             assertAcceptanceCase(prereq, false);

@@ -105,6 +105,8 @@ public final class StreamReceiver {
         final ReceiveRoute route;
         final BlockedHeadTimer timer;
         boolean enqueued;
+        /** Sticky for the current wait: some prerequisite on the chain was withheld locally (13.12). */
+        boolean chainWasWithheld;
 
         Unit(Record record, ReceiveRoute route, BlockedHeadTimer timer) {
             this.record = record;
@@ -288,6 +290,7 @@ public final class StreamReceiver {
         if (!unit.enqueued) {
             throw new IllegalStateException("applied before enqueued on stream " + stream);
         }
+        rememberWithheldChains();
         head[stream] = null;
         applied[stream] = sequence;
         slots.releaseHead(stream);
@@ -318,7 +321,8 @@ public final class StreamReceiver {
         for (int stream = 0; stream < streams; stream++) {
             Unit unit = head[stream];
             if (unit != null && !unit.enqueued && !ready(unit) && unit.timer.expired()) {
-                return ReceiveClose.blockedExpiry(unit.timer.stallConsumed(), chainWithheld(unit.record));
+                boolean wasWithheld = unit.chainWasWithheld || chainWithheld(unit.record);
+                return ReceiveClose.blockedExpiry(unit.timer.stallConsumed(), wasWithheld);
             }
         }
         return null;
@@ -591,6 +595,16 @@ public final class StreamReceiver {
         for (Unit unit : head) {
             if (unit != null && !unit.enqueued && ready(unit)) {
                 unit.timer.stop();
+                unit.chainWasWithheld = false;
+            }
+        }
+    }
+
+    /** Captures withholding history for every waiting head before an apply clears markers (13.12). */
+    private void rememberWithheldChains() {
+        for (Unit unit : head) {
+            if (unit != null && !unit.enqueued && !unit.chainWasWithheld && chainWithheld(unit.record)) {
+                unit.chainWasWithheld = true;
             }
         }
     }
