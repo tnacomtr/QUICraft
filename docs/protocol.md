@@ -921,8 +921,9 @@ position extraction. Those implementations must change together before this revi
 3. **13.3 Stream identities.** There are exactly N+2 bidirectional streams: CONTROL on QUIC
    id 0 and REALTIME on id 4, both client-opened; CHUNK[i] on id `1+4*i`, server-opened,
    for `0 <= i < N`. Logical stream indices used in dependencies are CONTROL=0, REALTIME=1,
-   CHUNK[i]=2+i (not QUIC ids). Chunk packets are initially clientbound only; reverse chunk
-   directions still open and send their preambles, but no records are allowed there.
+   CHUNK[i]=2+i (not QUIC ids). All serverbound packets use CONTROL. Reverse auxiliary
+   directions still send their preambles, but no records are allowed on either REALTIME
+   or CHUNK[i] serverbound; they need no application receive slots at the server.
    Auxiliary streams open only after the opener activates under §12; each direction starts
    `u8(version=2) || u8(logical_stream_index)`. CONTROL has no second preamble. No other
    stream ids, replacements, unidirectional streams or datagrams are allowed.
@@ -1005,7 +1006,11 @@ position extraction. Those implementations must change together before this revi
    null for other routes except globally routed multi-chunk packets. `lane` is REALTIME or
    chunk only; global/view/control/ordinary are CONTROL only; joins are chunk only.
    `epoch_change:true` is CONTROL/global only and matches reviewed level replacement packets.
-   Non-play routes are CONTROL/global. Reject missing/unknown fields, duplicate keys/routes,
+   Non-play routes are CONTROL/global. Every serverbound route MUST be CONTROL; reject a
+   serverbound REALTIME or chunk route before offering `/3`. Serverbound records have no
+   explicit cross-stream dependencies, since that direction uses only CONTROL; a nonzero
+   serverbound dependency_count or a serverbound auxiliary record closes with `0x11`.
+   Reject missing/unknown fields, duplicate keys/routes,
    unsupported schema/identifiers and invalid combinations before offering `/3`.
    R is SHA-256 of the exact resource bytes, whitespace included, identical at both peers.
    Mandatory CONTROL data must now enforce the required fence policy too, not merely lane.
@@ -1073,7 +1078,8 @@ position extraction. Those implementations must change together before this revi
     of those entities. A later view gate can execute while chunk 7 is missing, but new chunk
     records wait for that gate. A respawn/global waits for every old chunk, and new-epoch
     records wait for respawn execution. Independently withhold every predecessor in tests.
-12. **13.12 Memory, reservations and progress.** Give every active stream a non-borrowable
+12. **13.12 Direction-specific memory, reservations and progress.**
+    **Clientbound (client receives):** give every active stream a non-borrowable
     receive slot of B = 2 MiB + 128 bytes and 128 record slots. Admit at most one head
     scheduling unit (one record or one complete bundle) per stream into application buffering;
     stop reading that stream until its unit commits. A bundle's total wire size, headers
@@ -1096,13 +1102,45 @@ position extraction. Those implementations must change together before this revi
     scheduling therefore advances the earliest unit; a blocked join cannot steal the missing
     predecessor's capacity. This assumes transport progress and a completing game handler,
     not a malicious or stalled peer. The timer is a failure bound, not the deadlock remedy.
-    Initial/native credit and unparsed read chunks are additional exposure (13.13). Each node
-    MUST reserve aggregate capacity for every admitted connection's progress slots, workspace
-    and transport exposure before admitting it; reserve capacity need not allocate buffers.
-    No credit or retained allocation may overcommit the node budget. Refuse new `/3`
-    admissions if the reservation cannot fit; leave TCP untouched. Release reservations only
-    after credit exposure and retained data are gone. Record this cost at the 50,000-player
-    target; profile values remain unmeasured, not claims that this peak fits every node.
+    Client native credit and unparsed read chunks are additional exposure (13.13). The
+    client reserves capacity for its progress slots, workspace and transport exposure;
+    reserve capacity need not allocate buffers. These are client receive reservations,
+    NOT reservations imposed on the server for every connected player.
+
+    **Serverbound (server receives):** all packets use one ordered CONTROL direction, so
+    there is no cross-stream prerequisite and no need for per-stream progress slots or a
+    pre-reserved execution workspace. Reserve only 24 KiB per admitted connection for unread
+    serverbound stream data (13.13). Idle connections retain no partial/read/decode buffers
+    and hold no more than this admission share against the receive budget. This figure is
+    not total connection memory: QUIC metadata, crypto/handshake and other subsystems remain
+    separately accounted. At 50,000 idle connections the receive admission shares total
+    1,228,800,000 bytes (about 1.14 GiB), not a multi-MiB workspace per player.
+    Admit at most one serverbound record into application buffering, bounded by both the
+    game's serverbound packet limits and 13.4's maximum record length (2097212 wire bytes
+    including its prefix). Charge read chunks, partial records and decoded/scratch storage
+    to the shared node budget on demand, before reading or allocating them. Retain at most
+    8 MiB decoded/scratch data for the one executing record, or stricter game limits; this
+    is a ceiling, not an idle reservation or a claimed game packet limit. No speculative
+    decoding or second record while that workspace is occupied. Release each charge when
+    its bytes are no longer retained, returning to the admission share when idle.
+    Node refusal is non-fatal: withhold/retry the read or allocation without evicting data
+    or advancing the parser/handler; leave already charged partial data intact. The 10-second
+    timers below still run and eventually close a stalled connection. If a refused read
+    has not consumed a first byte yet, start a 10-second resource-wait timer at its first
+    refusal; only resuming that operation clears it, not unrelated progress. Unlike clientbound
+    reception, progress under aggregate node pressure may rely on these timeouts releasing
+    resources; no cross-stream dependency can deadlock one serverbound connection.
+    With the conservative 128 KiB unparsed-read ceiling in 13.13, the server's per-connection
+    receive worst case is 24 KiB + 128 KiB + 2097212 bytes + 8 MiB = 10641468 bytes
+    (about 10.15 MiB), further reduced by the game's serverbound packet limits. This peak
+    is charged on demand from the node pool, never reserved for every idle player.
+
+    **Shared accounting:** no advertised credit or retained allocation may overcommit the
+    node budget. Before admission, reserve the server's 24 KiB share, not the client's
+    progress/workspace budget; refuse admission if that share cannot fit, leaving TCP
+    untouched. Debit further server buffering before taking ownership of bytes. Release
+    credit reservations only when their exposure is gone. Record admission shares, actual
+    active peaks and refusals at the 50,000-player target; profile values remain unmeasured.
     Unsent application queues are separately capped at 1024 packets or 16 MiB, with node
     accounting and backpressure; an unpausable producer overflows with `0x11`.
     Incomplete record/bundle: 10 seconds from first byte. Blocked head: 10 seconds from
@@ -1118,21 +1156,30 @@ position extraction. Those implementations must change together before this revi
     uni limits are zero. Never increase MAX_STREAMS. Application validation rejects any
     server stream index >= N even though transport permits six. The client initially
     advertises 256 KiB per bidi stream and 2 MiB connection credit; the server advertises
-    8 KiB per bidi stream and 64 KiB connection credit. Pin native maximum receive windows
-    to those same respective values: no auto-tuning to larger windows. As the application reads
-    into its reserved slot, rolling flow control can replenish that stream's pinned window;
-    an incomplete head must continue reading, even while it is dependency-blocked, until its
+    8 KiB per bidi stream and 24 KiB connection credit, preserving the existing server
+    admission share. Pin native maximum receive windows
+    to those same respective values: no auto-tuning to larger windows. As the application
+    reads into client-reserved or server-node-charged buffering, rolling flow control can
+    replenish that stream's pinned window;
+    a clientbound incomplete head must continue reading, even while dependency-blocked, until its
     complete frame/unit fits the reserved slot. Do not read ahead into the next unit.
-    This bounds quiche-unread stream exposure by 2 MiB at the client and 64 KiB at the server
-    (8 streams times the pinned window), additional to 13.12. Count one at-most-16-KiB
-    unparsed read chunk per stream separately: at most 128 KiB more, including any suffix
+    This bounds quiche-unread stream exposure by 2 MiB at the client and 24 KiB at the server
+    (the server connection window bounds the aggregate even with eight permitted streams).
+    The latter is exactly the server admission share in 13.12, not an additional charge.
+    Count one at-most-16-KiB unparsed read chunk per stream separately: at most 128 KiB more,
+    including any suffix
     beyond a unit boundary. Native transport and read chunk charges may overlap conservatively,
     never be omitted. Crypto/handshake/0-RTT
     buffers need separate node admission accounting, not a claim they fit stream credit.
-    Receiving and credit replenishment MUST be fair across all streams; never stop all
-    reads because one shard is full. Reserve the native exposure even for unused permitted
-    streams until the connection closes. If Netty cannot enforce window pins and bounded
-    reads, patch/test it before enabling `/3`; initial values alone are insufficient.
+    Client receiving and credit replenishment MUST be fair across all streams; never stop
+    all reads because one shard is full. The server may stop CONTROL reads on a node-budget
+    refusal as in 13.12; auxiliary serverbound directions accept only their bounded preambles,
+    then need no further reads; any observed record is fatal. Keep the respective native exposure reserved
+    until connection close; unused streams do not multiply the server's 24 KiB aggregate.
+    Maximum-window pins are provided by the project's existing, tested Netty patch
+    `natives/patches/netty/0005-max-flow-control-windows.patch` (netty/0005); no further native
+    patch is planned. Retest pins and bounded reads for these revised limits before enabling
+    `/3`; initial values alone are insufficient.
     These windows trade throughput for a provable memory bound. A clientbound 2 MiB record
     needs roughly eight window turns; a large serverbound record at 8 KiB per RTT can hit
     the 10-second timer (about 800 KiB at 100 ms RTT). Benchmark the limits before enablement;
@@ -1164,6 +1211,8 @@ position extraction. Those implementations must change together before this revi
     bundle, validates the strongest member policy before execution, and commits the closing
     watermark only after applying the complete bundle atomically to the game's bundle handler.
     A missing close after 10 seconds, nested delimiter or policy violation closes `0x11`.
+    These bundle buffering limits apply clientbound. Serverbound records remain bounded by
+    the game's serverbound packet limits and the single-record admission rules in 13.12.
 16. **13.16 Compression.** Compression remains per Minecraft packet, not a shared compressed
     stream. Threshold changes are global fences; encode the change packet using the old
     threshold, subsequent packets using the new one. Receiver applies the new threshold
@@ -1291,7 +1340,10 @@ position extraction. Those implementations must change together before this revi
     batch installs before finished/rate feedback; join-cycle rejection; bundle promotion;
     all slots simultaneously full with each missing prerequisite withheld independently;
     serial handler delayed after receipt; native-window pins and node admission pressure;
-    and sustained REALTIME load with guaranteed chunk progress and aged CONTROL progress.
+    all-serverbound-CONTROL routing, 24 KiB idle server receive shares, non-fatal node-budget
+    read/allocation refusals followed by recovery or timeout, release of active buffers back
+    to the idle share, and sustained REALTIME load with guaranteed chunk progress and aged
+    CONTROL progress.
     Measure actual header bytes, per-stream peak buffers, execution workspace, native/unparsed
     exposure, CPU per player, priority fairness, join latency and chunk-load throughput,
     comparing TCP and single-stream under every netem profile. No measurements are claimed.
@@ -1314,7 +1366,8 @@ position extraction. Those implementations must change together before this revi
    and immutable per-connection selection in 13.2? Benchmark 1..6 before choosing defaults.
 2. Confirm the fixed epoch-mixed 32-bit position hash in 13.18, or choose another before
    implementing golden vectors? This is a wire decision, not administrator configuration.
-3. Confirm the explicit worst-case receive reservation: 16 MiB + 1 KiB wire, 8 MiB execution,
-   plus 2 MiB client/64 KiB server native stream exposure and at most 128 KiB unparsed reads?
-   The tighter one-unit-per-stream/bundle limits buy deadlock-free progress but must be
-   benchmarked, particularly at 50,000 connections. Hardware profile values stay planned.
+3. Confirm the direction-specific receive policy: the client reserves up to 16 MiB + 1 KiB
+   wire and 8 MiB execution, plus 2 MiB native exposure and at most 128 KiB unparsed reads;
+   the server reserves only 24 KiB per idle connection, charging active CONTROL buffering
+   on demand to the node pool (13.12/13.13)? Client progress and server capacity must be
+   benchmarked separately, including 50,000 server connections. Hardware profiles stay planned.
