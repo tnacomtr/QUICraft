@@ -1637,7 +1637,12 @@ position extraction. Those implementations must change together before this revi
      bounded, not per identity); that precondition is DDoS-sized and the table never
      refuses admission, so the damage is limited to which eligible holder is reclaimed
      first, never to protected shares.
-     Under churn beyond the continuity table's bound (the exact IP and account tracking capacities), the oldest overflowed identities can lose bucket continuity. Like poisoning, this is DDoS-sized and affects only the shedding order.
+     Under churn beyond the continuity table's bound (the exact IP and account tracking
+     capacities), the oldest overflowed identities can lose bucket continuity. When the
+     table is full it drops, in order: the oldest record past the 10-minute history window,
+     else the oldest record whose bucket still has live users, else the oldest record, so
+     the bound always holds. Like poisoning, this is DDoS-sized and affects only the
+     shedding order.
      The ranking-history table NEVER causes admission/grant refusal or TCP fallback,
      even when all exact entries are protected. Independent rate admission limits
      still apply. All ranking windows/weights are
