@@ -99,6 +99,39 @@ class V3NodeBudgetTest {
         }
     }
 
+    /**
+     * 13.12 with the 13.13 exposure: a budget of exactly N times the per-connection exposure admits N
+     * /3 connections and refuses the N+1th, so the reservation is what the server can really hold.
+     */
+    @Test
+    void aBudgetOfExactlyNExposuresAdmitsNConnectionsAndRefusesTheNPlusFirst() throws Exception {
+        assumeTrue(QuicSupport.hasMaxFlowControlWindows() && QuicSupport.hasKeyingMaterialExport(),
+                "/3 needs QUICraft's patched native (12.2, 12.3, 13.13)");
+        final int n = 3;
+        AtomicInteger accepted = new AtomicInteger();
+        ReceiveBudget budget = ReceiveBudget.bounded(n * TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
+        TransportConfig config = TransportConfig.builder().nodeBudget(budget).build();
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity, config,
+                stream -> accepted.incrementAndGet(), protocol -> V3ConnectionTest.TABLE)) {
+            for (int i = 1; i <= n; i++) {
+                V3Connection conn = QuicClient.connectV3(server.localAddress(), identity.fingerprint(),
+                        V3ConnectionTest.TABLE, null).get(10, TimeUnit.SECONDS);
+                final int expected = i;
+                assertTrue(await(() -> accepted.get() == expected, 5_000), "connection " + i + " of " + n + " fits");
+            }
+            assertEquals(n * TransportConfig.V3_INITIAL_EXPOSURE_BYTES, budget.reserved(), "N exposures reserved");
+
+            try {
+                V3Connection extra = QuicClient.connectV3(server.localAddress(), identity.fingerprint(),
+                        V3ConnectionTest.TABLE, null).get(10, TimeUnit.SECONDS);
+                assertTrue(await(() -> !extra.isOpen(), 5_000), "the N+1th connection ends");
+            } catch (java.util.concurrent.ExecutionException refusedAtHandshake) {
+                // Also a refusal.
+            }
+            assertEquals(n, accepted.get(), "the N+1th /3 connection was refused");
+        }
+    }
+
     private static boolean await(BooleanSupplier condition, long millis) throws InterruptedException {
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
         while (System.nanoTime() < deadline) {

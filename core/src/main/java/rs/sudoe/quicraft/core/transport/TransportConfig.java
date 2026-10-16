@@ -33,10 +33,17 @@ public final class TransportConfig {
      * server may send (clientbound).
      */
     public static final long MULTISTREAM_CLIENTBOUND_INITIAL_MAX_DATA = 16L << 20;
-    /** /3: the server advertises this much connection credit, i.e. what the client may send (serverbound). */
-    public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = 256L << 10;
     /** /3: both bidirectional per-stream initial limits, at both ends. */
     public static final long MULTISTREAM_INITIAL_MAX_STREAM_DATA = 8L << 10;
+    /** /3 (13.3): bidirectional streams in use at once: client streams 0 and 4, server stream 1. */
+    public static final int MULTISTREAM_STREAMS = 3;
+    /**
+     * /3: the server advertises this much connection credit, i.e. what the client may send (serverbound).
+     * It equals the sum of the three pinned stream windows, the most quiche can hold unread on the
+     * server (a larger connection window is unreachable and would only inflate the node-budget
+     * reservation, 13.12). Pinned by {@code MultistreamTransportConfigTest}.
+     */
+    public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = MULTISTREAM_STREAMS * MULTISTREAM_INITIAL_MAX_STREAM_DATA;
     /** /3: the server lets the client open streams 0 and 4. */
     public static final int MULTISTREAM_SERVER_MAX_STREAMS_BIDI = 2;
     /** /3: the client lets the server open stream 1. */
@@ -250,9 +257,10 @@ public final class TransportConfig {
 
     /**
      * The receive credit a server grants an admitted {@code /3} connection before anything arrives
-     * (13.13: {@code initial_max_data} 256 KiB), which 13.12 reserves against the node budget.
+     * (13.13: {@code initial_max_data} = three pinned 8 KiB stream windows, 24 KiB), which 13.12 reserves
+     * against the node budget.
      */
-    public static final long V3_INITIAL_EXPOSURE_BYTES = 256L * 1024;
+    public static final long V3_INITIAL_EXPOSURE_BYTES = MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA;
 
     /** IP addresses tracked per limiter. System property {@code quicraft.admission.maxTrackedIps}. */
     public int maxTrackedIps() {
@@ -407,7 +415,7 @@ public final class TransportConfig {
         }
 
         /**
-         * /3 limits (13.13): initial_max_data 16 MiB at the client and 256 KiB at the server, bidi
+         * /3 limits (13.13): initial_max_data 16 MiB at the client and 24 KiB at the server, bidi
          * per-stream limits of 8 KiB, 2 bidi streams at the server and 1 at the client, no uni
          * streams. Replaces initialMaxData and initialMaxStreamData.
          */
