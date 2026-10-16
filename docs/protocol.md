@@ -1520,7 +1520,9 @@ position extraction. Those implementations must change together before this revi
     Thus an activated idle server connection with the currently implemented table (every
     serverbound record on CONTROL) reserves 30 KiB: the separate 24 KiB quiche-unread
     admission share plus 4 + 1 + 1 KiB read grants (measured in `docs/benchmarks.md`). This
-    post-login accounting does not apply during staged pre-login admission.
+    post-login accounting does not apply during staged pre-login admission. The 4 + 1 + 1 KiB
+    grants describe the current code only; under this draft, serverbound read grants come from
+    the protected area P inside the 24 KiB share (13.13) and are not charged on top of it.
     The serverbound dual-lane draft below puts serverbound REALTIME in the table: that lane
     then carries records within its 512-byte wire cap instead of holding a sentinel read,
     its reads come from the 2 KiB REALTIME slice inside the 24 KiB share, and the 40 KiB
@@ -1963,8 +1965,8 @@ position extraction. Those implementations must change together before this revi
     duplicated in the header: extract them from the eligible packet and validate its stream
     before executing it. Invalid coordinates/extraction, wrong shard and invalid epoch are
     `0x11`. Supply cross-language golden vectors for all N=1..6, negative/extreme coordinates
-    and successive epochs before implementation is accepted. The proposed hash is subject
-    to the explicit user confirmation below, not an implementation choice left unspecified.
+    and successive epochs before implementation is accepted. The owner approved this hash
+    (answered question 2); it is not an implementation choice.
 
 19. **13.19 Join records.** Joins live on CHUNK[0], even when their semantic positions hash
     elsewhere. They have explicit dependencies on the actual covered frontiers, not an
