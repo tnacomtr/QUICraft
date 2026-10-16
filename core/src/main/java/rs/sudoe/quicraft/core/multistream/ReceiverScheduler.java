@@ -127,12 +127,62 @@ public final class ReceiverScheduler {
     /** Identity token for a first-byte reservation; never reuse after release/complete. */
     public static final class Partial {
         private final Lane lane;
-        private final long started;
+        private long started;
         private long bytes;
         private Partial(Lane lane, long bytes, long now) {
             this.lane = lane;
             this.bytes = bytes;
             this.started = now;
+        }
+    }
+
+    /** Transport-local withholding is not evidence of a stalled peer. Event-loop only. */
+    private final long[] receiveBlockedSince = {-1, -1, -1};
+    private long dependenciesBlockedSince = -1;
+
+    void receiveBlocked(Lane lane, boolean blocked, long now) {
+        enter();
+        int index = lane.ordinal();
+        long since = receiveBlockedSince[index];
+        if (blocked == (since >= 0)) {
+            return;
+        }
+        if (blocked) {
+            receiveBlockedSince[index] = now;
+        } else {
+            for (Partial p : partials.keySet()) {
+                if (p.lane == lane) {
+                    p.started += now - Math.max(p.started, since);
+                }
+            }
+            receiveBlockedSince[index] = -1;
+        }
+        updateDependencyPause(now);
+    }
+
+    private void updateDependencyPause(long now) {
+        boolean blocked = false;
+        for (long since : receiveBlockedSince) {
+            blocked |= since >= 0;
+        }
+        for (ArrayDeque<Entry> q : queues) {
+            for (Entry entry : q) {
+                blocked |= entry.nodeBlockedSince >= 0;
+            }
+        }
+        if (blocked && dependenciesBlockedSince < 0) {
+            dependenciesBlockedSince = now;
+        } else if (!blocked && dependenciesBlockedSince >= 0) {
+            // Missing predecessors and bundle-close bytes can be on any locally withheld lane.
+            for (ArrayDeque<Entry> q : queues) {
+                for (Entry entry : q) {
+                    entry.headSince += now - Math.max(entry.headSince, dependenciesBlockedSince);
+                }
+            }
+            if (receivingBundle) {
+                bundleStarted += now - Math.max(bundleStarted, dependenciesBlockedSince);
+            }
+            dependenciesBlockedSince = -1;
         }
     }
 
@@ -146,6 +196,7 @@ public final class ReceiverScheduler {
         boolean head;
         /** First attempt of this entry's current decode, or -1 while it has none (13.12). */
         long decodeSince = -1;
+        long nodeBlockedSince = -1;
         /** Bytes the current decode attempt reserved, released if that attempt is refused. */
         long decodeReservedBytes;
         Entry(Envelope envelope, long bytes) {
@@ -659,6 +710,11 @@ public final class ReceiverScheduler {
                 }
                 if (next.decode != null) {
                     decoding = next.decode;
+                    if (decoding.nodeBlockedSince >= 0) {
+                        decoding.decodeSince += pumpNow - Math.max(decoding.decodeSince, decoding.nodeBlockedSince);
+                        decoding.nodeBlockedSince = -1;
+                        updateDependencyPause(pumpNow);
+                    }
                     if (decoding.decodeSince < 0) {
                         // This entry's own first attempt. A retry of the same entry keeps it, so the
                         // 13.12 decode deadline runs from the first attempt; a later entry starts
@@ -674,6 +730,8 @@ public final class ReceiverScheduler {
                         // rerun from its start, so keeping them would charge the same output again on
                         // every retry and drain the budget.
                         releaseDecodeAttempt(decoding);
+                        decoding.nodeBlockedSince = pumpNow;
+                        updateDependencyPause(pumpNow);
                         decoding = null;
                         return;
                     } catch (RuntimeException ex) {
@@ -837,31 +895,29 @@ public final class ReceiverScheduler {
     public void checkDeadlines(long now) {
         enter();
         try {
-            // 13.12: every entry with an active decode deadline, whether that decode is still
-            // running or was refused before any allocation. A refused entry is queued, undecoded and
-            // eligible, so it is not a "blocked head" and no retry of it may ever come: its deadline
-            // has to be enforced here and cannot wait for another attempt to check it.
+            // Local allocation refusal pauses the decode timer, not application/handler timeouts.
             for (ArrayDeque<Entry> q : queues) {
                 for (Entry entry : q) {
-                    if (entry.decodeSince >= 0 && now - entry.decodeSince >= TIMEOUT_NANOS) {
+                    if (entry.nodeBlockedSince < 0 && entry.decodeSince >= 0
+                            && now - entry.decodeSince >= TIMEOUT_NANOS) {
                         throw new OrderingException("uncompleted decode timeout");
                     }
                 }
             }
-            if (receivingBundle && now - bundleStarted >= TIMEOUT_NANOS) {
+            if (dependenciesBlockedSince < 0 && receivingBundle && now - bundleStarted >= TIMEOUT_NANOS) {
                 throw new OrderingException("missing bundle close timeout");
             }
             if (outstanding != null && now - outstandingSince >= TIMEOUT_NANOS) {
                 throw new OrderingException("unapplied handler timeout");
             }
             for (Partial p : partials.keySet()) {
-                if (now - p.started >= TIMEOUT_NANOS) {
+                if (receiveBlockedSince[p.lane.ordinal()] < 0 && now - p.started >= TIMEOUT_NANOS) {
                     throw new OrderingException("incomplete record timeout");
                 }
             }
             for (ArrayDeque<Entry> q : queues) {
                 Entry head = q.peek();
-                if (head != null && now - head.headSince >= TIMEOUT_NANOS
+                if (dependenciesBlockedSince < 0 && head != null && now - head.headSince >= TIMEOUT_NANOS
                         && (outstanding == null || outstanding.lane() != head.envelope.lane())
                         && (decoding == null || decoding.envelope.lane() != head.envelope.lane())
                         && blocked(q)) {

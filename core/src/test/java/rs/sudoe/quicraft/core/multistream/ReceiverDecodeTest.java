@@ -268,20 +268,26 @@ class ReceiverDecodeTest {
         assertEquals(0, h.scheduler.pendingBytes(), "nothing is retained after both records");
     }
 
-    @Test void aRefusedDecodeExpiresOnItsOwnDeadlineWithoutARetry() {
-        // Room for the wire charge only, so the decode itself is always refused; the entry stays
-        // queued, undecoded and eligible. Nothing retries it, so this deadline check is the only
-        // thing that can end it (13.12).
-        ReceiveBudget node = ReceiveBudget.bounded(35);
+    @Test void aLocallyRefusedDecodeRecoversBeyondItsDeadline() {
+        ReceiveBudget node = ReceiveBudget.bounded(36);
+        assertTrue(node.tryReserve(1));
+        List<ReceiverScheduler.Delivery> delivered = new ArrayList<>();
         final ReceiverScheduler[] self = new ReceiverScheduler[1];
         ReceiverScheduler scheduler = new ReceiverScheduler((envelope, insideBundle, now) -> {
             self[0].reserveDecoded(envelope, 1, 1, now);
             self[0].decoded(envelope, Envelope.Bundle.NONE, false, "decoded", now);
-        }, delivery -> { }, node);
+        }, delivered::add, node);
         self[0] = scheduler;
         scheduler.offer(raw(Lane.CONTROL, 1, 0, 0, 0), 0);
         scheduler.checkDeadlines(T - 1);
-        fails(() -> scheduler.checkDeadlines(T));
+        scheduler.checkDeadlines(2 * T);
+        scheduler.retry(2 * T);
+        assertTrue(delivered.isEmpty());
+        node.release(1);
+        scheduler.retry(3 * T);
+        assertEquals(1, delivered.size());
+        scheduler.applied(Lane.CONTROL, 1, 3 * T);
+        assertEquals(0, node.reserved());
     }
 
     @Test void aRefusedSecondReservationIsNotKeptForTheRetry() {

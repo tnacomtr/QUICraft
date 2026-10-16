@@ -643,13 +643,14 @@ public final class LaneSession {
 
     /**
      * Charges an unparsed transport chunk to the node budget while it is held (13.12). The bytes
-     * already arrived, so a refusal is the fatal case of 13.12: this connection closes with 0x11
-     * rather than evicting another connection's reservation. The charge goes back when the lane
-     * stream consumes or discards the chunk.
+     * already arrived. The read allocator caps every granted read at {@code grantedBytes}, so a
+     * refusal here is a local invariant violation, never peer misconduct: it closes with the
+     * internal-error code (0x2), not 0x11, rather than evicting another connection's reservation.
+     * The charge goes back when the lane stream consumes or discards the chunk.
      */
     private void chargeChunk(int bytes) {
         if (bytes > 0 && !node.tryReserve(bytes)) {
-            throw new OrderingException("node receive budget exhausted by an unparsed chunk (13.12)");
+            throw new IllegalStateException("node receive budget refused an unparsed chunk the read cap should have prevented (13.12)");
         }
     }
 
@@ -1272,13 +1273,18 @@ public final class LaneSession {
 
     // --- Timers.
 
-    private boolean awaitingPeerStreams() {
+    private boolean peerStreamOverdue(long t) {
         if (!activated) {
             return false;
         }
         LaneStream r = streams[Lane.REALTIME.ordinal()];
         LaneStream w = streams[Lane.WORLD.ordinal()];
-        return r == null || w == null || !r.opened || !w.opened;
+        return streamOverdue(r, t) || streamOverdue(w, t);
+    }
+
+    private boolean streamOverdue(LaneStream s, long t) {
+        return (s == null || !s.opened) && t - activatedAt
+                - (s == null ? 0 : s.localWaitNanos(t)) >= timing.openTimeoutNanos;
     }
 
     /**
@@ -1340,7 +1346,7 @@ public final class LaneSession {
                 fail(CLOSE_ORDERING, "the peer stopped reading a lane (13.14)", null);
                 return;
             }
-            if (awaitingPeerStreams() && t - activatedAt >= timing.openTimeoutNanos) {
+            if (peerStreamOverdue(t)) {
                 fail(CLOSE_ORDERING, "an allowed stream did not open in time (13.14)", null);
                 return;
             }
@@ -1445,7 +1451,7 @@ public final class LaneSession {
     private boolean firstRecordByteBlocked(long now) {
         for (Lane lane : Lane.values()) {
             LaneStream s = streams[lane.ordinal()];
-            if (s != null && s.waitingSince != 0
+            if (s != null && s.localBlockedSince < 0 && s.waitingSince != 0
                     && now - s.waitingSince >= ReceiverScheduler.TIMEOUT_NANOS) {
                 return true;
             }
@@ -1537,6 +1543,35 @@ public final class LaneSession {
          * moves into the parser reservation ({@link #takeWaitingSince()}) and is cleared there.
          */
         long waitingSince;
+        boolean nodeReadBlocked;
+        boolean nodeParserBlocked;
+        long localBlockedSince = -1;
+        long localPausedNanos;
+
+        long localWaitNanos(long t) {
+            return localPausedNanos + (localBlockedSince < 0 ? 0 : t - localBlockedSince);
+        }
+
+        void nodeBlocked(boolean parser, boolean blocked) {
+            if (parser) {
+                nodeParserBlocked = blocked;
+            } else {
+                nodeReadBlocked = blocked;
+            }
+            boolean any = nodeParserBlocked || nodeReadBlocked;
+            long t = now();
+            if (any && localBlockedSince < 0) {
+                localBlockedSince = t;
+                receiver.receiveBlocked(lane, true, t);
+            } else if (!any && localBlockedSince >= 0) {
+                if (waitingSince != 0) {
+                    waitingSince += t - Math.max(waitingSince, localBlockedSince);
+                }
+                localPausedNanos += t - localBlockedSince;
+                localBlockedSince = -1;
+                receiver.receiveBlocked(lane, false, t);
+            }
+        }
 
         LaneStream(Lane lane) {
             this.lane = lane;
@@ -1569,8 +1604,10 @@ public final class LaneSession {
             int growth = wireBytes - (partial == null ? 0 : (int) charged);
             if (!node.tryReserve(growth)) {
                 withheldForNode = true;
+                nodeBlocked(true, true);
                 return false;
             }
+            nodeBlocked(true, false);
             try {
                 if (partial == null) {
                     // The exact parser allocation owns this charge, not a speculative record grant.
@@ -1600,8 +1637,10 @@ public final class LaneSession {
             }
             if (!node.tryReserve(growth)) {
                 withheldForNode = true;
+                nodeBlocked(true, true);
                 return false;
             }
+            nodeBlocked(true, false);
             try {
                 if (partial == null) {
                     partial = receiver.reservePartial(lane, size, growth, takeWaitingSince(), now());
@@ -1650,8 +1689,10 @@ public final class LaneSession {
             int size = sentinel() ? READ_SENTINEL : nextReadBytes;
             if (!node.tryReserve(size)) {
                 withheldForNode = true;
+                nodeBlocked(false, true);
                 return false;
             }
+            nodeBlocked(false, false);
             granted = true;
             grantedBytes = size;
             ReadGrantAllocator.limit(channel, size);

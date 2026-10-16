@@ -1365,7 +1365,7 @@ class LaneSessionTest {
     }
 
     @Test
-    void waitForANodeGrantThatNeverComesClosesWith0x11AtTheDeadline() throws Exception {
+    void localParserRefusalBeyondTheDeadlineRecoversWithoutPeerMisconduct() throws Exception {
         ReceiveBudget node = ReceiveBudget.bounded(6L << 20);
         AtomicLong clock = new AtomicLong(5_000_000_000L);
         LaneRig.Config starved = new LaneRig.Config();
@@ -1381,20 +1381,73 @@ class LaneSessionTest {
             try {
                 assertTrue(LaneRig.await(() -> node.available() < (6L << 20) - 4_000_000L, 30000),
                         "the holder charged the node budget: " + node.available());
-                // The starved lane can parse the length but cannot allocate its body; 13.12's
-                // deadline still has to end it, because its first bytes are already buffered.
+                // A local allocation refusal is not evidence of peer inactivity.
                 LaneLoopback.write(four, RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.MOVE, 2_000_000)));
                 sleep(500);
                 assertEquals(0, rigB.serverGame.packetCount(), "no record is delivered while allocation is refused");
                 assertFalse(rigB.serverGame.closed.isDone(), "waiting is not a close by itself");
                 clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + 1_000_000_000L);
-                closedWith(rigB.serverGame, 0x11, false);
-                sawClose(rigB.net.clientSawClose, 0x11);
+                rigB.server.eventLoop().submit(rigB.server::tick).get(10, TimeUnit.SECONDS);
+                assertFalse(rigB.serverGame.closed.isDone(), "local parser contention must pause the deadline");
                 assertFalse(holder.serverGame.closed.isDone(), "the holder is never evicted");
             } finally {
                 holder.close();
             }
+            assertTrue(LaneRig.await(() -> rigB.serverGame.packetCount() == 1, 30000),
+                    "the legal record resumes after local pressure ends");
+            assertFalse(rigB.serverGame.closed.isDone());
         }
+    }
+
+    @Test
+    void locallyWithheldPreamblesCanOpenAfterTheOpenDeadline() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(512 * 1024);
+        AtomicLong clock = new AtomicLong(5_000_000_000L);
+        LaneRig.Config config = rawServerConfig(node);
+        config.serverTiming = new LaneSession.Timing(clock::get, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
+        try (LaneRig rig = LaneRig.start(config)) {
+            long held = node.available();
+            assertTrue(node.tryReserve(held));
+            openRawServerLanes(rig);
+            rig.server.eventLoop().submit(rig.server::tick).get(10, TimeUnit.SECONDS);
+            clock.addAndGet(LaneSession.OPEN_TIMEOUT_NANOS + TimeUnit.SECONDS.toNanos(1));
+            rig.server.eventLoop().submit(rig.server::tick).get(10, TimeUnit.SECONDS);
+            assertFalse(rig.serverGame.closed.isDone(), "locally withheld preambles are not late peer streams");
+            node.release(held);
+            assertTrue(LaneRig.await(() -> node.reserved() == 3 * LaneSession.READ_CHUNK_MIN, 10000));
+            clock.addAndGet(LaneSession.OPEN_TIMEOUT_NANOS + TimeUnit.SECONDS.toNanos(1));
+            rig.server.eventLoop().submit(rig.server::tick).get(10, TimeUnit.SECONDS);
+            assertFalse(rig.serverGame.closed.isDone(), "both preambles opened after recovery");
+        }
+        assertEquals(0, node.reserved());
+    }
+
+    @Test
+    void aSplitPrefixLocallyBlockedBeyondThePartialDeadlineRecovers() throws Exception {
+        ReceiveBudget node = ReceiveBudget.bounded(512 * 1024);
+        AtomicLong clock = new AtomicLong(5_000_000_000L);
+        LaneRig.Config config = rawServerConfig(node);
+        config.serverTiming = new LaneSession.Timing(clock::get, LaneSession.OPEN_TIMEOUT_NANOS,
+                LaneSession.END_LINGER_NANOS, TimeUnit.MILLISECONDS.toNanos(10));
+        try (LaneRig rig = LaneRig.start(config)) {
+            openRawServerLanes(rig);
+            byte[] record = RecordCodec.encodeGame(1, 0, 0, 0, LaneRig.frame(LaneRig.SPAWN, 200_000));
+            LaneLoopback.write(rig.clientControl, record[0]);
+            assertTrue(LaneRig.await(() -> snapshotIs(rig.server, 0, 1), 10000));
+            long held = node.available();
+            assertTrue(node.tryReserve(held));
+            LaneLoopback.write(rig.clientControl, Arrays.copyOfRange(record, 1, record.length));
+            sleep(300);
+            assertEquals(0, rig.serverGame.packetCount());
+            clock.addAndGet(ReceiverScheduler.TIMEOUT_NANOS + TimeUnit.SECONDS.toNanos(1));
+            rig.server.eventLoop().submit(rig.server::tick).get(10, TimeUnit.SECONDS);
+            assertFalse(rig.serverGame.closed.isDone(), "a partial's local wait must not expire");
+            node.release(held);
+            assertTrue(LaneRig.await(() -> rig.serverGame.packetCount() == 1, 10000));
+            assertFalse(rig.serverGame.closed.isDone());
+        }
+        assertEquals(0, node.reserved());
     }
 
     @Test
@@ -1664,7 +1717,7 @@ class LaneSessionTest {
     }
 
     @Test
-    void aRefusedOversizedChunkStillReturnsItsReadGrant() throws Exception {
+    void anOversizedTransportCompletionIsALocalInvariantFailureNotPeerMisconduct() throws Exception {
         // Room for the three lanes' idle grants and 1024 bytes more. A synthetic oversized
         // completion cannot charge its excess, so it fails closed and returns every grant.
         ReceiveBudget node = ReceiveBudget.bounded(3 * LaneSession.READ_CHUNK_MIN + 1024);
@@ -1676,8 +1729,9 @@ class LaneSessionTest {
             assertTrue(LaneRig.await(() -> node.reserved() == LaneSession.READ_CHUNK_MIN * 3, 10000),
                     "the lane holds its read grant before the read: " + node.reserved());
             feedChunk(rig.server, Lane.CONTROL, LaneSession.READ_CHUNK_MIN + 1025);
-            closedWith(rig.serverGame, 0x11, false);
-            sawClose(rig.net.clientSawClose, 0x11);
+            closedWith(rig.serverGame, LaneSession.CLOSE_INTERNAL_ERROR, false);
+            assertTrue(rig.serverGame.closeCause instanceof IllegalStateException);
+            sawClose(rig.net.clientSawClose, LaneSession.CLOSE_INTERNAL_ERROR);
             assertTrue(LaneRig.await(() -> node.reserved() == 0, 10000),
                     "closing returns every charge, the read grant included: " + node.reserved());
         }
