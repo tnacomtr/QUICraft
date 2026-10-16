@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -61,8 +62,16 @@ class NodePoolsTest {
         assertEquals(10, pools.reserved(ResourcePools.Pool.NODE));
     }
 
-    @Test void concurrentReservationsNeverExceedCapOrGoNegative() throws Exception {
-        final NodePools pools = new NodePools(1000, 0, 0, 10, false, 0);
+    /**
+     * Eight owners hold 7-byte reservations until the 100-byte cap refuses them, then release everything and start
+     * again. Holdings sum past the cap, so the threads really contend at it: refusals must occur, and no observed
+     * total may exceed the cap or go negative.
+     */
+    @Test void concurrentReservationsContendAtTheCapAndNeverExceedIt() throws Exception {
+        final long cap = 100;
+        final NodePools pools = new NodePools(cap, 0, 0, 10, false, 0);
+        final AtomicLong peak = new AtomicLong();
+        final AtomicInteger refused = new AtomicInteger();
         final AtomicInteger overCap = new AtomicInteger();
         final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
         List<Thread> threads = new ArrayList<Thread>();
@@ -70,12 +79,22 @@ class NodePoolsTest {
             final String owner = "owner" + n;
             Thread t = new Thread(() -> {
                 try {
+                    long held = 0;
                     for (int i = 0; i < 20_000; i++) {
                         if (pools.reserve(ResourcePools.Pool.NODE, owner, 7)) {
-                            if (pools.reserved(ResourcePools.Pool.NODE) > 1000) overCap.incrementAndGet();
-                            pools.release(ResourcePools.Pool.NODE, owner, 7);
+                            held += 7;
+                            long total = pools.reserved(ResourcePools.Pool.NODE);
+                            if (total > cap) overCap.incrementAndGet();
+                            peak.accumulateAndGet(total, Math::max);
+                        } else {
+                            refused.incrementAndGet();
+                            if (held > 0) {
+                                pools.release(ResourcePools.Pool.NODE, owner, held);
+                                held = 0;
+                            }
                         }
                     }
+                    if (held > 0) pools.release(ResourcePools.Pool.NODE, owner, held);
                 } catch (Throwable e) {
                     failure.compareAndSet(null, e);
                 }
@@ -85,6 +104,8 @@ class NodePoolsTest {
         }
         for (Thread t : threads) t.join();
         assertEquals(null, failure.get());
+        assertTrue(refused.get() > 0, "the threads must reach the cap and be refused");
+        assertTrue(peak.get() > cap / 2, "contention must push the pool well above half the cap: " + peak.get());
         assertEquals(0, overCap.get());
         assertEquals(0, pools.reserved(ResourcePools.Pool.NODE));
     }
