@@ -952,11 +952,13 @@ class LaneSessionTest {
     void aBridgeSideCloseAfterActivationIsTakenOverByTheControlEndPath() throws Exception {
         LaneRig.Config config = new LaneRig.Config();
         config.serverSession = false;
+        // The END linger must outlast a loopback retransmit, so one dropped datagram cannot make
+        // this test see no END at all (production lingers for 10 s, 13.14).
         config.clientTiming = new LaneSession.Timing(System::nanoTime, LaneSession.OPEN_TIMEOUT_NANOS,
-                TimeUnit.MILLISECONDS.toNanos(400), TimeUnit.MILLISECONDS.toNanos(20));
+                TimeUnit.SECONDS.toNanos(3), TimeUnit.MILLISECONDS.toNanos(20));
         try (LaneRig rig = LaneRig.start(config)) {
             LegacyControlOwner bridge = new LegacyControlOwner();
-            rig.clientControl.pipeline().addLast(bridge);
+            installOnLoop(rig.clientControl, bridge);
             rig.activateClient();
             // The raw server answers both preambles so the client's two lanes open.
             LaneLoopback.write(rig.serverRawStreams.poll(10, TimeUnit.SECONDS), (byte) 2, (byte) 1);
@@ -968,8 +970,11 @@ class LaneSessionTest {
                     "activation takes stream 0 over from the old handler");
             final LaneRig.Bytes controlBytes = new LaneRig.Bytes();
             final java.util.concurrent.atomic.AtomicBoolean fin = new java.util.concurrent.atomic.AtomicBoolean();
-            rig.serverControl.pipeline().addLast(finWatch(fin));
-            rig.serverControl.pipeline().addLast(controlBytes);
+            // Installed on the peer's loop and awaited, so both collectors are complete before the
+            // END is written: an off-loop pipeline change adds a handler's context at once but runs
+            // its handlerAdded() later, on that loop.
+            installOnLoop(rig.serverControl, finWatch(fin));
+            installOnLoop(rig.serverControl, controlBytes);
             // The lane path owns the close: END, never the old owner's bare FIN.
             rig.client.end();
             boolean closedPeersStream = LaneRig.await(() -> controlBytes.snapshot().length > 0, 10000);
@@ -984,6 +989,12 @@ class LaneSessionTest {
             closedWith(rig.clientGame, 0x0, false);
             sawClose(rig.net.serverSawClose, 0x0);
         }
+    }
+
+    /** Adds a handler to a channel's pipeline on that channel's loop, then waits for it. */
+    private static void installOnLoop(QuicStreamChannel channel,
+            io.netty.channel.ChannelHandler handler) throws Exception {
+        channel.eventLoop().submit(() -> channel.pipeline().addLast(handler)).get(10, TimeUnit.SECONDS);
     }
 
     private static ChannelInboundHandlerAdapter finWatch(final java.util.concurrent.atomic.AtomicBoolean fin) {
