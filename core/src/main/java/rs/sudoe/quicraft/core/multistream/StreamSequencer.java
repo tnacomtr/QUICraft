@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package rs.sudoe.quicraft.core.multistream;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/** Builds /3 sender headers at the single logical send ordering point (13.9, 13.18). */
+public final class StreamSequencer {
+    public enum Fence { ORDINARY_CONTROL, CONTROL_FENCE, GLOBAL, VIEW, REALTIME, CHUNK }
+    public static final int MAX_BUNDLE_MEMBERS = 126;
+    private final int n;
+    private final long[] assigned;
+    private final long[] epochs;
+    private long global, view, control;
+
+    /** Creates a direction-local sequencer for negotiated N (13.2, 13.18). */
+    public StreamSequencer(int n) {
+        LogicalStream.validateShardCount(n); this.n=n; assigned=new long[n+2]; epochs=new long[n+2];
+    }
+    /** Assigns a payload and sparse safe predecessors according to its fence class (13.9). */
+    public Record assign(int stream, Fence fence, byte[] payload, boolean serverboundInteraction) {
+        if (stream<0 || stream>=assigned.length || fence==null || payload==null) throw new IllegalArgumentException("record");
+        long seq=++assigned[stream]; if(seq<=0) throw new IllegalStateException("sequence overflow");
+        long[] deps=new long[assigned.length]; deps[stream]=seq-1;
+        if(stream!=LogicalStream.CONTROL && control>0) deps[0]=control;
+        switch(fence) {
+            case GLOBAL: for(int i=0;i<assigned.length;i++) deps[i]=Math.max(deps[i],assigned[i]-(i==stream?1:0)); global=seq; break;
+            case VIEW: for(int i=0;i<assigned.length;i++) deps[i]=Math.max(deps[i],assigned[i]-(i==stream?1:0)); view=seq; control=stream==0?seq:control; break;
+            case CONTROL_FENCE: deps[0]=Math.max(deps[0],assigned[0]-(stream==0?1:0)); deps[1]=Math.max(deps[1],assigned[1]); control=seq; break;
+            case REALTIME: if(serverboundInteraction || true) { deps[0]=Math.max(deps[0],Math.max(global,control)); } break;
+            case CHUNK: if(view>0) deps[0]=Math.max(deps[0],view); break;
+            default: if(serverboundInteraction && stream==0) deps[1]=assigned[1];
+        }
+        List<Record.Dependency> sparse=new ArrayList<Record.Dependency>();
+        for(int i=0;i<deps.length;i++) if(i!=stream && deps[i]>0) sparse.add(new Record.Dependency(i,deps[i]));
+        return new Record(stream,seq,epochs[stream],sparse,0,payload);
+    }
+    /** Starts a new epoch for the specified stream after an epoch transition (13.18). */
+    public void nextEpoch(int stream) { if(stream<0||stream>=epochs.length) throw new IllegalArgumentException("stream"); epochs[stream]++; assigned[stream]=0; }
+    /** Returns an immutable-by-copy sequence frontier (13.9). */
+    public long[] assigned() { return assigned.clone(); }
+}
