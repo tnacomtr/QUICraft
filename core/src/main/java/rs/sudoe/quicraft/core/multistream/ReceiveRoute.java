@@ -32,7 +32,8 @@ public final class ReceiveRoute {
      * @param lane lane class the route requires
      * @param fence fence/route the decoded packet requires; a header cannot downgrade it (13.10)
      * @param position chunk position for shard validation, or null for global/CONTROL/REALTIME records
-     * @param epochChange true if this record is the epoch boundary (its epoch is the new one, 13.18)
+     * @param epochChange true if this record is the epoch boundary; it carries the OLD epoch and advances
+     *                    the receive epoch by one when applied (13.18)
      * @param join true if this is an ACK_JOIN or BATCH_JOIN record, which must live on CHUNK[0] (13.19)
      */
     public ReceiveRoute(Lane lane, Dependency fence, Extractor.Position position, boolean epochChange, boolean join) {
