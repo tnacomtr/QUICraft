@@ -34,6 +34,13 @@ import rs.sudoe.quicraft.core.tls.Fingerprint;
  * is what a successful activation calls. Both maps use §6's schedule and both are persisted; a file
  * written before this state existed loads unchanged, because the activation entries carry their own
  * key prefix.
+ *
+ * <p><b>Unseen-prerequisite closes.</b> 13.12 makes repeated authenticated {@code unseen-prerequisite}
+ * closes the only resource close that writes this cache: {@link #recordUnseenPrerequisite(InetAddress,
+ * int, Fingerprint)} keeps the time of the last counted event per key, under its own key prefix, and
+ * the second counted event within ten minutes writes a shortest-step entry through
+ * {@link #recordShortestFailure(InetAddress, int, Fingerprint)}. A handshake success does not clear
+ * the counter, so successive joins can reach two events.</p>
  */
 public final class FailureCache {
     static final long INITIAL_BACKOFF_MILLIS = TimeUnit.MINUTES.toMillis(1);
@@ -47,6 +54,10 @@ public final class FailureCache {
      * failures only.
      */
     static final String ACTIVATION_PREFIX = "activation|";
+    /** Prefix of 13.12's unseen-prerequisite counter: {@code key=1,lastCountedEventTime}. */
+    static final String UNSEEN_PREFIX = "unseen|";
+    /** 13.12: two counted unseen-prerequisite events within this interval write an entry. */
+    static final long UNSEEN_INTERVAL_MILLIS = TimeUnit.MINUTES.toMillis(10);
 
     private static final class Entry {
         final int failures;
@@ -63,6 +74,8 @@ public final class FailureCache {
     private final Map<String, Entry> entries = new HashMap<>();
     /** §12.14's activation failures, keyed exactly like {@link #entries} and never cleared by a handshake success. */
     private final Map<String, Entry> activationEntries = new HashMap<>();
+    /** 13.12's last counted unseen-prerequisite event per key, in {@link Entry#blockedUntil}. */
+    private final Map<String, Entry> unseen = new HashMap<>();
 
     private FailureCache(Path file, LongSupplier clock) {
         this.file = file;
@@ -84,8 +97,20 @@ public final class FailureCache {
                 for (String key : p.stringPropertyNames()) {
                     String[] parts = p.getProperty(key).split(",");
                     Entry e = new Entry(Integer.parseInt(parts[0]), Long.parseLong(parts[1]));
-                    // Ignore nonsense rather than trusting it; drop long-expired entries.
-                    if (e.failures > 0 && e.blockedUntil - now <= MAX_BACKOFF_MILLIS
+                    if (key.startsWith(UNSEEN_PREFIX)) {
+                        // The counter's time is the last counted event: keep it only while it can
+                        // still pair with a new one, and never trust a time far in the future.
+                        if (e.failures == 1 && now - e.blockedUntil < UNSEEN_INTERVAL_MILLIS
+                                && e.blockedUntil - now <= UNSEEN_INTERVAL_MILLIS) {
+                            cache.unseen.put(key.substring(UNSEEN_PREFIX.length()), e);
+                        }
+                        continue;
+                    }
+                    // Ignore nonsense rather than trusting it; drop long-expired entries. A
+                    // shortest-step entry with no failure counted (13.12) is kept only while its
+                    // window runs, because it has nothing else to remember.
+                    if ((e.failures > 0 || (e.failures == 0 && e.blockedUntil > now))
+                            && e.blockedUntil - now <= MAX_BACKOFF_MILLIS
                             && now - e.blockedUntil < TimeUnit.DAYS.toMillis(7)) {
                         if (key.startsWith(ACTIVATION_PREFIX)) {
                             cache.activationEntries.put(key.substring(ACTIVATION_PREFIX.length()), e);
@@ -98,6 +123,7 @@ public final class FailureCache {
                 LOG.log(Level.INFO, "QUIC failure cache unreadable, starting empty: {0}", String.valueOf(e));
                 cache.entries.clear();
                 cache.activationEntries.clear();
+                cache.unseen.clear();
             }
         }
         return cache;
@@ -120,6 +146,55 @@ public final class FailureCache {
         long backoff = Math.min(INITIAL_BACKOFF_MILLIS << Math.min(failures - 1, 20), MAX_BACKOFF_MILLIS);
         entries.put(key, new Entry(failures, clock.getAsLong() + backoff));
         save();
+    }
+
+    /**
+     * Records a failure at §6's SHORTEST backoff step, for docs/protocol.md 13.12's two shortest-step
+     * writers: a peer {@code 0x12} received after the client's own ack-eliciting data sat unACKed
+     * for the fixed 10 seconds, and two counted unseen-prerequisite events. The window is one minute
+     * from now, but an existing longer window is kept as it is, and the consecutive-failure count
+     * (the exponent) is never increased: a fresh entry counts zero failures, so the next ordinary
+     * failure still starts at one minute.
+     */
+    public synchronized void recordShortestFailure(InetAddress address, int port, Fingerprint fingerprint) {
+        shortest(key(address, port, fingerprint));
+        save();
+    }
+
+    private void shortest(String key) {
+        Entry previous = entries.get(key);
+        long until = clock.getAsLong() + INITIAL_BACKOFF_MILLIS;
+        if (previous != null && previous.blockedUntil > until) {
+            until = previous.blockedUntil;
+        }
+        entries.put(key, new Entry(previous == null ? 0 : previous.failures, until));
+    }
+
+    /**
+     * Counts one authenticated unseen-prerequisite event for this key (docs/protocol.md 13.12,
+     * "Repeated unseen-prerequisite closes"): either a received application {@code CONNECTION_CLOSE}
+     * with {@code 0x12} and exactly the {@code unseen-prerequisite} phrase while {@code /3} was active
+     * after SERVER_SWITCH verified, or the client's own blocked-head timer expiry under the same
+     * conditions. The caller has already checked those conditions. When the previous counted event
+     * for this key lies within ten minutes, this writes a shortest-step entry
+     * ({@link #recordShortestFailure(InetAddress, int, Fingerprint)}), so the next join uses TCP until
+     * it expires; a single event writes no entry. The last event's time is kept either way, so two
+     * successive events always pair.
+     *
+     * @return true when this event wrote the shortest-step entry
+     */
+    public synchronized boolean recordUnseenPrerequisite(InetAddress address, int port, Fingerprint fingerprint) {
+        String key = key(address, port, fingerprint);
+        long now = clock.getAsLong();
+        Entry previous = unseen.get(key);
+        // A time ahead of the clock (it moved back) still pairs: the stricter reading.
+        boolean second = previous != null && now - previous.blockedUntil < UNSEEN_INTERVAL_MILLIS;
+        unseen.put(key, new Entry(1, now));
+        if (second) {
+            shortest(key);
+        }
+        save();
+        return second;
     }
 
     public synchronized void recordSuccess(InetAddress address, int port, Fingerprint fingerprint) {
@@ -167,9 +242,10 @@ public final class FailureCache {
 
     /** Forgets every failure, e.g. after the player fixed their firewall. */
     public synchronized void clear() {
-        if (!entries.isEmpty() || !activationEntries.isEmpty()) {
+        if (!entries.isEmpty() || !activationEntries.isEmpty() || !unseen.isEmpty()) {
             entries.clear();
             activationEntries.clear();
+            unseen.clear();
             save();
         }
     }
@@ -185,6 +261,9 @@ public final class FailureCache {
         for (Map.Entry<String, Entry> e : activationEntries.entrySet()) {
             p.setProperty(ACTIVATION_PREFIX + e.getKey(),
                     e.getValue().failures + "," + e.getValue().blockedUntil);
+        }
+        for (Map.Entry<String, Entry> e : unseen.entrySet()) {
+            p.setProperty(UNSEEN_PREFIX + e.getKey(), e.getValue().failures + "," + e.getValue().blockedUntil);
         }
         try {
             Files.createDirectories(file.toAbsolutePath().getParent());

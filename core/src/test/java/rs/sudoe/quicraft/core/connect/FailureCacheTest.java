@@ -197,4 +197,31 @@ class FailureCacheTest {
         assertTrue(cache.allows(ip, 25565, fp));
         assertFalse(cache.isActivationBlocked(ip, 25565, fp, now.get()));
     }
+
+    @Test
+    void theUnseenCounterAndItsShortestStepSurviveARestart(@TempDir Path dir) {
+        Path file = dir.resolve("quic-failures.properties");
+        AtomicLong now = new AtomicLong(5_000_000);
+        assertFalse(FailureCache.load(file, now::get).recordUnseenPrerequisite(ip, 25565, fp),
+                "one counted event writes nothing");
+
+        now.addAndGet(5 * MIN);
+        assertTrue(FailureCache.load(file, now::get).recordUnseenPrerequisite(ip, 25565, fp),
+                "the second event within ten minutes pairs with the first after a restart");
+        FailureCache reloaded = FailureCache.load(file, now::get);
+        assertFalse(reloaded.allows(ip, 25565, fp), "the shortest-step entry is on disk");
+        now.addAndGet(MIN);
+        assertTrue(reloaded.allows(ip, 25565, fp), "and it is one minute long");
+    }
+
+    @Test
+    void anUnseenCounterTenMinutesOldDoesNotPairAfterARestart(@TempDir Path dir) {
+        Path file = dir.resolve("quic-failures.properties");
+        AtomicLong now = new AtomicLong(5_000_000);
+        FailureCache.load(file, now::get).recordUnseenPrerequisite(ip, 25565, fp);
+        now.addAndGet(10 * MIN);
+        assertFalse(FailureCache.load(file, now::get).recordUnseenPrerequisite(ip, 25565, fp),
+                "ten minutes is not within the interval, so it starts a new count");
+        assertTrue(FailureCache.load(file, now::get).allows(ip, 25565, fp));
+    }
 }

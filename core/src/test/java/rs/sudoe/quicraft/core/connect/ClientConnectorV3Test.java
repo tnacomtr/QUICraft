@@ -777,6 +777,27 @@ class ClientConnectorV3Test {
     }
 
     @Test
+    void anActiveResourceWindowSendsAutoToTcpAndFailsQuicOnlyWithoutADial() throws Exception {
+        // 12.14: a locally detected resource abort started the fixed 60-second window for this server.
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+        assertTrue(f.rebinds.startResourceWindow(HOST, LOGICAL_PORT));
+
+        FakePlatform auto = new FakePlatform();
+        assertEquals("tcp", f.connect(f.connector(true, true), auto, Mode.AUTO).tcp(),
+                "inside the window, AUTO joins over TCP without another QUIC login");
+        assertEquals(0, auto.v3Dials.get());
+
+        FakePlatform quicOnly = new FakePlatform();
+        assertThrows(java.util.concurrent.ExecutionException.class,
+                () -> f.connect(f.connector(true, true), quicOnly, Mode.QUIC_ONLY),
+                "quic-only has no TCP fallback, so the window fails it");
+        assertEquals(0, quicOnly.v3Dials.get(), "and it does not dial /3 inside the window");
+        assertEquals(0, quicOnly.v2Dials.get());
+        assertEquals(0, quicOnly.tcpAttempts.get());
+    }
+
+    @Test
     void aFullPinStoreInQuicOnlyModeFailsInsteadOfSilentlyUsingTcp() throws Exception {
         Fixture f = Fixture.empty();
         f.advertiseV3();

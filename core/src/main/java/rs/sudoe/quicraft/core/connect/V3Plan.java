@@ -7,7 +7,10 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.function.Supplier;
+import java.util.Arrays;
+import rs.sudoe.quicraft.core.CloseReason;
 import rs.sudoe.quicraft.core.Faults;
+import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.pin.PinExpiry;
@@ -57,6 +60,16 @@ import rs.sudoe.quicraft.core.tls.Fingerprint;
  * tasks serially, which {@link ClientConnector.V3Support} guarantees by wrapping whatever executor
  * it is given; the plan's own state writes are ordered by that.</p>
  *
+ * <p><b>Close classification.</b> {@link #closed(Phase, CloseEvent, String)} is the classified form
+ * of {@link #failed(Phase, String)}: it sorts a {@code /3} close into a {@link CloseClass} with
+ * {@link #classify(CloseEvent, boolean, boolean, boolean)} (12.14, 13.12) and applies only that
+ * class's failure-cache and limiter effects. Generic resource closes write no failure-cache entry
+ * and start 12.14's fixed 60-second window instead; a pre-login shed writes nothing and only counts
+ * toward its own three-consecutive-shed bound; a dead path counts like an idle timeout; repeated
+ * authenticated unseen-prerequisite closes are the only resource closes that write the cache. The
+ * per-logical-server resource state lives in {@link RebindState}, with 12.16's limiter.
+ * {@link #failed(Phase, String)} stays the non-resource case.</p>
+ *
  * <p>Every state call fails closed: a failure cache or pin write that throws is treated as "the
  * write did not happen", so the pin is never assumed written and the backoff never assumed clear.
  * No method throws for anything the adapter or the worker does.</p>
@@ -72,6 +85,225 @@ public final class V3Plan {
         JOINING,
         /** The failure happened after activation, during play: disconnect, and the next join is TCP. */
         PLAY
+    }
+
+    /**
+     * 13.12: a peer {@code 0x12} received after the client's own ack-eliciting data sat unACKed for
+     * at least this long, on the client's own monotonic clock, is a transport failure.
+     */
+    public static final long PEER_RESOURCE_DEAD_PATH_MILLIS = 10_000L;
+
+    /**
+     * What ended a {@code /3} connection, as the client saw it (docs/protocol.md 12.14, 13.12). The
+     * client state that decides the class (Login Success, SERVER_SWITCH verified, {@code /3} active)
+     * is kept by the plan itself ({@link #loginSucceeded()}, {@link #serverSwitchVerified()}); this
+     * holds only the close and the path measurements of the moment. Immutable.
+     */
+    public static final class CloseEvent {
+        /** Where the close came from. */
+        public enum Kind {
+            /** A {@code CONNECTION_CLOSE} received from the server. */
+            PEER_CLOSE,
+            /** The client's own QUIC idle timeout (§5 step 5: a transport failure). */
+            IDLE_TIMEOUT,
+            /**
+             * A client-detected resource abort (outbound, pending-ACK or binding-queue wait, a pool
+             * refusal or a deadline the client closes with {@code 0x12}).
+             */
+            LOCAL_RESOURCE_ABORT,
+            /** The client's own blocked-head (unseen-prerequisite) timer expired (13.12). */
+            BLOCKED_HEAD_EXPIRY,
+            /** Any other client-side failure: {@code 0x10}, {@code 0x11}, an exception (non-resource). */
+            LOCAL_FAILURE
+        }
+
+        private final Kind kind;
+        private final CloseReason peerReason;
+        private final long unackedMillis;
+        private final long silentMillis;
+        private final long deadlineMillis;
+        private final boolean stallOrWithheld;
+
+        private CloseEvent(Kind kind, CloseReason peerReason, long unackedMillis, long silentMillis,
+                long deadlineMillis, boolean stallOrWithheld) {
+            this.kind = kind;
+            this.peerReason = peerReason;
+            this.unackedMillis = unackedMillis;
+            this.silentMillis = silentMillis;
+            this.deadlineMillis = deadlineMillis;
+            this.stallOrWithheld = stallOrWithheld;
+        }
+
+        /** A {@code CONNECTION_CLOSE} the server sent; {@code reason} carries its frame type, code and phrase. */
+        public static CloseEvent peerClose(CloseReason reason) {
+            if (reason == null) {
+                throw new IllegalArgumentException("reason");
+            }
+            return new CloseEvent(Kind.PEER_CLOSE, reason, 0, 0, 0, false);
+        }
+
+        /** The client's own idle timeout. */
+        public static CloseEvent idleTimeout() {
+            return new CloseEvent(Kind.IDLE_TIMEOUT, null, 0, 0, 0, false);
+        }
+
+        /**
+         * A resource abort the client detected and closes with {@code 0x12}.
+         *
+         * @param deadlineMillis the abort's whole deadline (13.12's zero-progress test spans it)
+         */
+        public static CloseEvent localResourceAbort(long deadlineMillis) {
+            return new CloseEvent(Kind.LOCAL_RESOURCE_ABORT, null, 0, 0, deadlineMillis, false);
+        }
+
+        /**
+         * The client's own blocked-head timer expired (13.12, "Deadline precedence"); the client
+         * closes {@code 0x12} with the {@code unseen-prerequisite} phrase.
+         *
+         * @param stallOrWithheld true when the expired wait consumed recorded tick-stall time or any
+         *     part of the blocked record's prerequisite chain was withheld locally (node pool, read
+         *     grant or decode refusal); such an expiry is a generic resource close and never counts
+         */
+        public static CloseEvent blockedHeadExpiry(boolean stallOrWithheld) {
+            return new CloseEvent(Kind.BLOCKED_HEAD_EXPIRY, null, 0, 0, 0, stallOrWithheld);
+        }
+
+        /** Any other client-side failure, classified non-resource. */
+        public static CloseEvent localFailure() {
+            return new CloseEvent(Kind.LOCAL_FAILURE, null, 0, 0, 0, false);
+        }
+
+        /**
+         * The same event with the path measurements of the moment, on the client's own monotonic
+         * clock (13.12 zero-progress rule).
+         *
+         * @param unackedMillis how long the client's own ack-eliciting data (PING/PTO probes
+         *     included) had been continuously outstanding without an ACK; 0 when none was
+         * @param silentMillis how long no authenticated packet of any kind had arrived from the peer
+         */
+        public CloseEvent path(long unackedMillis, long silentMillis) {
+            return new CloseEvent(kind, peerReason, Math.max(0, unackedMillis), Math.max(0, silentMillis),
+                    deadlineMillis, stallOrWithheld);
+        }
+
+        public Kind kind() {
+            return kind;
+        }
+
+        /** The received close, or null for a client-side event. */
+        public CloseReason peerReason() {
+            return peerReason;
+        }
+
+        /**
+         * 13.12's dead path: ack-eliciting data was outstanding for the WHOLE deadline and no
+         * authenticated packet arrived in that time. Only a client-detected abort with a deadline
+         * can be one; a blocked-head expiry never is.
+         */
+        boolean deadPath() {
+            return deadlineMillis > 0 && unackedMillis >= deadlineMillis && silentMillis >= deadlineMillis;
+        }
+
+        /** An application {@code CONNECTION_CLOSE} with the local/resource code {@code 0x12}. */
+        boolean peerResource() {
+            return peerReason != null && peerReason.isApplication()
+                    && peerReason.errorCode() == Protocol.CLOSE_RESOURCE;
+        }
+    }
+
+    /**
+     * How a {@code /3} close is treated by the client (docs/protocol.md 12.14, 13.12, Answered
+     * question 5), each with its own failure-cache and limiter effect.
+     */
+    public enum CloseClass {
+        /**
+         * Not a resource close (or a pre-verification report past its allowance): 12.14's normal
+         * handling, the activation-failure entry on §6's exponential schedule and the re-bind attempt
+         * ends with failure.
+         */
+        NON_RESOURCE,
+        /**
+         * 13.12's zero-progress transport failure: a client-detected abort on a dead path, or the
+         * client's own idle timeout. Counts like an idle timeout: §6's entry advances on its
+         * exponential schedule, and during binding the limiter's non-resource schedule applies.
+         */
+        DEAD_PATH,
+        /**
+         * 13.12's asymmetric case: a peer {@code 0x12} received after the client's own data sat
+         * unACKed for {@link #PEER_RESOURCE_DEAD_PATH_MILLIS}. §6's entry is written at the SHORTEST
+         * step (never shortening a longer window, never raising the exponent); the limiter still
+         * uses its non-resource schedule. Takes precedence over a pre-login shed.
+         */
+        DEAD_PATH_SHORTEST,
+        /**
+         * A peer {@code 0x12} before Login Success (12.13): retry TCP for this join only, no
+         * failure-cache or re-bind entry, not counted toward the pre-verification allowance, and
+         * no UDP-unreachable hint. Three consecutive within ten minutes start the fixed window.
+         */
+        PRE_LOGIN_SHED,
+        /** A generic client-detected resource abort: no cache entry, the fixed 60-second window. */
+        LOCAL_RESOURCE,
+        /**
+         * A peer {@code 0x12} after Login Success but before SERVER_SWITCH verified: the fixed window
+         * while within 12.14's allowance of three per rolling ten minutes, else {@link #NON_RESOURCE}.
+         */
+        PEER_RESOURCE_UNVERIFIED,
+        /** An authenticated peer {@code 0x12} after SERVER_SWITCH: no cache entry, the fixed window. */
+        PEER_RESOURCE_VERIFIED,
+        /**
+         * A counted unseen-prerequisite event (13.12): a resource close like
+         * {@link #PEER_RESOURCE_VERIFIED}, and two within ten minutes per (address, fingerprint)
+         * write a shortest-step failure-cache entry.
+         */
+        UNSEEN_PREREQUISITE
+    }
+
+    /**
+     * Classifies a {@code /3} close (docs/protocol.md 12.14, 13.12). A pure function of the event and
+     * the client state at that moment. Order: the 13.12 zero-progress rules first (they take
+     * precedence over everything, the pre-login shed included), then the pre-login shed, then the
+     * pre-verification allowance, then the counted unseen-prerequisite conditions. A close that does
+     * not match all of a class's conditions keeps its normal classification: a transport close
+     * ({@code 0x1c}) or any code but {@code 0x12} is non-resource, and a {@code 0x12} with another
+     * phrase, or before {@code /3} is active, is a generic resource close.
+     *
+     * @param loginSucceeded whether Login Success was received on this connection
+     * @param serverSwitchVerified whether SERVER_SWITCH verified on this connection
+     * @param active whether {@code /3} is active (after SERVER_SWITCH verified, not failed)
+     */
+    public static CloseClass classify(CloseEvent event, boolean loginSucceeded, boolean serverSwitchVerified,
+            boolean active) {
+        switch (event.kind()) {
+            case IDLE_TIMEOUT:
+                return CloseClass.DEAD_PATH;
+            case PEER_CLOSE:
+                if (!event.peerResource()) {
+                    return CloseClass.NON_RESOURCE;
+                }
+                if (event.unackedMillis >= PEER_RESOURCE_DEAD_PATH_MILLIS) {
+                    return CloseClass.DEAD_PATH_SHORTEST;
+                }
+                if (!loginSucceeded) {
+                    return CloseClass.PRE_LOGIN_SHED;
+                }
+                if (!serverSwitchVerified) {
+                    return CloseClass.PEER_RESOURCE_UNVERIFIED;
+                }
+                if (active && Arrays.equals(event.peerReason().reason(), CloseReason.UNSEEN_PREREQUISITE)) {
+                    return CloseClass.UNSEEN_PREREQUISITE;
+                }
+                return CloseClass.PEER_RESOURCE_VERIFIED;
+            case LOCAL_RESOURCE_ABORT:
+                return event.deadPath() ? CloseClass.DEAD_PATH : CloseClass.LOCAL_RESOURCE;
+            case BLOCKED_HEAD_EXPIRY:
+                // An inbound wait, not one of 13.12's outbound/pending-ACK/binding-queue aborts, so
+                // the zero-progress rule does not apply; a fully dead path ends in the idle timeout.
+                return serverSwitchVerified && active && !event.stallOrWithheld
+                        ? CloseClass.UNSEEN_PREREQUISITE : CloseClass.LOCAL_RESOURCE;
+            case LOCAL_FAILURE:
+            default:
+                return CloseClass.NON_RESOURCE;
+        }
     }
 
     /** The cause used when the caller does not name a more specific one (user decision). */
@@ -108,6 +340,12 @@ public final class V3Plan {
     private volatile boolean failureReported;
     private volatile boolean failureStateWritten;
     private volatile String reason;
+    /** The class of the first reported failure, or null while nothing failed. */
+    private volatile CloseClass closeClass;
+    /** Set by the integration at Login Success (12.13): a later {@code 0x12} is no pre-login shed. */
+    private volatile boolean loginSucceeded;
+    /** Set when SERVER_SWITCH verified (12.12): a later peer {@code 0x12} is authenticated. */
+    private volatile boolean serverSwitchVerified;
     /** The first {@link #activated(BindingSession)} future, so every caller sees the same answer. */
     private CompletableFuture<Boolean> activation;
     /** What {@link #isActivated()} answers before the first {@link #activated(BindingSession)}. */
@@ -195,6 +433,11 @@ public final class V3Plan {
     public CompletableFuture<Boolean> activated(BindingSession session) {
         final boolean bindingPassed = session != null && session.isActivated();
         final boolean online = bindingPassed && session.mode() == BindingStateMachine.MODE_ONLINE;
+        if (bindingPassed) {
+            // A passed binding saw SERVER_SWITCH verify, and that only happens after Login Success.
+            loginSucceeded = true;
+            serverSwitchVerified = true;
+        }
         synchronized (this) {
             if (activation != null) {
                 return activation;
@@ -239,8 +482,10 @@ public final class V3Plan {
             writeFailureStateOnce();
             return Boolean.FALSE;
         }
-        // 12.14: only a later successful activation clears the activation-failure state.
+        // 12.14: only a later successful activation clears the activation-failure state, and it
+        // ends any run of consecutive pre-login sheds.
         clearActivationFailure();
+        resetSheds();
         if (online) {
             endAttempt(true);
         } else if (attempt != null) {
@@ -281,6 +526,86 @@ public final class V3Plan {
      *     without a TCP fallback (§4) and the failure only closes the connection
      */
     public boolean failed(Phase phase, String reason) {
+        return report(phase, reason, CloseClass.NON_RESOURCE);
+    }
+
+    /**
+     * Marks that Login Success was received on this connection (12.13), so a later peer {@code 0x12}
+     * is no longer a pre-login shed. {@link #activated(BindingSession)} with a passed binding implies it.
+     */
+    public void loginSucceeded() {
+        loginSucceeded = true;
+    }
+
+    /**
+     * Marks that SERVER_SWITCH verified on this connection (12.12), so a later peer {@code 0x12} is
+     * an authenticated resource report and {@code /3} counts as active for 13.12's
+     * unseen-prerequisite rule. Implies {@link #loginSucceeded()}. {@link #activated(BindingSession)}
+     * with a passed binding implies it.
+     */
+    public void serverSwitchVerified() {
+        loginSucceeded = true;
+        serverSwitchVerified = true;
+    }
+
+    /**
+     * Reports that the {@code /3} connection closed, classified by
+     * {@link #classify(CloseEvent, boolean, boolean, boolean)} from {@code event} and this plan's
+     * Login Success and SERVER_SWITCH marks (docs/protocol.md 12.14, 13.12). The retry answer is
+     * exactly {@link #failed(Phase, String)}'s: a {@link Phase#JOINING} close retries over a fresh
+     * TCP join once (a pre-login shed included: TCP for that join only), a {@link Phase#PLAY} close
+     * does not. Only the first report of a connection classifies and writes state; the effects run on
+     * the worker:
+     *
+     * <ul>
+     *   <li>{@link CloseClass#NON_RESOURCE}: the activation-failure entry and a failed re-bind attempt;</li>
+     *   <li>{@link CloseClass#DEAD_PATH}: §6's entry on its exponential schedule (like an idle
+     *       timeout) and a failed re-bind attempt;</li>
+     *   <li>{@link CloseClass#DEAD_PATH_SHORTEST}: §6's entry at the shortest step and a failed re-bind
+     *       attempt (the limiter keeps its non-resource schedule);</li>
+     *   <li>{@link CloseClass#PRE_LOGIN_SHED}: no cache or re-bind entry; three consecutive within ten
+     *       minutes start the fixed window;</li>
+     *   <li>{@link CloseClass#LOCAL_RESOURCE}, {@link CloseClass#PEER_RESOURCE_VERIFIED}: no cache or
+     *       re-bind entry, the fixed 60-second window;</li>
+     *   <li>{@link CloseClass#PEER_RESOURCE_UNVERIFIED}: the fixed window within 12.14's allowance
+     *       of three per rolling ten minutes, otherwise handled like {@code 0x10};</li>
+     *   <li>{@link CloseClass#UNSEEN_PREREQUISITE}: as a verified resource close, plus 13.12's
+     *       counter, whose second event within ten minutes writes a shortest-step entry.</li>
+     * </ul>
+     *
+     * @param reason the short human-readable cause for the player; null means {@link #INTERNAL_ERROR}
+     * @return whether the caller must start a fresh vanilla TCP join in this same attempt
+     */
+    public boolean closed(Phase phase, CloseEvent event, String reason) {
+        CloseClass kind;
+        try {
+            kind = event == null ? CloseClass.NON_RESOURCE
+                    : classify(event, loginSucceeded, serverSwitchVerified,
+                            serverSwitchVerified && !activationFailed);
+        } catch (Throwable t) {
+            kind = CloseClass.NON_RESOURCE;
+        }
+        return report(phase, reason, kind);
+    }
+
+    /**
+     * The class of the first reported failure, or null while nothing failed. A pre-verification
+     * report is {@link CloseClass#PEER_RESOURCE_UNVERIFIED} here whichever way its allowance went.
+     */
+    public CloseClass closeClass() {
+        return closeClass;
+    }
+
+    /**
+     * Whether a fallback after this plan's failure may feed the server's UDP-unreachable hint
+     * (§6's {@code quicraft:fallback} report). False for a pre-login shed (12.13): the server shed
+     * the connection, so its UDP port was reachable.
+     */
+    public boolean udpHintAllowed() {
+        return closeClass != CloseClass.PRE_LOGIN_SHED;
+    }
+
+    private boolean report(Phase phase, String reason, CloseClass kind) {
         boolean retry;
         synchronized (this) {
             // The retry decision belongs to the first report only, so one connection can never start
@@ -292,6 +617,7 @@ public final class V3Plan {
             if (!failureReported) {
                 failureReported = true;
                 this.reason = reason == null ? INTERNAL_ERROR : reason;
+                this.closeClass = kind;
             }
         }
         writeFailureStateOnce();
@@ -305,19 +631,21 @@ public final class V3Plan {
      * double the backoff window.
      */
     private void writeFailureStateOnce() {
+        final CloseClass kind;
         synchronized (this) {
             if (failureStateWritten) {
                 return;
             }
             failureStateWritten = true;
+            // A pin-write failure reaches here before any report: it is non-resource (12.15).
+            kind = closeClass == null ? CloseClass.NON_RESOURCE : closeClass;
         }
         try {
             worker.execute(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        recordActivationFailure();
-                        endAttempt(false);
+                        applyFailureState(kind);
                     } catch (Throwable ignored) {
                         // Best effort: the state disables itself on a failed write.
                     }
@@ -326,6 +654,84 @@ public final class V3Plan {
         } catch (Throwable ignored) {
             // A worker that refuses the task must not hide the retry decision: the caller still has
             // to close the QUIC connection and fall back to TCP.
+        }
+    }
+
+    /** The worker half of a failure: each class's failure-cache and limiter effect (12.14, 13.12). */
+    private void applyFailureState(CloseClass kind) {
+        switch (kind) {
+            case PRE_LOGIN_SHED:
+                releaseAttempt();
+                if (rebinds != null) {
+                    rebinds.recordPreLoginShed(host, logicalPort);
+                }
+                return;
+            case LOCAL_RESOURCE:
+            case PEER_RESOURCE_VERIFIED:
+                resourceWindow();
+                return;
+            case UNSEEN_PREREQUISITE:
+                resourceWindow();
+                failures.recordUnseenPrerequisite(address, port, fingerprint);
+                return;
+            case PEER_RESOURCE_UNVERIFIED:
+                resetSheds();
+                // Fail closed: a report the state cannot record is treated like 0x10.
+                if (rebinds != null && rebinds.recordPeerResourceReport(host, logicalPort)) {
+                    releaseAttempt();
+                    return;
+                }
+                recordActivationFailure();
+                endAttempt(false);
+                return;
+            case DEAD_PATH:
+                resetSheds();
+                failures.recordFailure(address, port, fingerprint);
+                endAttempt(false);
+                return;
+            case DEAD_PATH_SHORTEST:
+                resetSheds();
+                failures.recordShortestFailure(address, port, fingerprint);
+                endAttempt(false);
+                return;
+            case NON_RESOURCE:
+            default:
+                resetSheds();
+                recordActivationFailure();
+                endAttempt(false);
+        }
+    }
+
+    /** 12.14's fixed window for a resource close; the re-bind attempt ends without a failure. */
+    private void resourceWindow() {
+        resetSheds();
+        releaseAttempt();
+        if (rebinds != null) {
+            rebinds.startResourceWindow(host, logicalPort);
+        }
+    }
+
+    /** Ends a run of consecutive pre-login sheds (12.14): this outcome was not a shed. */
+    private void resetSheds() {
+        if (rebinds == null || host == null) {
+            return;
+        }
+        try {
+            rebinds.resetPreLoginSheds(host, logicalPort);
+        } catch (Throwable ignored) {
+            // The state disables itself on a failed write.
+        }
+    }
+
+    /** Ends the re-bind attempt without advancing its window: a resource close (12.14). */
+    private void releaseAttempt() {
+        if (rebinds == null || attempt == null) {
+            return;
+        }
+        try {
+            rebinds.releaseAttempt(attempt);
+        } catch (Throwable ignored) {
+            // The state disables itself on a failed write.
         }
     }
 

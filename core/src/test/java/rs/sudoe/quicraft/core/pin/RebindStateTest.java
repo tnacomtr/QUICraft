@@ -919,6 +919,38 @@ class RebindStateTest {
         }
     }
 
+    @Test
+    void theResourceWindowAndTheReportAllowanceSurviveARestart(@TempDir Path dir) {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState state = RebindState.load(file, now::get);
+        for (int i = 0; i < 3; i++) {
+            assertTrue(state.recordPeerResourceReport("mc.example.com", 25565), "within the allowance");
+            now.addAndGet(MINUTE / 2);
+        }
+        // Reports at 0, 30 and 60 seconds: the window from the last one runs until 120 seconds.
+        RebindState reloaded = RebindState.load(file, now::get);
+        assertTrue(reloaded.resourceWindowActive("mc.example.com", 25565, now.get()), "the window is on disk");
+        assertFalse(reloaded.recordPeerResourceReport("mc.example.com", 25565),
+                "the fourth report in ten minutes is over the allowance, after a restart too");
+        now.addAndGet(MINUTE);
+        assertFalse(RebindState.load(file, now::get).resourceWindowActive("mc.example.com", 25565, now.get()),
+                "the fixed window ends after 60 seconds");
+    }
+
+    @Test
+    void threePreLoginShedsSurviveARestartAndStartTheWindow(@TempDir Path dir) {
+        Path file = dir.resolve("rebind-v1.bin");
+        AtomicLong now = new AtomicLong(BASE);
+        RebindState.load(file, now::get).recordPreLoginShed("mc.example.com", 25565);
+        now.addAndGet(MINUTE);
+        RebindState.load(file, now::get).recordPreLoginShed("mc.example.com", 25565);
+        now.addAndGet(MINUTE);
+        assertTrue(RebindState.load(file, now::get).recordPreLoginShed("mc.example.com", 25565),
+                "the third consecutive shed within ten minutes starts the window, after restarts");
+        assertTrue(RebindState.load(file, now::get).resourceWindowActive("mc.example.com", 25565, now.get()));
+    }
+
     private static String fingerprint(int index) {
         return "sha256:" + String.format(Locale.ROOT, "%064x", index);
     }
