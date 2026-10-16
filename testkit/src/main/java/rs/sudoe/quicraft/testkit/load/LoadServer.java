@@ -201,7 +201,7 @@ public final class LoadServer {
             connection.write(java.nio.ByteBuffer.wrap(ACTIVATION_MARKER));
             connection.flush();
             connection.detachForActivation(leftover -> { });
-            connection.activate(IdleLaneGame.INSTANCE, PROTOCOL, null);
+            connection.activate(new IdleLaneGame((code, cause) -> {}), PROTOCOL, null);
             lanesActive.incrementAndGet();
         } catch (Throwable t) {
             lanesFailed.incrementAndGet();

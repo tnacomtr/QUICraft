@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -53,6 +54,8 @@ public final class LoadClient {
     private final AtomicLong failed = new AtomicLong();
     private final AtomicLong closed = new AtomicLong();
     private final AtomicLong lanesActive = new AtomicLong();
+    private final AtomicLong activationRequested = new AtomicLong();
+    private final Set<V3Connection> activationTracked = ConcurrentHashMap.newKeySet();
     private final AtomicLong preMarkerReads = new AtomicLong();
     private final AtomicLong lanesFailed = new AtomicLong();
     private final Map<String, AtomicLong> closeCauses = new ConcurrentHashMap<>();
@@ -137,11 +140,14 @@ public final class LoadClient {
         load.allDone.await();
         System.out.println("ALL_ATTEMPTS_RESOLVED seconds=" + (System.nanoTime() - t0) / 1_000_000_000L);
         long closedAtHoldStart = load.closed.get();
+        long activatedLiveBaseline = v3 && lanes ? load.activatedLive() : 0;
+        if (v3 && lanes) System.out.println("HOLD_BASELINE activated_live=" + activatedLiveBaseline);
         Thread.sleep(TimeUnit.SECONDS.toMillis(holdSec));
         monitor.shutdownNow();
         System.out.println("SUMMARY started=" + load.started.get() + " connected=" + load.connected.get()
                 + " failed=" + load.failed.get() + load.v3Fields()
                 + (v3 ? " closed_during_hold=" + (load.closed.get() - closedAtHoldStart) : "")
+                + (v3 && lanes ? " activated_live_baseline=" + activatedLiveBaseline + " activated_live=" + load.activatedLive() : "")
                 + " rss_mb=" + ProcStats.rssMb());
         load.printCauses();
         return 0;
@@ -181,11 +187,14 @@ public final class LoadClient {
             root = root.getCause();
         }
         String message = root.getMessage() == null ? "" : root.getMessage().replace('\n', ' ');
-        message = message.replaceAll("[0-9]+", "N");
+        String code = "";
+        java.util.regex.Matcher codeMatcher = java.util.regex.Pattern.compile("(?i)0x[0-9a-f]+|rule\\s+\\d+\\.\\d+").matcher(message);
+        if (codeMatcher.find()) code = " [close=" + codeMatcher.group().toLowerCase(java.util.Locale.ROOT) + "]";
+        message = message.replaceAll("(?i)0x[0-9a-f]+|rule\\s+\\d+\\.\\d+", "CODE").replaceAll("[0-9]+", "N");
         if (message.length() > 160) {
             message = message.substring(0, 160);
         }
-        String text = root.getClass().getName() + ": " + message;
+        String text = root.getClass().getName() + ": " + message + code;
         return root == t ? text : t.getClass().getSimpleName() + " <- " + text;
     }
 
@@ -210,6 +219,7 @@ public final class LoadClient {
         V3Connection v3 = (V3Connection) connection;
         byte marker = LoadServer.ACTIVATION_MARKER[0];
         AtomicBoolean activated = new AtomicBoolean();
+        AtomicBoolean closeRecorded = new AtomicBoolean();
         v3.setListener(new QuicByteStream.Listener() {
             @Override
             public void onData(ByteBuffer data) {
@@ -229,8 +239,17 @@ public final class LoadClient {
                     data.get(); // Consume the harness SERVER_SWITCH marker, never a lane record.
                     ByteBuffer suffix = data.hasRemaining() ? data.slice() : null;
                     v3.detachForActivation(leftover -> { });
-                    v3.activate(IdleLaneGame.INSTANCE, suffix);
-                    lanesActive.incrementAndGet();
+                    activationTracked.add(v3);
+                    v3.activate(new IdleLaneGame((code, cause) -> {
+                        if (closeRecorded.compareAndSet(false, true)) {
+                            activationTracked.remove(v3);
+                            closed.incrementAndGet();
+                            String key = "code=" + (code < 0 ? "none" : "0x" + Integer.toHexString(code))
+                                    + " " + (cause == null ? "normal" : normalizeCause(cause));
+                            closeCauses.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
+                        }
+                    }), suffix);
+                    activationRequested.incrementAndGet();
                 } catch (Throwable t) {
                     lanesFailed.incrementAndGet();
                 }
@@ -241,9 +260,12 @@ public final class LoadClient {
 
             @Override
             public void onClosed(Throwable cause) {
-                closed.incrementAndGet();
-                String key = cause == null ? "normal" : normalizeCause(cause);
-                closeCauses.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
+                if (closeRecorded.compareAndSet(false, true)) {
+                    activationTracked.remove(v3);
+                    closed.incrementAndGet();
+                    String key = cause == null ? "normal" : normalizeCause(cause);
+                    closeCauses.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
+                }
             }
         });
         // The connection stops reading stream 0 after the preamble until the owner asks for
@@ -261,7 +283,18 @@ public final class LoadClient {
             return "";
         }
         return " closed=" + closed.get() + " live=" + (connected.get() - closed.get())
-                + " lanes_active=" + lanesActive.get() + " pre_marker_reads=" + preMarkerReads.get() + " lanes_failed=" + lanesFailed.get();
+                + " activation_requested=" + activationRequested.get() + " activated_live=" + activatedLive()
+                + " pre_marker_reads=" + preMarkerReads.get() + " lanes_failed=" + lanesFailed.get();
+    }
+
+    // Public-API observation, not a LaneGame activation-confirmation callback: session() != null
+    // and isOpen() are sampled for each tracked connection whenever a STAT/SUMMARY is printed.
+    private long activatedLive() {
+        long live = 0;
+        for (V3Connection connection : activationTracked) {
+            if (connection.session() != null && connection.isOpen()) live++;
+        }
+        return live;
     }
 
     private void status() {

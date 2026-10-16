@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.testkit.load;
 
 import java.util.List;
+import java.util.function.BiConsumer;
 import rs.sudoe.quicraft.core.multistream.Envelope;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
@@ -15,9 +16,9 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
  * spike has no Minecraft login).
  */
 final class IdleLaneGame implements LaneGame {
-    static final IdleLaneGame INSTANCE = new IdleLaneGame();
+    private final BiConsumer<Integer, Throwable> closed;
 
-    private IdleLaneGame() {}
+    IdleLaneGame(BiConsumer<Integer, Throwable> closed) { this.closed = closed; }
 
     @Override
     public Decoded decode(Lane lane, long sequence, byte[] frame, boolean insideBundle,
@@ -38,5 +39,5 @@ final class IdleLaneGame implements LaneGame {
     public void onWritabilityChanged(boolean writable) {}
 
     @Override
-    public void onClosed(int code, boolean byPeer, Throwable cause) {}
+    public void onClosed(int code, boolean byPeer, Throwable cause) { closed.accept(code, cause); }
 }
