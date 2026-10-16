@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.multistream;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -17,6 +19,55 @@ class ReceiverDecodeTest {
 
     private static void fails(Runnable action) {
         assertEquals(0x11, assertThrows(OrderingException.class, action::run).closeCode());
+    }
+
+    @Test
+    void theNodeCreditProbeIsAQueryThatNeverMutatesTheSharedBudget() {
+        RecordingBudget budget = new RecordingBudget(ReceiveBudget.bounded(100));
+        ReceiverScheduler scheduler = new ReceiverScheduler(
+                (envelope, insideBundle, now) -> { }, delivery -> { }, budget);
+        assertTrue(scheduler.nodeCreditAvailable(0), "a zero-byte grant is always available");
+        assertTrue(scheduler.nodeCreditAvailable(100));
+        assertFalse(scheduler.nodeCreditAvailable(101));
+        assertEquals(0, budget.tryReserves, "the probe must not reserve");
+        assertEquals(0, budget.releases, "the probe must not release");
+        assertEquals(2, budget.availableCalls);
+        assertEquals(0, budget.reserved());
+    }
+
+    /** Wraps a budget and counts what a scheduler asks of it. */
+    private static final class RecordingBudget extends ReceiveBudget {
+        private final ReceiveBudget delegate;
+        private int tryReserves;
+        private int releases;
+        private int availableCalls;
+
+        RecordingBudget(ReceiveBudget delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public boolean tryReserve(long bytes) {
+            tryReserves++;
+            return delegate.tryReserve(bytes);
+        }
+
+        @Override
+        public void release(long bytes) {
+            releases++;
+            delegate.release(bytes);
+        }
+
+        @Override
+        public long reserved() {
+            return delegate.reserved();
+        }
+
+        @Override
+        public long available() {
+            availableCalls++;
+            return delegate.available();
+        }
     }
 
     private static final class Harness {
@@ -195,6 +246,126 @@ class ReceiverDecodeTest {
         h.finish(Envelope.Bundle.MEMBER, 1, 1, false, 0);
         h.finish(Envelope.Bundle.CLOSE, 1, 1, false, 0);
         assertTrue(h.deliveries.get(0).isBundle());
+    }
+
+    @Test void aSecondRecordDecodedLongAfterTheFirstIsNotOnTheFirstsDeadline() {
+        Harness h = new Harness();
+        // A clock that never starts at zero, like the monotonic clock a session injects.
+        long t0 = 1_000_000_000L;
+        h.scheduler.offer(raw(Lane.CONTROL, 1, 0, 0, 0), t0);
+        h.finish(Envelope.Bundle.NONE, 1, 1, false, t0);
+        h.apply(t0);
+        // A successful decode must not leave its start time behind: a later, healthy record decodes
+        // and applies more than one deadline after it (13.12).
+        long later = t0 + T + 1;
+        h.scheduler.checkDeadlines(later);
+        h.scheduler.offer(raw(Lane.CONTROL, 2, 1, 0, 0), later);
+        h.finish(Envelope.Bundle.NONE, 1, 1, false, later);
+        assertEquals(1, h.deliveries.size(), "the second record is delivered");
+        assertEquals(2, h.deliveries.get(0).sequence());
+        h.apply(later);
+        h.scheduler.checkDeadlines(2 * T + t0);
+        assertEquals(0, h.scheduler.pendingBytes(), "nothing is retained after both records");
+    }
+
+    @Test void aRefusedDecodeExpiresOnItsOwnDeadlineWithoutARetry() {
+        // Room for the wire charge only, so the decode itself is always refused; the entry stays
+        // queued, undecoded and eligible. Nothing retries it, so this deadline check is the only
+        // thing that can end it (13.12).
+        ReceiveBudget node = ReceiveBudget.bounded(35);
+        final ReceiverScheduler[] self = new ReceiverScheduler[1];
+        ReceiverScheduler scheduler = new ReceiverScheduler((envelope, insideBundle, now) -> {
+            self[0].reserveDecoded(envelope, 1, 1, now);
+            self[0].decoded(envelope, Envelope.Bundle.NONE, false, "decoded", now);
+        }, delivery -> { }, node);
+        self[0] = scheduler;
+        scheduler.offer(raw(Lane.CONTROL, 1, 0, 0, 0), 0);
+        scheduler.checkDeadlines(T - 1);
+        fails(() -> scheduler.checkDeadlines(T));
+    }
+
+    @Test void aRefusedSecondReservationIsNotKeptForTheRetry() {
+        // A decoder that reserves twice per attempt: 300 bytes, then 500. The node budget carries
+        // the first call of an attempt but not the second until the holder frees its space, so every
+        // attempt before that is refused by the second call.
+        ReceiveBudget node = ReceiveBudget.bounded(900);
+        List<ReceiverScheduler.Delivery> deliveries = new ArrayList<ReceiverScheduler.Delivery>();
+        int[] attempts = new int[1];
+        final ReceiverScheduler[] self = new ReceiverScheduler[1];
+        ReceiverScheduler scheduler = new ReceiverScheduler((envelope, insideBundle, now) -> {
+            attempts[0]++;
+            self[0].reserveDecoded(envelope, 300, 400, now);
+            self[0].reserveDecoded(envelope, 500, 800, now);
+            self[0].decoded(envelope, Envelope.Bundle.NONE, false, "decoded packet", now);
+        }, deliveries::add, node);
+        self[0] = scheduler;
+        assertTrue(node.tryReserve(200), "a holder takes part of the node budget");
+        Envelope e = raw(Lane.CONTROL, 1, 0, 0, 0); // 35 wire bytes
+        scheduler.offer(e, 0);
+        assertTrue(deliveries.isEmpty(), "the second reservation does not fit yet");
+        // Several retries of the same entry must not keep the first reservation of the refused
+        // attempts: they would charge the same output again and drain the budget.
+        for (int i = 0; i < 3; i++) {
+            scheduler.retry(1_000_000_000L + i);
+        }
+        assertTrue(deliveries.isEmpty());
+        assertEquals(e.wireBytes() + 200, node.reserved(),
+                "only the wire charge and the holder's bytes stay reserved");
+        assertEquals(e.wireBytes(), scheduler.pendingBytes(), "the refused attempts added nothing");
+        // The holder lets go, so the next retry completes exactly one decode.
+        node.release(200);
+        scheduler.retry(2_000_000_000L);
+        assertEquals(1, deliveries.size(), "the record is delivered once the retry fits");
+        assertEquals(5, attempts[0], "the offer and each retry ran the decoder once");
+        assertEquals(e.wireBytes() + 800, node.reserved(),
+                "exactly one decode's reservations stay charged");
+        assertEquals(e.wireBytes() + 800, scheduler.pendingBytes());
+    }
+
+    @Test void aDecoderThatAllocatesBeforeItsSecondReservationIsRefusedReleasesItForTheRetry() {
+        // Room for the wire charge, a holder's bytes and one decode, but not for a refused attempt
+        // plus a rerun: the first attempt allocates output and is then refused its second
+        // reservation, and the retry starts the decode over (13.12).
+        ReceiveBudget node = ReceiveBudget.bounded(900);
+        List<ReceiverScheduler.Delivery> deliveries = new ArrayList<ReceiverScheduler.Delivery>();
+        List<ByteBuf> earlierAttempts = new ArrayList<ByteBuf>();
+        int[] attempts = new int[1];
+        final ReceiverScheduler[] self = new ReceiverScheduler[1];
+        ReceiverScheduler scheduler = new ReceiverScheduler((envelope, insideBundle, now) -> {
+            attempts[0]++;
+            // The contract a decoder has to keep: a refused attempt released what it allocated.
+            for (ByteBuf earlier : earlierAttempts) {
+                assertEquals(0, earlier.refCnt(),
+                        "a refused decode released what it had allocated before the rerun");
+            }
+            self[0].reserveDecoded(envelope, 300, 400, now);
+            ByteBuf output = Unpooled.buffer(64);
+            earlierAttempts.add(output);
+            try {
+                self[0].reserveDecoded(envelope, 500, 800, now);
+            } catch (ReceiverScheduler.RetryLater refused) {
+                output.release();
+                throw refused;
+            }
+            self[0].decoded(envelope, Envelope.Bundle.NONE, false, output, now);
+        }, deliveries::add, node);
+        self[0] = scheduler;
+        assertTrue(node.tryReserve(200), "a holder takes part of the node budget");
+        Envelope e = raw(Lane.CONTROL, 1, 0, 0, 0);
+        scheduler.offer(e, 0);
+        assertTrue(deliveries.isEmpty(), "the first attempt is refused");
+        scheduler.retry(1_000_000_000L);
+        assertTrue(deliveries.isEmpty(), "the second attempt is refused too");
+        assertEquals(e.wireBytes() + 200, node.reserved(),
+                "every refused attempt gave its own reservations back");
+        node.release(200);
+        scheduler.retry(2_000_000_000L);
+        assertEquals(3, attempts[0], "the offer and each retry ran the decoder once");
+        assertEquals(1, deliveries.size(), "the record is delivered by the successful attempt");
+        assertEquals(e.wireBytes() + 800, node.reserved(), "exactly one decode stays charged");
+        ByteBuf delivered = (ByteBuf) deliveries.get(0).records().get(0).body();
+        assertEquals(1, delivered.refCnt(), "the delivered body is the successful attempt's output");
+        delivered.release();
     }
 
     @Test void closingDecodedBundleDoesNotPermitDecodingTheFollowingControlBeforeCommit() {

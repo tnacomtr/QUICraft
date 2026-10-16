@@ -137,6 +137,8 @@ final class LaneRig implements AutoCloseable {
         volatile LaneSession session;
         volatile boolean autoApply = true;
         volatile boolean applyOnOtherThread;
+        /** Retained bytes this game asks the node budget for while decoding (13.12). */
+        volatile long decodeReserveBytes;
 
         @Override
         public Decoded decode(Lane lane, long sequence, byte[] frame, boolean insideBundle,
@@ -149,7 +151,7 @@ final class LaneRig implements AutoCloseable {
             int id = frame[prefix] & 0xff;
             String label = new String(frame, prefix + 1, frame.length - prefix - 1,
                     java.nio.charset.StandardCharsets.UTF_8);
-            reservation.reserve(0, frame.length);
+            reservation.reserve((int) decodeReserveBytes, frame.length);
             Envelope.Bundle bundle = id == BUNDLE_OPEN ? Envelope.Bundle.OPEN
                     : id == BUNDLE_CLOSE ? Envelope.Bundle.CLOSE
                     : insideBundle ? Envelope.Bundle.MEMBER : Envelope.Bundle.NONE;
@@ -230,6 +232,50 @@ final class LaneRig implements AutoCloseable {
         }
     }
 
+    /**
+     * The owner of the client's stream 0 before activation, standing in for the login code of
+     * 12.11/12.13. It never discards what it reads: a server may start records right after its own
+     * activation (12.12), so bytes read here are the start of the record stream and are handed to
+     * the session as the activation leftover, exactly as {@code V3ConnectionImpl} does.
+     */
+    static final class EarlyControl extends ChannelInboundHandlerAdapter {
+        private final ByteArrayOutputStream kept = new ByteArrayOutputStream();
+        private volatile int retained;
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) {
+            ByteBuf buf = (ByteBuf) msg;
+            try {
+                byte[] chunk = new byte[buf.readableBytes()];
+                buf.readBytes(chunk);
+                synchronized (kept) {
+                    kept.write(chunk, 0, chunk.length);
+                    retained = kept.size();
+                }
+            } finally {
+                buf.release();
+            }
+        }
+
+        /** Takes every byte read so far as the activation leftover; call on the client's loop. */
+        java.nio.ByteBuffer take() {
+            synchronized (kept) {
+                if (kept.size() == 0) {
+                    return null;
+                }
+                byte[] bytes = kept.toByteArray();
+                kept.reset();
+                retained = 0;
+                return java.nio.ByteBuffer.wrap(bytes);
+            }
+        }
+
+        /** How many bytes this owner read and has not handed over yet. */
+        int retained() {
+            return retained;
+        }
+    }
+
     /** What to build. */
     static final class Config {
         LaneLoopback.Options options = new LaneLoopback.Options();
@@ -239,11 +285,18 @@ final class LaneRig implements AutoCloseable {
         RoutingTable clientTable = TABLE;
         LaneSession.Timing serverTiming = LaneSession.Timing.DEFAULT;
         LaneSession.Timing clientTiming = LaneSession.Timing.DEFAULT;
+        /** The node receive budget of 13.12 both sessions of this rig share. */
+        ReceiveBudget nodeBudget = ReceiveBudget.unlimited();
+        /** Build the session without a game so a test can call bindGame itself, before or after activate. */
+        boolean deferServerGame;
+        boolean deferClientGame;
     }
 
     final LaneLoopback net;
     final TestGame serverGame = new TestGame();
     final TestGame clientGame = new TestGame();
+    /** The client's pre-activation stream-0 owner; it hands what it read to {@link #activateClient()}. */
+    final EarlyControl earlyControl = new EarlyControl();
     LaneSession server;
     LaneSession client;
     QuicStreamChannel serverControl;
@@ -306,7 +359,7 @@ final class LaneRig implements AutoCloseable {
         };
         net = LaneLoopback.open(config.options);
         try {
-            clientControl = net.clientStream();
+            clientControl = net.clientStream(earlyControl);
             LaneLoopback.write(clientControl, (byte) 'L');
             serverControl = serverControlSeen.get(10, TimeUnit.SECONDS);
             preludeRead.get(10, TimeUnit.SECONDS);
@@ -314,7 +367,8 @@ final class LaneRig implements AutoCloseable {
             if (config.serverSession) {
                 serverConnection.eventLoop().submit(() -> {
                     server = new LaneSession(serverConnection, LaneSession.Role.SERVER, serverControl,
-                            config.serverTable, serverGame, config.serverTiming);
+                            config.serverTable, config.deferServerGame ? null : serverGame,
+                            config.nodeBudget, config.serverTiming);
                     serverGame.session = server;
                     serverSessionRef = server;
                     for (QuicStreamChannel s : serverEarly) {
@@ -325,7 +379,8 @@ final class LaneRig implements AutoCloseable {
             if (config.clientSession) {
                 net.clientConnection.eventLoop().submit(() -> {
                     client = new LaneSession(net.clientConnection, LaneSession.Role.CLIENT, clientControl,
-                            config.clientTable, clientGame, config.clientTiming);
+                            config.clientTable, config.deferClientGame ? null : clientGame,
+                            config.nodeBudget, config.clientTiming);
                     clientGame.session = client;
                     clientSessionRef = client;
                     for (QuicStreamChannel s : clientEarly) {
@@ -361,10 +416,32 @@ final class LaneRig implements AutoCloseable {
     /**
      * Both sessions' activation, server first and complete before the client starts: as in the
      * protocol, the client's stream 4 must never reach a server that has not activated yet.
+     *
+     * <p>The client's own activation is queued, not waited for, so a test may drive lanes while it
+     * is still pending: 12.12 lets a server start records right after its own activation, and what
+     * the client's stream-0 owner reads before that activation is handed over as the leftover
+     * (12.13, 13.14). Use {@link #activateClient()} where a test needs the client activated first.
      */
     void activateBoth() throws Exception {
         activate(server, null);
-        client.activate(null);
+        client.eventLoop().execute(this::activateClientNow);
+    }
+
+    /**
+     * Activates the client and waits for it, handing over every byte its stream-0 owner read before
+     * that point as the activation leftover (12.13, 13.14).
+     */
+    void activateClient() throws Exception {
+        client.eventLoop().submit(this::activateClientNow).get(10, TimeUnit.SECONDS);
+    }
+
+    private void activateClientNow() {
+        client.activate(earlyControl.take());
+    }
+
+    /** How many bytes the client's pre-activation stream-0 owner read and has not handed over. */
+    int earlyControlRetained() {
+        return earlyControl.retained();
     }
 
     void activate(LaneSession session, java.nio.ByteBuffer leftover) throws Exception {
@@ -374,6 +451,16 @@ final class LaneRig implements AutoCloseable {
 
     static long[] snapshot(LaneSession session) throws Exception {
         return session.eventLoop().submit(session::snapshot).get(10, TimeUnit.SECONDS);
+    }
+
+    /** The sender's last-assigned sequences per lane, from the session's event loop. */
+    static long[] assigned(LaneSession session) throws Exception {
+        return session.eventLoop().submit(session::assignedSequences).get(10, TimeUnit.SECONDS);
+    }
+
+    /** A lane's stream channel, read on the session's event loop. */
+    static QuicStreamChannel channelOf(LaneSession session, Lane lane) throws Exception {
+        return session.eventLoop().submit(() -> session.channelFor(lane)).get(10, TimeUnit.SECONDS);
     }
 
     @Override

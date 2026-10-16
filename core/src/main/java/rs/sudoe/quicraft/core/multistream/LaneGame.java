@@ -20,7 +20,16 @@ public interface LaneGame {
      * and protocol-state changes of every earlier record have been applied. Use
      * {@code reservation} before allocating decompression output (13.12); a game that skips it
      * gets the sizes in the returned {@link Decoded} reserved after the fact. Any exception
-     * closes the connection with 0x11.</p>
+     * closes the connection with 0x11, with one exception: a reservation that the shared node
+     * budget cannot carry yet makes the scheduler throw out of this method (13.12's temporary
+     * contention, {@link Reservation#reserve}).</p>
+     *
+     * <p>That throw is a retry, not a failure: the record stays undecoded and this method is called
+     * again from the start. The game therefore owns the cleanup of everything it allocated for the
+     * refused attempt: release it (a {@code finally} or a catch-and-release around the reservation)
+     * before letting the throw propagate, or the attempt leaks its buffers and the rerun charges
+     * the same output again. What the scheduler itself reserved for the attempt goes back on its
+     * own.</p>
      *
      * @param insideBundle true for CONTROL records between a decoded bundle OPEN and its CLOSE
      */
@@ -58,6 +67,9 @@ public interface LaneGame {
          * @param additionalRetainedBytes bytes about to be allocated for output and decoded objects
          * @param totalUncompressedBytes  the packet's total uncompressed size, replacing any
          *                                earlier estimate (at most 8 MiB)
+         * @throws RuntimeException when the shared node budget cannot carry the bytes yet (13.12):
+         *     the call takes nothing, the game must release what it allocated for this attempt and
+         *     let the throw leave {@link #decode}, which the scheduler then reruns from its start
          */
         void reserve(long additionalRetainedBytes, int totalUncompressedBytes);
     }
