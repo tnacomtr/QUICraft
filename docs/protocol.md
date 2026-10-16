@@ -2124,7 +2124,8 @@ position extraction. Those implementations must change together before this revi
    (13.12); a server-detected case only logs.
    Generic locally detected resource aborts never write a failure-cache entry. The single
    exception is the unseen-prerequisite expiry (13.12): two counted events within 10 minutes,
-   identified only by the authenticated `unseen-prerequisite` reason phrase or the client's
-   own blocked-head timer, write a shortest-step entry; shedding and stall-affected or locally
+   identified only by the `unseen-prerequisite` reason phrase on an application close received
+   after SERVER_SWITCH verifies (earlier peer closes follow 12.14's bounded pre-verification
+   allowance) or by the client's own blocked-head timer, write a shortest-step entry; shedding and stall-affected or locally
    withheld expiries never count. Before SERVER_SWITCH verifies, other peer reports remain untrusted and receive only 12.14's bounded retry allowance.
    Close codes are wire format; nothing ships with `0x12` until this is confirmed.
