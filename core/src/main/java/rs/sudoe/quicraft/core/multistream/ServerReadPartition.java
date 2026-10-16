@@ -159,6 +159,27 @@ public final class ServerReadPartition {
     }
 
     /**
+     * Chooses the next serverbound stream to read from its in-share partition (13.12, "protected
+     * REALTIME heads served first"). REALTIME is considered before CONTROL. A stream is chosen only if
+     * it has demand and a non-zero read grant inside P. Nothing here draws on the node pool: when
+     * neither stream can be granted in-share, the result is -1 and any CONTROL excess is the caller's
+     * refusable concern, never a protected grant.
+     *
+     * @param realtimeRemaining unread bytes of the current REALTIME unit, 0 if none
+     * @param controlRemaining unread bytes of the current CONTROL unit, 0 if none
+     * @return LogicalStream.REALTIME, LogicalStream.CONTROL, or -1
+     */
+    public int nextReadStream(int realtimeRemaining, int controlRemaining) {
+        if (readGrant(LogicalStream.REALTIME, realtimeRemaining) > 0) {
+            return LogicalStream.REALTIME;
+        }
+        if (readGrant(LogicalStream.CONTROL, controlRemaining) > 0) {
+            return LogicalStream.CONTROL;
+        }
+        return -1;
+    }
+
+    /**
      * Checks a REALTIME record against the hard per-record caps (13.12). A record that fails is peer
      * misconduct and closes 0x11.
      *

@@ -49,6 +49,28 @@ class ServerReadPartitionTest {
         assertFalse(ServerReadPartition.realtimeRecordLegal(100, 0, 1025));
     }
 
+    @Test void protectedRealtimeReadIsServedBeforeControl() {
+        ServerReadPartition partition = new ServerReadPartition(6);
+        assertEquals(LogicalStream.REALTIME, partition.nextReadStream(100, 100));
+        assertTrue(partition.reserve(LogicalStream.REALTIME, 2048));
+        assertEquals(LogicalStream.CONTROL, partition.nextReadStream(100, 100), "full REALTIME slice yields to CONTROL");
+        assertEquals(LogicalStream.CONTROL, partition.nextReadStream(0, 100));
+    }
+
+    @Test void readGrantsComeOnlyFromProtectedPAndNeverFromExcess() {
+        ServerReadPartition partition = new ServerReadPartition(6);
+        assertTrue(partition.reserve(LogicalStream.CONTROL, partition.controlAllowance()));
+        // CONTROL's in-share allowance is exhausted: no protected grant, so the caller must use excess.
+        assertEquals(0, partition.readGrant(LogicalStream.CONTROL, 1000));
+        assertEquals(-1, partition.nextReadStream(0, 1000));
+        // REALTIME still has its own protected slice, which CONTROL excess cannot borrow.
+        assertEquals(LogicalStream.REALTIME, partition.nextReadStream(1000, 1000));
+        assertEquals(2048, partition.readGrant(LogicalStream.REALTIME, 1 << 20));
+        // Every grant reserved is accounted against P: the sum never exceeds the protected area.
+        int granted = partition.controlAllowance() + partition.readGrant(LogicalStream.REALTIME, 1 << 20);
+        assertTrue(granted <= partition.protectedBytes());
+    }
+
     @Test void chunkStreamsGetNoServerboundAdmissionFromThePartition() {
         ServerReadPartition partition = new ServerReadPartition(2);
         assertFalse(partition.reserve(2, 1));
