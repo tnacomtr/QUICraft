@@ -202,6 +202,10 @@ public final class SendScheduler {
         if (starved != null) {
             return pick(starved, writable);
         }
+        Item aged = agedControl(writable);
+        if (aged != null) {
+            return pick(aged, writable);
+        }
         Item chosen = promotedHead(writable);
         if (chosen == null) {
             chosen = choose(writable, chunkCandidate(writable));
@@ -279,11 +283,17 @@ public final class SendScheduler {
         return queuedRecords >= queuePacketLimit || queuedBytes >= queueByteLimit;
     }
 
+    /**
+     * The ready, writable CONTROL head that has waited {@link #AGE_LIMIT} selections, or null. It is
+     * checked before prerequisite promotion, so a sustained promoted load cannot pass it (13.20).
+     */
+    private Item agedControl(IntPredicate writable) {
+        Item control = usableFront(CONTROL, writable);
+        return control != null && selections - control.enqueuedAt >= AGE_LIMIT ? control : null;
+    }
+
     private Item choose(IntPredicate writable, Item chunk) {
         Item control = usableFront(CONTROL, writable);
-        if (control != null && selections - control.enqueuedAt >= AGE_LIMIT) {
-            return control;
-        }
         Item realtime = usableFront(REALTIME, writable);
         boolean others = chunk != null || control != null;
         List<Item> candidates = new ArrayList<Item>(3);

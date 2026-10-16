@@ -135,7 +135,7 @@ class SendSchedulerTest {
             scheduler.offer(rec(3, i), 1);
         }
         scheduler.offer(new Record(2, 1, 0,
-                Collections.singletonList(new Record.Dependency(3, 1200)), 1, NONE), 1);
+                Collections.singletonList(new Record.Dependency(3, 1200)), 2, NONE), 1);
         for (int i = 1; i <= 2000; i++) {
             scheduler.offer(rec(4, i), 1);
         }
@@ -185,6 +185,26 @@ class SendSchedulerTest {
             }
         }
         assertTrue(position >= 0 && position <= SendScheduler.AGE_LIMIT + 8,
+                "CONTROL record selected at position " + position);
+    }
+
+    @Test void agedControlRecordProgressesUnderSustainedPromotion() {
+        // The ACK_JOIN on CHUNK[0] waits for CHUNK[1] record 1200, so every pick would otherwise be a
+        // promotion; an independent CONTROL record must still go out within the aging limit (13.20).
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
+        for (int i = 1; i <= 1200; i++) {
+            scheduler.offer(rec(3, i), 1);
+        }
+        scheduler.offer(new Record(2, 1, 0,
+                Collections.singletonList(new Record.Dependency(3, 1200)), 2, NONE), 1);
+        scheduler.offer(rec(0, 1), 1);
+        int position = -1;
+        for (int i = 0; i < 200 && position < 0; i++) {
+            if (name(scheduler.pollSelection(ALL)).equals("0:1")) {
+                position = i;
+            }
+        }
+        assertTrue(position >= 0 && position <= SendScheduler.AGE_LIMIT,
                 "CONTROL record selected at position " + position);
     }
 
