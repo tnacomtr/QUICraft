@@ -1,56 +1,372 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.multistream;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.function.IntPredicate;
 import rs.sudoe.quicraft.core.profile.ServerProfile;
 
-/** Dependency-aware local record selection before transport writes (13.20). */
+/**
+ * Dependency-aware, bounded write policy that runs before record bytes enter QUIC (docs/protocol.md
+ * 13.20). It is local policy, not wire format: it never changes stream order, dependency
+ * construction or bundle atomicity.
+ *
+ * <p>Rules:
+ * <ul>
+ * <li>Each logical stream is a FIFO. Only the head of a stream can be selected, so a record is
+ *     never sent before its own predecessor and bytes on one stream are never reordered.</li>
+ * <li>A head is ready when every explicit dependency has already been selected (sent).</li>
+ * <li>Urgent records (REALTIME, and ACK_JOIN or BATCH_JOIN) whose prerequisites are unsent promote
+ *     the earliest ready prerequisite chain instead of filling QUIC with dependents.</li>
+ * <li>Fair selection: each class (CONTROL, REALTIME, CHUNK) has a virtual time advanced by
+ *     bytes divided by its profile weight. The lowest one wins, so each runnable class gets a
+ *     share proportional to its weight. REALTIME is also limited to {@link #MAX_REALTIME_BURST}
+ *     consecutive picks while another class is ready.</li>
+ * <li>Chunk streams are served round-robin among shards that are ready and writable.</li>
+ * <li>A ready CONTROL head that has waited {@link #AGE_LIMIT} selections is taken regardless of
+ *     weights, so small CONTROL traffic keeps progressing under sustained load.</li>
+ * <li>A record offered with {@code bundleContinues} keeps stream 0 open: the next selection must
+ *     be the following bundle member, so the bundle stays one contiguous CONTROL run (13.15).</li>
+ * </ul>
+ *
+ * <p>Selections account at most {@link #QUANTUM_BYTES} per transport write. A record already
+ * selected is written in full; the transport must not preempt a partially written record.
+ *
+ * <p>Thread-safe through its monitor. Weights, burst and aging constants are benchmark policy
+ * (13.20), not negotiated data.
+ */
 public final class SendScheduler {
-    public static final int QUANTUM_BYTES=64*1024;
-    private final List<Item> queue=new ArrayList<Item>();
-    private final int realtimeWeight,chunkWeight,controlWeight;
-    private long clock;
-    private int lastChunk=1, realtimeBurst;
-    /** Initializes scheduler weights from the immutable server profile (13.20). */
-    public SendScheduler(ServerProfile profile){if(profile==null)throw new IllegalArgumentException("profile");realtimeWeight=Math.max(1,profile.realtimeWeight);chunkWeight=Math.max(1,profile.chunkWeight);controlWeight=Math.max(1,profile.controlWeight);}
-    /** Enqueues a pre-sequenced record and its encoded byte cost (13.20). */
-    public synchronized void offer(Record record,int bytes){if(record==null||bytes<0)throw new IllegalArgumentException("item");queue.add(new Item(record,bytes,clock++));}
-    /** Selects the next dependency-ready item, with age and stream-class weighting (13.20). */
-    public synchronized Record poll(long[] delivered){
-        if(delivered==null)return null;
-        Item promoted=promotedPrerequisite(delivered);
-        if(promoted!=null) { queue.remove(promoted); return promoted.record; }
-        Item urgent=null;
-        for(Item i:queue) if(ready(i.record,delivered) && i.record.streamIndex()==1 && (urgent==null||i.created<urgent.created)) urgent=i;
-        Item best=null;
-        for(Item i:queue){if(!ready(i.record,delivered))continue;
-            boolean chunk=i.record.streamIndex()>=2;
-            if(urgent!=null && realtimeBurst>=4 && i.record.streamIndex()==1) continue;
-            if(urgent!=null && realtimeBurst>=4 && chunk) { if(best==null||chunkRank(i)<chunkRank(best))best=i; continue; }
-            if(urgent!=null && realtimeBurst<4 && i.record.streamIndex()==1) { if(best==null||i.created<best.created)best=i; continue; }
-            if(best==null||score(i)>score(best))best=i;
+    /** Write quantum: no transport write is accounted above 64 KiB (13.20). */
+    public static final int QUANTUM_BYTES = 64 * 1024;
+    /** Largest encoded record including its outer length prefix (13.4). */
+    public static final int MAX_RECORD_BYTES = 2_097_212;
+    /** Consecutive REALTIME selections allowed while another class is ready (13.20). */
+    public static final int MAX_REALTIME_BURST = 8;
+    /** Selections a ready CONTROL head may wait before it is taken regardless of weight (13.20). */
+    public static final int AGE_LIMIT = 32;
+
+    private static final int CONTROL = LogicalStream.CONTROL;
+    private static final int REALTIME = LogicalStream.REALTIME;
+    private static final int FIRST_CHUNK = 2;
+    private static final int CLASS_CHUNK = 0;
+    private static final int CLASS_CONTROL = 1;
+    private static final int CLASS_REALTIME = 2;
+
+    private final int realtimeWeight;
+    private final int chunkWeight;
+    private final int controlWeight;
+    private final int queuePacketLimit;
+    private final long queueByteLimit;
+    private final TreeMap<Integer, ArrayDeque<Item>> queues = new TreeMap<Integer, ArrayDeque<Item>>();
+    private final TreeMap<Integer, Long> offered = new TreeMap<Integer, Long>();
+    private final TreeMap<Integer, Long> sent = new TreeMap<Integer, Long>();
+    private final long[] classVirtualTime = new long[3];
+    private long virtualTime;
+    private long selections;
+    private int realtimeRun;
+    private int lastChunk = 1;
+    private boolean bundleOpen;
+    private int queuedRecords;
+    private long queuedBytes;
+
+    /** One selected record and its write accounting (13.20). */
+    public static final class Selection {
+        private final Record record;
+        private final int bytes;
+
+        private Selection(Record record, int bytes) {
+            this.record = record;
+            this.bytes = bytes;
         }
-        if(best==null)return null;
-        queue.remove(best);
-        if(best.record.streamIndex()==1)realtimeBurst++;else if(best.record.streamIndex()>=2){realtimeBurst=0;lastChunk=best.record.streamIndex();}
-        return best.record;
+
+        /** The selected record, whose stream order is unchanged. */
+        public Record record() {
+            return record;
+        }
+
+        /** The record's full encoded byte count. */
+        public int bytes() {
+            return bytes;
+        }
+
+        /** The byte count charged to one transport write, capped at {@link #QUANTUM_BYTES}. */
+        public int quantumBytes() {
+            return Math.min(bytes, QUANTUM_BYTES);
+        }
     }
-    /** Returns pending item count for bounded external queue management (13.20). */
-    public synchronized int size(){return queue.size();}
-    private long score(Item i){int stream=i.record.streamIndex();long weight=stream==1?realtimeWeight:stream>=2?chunkWeight:controlWeight;long age=clock-i.created;long priority=stream==1?3:stream>=2?2:1;return priority*1_000_000L+weight*1024L+Math.min(age,1_000_000L);}
-    private Item promotedPrerequisite(long[] delivered){
-        for(Item urgent:queue){
-            if(urgent.record.streamIndex()!=1 && urgent.record.kind()!=2)continue;
-            for(Record.Dependency dependency:urgent.record.dependencies()){
-                if(dependency.streamIndex()>=delivered.length||delivered[dependency.streamIndex()]>=dependency.sequence())continue;
-                for(Item candidate:queue)if(candidate.record.streamIndex()==dependency.streamIndex()&&candidate.record.sequence()<=dependency.sequence()&&ready(candidate.record,delivered))return candidate;
+
+    /**
+     * Reads weights and queue limits from the connection's immutable profile (13.20).
+     *
+     * @throws IllegalArgumentException if the profile is null
+     */
+    public SendScheduler(ServerProfile profile) {
+        if (profile == null) {
+            throw new IllegalArgumentException("profile");
+        }
+        this.realtimeWeight = positive(profile.realtimeWeight);
+        this.chunkWeight = positive(profile.chunkWeight);
+        this.controlWeight = positive(profile.controlWeight);
+        this.queuePacketLimit = profile.queuePacketLimit;
+        this.queueByteLimit = profile.queueByteLimit;
+    }
+
+    /**
+     * Enqueues one sequenced record and its encoded byte count (13.20). Records of each stream must
+     * be offered in sequence order without gaps, which the sequencer guarantees.
+     *
+     * @param bundleContinues true for every bundle record except the closing one (13.15)
+     * @throws IllegalArgumentException for an invalid byte count, an out-of-order offer, or a bundle
+     *         flag on a non-CONTROL record
+     */
+    public synchronized void offer(Record record, int bytes, boolean bundleContinues) {
+        if (record == null || bytes < 0 || bytes > MAX_RECORD_BYTES) {
+            throw new IllegalArgumentException("item");
+        }
+        int stream = record.streamIndex();
+        if (bundleContinues && stream != CONTROL) {
+            throw new IllegalArgumentException("bundle stream");
+        }
+        long previous = offeredOf(stream);
+        if (record.sequence() != previous + 1) {
+            throw new IllegalArgumentException("out-of-order offer");
+        }
+        offered.put(stream, record.sequence());
+        queues.computeIfAbsent(stream, key -> new ArrayDeque<Item>()).addLast(
+                new Item(record, bytes, bundleContinues, selections));
+        queuedRecords++;
+        queuedBytes += bytes;
+    }
+
+    /** Enqueues a record that is not part of a bundle (13.20). */
+    public synchronized void offer(Record record, int bytes) {
+        offer(record, bytes, false);
+    }
+
+    /**
+     * Selects the next record to write, or returns null when nothing is ready and writable.
+     *
+     * @param writable reports whether a logical stream can accept bytes now, including connection
+     *                 level writability; unwritable streams are never selected (13.20)
+     */
+    public synchronized Selection pollSelection(IntPredicate writable) {
+        if (writable == null) {
+            throw new IllegalArgumentException("writable");
+        }
+        if (bundleOpen) {
+            Item next = front(CONTROL);
+            if (next == null || !usable(next, writable)) {
+                return null;
+            }
+            return select(next);
+        }
+        for (Map.Entry<Integer, ArrayDeque<Item>> entry : queues.entrySet()) {
+            Item head = entry.getValue().peekFirst();
+            if (head == null || !isUrgent(head) || ready(head)) {
+                continue;
+            }
+            Item promoted = promote(head, new HashSet<Long>(), writable);
+            if (promoted != null) {
+                return select(promoted);
+            }
+        }
+        Item chosen = choose(writable);
+        return chosen == null ? null : select(chosen);
+    }
+
+    /** Records queued and not yet selected (13.20). */
+    public synchronized int size() {
+        return queuedRecords;
+    }
+
+    /** Encoded bytes queued and not yet selected, for outbound pool accounting (13.20). */
+    public synchronized long queuedBytes() {
+        return queuedBytes;
+    }
+
+    /** Whether the profile's queue limits are reached, so the producer should back off. */
+    public synchronized boolean queueFull() {
+        return queuedRecords >= queuePacketLimit || queuedBytes >= queueByteLimit;
+    }
+
+    private Item choose(IntPredicate writable) {
+        Item control = usableFront(CONTROL, writable);
+        if (control != null && selections - control.enqueuedAt >= AGE_LIMIT) {
+            return control;
+        }
+        Item chunk = chunkCandidate(writable);
+        Item realtime = usableFront(REALTIME, writable);
+        List<Item> candidates = new ArrayList<Item>(3);
+        List<Integer> classes = new ArrayList<Integer>(3);
+        if (chunk != null) {
+            candidates.add(chunk);
+            classes.add(CLASS_CHUNK);
+        }
+        if (control != null) {
+            candidates.add(control);
+            classes.add(CLASS_CONTROL);
+        }
+        if (realtime != null && (candidates.isEmpty() || realtimeRun < MAX_REALTIME_BURST)) {
+            candidates.add(realtime);
+            classes.add(CLASS_REALTIME);
+        }
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        int best = 0;
+        for (int i = 1; i < candidates.size(); i++) {
+            if (effectiveTime(classes.get(i)) < effectiveTime(classes.get(best))) {
+                best = i;
+            }
+        }
+        return candidates.get(best);
+    }
+
+    /** Next ready CHUNK[i] after the previously served shard, cyclically (13.20). */
+    private Item chunkCandidate(IntPredicate writable) {
+        Item first = null;
+        for (Map.Entry<Integer, ArrayDeque<Item>> entry : queues.tailMap(FIRST_CHUNK, true).entrySet()) {
+            int stream = entry.getKey();
+            Item head = entry.getValue().peekFirst();
+            if (head == null || !usable(head, writable)) {
+                continue;
+            }
+            if (stream > lastChunk) {
+                return head;
+            }
+            if (first == null) {
+                first = head;
+            }
+        }
+        return first;
+    }
+
+    /**
+     * Earliest ready, writable prerequisite chain that unblocks {@code item}, or null. Depth-first
+     * through unsent explicit dependencies; each visited head is examined once.
+     */
+    private Item promote(Item item, Set<Long> seen, IntPredicate writable) {
+        for (Record.Dependency dependency : item.record.dependencies()) {
+            int stream = dependency.streamIndex();
+            if (sentOf(stream) >= dependency.sequence()) {
+                continue;
+            }
+            Item head = front(stream);
+            if (head == null || !seen.add(key(head))) {
+                continue;
+            }
+            if (usable(head, writable)) {
+                return head;
+            }
+            Item deeper = promote(head, seen, writable);
+            if (deeper != null) {
+                return deeper;
             }
         }
         return null;
     }
-    private int chunkRank(Item i){return (i.record.streamIndex()-lastChunk+6)%6;}
-    private boolean ready(Record r,long[] d){if(d==null||r.streamIndex()>=d.length)return false;for(Record.Dependency x:r.dependencies())if(x.streamIndex()>=d.length||d[x.streamIndex()]<x.sequence())return false;return true;}
-    private static final class Item{final Record record;final int bytes;final long created;Item(Record r,int b,long c){record=r;bytes=b;created=c;}}
+
+    private Selection select(Item item) {
+        int stream = item.record.streamIndex();
+        ArrayDeque<Item> queue = queues.get(stream);
+        queue.pollFirst();
+        queuedRecords--;
+        queuedBytes -= item.bytes;
+        sent.put(stream, item.record.sequence());
+        int cls = classOf(stream);
+        long base = Math.max(classVirtualTime[cls], virtualTime);
+        virtualTime = base;
+        classVirtualTime[cls] = base + (long) Math.max(1, item.bytes) * 1024L / weightOf(cls);
+        realtimeRun = cls == CLASS_REALTIME ? realtimeRun + 1 : 0;
+        if (cls == CLASS_CHUNK) {
+            lastChunk = stream;
+        }
+        if (stream == CONTROL) {
+            bundleOpen = item.bundleContinues;
+        }
+        selections++;
+        return new Selection(item.record, item.bytes);
+    }
+
+    private long effectiveTime(int cls) {
+        return Math.max(classVirtualTime[cls], virtualTime);
+    }
+
+    private Item usableFront(int stream, IntPredicate writable) {
+        Item head = front(stream);
+        return head != null && usable(head, writable) ? head : null;
+    }
+
+    private boolean usable(Item item, IntPredicate writable) {
+        return ready(item) && writable.test(item.record.streamIndex());
+    }
+
+    private boolean ready(Item item) {
+        for (Record.Dependency dependency : item.record.dependencies()) {
+            if (sentOf(dependency.streamIndex()) < dependency.sequence()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isUrgent(Item head) {
+        return head.record.streamIndex() == REALTIME || head.record.kind() != 0;
+    }
+
+    private Item front(int stream) {
+        ArrayDeque<Item> queue = queues.get(stream);
+        return queue == null ? null : queue.peekFirst();
+    }
+
+    private long sentOf(int stream) {
+        Long value = sent.get(stream);
+        return value == null ? 0 : value;
+    }
+
+    private long offeredOf(int stream) {
+        Long value = offered.get(stream);
+        return value == null ? 0 : value;
+    }
+
+    private static long key(Item head) {
+        return (long) head.record.streamIndex() * 4_294_967_296L + head.record.sequence();
+    }
+
+    private static int classOf(int stream) {
+        if (stream == CONTROL) {
+            return CLASS_CONTROL;
+        }
+        return stream == REALTIME ? CLASS_REALTIME : CLASS_CHUNK;
+    }
+
+    private long weightOf(int cls) {
+        if (cls == CLASS_CONTROL) {
+            return controlWeight;
+        }
+        return cls == CLASS_REALTIME ? realtimeWeight : chunkWeight;
+    }
+
+    private static int positive(int value) {
+        return Math.max(1, value);
+    }
+
+    private static final class Item {
+        final Record record;
+        final int bytes;
+        final boolean bundleContinues;
+        final long enqueuedAt;
+
+        Item(Record record, int bytes, boolean bundleContinues, long enqueuedAt) {
+            this.record = record;
+            this.bytes = bytes;
+            this.bundleContinues = bundleContinues;
+            this.enqueuedAt = enqueuedAt;
+        }
+    }
 }
