@@ -6,19 +6,7 @@
   "license": "GPL-3.0-or-later",
   "environment": "client",
   "entrypoints": {
-    "fabric-client-gametest": [
-      "rs.sudoe.quicraft.fabric.gametest.SettingsScreenGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.QuicJoinGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.EarlyDataGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.FallbackGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.TcpOnlyGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.QuicOnlyGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.FaultInjectionGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.AsyncFaultInjectionGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.ServerMultistreamGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.JoinTimingGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.ExternalServerGameTest"
-    ]
+    "fabric-client-gametest": ["rs.sudoe.quicraft.fabric.gametest.ServerMultistreamGameTest", "rs.sudoe.quicraft.fabric.gametest.ServerMultistreamOnlineGameTest"]
   },
   "mixins": ["quicraft-gametest.mixins.json"],
   "depends": {

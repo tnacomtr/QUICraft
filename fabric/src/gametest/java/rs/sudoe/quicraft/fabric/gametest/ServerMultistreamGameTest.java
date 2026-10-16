@@ -52,13 +52,14 @@ public class ServerMultistreamGameTest implements FabricClientGameTest {
             check(ad != null && "quicraft/3".equals(ad.alpn()), "the server advertises quicraft/3: " + ad);
             RawV3Client.Result result;
             try (RawV3Client.Join join = RawV3Client.start(new InetSocketAddress(InetAddress.getLoopbackAddress(),
-                    ad.port()), ad.fingerprint(), MultistreamSwitch.tableFor(775), 5)) {
+                    ad.port()), ad.fingerprint(), MultistreamSwitch.tableFor(775), 5, false)) {
                 // The harness steps the game's ticks only while the test waits for them.
                 for (int tick = 0; tick < 1200 && !join.done.isDone(); tick++) {
                     context.waitTick();
                 }
                 result = join.result;
             }
+            QuicraftFabricTestLog.info("offline /3 join: " + result);
             check(result.failure == null, "the raw join ran without error: " + result);
             check(result.activated, "binding activated the lanes: " + result);
             check(result.finishedConfiguration, "the configuration stage finished over records: " + result);

@@ -8,8 +8,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.security.KeyFactory;
+import java.security.SecureRandom;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 import rs.sudoe.quicraft.core.binding.BindingDriver;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
@@ -52,6 +58,8 @@ final class RawV3Client {
     }
 
     private static final int PROTOCOL = 775;
+    private static final int CLIENTBOUND_LOGIN_HELLO = 1;
+    private static final int SERVERBOUND_LOGIN_KEY = 1;
     private static final int CLIENTBOUND_LOGIN_COMPRESSION = 3;
     private static final int CLIENTBOUND_LOGIN_FINISHED = 2;
     private static final int CLIENTBOUND_CONFIG_CUSTOM_PAYLOAD = 1;
@@ -80,8 +88,15 @@ final class RawV3Client {
     private boolean offerSeen;
     private ProtocolState laneState = ProtocolState.CONFIGURATION;
     private final int playPacketsWanted;
+    private final boolean online;
+    private byte[] rawBuffer = new byte[0];
+    private byte[] secret;
+    private Cipher decryptIn;
+    private Cipher encryptOut;
 
-    private RawV3Client(V3Connection connection, RoutingTable table, byte[] fingerprint, int playPacketsWanted) {
+    private RawV3Client(V3Connection connection, RoutingTable table, byte[] fingerprint, int playPacketsWanted,
+            boolean online) {
+        this.online = online;
         this.connection = connection;
         this.table = table;
         this.fingerprint = fingerprint;
@@ -109,10 +124,10 @@ final class RawV3Client {
      * Starts a join. The caller must keep the game's ticks running (the client gametest harness steps
      * them) until {@link Join#done} completes: the server's login needs its main thread.
      */
-    static Join start(InetSocketAddress server, Fingerprint fingerprint, RoutingTable table, int playPacketsWanted)
-            throws Exception {
+    static Join start(InetSocketAddress server, Fingerprint fingerprint, RoutingTable table, int playPacketsWanted,
+            boolean online) throws Exception {
         V3Connection connection = QuicClient.connectV3(server, fingerprint, table, null).get(15, TimeUnit.SECONDS);
-        RawV3Client client = new RawV3Client(connection, table, digest(fingerprint), playPacketsWanted);
+        RawV3Client client = new RawV3Client(connection, table, digest(fingerprint), playPacketsWanted, online);
         connection.setListener(client.new Listener());
         connection.setAutoRead(true);
         client.send(handshake(server.getPort()));
@@ -132,7 +147,10 @@ final class RawV3Client {
                     return;
                 }
                 result.events.add("data " + chunk.length);
-                buffer = concat(buffer, chunk);
+                rawBuffer = concat(rawBuffer, chunk);
+                // CFB8 is byte for byte: the plaintext and the ciphertext it came from stay aligned, so
+                // the ciphertext after a frame is still there when the cipher has to stop at it (12.13).
+                buffer = concat(buffer, decryptIn == null ? chunk : decryptIn.update(chunk));
                 parse();
             } catch (Throwable t) {
                 result.failure = t;
@@ -168,6 +186,7 @@ final class RawV3Client {
             int total = position[0] + (int) length;
             byte[] frame = Arrays.copyOf(buffer, total);
             buffer = Arrays.copyOfRange(buffer, total, buffer.length);
+            rawBuffer = Arrays.copyOfRange(rawBuffer, total, rawBuffer.length);
             handleFrame(FrameCodec.decode(frame, threshold, false, (a, b) -> { }));
             if (inboundSwitched) {
                 activateLanes();
@@ -180,7 +199,9 @@ final class RawV3Client {
         int[] position = {0};
         int id = (int) readVarInt(packet, position);
         if (phase == 0) {
-            if (id == CLIENTBOUND_LOGIN_COMPRESSION) {
+            if (id == CLIENTBOUND_LOGIN_HELLO && online) {
+                answerHello(packet, position);
+            } else if (id == CLIENTBOUND_LOGIN_COMPRESSION) {
                 threshold = (int) readVarInt(packet, position);
                 result.events.add("compression " + threshold);
             } else if (id == CLIENTBOUND_LOGIN_FINISHED) {
@@ -188,8 +209,8 @@ final class RawV3Client {
                 connection.flush();
                 phase = 1;
                 result.events.add("login finished, configuration entered");
-                binding = new BindingSession(BindingStateMachine.Role.CLIENT, connection::exporterValue, null,
-                        BindingStateMachine.MODE_OFFLINE, PROTOCOL, fingerprint, table.digest(), System::nanoTime, 0L,
+                binding = new BindingSession(BindingStateMachine.Role.CLIENT, connection::exporterValue, secret,
+                        online ? BindingStateMachine.MODE_ONLINE : BindingStateMachine.MODE_OFFLINE, PROTOCOL, fingerprint, table.digest(), System::nanoTime, 0L,
                         new BindingDriver.Callbacks() {
                             @Override
                             public void send(byte[] payload) {
@@ -199,6 +220,8 @@ final class RawV3Client {
 
                             @Override
                             public void activateOutbound() {
+                                // 12.11: the cipher stops right after the last encrypted byte.
+                                encryptOut = null;
                                 result.events.add("client switch sent");
                             }
 
@@ -258,8 +281,10 @@ final class RawV3Client {
     }
 
     private void activateLanes() {
-        byte[] rest = buffer;
+        // The bytes after the final encrypted frame are the peer's first record, still ciphertext.
+        byte[] rest = rawBuffer;
         buffer = new byte[0];
+        rawBuffer = new byte[0];
         // Before anything else: from here stream 0 is the lane session's, and a byte the stream
         // still delivers to this listener must not be parsed as Minecraft frames.
         phase = 2;
@@ -357,7 +382,38 @@ final class RawV3Client {
     // --- Minecraft bytes.
 
     private void send(byte[] bytes) {
-        connection.write(ByteBuffer.wrap(bytes));
+        connection.write(ByteBuffer.wrap(encryptOut == null ? bytes : encryptOut.update(bytes)));
+    }
+
+    /** Vanilla's login encryption: RSA-encrypted secret and challenge, then AES/CFB8 both ways. */
+    private void answerHello(byte[] packet, int[] position) throws Exception {
+        int idLength = (int) readVarInt(packet, position);
+        position[0] += idLength;
+        int keyLength = (int) readVarInt(packet, position);
+        byte[] publicKey = Arrays.copyOfRange(packet, position[0], position[0] + keyLength);
+        position[0] += keyLength;
+        int challengeLength = (int) readVarInt(packet, position);
+        byte[] challenge = Arrays.copyOfRange(packet, position[0], position[0] + challengeLength);
+        secret = new byte[16];
+        new SecureRandom().nextBytes(secret);
+        Cipher rsa = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+        rsa.init(Cipher.ENCRYPT_MODE, KeyFactory.getInstance("RSA").generatePublic(new X509EncodedKeySpec(publicKey)));
+        byte[] encryptedSecret = rsa.doFinal(secret);
+        byte[] encryptedChallenge = rsa.doFinal(challenge);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeVarInt(out, SERVERBOUND_LOGIN_KEY);
+        writeVarInt(out, encryptedSecret.length);
+        out.write(encryptedSecret, 0, encryptedSecret.length);
+        writeVarInt(out, encryptedChallenge.length);
+        out.write(encryptedChallenge, 0, encryptedChallenge.length);
+        send(framed(out.toByteArray()));
+        connection.flush();
+        // Everything after the key packet is encrypted, in both directions.
+        encryptOut = Cipher.getInstance("AES/CFB8/NoPadding");
+        encryptOut.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(secret, "AES"), new IvParameterSpec(secret));
+        decryptIn = Cipher.getInstance("AES/CFB8/NoPadding");
+        decryptIn.init(Cipher.DECRYPT_MODE, new SecretKeySpec(secret, "AES"), new IvParameterSpec(secret));
+        result.events.add("login encryption on");
     }
 
     private byte[] framed(byte[] packet) {
