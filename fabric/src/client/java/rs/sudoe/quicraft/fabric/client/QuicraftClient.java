@@ -18,6 +18,7 @@ public final class QuicraftClient implements ClientModInitializer {
     private ClientConnector connector;
     private Path configDir;
     private volatile Mode mode = Mode.AUTO;
+    private volatile boolean multistream;
 
     /** Null if initialization failed: every hook then takes the vanilla path. */
     public static @Nullable QuicraftClient get() {
@@ -29,7 +30,9 @@ public final class QuicraftClient implements ClientModInitializer {
         try {
             Hooks.enter("client initialize");
             configDir = QuicraftFabric.configDir();
-            mode = ClientSettings.load(configDir);
+            ClientSettings.Loaded settings = ClientSettings.load(configDir);
+            mode = settings.mode();
+            multistream = settings.multistream();
             connector = new ClientConnector(new AdvertisementCache(),
                     FailureCache.load(configDir.resolve("quic-failures.properties")));
             instance = this;
@@ -48,6 +51,16 @@ public final class QuicraftClient implements ClientModInitializer {
 
     public void setMode(Mode mode) {
         this.mode = mode;
-        ClientSettings.save(configDir, mode);
+        ClientSettings.save(configDir, mode, multistream);
+    }
+
+    /** Whether the player allows multi-stream ({@code quicraft/3}); off by default (12.1). */
+    public boolean multistream() {
+        return multistream;
+    }
+
+    public void setMultistream(boolean multistream) {
+        this.multistream = multistream;
+        ClientSettings.save(configDir, mode, multistream);
     }
 }

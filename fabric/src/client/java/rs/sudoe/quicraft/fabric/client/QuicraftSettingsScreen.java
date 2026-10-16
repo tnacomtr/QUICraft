@@ -21,6 +21,7 @@ import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 public final class QuicraftSettingsScreen extends Screen {
     static final String TITLE = "quicraft.settings.title";
     static final String TRANSPORT = "quicraft.settings.transport";
+    static final String MULTISTREAM = "quicraft.settings.multistream";
     static final String FORGET = "quicraft.settings.forget_failures";
 
     private final Screen parent;
@@ -52,6 +53,15 @@ public final class QuicraftSettingsScreen extends Screen {
                 });
         transport.active = client != null;
         contents.addChild(transport);
+        CycleButton<Boolean> multistream = CycleButton.onOffBuilder(client != null && client.multistream())
+                .withTooltip(on -> Tooltip.create(Component.translatable(MULTISTREAM + ".tooltip")))
+                .create(0, 0, 310, 20, Component.translatable(MULTISTREAM), (button, on) -> {
+                    if (client != null) {
+                        client.setMultistream(on);
+                    }
+                });
+        multistream.active = client != null;
+        contents.addChild(multistream);
         Button forget = Button.builder(Component.translatable(FORGET), button -> {
             if (client != null) {
                 client.connector().forgetFailures();

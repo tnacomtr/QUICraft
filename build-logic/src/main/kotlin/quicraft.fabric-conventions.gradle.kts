@@ -49,6 +49,10 @@ sourceSets {
     // inputs). They never start a game; each module's own src/test/java applies on top.
     named("test") {
         java.srcDirs(shared.dir("test/java"), layout.projectDirectory.dir("src/test/java"))
+        // The client classes' pure logic (settings files, pin paths, notices) is unit-tested too.
+        // Only classes whose constructors and statics touch no game class are loaded there.
+        compileClasspath += sourceSets.getByName("client").output + sourceSets.getByName("client").compileClasspath
+        runtimeClasspath += sourceSets.getByName("client").output
     }
 }
 // Separate run directories, so a client and a server can run side by side (both gitignored).
