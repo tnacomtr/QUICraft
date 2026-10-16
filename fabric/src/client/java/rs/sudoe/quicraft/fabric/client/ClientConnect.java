@@ -218,36 +218,67 @@ public final class ClientConnect {
      * the game's packet handler. From here {@link V3Client} runs the exchange; a failure before the
      * lanes are active ends in a TCP retry (docs/protocol.md 12.14).
      */
-    private static void useV3(V3Connection v3, V3Plan plan, EventLoop loop, Connection connection,
+    static void useV3(V3Connection v3, V3Plan plan, EventLoop loop, Connection connection,
             ChannelPromise promise, boolean[] attached, Mode mode, ClientV3State files, ServerAddress logical,
             Supplier<ChannelFuture> vanilla) {
-        int protocol = SharedConstants.getCurrentVersion().protocolVersion();
-        RoutingTable table = RoutingRegistry.forProtocol(protocol)
-                .orElseThrow(() -> new IllegalStateException("no routing table for protocol " + protocol));
-        QuicBridgeChannel channel = new QuicBridgeChannel(v3);
-        V3Client client = new V3Client(connection, channel, loop, v3, plan, table, protocol, mode == Mode.QUIC_ONLY, files,
-                logical.getHost(), logical.getPort(),
-                plan.pinState() == TransportSelection.PinState.CHANGED
-                        ? V3Client.oldPin(files, logical.getHost(), logical.getPort())
-                        : java.util.concurrent.CompletableFuture.completedFuture(null));
-        attached[0] = true;
-        installVanillaPipeline(channel, connection);
-        channel.pipeline().addBefore("packet_handler", V3Handler.NAME, new V3Handler(client));
-        Transports.quic(connection, v3);
-        Transports.v3(connection, client);
-        if (v3 instanceof V3ConnectionImpl impl) {
-            // The game's first flight differed from the 0-RTT one: the connection closes, and the join
-            // starts again over TCP like any other /3 failure before activation.
-            impl.onFirstFlightMismatch(() -> client.fail("the early data did not match"));
-        }
-        loop.register(channel).addListener(f -> {
-            if (!f.isSuccess()) {
-                client.fail(f.cause());
-                promise.tryFailure(withMessage(f.cause()));
-            } else if (!promise.trySuccess()) {
-                channel.close(); // cancelled meanwhile
+        // Transactional: until the pipeline is complete and the channel registered, nothing is attached
+        // to the screen's future, and any failure releases what was built and takes the mode-aware
+        // fallback (docs/protocol.md 12.14).
+        QuicBridgeChannel channel = null;
+        try {
+            int protocol = SharedConstants.getCurrentVersion().protocolVersion();
+            RoutingTable table = RoutingRegistry.forProtocol(protocol)
+                    .orElseThrow(() -> new IllegalStateException("no routing table for protocol " + protocol));
+            channel = new QuicBridgeChannel(v3);
+            Hooks.enter("v3 setup");
+            V3Client client = new V3Client(connection, channel, loop, v3, plan, table, protocol,
+                    mode == Mode.QUIC_ONLY, files, logical.getHost(), logical.getPort(),
+                    plan.pinState() == TransportSelection.PinState.CHANGED
+                            ? V3Client.oldPin(files, logical.getHost(), logical.getPort())
+                            : java.util.concurrent.CompletableFuture.completedFuture(null));
+            installVanillaPipeline(channel, connection);
+            channel.pipeline().addBefore("packet_handler", V3Handler.NAME, new V3Handler(client));
+            Transports.quic(connection, v3);
+            Transports.v3(connection, client);
+            if (v3 instanceof V3ConnectionImpl impl) {
+                // The game's first flight differed from the 0-RTT one: the connection closes, and the join
+                // starts again over TCP like any other /3 failure before activation.
+                impl.onFirstFlightMismatch(() -> client.fail("the early data did not match"));
             }
-        });
+            final QuicBridgeChannel registering = channel;
+            attached[0] = true;
+            loop.register(channel).addListener(f -> {
+                if (!f.isSuccess()) {
+                    setupFailed(v3, registering, plan, mode, f.cause(), promise, vanilla);
+                } else if (!promise.trySuccess()) {
+                    registering.close(); // cancelled meanwhile
+                }
+            });
+        } catch (Throwable t) {
+            attached[0] = false;
+            setupFailed(v3, channel, plan, mode, t, promise, vanilla);
+        }
+    }
+
+    /** Releases a half-built /3 join and falls back as the mode requires: TCP and a notice, or the error. */
+    private static void setupFailed(V3Connection v3, QuicBridgeChannel channel, V3Plan plan, Mode mode, Throwable cause,
+            ChannelPromise promise, Supplier<ChannelFuture> vanilla) {
+        try {
+            if (channel != null && channel.isRegistered()) {
+                channel.close();
+            }
+            v3.close();
+        } catch (Throwable ignored) {
+            // Closing is best effort; the connection dies with its owner.
+        }
+        boolean retry = plan.failed(V3Plan.Phase.JOINING, V3Plan.INTERNAL_ERROR);
+        if (retry && mode != Mode.QUIC_ONLY) {
+            QuicraftFabric.LOG.warn("QUICraft: {}", V3Notices.fellBack(V3Plan.INTERNAL_ERROR), cause);
+            failed(mode, cause, promise, vanilla);
+        } else {
+            promise.tryFailure(withMessage(new java.io.IOException(
+                    "QUIC multi-stream failed (" + V3Plan.INTERNAL_ERROR + ")", cause)));
+        }
     }
 
     private static void useTcp(ClientConnector.Outcome<Channel> outcome, Connection connection,

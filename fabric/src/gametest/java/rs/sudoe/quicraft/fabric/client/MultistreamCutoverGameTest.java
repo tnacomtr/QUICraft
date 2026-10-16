@@ -118,6 +118,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             theTailKeepsProtocolSwitchTasksAwayFromTheLanes(table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
             offlineTestModeNeverAcceptsAChangedPin(protocol, table.get());
+            aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), false);
+            aFailedPipelineSetupFallsBackToTcp(protocol, table.get(), true);
             aChangedCertificateIsReboundAndTheNewPinIsNoticed(protocol, table.get());
             aReboundThatGetsNoOfferFailsAfterTheBoundedWait(protocol, table.get());
         } catch (Exception e) {
@@ -391,6 +393,46 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(rig.awaitCondition(() -> !rig.channel.isOpen()), "silence closed the connection, as vanilla does");
         } finally {
             V3Client.readTimeoutMillis = 30_000L;
+        }
+    }
+
+    /**
+     * Setting up the join's pipeline fails after the QUIC connection won: nothing is attached to the
+     * screen, the QUIC connection is closed, and auto retries over TCP with the notice while quic-only
+     * reports the error (docs/protocol.md 12.14, section 4).
+     */
+    private static void aFailedPipelineSetupFallsBackToTcp(int protocol, RoutingTable table, boolean quicOnly)
+            throws Exception {
+        try (Rig rig = new Rig(protocol, table, quicOnly, false)) {
+            Fake second = rig.fake;
+            io.netty.channel.ChannelPromise promise = new io.netty.channel.DefaultChannelPromise(new EmbeddedChannel(), rig.loop);
+            int[] tcpJoins = {0};
+            Hooks.setFaultInjection("v3 setup");
+            boolean[] attached = {false};
+            try {
+                ClientConnect.useV3(second, rig.plan, rig.loop, new Connection(PacketFlow.CLIENTBOUND), promise,
+                        attached, quicOnly ? Mode.QUIC_ONLY : Mode.AUTO, rig.files,
+                        new net.minecraft.client.multiplayer.resolver.ServerAddress(HOST, PORT), () -> {
+                            tcpJoins[0]++;
+                            return new EmbeddedChannel().newSucceededFuture();
+                        });
+            } finally {
+                Hooks.setFaultInjection(false);
+            }
+            check(rig.awaitCondition(promise::isDone), "the screen's future completes");
+            check(!attached[0], "nothing stayed attached");
+            check(rig.awaitCondition(() -> !second.open), "the QUIC connection was closed");
+            check(rig.plan.isFailed(), "the failure is recorded");
+            if (quicOnly) {
+                check(!promise.isSuccess() && promise.cause().getMessage().contains("QUIC multi-stream failed"),
+                        "quic-only reports the error: " + promise.cause());
+                check(tcpJoins[0] == 0 && V3Notices.isEmpty(), "and does not fall back");
+            } else {
+                check(promise.isSuccess() && tcpJoins[0] == 1, "auto joins over TCP: " + promise);
+                List<V3Notices.Notice> notices = V3Notices.drain();
+                check(notices.size() == 1 && notices.get(0).literal().contains("fell back to TCP"),
+                        "with the notice: " + notices);
+            }
         }
     }
 
