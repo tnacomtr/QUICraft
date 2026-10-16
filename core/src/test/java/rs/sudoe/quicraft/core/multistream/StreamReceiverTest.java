@@ -397,4 +397,36 @@ class StreamReceiverTest {
             assertEquals("unseen-prerequisite", new String(close.reason(), java.nio.charset.StandardCharsets.US_ASCII), label);
         }
     }
+
+    @Test void heldEpochPlusOneHeadWithoutAnyTransitionIsAViolationOnceItsPrerequisiteApplies() {
+        Fixture f = new Fixture(2);
+        // The CHUNK head at epoch 1 is admitted while REALTIME 1 is unseen, so a path still exists.
+        assertAdmitted(f.receiver, rec(2, 1, 1, dep(1, 1)));
+        assertAdmitted(f.receiver, rec(1, 1, 0));
+        f.receiver.enqueued(1, 1);
+        f.receiver.applied(1, 1);
+        // No transition was admitted, so the held head can never reach its epoch: 0x11, not a 0x12 expiry.
+        ReceiveClose close = f.receiver.pendingViolation();
+        assertNotNull(close, "the apply must surface the violation");
+        assertEquals(0x11, close.errorCode());
+        assertEquals(StreamReceiver.Admission.Kind.VIOLATION, offer(f.receiver, rec(0, 1, 0)).kind(),
+                "the violation is sticky for later offers");
+    }
+
+    @Test void heldEpochPlusOneHeadIsReleasedWhenATransitionArrivesBeforeTheApply() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 1, dep(1, 1)));
+        assertAdmitted(f.receiver, rec(1, 1, 0));
+        f.receiver.enqueued(1, 1);
+        // The transition arrives while REALTIME 1 is still held, so the path is reachable again.
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
+                f.receiver.offer(rec(0, 1, 0), boundary(), 100, 1).kind());
+        f.receiver.applied(1, 1);
+        assertNull(f.receiver.pendingViolation(), "a pending transition keeps the head legal");
+        f.receiver.enqueued(0, 1);
+        f.receiver.applied(0, 1);
+        assertEquals(1, f.receiver.epoch());
+        assertNull(f.receiver.pendingViolation());
+        assertEquals(2, f.receiver.nextToEnqueue(), "the chunk head is released normally");
+    }
 }

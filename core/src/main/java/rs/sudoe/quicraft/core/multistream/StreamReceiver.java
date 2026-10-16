@@ -93,6 +93,10 @@ public final class StreamReceiver {
         static Admission violation(String detail) {
             return new Admission(Kind.VIOLATION, ReceiveClose.peerViolation(detail));
         }
+
+        static Admission of(ReceiveClose close) {
+            return new Admission(Kind.VIOLATION, close);
+        }
     }
 
     /** One admitted head unit and its per-stream state. */
@@ -122,6 +126,8 @@ public final class StreamReceiver {
     private long epoch;
     private boolean transitionPending;
     private boolean stalled;
+    /** First 0x11 found by a re-check after an apply; sticky, every later offer returns it (13.18). */
+    private ReceiveClose violation;
 
     /**
      * Clientbound receiver, kept for existing callers.
@@ -169,6 +175,9 @@ public final class StreamReceiver {
         if (record == null || route == null) {
             throw new IllegalArgumentException("record and route are required");
         }
+        if (violation != null) {
+            return Admission.of(violation);
+        }
         int stream = record.streamIndex();
         if (stream < 0 || stream >= streams) {
             return Admission.violation("stream index " + stream + " outside 0.." + (streams - 1));
@@ -201,6 +210,10 @@ public final class StreamReceiver {
         if (wireBytes > ReceiveSlots.BYTES_PER_STREAM || recordCount > ReceiveSlots.RECORDS_PER_STREAM
                 || recordCount < 0 || wireBytes < 0) {
             return Admission.violation("unit exceeds the stream slot on stream " + stream);
+        }
+        ReceiveClose heldViolation = heldPathViolation(transitionPending || route.epochChange());
+        if (heldViolation != null) {
+            return Admission.of(heldViolation);
         }
         if (head[stream] != null) {
             return Admission.busy();
@@ -284,6 +297,17 @@ public final class StreamReceiver {
             transitionPending = false;
         }
         stopTimersOfReadyHeads();
+        if (violation == null) {
+            violation = heldPathViolation(transitionPending);
+        }
+    }
+
+    /**
+     * Returns the 0x11 found when an apply left a held epoch+1 head without a path to its transition,
+     * or null. Stays set until the connection closes; the caller must act on it (13.18).
+     */
+    public ReceiveClose pendingViolation() {
+        return violation;
     }
 
     /**
@@ -417,6 +441,23 @@ public final class StreamReceiver {
             }
         }
         return true;
+    }
+
+    /**
+     * Re-runs the epoch+1 path rule for every held head (13.18). Prerequisites only change on apply and a
+     * transition only leaves on apply, so this runs after each apply and before each admission.
+     */
+    private ReceiveClose heldPathViolation(boolean transitionReachable) {
+        if (transitionReachable) {
+            return null;
+        }
+        for (Unit unit : head) {
+            Record held = unit == null ? null : unit.record;
+            if (held != null && !unit.enqueued && held.epoch() == epoch + 1 && prerequisitesApplied(held)) {
+                return ReceiveClose.peerViolation("epoch " + held.epoch() + " without a transition path");
+            }
+        }
+        return null;
     }
 
     private Admission checkRoute(int stream, Record record, ReceiveRoute route) {
