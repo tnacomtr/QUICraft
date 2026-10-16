@@ -88,6 +88,7 @@ final class V3Handler extends ChannelDuplexHandler implements DecodeContext.Gate
                 lastRead = System.nanoTime();
             } else if (System.nanoTime() - lastRead >= timeoutNanos) {
                 silenceWatch.cancel(false);
+                client.silent();
                 ctx.fireExceptionCaught(ReadTimeoutException.INSTANCE);
             }
         }, period, period, TimeUnit.NANOSECONDS);
@@ -150,10 +151,14 @@ final class V3Handler extends ChannelDuplexHandler implements DecodeContext.Gate
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
         if (cause instanceof GameLanes.LaneClosedException) {
             client.laneClosed((GameLanes.LaneClosedException) cause);
-        } else if (cause instanceof BoundaryCipherDecoder.MalformedFrameException
-                || cause.getCause() instanceof BoundaryCipherDecoder.MalformedFrameException) {
-            // Our own decoder at the cipher boundary (12.13) failed: a /3 failure, not the game's.
-            client.fail(cause);
+        } else if (client.state() == V3Client.State.ACTIVE) {
+            // After activation: recorded (the next join uses TCP), then vanilla's own disconnect.
+            client.failActive("protocol error");
+        } else if (client.state() != V3Client.State.FAILED && !client.serverHasDisconnected()) {
+            // Before activation any error is a /3 failure, handled BEFORE vanilla closes the
+            // connection: vanilla's close would otherwise look like the player leaving and skip the
+            // failure record and the TCP retry.
+            client.fail("protocol error");
             return;
         }
         ctx.fireExceptionCaught(cause);

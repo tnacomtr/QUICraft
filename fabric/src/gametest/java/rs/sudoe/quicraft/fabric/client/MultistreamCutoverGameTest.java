@@ -114,6 +114,9 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             aClosedConnectionBeforeActivationFallsBack(protocol, table.get());
             aServerDisconnectIsNotAMultistreamFailure(protocol, table.get());
             heldPacketsStayHeldUntilActivation(protocol, table.get());
+            aProtocolErrorBeforeActivationFallsBackToTcp(protocol, table.get(), false);
+            aProtocolErrorBeforeActivationFallsBackToTcp(protocol, table.get(), true);
+            aHookFailureAfterActivationDisconnectsAndTheNextJoinUsesTcp(protocol, table.get());
             anOversizedBindingPayloadOutsideV3IsDiscardedAsVanillaDoes(table.get());
             theTailKeepsProtocolSwitchTasksAwayFromTheLanes(table.get());
             aSilentConnectionTimesOutLikeVanillasDoes(protocol, table.get());
@@ -392,8 +395,64 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(rig.awaitState(V3Client.State.ACTIVE), "active");
             check(rig.channel.pipeline().get("timeout") == null, "the byte path's timeout handler is gone");
             check(rig.awaitCondition(() -> !rig.channel.isOpen()), "silence closed the connection, as vanilla does");
+            check(rig.awaitCondition(() -> rig.plan.isFailed()), "the failure is recorded");
+            check(!Transports.takeRetryOverTcp(rig.connection), "after activation nothing is retried");
+            rig.expectNextJoinUsesTcp();
         } finally {
             V3Client.readTimeoutMillis = 30_000L;
+        }
+    }
+
+    /**
+     * A decoder failure before activation (here a packet id that does not exist, or an over-long
+     * binding payload) is a /3 failure: it must reach the failure path before vanilla closes the
+     * connection, so the join is retried over TCP and the player is told.
+     */
+    private static void aProtocolErrorBeforeActivationFallsBackToTcp(int protocol, RoutingTable table,
+            boolean oversizedBinding) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            byte[] frame;
+            if (oversizedBinding) {
+                frame = rig.server.frame(new ClientboundCustomPayloadPacket(
+                        new rs.sudoe.quicraft.fabric.net.BindingPayload(new byte[500])));
+            } else {
+                frame = new byte[] {3, 0x7e, 1, 2}; // length 3: an unknown packet id and two bytes
+            }
+            rig.fake.inject(rig.server.encrypted(frame));
+
+            check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
+            rig.expectFallback("protocol error");
+        }
+    }
+
+    /**
+     * After activation a failure ends the connection with a reason and no retry, and the next join
+     * goes straight to TCP (12.14: the activation failure is recorded either way).
+     */
+    private static void aHookFailureAfterActivationDisconnectsAndTheNextJoinUsesTcp(int protocol,
+            RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+            check(rig.awaitState(V3Client.State.ACTIVE), "active");
+
+            rig.client.fail(new IllegalStateException("a hook failed"));
+
+            check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
+            check(rig.awaitCondition(() -> rig.fake.abortCode >= 0), "the connection was closed: " + rig.fake.abortCode);
+            check(rig.plan.isFailed(), "the failure is recorded");
+            check(!Transports.takeRetryOverTcp(rig.connection), "no retry after activation");
+            check(V3Notices.isEmpty(), "no fallback line: the join was already in play");
+            check(Transports.v3Failure(rig.connection) != null
+                    && Transports.v3Failure(rig.connection).startsWith("QUIC multi-stream failed"),
+                    "the disconnect has a clear reason: " + Transports.v3Failure(rig.connection));
+            rig.expectNextJoinUsesTcp();
         }
     }
 
@@ -614,6 +673,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         final SecretKey key;
         final ListenerProxy listener = new ListenerProxy();
         final FakePlatform platform;
+        final ClientConnector connector;
         final String pinned;
         V3Plan plan;
         V3Client client;
@@ -644,7 +704,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             Advertisement ad = Advertisement.of(Protocol.ALPN_V3, 25570, identity.fingerprint(),
                     Map.of(protocol, "sha256:" + table.digestHex()));
             ads.record(ClientConnector.key(server), Optional.of(ad));
-            ClientConnector connector = new ClientConnector(ads, FailureCache.load(dir.resolve("failures.properties")),
+            connector = new ClientConnector(ads, FailureCache.load(dir.resolve("failures.properties")),
                     new ClientConnector.V3Support(files.pins(), files.rebinds(), files.worker(),
                             System::currentTimeMillis, protocol, true, true));
             ClientConnector.Outcome<Object> outcome = connector.connect(server, HOST, PORT,
@@ -710,6 +770,17 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             for (int offset = 0; offset < bytes.length; offset += chunk) {
                 fake.inject(Arrays.copyOfRange(bytes, offset, (int) Math.min((long) bytes.length, (long) offset + chunk)));
             }
+        }
+
+        /** The recorded activation failure makes the next join to this server use TCP (12.14). */
+        void expectNextJoinUsesTcp() throws Exception {
+            files.worker().submit(() -> { }).get(10, TimeUnit.SECONDS); // the plan's writes are queued before this
+            FakePlatform tcp = new FakePlatform(fake, loop);
+            tcp.tcpWins = true;
+            ClientConnector.Outcome<Object> next = connector.connect(
+                    new InetSocketAddress(InetAddress.getLoopbackAddress(), PORT), HOST, PORT, Mode.AUTO, null, tcp)
+                    .get(10, TimeUnit.SECONDS);
+            check(next.tcp() != null && next.quic() == null, "the next join uses TCP");
         }
 
         boolean awaitState(V3Client.State wanted) throws Exception {
@@ -1075,6 +1146,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         final Fake fake;
         final EventLoop loop;
         volatile boolean bypassResumption;
+        volatile boolean tcpWins;
 
         FakePlatform(Fake fake, EventLoop loop) {
             this.fake = fake;
@@ -1106,7 +1178,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             return new ConnectionRace.Tcp<Object>() {
                 @Override
                 public CompletableFuture<Object> connect() {
-                    return new CompletableFuture<>(); // never completes: QUIC wins
+                    return tcpWins ? CompletableFuture.completedFuture((Object) "tcp")
+                            : new CompletableFuture<>(); // otherwise never completes: QUIC wins
                 }
 
                 @Override

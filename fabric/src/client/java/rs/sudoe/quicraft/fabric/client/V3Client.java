@@ -34,6 +34,7 @@ import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.connect.TransportSelection;
 import rs.sudoe.quicraft.core.connect.V3Plan;
+import rs.sudoe.quicraft.core.multistream.LaneSession;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
@@ -284,6 +285,10 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             default:
                 return false;
         }
+    }
+
+    boolean serverHasDisconnected() {
+        return serverDisconnected;
     }
 
     void serverDisconnects() {
@@ -556,7 +561,11 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             loop.execute(() -> fail(reason));
             return;
         }
-        if (state == State.FAILED || state == State.ACTIVE) {
+        if (state == State.ACTIVE) {
+            failActive(reason);
+            return;
+        }
+        if (state == State.FAILED) {
             return;
         }
         state = State.FAILED;
@@ -577,6 +586,37 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         }
         cleanUp();
         v3.abort(Protocol.CLOSE_BINDING_FAILURE);
+    }
+
+    /**
+     * A failure after the lanes are active (docs/protocol.md 12.14): no retry, the join was already
+     * in play. The plan records it, so the next join to this server goes straight to TCP; the player
+     * gets a clear reason on the disconnect screen; the QUIC connection is closed.
+     */
+    void failActive(String reason) {
+        if (!loop.inEventLoop()) {
+            loop.execute(() -> failActive(reason));
+            return;
+        }
+        if (state != State.ACTIVE) {
+            return;
+        }
+        state = State.FAILED;
+        failureText = "QUIC multi-stream failed (" + reason + ")";
+        Transports.v3Failure(connection, failureText);
+        QuicraftFabric.LOG.warn("QUICraft: {}; the next join uses TCP", failureText);
+        try {
+            plan.failed(V3Plan.Phase.PLAY, reason);
+        } catch (Throwable ignored) {
+            // The bookkeeping fails closed; the connection still has to end.
+        }
+        cleanUp();
+        v3.abort(LaneSession.CLOSE_INTERNAL_ERROR);
+    }
+
+    /** Nothing was delivered for the read timeout and the game is not busy (see {@link V3Handler}). */
+    void silent() {
+        failActive("timed out");
     }
 
     private void cleanUp() {
