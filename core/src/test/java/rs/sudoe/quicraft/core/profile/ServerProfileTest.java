@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.transport.TransportConfig;
 
 /** docs/protocol.md 12.13 and 13.12: profile ranges, cross-field rules and the maxOpen invariant. */
 class ServerProfileTest {
@@ -44,5 +45,14 @@ class ServerProfileTest {
                 "a pool too small for one staged share");
         assertThrows(IllegalArgumentException.class, () -> new ServerProfile(1, 6, MIB256, 0.1, 0, 1, 1, 1, 1).validate());
         assertThrows(IllegalArgumentException.class, () -> new ServerProfile(1, 6, MIB256, 0.1, 1, 1, 0, 1, 1).validate());
+    }
+
+    @Test
+    void theListenerRefusesAMaxOpenThatCannotCoverTheProfileAtBuildTime() {
+        ServerProfile profile = valid();
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> TransportConfig.builder().maxOpen(50_000).serverProfile(profile).build());
+        assertEquals(true, refused.getMessage().contains("raise maxOpen"));
+        assertEquals(65_536, TransportConfig.builder().maxOpen(65_536).serverProfile(profile).build().maxOpen());
     }
 }

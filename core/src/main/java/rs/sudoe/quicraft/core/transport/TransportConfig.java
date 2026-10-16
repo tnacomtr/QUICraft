@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core.transport;
 
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
+import rs.sudoe.quicraft.core.profile.ServerProfile;
 import rs.sudoe.quicraft.core.resource.ResourcePools;
 
 import java.util.concurrent.TimeUnit;
@@ -128,6 +129,10 @@ public final class TransportConfig {
         this.maxOpen = positiveOr(b.maxOpen, DEFAULT_MAX_OPEN);
         this.maxOpenPerIp = positiveOr(b.maxOpenPerIp, DEFAULT_MAX_OPEN_PER_IP);
         this.maxTrackedIps = positiveOr(b.maxTrackedIps, DEFAULT_MAX_TRACKED_IPS);
+        if (b.serverProfile != null) {
+            // 12.13: maxOpen covers the logged-in target plus the pre-login cap; refused at build time.
+            b.serverProfile.requireOpen(this.maxOpen);
+        }
         this.ingressInitialsPerSecond = positiveOr(b.ingressInitialsPerSecond, DEFAULT_INGRESS_INITIALS);
         this.ingressInitialsPerIpPerSecond = positiveOr(b.ingressInitialsPerIpPerSecond,
                 DEFAULT_INGRESS_INITIALS_PER_IP);
@@ -381,6 +386,7 @@ public final class TransportConfig {
         private ReceiveBudget nodeBudget;
         private ResourcePools resourcePools;
         private boolean preLoginOnline = true;
+        private ServerProfile serverProfile;
 
         public Builder maxIdleTimeout(long value, TimeUnit unit) {
             this.maxIdleTimeoutMillis = unit.toMillis(value);
@@ -487,6 +493,15 @@ public final class TransportConfig {
         /** Shared staged and logged-in accounting for /3 (§12.13, §13.12). */
         public Builder resourcePools(ResourcePools pools) {
             this.resourcePools = pools;
+            return this;
+        }
+
+        /**
+         * The server profile this listener runs under. Build refuses a {@code maxOpen} that cannot cover
+         * the profile's logged-in target plus its pre-login connection cap (12.13).
+         */
+        public Builder serverProfile(ServerProfile profile) {
+            this.serverProfile = profile;
             return this;
         }
 
