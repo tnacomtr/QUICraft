@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package rs.sudoe.quicraft.fabric.client;
+
+import io.netty.channel.ChannelDuplexHandler;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
+import net.minecraft.network.protocol.common.ClientboundDisconnectPacket;
+import net.minecraft.network.protocol.login.ClientboundLoginDisconnectPacket;
+import rs.sudoe.quicraft.bridge.BoundaryCipherDecoder;
+import rs.sudoe.quicraft.bridge.GameLanes;
+import rs.sudoe.quicraft.fabric.net.BindingPayload;
+
+/**
+ * The pipeline side of a {@code /3} join, in front of the game's packet handler: it sees every
+ * decoded packet before the game does and every written packet after it.
+ *
+ * <p><b>Inbound.</b> A {@code quicraft:binding} payload is taken off the wire here, on the
+ * connection's event loop and synchronously inside the read that carried it, which the cipher
+ * cutover of 12.13 depends on; it never reaches the game's packet listener, so no mod sees it
+ * (12.8). A {@link GameLanes.Ack} is turned into an acknowledgement after the game's main thread
+ * applied what it follows (13.10).</p>
+ *
+ * <p><b>Outbound.</b> Ordinary packets are held while the exchange pauses them (12.10), and until the
+ * lanes are active after it. Anything else, such as the game's own protocol-switch tasks, passes.</p>
+ */
+final class V3Handler extends ChannelDuplexHandler {
+    static final String NAME = "quicraft_v3";
+    static final String TAIL_NAME = "quicraft_v3_tail";
+
+    private final V3Client client;
+
+    V3Handler(V3Client client) {
+        this.client = client;
+    }
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        try {
+            if (msg instanceof GameLanes.Ack) {
+                client.acknowledge((GameLanes.Ack) msg);
+                return;
+            }
+            if (msg instanceof ClientboundCustomPayloadPacket) {
+                Object payload = ((ClientboundCustomPayloadPacket) msg).payload();
+                if (payload instanceof BindingPayload) {
+                    client.onBindingPayload(((BindingPayload) payload).data());
+                    return;
+                }
+            } else if (msg instanceof ClientboundLoginDisconnectPacket || msg instanceof ClientboundDisconnectPacket) {
+                client.serverDisconnects();
+            }
+        } catch (Throwable t) {
+            client.fail(t);
+            return;
+        }
+        ctx.fireChannelRead(msg);
+    }
+
+    @Override
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+        boolean held;
+        try {
+            held = msg instanceof Packet && client.hold(msg, promise);
+        } catch (Throwable t) {
+            client.fail(t);
+            held = false;
+        }
+        if (!held) {
+            ctx.write(msg, promise);
+        }
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        client.channelClosed();
+        ctx.fireChannelInactive();
+    }
+
+    @Override
+    public void close(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+        client.closing();
+        ctx.close(promise);
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+        if (cause instanceof GameLanes.LaneClosedException) {
+            client.laneClosed((GameLanes.LaneClosedException) cause);
+        } else if (cause instanceof BoundaryCipherDecoder.MalformedFrameException
+                || cause.getCause() instanceof BoundaryCipherDecoder.MalformedFrameException) {
+            // Our own decoder at the cipher boundary (12.13) failed: a /3 failure, not the game's.
+            client.fail(cause);
+            return;
+        }
+        ctx.fireExceptionCaught(cause);
+    }
+
+    /**
+     * The last handler of the pipeline once the lanes are active. {@link GameLanes} sits right in
+     * front of it and takes every packet; the game's own non-packet writes (the tasks that swap the
+     * codec handlers when the protocol changes) must not reach the lanes, so they are written from
+     * the game's packet handler instead, which skips them.
+     */
+    static final class Tail extends ChannelOutboundHandlerAdapter {
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+            if (msg instanceof Packet) {
+                ctx.write(msg, promise); // on to GameLanes
+                return;
+            }
+            ChannelHandlerContext packetHandler = ctx.pipeline().context("packet_handler");
+            if (packetHandler == null) {
+                ctx.write(msg, promise);
+                return;
+            }
+            packetHandler.write(msg, promise);
+        }
+    }
+}

@@ -4,11 +4,19 @@
   "package": "rs.sudoe.quicraft.fabric.client.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
+    "BindingCodecMixin",
+    "ClientCommonPacketListenerImplMixin",
     "ClientHandshakePacketListenerImplMixin",
+    "ClientPacketListenerMixin",
+    "CompressionDecoderAccessor",
+    "CompressionEncoderAccessor",
+    "ConnectionEncryptionMixin",
     "ConnectScreenConnectorMixin",
     "ConnectScreenStartMixin",
     "DebugEntryTpsMixin",
     "JoinMultiplayerScreenMixin",
+    "PacketDecoderAccessor",
+    "PacketEncoderAccessor",
     "ServerStatusPingerMixin"
   ],
   "injectors": {

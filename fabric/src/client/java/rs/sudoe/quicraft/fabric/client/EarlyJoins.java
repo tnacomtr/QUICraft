@@ -55,6 +55,15 @@ public final class EarlyJoins {
                 Integer.toString(SharedConstants.getCurrentVersion().protocolVersion()));
     }
 
+    /**
+     * The address the player typed for the join in progress, before SRV: what pins and the re-bind
+     * backoff are keyed by (docs/protocol.md 12.15), or null if not known.
+     */
+    static @Nullable ServerAddress logicalAddress() {
+        Request request = current;
+        return request == null ? null : request.address();
+    }
+
     /** Whether this join must go vanilla TCP (consumed). */
     static boolean takeTcpOnce(InetSocketAddress address) {
         InetSocketAddress forced = tcpOnce;

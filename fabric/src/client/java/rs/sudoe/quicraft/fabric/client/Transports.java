@@ -13,6 +13,7 @@ public final class Transports {
     private static final Map<Connection, QuicByteStream> QUIC = new WeakHashMap<>();
     private static final Map<Connection, FallbackReason> FALLBACKS = new WeakHashMap<>();
     private static final Map<Connection, Boolean> RETRY_OVER_TCP = new WeakHashMap<>();
+    private static final Map<Connection, V3Client> V3 = new WeakHashMap<>();
 
     private Transports() {}
 
@@ -29,6 +30,21 @@ public final class Transports {
     public static synchronized boolean usedZeroRtt(Connection connection) {
         return QUIC.get(connection) instanceof rs.sudoe.quicraft.core.transport.ClientStream stream
                 && stream.sentEarlyData();
+    }
+
+    static synchronized void v3(Connection connection, V3Client client) {
+        V3.put(connection, client);
+    }
+
+    /** The multi-stream controller of {@code connection}, or null when it is not a {@code /3} join. */
+    static synchronized @Nullable V3Client v3(Connection connection) {
+        return V3.get(connection);
+    }
+
+    /** Where a {@code /3} connection is, or null on TCP and on {@code /2}. */
+    static V3Client.@Nullable State v3State(Connection connection) {
+        V3Client client = v3(connection);
+        return client == null ? null : client.state();
     }
 
     static synchronized @Nullable QuicByteStream quic(Connection connection) {
