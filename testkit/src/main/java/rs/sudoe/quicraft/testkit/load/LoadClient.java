@@ -53,6 +53,7 @@ public final class LoadClient {
     private final AtomicLong failed = new AtomicLong();
     private final AtomicLong closed = new AtomicLong();
     private final AtomicLong lanesActive = new AtomicLong();
+    private final AtomicLong preMarkerReads = new AtomicLong();
     private final AtomicLong lanesFailed = new AtomicLong();
     private final Map<String, AtomicLong> closeCauses = new ConcurrentHashMap<>();
     /** Failed dials by normalized cause (root exception class and message, digits folded). */
@@ -212,8 +213,16 @@ public final class LoadClient {
         v3.setListener(new QuicByteStream.Listener() {
             @Override
             public void onData(ByteBuffer data) {
-                if (!lanes || !data.hasRemaining() || data.get(data.position()) != marker
-                        || !activated.compareAndSet(false, true)) {
+                if (!lanes || activated.get() || !data.hasRemaining()) {
+                    return;
+                }
+                if (data.get(data.position()) != marker) {
+                    // Bytes before the harness marker: count them so a run shows whether the
+                    // marker can arrive behind other stream-0 data in the same read.
+                    preMarkerReads.incrementAndGet();
+                    return;
+                }
+                if (!activated.compareAndSet(false, true)) {
                     return;
                 }
                 try {
@@ -237,6 +246,9 @@ public final class LoadClient {
                 closeCauses.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
             }
         });
+        // The connection stops reading stream 0 after the preamble until the owner asks for
+        // data; without this the marker can stay unread in quiche or parked behind the gate.
+        v3.setAutoRead(true);
     }
 
     /**
@@ -249,7 +261,7 @@ public final class LoadClient {
             return "";
         }
         return " closed=" + closed.get() + " live=" + (connected.get() - closed.get())
-                + " lanes_active=" + lanesActive.get() + " lanes_failed=" + lanesFailed.get();
+                + " lanes_active=" + lanesActive.get() + " pre_marker_reads=" + preMarkerReads.get() + " lanes_failed=" + lanesFailed.get();
     }
 
     private void status() {
