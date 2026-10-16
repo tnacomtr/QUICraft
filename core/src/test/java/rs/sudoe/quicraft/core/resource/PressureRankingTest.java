@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.net.InetAddress;
+import java.util.Arrays;
 import org.junit.jupiter.api.Test;
 
 /** Pressure ranking: decay, stall exclusion, progress windows, overflow buckets, eviction and floors (13.12). */
@@ -274,5 +275,67 @@ class PressureRankingTest {
         r.connect("c3", guest, null, 701 * S);
         r.setRetained("c3", 1000, 701 * S);
         assertEquals(1000, r.bucketBytes(bucket), "the reconnect is charged to its bucket, not a fresh exact entry");
+    }
+
+    /** An IPv4 address in the same overflow bucket as {@code bucket}, distinct from every address in {@code avoid}. */
+    private static InetAddress sameBucket(PressureRanking r, int bucket, InetAddress... avoid) throws Exception {
+        for (int i = 1; i < 65_536; i++) {
+            InetAddress candidate = InetAddress.getByAddress(new byte[] {10, 9, (byte) (i >> 8), (byte) i});
+            if (r.bucketFor(candidate) == bucket && !Arrays.asList(avoid).contains(candidate)) return candidate;
+        }
+        throw new AssertionError("no address maps to bucket " + bucket);
+    }
+
+    @Test void neverSeenNewcomerTakesAnExactEntryWhileAStickyBucketExists() throws Exception {
+        PressureRanking r = new PressureRanking(60_000, 1, 10, SECRET);
+        r.connect("c1", ip("192.0.2.60"), null, 0);
+        InetAddress first = ip("192.0.2.61");
+        int bucket = r.bucketFor(first);
+        InetAddress second = sameBucket(r, bucket, first);
+        r.connect("c2", first, null, 0);
+        r.connect("c3", second, null, 0);
+        r.disconnect("c2", 0);
+        r.disconnect("c1", 0);
+        // The bucket is live through c3; the newcomer has no record, so it must not be routed by the bucket.
+        InetAddress newcomer = sameBucket(r, bucket, first, second);
+        r.connect("c4", newcomer, null, S);
+        r.setRetained("c4", 1000, S);
+        assertEquals(0, r.bucketBytes(bucket), "a never-seen identity does not read a sticky bucket");
+        assertEquals(1, r.exactIpCount());
+    }
+
+    @Test void overflowedIdentityKeepsItsBucketWhileItsExactSlotIsReclaimable() throws Exception {
+        PressureRanking r = new PressureRanking(60_000, 1, 10, SECRET);
+        r.connect("c1", ip("192.0.2.70"), null, 0);
+        InetAddress guest = ip("192.0.2.71");
+        r.connect("c2", guest, null, 0);
+        r.disconnect("c1", S);
+        // The exact slot is inactive and reclaimable, but the guest's bucket is still live through c2.
+        r.connect("c3", guest, null, 2 * S);
+        r.setRetained("c3", 500, 2 * S);
+        assertEquals(500, r.bucketBytes(r.bucketFor(guest)));
+        assertEquals(1, r.exactIpCount(), "the overflowed guest does not take the reclaimable exact slot");
+    }
+
+    @Test void continuityTableNeverExceedsItsTrackingBounds() throws Exception {
+        PressureRanking ipOnly = new PressureRanking(60_000, 3, 10, SECRET);
+        ipOnly.connect("h1", ip("192.0.2.80"), null, 0);
+        ipOnly.connect("h2", ip("192.0.2.81"), null, 0);
+        ipOnly.connect("h3", ip("192.0.2.82"), null, 0);
+        for (int i = 0; i < 100; i++) {
+            InetAddress guest = InetAddress.getByAddress(new byte[] {10, 8, 0, (byte) i});
+            ipOnly.connect("g" + i, guest, null, 0);
+            ipOnly.disconnect("g" + i, 0);
+            assertTrue(ipOnly.continuityEntries() <= 3, "IP continuity is bounded by maxTrackedIps");
+        }
+        PressureRanking accounts = new PressureRanking(60_000, 1000, 2, SECRET);
+        accounts.connect("h1", ip("192.0.2.90"), "a1", 0);
+        accounts.connect("h2", ip("192.0.2.91"), "a2", 0);
+        for (int i = 0; i < 100; i++) {
+            InetAddress guest = InetAddress.getByAddress(new byte[] {10, 8, 1, (byte) i});
+            accounts.connect("g" + i, guest, "guest" + i, 0);
+            accounts.disconnect("g" + i, 0);
+            assertTrue(accounts.continuityEntries() <= 2, "account continuity is bounded by maxTrackedAccounts");
+        }
     }
 }

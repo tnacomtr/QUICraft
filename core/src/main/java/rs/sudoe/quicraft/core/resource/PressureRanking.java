@@ -37,18 +37,12 @@ public final class PressureRanking {
     private final Map<InetAddress, IdentityHistory> ips = new HashMap<InetAddress, IdentityHistory>();
     private final Map<String, IdentityHistory> accounts = new HashMap<String, IdentityHistory>();
     private final Map<String, List<InetAddress>> accountRecentIps = new HashMap<String, List<InetAddress>>();
-    /** Evicted or overflowed IP identities and the time each was last served by its bucket (13.12 continuity). */
-    private final Map<InetAddress, Long> overflowMemory = new LinkedHashMap<InetAddress, Long>(16, 0.75f, true);
-    /** Accounts turned away from an exact entry, with the time each was last served by its bucket. */
-    private final Map<String, Long> accountOverflow = new LinkedHashMap<String, Long>(16, 0.75f, true);
+    /** Bounded continuity records of overflowed IP identities, access-ordered by last use (13.12). */
+    private final Map<InetAddress, Continuity> overflowMemory = new LinkedHashMap<InetAddress, Continuity>(16, 0.75f, true);
+    /** Bounded continuity records of accounts turned away from an exact entry, access-ordered by last use (13.12). */
+    private final Map<String, Continuity> accountOverflow = new LinkedHashMap<String, Continuity>(16, 0.75f, true);
     /** Connections currently in a refused wait, whose refused-wait floor lifts their identities (13.12). */
     private final Set<Connection> refusedWaiters = new HashSet<Connection>();
-    /**
-     * Last-served time of the continuity records trimmed from the bounded maps, per overflow bucket (13.12). A
-     * trimmed identity keeps its bucket through this bounded fold instead of falling back to a fresh exact entry.
-     */
-    private final Long[] foldedIpServed = new Long[OVERFLOW];
-    private final Long[] foldedAccountServed = new Long[OVERFLOW];
     private final IdentityHistory[] buckets = new IdentityHistory[OVERFLOW];
     private final List<Map<Object, Integer>> bucketLive = new ArrayList<Map<Object, Integer>>(OVERFLOW);
     private final Map<Object, Connection> connections = new HashMap<Object, Connection>();
@@ -258,6 +252,9 @@ public final class PressureRanking {
     /** Number of exact account entries currently held. */
     public synchronized int exactAccountCount() { return accounts.size(); }
 
+    /** Continuity records kept for overflowed IP and account identities; bounded by the tracking capacities. */
+    synchronized int continuityEntries() { return overflowMemory.size() + accountOverflow.size(); }
+
     /** Keyed overflow bucket that an IP address maps to, in [0, 256). */
     public int bucketFor(InetAddress ip) { return PrefixKey.overflow(ip).bucket(secret); }
 
@@ -297,9 +294,13 @@ public final class PressureRanking {
      * from last use, so a long-lived overflow connection keeps its continuity record while its charge changes.
      */
     private void touchContinuity(Connection c, long now) {
-        if (c.ip != null && c.ip.bucket >= 0 && overflowMemory.containsKey(c.addr)) overflowMemory.put(c.addr, now);
-        if (c.account != null && c.account.bucket >= 0 && c.acct != null && accountOverflow.containsKey(c.acct)) {
-            accountOverflow.put(c.acct, now);
+        if (c.ip != null && c.ip.bucket >= 0) {
+            Continuity record = overflowMemory.get(c.addr);
+            if (record != null) record.lastUse = now;
+        }
+        if (c.account != null && c.account.bucket >= 0 && c.acct != null) {
+            Continuity record = accountOverflow.get(c.acct);
+            if (record != null) record.lastUse = now;
         }
     }
 
@@ -307,21 +308,14 @@ public final class PressureRanking {
     private IdentityHistory exactIp(InetAddress ip, long now, long eff) {
         IdentityHistory existing = ips.get(ip);
         if (existing != null) return existing;
-        int bucket = PrefixKey.overflow(ip).bucket(secret);
-        Long remembered = overflowMemory.get(ip);
-        if (remembered != null && stickyOverflow(remembered, bucket, now)) {
-            overflowMemory.put(ip, now);
-            return null;
-        }
-        // A record trimmed from the bounded memory folds into its bucket: the reconnect still reads that bucket.
-        Long folded = foldedIpServed[bucket];
-        if (remembered == null && folded != null && stickyOverflow(folded, bucket, now)) {
-            fold(foldedIpServed, bucket, now);
+        Continuity remembered = overflowMemory.get(ip);
+        if (remembered != null && stickyOverflow(remembered, now)) {
+            remembered.lastUse = now;
             return null;
         }
         if (ips.size() >= maxTrackedIps && !makeIpRoom(now, eff)) {
-            overflowMemory.put(ip, now);
-            trimOverflowMemory();
+            overflowMemory.put(ip, new Continuity(PrefixKey.overflow(ip).bucket(secret), now));
+            trimContinuity(overflowMemory, maxTrackedIps, now);
             return null;
         }
         overflowMemory.remove(ip);
@@ -333,22 +327,16 @@ public final class PressureRanking {
     private IdentityHistory exactAccount(String account, long now, long eff) {
         IdentityHistory existing = accounts.get(account);
         if (existing != null) return existing;
-        int bucket = PrefixKey.accountBucket(secret, account);
-        Long remembered = accountOverflow.get(account);
-        if (remembered != null && stickyOverflow(remembered, bucket, now)) {
-            accountOverflow.put(account, now);
-            return null;
-        }
-        Long folded = foldedAccountServed[bucket];
-        if (remembered == null && folded != null && stickyOverflow(folded, bucket, now)) {
-            fold(foldedAccountServed, bucket, now);
+        Continuity remembered = accountOverflow.get(account);
+        if (remembered != null && stickyOverflow(remembered, now)) {
+            remembered.lastUse = now;
             return null;
         }
         if (accounts.size() >= maxTrackedAccounts) {
             removeExpiredAccounts(now);
             if (accounts.size() >= maxTrackedAccounts) {
-                accountOverflow.put(account, now);
-                trimAccountOverflow();
+                accountOverflow.put(account, new Continuity(PrefixKey.accountBucket(secret, account), now));
+                trimContinuity(accountOverflow, maxTrackedAccounts, now);
                 return null;
             }
         }
@@ -362,26 +350,38 @@ public final class PressureRanking {
      * An overflowed identity keeps using its bucket (13.12): until its bucket has no live users and its
      * 10-minute inactive history expires, reconnects map back there even when exact slots are free.
      */
-    private boolean stickyOverflow(long lastServed, int bucket, long now) {
-        return now - lastServed < IdentityHistory.RETENTION_NANOS || !bucketLive.get(bucket).isEmpty();
+    private boolean stickyOverflow(Continuity record, long now) {
+        return now - record.lastUse < IdentityHistory.RETENTION_NANOS || !bucketLive.get(record.bucket).isEmpty();
     }
 
-    private void trimAccountOverflow() {
-        while (accountOverflow.size() > maxTrackedAccounts) {
-            Iterator<Map.Entry<String, Long>> oldest = accountOverflow.entrySet().iterator();
-            Map.Entry<String, Long> entry = oldest.next();
-            fold(foldedAccountServed, PrefixKey.accountBucket(secret, entry.getKey()), entry.getValue());
-            oldest.remove();
+    /**
+     * Trims a continuity map to its bound (13.12): the oldest expired record first, then the oldest record whose
+     * bucket has live users. Only when neither exists (every record is recent and idle) is the oldest one trimmed,
+     * so the bound always holds. Under churn beyond the bound, overflowed identities can lose continuity.
+     */
+    private <K> void trimContinuity(Map<K, Continuity> map, int bound, long now) {
+        while (map.size() > bound) {
+            K victim = null;
+            for (Map.Entry<K, Continuity> entry : map.entrySet()) {
+                if (!stickyOverflow(entry.getValue(), now)) {
+                    victim = entry.getKey();
+                    break;
+                }
+            }
+            if (victim == null) {
+                for (Map.Entry<K, Continuity> entry : map.entrySet()) {
+                    if (!bucketLive.get(entry.getValue().bucket).isEmpty()) {
+                        victim = entry.getKey();
+                        break;
+                    }
+                }
+            }
+            if (victim == null) victim = map.keySet().iterator().next();
+            map.remove(victim);
         }
     }
 
-    /** Keeps the latest last-served time of a bucket's folded continuity records. */
-    private static void fold(Long[] folded, int bucket, long servedNanos) {
-        Long previous = folded[bucket];
-        if (previous == null || servedNanos > previous) folded[bucket] = servedNanos;
-    }
-
-    /** Frees one exact IP slot: expired entries first, then fold the lowest-score unprotected inactive entry. */
+    /** Frees one exact IP slot: expired entries first, then evict the lowest-score unprotected inactive entry. */
     private boolean makeIpRoom(long now, long eff) {
         Iterator<Map.Entry<InetAddress, IdentityHistory>> it = ips.entrySet().iterator();
         while (it.hasNext()) {
@@ -406,9 +406,9 @@ public final class PressureRanking {
         if (victim == null) return false;
         IdentityHistory evicted = ips.remove(victim);
         int bucket = PrefixKey.overflow(victim).bucket(secret);
-        // The evicted identity keeps its bucket on reconnect; its history is already folded into that bucket.
-        overflowMemory.put(victim, now);
-        trimOverflowMemory();
+        // The evicted identity keeps its bucket on reconnect; its history is already absorbed into that bucket.
+        overflowMemory.put(victim, new Continuity(bucket, now));
+        trimContinuity(overflowMemory, maxTrackedIps, now);
         overflow(bucket, now, eff).absorb(evicted, now, eff);
         return true;
     }
@@ -444,15 +444,6 @@ public final class PressureRanking {
         while (recent.size() > PROTECTED_IPS_PER_ACCOUNT) recent.remove(recent.size() - 1);
     }
 
-    private void trimOverflowMemory() {
-        while (overflowMemory.size() > maxTrackedIps) {
-            Iterator<Map.Entry<InetAddress, Long>> oldest = overflowMemory.entrySet().iterator();
-            Map.Entry<InetAddress, Long> entry = oldest.next();
-            fold(foldedIpServed, PrefixKey.overflow(entry.getKey()).bucket(secret), entry.getValue());
-            oldest.remove();
-        }
-    }
-
     private IdentityHistory overflow(int bucket, long now, long eff) {
         if (buckets[bucket] == null) buckets[bucket] = new IdentityHistory(halfLifeNanos, now, eff);
         return buckets[bucket];
@@ -472,6 +463,17 @@ public final class PressureRanking {
         byte[] secret = new byte[32];
         new SecureRandom().nextBytes(secret);
         return secret;
+    }
+
+    /** Bounded continuity record of an overflowed identity: its bucket and last use (13.12). */
+    private static final class Continuity {
+        final int bucket;
+        long lastUse;
+
+        Continuity(int bucket, long lastUse) {
+            this.bucket = bucket;
+            this.lastUse = lastUse;
+        }
     }
 
     /** One identity's read target: an exact history ({@code bucket} -1) or an overflow bucket index. */
