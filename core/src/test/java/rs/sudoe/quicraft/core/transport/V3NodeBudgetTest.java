@@ -5,9 +5,16 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -22,6 +29,9 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
  */
 class V3NodeBudgetTest {
     private static ServerIdentity identity;
+
+    /** The server's log line for a connection refused by the node budget (QuicServer, 13.12). */
+    private static final String BUDGET_REFUSAL = "QUIC /3 connection over the node pending-bytes budget; refusing it";
 
     @BeforeAll
     static void setUp() throws Exception {
@@ -121,14 +131,49 @@ class V3NodeBudgetTest {
             }
             assertEquals(n * TransportConfig.V3_INITIAL_EXPOSURE_BYTES, budget.reserved(), "N exposures reserved");
 
+            // The reason, not just the outcome: the server logs the budget refusal on its own loop, so
+            // the log line is awaited with a bound.
+            List<String> lines = Collections.synchronizedList(new ArrayList<String>());
+            Logger logger = Logger.getLogger("QUICraft");
+            Level previous = logger.getLevel();
+            Handler capture = new Handler() {
+                @Override
+                public void publish(LogRecord record) {
+                    lines.add(record.getMessage());
+                }
+
+                @Override
+                public void flush() {
+                }
+
+                @Override
+                public void close() {
+                }
+            };
+            capture.setLevel(Level.ALL);
+            logger.setLevel(Level.FINE);
+            logger.addHandler(capture);
             try {
-                V3Connection extra = QuicClient.connectV3(server.localAddress(), identity.fingerprint(),
-                        V3ConnectionTest.TABLE, null).get(10, TimeUnit.SECONDS);
-                assertTrue(await(() -> !extra.isOpen(), 5_000), "the N+1th connection ends");
-            } catch (java.util.concurrent.ExecutionException refusedAtHandshake) {
-                // Also a refusal.
+                try {
+                    V3Connection extra = QuicClient.connectV3(server.localAddress(), identity.fingerprint(),
+                            V3ConnectionTest.TABLE, null).get(10, TimeUnit.SECONDS);
+                    assertTrue(await(() -> !extra.isOpen(), 5_000), "the N+1th connection ends");
+                } catch (java.util.concurrent.ExecutionException refusedAtHandshake) {
+                    // Also a refusal.
+                }
+                assertEquals(n, accepted.get(), "the N+1th /3 connection was refused");
+                assertTrue(await(() -> containsLine(lines, BUDGET_REFUSAL), 5_000),
+                        "13.12: the refusal reason is the node pending-bytes budget, logged: " + lines);
+            } finally {
+                logger.removeHandler(capture);
+                logger.setLevel(previous);
             }
-            assertEquals(n, accepted.get(), "the N+1th /3 connection was refused");
+        }
+    }
+
+    private static boolean containsLine(List<String> lines, String wanted) {
+        synchronized (lines) {
+            return lines.contains(wanted);
         }
     }
 
