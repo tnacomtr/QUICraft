@@ -769,24 +769,27 @@ declared-length bytes in flight (profile value); once charged, its assembly may 
 game-read-but-unconsumed cap up to that exact charge, and is then read in credit-sized steps.
 Time spent waiting for such a charge counts toward the client-wait deadline;
 if the charge cannot be made it waits non-fatally under the deadline, never `0x11`. This cap is not a
-total-byte limit. `/3` 0-RTT tickets carry the staged limits; never reduce remembered 0-RTT limits.
-Staging changes only the server's advertised CONNECTION credit: `initial_max_data = 8 KiB`
-until promotion (online mode: Login Success, after session-server authentication; offline mode: `/3` activation), then MAX_DATA to 24 KiB. Stream windows are unchanged from §13.13: 8 KiB on
-client-opened bidi directions (CONTROL, REALTIME), one byte on reverse-CHUNK guards, pinned
-maxima; uni limits remain zero. The client's advertised limits are unchanged. Require a per-connection maximum-window
-setter so quiche auto-growth cannot raise a window before authentication. The current patched
-native sets the maximum window per listener configuration only (`Codecs`), so this needs a
-native change, which is an owner decision before implementation. A server MUST NOT advertise
-`/3` without that setter. The pre-login interval
+total-byte limit. `/3` 0-RTT tickets carry the listener limits; never reduce remembered 0-RTT limits.
+Staging changes nothing on the wire. Every `/3` connection gets the listener limits of §13.13
+from its first packet: 24 KiB connection credit, 8 KiB on client-opened bidi directions (CONTROL,
+REALTIME), one byte on reverse-CHUNK guards, uni limits zero, and every maximum pinned equal to
+its initial window by netty/0005, so quiche never grows a window. Credit advances only as the
+server reads, and stream windows bound what quiche can buffer, so a staged connection's native
+exposure is at most `2*8 KiB + N` bytes whatever its connection credit; everything past that is
+bounded by stopping reads at the cap above. Charge that full native exposure (not a smaller
+staged credit) to the pre-login pool. Promotion (online mode: Login Success, after
+session-server authentication; offline mode: `/3` activation) only moves the connection's
+reservation from the pre-login pool to the node budget. No per-connection window setter, and
+so no native change, is needed. The client's advertised limits are unchanged. The pre-login interval
 (Handshake through Login Success) carries Handshake, Login Start, the online-mode encryption
 request/response and login plugin traffic; `/3` OFFER, proofs and switch messages (fixed
 104-byte binding payloads, 12.8) belong to configuration, after Login Success, and are not
-pre-login. Eight KiB is a rolling credit, not a size limit: a larger legal message (for
+pre-login. Stream windows are rolling credit, not a size limit: a larger legal message (for
 example a large login plugin answer) is read in window-sized steps, bounded by the
 game-read-but-unconsumed cap above. Do not reserve inflater state before compression is enabled. Compressed pre-login connections
 are charged to the pre-login pool. At promotion reserve the full 24 KiB
-share from the node budget before raising MAX_DATA to 24 KiB.
-Reserve the shared 40 KiB inflater only when Minecraft enables compression. If a raise or inflater
+share from the node budget before releasing the pre-login charge.
+Reserve the shared 40 KiB inflater only when Minecraft enables compression. If a promotion or inflater
 reservation cannot be made, follow existing resource refusal/backpressure rules: wait non-fatally,
 then close locally for resource exhaustion; never close `0x11`.
 
@@ -1520,7 +1523,7 @@ position extraction. Those implementations must change together before this revi
     its reads come from the 2 KiB REALTIME slice inside the 24 KiB share, and the 40 KiB
      shared inflater is reserved at compression enablement; compressed pre-login connections are
      charged to the pre-login pool until promotion (online Login Success, offline activation;
-     open question 3).
+     answered question 3).
     Sentinel reads remain only for lanes the table leaves out.
     Do not reserve a maximum-sized record at its boundary: charge the exact parser
     allocation only once its length is known, withholding allocation and further reads
@@ -1706,7 +1709,7 @@ position extraction. Those implementations must change together before this revi
      the asymmetric case's shortest step applies to the failure cache only, never to the limiter. Shared-pool `0x12`
      aborts on a live path never do this.
      **Deadline precedence:** Any unseen-prerequisite expiry closes the connection with the
-      current local/resource code (proposed `0x12` if approved), never `0x11`, because the
+      current local/resource code (`0x12`), never `0x11`, because the
       receiver cannot distinguish honest loss from a forged dependency. The sender of that
       close puts the fixed ASCII reason phrase `unseen-prerequisite` in the CONNECTION_CLOSE
       frame (authenticated after the handshake). Any other reason phrase, or none, on a
@@ -1747,11 +1750,11 @@ position extraction. Those implementations must change together before this revi
     uni limits are zero. Never increase MAX_STREAMS. Application validation rejects any
     server stream index >= N even though transport permits six. The client initially
     advertises 256 KiB per bidi stream and 2 MiB connection credit; the server advertises
-    24 KiB connection credit after promotion (8 KiB while staged pre-login, 12.13), preserving the existing per-connection credit and admission
+    24 KiB connection credit from the first packet (staging, 12.13, changes accounting only), preserving the existing per-connection credit and admission
     share. Server stream credit is asymmetric: 8 KiB on client-opened bidi directions
     (CONTROL and REALTIME), but only one byte on server-opened bidi directions (reverse
     CHUNK streams, which carry no valid bytes). Pin server stream maximum windows at
-    8 KiB and its connection maximum at the current staged or promoted credit; client maxima equal its initial windows.
+    8 KiB and its connection maximum at 24 KiB; client maxima equal its initial windows.
     No reverse-CHUNK guard read may replenish credit: its first byte closes the connection
     on the event loop before any further credit/send work. Thus the reverse chunk windows
     never grow beyond one byte on a live connection; the valid serverbound native exposure
@@ -1784,9 +1787,7 @@ position extraction. Those implementations must change together before this revi
     until connection close; unused streams do not multiply the server's 24 KiB aggregate.
     Maximum-window pins are provided by the project's existing, tested Netty patch
     `natives/patches/netty/0005-max-flow-control-windows.patch` (netty/0005), which sets them per
-    listener. Staged pre-login admission (12.13) additionally needs a per-connection connection-
-    maximum setter so the 8 KiB staged maximum can be raised at promotion; that native change is
-    an owner decision before implementation. Retest pins and bounded reads for these revised limits before enabling
+    listener; staged pre-login admission (12.13) needs no per-connection setter. Retest pins and bounded reads for these revised limits before enabling
     `/3`; initial values alone are insufficient.
     These windows trade throughput for a provable memory bound. A clientbound 2 MiB record
      needs roughly eight window turns; a large serverbound CONTROL record at 8 KiB per RTT can hit
@@ -2203,44 +2204,29 @@ position extraction. Those implementations must change together before this revi
 4. The original memory/packet limits are superseded by 13.12/13.13's progress reservations.
    The 10-second fail-closed deadlines remain for benchmarking, including per-node cost.
 
-### Open questions for the user
+### Answered questions (owner, 2026-10-16)
 
-1. Confirm the proposed hard cap of 6, draft server preference of 3 (client offers 1..6),
-   and immutable per-connection selection in 13.2? Benchmark 1..6 before choosing defaults.
-2. Confirm the fixed epoch-mixed 32-bit position hash in 13.18, or choose another before
-   implementing golden vectors? This is a wire decision, not administrator configuration.
-3. Confirm the direction-specific receive policy: the client reserves up to 16 MiB + 1 KiB
-    wire and 8 MiB execution, plus 2 MiB native exposure and at most 128 KiB unparsed reads;
-     the server pre-login staged reservation includes full advertised credit, read buffers, native
-     exposure and measured QUIC/TLS state; cost remains unknown pending measurement. Test 50,000
-     staged connections on top of 50,000 logged-in players. Logged-in compressed accounting is
-     about 64 KiB (24 KiB share plus 40 KiB inflater).
-    idle costs about 3.05 GiB (3,276,800,000 bytes); the pool cap defaults to 10% of node budget.
-     Reserve the 40 KiB inflater at compression enablement; compressed pre-login connections pay
-     from the pre-login pool until activation. Include
-    total protected P <= 7667 bytes at N=6 (CONTROL allowance <= 5619 bytes), its 2 KiB
-    REALTIME parse/output-copy slice, 512-byte REALTIME wire cap (`record_length <= 510`) and
-    1024-byte decoded cap, plus one-byte unused chunk-direction guards. CONTROL excess is
-    separately capped from outbound queues (13.12/13.13). Benchmark inflater memory under
-    forced compression and outbound Deflater memory (about 256 KiB each by zlib defaults,
-    about 12.2 GiB at 50,000); reduced deflate window/memLevel is a candidate profile value.
-    Hardware profiles stay planned.
-4. Should the pre-enqueue decode/dispatch executor-active work budget be raised above the
-   approved 10 seconds? Executor waits and tick stalls are excluded; after FIFO enqueue
-   there is no transport application timeout. This is not a comparison with the keepalive's
-   elapsed-time budget, and this draft does not change the approved duration.
-5. Approve the new close code `0x12` (resource abort) next to `0x10` (binding/setup failure)
-   and `0x11` (peer ordering/protocol violation)? It marks closes caused by the local node's
-   genuine shared resource exhaustion, not inbound self-cap refusals attributable to the peer's own sent bytes (13.12).
-   A client-detected abort on a dead path (ack-eliciting data outstanding, with probes, for
-   the whole deadline and no authenticated packet from the peer; for a peer `0x12`, a fixed
-   10 seconds on the client's own clock) is a transport failure: it
-   keeps the same wire code but advances section 6's failure cache like an idle timeout
-   (13.12); a server-detected case only logs.
-   Generic locally detected resource aborts never write a failure-cache entry. The single
-   exception is the unseen-prerequisite expiry (13.12): two counted events within 10 minutes,
-   identified only by the `unseen-prerequisite` reason phrase on an application close received
-   after SERVER_SWITCH verifies (earlier peer closes follow 12.14's bounded pre-verification
-   allowance) or by the client's own blocked-head timer, write a shortest-step entry; shedding and stall-affected or locally
-   withheld expiries never count. Before SERVER_SWITCH verifies, other peer reports remain untrusted and receive only 12.14's bounded retry allowance.
-   Close codes are wire format; nothing ships with `0x12` until this is confirmed.
+The owner accepted all five recommendations:
+
+1. Chunk lanes: hard cap 6, client offers 1..6, draft server preference 3, selection immutable
+   per connection (13.2). The default is set after benchmarking 1..6.
+2. Lane assignment uses the fixed epoch-mixed 32-bit position hash of 13.18; golden vectors
+   follow.
+3. Receive policy as specified in 13.12/13.13 and 12.13. Client: up to 16 MiB + 1 KiB wire,
+   8 MiB execution, 2 MiB native exposure, at most 128 KiB unparsed reads. Server, logged in:
+   24 KiB share plus the 40 KiB inflater once compression is enabled (about 64 KiB, about
+   3.05 GiB at 50,000 connections). Server, pre-login (`/3` only): native exposure (at most
+   `2*8 KiB + N`), read buffers and measured QUIC/TLS state, charged to a pool capped at 10% of
+   the node budget, moved to the node budget at promotion (online: Login Success; offline:
+   `/3` activation). Protected area P <= 7667 bytes at N=6 (CONTROL allowance <= 5619 bytes),
+   2 KiB REALTIME slice, 512-byte REALTIME wire cap and 1024-byte decoded cap, one-byte
+   reverse-CHUNK guards. Still to measure: pre-login cost, 50,000 staged connections on top of
+   50,000 logged-in players, inflater memory under forced compression, and outbound Deflater
+   memory (about 256 KiB each at zlib defaults, about 12.2 GiB at 50,000; a reduced
+   window/memLevel is a candidate profile value).
+4. The pre-enqueue decode/dispatch executor-active budget stays at 10 seconds.
+5. Close code `0x12` (resource abort) is approved, with the 13.12 rules: generic local resource
+   aborts write no failure-cache entry; a client-detected dead path (and a peer `0x12` after a
+   fixed 10 s on the client's clock) counts like an idle timeout; the only other cache writer is
+   the `unseen-prerequisite` rule (two counted events within 10 minutes, shortest step); before
+   SERVER_SWITCH verifies, peer reports get only 12.14's bounded allowance.
