@@ -104,6 +104,12 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
         property("minecraft.api.profiles.host", it)
     }
 }
+// Fedora's NVIDIA GLX vendor is preferred by libglvnd and breaks Xvfb context creation; CI runners
+// have no such vendor, so this is a no-op there. The run task is a JavaExec.
+tasks.withType<JavaExec>().matching { it.name == "runClientGameTest" }.configureEach {
+    environment("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+    environment("LIBGL_ALWAYS_SOFTWARE", "1")
+}
 sourceSets.named("gametest") {
     java.setSrcDirs(listOf(shared.dir("gametest/java")))
     resources.setSrcDirs(listOf(shared.dir("gametest/resources")))
