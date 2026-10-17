@@ -492,24 +492,24 @@ class SessionReadPumpTest {
         }
     }
 
-    @Test void clientBundleFitsItsSlotAndReadsStopAtOneUnit() throws Exception {
+    @Test void clientSingleLargeRecordFitsItsSlotAndReadsStopAtOneUnit() throws Exception {
         int chunks = 6;
         int chunkStream = 2;
         ReceiveSlots slots = new ReceiveSlots(chunks);
         byte[] packet = filled(1_500_000, 5);
         byte[] bundle = gameWire(chunkStream, 1, packet);
-        assertTrue(bundle.length <= ReceiveSlots.BYTES_PER_STREAM, "a bundle's wire size fits the slot");
+        assertTrue(bundle.length <= ReceiveSlots.BYTES_PER_STREAM, "a large record's wire size fits the slot");
         Streams source = new Streams(chunks + 2, 16 * 1024);
         source.put(chunkStream, bundle);
         ClientReadPump pump = new ClientReadPump(chunks, slots, false, source);
 
         ClientReadPump.Unit unit = nextClientUnit(pump);
         assertEquals(chunkStream, unit.stream());
-        assertEquals(bundle.length, slots.heldBytes(chunkStream), "the whole bundle is held in its slot");
+        assertEquals(bundle.length, slots.heldBytes(chunkStream), "the whole record is held in its slot");
         assertArrayEquals(inner(packet), unit.record().payload());
         int reads = source.reads[chunkStream];
         for (int i = 0; i < 5; i++) pump.step();
-        assertEquals(reads, source.reads[chunkStream], "the stream is not read while its bundle is held");
+        assertEquals(reads, source.reads[chunkStream], "the stream is not read while its record is held");
         pump.commit(unit);
         assertFalse(slots.holdsHead(chunkStream));
         pump.cancel();
