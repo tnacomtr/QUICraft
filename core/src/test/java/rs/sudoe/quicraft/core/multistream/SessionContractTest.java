@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -12,7 +13,13 @@ import io.netty.handler.codec.quic.QuicChannel;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.Protocol;
+import rs.sudoe.quicraft.core.binding.BindingDriver;
 import rs.sudoe.quicraft.core.binding.BindingFailure;
 import rs.sudoe.quicraft.core.binding.BindingMachineResult;
 import rs.sudoe.quicraft.core.binding.BindingResult;
@@ -185,6 +192,69 @@ class SessionContractTest {
                 null, null, null));
     }
 
+    /** The N-taking constructor carries the negotiated N into the binding (12.7, 13.2). */
+    @Test
+    void bindingSessionCarriesTheSelectedN() throws Exception {
+        ScheduledExecutorService timers = Executors.newSingleThreadScheduledExecutor();
+        try {
+            Recorder serverSide = new Recorder();
+            BindingSession server = bindingSession(BindingStateMachine.Role.SERVER, 3, serverSide, timers);
+            Recorder matching = new Recorder();
+            BindingSession client = bindingSession(BindingStateMachine.Role.CLIENT, 3, matching, timers);
+            client.onConfigurationEntered(0L);
+            server.onConfigurationEntered(0L);
+            assertFalse(serverSide.sent.isEmpty(), "the server opened the binding with its OFFER");
+            client.onPayload(serverSide.sent.get(0));
+            assertNull(matching.failReason, "the matching N is accepted");
+            assertFalse(matching.sent.isEmpty(), "the client answers the OFFER with its CLIENT_PROOF");
+
+            Recorder mismatched = new Recorder();
+            BindingSession otherN = bindingSession(BindingStateMachine.Role.CLIENT, 2, mismatched, timers);
+            otherN.onConfigurationEntered(0L);
+            otherN.onPayload(serverSide.sent.get(0));
+            assertEquals(Protocol.CLOSE_BINDING_FAILURE, mismatched.failCode);
+            assertTrue(mismatched.failReason.contains("WRONG_SHARD_COUNT"), mismatched.failReason);
+            assertTrue(mismatched.sent.isEmpty(), "a mismatched N sends nothing back");
+            client.close();
+            server.close();
+            otherN.close();
+        } finally {
+            timers.shutdownNow();
+        }
+    }
+
+    private static BindingSession bindingSession(BindingStateMachine.Role role, int shardCount,
+                                                 BindingDriver.Callbacks callbacks,
+                                                 ScheduledExecutorService timers) {
+        return new BindingSession(role, () -> EXPORTER.clone(), SECRET.clone(), ONLINE, PROTOCOL, shardCount,
+                FINGERPRINT.clone(), ROUTING.clone(), () -> 0L, BindingSession.ACTIVATION_DEADLINE_NANOS,
+                callbacks, timers, () -> true);
+    }
+
+    /** Records the binding's outbound payloads and its failure, nothing else. */
+    static final class Recorder implements BindingDriver.Callbacks {
+        final List<byte[]> sent = new ArrayList<byte[]>();
+        volatile int failCode;
+        volatile String failReason;
+
+        @Override
+        public void send(byte[] payload) {
+            sent.add(payload);
+        }
+
+        @Override
+        public void activateOutbound() { }
+
+        @Override
+        public void activateInbound() { }
+
+        @Override
+        public void fail(int code, String reason) {
+            failCode = code;
+            failReason = reason;
+        }
+    }
+
     private static BindingStateMachine machine(BindingMachineResult result) {
         assertNotNull(result.machine(), "expected a machine but got " + result);
         return result.machine();
@@ -192,8 +262,9 @@ class SessionContractTest {
 
     // --- Legacy acknowledgement and compatibility (13.10, 13.6).
 
+    // Same-category multi-shard acknowledgement (two CHUNK shards sharing a sequence) is deferred to U8d.
     @Test
-    void legacyApplyAcknowledgesActualOutstandingShard() {
+    void legacyApplyRefusesAnotherLanesSameSequence() {
         ReceiverHarness h = new ReceiverHarness();
         h.offer(Lane.CONTROL, 1);
         h.offer(Lane.WORLD, 1);
@@ -233,9 +304,9 @@ class SessionContractTest {
         for (String name : new String[] {"onExecutorTickStallStart", "onExecutorTickStallEnd"}) {
             assertDefaultMethod(LaneGame.class, name);
         }
-        assertDefaultMethod(LaneGame.class, "onDecodedUncompressed", Lane.class, long.class, byte[].class);
-        assertDefaultMethod(LaneGame.class, "onEnqueued", Lane.class, long.class);
-        assertDefaultMethod(LaneGame.class, "onApplicationComplete", Lane.class, long.class);
+        assertDefaultMethod(LaneGame.class, "onDecodedUncompressed", Lane.class, int.class, long.class, byte[].class);
+        assertDefaultMethod(LaneGame.class, "onEnqueued", Lane.class, int.class, long.class);
+        assertDefaultMethod(LaneGame.class, "onApplicationComplete", Lane.class, int.class, long.class);
         assertTrue(LaneSession.class.getMethod("context").getReturnType() == SessionContext.class);
     }
 

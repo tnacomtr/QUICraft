@@ -105,6 +105,11 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     private Throwable rawCloseCause;
     private boolean closeDelivered;
     private boolean discarding;
+    /**
+     * A malformed or invalid preamble (13.2) ended negotiation: terminal. The bytes that came with it
+     * are dropped, later data is ignored, and the game only sees the close, never buffered bytes.
+     */
+    private boolean negotiationFailed;
     private volatile boolean activated;
 
     /** The client's side: the routing table comes from the dial and a token is stored for it. */
@@ -452,6 +457,9 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     @Override
     public void onData(ByteBuffer data) {
+        if (negotiationFailed) {
+            return;
+        }
         if (!parser.done()) {
             boolean complete;
             try {
@@ -467,6 +475,9 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
                 raw.setAutoRead(false);
             }
             onPreamble(parser.token());
+            if (negotiationFailed) {
+                return;
+            }
         }
         if (!data.hasRemaining() || discarding) {
             return;
@@ -562,6 +573,11 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     private void onInvalidPreamble(MultistreamProtocolException e) {
         LOG.log(Level.FINE, "invalid /3 preamble; closing", e);
+        // Terminal (13.2): whatever arrived with the bad preamble is never delivered to the game.
+        negotiationFailed = true;
+        discarding = true;
+        kept.clear();
+        keptBytes = 0;
         Codecs.closeLater(connection, true, e.closeCode());
     }
 
@@ -607,7 +623,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         if (l == null) {
             return;
         }
-        while (!kept.isEmpty() && (autoRead || readRequested)) {
+        while (!negotiationFailed && !kept.isEmpty() && (autoRead || readRequested)) {
             readRequested = false;
             ByteBuffer next = kept.poll();
             keptBytes -= next.remaining();
