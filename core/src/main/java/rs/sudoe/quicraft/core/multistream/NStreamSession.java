@@ -902,7 +902,9 @@ public final class NStreamSession implements MultistreamSession {
         }
         LOG.log(Level.FINE, "closing N+2 connection with 0x{0}: {1}", new Object[] {Integer.toHexString(code), why});
         closed = true;
-        final byte[] phrase = reason == null ? NO_REASON : reason;
+        // A 0x12 without a classified phrase carries the generic "resource" (13.12).
+        final byte[] phrase = reason != null && reason.length > 0 ? reason
+                : code == CLOSE_RESOURCE ? SessionReceiveDriver.GENERIC_RESOURCE_REASON.clone() : NO_REASON;
         loop.execute(() -> connection.close(true, code, Unpooled.wrappedBuffer(phrase)));
         release();
         notifyClosed(code, false, cause != null ? cause : new IOException(why));

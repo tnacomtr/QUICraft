@@ -259,6 +259,15 @@ class NStreamSessionLoopbackTest {
             assertArrayEquals(CloseReason.UNSEEN_PREREQUISITE, rig.net.serverSawReason.get(15, TimeUnit.SECONDS));
             assertEquals(0, rig.clientGame.count(NRig.CHUNK_ID));
         }
+        // An owner's abort with 0x12 has no classified phrase, so it carries the generic one.
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            rig.server.abort(CLOSE_RESOURCE);
+            assertEquals(CLOSE_RESOURCE, closed(rig.serverGame).code);
+            assertEquals(CLOSE_RESOURCE, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
+            assertArrayEquals("resource".getBytes(StandardCharsets.US_ASCII),
+                    rig.net.clientSawReason.get(15, TimeUnit.SECONDS));
+        }
     }
 
     @Test
