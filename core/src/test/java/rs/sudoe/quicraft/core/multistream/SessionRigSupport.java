@@ -36,15 +36,19 @@ class SessionRigSupport {
     static final class Closed {
         final int code;
         final boolean byPeer;
+        /** The cause the session reported, or null when the close carried none. */
+        final Throwable cause;
 
-        Closed(int code, boolean byPeer) {
+        Closed(int code, boolean byPeer, Throwable cause) {
             this.code = code;
             this.byPeer = byPeer;
+            this.cause = cause;
         }
 
         @Override
         public String toString() {
-            return "closed " + Integer.toHexString(code) + (byPeer ? " by peer" : " locally");
+            return "closed " + Integer.toHexString(code) + (byPeer ? " by peer" : " locally")
+                    + (cause == null ? "" : ": " + cause.getMessage());
         }
     }
 

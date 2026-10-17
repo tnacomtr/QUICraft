@@ -1345,6 +1345,11 @@ public final class NStreamSession implements MultistreamSession {
         return channels[stream];
     }
 
+    /** Whether every peer preamble this side expects has been read (13.3); call on the loop. */
+    boolean peerPreamblesSeen() {
+        return preambles.allExpectedSeen();
+    }
+
     EventLoop eventLoop() {
         return loop;
     }

@@ -212,7 +212,7 @@ final class NRig implements AutoCloseable {
 
         @Override
         public void onClosed(int code, boolean byPeer, Throwable cause) {
-            closed.complete(new SessionRigSupport.Closed(code, byPeer));
+            closed.complete(new SessionRigSupport.Closed(code, byPeer, cause));
         }
 
         List<Pkt> packets() {
@@ -413,6 +413,25 @@ final class NRig implements AutoCloseable {
             }, 10_000);
             if (!ready) {
                 throw new IllegalStateException("streams did not open");
+            }
+        }
+    }
+
+    /** Waits until every session has read all of its expected peer preambles (13.3). */
+    void awaitPeerPreambles() throws Exception {
+        for (NStreamSession session : new NStreamSession[] {server, client}) {
+            if (session == null) {
+                continue;
+            }
+            boolean settled = SessionRigSupport.await(() -> {
+                try {
+                    return onLoop(session, () -> session.peerPreamblesSeen());
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            }, 10_000);
+            if (!settled) {
+                throw new IllegalStateException("peer preambles did not settle");
             }
         }
     }

@@ -19,6 +19,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -242,20 +243,39 @@ class NStreamSessionLoopbackTest {
     /**
      * The peer stops reading a lane with nothing in flight. Netty reports no event for the incoming
      * STOP_SENDING and the writer never touches the lane again, so only the periodic send-capacity
-     * probe (13.14) can notice: the writer closes 0x11 by its own decision.
+     * probe (13.14) can notice: the writer closes 0x11 by its own decision, carrying the probe's
+     * cause, and without an attempted write.
      */
     @Test
     void aStopSendingOnAnIdleLaneClosesBothSidesWith0x11WithoutAWrite() throws Exception {
         try (NRig rig = NRig.start(2)) {
             rig.activateBoth();
+            // Attachment is not setup: wait until both sides have read every peer preamble, so the
+            // lanes are provably idle and quiet before the STOP.
+            rig.awaitPeerPreambles();
+            AtomicInteger realtimeWrites = new AtomicInteger();
+            NRig.onLoop(rig.server, () -> {
+                rig.server.channelOf(LogicalStream.REALTIME).pipeline().addFirst(new ChannelOutboundHandlerAdapter() {
+                    @Override
+                    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+                        realtimeWrites.incrementAndGet();
+                        ctx.write(msg, promise);
+                    }
+                });
+                return null;
+            });
             NRig.channel(rig.client, LogicalStream.REALTIME).shutdownInput(0x43);
             SessionRigSupport.Closed server = closed(rig.serverGame);
             assertEquals(CLOSE_ORDERING, server.code, server.toString());
             assertFalse(server.byPeer, "the probe closes locally, with no write to learn it from: " + server);
+            assertNotNull(server.cause, "the local close carries the probe's cause: " + server);
+            assertTrue(String.valueOf(server.cause.getMessage()).contains("the peer stopped reading a stream"),
+                    "the close came from the idle STOP_SENDING probe: " + server.cause);
             SessionRigSupport.Closed client = closed(rig.clientGame);
             assertEquals(CLOSE_ORDERING, client.code, client.toString());
             assertTrue(client.byPeer, "the client only sees the writer's close: " + client);
-            assertEquals(0, rig.clientGame.count(NRig.REALTIME_ID), "no REALTIME record was needed to notice");
+            assertEquals(0, realtimeWrites.get(), "the probe closed without an attempted REALTIME write");
+            assertEquals(0, rig.clientGame.count(NRig.REALTIME_ID), "no REALTIME record was delivered either");
         }
     }
 
