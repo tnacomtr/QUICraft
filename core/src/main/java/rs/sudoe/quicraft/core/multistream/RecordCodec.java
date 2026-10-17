@@ -61,7 +61,7 @@ public final class RecordCodec {
         }
         byte[] payload = record.payload();
         try {
-            validateCompactBody(record.streamIndex(), record.kind(), payload);
+            validateCompactBody(record.streamIndex(), record.kind(), payload, 0, payload.length);
         } catch (MultistreamProtocolException e) {
             throw new IllegalArgumentException(e.getMessage(), e);
         }
@@ -134,6 +134,26 @@ public final class RecordCodec {
         /** Bytes the record_length VarInt occupied; valid once it is complete. */
         public int lengthPrefixBytes() {
             return lengthBytes;
+        }
+
+        /**
+         * The array the next bytes belong in: the bounded prefix before admission, the record frame after.
+         * Null while the record_length VarInt is pending. A caller may read straight into it at
+         * {@link #stagingOffset()} and pass that same region to {@link #next}, so no read buffer is copied.
+         */
+        public byte[] stagingArray() {
+            if (recordLength < 0) return null;
+            return admitted ? frame : prefix;
+        }
+
+        /** Offset in {@link #stagingArray()} where the next bytes go. */
+        public int stagingOffset() {
+            return filled;
+        }
+
+        /** True while the length or the bounded prefix is staged and not yet transferred to the frame. */
+        public boolean prefixStage() {
+            return recordLength < 0 || !admitted;
         }
 
         /** Record bodies allocated so far. A held or refused declaration allocates none. */
@@ -278,8 +298,8 @@ public final class RecordCodec {
         }
         if (header >= prefixLength) throw compactError("GAME record without an inner length");
         byte[] body = Arrays.copyOfRange(prefix, header, prefixLength);
-        int innerLength = readInnerLength(body);
-        int innerBytes = innerVarIntBytes(body);
+        int innerLength = readInnerLength(body, 0, body.length);
+        int innerBytes = innerVarIntBytes(body, 0, body.length);
         if (header + innerBytes + (long) innerLength != recordLength) {
             throw compactError("inner frame length " + innerLength + " does not match record_length");
         }
@@ -329,9 +349,11 @@ public final class RecordCodec {
             deps.add(new rs.sudoe.quicraft.core.multistream.Record.Dependency(index, dseq));
         }
         if (at[0] > COMPACT_MAX_HEADER) throw compactError("header over " + COMPACT_MAX_HEADER + " bytes");
-        byte[] payload = Arrays.copyOfRange(frame, at[0], end);
-        validateCompactBody(streamIndex, kind, payload);
-        return new rs.sudoe.quicraft.core.multistream.Record(streamIndex, seq, epoch, deps, kind, payload);
+        // The payload stays in the frame (13.12): no second copy of the record is made.
+        int offset = at[0];
+        validateCompactBody(streamIndex, kind, frame, offset, end - offset);
+        return rs.sudoe.quicraft.core.multistream.Record.adopt(streamIndex, seq, epoch, deps, kind, frame, offset,
+                end - offset);
     }
 
     private static int checked31(long value, String name) {
@@ -348,17 +370,17 @@ public final class RecordCodec {
     }
 
     /** Validates compact record kind placement and its §13.4 body form. */
-    private static void validateCompactBody(int streamIndex, int kind, byte[] payload)
+    private static void validateCompactBody(int streamIndex, int kind, byte[] payload, int off, int len)
             throws MultistreamProtocolException {
         if (kind == KIND_GAME) {
-            validateBody(KIND_GAME, payload, true);
+            validateBody(KIND_GAME, payload, off, len, true);
         } else if (kind == KIND_END) {
             if (streamIndex != LogicalStream.CONTROL) throw compactError("END outside CONTROL");
-            if (payload.length != 0) throw compactError("END body");
+            if (len != 0) throw compactError("END body");
         } else if (kind == 2 || kind == 3) {
             // 13.19: joins live on CHUNK[0] only.
             if (streamIndex != 2) throw compactError("join outside CHUNK[0]");
-            validateBody(KIND_GAME, payload, true);
+            validateBody(KIND_GAME, payload, off, len, true);
         } else {
             throw compactError("invalid kind");
         }
@@ -417,7 +439,7 @@ public final class RecordCodec {
                 throw new IllegalStateException("not a GAME record");
             }
             try {
-                return readInnerLength(body);
+                return readInnerLength(body, 0, body.length);
             } catch (MultistreamProtocolException e) {
                 throw new IllegalStateException(e); // a decoded GAME body already passed validation
             }
@@ -425,7 +447,7 @@ public final class RecordCodec {
 
         /** GAME only: the framed packet content, without the inner VarInt length prefix. */
         public byte[] gameContent() {
-            int prefix = innerVarIntBytes(body);
+            int prefix = innerVarIntBytes(body, 0, body.length);
             return Arrays.copyOfRange(body, prefix, body.length);
         }
     }
@@ -651,12 +673,18 @@ public final class RecordCodec {
      */
     static void validateBody(int kind, byte[] body, boolean controlStream)
             throws MultistreamProtocolException {
+        validateBody(kind, body, 0, body.length, controlStream);
+    }
+
+    /** Validates the body bytes {@code body[off, off+len)} in place (13.4). */
+    static void validateBody(int kind, byte[] body, int off, int len, boolean controlStream)
+            throws MultistreamProtocolException {
         if (kind == KIND_GAME) {
-            if (body.length < 1) {
+            if (len < 1) {
                 throw new MultistreamProtocolException(CLOSE_CODE, "13.4", "GAME record with empty body");
             }
-            int innerLength = readInnerLength(body);
-            int prefix = innerVarIntBytes(body);
+            int innerLength = readInnerLength(body, off, len);
+            int prefix = innerVarIntBytes(body, off, len);
             if (innerLength < 1) {
                 throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
                         "GAME inner frame length 0");
@@ -665,19 +693,19 @@ public final class RecordCodec {
                 throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
                         "GAME inner frame length " + innerLength + " > " + MAX_INNER_CONTENT);
             }
-            if (prefix + innerLength != body.length) {
+            if (prefix + innerLength != len) {
                 throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
                         "GAME inner frame length " + innerLength + " does not match body length "
-                                + (body.length - prefix));
+                                + (len - prefix));
             }
         } else if (kind == KIND_END) {
             if (!controlStream) {
                 throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
                         "END record on a non-CONTROL stream");
             }
-            if (body.length != 0) {
+            if (len != 0) {
                 throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
-                        "END record with " + body.length + " body bytes");
+                        "END record with " + len + " body bytes");
             }
         } else {
             throw new MultistreamProtocolException(CLOSE_CODE, "13.4", "unknown record kind " + kind);
@@ -690,7 +718,7 @@ public final class RecordCodec {
      * packet lengths unchanged), so the reader is lenient here; 13.4 still caps it at three
      * bytes and the value must be nonnegative.
      */
-    private static int readInnerLength(byte[] body) throws MultistreamProtocolException {
+    private static int readInnerLength(byte[] body, int off, int len) throws MultistreamProtocolException {
         VarInt.Reader reader = new VarInt.Reader(CLOSE_CODE, "13.4", false);
         int i = 0;
         while (!reader.done()) {
@@ -698,17 +726,17 @@ public final class RecordCodec {
                 throw new MultistreamProtocolException(CLOSE_CODE, "13.4",
                         "inner frame length prefix over 3 bytes");
             }
-            if (i >= body.length) {
+            if (i >= len) {
                 throw new MultistreamProtocolException(CLOSE_CODE, "13.4", "truncated inner frame length");
             }
-            reader.feed(body[i++] & 0xff);
+            reader.feed(body[off + i++] & 0xff);
         }
         return reader.value();
     }
 
-    private static int innerVarIntBytes(byte[] body) {
-        for (int i = 0; i < MAX_INNER_VARINT_BYTES && i < body.length; i++) {
-            if ((body[i] & 0x80) == 0) {
+    private static int innerVarIntBytes(byte[] body, int off, int len) {
+        for (int i = 0; i < MAX_INNER_VARINT_BYTES && i < len; i++) {
+            if ((body[off + i] & 0x80) == 0) {
                 return i + 1;
             }
         }

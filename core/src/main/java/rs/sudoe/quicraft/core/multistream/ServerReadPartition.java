@@ -80,6 +80,11 @@ public final class ServerReadPartition {
         return true;
     }
 
+    /** Prefix staging bytes currently held; never above {@link #PREFIX_SLICE}. */
+    public int prefixInUse() {
+        return prefixInUse;
+    }
+
     /** Returns prefix staging bytes. */
     public void releasePrefix(int bytes) {
         if (bytes < 0 || bytes > prefixInUse) {
