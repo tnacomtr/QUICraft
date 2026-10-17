@@ -1450,8 +1450,9 @@ position extraction. Those implementations must change together before this revi
      inner length and compression Data Length prefixes using P, with read grants limited
       to those prefix bytes until the declaration is known. Prefix staging ALWAYS comes
       from a fixed reserved slice of P, never the excess pool. Reserve 160 bytes of P for
-      staged prefixes and their read/parser copies (54-byte header plus three at-most-5-byte
-      lengths, at most two retained copies = 138 bytes, rounded up to 160);
+      staged prefixes and their read/parser copies (74 bytes per lane: a 5-byte record_length
+      VarInt plus the 69-byte prefix window of a 54-byte header and three at-most-5-byte lengths;
+      two lanes = 148 bytes, within 160; the prefix is parsed in place, with no body copy);
       validate this bound against the reviewed envelope/length encodings before enablement.
         The REALTIME 2 KiB parse/output-copy slice is also partitioned within P, never lent to
        CONTROL, so a CONTROL head waiting on REALTIME cannot consume it.

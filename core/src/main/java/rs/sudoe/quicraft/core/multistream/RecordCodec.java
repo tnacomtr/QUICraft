@@ -297,9 +297,11 @@ public final class RecordCodec {
             return new Declarations(kind, header, 0, 0, compressed ? 0 : -1, 0, 0);
         }
         if (header >= prefixLength) throw compactError("GAME record without an inner length");
-        byte[] body = Arrays.copyOfRange(prefix, header, prefixLength);
-        int innerLength = readInnerLength(body, 0, body.length);
-        int innerBytes = innerVarIntBytes(body, 0, body.length);
+        // The inner length and Data Length are read in place from the prefix at offset `header`: no copy
+        // of the body is made, so the staged prefix is the only bytes this method touches (13.12).
+        int bodyLength = prefixLength - header;
+        int innerLength = readInnerLength(prefix, header, bodyLength);
+        int innerBytes = innerVarIntBytes(prefix, header, bodyLength);
         if (header + innerBytes + (long) innerLength != recordLength) {
             throw compactError("inner frame length " + innerLength + " does not match record_length");
         }
@@ -309,10 +311,10 @@ public final class RecordCodec {
         VarInt.Reader data = new VarInt.Reader(CLOSE_CODE, "13.4", false);
         int p = innerBytes;
         while (!data.done()) {
-            if (p >= body.length || p - innerBytes >= MAX_INNER_VARINT_BYTES + 2) {
+            if (p >= bodyLength || p - innerBytes >= MAX_INNER_VARINT_BYTES + 2) {
                 throw compactError("truncated Data Length");
             }
-            data.feed(body[p++] & 0xff);
+            data.feed(prefix[header + p++] & 0xff);
         }
         long dataLength = data.value();
         int dataBytes = p - innerBytes;
