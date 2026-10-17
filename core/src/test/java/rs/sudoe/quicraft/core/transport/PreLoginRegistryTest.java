@@ -647,6 +647,36 @@ class PreLoginRegistryTest {
         assertEquals(2 * STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN));
     }
 
+    /** 12.13: with no declared waiter queued, a fresh declared charge does not take bytes owed to a newcomer either. */
+    @Test
+    void aFreshDeclaredChargeDoesNotTakeBytesOwedToAPendingNewcomer() throws Exception {
+        PreLoginTrackerTest.FakePools pools = new PreLoginTrackerTest.FakePools()
+                .capacity(ResourcePools.Pool.PRE_LOGIN, STAGED * 2 + 2048);
+        PreLoginRegistry registry = new PreLoginRegistry(pools, 4, new Random(1));
+        List<Conn> shed = new ArrayList<>();
+        Conn victim = admit(registry, "victim", "192.0.2.1", false, shed);
+        Conn other = admit(registry, "other", "192.0.2.1", false, shed);
+        other.entry.recordProgress(1);
+
+        List<String> woken = new ArrayList<>();
+        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+                System::nanoTime, () -> { }, () -> woken.add("newcomer"));
+        assertTrue(first.pending, "the newcomer waits for the victim's close");
+        assertTrue(victim.closed, "the least-progressed victim was shed");
+        victim.entry.close();
+        assertEquals(STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN), "the victim's bytes are free");
+
+        assertEquals(PreLoginTracker.ChargeResult.WAIT, other.entry.chargeDeclaredFrame(STAGED + 1024, 0),
+                "a fresh declared charge is not granted the bytes owed to the newcomer");
+        assertEquals(STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN), "no declared bytes were granted");
+
+        PreLoginRegistry.Admission second = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+                System::nanoTime, () -> { }, () -> woken.add("again"));
+        assertNotNull(second.entry, "the newcomer is admitted on its retry");
+        assertFalse(other.closed, "no second victim is shed for the newcomer");
+        assertEquals(2 * STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN));
+    }
+
     /**
      * 12.13: a newcomer woken by a shed victim's confirmed close finds the victim's open-connection lease already
      * free, so it does not shed a second victim.

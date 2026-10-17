@@ -699,9 +699,11 @@ final class PreLoginRegistry {
                 }
                 // Grant at once while the pool has room, the prefix is under its per-prefix cap and no other charge
                 // is waiting (fair share is not checked against an empty pool, which would stall two equally charged
-                // prefixes). Otherwise the charge joins the wait set, and the pass grants it in priority order when
-                // bytes free up (12.13). Waiting never sheds anyone else.
-                if (declaredWaiters.isEmpty() && declaredInFlight(coarse) + total <= declaredBytesPerPrefix) {
+                // prefixes) and no shed's freed bytes are owed to a pending newcomer. Otherwise the charge joins the
+                // wait set, and the pass grants it in priority order when bytes free up (12.13). Waiting never sheds
+                // anyone else.
+                if (declaredWaiters.isEmpty() && owed.isEmpty()
+                        && declaredInFlight(coarse) + total <= declaredBytesPerPrefix) {
                     PreLoginTracker.ChargeResult result = tracker.chargeDeclaredFrame(declaredBytes, framingBytes);
                     if (result == PreLoginTracker.ChargeResult.CHARGED) {
                         declaredExtra += total;
