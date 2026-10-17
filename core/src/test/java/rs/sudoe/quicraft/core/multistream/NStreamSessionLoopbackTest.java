@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.multistream;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -144,6 +145,24 @@ class NStreamSessionLoopbackTest {
             assertTrue(SessionRigSupport.await(() -> rig.clientGame.count(NRig.CHUNK_ID) == 1, 10_000));
             assertFalse(rig.clientGame.closed.isDone());
         }
+    }
+
+    /**
+     * The N+2 session's idle STOP_SENDING probe depends on two package-private members of the pinned
+     * Netty: {@code Quiche.QUICHE_ERR_STREAM_STOPPED} and {@code QuicheQuicChannel.streamCapacity(long)}.
+     * Both are resolved reflectively at runtime, so a Netty upgrade or a relocation that drops either
+     * would leave the probe silently inert; this pins them against the Netty the build actually uses.
+     */
+    @Test
+    void theStopSendingProbeResolvesAgainstThePinnedNetty() throws Exception {
+        assertTrue(NStreamSession.stopSendingErrCode() != Integer.MIN_VALUE,
+                "the pinned Netty must expose QUICHE_ERR_STREAM_STOPPED");
+        assertTrue(NStreamSession.stopSendingErrCode() < 0,
+                "QUICHE_ERR_STREAM_STOPPED is a negative quiche error: " + NStreamSession.stopSendingErrCode());
+        Class<?> implementation = Class.forName(
+                QuicStreamChannel.class.getName().replace("QuicStreamChannel", "QuicheQuicChannel"));
+        assertNotNull(NStreamSession.findStreamCapacity(implementation),
+                "the pinned Netty must expose the stream send capacity of " + implementation.getName());
     }
 
     private enum Fault { RESET, FIN, STOP }
