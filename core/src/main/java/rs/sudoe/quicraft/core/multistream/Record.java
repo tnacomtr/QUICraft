@@ -32,7 +32,8 @@ public final class Record {
 
     private Record(int streamIndex, long sequence, long epoch, List<Dependency> dependencies, int kind,
                    byte[] payload, int offset, int length) {
-        if (streamIndex < 0 || sequence <= 0 || epoch < 0 || kind < 0 || kind > 3 || dependencies == null
+        if (streamIndex < 0 || sequence <= 0 || epoch < 0 || kind < 0 || kind > RecordCodec.KIND_BUNDLE_OPEN
+                || dependencies == null
                 || payload == null || offset < 0 || length < 0 || offset + length > payload.length)
             throw new IllegalArgumentException("record");
         this.streamIndex=streamIndex; this.sequence=sequence; this.epoch=epoch; this.kind=kind;
@@ -62,4 +63,22 @@ public final class Record {
     int payloadOffset() { return payloadOffset; }
     /** Payload length in bytes. */
     int payloadLength() { return payloadLength; }
+
+    /** True for a bundle opener (kind 4, 13.4). Its payload starts with the unit fields. */
+    public boolean isBundleOpen() { return kind == RecordCodec.KIND_BUNDLE_OPEN; }
+
+    /** Bundle opener only: records in the unit, delimiters included (13.4). */
+    public int unitRecords() { return (int) unitFields()[0]; }
+
+    /** Bundle opener only: total wire size of the unit, length prefixes included (13.4). */
+    public long unitWireBytes() { return unitFields()[1]; }
+
+    private long[] unitFields() {
+        if (!isBundleOpen()) throw new IllegalStateException("not a bundle opener");
+        try {
+            return RecordCodec.readBundleFields(payload, payloadOffset, payloadOffset + payloadLength);
+        } catch (MultistreamProtocolException e) {
+            throw new IllegalStateException(e); // a bundle opener's payload passed validation
+        }
+    }
 }

@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.multistream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import rs.sudoe.quicraft.core.Protocol;
@@ -19,6 +20,11 @@ import rs.sudoe.quicraft.core.Protocol;
  * one unit: after its record completes it reads nothing more until {@link #commit} releases the slot.
  * A stream that is partway through a record keeps reading, so every incomplete head can finish.
  *
+ * <p>A bundle (kind 4 opener, then its members and closer, 13.15) is one unit. The opener's declaration
+ * admits the whole unit at once: its unit_wire_bytes and unit_records are charged to the CONTROL slot, and
+ * the stream keeps reading the following kind 0 records into that same slot until the declared count is
+ * reached. The declared bytes and the declared count must both match exactly, or the stream closes 0x11.
+ *
  * <p>Grants never exceed the bytes the current head still needs, and that head's slot already holds
  * those bytes, so no separate grant is reserved and none has to be returned. Streams are served
  * round-robin, so no stream is starved by the others.
@@ -26,26 +32,46 @@ import rs.sudoe.quicraft.core.Protocol;
  * <p>Not thread-safe; owned by the connection's receive path. Not wired into the live receive path yet.
  */
 public final class ClientReadPump {
-    private static final byte[] NO_BYTES = new byte[0];
-
-    /** A completed record. Its slot stays held until {@link ClientReadPump#commit} releases it. */
+    /** A completed unit. Its slot stays held until {@link ClientReadPump#commit} releases it. */
     public static final class Unit {
         private final Lane lane;
-        private final Record record;
+        private final List<Record> records;
+        private final long wireBytes;
 
-        private Unit(Lane lane, Record record) {
+        private Unit(Lane lane, List<Record> records, long wireBytes) {
             this.lane = lane;
-            this.record = record;
+            this.records = records;
+            this.wireBytes = wireBytes;
         }
 
-        /** The stream this record arrived on. */
+        /** The stream this unit arrived on. */
         public int stream() {
             return lane.stream;
         }
 
-        /** The parsed record. */
+        /** The opening record: the record itself for a single-record unit, the opening delimiter for a bundle. */
         public Record record() {
-            return record;
+            return records.get(0);
+        }
+
+        /** Every record of the unit in stream order, opener first; one record for a single-record unit. */
+        public List<Record> records() {
+            return Collections.unmodifiableList(records);
+        }
+
+        /** Records in the unit, delimiters included. */
+        public int recordCount() {
+            return records.size();
+        }
+
+        /** Sequence of the unit's last record: the closing sequence for {@link StreamReceiver#offer}. */
+        public long closingSequence() {
+            return records.get(records.size() - 1).sequence();
+        }
+
+        /** Total wire size of the unit, length prefixes included: the bytes its stream slot holds. */
+        public long wireBytes() {
+            return wireBytes;
         }
     }
 
@@ -73,12 +99,12 @@ public final class ClientReadPump {
     }
 
     /**
-     * Advances every stream that may read, by at most one read each, and returns the records completed
+     * Advances every stream that may read, by at most one read each, and returns the units completed
      * by this call. Each returned unit holds its stream's slot until committed.
      *
      * @throws IOException when the byte source fails
      * @throws MultistreamProtocolException for a record that violates its declaration or does not fit
-     *     its stream's slot (close 0x11)
+     *     its stream's slot, or a bundle whose declared bytes or count do not match (close 0x11)
      */
     public List<Unit> step() throws IOException, MultistreamProtocolException {
         if (!open) throw new IllegalStateException("client read pump is cancelled");
@@ -105,6 +131,7 @@ public final class ClientReadPump {
         for (Lane lane : lanes) {
             lane.decoder.cancel();
             lane.ready = null;
+            lane.pending = null;
             lane.provisional = false;
             lane.admitted = false;
             if (slots.holdsHead(lane.stream)) slots.releaseHead(lane.stream);
@@ -113,8 +140,14 @@ public final class ClientReadPump {
 
     private void pumpLane(Lane lane, List<Unit> done) throws IOException, MultistreamProtocolException {
         if (lane.ready != null) return; // one unit per stream until it commits (13.12)
-        if (!lane.provisional && !lane.admitted) {
+        Pending pending = lane.pending;
+        if (pending != null && pending.consumed >= pending.wireBytes && pending.declared < pending.records) {
+            throw bundleError("unit_wire_bytes " + pending.wireBytes + " reached before unit_records "
+                    + pending.records);
+        }
+        if (pending == null && !lane.provisional && !lane.admitted) {
             // Early bytes need their own slot before any read; a full slot means no read on this stream.
+            // Inside a bundle the unit already holds the slot, so its members need no admission here.
             if (!slots.admitHead(lane.stream, SessionReadPump.PREFIX_STAGE, 1)) return;
             lane.provisional = true;
         }
@@ -132,19 +165,40 @@ public final class ClientReadPump {
         if (got <= 0) return;
         if (got > grant) throw new IllegalStateException("byte source returned more than was requested");
         Record record = lane.decoder.next(ByteBuffer.wrap(target, off, got));
-        if (record != null) {
-            lane.provisional = false;
-            lane.admitted = false;
-            lane.ready = new Unit(lane, record);
-            done.add(lane.ready);
-        }
+        if (record != null) complete(lane, record, done);
     }
 
-    /** Replaces the provisional head with the declared record's full wire size (13.12). */
+    /** Adds a completed record to its unit; a unit that is whole becomes ready, awaiting commit. */
+    private void complete(Lane lane, Record record, List<Unit> done) throws MultistreamProtocolException {
+        lane.provisional = false;
+        lane.admitted = false;
+        Pending pending = lane.pending;
+        if (pending == null) {
+            lane.ready = new Unit(lane, Collections.singletonList(record), slots.heldBytes(lane.stream));
+        } else {
+            if (!pending.seen.isEmpty()
+                    && record.sequence() != pending.seen.get(pending.seen.size() - 1).sequence() + 1) {
+                throw bundleError("bundle record sequence " + record.sequence() + " is not consecutive");
+            }
+            pending.seen.add(record);
+            if (pending.seen.size() < pending.records) return;
+            if (pending.consumed != pending.wireBytes) {
+                throw bundleError("unit_records " + pending.records + " reached with " + pending.consumed
+                        + " wire bytes, not unit_wire_bytes " + pending.wireBytes);
+            }
+            lane.pending = null;
+            lane.ready = new Unit(lane, pending.seen, pending.wireBytes);
+        }
+        done.add(lane.ready);
+    }
+
+    /** Admits a declared record (13.12). Single records replace the provisional head; bundles admit the whole unit. */
     private boolean declare(Lane lane, long recordLength, byte[] prefix, int prefixLength)
             throws MultistreamProtocolException {
-        RecordCodec.inspectPrefix(prefix, prefixLength, recordLength, compressed);
+        RecordCodec.Declarations d = RecordCodec.inspectPrefix(prefix, prefixLength, recordLength, compressed);
         long wire = (long) lane.decoder.lengthPrefixBytes() + recordLength;
+        if (lane.pending != null) return declareMember(lane, d, wire);
+        if (d.kind == RecordCodec.KIND_BUNDLE_OPEN) return declareOpener(lane, d, wire);
         slots.releaseHead(lane.stream);
         if (!slots.admitHead(lane.stream, wire, 1)) {
             throw new MultistreamProtocolException(Protocol.CLOSE_RESOURCE, "13.12",
@@ -155,13 +209,72 @@ public final class ClientReadPump {
         return true;
     }
 
-    /** Per-stream state: the decoder, whether a head is admitted, and the unit awaiting commit. */
+    /** A bundle opener (13.15): clientbound CONTROL only; its unit replaces the provisional head. */
+    private boolean declareOpener(Lane lane, RecordCodec.Declarations d, long wire)
+            throws MultistreamProtocolException {
+        if (lane.stream != LogicalStream.CONTROL) throw bundleError("bundle open on stream " + lane.stream);
+        if (d.unitWireBytes < wire) {
+            throw bundleError("unit_wire_bytes " + d.unitWireBytes + " is smaller than the opener's " + wire);
+        }
+        slots.releaseHead(lane.stream);
+        if (!slots.admitHead(lane.stream, d.unitWireBytes, (int) d.unitRecords)) {
+            throw bundleError("bundle of " + d.unitRecords + " records and " + d.unitWireBytes
+                    + " wire bytes does not fit stream " + lane.stream + "'s slot");
+        }
+        Pending pending = new Pending((int) d.unitRecords, d.unitWireBytes);
+        pending.declared = 1;
+        pending.consumed = wire;
+        lane.pending = pending;
+        lane.provisional = false;
+        lane.admitted = true;
+        return true;
+    }
+
+    /** A bundle member or closer (13.15): a kind 0 GAME record that must fit the declared bytes and count. */
+    private boolean declareMember(Lane lane, RecordCodec.Declarations d, long wire) throws MultistreamProtocolException {
+        Pending pending = lane.pending;
+        if (d.kind != RecordCodec.KIND_GAME) throw bundleError("bundle member of kind " + d.kind);
+        if (pending.declared >= pending.records) {
+            throw bundleError("more records than unit_records " + pending.records);
+        }
+        if (pending.consumed + wire > pending.wireBytes) {
+            throw bundleError("bundle bytes exceed unit_wire_bytes " + pending.wireBytes);
+        }
+        pending.declared++;
+        pending.consumed += wire;
+        lane.provisional = false;
+        lane.admitted = true;
+        return true;
+    }
+
+    private static MultistreamProtocolException bundleError(String detail) {
+        return new MultistreamProtocolException(MultistreamProtocolException.CLOSE_ORDERING, "13.15", detail);
+    }
+
+    /** A bundle being read on one stream: its declared totals and the records completed so far. */
+    private static final class Pending {
+        final int records;
+        final long wireBytes;
+        final List<Record> seen = new ArrayList<>();
+        /** Records declared so far, opener included. */
+        int declared;
+        /** Wire bytes of the records declared so far, prefixes included. */
+        long consumed;
+
+        Pending(int records, long wireBytes) {
+            this.records = records;
+            this.wireBytes = wireBytes;
+        }
+    }
+
+    /** Per-stream state: the decoder, whether a head is admitted, the bundle in progress and the unit awaiting commit. */
     private final class Lane {
         final int stream;
         final RecordCodec.CompactDecoder decoder;
         final byte[] lengthByte = new byte[1];
         boolean provisional;
         boolean admitted;
+        Pending pending;
         Unit ready;
 
         Lane(int stream) {

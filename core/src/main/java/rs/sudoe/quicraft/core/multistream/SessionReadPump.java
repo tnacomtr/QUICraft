@@ -249,6 +249,8 @@ public final class SessionReadPump {
             throws MultistreamProtocolException {
         boolean realtimeLane = lane.stream == LogicalStream.REALTIME;
         RecordCodec.Declarations d = RecordCodec.inspectPrefix(prefix, prefixLength, recordLength, compressed);
+        // Bundles are clientbound CONTROL only (13.15); a serverbound opener is refused before any allocation.
+        if (d.kind == RecordCodec.KIND_BUNDLE_OPEN) throw refused("bundle open on a serverbound stream (13.15)");
         int lengthBytes = lane.decoder.lengthPrefixBytes();
         if (realtimeLane) {
             if (!ServerReadPartition.realtimeRecordLegal(recordLength, Math.max(0, d.dataLength), d.decodedLength)) {

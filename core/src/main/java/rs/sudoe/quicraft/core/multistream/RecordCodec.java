@@ -26,6 +26,12 @@ public final class RecordCodec {
     public static final int KIND_ACK_JOIN = 2;
     /** Kind 3 BATCH_JOIN: one GAME frame of the designated packet, on a chunk stream (13.4, 13.19). */
     public static final int KIND_BATCH_JOIN = 3;
+    /**
+     * Kind 4 BUNDLE_OPEN: clientbound CONTROL only (13.4, 13.15). Its body is VarInt(unit_records) ||
+     * VarInt(unit_wire_bytes) || one GAME frame, the opening delimiter. The members and the closer are
+     * ordinary kind 0 GAME records that follow it on the same stream.
+     */
+    public static final int KIND_BUNDLE_OPEN = 4;
 
     /** kind (1) + four unsigned 64-bit fields (32). */
     public static final int HEADER_LENGTH = 33;
@@ -74,6 +80,32 @@ public final class RecordCodec {
     }
 
     /**
+     * Encodes a bundle opener (kind 4, 13.4, 13.15). The body is VarInt(unit_records) ||
+     * VarInt(unit_wire_bytes) || {@code frame}, where {@code frame} is one complete length-prefixed GAME
+     * body (the same bytes a kind 0 record carries). Returns the opener's wire bytes; its own wire size
+     * must not exceed {@code unitWireBytes}. Member and closer records are encoded separately.
+     */
+    public static byte[] encodeBundleOpen(int streamIndex, long sequence, long epoch,
+            List<rs.sudoe.quicraft.core.multistream.Record.Dependency> deps, int unitRecords, long unitWireBytes,
+            byte[] frame) {
+        if (frame == null) throw new NullPointerException("frame");
+        if (unitRecords < 2 || unitRecords > ReceiveSlots.RECORDS_PER_STREAM) {
+            throw new IllegalArgumentException("unit_records outside 2..128");
+        }
+        if (unitWireBytes < 0 || unitWireBytes > ReceiveSlots.BYTES_PER_STREAM) {
+            throw new IllegalArgumentException("unit_wire_bytes outside 0..B");
+        }
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        VarInt.write(body, unitRecords);
+        VarInt.write(body, (int) unitWireBytes);
+        body.write(frame, 0, frame.length);
+        byte[] wire = encodeRecord(new rs.sudoe.quicraft.core.multistream.Record(streamIndex, sequence, epoch, deps,
+                KIND_BUNDLE_OPEN, body.toByteArray()));
+        if (wire.length > unitWireBytes) throw new IllegalArgumentException("opener larger than its unit");
+        return wire;
+    }
+
+    /**
      * Decodes one complete compact /3 record (13.4). The bytes must be exactly one record: a
      * short, oversize or trailing input is rejected. Delegates to {@link CompactDecoder}, so the
      * same length rules apply as on a stream.
@@ -95,7 +127,7 @@ public final class RecordCodec {
      */
     public static final class CompactDecoder {
         /** Largest bounded prefix: the 54-byte header plus three at-most-5-byte lengths (13.12). */
-        public static final int PREFIX_WINDOW = COMPACT_MAX_HEADER + 3 * 5;
+        public static final int PREFIX_WINDOW = COMPACT_MAX_HEADER + 4 * 5;
 
         private final int streamIndex;
         private final VarInt.Reader length = new VarInt.Reader(CLOSE_CODE, "13.4");
@@ -237,7 +269,7 @@ public final class RecordCodec {
 
     /** What a record's bounded prefix declares, read before its body is allocated (13.12). */
     public static final class Declarations {
-        /** Record kind (0..3). */
+        /** Record kind (0..4). */
         public final int kind;
         /** Compact header length, through the dependency list. */
         public final int headerLength;
@@ -251,9 +283,13 @@ public final class RecordCodec {
         public final long decodedLength;
         /** Bytes after the Data Length prefix: the zlib input when compressed, else the packet. */
         public final long payloadLength;
+        /** KIND_BUNDLE_OPEN only: the declared unit_records, delimiters included; 0 otherwise (13.4). */
+        public final long unitRecords;
+        /** KIND_BUNDLE_OPEN only: the declared unit_wire_bytes, prefixes included; 0 otherwise (13.4). */
+        public final long unitWireBytes;
 
         Declarations(int kind, int headerLength, int innerLengthBytes, int dataLengthBytes, long dataLength,
-                     long decodedLength, long payloadLength) {
+                     long decodedLength, long payloadLength, long unitRecords, long unitWireBytes) {
             this.kind = kind;
             this.headerLength = headerLength;
             this.innerLengthBytes = innerLengthBytes;
@@ -261,6 +297,8 @@ public final class RecordCodec {
             this.dataLength = dataLength;
             this.decodedLength = decodedLength;
             this.payloadLength = payloadLength;
+            this.unitRecords = unitRecords;
+            this.unitWireBytes = unitWireBytes;
         }
     }
 
@@ -280,7 +318,7 @@ public final class RecordCodec {
         }
         int[] at = {1};
         int kind = prefix[0] & 255;
-        if (kind > 3) throw compactError("invalid kind " + kind);
+        if (kind > KIND_BUNDLE_OPEN) throw compactError("invalid kind " + kind);
         readCompact(prefix, prefixLength, at);
         readCompact(prefix, prefixLength, at);
         long count = readCompact(prefix, prefixLength, at);
@@ -294,19 +332,36 @@ public final class RecordCodec {
         if (header > COMPACT_MAX_HEADER) throw compactError("header over " + COMPACT_MAX_HEADER + " bytes");
         if (kind == KIND_END) {
             if (recordLength != header) throw compactError("END length does not match its header");
-            return new Declarations(kind, header, 0, 0, compressed ? 0 : -1, 0, 0);
+            return new Declarations(kind, header, 0, 0, compressed ? 0 : -1, 0, 0, 0, 0);
         }
-        if (header >= prefixLength) throw compactError("GAME record without an inner length");
-        // The inner length and Data Length are read in place from the prefix at offset `header`: no copy
+        // A bundle opener carries its unit fields before the frame (13.4); both are bounded here, before admission.
+        int frame = header;
+        long unitRecords = 0;
+        long unitWireBytes = 0;
+        if (kind == KIND_BUNDLE_OPEN) {
+            long[] unit = readBundleFields(prefix, header, prefixLength);
+            if (unit[0] < 2 || unit[0] > ReceiveSlots.RECORDS_PER_STREAM) {
+                throw compactError("unit_records " + unit[0] + " outside 2..128");
+            }
+            if (unit[1] > ReceiveSlots.BYTES_PER_STREAM) {
+                throw compactError("unit_wire_bytes " + unit[1] + " over B");
+            }
+            unitRecords = unit[0];
+            unitWireBytes = unit[1];
+            frame = header + (int) unit[2];
+        }
+        if (frame >= prefixLength) throw compactError("GAME record without an inner length");
+        // The inner length and Data Length are read in place from the prefix at offset `frame`: no copy
         // of the body is made, so the staged prefix is the only bytes this method touches (13.12).
-        int bodyLength = prefixLength - header;
-        int innerLength = readInnerLength(prefix, header, bodyLength);
-        int innerBytes = innerVarIntBytes(prefix, header, bodyLength);
-        if (header + innerBytes + (long) innerLength != recordLength) {
+        int bodyLength = prefixLength - frame;
+        int innerLength = readInnerLength(prefix, frame, bodyLength);
+        int innerBytes = innerVarIntBytes(prefix, frame, bodyLength);
+        if (frame + innerBytes + (long) innerLength != recordLength) {
             throw compactError("inner frame length " + innerLength + " does not match record_length");
         }
         if (!compressed) {
-            return new Declarations(kind, header, innerBytes, 0, -1, innerLength, innerLength);
+            return new Declarations(kind, header, innerBytes, 0, -1, innerLength, innerLength,
+                    unitRecords, unitWireBytes);
         }
         VarInt.Reader data = new VarInt.Reader(CLOSE_CODE, "13.4", false);
         int p = innerBytes;
@@ -314,16 +369,26 @@ public final class RecordCodec {
             if (p >= bodyLength || p - innerBytes >= MAX_INNER_VARINT_BYTES + 2) {
                 throw compactError("truncated Data Length");
             }
-            data.feed(prefix[header + p++] & 0xff);
+            data.feed(prefix[frame + p++] & 0xff);
         }
         long dataLength = data.value();
         int dataBytes = p - innerBytes;
         if (innerLength < dataBytes) throw compactError("Data Length longer than the frame");
         long payload = innerLength - dataBytes;
         if (dataLength == 0) {
-            return new Declarations(kind, header, innerBytes, dataBytes, 0, payload, payload);
+            return new Declarations(kind, header, innerBytes, dataBytes, 0, payload, payload,
+                    unitRecords, unitWireBytes);
         }
-        return new Declarations(kind, header, innerBytes, dataBytes, dataLength, dataLength, payload);
+        return new Declarations(kind, header, innerBytes, dataBytes, dataLength, dataLength, payload,
+                unitRecords, unitWireBytes);
+    }
+
+    /** Reads a bundle opener's unit_records and unit_wire_bytes (13.4): {records, bytes, bytes consumed}. */
+    static long[] readBundleFields(byte[] b, int off, int end) throws MultistreamProtocolException {
+        int[] at = {off};
+        long records = readCompact(b, end, at);
+        long bytes = readCompact(b, end, at);
+        return new long[] {records, bytes, at[0] - off};
     }
 
     /** Parses one complete record body (everything after the length prefix), 13.4. */
@@ -332,7 +397,7 @@ public final class RecordCodec {
         int end = frame.length;
         int[] at = {1};
         int kind = frame[0] & 255;
-        if (kind > 3) throw compactError("invalid kind " + kind);
+        if (kind > KIND_BUNDLE_OPEN) throw compactError("invalid kind " + kind);
         long seq = readCompact(frame, end, at);
         long epoch = readCompact(frame, end, at);
         long countLong = readCompact(frame, end, at);
@@ -383,6 +448,15 @@ public final class RecordCodec {
             // 13.19: joins live on CHUNK[0] only.
             if (streamIndex != 2) throw compactError("join outside CHUNK[0]");
             validateBody(KIND_GAME, payload, off, len, true);
+        } else if (kind == KIND_BUNDLE_OPEN) {
+            // 13.4, 13.15: clientbound CONTROL only; the direction is enforced by the receivers.
+            if (streamIndex != LogicalStream.CONTROL) throw compactError("bundle open outside CONTROL");
+            long[] unit = readBundleFields(payload, off, off + len);
+            if (unit[0] < 2 || unit[0] > ReceiveSlots.RECORDS_PER_STREAM) {
+                throw compactError("unit_records " + unit[0] + " outside 2..128");
+            }
+            if (unit[1] > ReceiveSlots.BYTES_PER_STREAM) throw compactError("unit_wire_bytes " + unit[1] + " over B");
+            validateBody(KIND_GAME, payload, off + (int) unit[2], len - (int) unit[2], true);
         } else {
             throw compactError("invalid kind");
         }
