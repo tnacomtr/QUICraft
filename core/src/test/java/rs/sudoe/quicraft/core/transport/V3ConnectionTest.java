@@ -58,8 +58,20 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
  */
 class V3ConnectionTest {
     /** Everything defaults to CONTROL, which is all a one-record round trip needs (13.6). */
-    static final RoutingTable TABLE = RoutingTableLoader.parse(
-            "{\"schema\":1,\"protocol\":4242,\"default\":\"control\",\"routes\":[]}");
+    static final RoutingTable TABLE = RoutingTableLoader.parse(tableJson());
+
+    private static String tableJson() {
+        String limit = "{\"maxServerboundRecord\":32768,\"maxServerboundRealtimeRecord\":510,"
+                + "\"maxDecodedFootprint\":1048576,\"ordinaryReadAllowance\":5619,"
+                + "\"decodeFootprintBound\":\"primitive.raw_copies.v1\"}";
+        StringBuilder limits = new StringBuilder();
+        for (String state : new String[] {"handshaking", "status", "login", "configuration", "play"}) {
+            if (limits.length() != 0) limits.append(',');
+            limits.append('"').append(state).append("\":").append(limit);
+        }
+        return "{\"schema\":2,\"protocol\":4242,\"default\":\"global\",\"extractors\":{},"
+                + "\"serverboundLimits\":{" + limits + "},\"routes\":[]}";
+    }
 
     /** Two VarInt-framed packets, a handshake and a Login Start ({@link rs.sudoe.quicraft.core.transport.FlightRecorder}). */
     static final byte[] LOGIN_FLIGHT = {3, 0, 1, 2, 2, 0, 7};
@@ -90,6 +102,48 @@ class V3ConnectionTest {
     // --- The tests.
 
     @Test
+    void productionClientAcceptsAllNegotiatedChunkStreams() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            activate(pair.serverSide, pair.serverGame, 4242);
+            activate(pair.client, pair.clientGame, -1);
+            assertTrue(pair.client.session() instanceof rs.sudoe.quicraft.core.multistream.NStreamSession);
+            int n = pair.client.sessionContext().shardCount();
+            assertTrue(n > 1, "exercise the old id-1-only admission defect");
+            java.lang.reflect.Method channel = rs.sudoe.quicraft.core.multistream.NStreamSession.class
+                    .getDeclaredMethod("channelOf", int.class);
+            channel.setAccessible(true);
+            assertTrue(await(() -> {
+                CompletableFuture<Boolean> ready = new CompletableFuture<>();
+                pair.client.execute(() -> {
+                    try {
+                        for (int i = 0; i < n; i++) {
+                            io.netty.handler.codec.quic.QuicStreamChannel stream =
+                                    (io.netty.handler.codec.quic.QuicStreamChannel)
+                                            channel.invoke(pair.client.session(), i + 2);
+                            if (stream == null || stream.streamId() != 1 + 4L * i) {
+                                ready.complete(false);
+                                return;
+                            }
+                        }
+                        ready.complete(true);
+                    } catch (Exception e) {
+                        ready.completeExceptionally(e);
+                    }
+                });
+                try {
+                    return ready.get(1, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    throw new AssertionError(e);
+                }
+            }, 5_000), "every negotiated CHUNK was admitted through QuicClient");
+            pair.serverSide.session().send(ProtocolState.PLAY, 0, frame(0, "still-open"));
+            assertTrue(await(() -> pair.clientGame.count() == 1, 5_000));
+        }
+    }
+
+    @Test
     void aThreeDialAndListenerConnectExportEqualValuesAndRoundTripARecord() throws Exception {
         requireV3();
         try (Pair pair = new Pair(connection -> { })) {
@@ -113,7 +167,12 @@ class V3ConnectionTest {
     void activatedConnectionRejectsGameWritesButPreActivationWriteStillWorks() throws Exception {
         requireV3();
         try (Pair pair = new Pair(connection -> { })) {
+            Loopback.Collector login = new Loopback.Collector();
+            pair.serverSide.setListener(login);
+            pair.serverSide.setAutoRead(true);
             pair.client.write(ByteBuffer.wrap(LOGIN_FLIGHT));
+            assertArrayEquals(LOGIN_FLIGHT, login.await(LOGIN_FLIGHT.length, 5, TimeUnit.SECONDS),
+                    "activation must follow the login flight, not race it");
             activate(pair.serverSide, pair.serverGame, 4242);
             activate(pair.client, pair.clientGame, -1);
             IllegalStateException failure = assertThrows(IllegalStateException.class,
@@ -612,6 +671,15 @@ class V3ConnectionTest {
             reservation.reserve(0, frame.length);
             return new Decoded(new Packet(ProtocolState.PLAY, id, frame), ProtocolState.PLAY, id,
                     Envelope.Bundle.NONE, false);
+        }
+
+        @Override
+        public Decoded decodeInflated(Lane lane, long sequence, byte[] content, boolean insideBundle,
+                                      Reservation reservation) {
+            byte[] frame = new byte[content.length + 1];
+            frame[0] = (byte) content.length;
+            System.arraycopy(content, 0, frame, 1, content.length);
+            return decode(lane, sequence, frame, insideBundle, reservation);
         }
 
         @Override

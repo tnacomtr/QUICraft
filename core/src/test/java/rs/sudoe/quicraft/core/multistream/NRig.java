@@ -91,7 +91,7 @@ final class NRig implements AutoCloseable {
 
     /** A play frame with a label body. */
     static byte[] frame(int id, String label) {
-        return LaneRig.frame(id, label);
+        return SessionRigSupport.frame(id, label);
     }
 
     /** A chunk frame: big-endian x and z, then the label. */
@@ -99,7 +99,7 @@ final class NRig implements AutoCloseable {
         byte[] text = label.getBytes(StandardCharsets.UTF_8);
         ByteBuffer body = ByteBuffer.allocate(8 + text.length);
         body.putInt(x).putInt(z).put(text);
-        return LaneRig.frame(CHUNK_ID, body.array());
+        return SessionRigSupport.frame(CHUNK_ID, body.array());
     }
 
     /** The uncompressed packet id and position, as a game hands it to the session for extraction. */
@@ -150,7 +150,7 @@ final class NRig implements AutoCloseable {
     /** Records every delivery and acknowledges it. */
     static final class Game implements LaneGame {
         final List<Got> got = Collections.synchronizedList(new ArrayList<Got>());
-        final CompletableFuture<LaneRig.Closed> closed = new CompletableFuture<>();
+        final CompletableFuture<SessionRigSupport.Closed> closed = new CompletableFuture<>();
         volatile NStreamSession session;
         volatile long decodeReserveBytes;
         volatile boolean autoApply = true;
@@ -212,7 +212,7 @@ final class NRig implements AutoCloseable {
 
         @Override
         public void onClosed(int code, boolean byPeer, Throwable cause) {
-            closed.complete(new LaneRig.Closed(code, byPeer));
+            closed.complete(new SessionRigSupport.Closed(code, byPeer));
         }
 
         List<Pkt> packets() {
@@ -261,7 +261,7 @@ final class NRig implements AutoCloseable {
     final LaneLoopback net;
     final Game serverGame = new Game();
     final Game clientGame = new Game();
-    final LaneRig.EarlyControl earlyControl = new LaneRig.EarlyControl();
+    final SessionRigSupport.EarlyControl earlyControl = new SessionRigSupport.EarlyControl();
     NStreamSession server;
     NStreamSession client;
     QuicChannel serverConnection;
@@ -269,7 +269,7 @@ final class NRig implements AutoCloseable {
     QuicStreamChannel clientControl;
     final BlockingQueue<QuicStreamChannel> serverRawStreams = new LinkedBlockingQueue<>();
     final BlockingQueue<QuicStreamChannel> clientRawStreams = new LinkedBlockingQueue<>();
-    final List<LaneRig.Bytes> clientRawBytes = Collections.synchronizedList(new ArrayList<LaneRig.Bytes>());
+    final List<SessionRigSupport.Bytes> clientRawBytes = Collections.synchronizedList(new ArrayList<SessionRigSupport.Bytes>());
     private final CompletableFuture<QuicStreamChannel> serverControlSeen = new CompletableFuture<>();
     private final CompletableFuture<Boolean> preludeRead = new CompletableFuture<>();
     private final List<QuicStreamChannel> serverEarly = new ArrayList<>();
@@ -309,7 +309,7 @@ final class NRig implements AutoCloseable {
                     serverRef.acceptStream(stream);
                 }
             } else {
-                raw(stream, serverRawStreams, new ArrayList<LaneRig.Bytes>());
+                raw(stream, serverRawStreams, new ArrayList<SessionRigSupport.Bytes>());
             }
         };
         options.clientSink = stream -> {
@@ -361,8 +361,8 @@ final class NRig implements AutoCloseable {
     }
 
     private static void raw(QuicStreamChannel stream, BlockingQueue<QuicStreamChannel> streams,
-            List<LaneRig.Bytes> bytes) {
-        LaneRig.Bytes collector = new LaneRig.Bytes();
+            List<SessionRigSupport.Bytes> bytes) {
+        SessionRigSupport.Bytes collector = new SessionRigSupport.Bytes();
         stream.pipeline().addLast(collector);
         bytes.add(collector);
         stream.config().setAutoRead(true);
@@ -397,7 +397,7 @@ final class NRig implements AutoCloseable {
             if (session == null) {
                 continue;
             }
-            boolean ready = LaneRig.await(() -> {
+            boolean ready = SessionRigSupport.await(() -> {
                 try {
                     return onLoop(session, () -> {
                         for (int i = 0; i < streams; i++) {

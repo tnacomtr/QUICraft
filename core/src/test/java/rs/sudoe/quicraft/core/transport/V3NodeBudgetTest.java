@@ -29,12 +29,13 @@ import rs.sudoe.quicraft.core.tls.ServerIdentity;
  */
 class V3NodeBudgetTest {
     @Test
-    void activatedIdleConnectionsReserveThirtyKiBAndRefuseTheNext() throws Exception {
+    void activatedIdleConnectionsKeepTheProtectedShareAndRefuseTheNext() throws Exception {
         assumeTrue(QuicSupport.hasMaxFlowControlWindows() && QuicSupport.hasKeyingMaterialExport());
         rs.sudoe.quicraft.core.routing.RoutingTable table =
-                rs.sudoe.quicraft.core.routing.RoutingTableLoader.loadResource(775);
+                V3ConnectionTest.TABLE;
         int n = 3;
-        long idle = TransportConfig.V3_INITIAL_EXPOSURE_BYTES + 6 * 1024;
+        // N+2 protected reads stay inside the existing exposure share, not legacy lane buffers.
+        long idle = TransportConfig.V3_INITIAL_EXPOSURE_BYTES;
         ReceiveBudget budget = ReceiveBudget.bounded(n * idle);
         List<V3Connection> peers = Collections.synchronizedList(new ArrayList<V3Connection>());
         try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity,
@@ -45,7 +46,8 @@ class V3NodeBudgetTest {
                         table, null).get(10, TimeUnit.SECONDS);
                 final int count = i + 1;
                 assertTrue(await(() -> peers.size() == count, 5000));
-                V3ConnectionTest.activate(peers.get(i), new V3ConnectionTest.Game(), 775);
+                assertTrue(await(peers.get(i)::handshakeComplete, 5000));
+                V3ConnectionTest.activate(peers.get(i), new V3ConnectionTest.Game(), 4242);
                 V3ConnectionTest.activate(client, new V3ConnectionTest.Game(), -1);
                 long expected = count * idle;
                 assertTrue(await(() -> budget.reserved() == expected, 5000),

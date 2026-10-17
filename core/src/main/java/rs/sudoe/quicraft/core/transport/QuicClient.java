@@ -918,9 +918,13 @@ public final class QuicClient {
                                 return; // stream 0 is created with its own handler below
                             }
                             rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
-                            // A server-created stream: only stream 1 (WORLD) is allowed (13.3).
+                            // /3 server-created CHUNK streams are 1+4i for the negotiated N (13.3).
                             V3ConnectionImpl current = v3;
-                            if (current == null || stream.streamId() != 1) {
+                            long id = stream.streamId();
+                            if (current == null || !current.preambleRead()
+                                    || stream.type() != QuicStreamType.BIDIRECTIONAL
+                                    || id < 1 || (id - 1) % 4 != 0
+                                    || (id - 1) / 4 >= current.sessionContext().shardCount()) {
                                 Codecs.closeLater(stream.parent(), true,
                                         MultistreamProtocolException.CLOSE_ORDERING);
                                 return;

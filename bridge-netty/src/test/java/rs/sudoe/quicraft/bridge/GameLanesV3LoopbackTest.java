@@ -57,8 +57,20 @@ import rs.sudoe.quicraft.core.transport.V3Listener;
  */
 class GameLanesV3LoopbackTest {
     /** Everything defaults to CONTROL, which is what a one-record check needs (13.6). */
-    static final RoutingTable TABLE = RoutingTableLoader.parse(
-            "{\"schema\":1,\"protocol\":4242,\"default\":\"control\",\"routes\":[]}");
+    static final RoutingTable TABLE = RoutingTableLoader.parse(tableJson());
+
+    private static String tableJson() {
+        String limit = "{\"maxServerboundRecord\":32768,\"maxServerboundRealtimeRecord\":510,"
+                + "\"maxDecodedFootprint\":1048576,\"ordinaryReadAllowance\":5619,"
+                + "\"decodeFootprintBound\":\"primitive.raw_copies.v1\"}";
+        StringBuilder limits = new StringBuilder();
+        for (String state : new String[] {"handshaking", "status", "login", "configuration", "play"}) {
+            if (limits.length() != 0) limits.append(',');
+            limits.append('"').append(state).append("\":").append(limit);
+        }
+        return "{\"schema\":2,\"protocol\":4242,\"default\":\"global\",\"extractors\":{},"
+                + "\"serverboundLimits\":{" + limits + "},\"routes\":[]}";
+    }
     static final int PROTOCOL = 4242;
     /** The application had nothing buffered past the switch packet. */
     static final ByteBuffer NO_LEFTOVER = null;
@@ -79,7 +91,9 @@ class GameLanesV3LoopbackTest {
             // What the application hands to activate: the start of the record stream, which here is
             // one complete CONTROL record (13.2, 13.4). It is the peer direction's first record.
             byte[] frame = frame(7, "spawn");
-            rig.activateServer(ByteBuffer.wrap(RecordCodec.encodeGame(1L, 0L, 0L, 0L, frame)));
+            rig.activateServer(ByteBuffer.wrap(RecordCodec.encodeRecord(
+                    new rs.sudoe.quicraft.core.multistream.Record(0, 1L, 0L,
+                            Collections.emptyList(), RecordCodec.KIND_GAME, frame))));
             rig.activateClient(NO_LEFTOVER);
 
             List<Object> first = rig.serverGame.await(2);
@@ -118,11 +132,11 @@ class GameLanesV3LoopbackTest {
     }
 
     /**
-     * U8f: the production sink's uncompressed-bytes send delegates to the legacy session. The bytes
-     * are for the extractor and the legacy session ignores them, so the peer gets the plain frame.
+     * The production sink passes uncompressed bytes to the N+2 session. A global route needs no
+     * extractor, so the peer still gets the encoded frame.
      */
     @Test
-    void theUncompressedSendOverloadDelegatesToTheLegacySession() throws Exception {
+    void theUncompressedSendOverloadDelegatesToTheNStreamSession() throws Exception {
         try (Rig rig = new Rig()) {
             rig.activateServer(NO_LEFTOVER);
             rig.activateClient(NO_LEFTOVER);
@@ -136,7 +150,7 @@ class GameLanesV3LoopbackTest {
             List<Object> received = rig.serverGame.await(2);
             assertEquals(2, received.size(), "the peer received the packet and its ack: " + received);
             assertArrayEquals(frame, ((Packet) received.get(0)).frame,
-                    "the legacy session sent the frame; the uncompressed bytes were not used");
+                    "the global route sent the frame without extracting a position");
             assertEquals(Lane.CONTROL, ((GameLanes.Ack) received.get(1)).lane());
         }
     }
@@ -174,11 +188,11 @@ class GameLanesV3LoopbackTest {
 
             Throwable rejected = awaitRejected(rig.serverCodec);
             assertNotNull(rejected, "13.12: the reservation itself refuses an over-budget packet");
-            assertTrue(rejected.getMessage().contains("budget"), rejected.getMessage());
+            assertTrue(rejected.getMessage().contains("workspace"), rejected.getMessage());
             assertFalse(rig.serverCodec.allocated.get(),
                     "13.12: the refusal happens before the codec allocates decompression output");
-            assertEquals(LaneSession.CLOSE_ORDERING, rig.serverGame.awaitClose(10),
-                    "and a packet that cannot fit the budget closes the connection with 0x11");
+            assertEquals(0x12, rig.serverGame.awaitClose(10),
+                    "an execution workspace refusal closes the N+2 session with 0x12");
             assertTrue(rig.serverGame.seen.isEmpty());
         }
     }
@@ -280,10 +294,8 @@ class GameLanesV3LoopbackTest {
                 LaneGame.Reservation reservation) {
             if (chargeBeyondBudget) {
                 try {
-                    // 13.12: charge before allocating. 17 MiB of retained bytes is more than the
-                    // remaining budget (16 MiB shared plus 1 MiB CONTROL reserve), while the packet's
-                    // own uncompressed size stays inside its 8 MiB cap, so it is the reservation that
-                    // refuses it.
+                    // 13.12: charge before allocating. This exceeds the schema-2 table's
+                    // execution workspace, so the reservation refuses before output allocation.
                     reservation.reserve(17L * 1024 * 1024, 8 * 1024 * 1024);
                 } catch (RuntimeException refused) {
                     rejected.set(refused);
@@ -297,6 +309,24 @@ class GameLanesV3LoopbackTest {
             frame.getBytes(frame.readerIndex(), body);
             return new LaneGame.Decoded(new Packet(body), ProtocolState.PLAY, 0, Envelope.Bundle.NONE,
                     false);
+        }
+
+        @Override
+        public LaneGame.Decoded decodeInflated(ByteBuf content, ProtocolState state,
+                LaneGame.Reservation reservation) {
+            ByteBuf frame = io.netty.buffer.Unpooled.buffer(content.readableBytes() + 5);
+            try {
+                int size = content.readableBytes();
+                while ((size & ~0x7f) != 0) {
+                    frame.writeByte((size & 0x7f) | 0x80);
+                    size >>>= 7;
+                }
+                frame.writeByte(size);
+                frame.writeBytes(content, content.readerIndex(), content.readableBytes());
+                return decode(frame, state, reservation);
+            } finally {
+                frame.release();
+            }
         }
 
         @Override

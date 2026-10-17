@@ -250,6 +250,12 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
             Codecs.closeLater(connection, true, MultistreamProtocolException.CLOSE_ORDERING);
             return;
         }
+        for (QuicStreamChannel previous : early) {
+            if (previous.streamId() == stream.streamId()) {
+                Codecs.closeLater(connection, true, MultistreamProtocolException.CLOSE_ORDERING);
+                return;
+            }
+        }
         early.add(stream);
     }
 

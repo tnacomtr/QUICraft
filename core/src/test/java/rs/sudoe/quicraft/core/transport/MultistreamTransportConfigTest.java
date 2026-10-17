@@ -86,6 +86,22 @@ class MultistreamTransportConfigTest {
     }
 
     @Test
+    void v2TransportParametersRemainUnchanged() throws Exception {
+        for (boolean server : new boolean[] {false, true}) {
+            Object builder = Codecs.apply(new io.netty.handler.codec.quic.QuicServerCodecBuilder(),
+                    TransportConfig.DEFAULT, server);
+            assertEquals(16L << 20, field(builder, "initialMaxData"));
+            assertEquals(8L << 20, field(builder, "initialMaxStreamDataBidiLocal"));
+            assertEquals(8L << 20, field(builder, "initialMaxStreamDataBidiRemote"));
+            assertEquals(0L, field(builder, "initialMaxStreamDataUni"));
+            assertEquals(server ? 1L : 0L, field(builder, "initialMaxStreamsBidi"));
+            assertEquals(0L, field(builder, "initialMaxStreamsUni"));
+            assertEquals(null, field(builder, "maxConnectionWindow"));
+            assertEquals(null, field(builder, "maxStreamWindow"));
+        }
+    }
+
+    @Test
     void theWindowMaximaReachTheCodecBuildersOrMultistreamIsRefused() throws Exception {
         boolean expected = Boolean.parseBoolean(System.getProperty("quicraft.test.expectKeyingMaterialExport"));
         assertEquals(expected, QuicSupport.hasMaxFlowControlWindows());

@@ -77,6 +77,15 @@ public final class GameLanes implements LaneGame {
         LaneGame.Decoded decode(ByteBuf frame, ProtocolState state, LaneGame.Reservation reservation)
                 throws Exception;
 
+        /** Decodes already-inflated packet content (id and payload, no frame or compression header).
+         * The platform must charge the reservation before allocating output. Fails closed until
+         * the platform implements this distinct serverbound contract.
+         */
+        default LaneGame.Decoded decodeInflated(ByteBuf content, ProtocolState state,
+                LaneGame.Reservation reservation) throws Exception {
+            throw new UnsupportedOperationException("inflated packet decoding is not implemented");
+        }
+
         /**
          * Appends one outbound packet's Minecraft frame (VarInt length, packet id, negotiated
          * compression wrapper) to {@code out}, exactly as the game's own encoder would.
@@ -380,6 +389,21 @@ public final class GameLanes implements LaneGame {
             // 13.12: the platform charges decoded output before it allocates it, so an over-budget
             // packet is refused before any decompression or object is created.
             Decoded decoded = codec.decode(body, state, reservation);
+            if (decoded == null) {
+                throw new IllegalStateException("the codec decoded nothing for " + lane + " " + sequence);
+            }
+            return decoded;
+        } finally {
+            body.release();
+        }
+    }
+
+    @Override
+    public Decoded decodeInflated(Lane lane, long sequence, byte[] content, boolean insideBundle,
+            Reservation reservation) throws Exception {
+        ByteBuf body = Unpooled.wrappedBuffer(content);
+        try {
+            Decoded decoded = codec.decodeInflated(body, state, reservation);
             if (decoded == null) {
                 throw new IllegalStateException("the codec decoded nothing for " + lane + " " + sequence);
             }

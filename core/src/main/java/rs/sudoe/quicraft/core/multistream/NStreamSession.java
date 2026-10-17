@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core.multistream;
 
 import io.netty.buffer.Unpooled;
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -266,6 +267,8 @@ public final class NStreamSession implements MultistreamSession {
     private final GameProxy proxy = new GameProxy();
     /** Test hook: a bit per logical stream whose writes are held back. */
     private volatile int heldWrites;
+    /** Test seam to hold guard reads before they reach the transport. */
+    java.util.function.Consumer<QuicStreamChannel> reverseGuardSetupForTests;
 
     private SessionReadPump serverPump;
     private ServerReceiveDriver serverDriver;
@@ -757,12 +760,28 @@ public final class NStreamSession implements MultistreamSession {
     }
 
     /**
-     * Hook for the reverse CHUNK direction of a server-opened CHUNK stream (U8f-2). The client must send nothing
-     * there; the server never reads it, so its bytes are never acknowledged and the peer's flow-control credit
-     * on it stays at the transport's initial window. The 1-byte reverse-window guard belongs here.
+     * One guard copy per CHUNK is charged by ServerReadPartition's fixed 2N+1 admission reservation.
+     * Never rearm: reading the first byte must close quiche in this call stack, before Netty can send
+     * replenished credit or execute another queued send. There is no reverse preamble (13.13).
      */
     private void reverseChunkOpened(int index, QuicStreamChannel stream) {
-        // Intentionally empty until U8f-2.
+        if (reverseGuardSetupForTests != null) {
+            reverseGuardSetupForTests.accept(stream);
+        }
+        stream.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+            @Override
+            public void channelRead(ChannelHandlerContext ctx, Object message) {
+                try {
+                    if (((ByteBuf) message).isReadable() && !closed) {
+                        fail(CLOSE_ORDERING, NO_REASON, "byte on reverse CHUNK " + index, null, true);
+                    }
+                } finally {
+                    io.netty.util.ReferenceCountUtil.release(message);
+                }
+            }
+        });
+        ReadGrantAllocator.limit(stream, 1);
+        stream.read();
     }
 
     private void writePreamble(QuicStreamChannel stream, int index) {
@@ -1058,6 +1077,10 @@ public final class NStreamSession implements MultistreamSession {
 
     /** Closes the whole connection with {@code code} and {@code reason}; idempotent. Event loop only. */
     private void fail(int code, byte[] reason, String why, Throwable cause) {
+        fail(code, reason, why, cause, false);
+    }
+
+    private void fail(int code, byte[] reason, String why, Throwable cause, boolean immediate) {
         if (closed) {
             return;
         }
@@ -1066,7 +1089,11 @@ public final class NStreamSession implements MultistreamSession {
         // A 0x12 without a classified phrase carries the generic "resource" (13.12).
         final byte[] phrase = reason != null && reason.length > 0 ? reason
                 : code == CLOSE_RESOURCE ? SessionReceiveDriver.GENERIC_RESOURCE_REASON.clone() : NO_REASON;
-        loop.execute(() -> connection.close(true, code, Unpooled.wrappedBuffer(phrase)));
+        if (immediate) {
+            connection.close(true, code, Unpooled.wrappedBuffer(phrase));
+        } else {
+            loop.execute(() -> connection.close(true, code, Unpooled.wrappedBuffer(phrase)));
+        }
         release();
         notifyClosed(code, false, cause != null ? cause : new IOException(why));
     }

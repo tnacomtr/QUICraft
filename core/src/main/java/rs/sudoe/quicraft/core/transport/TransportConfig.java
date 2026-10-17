@@ -56,7 +56,7 @@ public final class TransportConfig {
      * True while the legacy 3-lane LaneSession is the {@code /3} implementation, so Codecs applies
      * {@link #LEGACY_LANE_REVERSE_STREAM_DATA}. The U8 integration unit sets this to false.
      */
-    static final boolean LEGACY_LANE_SESSION = true;
+    static final boolean LEGACY_LANE_SESSION = false;
     /**
      * /3: the server advertises this much connection credit, i.e. what the client may send (serverbound).
      * It is fixed before N is known and is the staged pre-login exposure (12.13): the server pins both its
