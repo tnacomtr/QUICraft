@@ -32,6 +32,14 @@ public final class QuicStreamWriteSink {
     private final SessionSendDriver driver;
     private final QuicStreamChannel[] channels;
     private final IntPredicate writable = this::isWritable;
+    private final IntPredicate gate;
+    private final Settled settled;
+
+    /** Told after each slice's write future completed and the driver was told; on the event loop. */
+    interface Settled {
+        /** {@code success} is false when the write failed, for example after a peer STOP_SENDING. */
+        void settled(boolean success);
+    }
 
     /**
      * Creates a sink for {@code streams} logical streams (N+2), none attached yet.
@@ -40,6 +48,22 @@ public final class QuicStreamWriteSink {
      * @param streams the number of logical streams; indexes run from 0 to {@code streams - 1}
      */
     public QuicStreamWriteSink(SessionSendDriver driver, int streams) {
+        this(driver, streams, stream -> true, success -> { });
+    }
+
+    /**
+     * A sink whose owner gates streams and hears every completed write. A release can grant later records,
+     * so the owner drains again from {@code settled}; the gate lets it hold a stream's writes back.
+     *
+     * @param gate a stream is written only while this also answers true
+     * @param settled told after each write future completed and the driver was told
+     */
+    QuicStreamWriteSink(SessionSendDriver driver, int streams, IntPredicate gate, Settled settled) {
+        if (gate == null || settled == null) {
+            throw new NullPointerException("gate/settled");
+        }
+        this.gate = gate;
+        this.settled = settled;
         if (driver == null) {
             throw new NullPointerException("driver");
         }
@@ -95,11 +119,13 @@ public final class QuicStreamWriteSink {
         }
         ByteBuf buf = Unpooled.wrappedBuffer(write.bytes());
         channel.writeAndFlush(buf).addListener((ChannelFutureListener) future -> {
-            if (future.isSuccess()) {
+            boolean success = future.isSuccess();
+            if (success) {
                 driver.released(token);
             } else {
                 driver.failed(token);
             }
+            settled.settled(success);
         });
     }
 
@@ -108,7 +134,7 @@ public final class QuicStreamWriteSink {
             return false;
         }
         QuicStreamChannel channel = channels[stream];
-        return channel != null && channel.isActive() && channel.isWritable();
+        return channel != null && channel.isActive() && channel.isWritable() && gate.test(stream);
     }
 
     private void checkIndex(int stream) {

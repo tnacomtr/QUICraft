@@ -331,6 +331,15 @@ public final class SessionSendDriver {
         return queuedRecords;
     }
 
+    /**
+     * True while a pool request of this owner waits for bytes. The pool grants it when another owner
+     * releases, but the driver only learns of the grant on its next {@link #poll}, so the session that owns
+     * the driver polls again after other owners release (13.12).
+     */
+    synchronized boolean awaitingGrant() {
+        return !closed && pendingGrants > 0;
+    }
+
     /** Assigns an ordinary GAME record and returns its handle. Chunk shards are hashed with the current epoch. */
     public synchronized SentPacket submit(OutboundPacket packet, StreamSequencer.Fence fence, int chunkX, int chunkZ,
             Record.Dependency... semantic) {
