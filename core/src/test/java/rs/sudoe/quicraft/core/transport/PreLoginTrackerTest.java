@@ -199,6 +199,12 @@ class PreLoginTrackerTest {
         FakePools pools = new FakePools();
         PreLoginTracker staged = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
         staged.onShed();
+        // 12.13: a shed victim keeps its charge until its close is confirmed; the release is at close.
+        assertEquals(PreLoginTracker.State.STAGED, staged.state());
+        assertTrue(staged.isShedding());
+        assertEquals(PreLoginTracker.stagedShare(6),
+                pools.held(ResourcePools.Pool.PRE_LOGIN));
+        staged.close();
         assertEquals(PreLoginTracker.State.CLOSED, staged.state());
         assertEquals(0, pools.held(ResourcePools.Pool.PRE_LOGIN));
 

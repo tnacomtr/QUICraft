@@ -45,6 +45,11 @@ final class PreLoginRegistry {
     private final Random random;
     private final Set<Entry> staged = new HashSet<>();
     /**
+     * Shed victims whose close is not yet confirmed (12.13). They keep their pool bytes and their prefix holdings,
+     * are never picked again, and release their bytes only when {@link Entry#close} confirms the close.
+     */
+    private final Set<Entry> shedding = new HashSet<>();
+    /**
      * Declared-length charges that could not be granted at once (12.13 wait set). Drained in priority order
      * (coarse holding, fine holding, arrival, id) whenever bytes are released; a granted waiter keeps its
      * bytes until its connection claims the frame, closes, or expires.
@@ -93,23 +98,39 @@ final class PreLoginRegistry {
      */
     synchronized Entry admit(InetAddress source, Object owner, int shards, boolean online, LongSupplier clock,
             Runnable closeConnection) {
+        return attempt(source, owner, shards, online, clock, closeConnection).entry;
+    }
+
+    /**
+     * One admission attempt (12.13). Returns the admitted entry, or refusal, or pending: victims were picked
+     * (or are still closing) and their bytes are not confirmed released yet. A pending newcomer is not granted
+     * and no second victim is picked while a shed is unconfirmed; the caller retries after the confirmation.
+     */
+    synchronized Admission attempt(InetAddress source, Object owner, int shards, boolean online, LongSupplier clock,
+            Runnable closeConnection) {
         InetAddress coarse = coarsePrefix(source);
         long share = PreLoginTracker.stagedShare(shards);
         boolean shedAny = false;
+        boolean pendingNow = false;
         try {
             while (true) {
                 PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, owner, shards, online, clock);
                 if (tracker != null) {
                     Entry entry = new Entry(tracker, source, coarse, closeConnection);
                     staged.add(entry);
-                    return entry;
+                    return Admission.admitted(entry);
                 }
                 if (overFairShare(coarse, share)) {
-                    return null;
+                    return Admission.REFUSED;
+                }
+                if (!shedding.isEmpty()) {
+                    // The freed bytes are owed to this newcomer: the wait set is not served until it settles.
+                    pendingNow = true;
+                    return Admission.PENDING;
                 }
                 Entry victim = pickVictim();
                 if (victim == null) {
-                    return null;
+                    return Admission.REFUSED;
                 }
                 LOG.log(Level.FINE, "shedding a staged /3 connection under pre-login pool pressure");
                 // Room freed for this newcomer is not offered to waiting declared charges until it is admitted
@@ -118,7 +139,7 @@ final class PreLoginRegistry {
                 shedAny = true;
             }
         } finally {
-            if (shedAny || drainOwed) {
+            if (!pendingNow && (shedAny || drainOwed)) {
                 drainDeclaredWaiters();
             }
         }
@@ -181,6 +202,7 @@ final class PreLoginRegistry {
      */
     private synchronized void forget(Entry entry) {
         staged.remove(entry);
+        shedding.remove(entry);
         dropDeclared(entry);
     }
 
@@ -191,6 +213,7 @@ final class PreLoginRegistry {
     private void shed(Entry victim, boolean drain) {
         staged.remove(victim);
         dropDeclared(victim);
+        shedding.add(victim);
         victim.tracker.onShed();
         if (drain) {
             drainDeclaredWaiters();
@@ -217,6 +240,9 @@ final class PreLoginRegistry {
     private Map<InetAddress, Long> bytesByFine() {
         Map<InetAddress, Long> bytes = new HashMap<>();
         for (Entry e : staged) {
+            bytes.merge(e.fine, e.charged(), Long::sum);
+        }
+        for (Entry e : shedding) {
             bytes.merge(e.fine, e.charged(), Long::sum);
         }
         return bytes;
@@ -404,6 +430,9 @@ final class PreLoginRegistry {
         for (Entry e : staged) {
             bytes.merge(e.coarse, e.charged(), Long::sum);
         }
+        for (Entry e : shedding) {
+            bytes.merge(e.coarse, e.charged(), Long::sum);
+        }
         return bytes;
     }
 
@@ -447,6 +476,25 @@ final class PreLoginRegistry {
             }
         }
         return raw[10] == (byte) 0xFF && raw[11] == (byte) 0xFF;
+    }
+
+    /** The outcome of {@link #attempt}: an entry when admitted, otherwise refused or pending. */
+    static final class Admission {
+        static final Admission REFUSED = new Admission(null, false);
+        static final Admission PENDING = new Admission(null, true);
+
+        final Entry entry;
+        /** True when the newcomer is waiting for shed victims to confirm their close (not a final refusal). */
+        final boolean pending;
+
+        private Admission(Entry entry, boolean pending) {
+            this.entry = entry;
+            this.pending = pending;
+        }
+
+        static Admission admitted(Entry entry) {
+            return new Admission(entry, false);
+        }
     }
 
     /**
@@ -558,8 +606,14 @@ final class PreLoginRegistry {
             synchronized (PreLoginRegistry.this) {
                 // Validation, oversize and a non-staged connection take the tracker's own answer.
                 if (declaredBytes < 0 || framingBytes < 0 || declaredBytes > PreLoginTracker.MAX_DECLARED_FRAME_BYTES
-                        || tracker.state() != PreLoginTracker.State.STAGED) {
+                        || tracker.state() != PreLoginTracker.State.STAGED || tracker.isShedding()) {
                     return tracker.chargeDeclaredFrame(declaredBytes, framingBytes);
+                }
+                if (tracker.expired()) {
+                    // 12.13: the deadlines still run; an expired connection is refused and never granted, even for a
+                    // frame inside its staged share.
+                    abandonDeclared(this);
+                    return PreLoginTracker.ChargeResult.WAIT;
                 }
                 long total = Math.addExact(declaredBytes, framingBytes);
                 if (total <= tracker.stagedShare()) {
@@ -568,11 +622,6 @@ final class PreLoginRegistry {
                 if (pendingTotal >= 0 && (pendingDeclared != declaredBytes || pendingFraming != framingBytes)) {
                     // The caller moved on to another frame: the earlier request is abandoned.
                     abandonDeclared(this);
-                }
-                if (tracker.expired()) {
-                    // 12.13: the deadlines still run; an expired connection is refused and never granted.
-                    abandonDeclared(this);
-                    return PreLoginTracker.ChargeResult.WAIT;
                 }
                 if (pendingTotal >= 0 && pendingGranted) {
                     // The grant made while this frame waited is claimed; its bytes are already charged.
@@ -622,7 +671,8 @@ final class PreLoginRegistry {
         @Override
         public boolean tryBeginSessionCall() {
             synchronized (PreLoginRegistry.this) {
-                if (tracker.state() != PreLoginTracker.State.STAGED || !PreLoginRegistry.this.tryBeginSessionCall(source)) {
+                if (tracker.state() != PreLoginTracker.State.STAGED || tracker.isShedding()
+                        || !PreLoginRegistry.this.tryBeginSessionCall(source)) {
                     return false;
                 }
                 sessionCalls++;
@@ -655,9 +705,15 @@ final class PreLoginRegistry {
                 while (sessionCalls > 0) {
                     endSessionCall();
                 }
+                // A confirmed shed close frees bytes owed to its newcomer, so the wait set waits for that admission.
+                boolean confirmedShed = shedding.contains(this);
                 forget(this);
                 tracker.close();
-                drainDeclaredWaiters();
+                if (confirmedShed) {
+                    drainOwed = true;
+                } else {
+                    drainDeclaredWaiters();
+                }
             }
         }
 

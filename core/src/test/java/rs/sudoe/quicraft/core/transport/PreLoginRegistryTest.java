@@ -47,6 +47,18 @@ class PreLoginRegistryTest {
             conn.closed = true;
             shedLog.add(conn);
         });
+        // The shed victims' bytes are confirmed released only when their close completes (12.13), so the newcomer
+        // is refused until then. Confirm each victim's close in order and retry, as the listener does.
+        for (int next = 0; conn.entry == null && next < shedLog.size(); next++) {
+            Conn victim = shedLog.get(next);
+            if (victim.entry != null) {
+                victim.entry.close();
+            }
+            conn.entry = registry.admit(ip(address), conn, 6, online, System::nanoTime, () -> {
+                conn.closed = true;
+                shedLog.add(conn);
+            });
+        }
         return conn;
     }
 
