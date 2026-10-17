@@ -34,6 +34,11 @@ public final class ReadGrantAllocator extends DefaultMaxMessagesRecvByteBufAlloc
         ((ReadGrantAllocator) stream.config().getRecvByteBufAllocator()).setLimit(bytes);
     }
 
+    /** The grant the next read on {@code stream} may allocate; for tests. */
+    static int limitOf(QuicStreamChannel stream) {
+        return ((ReadGrantAllocator) stream.config().getRecvByteBufAllocator()).limit;
+    }
+
     /**
      * Sets the grant the next read may allocate. A handle cached by QUIC reads this field on every
      * call, so the change applies without replacing the handle. Callers keep the value at most the

@@ -147,6 +147,44 @@ final class QuicStreamByteSourceTest {
         }
     }
 
+    /**
+     * The read that finishes a record body asks for exactly the bytes still wanted. Once they are copied out, the
+     * grant is used up: no channel read (and so no new peer credit) may fetch the next record before its admission.
+     * A grant only partly filled from the buffer asks the channel for the rest, not for the whole grant again.
+     */
+    @Test
+    void finishingABodyDoesNotPrefetchTheNextRecord() throws Exception {
+        try (Fixture fx = new Fixture(TransportConfig.multistream())) {
+            QuicStreamChannel[] client = new QuicStreamChannel[1];
+            QuicStreamChannel server = fill(fx, client, 64 * 1024, 64);
+            EventLoop loop = server.eventLoop();
+
+            int buffered = onLoop(loop, () -> fx.source.buffered(0));
+            int before = onLoop(loop, () -> fx.source.readCalls(0));
+            int got = onLoop(loop, () -> fx.source.read(0, new byte[buffered], 0, buffered));
+            assertEquals(buffered, got, "the whole body was buffered");
+            assertEquals(0, (int) onLoop(loop, () -> fx.source.buffered(0)));
+            assertEquals(before, (int) onLoop(loop, () -> fx.source.readCalls(0)),
+                    "a read call after the grant was filled prefetches the next record");
+
+            // A grant of 7 more than is buffered: the buffered bytes are copied and the channel is asked for 7.
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WAIT_MILLIS);
+            onLoop(loop, () -> fx.source.read(0, new byte[64], 0, 64));
+            int partial;
+            while ((partial = onLoop(loop, () -> fx.source.buffered(0))) == 0) {
+                assertTrue(System.nanoTime() < deadline, "no bytes arrived");
+                Thread.sleep(5);
+            }
+            int have = partial;
+            int calls = onLoop(loop, () -> fx.source.readCalls(0));
+            int copied = onLoop(loop, () -> fx.source.read(0, new byte[have + 7], 0, have + 7));
+            assertEquals(have, copied);
+            assertEquals(calls + 1, (int) onLoop(loop, () -> fx.source.readCalls(0)), "the unfilled rest is asked for");
+            assertEquals(7, (int) onLoop(loop, () -> ReadGrantAllocator.limitOf(server)),
+                    "the channel is asked only for the unfilled rest of the grant");
+        }
+    }
+
     @Test
     void buffersAreReleasedOnClose() throws Exception {
         try (Fixture fx = new Fixture(TransportConfig.multistream())) {

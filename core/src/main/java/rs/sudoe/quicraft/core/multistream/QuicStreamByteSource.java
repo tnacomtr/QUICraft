@@ -16,9 +16,10 @@ import java.util.ArrayDeque;
  *
  * <p>Each attached channel runs with autoRead off. Netty delivers bytes only when {@link QuicStreamChannel#read()}
  * is called, and QUIC returns flow-control credit only when quiche reads. So the source calls {@code read()} only
- * while the grant the pump asked for leaves room: the buffered bytes of a stream never exceed the largest grant
- * passed to {@link #read(int, byte[], int, int)}, and once they reach it no read is issued and the peer gets no
- * new credit. The per-read allocation size is set from that room through {@link ReadGrantAllocator}.
+ * while the grant the pump asked for leaves room: a read copies what is buffered, then asks the channel for at most
+ * the part of its grant still unfilled ({@code max} minus the bytes copied and still buffered), so the buffered
+ * bytes of a stream never exceed the remaining grant of the last {@link #read(int, byte[], int, int)}. Once the
+ * grant is filled no read is issued and the peer gets no new credit. The per-read allocation size is set from that room through {@link ReadGrantAllocator}.
  *
  * <p>Netty reports a FIN as {@link ChannelInputShutdownReadComplete}, after all the peer's data. The source then
  * returns the bytes still buffered and afterwards 0 forever, with no further read calls. A stream reset (any
@@ -139,7 +140,7 @@ public final class QuicStreamByteSource implements SessionReadPump.ByteSource {
 
     /**
      * Copies up to {@code max} buffered bytes of {@code stream} into {@code into} at {@code offset}, then issues at
-     * most one channel read if the stream's buffer has room under {@code max}.
+     * most one channel read, limited to what is left of {@code max} after the bytes copied and still buffered.
      *
      * @return the count copied, 0 when none are buffered (including after FIN) or after {@link #close}; never more
      *     than {@code max}
@@ -169,7 +170,9 @@ public final class QuicStreamByteSource implements SessionReadPump.ByteSource {
                 head.release();
             }
         }
-        int room = max - lane.buffered;
+        // The copied bytes used part of this grant: only what is left of it may be asked for, so finishing a
+        // record body never prefetches the next record before its admission (13.12).
+        int room = max - copied - lane.buffered;
         if (!lane.eof && room > 0 && lane.channel.isOpen()) {
             ReadGrantAllocator.limit(lane.channel, Math.min(room, ServerReadPartition.MAX_READ_GRANT));
             lane.readCalls++;
