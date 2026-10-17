@@ -52,7 +52,8 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * {@link #DEFAULT_REALTIME_SLICE_BYTES}) from the pool once, as its first ticket, and holds it until close. A REALTIME
  * record whose wire size is at most S is granted from that slice locally, in assignment order, with at most one
  * waiting record, and it never touches the pool ledger. A larger REALTIME record takes the main queue at its global
- * position, and is then written on the REALTIME stream in REALTIME order. Nothing is granted before the slice.
+ * position, and is then written on the REALTIME stream in REALTIME order. No record is offered before the slice
+ * is granted (ACK charges may be granted earlier, within their headroom).
  *
  * <p>Deadlock argument. Each queue grants in assignment order. Each queue's budget holds the largest record it
  * accepts: the slice holds at least S, and the main budget holds {@code maxRecordBytes + ackByteLimit}. Every
@@ -805,7 +806,7 @@ public final class SessionSendDriver {
                 releaseCharge(orphan);
             }
         }
-        // Nothing is granted before the REALTIME slice: it is the owner's first ticket (13.12).
+        // No record is offered before the REALTIME slice: it is the owner's first ticket (13.12).
         if (granted(slice)) {
             pumpMain();
             pumpRealtime();

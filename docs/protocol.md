@@ -1582,7 +1582,8 @@ position extraction. Those implementations must change together before this revi
       outbound queue at its position and is still written on REALTIME. The slice is protected: a
       connection holding nothing beyond its slice is never a shed victim, while bytes beyond it
       make the connection a normal candidate. The sender requires maximum record + ACK headroom +
-      slice <= the smallest applicable outbound cap. Use the same binding-cap eligibility/recompute rule as inbound. Shed only
+      slice <= the smallest applicable outbound cap.
+      Use the same binding-cap eligibility/recompute rule as inbound. Shed only
       outbound byte holders with `0x12`, never a requester holding no outbound bytes.
       Atomically retry waiting outbound grants FIFO from released capacity before new
       charges. Skip a still-ineligible wait without blocking grants under unrelated caps;

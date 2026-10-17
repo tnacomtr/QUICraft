@@ -70,7 +70,6 @@ public final class OutboundPool {
         return ledger.reserveTicket(owner, ip, account, bytes);
     }
 
-    /** True once for a ticket from {@link #reserveTicket} that has been charged; the grant is consumed. */
     /**
      * Requests the per-connection /3 REALTIME slice (13.12) as a protected ticket: once granted, a holder holding
      * nothing beyond it is never shed. It is released only by {@link #cancel}.
@@ -79,6 +78,7 @@ public final class OutboundPool {
         return ledger.reserveProtectedTicket(owner, ip, account, bytes);
     }
 
+    /** True once for a ticket from {@link #reserveTicket} that has been charged; the grant is consumed. */
     public synchronized boolean takeGrant(long ticket) { return ledger.takeGrant(ticket); }
 
     /**
