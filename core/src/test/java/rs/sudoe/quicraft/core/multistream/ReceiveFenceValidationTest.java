@@ -10,6 +10,127 @@ import rs.sudoe.quicraft.core.routing.Direction;
 import rs.sudoe.quicraft.core.routing.Extractor;
 
 class ReceiveFenceValidationTest {
+    private static ReceiveRoute control(Dependency fence) {
+        return new ReceiveRoute(ReceiveRoute.Lane.CONTROL, fence, null, false, false);
+    }
+
+    private static ReceiveRoute realtime() {
+        return new ReceiveRoute(ReceiveRoute.Lane.REALTIME, Dependency.LANE, null, false, false);
+    }
+
+    private static void applyControl(StreamReceiver receiver, long sequence, Dependency fence) {
+        assertAdmitted(receiver, rec(0, sequence, 0));
+        enqueue(receiver, 0, sequence, control(fence));
+        receiver.applied(0, sequence);
+    }
+
+    private static void applyRealtime(StreamReceiver receiver, long sequence, long reference) {
+        assertAdmitted(receiver, rec(1, sequence, 0, dep(0, reference)));
+        enqueue(receiver, 1, sequence, realtime());
+        receiver.applied(1, sequence);
+        assertNull(receiver.pendingViolation());
+    }
+
+    @Test
+    void displacedOrdinaryControlReferenceStillClosesOrdering() {
+        StreamReceiver receiver = new StreamReceiver(1, Direction.SERVERBOUND,
+                new NStreamSession.ShardValidator(1, Direction.SERVERBOUND, 16), () -> 0L);
+        applyControl(receiver, 1, Dependency.ORDINARY);
+        applyControl(receiver, 2, Dependency.CONTROL);
+        applyControl(receiver, 3, Dependency.ORDINARY);
+        assertAdmitted(receiver, rec(1, 1, 0, dep(0, 1)));
+        assertClose(receiver.validateEligible(1, realtime()));
+    }
+
+    @Test
+    void decreasingRealtimeReferenceClosesEvenAbovePinnedFloor() {
+        StreamReceiver receiver = new StreamReceiver(1, new NStreamSession.ShardValidator(1), () -> 0L);
+        applyControl(receiver, 1, Dependency.GLOBAL);
+        applyControl(receiver, 2, Dependency.CONTROL);
+        // A referencing chunk keeps sequence 1 retained, isolating the monotonic check.
+        assertAdmitted(receiver, rec(2, 1, 0, dep(0, 1)));
+        enqueue(receiver, 2, 1, new ReceiveRoute(ReceiveRoute.Lane.CHUNK, Dependency.LANE,
+                new Extractor.Position(0, 0), false, false));
+        receiver.applied(2, 1);
+        applyRealtime(receiver, 1, 2);
+        assertAdmitted(receiver, rec(1, 2, 0, dep(0, 1)));
+        assertClose(receiver.validateEligible(1, realtime()));
+    }
+
+    @Test
+    void ordinaryLongRunWithUnchangedFenceAndIdleChunkStaysOpen() {
+        for (Direction direction : Direction.values()) {
+            NStreamSession.ShardValidator validator = new NStreamSession.ShardValidator(1, direction, 8);
+            StreamReceiver receiver = new StreamReceiver(1, direction, validator, () -> 0L);
+            applyControl(receiver, 1, Dependency.GLOBAL);
+            for (int sequence = 2; sequence <= 100001; sequence++) {
+                applyControl(receiver, sequence, Dependency.ORDINARY);
+                applyRealtime(receiver, sequence - 1, 1);
+                assertNull(receiver.pendingViolation());
+                assertEquals(1, validator.retainedEntries());
+            }
+        }
+    }
+
+    @Test
+    void referenceBelowPrunedFloorClosesOrdering() {
+        NStreamSession.ShardValidator validator = new NStreamSession.ShardValidator(1, Direction.SERVERBOUND, 2);
+        StreamReceiver receiver = new StreamReceiver(1, Direction.SERVERBOUND, validator, () -> 0L);
+        for (int sequence = 1; sequence <= 5; sequence++) {
+            applyControl(receiver, sequence, Dependency.CONTROL);
+            applyRealtime(receiver, sequence, sequence);
+        }
+        assertEquals(1, validator.retainedEntries());
+        // Sequence 1 has been pruned; decreasing references remain invalid after ring reuse.
+        assertAdmitted(receiver, rec(1, 6, 0, dep(0, 1)));
+        assertClose(receiver.validateEligible(1, realtime()));
+    }
+
+    @Test
+    void overflowEvictsWithoutClosingAndOldReferenceClosesOrdering() {
+        NStreamSession.ShardValidator validator = new NStreamSession.ShardValidator(1, Direction.CLIENTBOUND, 3);
+        StreamReceiver receiver = new StreamReceiver(1, Direction.CLIENTBOUND, validator, () -> 0L);
+        for (int sequence = 1; sequence <= 100; sequence++) {
+            applyControl(receiver, sequence, Dependency.GLOBAL);
+            if (sequence == 1) applyRealtime(receiver, 1, 1);
+            assertNull(receiver.pendingViolation());
+            assertTrue(validator.retainedEntries() <= 3);
+        }
+        assertEquals(3, validator.retainedEntries());
+        // The previously referencing REALTIME is idle; CHUNK has never referenced at all.
+        assertAdmitted(receiver, rec(2, 1, 0, dep(0, 1)));
+        assertClose(receiver.validateEligible(2, new ReceiveRoute(ReceiveRoute.Lane.CHUNK, Dependency.LANE,
+                new Extractor.Position(0, 0), false, false)));
+    }
+
+    @Test
+    void neverReferencingChunkDoesNotPinPruning() {
+        NStreamSession.ShardValidator validator = new NStreamSession.ShardValidator(1, Direction.CLIENTBOUND, 3);
+        StreamReceiver receiver = new StreamReceiver(1, Direction.CLIENTBOUND, validator, () -> 0L);
+        for (int sequence = 1; sequence <= 100; sequence++) {
+            applyControl(receiver, sequence, Dependency.GLOBAL);
+            applyRealtime(receiver, sequence, sequence);
+            assertEquals(1, validator.retainedEntries());
+            assertNull(receiver.pendingViolation());
+        }
+    }
+
+    @Test
+    void interactionRealtimeReferencesCannotDecrease() {
+        StreamReceiver receiver = new StreamReceiver(1, Direction.SERVERBOUND,
+                new NStreamSession.ShardValidator(1, Direction.SERVERBOUND, 16), () -> 0L);
+        for (int sequence = 1; sequence <= 2; sequence++) {
+            assertAdmitted(receiver, rec(1, sequence, 0));
+            enqueue(receiver, 1, sequence, realtime());
+            receiver.applied(1, sequence);
+        }
+        assertAdmitted(receiver, rec(0, 1, 0, dep(1, 2)));
+        enqueue(receiver, 0, 1, control(Dependency.INTERACTION));
+        receiver.applied(0, 1);
+        assertAdmitted(receiver, rec(0, 2, 0, dep(1, 1)));
+        assertClose(receiver.validateEligible(0, control(Dependency.INTERACTION)));
+    }
+
     @Test
     void appliedControlClassMustMatchRealtimeAndChunkReferences() {
         for (Direction direction : Direction.values()) {
