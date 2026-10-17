@@ -316,6 +316,16 @@ public final class SessionSendDriver {
     /** Assigns an ordinary GAME record and returns its handle. Chunk shards are hashed with the current epoch. */
     public synchronized SentPacket submit(OutboundPacket packet, StreamSequencer.Fence fence, int chunkX, int chunkZ,
             Record.Dependency... semantic) {
+        return submit(packet, fence, false, chunkX, chunkZ, semantic);
+    }
+
+    /**
+     * As {@link #submit(OutboundPacket, StreamSequencer.Fence, int, int, Record.Dependency...)}, with the
+     * serverbound interaction flag (13.9). The flag is valid only for an ORDINARY_CONTROL route on CONTROL;
+     * the sequencer refuses it otherwise.
+     */
+    public synchronized SentPacket submit(OutboundPacket packet, StreamSequencer.Fence fence, boolean interaction,
+            int chunkX, int chunkZ, Record.Dependency... semantic) {
         SentPacket handle = new SentPacket();
         if (closed) {
             return handle;
@@ -326,7 +336,7 @@ public final class SessionSendDriver {
             return handle;
         }
         int stream = streamFor(fence, chunkX, chunkZ);
-        Record record = sequencer.assign(stream, fence, frame, false, semantic);
+        Record record = sequencer.assign(stream, fence, frame, interaction, semantic);
         if (!enqueueRecord(record, false)) {
             return handle;
         }

@@ -128,6 +128,17 @@ class SessionSendDriverTest {
     }
 
     @Test
+    void interactionFlagReachesTheSequencerAndIsRefusedClientbound() throws Exception {
+        Rig rig = new Rig(2, 100);
+        // The flag is serverbound-only (13.9): the sequencer's route validation refuses it here.
+        assertThrows(IllegalArgumentException.class, () -> rig.driver.submit(frame(3),
+                StreamSequencer.Fence.ORDINARY_CONTROL, true, 0, 0));
+        // The unflagged overload still assigns normally.
+        SentPacket ok = rig.driver.submit(frame(3), StreamSequencer.Fence.ORDINARY_CONTROL, false, 0, 0);
+        assertNotNull(ok);
+    }
+
+    @Test
     void shardsAndScopesFollowOriginalSubmissionOrder() throws Exception {
         Rig rig = new Rig(2, 1000);
         SessionSendDriver driver = rig.driver;
