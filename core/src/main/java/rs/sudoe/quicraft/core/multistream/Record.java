@@ -6,7 +6,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
-/** Decoded /3 record contract, separate from the legacy codec (docs/protocol.md 13.4). */
+/** Decoded /3 record contract (docs/protocol.md 13.4). */
 public final class Record {
     /** Sparse cross-stream prerequisite. */
     public static final class Dependency {
