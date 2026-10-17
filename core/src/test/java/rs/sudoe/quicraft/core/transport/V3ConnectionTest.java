@@ -44,6 +44,7 @@ import rs.sudoe.quicraft.core.multistream.Envelope;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
 import rs.sudoe.quicraft.core.multistream.PreambleV2;
+import rs.sudoe.quicraft.core.multistream.SessionContext;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
@@ -522,6 +523,29 @@ class V3ConnectionTest {
     // --- Helpers.
 
     /** A /3 listener with the test callback, on a fresh loopback port. */
+    @Test
+    void aThreeDialAndListenerAgreeOnTheSelectedShardCount() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            // 13.2: the client offers 1..6, the server clamps its preference (3) into that offer.
+            assertTrue(await(() -> negotiated(pair.serverSide) != null, 5_000), "the server's selection");
+            assertTrue(await(() -> negotiated(pair.client) != null, 5_000), "the client's selection");
+            assertEquals(TransportConfig.MULTISTREAM_PREFERRED_SHARDS, negotiated(pair.serverSide).shardCount());
+            assertEquals(negotiated(pair.serverSide), negotiated(pair.client),
+                    "both ends hold the same immutable N");
+        }
+    }
+
+    /** The negotiated context, or null before the preamble exchange has finished. */
+    private static SessionContext negotiated(V3Connection connection) {
+        try {
+            return connection.sessionContext();
+        } catch (IllegalStateException notYet) {
+            return null;
+        }
+    }
+
     private static QuicServer bindServer(Consumer<V3Connection> onAccepted) throws Exception {
         return QuicServer.bind(Loopback.anyLocal(), identity, TransportConfig.DEFAULT, stream -> {
             V3Connection connection = (V3Connection) stream;

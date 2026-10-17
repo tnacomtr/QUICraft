@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 import java.util.function.Consumer;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.SessionContext;
 
 /**
  * One {@code quicraft/3} connection (docs/protocol.md 12 and 13): stream 0 as the game sees it
@@ -91,6 +92,17 @@ public interface V3Connection extends QuicByteStream {
      * loop. The game sends, ends and aborts through it after activation.
      */
     LaneSession session();
+
+    /**
+     * The shard count N selected by the preamble exchange (13.2), fixed for the connection. Available
+     * once both preambles are read, from any thread. Fail-closed: before negotiation, or on an
+     * implementation that does not negotiate, this throws rather than guessing N.
+     *
+     * @throws IllegalStateException before the preambles have been negotiated
+     */
+    default SessionContext sessionContext() {
+        throw new IllegalStateException("the shard count is not negotiated yet (13.2)");
+    }
 
     /**
      * Normal shutdown (13.14): queues END as a full fence through the session, so any disconnect

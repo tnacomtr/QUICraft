@@ -11,12 +11,20 @@ import rs.sudoe.quicraft.core.routing.Lane;
  */
 public final class SentPacket {
     private volatile Lane lane;
+    private volatile int logicalStream = -1;
     private volatile long sequence;
 
     SentPacket() {}
 
+    /** Legacy three-lane assignment: the logical stream is the category's legacy index. */
     void assign(Lane lane, long sequence) {
+        assign(lane, SessionContext.legacyLogicalIndex(lane), sequence);
+    }
+
+    /** Assignment with the logical stream identity (13.3), written before the lane is published. */
+    void assign(Lane lane, int logicalStream, long sequence) {
         this.sequence = sequence;
+        this.logicalStream = logicalStream;
         this.lane = lane;
     }
 
@@ -25,9 +33,20 @@ public final class SentPacket {
         return lane != null;
     }
 
-    /** The assigned lane, or null while unassigned. */
+    /**
+     * The assigned lane, or null while unassigned. This is the category compatibility accessor;
+     * {@link #logicalStream()} carries the stream identity.
+     */
     public Lane lane() {
         return lane;
+    }
+
+    /**
+     * The assigned logical stream index (13.3: CONTROL 0, REALTIME 1, CHUNK[i] 2+i), or -1 while
+     * unassigned. Two chunk shards may share a sequence, so this, not the sequence, identifies a stream.
+     */
+    public int logicalStream() {
+        return logicalStream;
     }
 
     /** The assigned sequence (unsigned), meaningful only when {@link #isAssigned()}. */

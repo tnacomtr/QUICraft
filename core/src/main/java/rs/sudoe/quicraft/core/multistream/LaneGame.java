@@ -22,6 +22,30 @@ public interface LaneGame {
     default void onRecordAppliedSignal(int logicalStream, long sequence, boolean applied) { }
 
     /**
+     * The uncompressed bytes of one decoded GAME record, as the receiver obtained them before
+     * decoding (the input to position extraction, 13.8). {@code logicalStream} is the LogicalStream
+     * index (CONTROL, REALTIME, or the CHUNK shard), since two shards can share a lane and a sequence.
+     * Additive: the default ignores them. Contract only: {@link LaneSession} does not invoke this yet;
+     * the U8d receive driver wires the call.
+     */
+    default void onDecodedUncompressed(Lane lane, int logicalStream, long sequence, byte[] uncompressedFrame) { }
+
+    /**
+     * A delivery unit was successfully enqueued for the game's serial handler (Q, 13.10).
+     * {@code logicalStream} as for {@link #onDecodedUncompressed}. Additive:
+     * the default ignores it. Enqueue does not release dependencies; only {@link LaneSession#applied} does.
+     * Contract only: not invoked by {@link LaneSession} until U8d.
+     */
+    default void onEnqueued(Lane lane, int logicalStream, long sequence) { }
+
+    /**
+     * The game's serial handler finished applying a delivery unit (D, 13.10), once the
+     * acknowledgement is accepted. {@code logicalStream} as for {@link #onDecodedUncompressed}.
+     * Additive: the default ignores it. Contract only: not invoked by {@link LaneSession} until U8d.
+     */
+    default void onApplicationComplete(Lane lane, int logicalStream, long sequence) { }
+
+    /**
      * Decodes one dependency-eligible GAME body: exactly one Minecraft VarInt-length frame,
      * including the packet id and the negotiated compression wrapper, without CFB8 (13.4).
      *
@@ -92,6 +116,7 @@ public interface LaneGame {
         private final boolean stateChange;
         private final long retainedBytes;
         private final int uncompressedBytes;
+        private final byte[] uncompressed;
 
         /**
          * @param packet      the opaque decoded packet handed to {@link LaneGame#deliver}
@@ -109,6 +134,16 @@ public interface LaneGame {
         /** As above, also reporting what decoding retained, for games that did not reserve. */
         public Decoded(Object packet, ProtocolState state, int packetId, Envelope.Bundle bundle,
                        boolean stateChange, long retainedBytes, int uncompressedBytes) {
+            this(packet, state, packetId, bundle, stateChange, retainedBytes, uncompressedBytes, null);
+        }
+
+        /**
+         * As above, also carrying the uncompressed frame the game decoded from (13.8's input to
+         * position extraction). {@code uncompressed} may be null: the accessor then reports the
+         * bytes as absent, and a session that needs them must fail closed.
+         */
+        public Decoded(Object packet, ProtocolState state, int packetId, Envelope.Bundle bundle,
+                       boolean stateChange, long retainedBytes, int uncompressedBytes, byte[] uncompressed) {
             if (state == null || bundle == null) {
                 throw new IllegalArgumentException("state/bundle");
             }
@@ -119,6 +154,7 @@ public interface LaneGame {
             this.stateChange = stateChange;
             this.retainedBytes = retainedBytes;
             this.uncompressedBytes = uncompressedBytes;
+            this.uncompressed = uncompressed;
         }
 
         public Object packet() {
@@ -147,6 +183,15 @@ public interface LaneGame {
 
         public int uncompressedBytes() {
             return uncompressedBytes;
+        }
+
+        /**
+         * The uncompressed frame the game decoded from, or null when the game did not supply it.
+         * Null means missing metadata: once routing needs the bytes (U8d) the session treats null
+         * as a failure, never as an empty frame.
+         */
+        public byte[] uncompressed() {
+            return uncompressed;
         }
     }
 }
