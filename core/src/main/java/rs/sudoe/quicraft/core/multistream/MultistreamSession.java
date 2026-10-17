@@ -13,8 +13,11 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
  * this interface.
  *
  * <p>Threading and lifecycle are those of {@link NStreamSession}: {@link #acceptStream} runs on the
- * connection's event loop, every other method may be called from any thread and is marshalled onto
- * that loop in call order.
+ * connection's event loop. The send operations, including the ACK_JOIN and BATCH_JOIN passthroughs
+ * and {@link #end}, submit on the caller's thread, so their handles and answers are available at
+ * once and their order is the call order, and the session drains on that loop afterwards. Lifecycle
+ * and receive operations ({@link #bindGame}, {@link #activate}, {@link #abort} and {@link #applied})
+ * are marshalled onto the loop in call order.
  *
  * <p>The ACK_JOIN and BATCH_JOIN passthroughs (13.19) and the send overload that carries the
  * uncompressed packet bytes are additive. An implementation that does not support one fails
