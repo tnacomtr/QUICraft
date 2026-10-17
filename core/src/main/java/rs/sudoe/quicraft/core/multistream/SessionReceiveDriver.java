@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.core.multistream;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +25,14 @@ import rs.sudoe.quicraft.core.routing.RouteV2;
  * completes it on acknowledgement. Queued (Q) releases nothing; only applied (D) releases the workspace,
  * the slot and the dependencies.
  *
+ * <p>One execution unit at a time (13.12): once a unit is enqueued, no other head is decoded or delivered
+ * until its acknowledgement releases the workspace. A kind 1 END is a CONTROL global fence: it is validated
+ * and applied here, never decoded or delivered, and a clean shutdown (0x0) follows unless a violation wins.
+ *
+ * <p>Every terminal path goes through one cleanup: the pump is cancelled, every workspace byte the driver
+ * still holds is returned once, the held and waiting units are dropped, and only then is the sink told
+ * the close. {@link #close()} runs the same cleanup for an external close and does not call the sink.
+ *
  * <p>Bundle scope (13.15, with the orchestrator's mapping): GLOBAL and FENCE map to global, VIEW to view,
  * INTERACTION to interaction, CONTROL to control, ORDINARY to ordinary. Order: global beats everything;
  * view and interaction are incomparable, so holding both promotes to global; otherwise the highest of
@@ -34,7 +43,7 @@ import rs.sudoe.quicraft.core.routing.RouteV2;
  * <p>Missing-close timer (13.15): a bundle opener whose unit is not complete 10 s after admission closes
  * 0x11, on the injected non-excluding clock.
  *
- * <p>Thread confinement: this class is not thread-safe. Every call (receive, acknowledged, stall and
+ * <p>Thread confinement: this class is not thread-safe. Every call (receive, acknowledged, close, stall and
  * withholding notices) must run on the one receive thread. The game's acknowledgements from other threads
  * are marshalled onto that thread by the integration (U8f).
  */
@@ -44,6 +53,9 @@ public final class SessionReceiveDriver {
     /** The bounded generic 0x12 phrase used when no classified reason is present (orchestrator decision). */
     static final byte[] GENERIC_RESOURCE_REASON = "resource".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
     private static final byte[] NO_REASON = new byte[0];
+    /** The fixed route of a CONTROL global fence, used for END (13.4: END is CONTROL/global only). */
+    private static final ReceiveRoute END_ROUTE =
+            new ReceiveRoute(ReceiveRoute.Lane.CONTROL, Dependency.GLOBAL, null, false, false);
 
     /** Maps a route key to its reviewed route; production passes {@code routingTable::routeV2For}. */
     public interface RouteSource {
@@ -86,6 +98,10 @@ public final class SessionReceiveDriver {
     private final int streams;
     private final Entry[] held;
     private final List<ClientReadPump.Unit> waiting = new ArrayList<ClientReadPump.Unit>();
+    /** The unit enqueued and not yet acknowledged; at most one (13.12). Null when none is executing. */
+    private Entry executing;
+    /** Workspace bytes this driver has reserved and not yet returned. Terminal cleanup returns them once. */
+    private long reservedWorkspace;
     private boolean closed;
 
     /**
@@ -121,7 +137,7 @@ public final class SessionReceiveDriver {
         this.held = new Entry[streams];
     }
 
-    /** Returns true once the driver has closed the connection. */
+    /** Returns true once the driver has closed the connection, by a violation, by END or by {@link #close()}. */
     public boolean closed() {
         return closed;
     }
@@ -132,7 +148,8 @@ public final class SessionReceiveDriver {
     }
 
     /**
-     * Reads at most one step from the pump, admits what completed and delivers every eligible head.
+     * Reads at most one step from the pump, admits what completed and delivers the eligible head when no unit
+     * is executing.
      *
      * @throws IOException when the byte source fails
      */
@@ -155,12 +172,13 @@ public final class SessionReceiveDriver {
     public void acknowledged(int stream, long closingSequence) {
         if (closed) return;
         Entry entry = held[stream];
-        if (entry == null || !entry.enqueued || entry.closingSeq != closingSequence) {
+        if (entry == null || entry != executing || entry.closingSeq != closingSequence) {
             throw new IllegalStateException("acknowledgement for an unexpected unit on stream " + stream);
         }
         receiver.applied(stream, entry.openerSeq);
         held[stream] = null;
-        receiver.releaseWorkspace(entry.wireBytes);
+        executing = null;
+        releaseCharge(reservedWorkspace);
         ReceiveClose violation = receiver.pendingViolation();
         if (violation != null) {
             fail(violation);
@@ -169,6 +187,16 @@ public final class SessionReceiveDriver {
         pump.commit(entry.unit);
         game.onApplicationComplete(laneOf(stream), stream, closingSequence);
         drive();
+    }
+
+    /**
+     * Closes the driver from outside the receive path (the connection went away). Runs the same terminal
+     * cleanup as a protocol close, once; the sink is not called because the connection is already closing.
+     * A second call, or a call after a close, does nothing.
+     */
+    public void close() {
+        if (closed) return;
+        terminate();
     }
 
     /** Forwards the start of a game-executor tick stall to the receiver. */
@@ -194,7 +222,10 @@ public final class SessionReceiveDriver {
         receiver.markLocallyWithheld(stream, key);
     }
 
-    /** Admits waiting units, then enqueues every eligible head until none is left or the driver closes. */
+    /**
+     * Admits waiting units, then enqueues the next eligible head while no unit is executing. Stops when the
+     * driver closes, when nothing is eligible, or when a head must wait for the workspace.
+     */
     private void drive() {
         while (!closed) {
             if (!admitWaiting()) return;
@@ -213,6 +244,7 @@ public final class SessionReceiveDriver {
                 fail(expired);
                 return;
             }
+            if (executing != null) return; // one execution unit at a time (13.12)
             int stream = receiver.nextToEnqueue();
             if (stream < 0) return;
             if (!enqueue(stream)) return;
@@ -239,14 +271,21 @@ public final class SessionReceiveDriver {
         return !closed;
     }
 
-    /** Decodes, validates and enqueues the eligible head of {@code stream}. Returns false when closed. */
+    /**
+     * Decodes, validates and enqueues the eligible head of {@code stream}. Returns false when the driver
+     * closed or must wait for the workspace; the caller stops driving in both cases.
+     */
     private boolean enqueue(int stream) {
         Entry entry = held[stream];
+        if (entry.unit.recordCount() == 1 && entry.unit.record().kind() == RecordCodec.KIND_END) {
+            return endFence(stream, entry);
+        }
         Lane lane = laneOf(stream);
-        if (!receiver.reserveWorkspace(entry.wireBytes)) {
+        if (!charge(entry.wireBytes)) {
             fail(ReceiveClose.resourceWait("execution workspace"));
             return false;
         }
+        Attempt attempt = new Attempt();
         List<Object> packets = new ArrayList<Object>(entry.unit.recordCount());
         List<ReceiveRoute> memberRoutes = new ArrayList<ReceiveRoute>(entry.unit.recordCount());
         boolean bundle = entry.unit.recordCount() > 1;
@@ -255,24 +294,31 @@ public final class SessionReceiveDriver {
             rs.sudoe.quicraft.core.multistream.Record record = records.get(i);
             boolean inside = i > 0;
             LaneGame.Decoded decoded;
+            long before = attempt.reserved;
             try {
-                decoded = game.decode(lane, record.sequence(), record.payload(), inside, NO_RESERVATION);
+                decoded = game.decode(lane, record.sequence(), record.payload(), inside, attempt);
+            } catch (RetryLater retry) {
+                return retryLater();
             } catch (Exception e) {
-                receiver.releaseWorkspace(entry.wireBytes);
                 fail(ReceiveClose.peerViolation("decode failed: " + e));
                 return false;
             }
             if (decoded == null) {
-                receiver.releaseWorkspace(entry.wireBytes);
                 fail(ReceiveClose.peerViolation("decoder returned nothing"));
                 return false;
+            }
+            if (attempt.reserved == before && decoded.retainedBytes() > 0) {
+                // A game that did not reserve gets its retained bytes charged after the fact (13.12).
+                if (!charge(decoded.retainedBytes())) {
+                    fail(ReceiveClose.resourceWait("decoded output"));
+                    return false;
+                }
             }
             ReceiveClose markerClose = checkDelimiter(decoded.bundle(), i, records.size(), bundle);
             if (markerClose == null && bundle && decoded.stateChange()) {
                 markerClose = ReceiveClose.peerViolation("state change inside a bundle (13.15)");
             }
             if (markerClose != null) {
-                receiver.releaseWorkspace(entry.wireBytes);
                 fail(markerClose);
                 return false;
             }
@@ -281,14 +327,12 @@ public final class SessionReceiveDriver {
             }
             ReceiveRoute route = routeOf(decoded);
             if (route == null) {
-                receiver.releaseWorkspace(entry.wireBytes);
                 fail(ReceiveClose.peerViolation("no usable route for packet " + decoded.packetId()));
                 return false;
             }
             if (bundle) {
                 // Members are not the opener: validateEligible checks only the opener's body, so each member is checked here.
                 if (!validator.valid(stream, record, route)) {
-                    receiver.releaseWorkspace(entry.wireBytes);
                     fail(ReceiveClose.peerViolation("member validation failed on stream " + stream));
                     return false;
                 }
@@ -298,21 +342,55 @@ public final class SessionReceiveDriver {
         }
         ReceiveRoute unitRoute = bundle ? combineBundle(memberRoutes) : memberRoutes.get(0);
         if (unitRoute == null) {
-            receiver.releaseWorkspace(entry.wireBytes);
             fail(ReceiveClose.peerViolation("bundle member route not allowed in a bundle (13.15)"));
             return false;
         }
         ReceiveClose validated = receiver.validateEligible(stream, unitRoute);
         if (validated != null) {
-            receiver.releaseWorkspace(entry.wireBytes);
             fail(validated);
             return false;
         }
         receiver.enqueued(stream, entry.openerSeq);
         entry.enqueued = true;
+        executing = entry;
         game.onEnqueued(lane, stream, entry.closingSeq);
         game.deliver(lane, entry.closingSeq, packets, bundle);
         return true;
+    }
+
+    /**
+     * A decoder asked for workspace that is not free. Returns the attempt's own charges, keeps the unit queued
+     * and waits for the next receive call. If nothing else holds workspace, no retry can succeed: fail closed.
+     */
+    private boolean retryLater() {
+        releaseCharge(reservedWorkspace);
+        if (receiver.slots().workspaceInUse() == 0) {
+            fail(ReceiveClose.resourceWait("decoded output does not fit the execution workspace"));
+        }
+        return false;
+    }
+
+    /**
+     * Applies an eligible END (13.4): validated and applied as a CONTROL global fence, never decoded or
+     * delivered. A violation found on the apply wins; otherwise the connection closes cleanly with 0x0.
+     */
+    private boolean endFence(int stream, Entry entry) {
+        ReceiveClose validated = receiver.validateEligible(stream, END_ROUTE);
+        if (validated != null) {
+            fail(validated);
+            return false;
+        }
+        receiver.enqueued(stream, entry.openerSeq);
+        entry.enqueued = true;
+        receiver.applied(stream, entry.openerSeq);
+        held[stream] = null;
+        ReceiveClose violation = receiver.pendingViolation();
+        if (violation != null) {
+            fail(violation);
+            return false;
+        }
+        fail(0, NO_REASON);
+        return false;
     }
 
     /** Checks the bundle delimiters: a single record carries none; a bundle is OPEN, MEMBER..., CLOSE. */
@@ -423,6 +501,43 @@ public final class SessionReceiveDriver {
         return Lane.WORLD;
     }
 
+    /** Reserves driver workspace; false when the workspace cannot carry it (nothing is reserved then). */
+    private boolean charge(long bytes) {
+        if (!receiver.reserveWorkspace(bytes)) return false;
+        reservedWorkspace += bytes;
+        return true;
+    }
+
+    /** Returns driver workspace. Callers pass only bytes this driver reserved. */
+    private void releaseCharge(long bytes) {
+        if (bytes == 0) return;
+        receiver.releaseWorkspace(bytes);
+        reservedWorkspace -= bytes;
+    }
+
+    /** The reservation handed to the game for one decode attempt: charges come from the driver's workspace. */
+    private final class Attempt implements LaneGame.Reservation {
+        /** Bytes the game reserved during this attempt, across its records. */
+        long reserved;
+
+        @Override
+        public void reserve(long additionalRetainedBytes, int totalUncompressedBytes) {
+            if (additionalRetainedBytes < 0 || !charge(additionalRetainedBytes)) {
+                throw new RetryLater();
+            }
+            reserved += additionalRetainedBytes;
+        }
+    }
+
+    /** Thrown from {@link Attempt#reserve} when the workspace is full: a retry, not a failure (13.12). */
+    private static final class RetryLater extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+
+        RetryLater() {
+            super("execution workspace is full", null, false, false);
+        }
+    }
+
     /** Terminal close: one close, then the driver stops. */
     private void fail(ReceiveClose close) {
         fail(close.errorCode(), closeReason(close));
@@ -430,8 +545,22 @@ public final class SessionReceiveDriver {
 
     private void fail(int errorCode, byte[] reason) {
         if (closed) return;
-        closed = true;
+        terminate();
         sink.close(errorCode, reason);
+    }
+
+    /**
+     * The one terminal cleanup: cancels the pump (every held slot is released once by the pump), returns every
+     * workspace byte the driver holds, and drops the held and waiting units. Sets {@code closed} first, so it
+     * runs once.
+     */
+    private void terminate() {
+        closed = true;
+        executing = null;
+        pump.cancel();
+        releaseCharge(reservedWorkspace);
+        waiting.clear();
+        Arrays.fill(held, null);
     }
 
     private static byte[] closeReason(ReceiveClose close) {
@@ -441,7 +570,4 @@ public final class SessionReceiveDriver {
         }
         return NO_REASON;
     }
-
-    /** The reservation handed to the game: this driver's workspace already covers the unit, so nothing more. */
-    private static final LaneGame.Reservation NO_RESERVATION = (extra, total) -> { };
 }

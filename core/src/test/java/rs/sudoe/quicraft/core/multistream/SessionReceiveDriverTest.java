@@ -36,10 +36,16 @@ class SessionReceiveDriverTest {
     static final class FakeGame implements LaneGame {
         final Map<Long, Envelope.Bundle> markers = new HashMap<Long, Envelope.Bundle>();
         final List<String> log = new ArrayList<String>();
+        /** Decode calls so far, including retried ones. */
+        int decodes;
+        /** When positive, every decode reserves this many bytes of decoded output before returning. */
+        long reserveBytes;
 
         @Override
         public Decoded decode(rs.sudoe.quicraft.core.routing.Lane lane, long sequence, byte[] frame,
                               boolean insideBundle, Reservation reservation) {
+            decodes++;
+            if (reserveBytes > 0) reservation.reserve(reserveBytes, frame.length);
             int pid = frame[frame.length - 1] & 0xff;
             Envelope.Bundle marker = markers.containsKey(sequence) ? markers.get(sequence) : Envelope.Bundle.NONE;
             return new Decoded("p" + sequence, ProtocolState.PLAY, pid, marker, false, 0, frame.length, frame);
@@ -189,7 +195,147 @@ class SessionReceiveDriverTest {
         assertEquals(Collections.singletonList(CLOSE_ORDERING), h.codes);
         assertEquals(2, h.game.deliveries(), "the epoch-2 record on stream 2 is never delivered");
         assertFalse(h.game.log.contains("applied 3:1"), "a violated apply is not reported as completed");
-        assertTrue(h.slots.holdsHead(3), "a violated apply does not commit the pump unit");
+        assertFalse(h.slots.holdsHead(3), "a violated apply releases the pump slot once, through the terminal cleanup");
+        assertEquals(0L, h.slots.workspaceInUse(), "a violated apply returns the workspace");
+        h.driver.close();
+        assertEquals(Collections.singletonList(CLOSE_ORDERING), h.codes, "a close after the violation adds no close");
+    }
+
+    @Test void oneExecutionUnitAtATime() throws Exception {
+        Harness h = new Harness();
+        // Two independently eligible heads: REALTIME and CHUNK[0]. The second waits for the first's acknowledgement.
+        h.source.put(LogicalStream.REALTIME, rec(1, 1, 0, Collections.<Record.Dependency>emptyList(), PID_REALTIME));
+        h.source.put(2, rec(2, 1, 0, Collections.<Record.Dependency>emptyList(), PID_CHUNK));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("enqueued 1:1"), h.game.log.toString());
+        assertFalse(h.game.log.contains("enqueued 2:1"), h.game.log.toString());
+        assertEquals(1, h.game.decodes, "the second eligible head is not decoded before the first is applied");
+        h.driver.acknowledged(LogicalStream.REALTIME, 1);
+        h.rounds(30);
+        assertTrue(h.game.log.contains("enqueued 2:1"), h.game.log.toString());
+        assertEquals(2, h.game.decodes);
+        assertTrue(h.codes.isEmpty(), h.codes.toString());
+    }
+
+    @Test void validationFailureReleasesWorkspaceOnce() throws Exception {
+        Harness h = new Harness();
+        // A REALTIME route on the CONTROL stream fails validation after the workspace was charged.
+        h.source.put(LogicalStream.CONTROL, rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_REALTIME));
+        h.rounds(30);
+        assertEquals(Collections.singletonList(CLOSE_ORDERING), h.codes);
+        assertEquals(0L, h.slots.workspaceInUse());
+        assertFalse(h.slots.holdsHead(LogicalStream.CONTROL));
+        h.driver.close();
+        assertEquals(1, h.codes.size());
+    }
+
+    @Test void expiredWaitWhileExecutingReleasesEverything() throws Exception {
+        Harness h = new Harness();
+        // The transition executes (D is not reached); CHUNK[0] waits on a CONTROL sequence that never arrives.
+        h.source.put(LogicalStream.CONTROL, rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_TRANSITION));
+        h.source.put(2, rec(2, 1, 0, dep(LogicalStream.CONTROL, 2), PID_CHUNK));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("enqueued 0:1"), h.game.log.toString());
+        assertTrue(h.slots.workspaceInUse() > 0);
+        h.now[0] = TimeUnit.SECONDS.toNanos(11);
+        h.rounds(1);
+        assertEquals(Collections.singletonList(CLOSE_RESOURCE), h.codes);
+        assertEquals(0L, h.slots.workspaceInUse(), "the executing unit's workspace is returned");
+        assertFalse(h.slots.holdsHead(LogicalStream.CONTROL));
+        assertFalse(h.slots.holdsHead(2));
+    }
+
+    @Test void externalCloseReleasesOnceAndNeverCallsTheSink() throws Exception {
+        Harness h = new Harness();
+        h.source.put(LogicalStream.CONTROL, rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_TRANSITION));
+        h.rounds(30);
+        assertTrue(h.slots.workspaceInUse() > 0);
+        h.driver.close();
+        assertEquals(0L, h.slots.workspaceInUse());
+        assertFalse(h.slots.holdsHead(LogicalStream.CONTROL));
+        assertTrue(h.codes.isEmpty(), "an external close does not call the sink");
+        assertTrue(h.driver.closed());
+        h.driver.close();
+        h.driver.receive();
+        assertEquals(0L, h.slots.workspaceInUse());
+        assertTrue(h.codes.isEmpty());
+    }
+
+    @Test void missingCloseAfterFailureReleasesEverythingOnce() throws Exception {
+        Harness h = new Harness();
+        // A partial bundle holds the CONTROL slot; the missing-close timer closes the driver.
+        byte[] full = bundle(3, Collections.<Record.Dependency>emptyList(), PID_CONTROL, PID_CONTROL);
+        h.source.put(LogicalStream.CONTROL, Arrays.copyOf(full, full.length - 1));
+        h.rounds(10);
+        h.now[0] = TimeUnit.SECONDS.toNanos(11);
+        h.rounds(1);
+        assertEquals(Collections.singletonList(CLOSE_ORDERING), h.codes);
+        assertFalse(h.slots.holdsHead(LogicalStream.CONTROL), "the pump's held slot is released by the cleanup");
+        assertEquals(0L, h.slots.workspaceInUse());
+        h.driver.close();
+        assertEquals(1, h.codes.size());
+    }
+
+    @Test void endAppliesAsAFenceAndClosesCleanly() throws Exception {
+        Harness h = new Harness();
+        h.source.put(LogicalStream.CONTROL, endWire(1));
+        h.rounds(30);
+        assertEquals(Collections.singletonList(0), h.codes);
+        assertEquals(Collections.singletonList(""), h.reasons);
+        assertEquals(0, h.game.decodes, "END is never decoded");
+        assertEquals(0, h.game.deliveries(), "END is never delivered");
+        assertEquals(0L, h.slots.workspaceInUse());
+    }
+
+    @Test void endPostApplyViolationWinsOverTheCleanClose() throws Exception {
+        Harness h = new Harness();
+        // The epoch+1 chunk waits on END (a transition-less epoch change). Applying END leaves it without a path.
+        h.source.put(LogicalStream.CONTROL, endWire(1));
+        h.source.put(3, rec(3, 1, 1, dep(LogicalStream.CONTROL, 1), PID_CHUNK));
+        h.rounds(30);
+        assertEquals(Collections.singletonList(CLOSE_ORDERING), h.codes);
+        assertEquals(0, h.game.decodes);
+    }
+
+    @Test void decodeRetriesWhenTheWorkspaceIsFullThenSucceeds() throws Exception {
+        Harness h = new Harness();
+        long occupied = ReceiveSlots.EXECUTION_WORKSPACE - 100;
+        assertTrue(h.slots.reserveWorkspace(occupied), "another holder takes most of the workspace");
+        h.game.reserveBytes = 200;
+        byte[] wire = rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_CONTROL);
+        h.source.put(LogicalStream.CONTROL, wire);
+        h.rounds(30);
+        assertTrue(h.codes.isEmpty(), "a full workspace is a retry, not a close");
+        assertEquals(0, h.game.deliveries(), "the unit is not applied or delivered yet");
+        assertEquals(occupied, h.slots.workspaceInUse(), "the attempt's own charges are returned");
+        assertTrue(h.slots.holdsHead(LogicalStream.CONTROL), "the unit stays queued in its slot");
+        h.slots.releaseWorkspace(occupied);
+        h.rounds(1);
+        assertEquals(1, h.game.deliveries(), h.game.log.toString());
+        assertTrue(h.codes.isEmpty());
+        assertEquals(wire.length + 200L, h.slots.workspaceInUse(), "the delivered unit holds exactly its charges");
+    }
+
+    @Test void closeWhileWaitingForWorkspaceReleasesOnce() throws Exception {
+        Harness h = new Harness();
+        long occupied = ReceiveSlots.EXECUTION_WORKSPACE - 100;
+        assertTrue(h.slots.reserveWorkspace(occupied));
+        h.game.reserveBytes = 200;
+        h.source.put(LogicalStream.CONTROL, rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_CONTROL));
+        h.rounds(30);
+        assertTrue(h.slots.holdsHead(LogicalStream.CONTROL));
+        h.driver.close();
+        assertFalse(h.slots.holdsHead(LogicalStream.CONTROL), "the queued unit's slot is released");
+        assertEquals(occupied, h.slots.workspaceInUse(), "only the other holder's bytes remain");
+        assertTrue(h.codes.isEmpty());
+        h.slots.releaseWorkspace(occupied);
+        assertEquals(0L, h.slots.workspaceInUse());
+    }
+
+    /** A single END record on CONTROL at {@code seq} (kind 1, empty body, no dependencies). */
+    static byte[] endWire(long seq) {
+        return RecordCodec.encodeRecord(new Record(LogicalStream.CONTROL, seq, 0,
+                Collections.<Record.Dependency>emptyList(), RecordCodec.KIND_END, new byte[0]));
     }
 
     @Test void wrongRouteNeverReachesGameQueue() throws Exception {
