@@ -94,16 +94,62 @@ public final class RecordCodec {
      * the record buffer is allocated, so an oversize prefix never allocates.
      */
     public static final class CompactDecoder {
+        /** Largest bounded prefix: the 54-byte header plus three at-most-5-byte lengths (13.12). */
+        public static final int PREFIX_WINDOW = COMPACT_MAX_HEADER + 3 * 5;
+
         private final int streamIndex;
         private final VarInt.Reader length = new VarInt.Reader(CLOSE_CODE, "13.4");
+        private Admission admission;
         private int recordLength = -1;
+        private int lengthBytes;
+        private boolean admitted;
+        private byte[] prefix;
         private byte[] frame;
         private int filled;
+        private int frameAllocations;
 
         /** @param streamIndex the logical index the bytes arrived on, 0..7 (13.3). */
         public CompactDecoder(int streamIndex) {
             if (streamIndex < 0 || streamIndex > 7) throw new IllegalArgumentException("logical stream index");
             this.streamIndex = streamIndex;
+        }
+
+        /** Installs the admission hook. Set it before the first byte; without one, bodies allocate at once. */
+        public void setAdmission(Admission admission) {
+            if (recordLength >= 0) throw new IllegalStateException("admission set mid-record");
+            this.admission = admission;
+        }
+
+        /**
+         * How many bytes the next {@link #next} call can use: 1 while record_length is incomplete,
+         * the remaining bounded prefix before admission, then the remaining body. 0 means the
+         * record is held at admission; call {@link #next} with an empty buffer to retry it.
+         */
+        public int wanted() {
+            if (recordLength < 0) return 1;
+            if (!admitted) return prefix.length - filled;
+            return recordLength - filled;
+        }
+
+        /** Bytes the record_length VarInt occupied; valid once it is complete. */
+        public int lengthPrefixBytes() {
+            return lengthBytes;
+        }
+
+        /** Record bodies allocated so far. A held or refused declaration allocates none. */
+        public int frameAllocations() {
+            return frameAllocations;
+        }
+
+        /** Drops any partial record and returns to the initial state (connection cleanup). */
+        public void cancel() {
+            recordLength = -1;
+            lengthBytes = 0;
+            admitted = false;
+            prefix = null;
+            frame = null;
+            filled = 0;
+            length.reset();
         }
 
         /** Consumes bytes from {@code in} and returns one complete record, or null if more are needed. */
@@ -112,6 +158,7 @@ public final class RecordCodec {
                 while (!length.done()) {
                     if (!in.hasRemaining()) return null;
                     length.feed(in.get() & 0xff);
+                    lengthBytes++;
                 }
                 int declared = length.value();
                 if (declared > COMPACT_MAX_RECORD_LENGTH) {
@@ -119,19 +166,142 @@ public final class RecordCodec {
                 }
                 if (declared < 4) throw compactError("record_length " + declared + " < 4");
                 recordLength = declared;
-                frame = new byte[declared];
+                filled = 0;
+                admitted = admission == null;
+                if (admitted) {
+                    allocateFrame();
+                } else {
+                    prefix = new byte[Math.min(declared, PREFIX_WINDOW)];
+                }
+            }
+            if (!admitted) {
+                int n = Math.min(prefix.length - filled, in.remaining());
+                in.get(prefix, filled, n);
+                filled += n;
+                if (filled < prefix.length) return null;
+                // Claim-by-retry: a hold returns before any more bytes are consumed.
+                if (!admission.admit(streamIndex, recordLength, prefix, prefix.length)) return null;
+                admitted = true;
+                allocateFrame();
+                System.arraycopy(prefix, 0, frame, 0, prefix.length);
+                prefix = null;
             }
             int n = Math.min(recordLength - filled, in.remaining());
             in.get(frame, filled, n);
             filled += n;
             if (filled < recordLength) return null;
             rs.sudoe.quicraft.core.multistream.Record record = parseCompact(frame, streamIndex);
-            recordLength = -1;
-            frame = null;
-            filled = 0;
-            length.reset();
+            cancel();
             return record;
         }
+
+        private void allocateFrame() {
+            frame = new byte[recordLength];
+            frameAllocations++;
+        }
+    }
+
+    /**
+     * Decides whether a declared record may be buffered (13.12). {@link CompactDecoder} calls it once
+     * the bounded prefix is complete and before any body allocation or inflation.
+     */
+    public interface Admission {
+        /**
+         * @return true to admit the record (its body is allocated next); false to hold it, in which
+         *     case the decoder calls again with the same prefix and consumes nothing further
+         * @throws MultistreamProtocolException to refuse the record as a protocol error
+         */
+        boolean admit(int streamIndex, long recordLength, byte[] prefix, int prefixLength)
+                throws MultistreamProtocolException;
+    }
+
+    /** What a record's bounded prefix declares, read before its body is allocated (13.12). */
+    public static final class Declarations {
+        /** Record kind (0..3). */
+        public final int kind;
+        /** Compact header length, through the dependency list. */
+        public final int headerLength;
+        /** Bytes of the inner length VarInt, 0 for END. The packet content starts after it. */
+        public final int innerLengthBytes;
+        /** Bytes of the Data Length VarInt, 0 when compression is disabled or the record is not GAME. */
+        public final int dataLengthBytes;
+        /** Declared Data Length, or -1 when compression is disabled; 0 means stored (uncompressed). */
+        public final long dataLength;
+        /** Decoded packet bytes this record can produce: the footprint bound before inflation. */
+        public final long decodedLength;
+        /** Bytes after the Data Length prefix: the zlib input when compressed, else the packet. */
+        public final long payloadLength;
+
+        Declarations(int kind, int headerLength, int innerLengthBytes, int dataLengthBytes, long dataLength,
+                     long decodedLength, long payloadLength) {
+            this.kind = kind;
+            this.headerLength = headerLength;
+            this.innerLengthBytes = innerLengthBytes;
+            this.dataLengthBytes = dataLengthBytes;
+            this.dataLength = dataLength;
+            this.decodedLength = decodedLength;
+            this.payloadLength = payloadLength;
+        }
+    }
+
+    /**
+     * Reads a record's declarations from its bounded prefix (13.12): the compact envelope, the inner
+     * length and, when {@code compressed}, the Data Length. Nothing is inflated and nothing beyond the
+     * prefix is read. The total length must match {@code recordLength} exactly.
+     *
+     * @param prefix the first {@code prefixLength} bytes of the record body (at most PREFIX_WINDOW)
+     * @param recordLength the record_length as declared
+     * @throws MultistreamProtocolException for an envelope that does not match its declared length
+     */
+    public static Declarations inspectPrefix(byte[] prefix, int prefixLength, long recordLength, boolean compressed)
+            throws MultistreamProtocolException {
+        if (prefix == null || prefixLength < 1 || prefixLength > prefix.length) {
+            throw compactError("prefix length");
+        }
+        int[] at = {1};
+        int kind = prefix[0] & 255;
+        if (kind > 3) throw compactError("invalid kind " + kind);
+        readCompact(prefix, prefixLength, at);
+        readCompact(prefix, prefixLength, at);
+        long count = readCompact(prefix, prefixLength, at);
+        if (count > MAX_COMPACT_DEPENDENCIES) throw compactError("dependency count " + count);
+        for (int i = 0; i < count; i++) {
+            if (at[0] >= prefixLength) throw compactError("truncated dependency");
+            at[0]++;
+            readCompact(prefix, prefixLength, at);
+        }
+        int header = at[0];
+        if (header > COMPACT_MAX_HEADER) throw compactError("header over " + COMPACT_MAX_HEADER + " bytes");
+        if (kind == KIND_END) {
+            if (recordLength != header) throw compactError("END length does not match its header");
+            return new Declarations(kind, header, 0, 0, compressed ? 0 : -1, 0, 0);
+        }
+        if (header >= prefixLength) throw compactError("GAME record without an inner length");
+        byte[] body = Arrays.copyOfRange(prefix, header, prefixLength);
+        int innerLength = readInnerLength(body);
+        int innerBytes = innerVarIntBytes(body);
+        if (header + innerBytes + (long) innerLength != recordLength) {
+            throw compactError("inner frame length " + innerLength + " does not match record_length");
+        }
+        if (!compressed) {
+            return new Declarations(kind, header, innerBytes, 0, -1, innerLength, innerLength);
+        }
+        VarInt.Reader data = new VarInt.Reader(CLOSE_CODE, "13.4", false);
+        int p = innerBytes;
+        while (!data.done()) {
+            if (p >= body.length || p - innerBytes >= MAX_INNER_VARINT_BYTES + 2) {
+                throw compactError("truncated Data Length");
+            }
+            data.feed(body[p++] & 0xff);
+        }
+        long dataLength = data.value();
+        int dataBytes = p - innerBytes;
+        if (innerLength < dataBytes) throw compactError("Data Length longer than the frame");
+        long payload = innerLength - dataBytes;
+        if (dataLength == 0) {
+            return new Declarations(kind, header, innerBytes, dataBytes, 0, payload, payload);
+        }
+        return new Declarations(kind, header, innerBytes, dataBytes, dataLength, dataLength, payload);
     }
 
     /** Parses one complete record body (everything after the length prefix), 13.4. */
