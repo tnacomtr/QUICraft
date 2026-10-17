@@ -265,6 +265,24 @@ public final class SessionSendDriver {
     SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
             PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
             long maxRecordBytes, long ackByteLimit, long realtimeSliceBytes) {
+        this(context, profile, pool, ranking, owner, ip, account, clock, maxRecordBytes, ackByteLimit,
+                realtimeSliceBytes, false);
+    }
+
+    /**
+     * The production sender for either direction. A serverbound sender (the client's) accepts the interaction
+     * flag and refuses chunk routes and epoch transitions (13.9, 13.18); a clientbound one is the server's.
+     */
+    public SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
+            PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
+            boolean serverbound) {
+        this(context, profile, pool, ranking, owner, ip, account, clock, ReceiveSlots.BYTES_PER_STREAM,
+                AckJoinTracker.MAX_BYTES, DEFAULT_REALTIME_SLICE_BYTES, serverbound);
+    }
+
+    SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
+            PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
+            long maxRecordBytes, long ackByteLimit, long realtimeSliceBytes, boolean serverbound) {
         if (context == null || profile == null || pool == null || ranking == null || owner == null
                 || clock == null) {
             throw new IllegalArgumentException("send driver");
@@ -286,7 +304,7 @@ public final class SessionSendDriver {
         this.ip = ip;
         this.account = account;
         this.clock = clock;
-        this.sequencer = new StreamSequencer(context.shardCount());
+        this.sequencer = new StreamSequencer(context.shardCount(), serverbound);
         this.scheduler = new SendScheduler(profile);
         ranking.connect(owner, ip, account, clock.getAsLong());
         // The slice is the first ticket of this owner, requested before any record (13.12).
@@ -341,6 +359,26 @@ public final class SessionSendDriver {
             return handle;
         }
         handle.assign(laneOf(stream), stream, record.sequence());
+        return handle;
+    }
+
+    /**
+     * Assigns the fenced END (13.14): a CONTROL global fence after every record already assigned. Pending
+     * ACK_JOINs settle first, as for an epoch transition, since nothing may follow END. Returns an unassigned
+     * handle when closed.
+     */
+    public synchronized SentPacket submitEnd() {
+        SentPacket handle = new SentPacket();
+        if (closed) {
+            return handle;
+        }
+        settleAcksLocked();
+        batches.abort();
+        Record record = sequencer.assignEnd();
+        if (!enqueueRecord(record, false)) {
+            return handle;
+        }
+        handle.assign(Lane.CONTROL, CONTROL, record.sequence());
         return handle;
     }
 

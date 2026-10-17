@@ -128,6 +128,38 @@ class SessionSendDriverTest {
     }
 
     @Test
+    void endIsAnEmptyGlobalControlRecordAfterEveryEarlierRecord() throws Exception {
+        Rig rig = new Rig(2, 100);
+        SessionSendDriver driver = rig.driver;
+        SentPacket chunk = driver.submit(frame(5), StreamSequencer.Fence.CHUNK, 3, 4);
+        SentPacket realtime = driver.submit(frame(5), StreamSequencer.Fence.REALTIME, 0, 0);
+        SentPacket end = driver.submitEnd();
+        assertEquals(LogicalStream.CONTROL, end.logicalStream());
+        Drain drain = drainAndRelease(driver);
+        Record decoded = RecordCodec.decodeRecord(drain.stream(LogicalStream.CONTROL), LogicalStream.CONTROL);
+        assertEquals(RecordCodec.KIND_END, decoded.kind());
+        assertEquals(0, decoded.payload().length);
+        long[] deps = new long[4];
+        for (Record.Dependency dep : decoded.dependencies()) deps[dep.streamIndex()] = dep.sequence();
+        assertEquals(chunk.sequence(), deps[chunk.logicalStream()]);
+        assertEquals(realtime.sequence(), deps[LogicalStream.REALTIME]);
+    }
+
+    @Test
+    void serverboundDriverCarriesTheInteractionFlagAndRefusesChunks() throws Exception {
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        PressureRanking ranking = new PressureRanking();
+        AtomicLong now = new AtomicLong(1);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 1L << 40, ranking.view(now::get));
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(2),
+                new ServerProfile(1, 1, 1024, .5, 100, 1L << 40, 4, 4, 4), pool, ranking, new Object(),
+                InetAddress.getLoopbackAddress(), null, now::get, true);
+        SentPacket interaction = driver.submit(frame(3), StreamSequencer.Fence.ORDINARY_CONTROL, true, 0, 0);
+        assertTrue(interaction.isAssigned());
+        assertThrows(IllegalArgumentException.class, () -> driver.submit(frame(3), StreamSequencer.Fence.CHUNK, 0, 0));
+    }
+
+    @Test
     void interactionFlagReachesTheSequencerAndIsRefusedClientbound() throws Exception {
         Rig rig = new Rig(2, 100);
         // The flag is serverbound-only (13.9): the sequencer's route validation refuses it here.

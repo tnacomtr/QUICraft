@@ -102,6 +102,16 @@ public final class StreamSequencer {
     }
 
     /**
+     * Assigns the kind 1 END (13.4, 13.14): an empty CONTROL record with the global scope, so it waits for
+     * every record assigned before it on every stream. Nothing may be assigned after it.
+     */
+    public Record assignEnd() {
+        Record result = place(CONTROL, Fence.GLOBAL, new byte[0], false, RecordCodec.KIND_END, null);
+        applyFrontier(Fence.GLOBAL, result.sequence());
+        return result;
+    }
+
+    /**
      * Assigns an ACK_JOIN (kind 2) or BATCH_JOIN (kind 3) on CHUNK[0] (13.19). The join waits for
      * the latest view gate, the CONTROL frontier and the explicit covered frontiers the caller
      * supplies. A join never becomes a global, view or control frontier.
@@ -446,7 +456,9 @@ public final class StreamSequencer {
         if (serverbound && (fence == Fence.CHUNK || stream >= FIRST_CHUNK)) {
             throw new IllegalArgumentException("serverbound chunk route");
         }
-        if (kind != 0 && (fence != Fence.CHUNK || stream != FIRST_CHUNK)) {
+        if (kind == RecordCodec.KIND_END) {
+            if (fence != Fence.GLOBAL || stream != CONTROL) throw new IllegalArgumentException("end route");
+        } else if (kind != 0 && (fence != Fence.CHUNK || stream != FIRST_CHUNK)) {
             throw new IllegalArgumentException("join route");
         }
         switch (fence) {
