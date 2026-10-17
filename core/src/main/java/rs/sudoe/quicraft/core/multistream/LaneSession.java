@@ -185,6 +185,7 @@ public final class LaneSession {
     private final QuicChannel connection;
     private final Role role;
     private final RoutingTable table;
+    private final SessionContext context;
     private final ReceiveBudget node;
     private final Timing timing;
     private final Direction sendDirection;
@@ -252,11 +253,28 @@ public final class LaneSession {
         this(connection, role, control, table, null, node, Timing.DEFAULT);
     }
 
+    /**
+     * A session for an already negotiated shard count (13.2). The three-lane path still runs
+     * underneath; the context is exposed through {@link #context()} for the binding owner and for
+     * the N+2 work that follows.
+     */
+    public LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
+                       LaneGame game, ReceiveBudget node, SessionContext context) {
+        this(connection, role, control, table, game, node, Timing.DEFAULT, context);
+    }
+
     LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
                 LaneGame game, ReceiveBudget node, Timing timing) {
-        if (connection == null || role == null || control == null || table == null) {
+        this(connection, role, control, table, game, node, timing,
+                SessionContext.of(SessionContext.DEFAULT_SHARD_COUNT));
+    }
+
+    LaneSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
+                LaneGame game, ReceiveBudget node, Timing timing, SessionContext context) {
+        if (connection == null || role == null || control == null || table == null || context == null) {
             throw new IllegalArgumentException("null argument");
         }
+        this.context = context;
         if (control.streamId() != CONTROL_STREAM_ID || control.type() != QuicStreamType.BIDIRECTIONAL) {
             throw new IllegalArgumentException("CONTROL must be bidirectional stream 0");
         }
@@ -435,9 +453,21 @@ public final class LaneSession {
     /**
      * The game's serial handler has applied a delivered unit (13.10): acknowledge its lane and
      * final sequence. From any thread.
+     *
+     * <p>This is a checked translation of the single outstanding delivery: the receiver accepts it
+     * only when lane and sequence name that delivery exactly, so a same-sequence acknowledgement for
+     * another lane (or a stale one) is an ordering failure (0x11), never a guessed mapping.
      */
     public void applied(final Lane lane, final long sequence) {
         run(() -> doApplied(lane, sequence));
+    }
+
+    /**
+     * The negotiated shard count and logical stream layout of this connection (13.2-13.3). Immutable
+     * and safe from any thread; fixed when the session is created.
+     */
+    public SessionContext context() {
+        return context;
     }
 
     /**
@@ -1060,7 +1090,7 @@ public final class LaneSession {
         reserveQueue(1, RecordCodec.HEADER_LENGTH + frame.length + 4L);
         Envelope e = sender.assign(lane, frame.length, frame, semantic, now());
         queue(e, frame);
-        handle.assign(lane, e.sequence());
+        handle.assign(lane, SessionContext.legacyLogicalIndex(lane), e.sequence());
         drain();
         armTick();
     }
@@ -1101,7 +1131,7 @@ public final class LaneSession {
         for (int i = 0; i < records.size(); i++) {
             Envelope e = records.get(i);
             enqueue(e.lane(), encoded.get(i));
-            handles.get(i).assign(e.lane(), e.sequence());
+            handles.get(i).assign(e.lane(), SessionContext.legacyLogicalIndex(e.lane()), e.sequence());
         }
         drain();
         armTick();

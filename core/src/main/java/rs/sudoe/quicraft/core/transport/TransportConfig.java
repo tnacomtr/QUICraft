@@ -64,6 +64,13 @@ public final class TransportConfig {
      * {@code MultistreamTransportConfigTest}.
      */
     public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = 24L << 10;
+    /**
+     * /3 (13.2): the server's configured maximum shard count. Local policy, never a wire field; no
+     * administrator setting overrides the draft hard cap of 6.
+     */
+    public static final int MULTISTREAM_MAX_SHARDS = 6;
+    /** /3 (13.2): the server's preferred shard count, clamped into the client's offer and the maximum. */
+    public static final int MULTISTREAM_PREFERRED_SHARDS = 3;
     /** /3: the server lets the client open streams 0 and 4. */
     public static final int MULTISTREAM_SERVER_MAX_STREAMS_BIDI = 2;
     /** /3: the client lets the server open up to six chunk streams; application validation caps N (13.2). */

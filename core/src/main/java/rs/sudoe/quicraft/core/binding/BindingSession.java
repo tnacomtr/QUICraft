@@ -78,6 +78,8 @@ public final class BindingSession implements BindingDriver {
     private byte[] sharedSecret;
     private final int mode;
     private final int protocol;
+    /** N, the shard count the preamble exchange selected (13.2, 12.7). */
+    private final int shardCount;
     private final byte[] fingerprint;
     private final byte[] routing;
     private final LongSupplier clock;
@@ -130,6 +132,26 @@ public final class BindingSession implements BindingDriver {
     public BindingSession(Role role, ExporterSource exporter, byte[] sharedSecret, int mode, int protocol,
             byte[] advertisedFingerprint, byte[] routingDigest, LongSupplier clock, long offerWaitNanos,
             Callbacks callbacks, ScheduledExecutorService scheduler, BooleanSupplier inEventLoop) {
+        this(role, exporter, sharedSecret, mode, protocol, 1, advertisedFingerprint, routingDigest, clock,
+                offerWaitNanos, callbacks, scheduler, inEventLoop);
+    }
+
+    /**
+     * As the constructor above, bound to the shard count N that the preamble exchange selected
+     * (13.2). Use this form on {@code /3}: the binding must carry the same N the preambles agreed on,
+     * so a peer that binds a different N fails the exchange (12.7).
+     *
+     * @param shardCount N, 1..6, from {@link rs.sudoe.quicraft.core.multistream.SessionContext#shardCount()}
+     * @throws IllegalArgumentException for local misuse, including an N outside 1..6
+     */
+    public BindingSession(Role role, ExporterSource exporter, byte[] sharedSecret, int mode, int protocol,
+            int shardCount, byte[] advertisedFingerprint, byte[] routingDigest, LongSupplier clock,
+            long offerWaitNanos, Callbacks callbacks, ScheduledExecutorService scheduler,
+            BooleanSupplier inEventLoop) {
+        if (shardCount < 1 || shardCount > 6) {
+            throw new IllegalArgumentException("shard count must be 1..6, got " + shardCount);
+        }
+        this.shardCount = shardCount;
         this.role = Objects.requireNonNull(role, "role");
         this.exporter = Objects.requireNonNull(exporter, "exporter");
         this.callbacks = Objects.requireNonNull(callbacks, "callbacks");
@@ -199,9 +221,9 @@ public final class BindingSession implements BindingDriver {
         try {
             BindingMachineResult built = role == Role.SERVER
                     ? BindingStateMachine.server(faultCheckedExporter(), sharedSecret, mode, protocol,
-                            fingerprint, routing)
+                            shardCount, fingerprint, routing)
                     : BindingStateMachine.client(faultCheckedExporter(), sharedSecret, mode, protocol,
-                            fingerprint, routing);
+                            shardCount, fingerprint, routing);
             if (built.isFailed()) {
                 // 12.3, 12.14: an exporter error is fatal, never permission to continue.
                 fail("binding: " + built.failure().name());

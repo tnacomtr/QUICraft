@@ -24,7 +24,9 @@ import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
+import rs.sudoe.quicraft.core.multistream.LogicalStream;
 import rs.sudoe.quicraft.core.multistream.PreambleV2;
+import rs.sudoe.quicraft.core.multistream.SessionContext;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 
 /**
@@ -83,6 +85,8 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     private volatile RoutingTable table;
     private volatile LaneSession session;
+    /** The negotiated shard count (13.2); null until both preambles are read. Written on the event loop. */
+    private volatile SessionContext context;
     private volatile boolean handshakeComplete;
     private volatile Listener game;
     private volatile boolean gameWrote;
@@ -163,9 +167,17 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         raw.setAutoRead(true);
     }
 
-    /** On the event loop: writes this side's v2 preamble with a fresh token (null for none). */
+    /**
+     * On the event loop: writes this side's v2 preamble with a fresh token (null for none). The
+     * server's reply names its selected N in both range fields (13.2), so it needs the negotiated N.
+     */
     void writePreamble(byte[] token) {
-        raw.write(ByteBuffer.wrap(PreambleV2.encode(token)));
+        SessionContext selected = context;
+        if (selected == null) {
+            throw new IllegalStateException("the shard count is not negotiated yet (13.2)");
+        }
+        int n = selected.shardCount();
+        raw.write(ByteBuffer.wrap(PreambleV2.encode(token, n, n)));
         raw.flush();
     }
 
@@ -516,6 +528,14 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     private void onPreamble(byte[] token) {
         if (role == LaneSession.Role.CLIENT) {
+            try {
+                // 13.2: the reply must name exactly one N inside this client's offer (1..6).
+                context = SessionContext.accept(parser.minShards(), parser.maxShards(),
+                        LogicalStream.MIN_CHUNKS, LogicalStream.MAX_CHUNKS);
+            } catch (MultistreamProtocolException e) {
+                onInvalidPreamble(e);
+                return;
+            }
             if (token != null) {
                 cache.putToken(serverKey, token);
             }
@@ -528,13 +548,31 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
                 task.run();
             }
         } else {
+            try {
+                // 13.2: select N from the client's offer; an empty intersection closes with 0x10.
+                context = SessionContext.select(parser, TransportConfig.MULTISTREAM_MAX_SHARDS,
+                        TransportConfig.MULTISTREAM_PREFERRED_SHARDS);
+            } catch (MultistreamProtocolException e) {
+                onInvalidPreamble(e);
+                return;
+            }
             preambleHandler.onPreamble(this, token);
         }
     }
 
     private void onInvalidPreamble(MultistreamProtocolException e) {
         LOG.log(Level.FINE, "invalid /3 preamble; closing", e);
-        Codecs.closeLater(connection, true, MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION);
+        Codecs.closeLater(connection, true, e.closeCode());
+    }
+
+    /** The negotiated shard count (13.2): fixed once the preambles are read, safe from any thread. */
+    @Override
+    public SessionContext sessionContext() {
+        SessionContext selected = context;
+        if (selected == null) {
+            throw new IllegalStateException("the shard count is not negotiated yet (13.2)");
+        }
+        return selected;
     }
 
     /** On the event loop: the server's early-name recorder, if one is set. */
@@ -736,6 +774,11 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
             failActivation("the server's own TLS handshake is not complete yet (12.7)");
             return;
         }
+        SessionContext negotiated = context;
+        if (negotiated == null) {
+            failActivation("no negotiated shard count (13.2)");
+            return;
+        }
         doDetach(null); // implicit detach keeps whatever was buffered for the session below
         RoutingTable resolved = table;
         if (resolved == null) {
@@ -754,7 +797,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         kept.clear();
         keptBytes = 0;
         // The session installs itself first in stream 0's pipeline and drives reads itself.
-        LaneSession started = new LaneSession(connection, role, control, resolved, game, node);
+        LaneSession started = new LaneSession(connection, role, control, resolved, game, node, negotiated);
         session = started;
         activated = true;
         for (QuicStreamChannel stream : early) {

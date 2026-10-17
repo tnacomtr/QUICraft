@@ -22,6 +22,27 @@ public interface LaneGame {
     default void onRecordAppliedSignal(int logicalStream, long sequence, boolean applied) { }
 
     /**
+     * The uncompressed bytes of one decoded GAME record, as the receiver obtained them before
+     * decoding (the input to position extraction, 13.8). Additive: the default ignores them.
+     * Contract only: {@link LaneSession} does not invoke this yet; the U8d receive driver wires the call.
+     */
+    default void onDecodedUncompressed(Lane lane, long sequence, byte[] uncompressedFrame) { }
+
+    /**
+     * A delivery unit was successfully enqueued for the game's serial handler (Q, 13.10). Additive:
+     * the default ignores it. Enqueue does not release dependencies; only {@link LaneSession#applied} does.
+     * Contract only: not invoked by {@link LaneSession} until U8d.
+     */
+    default void onEnqueued(Lane lane, long sequence) { }
+
+    /**
+     * The game's serial handler finished applying a delivery unit (D, 13.10), once the
+     * acknowledgement is accepted. Additive: the default ignores it. Contract only: not invoked by
+     * {@link LaneSession} until U8d.
+     */
+    default void onApplicationComplete(Lane lane, long sequence) { }
+
+    /**
      * Decodes one dependency-eligible GAME body: exactly one Minecraft VarInt-length frame,
      * including the packet id and the negotiated compression wrapper, without CFB8 (13.4).
      *
