@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.netty.buffer.ByteBuf;
@@ -31,6 +32,7 @@ import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.multistream.Envelope;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.SentPacket;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 
@@ -455,5 +457,30 @@ class GameLanesTest {
                 }
             }
         }
+    }
+
+    /**
+     * U8f: the additive game-facing methods fail closed on a session that does not implement them, so a
+     * join or batch route can never be sent through the legacy session silently.
+     */
+    @Test
+    void theLegacySessionFailsClosedOnEveryJoinAndBatchMethod() {
+        GameLanes.Session session = new FakeSession();
+        ProtocolState state = ProtocolState.PLAY;
+        byte[] frame = new byte[] {1};
+        assertThrows(UnsupportedOperationException.class,
+                () -> session.send(state, 7, frame, frame, new SentPacket[0]), "send with uncompressed bytes");
+        assertThrows(UnsupportedOperationException.class, () -> session.createAck(1L, frame, 1));
+        assertThrows(UnsupportedOperationException.class, () -> session.coverAssigned(1L, null));
+        assertThrows(UnsupportedOperationException.class, () -> session.coverPending(1L, 2L));
+        assertThrows(UnsupportedOperationException.class, () -> session.assignedPending(2L, null));
+        assertThrows(UnsupportedOperationException.class, () -> session.suppressPending(2L));
+        assertThrows(UnsupportedOperationException.class, () -> session.markInexact(1L));
+        assertThrows(UnsupportedOperationException.class, () -> session.takeAck(1L));
+        assertThrows(UnsupportedOperationException.class, session::expireAcks);
+        assertThrows(UnsupportedOperationException.class, () -> session.beginBatch(3L, null));
+        assertThrows(UnsupportedOperationException.class, () -> session.batchInstall(3L, null, 0, 0));
+        assertThrows(UnsupportedOperationException.class, () -> session.finishBatch(3L, null));
+        assertTrue(((FakeSession) session).sent.isEmpty(), "nothing reached the legacy send path");
     }
 }
