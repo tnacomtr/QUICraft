@@ -34,6 +34,12 @@ import rs.sudoe.quicraft.core.routing.extract.FootprintRegistry;
  * Primitive decoder/accounting identifiers describe synthetic complete layouts only; game
  * adapters must add independently reviewed versioned identifiers, not offsets in JSON.
  *
+ * <p>Loading a resource from the classpath is the production path: it is the only path that can
+ * put a table into a shipped build or into {@code /3} selection, so it accepts only the
+ * production allowlist of {@link ExtractorRegistry#productionIds()} (13.7). {@link #parse(byte[])}
+ * and its siblings stay reachable for tests and fixtures, where synthetic identifiers describe
+ * route shapes the production allowlist deliberately rejects.
+ *
  * <p>A resource is UTF-8 JSON with {@code schema:1}, {@code protocol:<number>}, {@code default} and
  * a list of {@code routes}, each carrying {@code state}, {@code direction}, {@code packet_id},
  * {@code lane} and {@code dependency}. What ships in core's main resources is the 26.x placeholder
@@ -104,6 +110,9 @@ public final class RoutingTableLoader {
     private static final Set<String> MANDATORY_KEY_FIELDS = unmodifiableSet(
             STATE_FIELD, DIRECTION_FIELD, PACKET_ID_FIELD);
 
+    /** Which extractor identifiers a parse accepts: a shipped resource names only reviewed ones. */
+    private enum Policy { PRODUCTION, TEST }
+
     private RoutingTableLoader() {}
 
     /** The classpath resource path of the table for {@code protocolNumber}. */
@@ -138,7 +147,7 @@ public final class RoutingTableLoader {
             throw new IOException("routing resource not found on the classpath: " + path);
         }
         Set<RouteKey> mandatoryControl = loadMandatoryControl(protocolNumber);
-        RoutingTable table = parse(bytes, mandatoryControl);
+        RoutingTable table = parse(bytes, mandatoryControl, Policy.PRODUCTION);
         if (table.protocolNumber() != protocolNumber) {
             throw new RoutingTableException("13.7: " + path + " declares protocol "
                     + table.protocolNumber() + ", not the requested " + protocolNumber);
@@ -164,7 +173,7 @@ public final class RoutingTableLoader {
         if (bytes == null) {
             throw new IOException("routing resource not found on the classpath: " + resourcePath);
         }
-        return parse(bytes, mandatoryControl);
+        return parse(bytes, mandatoryControl, Policy.PRODUCTION);
     }
 
     /** Parses {@code json} as UTF-8 resource bytes. Digest R covers those exact bytes. */
@@ -175,7 +184,7 @@ public final class RoutingTableLoader {
 
     /** Parses the exact resource bytes {@code bytes}; digest R is SHA-256 over them (13.7). */
     public static RoutingTable parse(byte[] bytes) {
-        return parse(bytes, Collections.<RouteKey>emptySet());
+        return parse(bytes, Collections.<RouteKey>emptySet(), Policy.TEST);
     }
 
     /** Parses {@code json} as UTF-8 resource bytes, rejecting any {@code mandatoryControl} key
@@ -193,6 +202,15 @@ public final class RoutingTableLoader {
      *     version-specific packet-id knowledge behind 13.5 that a routing resource cannot express
      */
     public static RoutingTable parse(byte[] bytes, Set<RouteKey> mandatoryControl) {
+        return parse(bytes, mandatoryControl, Policy.TEST);
+    }
+
+    /**
+     * Parses the exact resource bytes {@code bytes} under {@code policy}. The classpath loaders
+     * pass {@link Policy#PRODUCTION}; this explicit test entry keeps synthetic identifiers
+     * reachable for fixtures (13.7).
+     */
+    static RoutingTable parse(byte[] bytes, Set<RouteKey> mandatoryControl, Policy policy) {
         Objects.requireNonNull(bytes, "bytes");
         Objects.requireNonNull(mandatoryControl, "mandatoryControl");
         Object parsed = decode(bytes, "13.7");
@@ -201,7 +219,7 @@ public final class RoutingTableLoader {
         }
         Map<?, ?> root = (Map<?, ?>) parsed;
         int selectedSchema = intField(root, SCHEMA_FIELD, "resource");
-        if (selectedSchema == SCHEMA_VERSION_V2) return parseV2(root, bytes, mandatoryControl);
+        if (selectedSchema == SCHEMA_VERSION_V2) return parseV2(root, bytes, mandatoryControl, policy);
         requireFields(root, ROOT_FIELDS, "resource", "13.7");
 
         int schema = intField(root, SCHEMA_FIELD, "resource");
@@ -263,7 +281,8 @@ public final class RoutingTableLoader {
         return new RoutingTable(protocolNumber, sha256(bytes), routes);
     }
 
-    private static RoutingTable parseV2(Map<?, ?> root, byte[] bytes, Set<RouteKey> mandatory) {
+    private static RoutingTable parseV2(Map<?, ?> root, byte[] bytes, Set<RouteKey> mandatory,
+            Policy policy) {
         requireFields(root, unmodifiableSet("schema", "protocol", "default", "extractors", "routes",
                 "serverboundLimits"), "resource", "13.7");
         int protocol = intField(root, "protocol", "resource");
@@ -275,7 +294,7 @@ public final class RoutingTableLoader {
                     || !(entry.getValue() instanceof String))
                 throw new RoutingTableException("13.7: invalid extractor definition");
             String identifier = (String) entry.getValue();
-            decoder(identifier);
+            decoder(identifier, policy);
             extractors.put((String) entry.getKey(), identifier);
         }
         Map<ProtocolState, RouteV2.ServerboundLimits> limits = new LinkedHashMap<>();
@@ -345,7 +364,7 @@ public final class RoutingTableLoader {
                     throw new RoutingTableException("13.7: unknown position extractor");
                 position = (String) positionValue;
                 identifier = extractors.get(position);
-                kind = decoder(identifier).kind;
+                kind = decoder(identifier, policy).kind;
             }
             if (lane == RouteV2.StreamLane.CHUNK) {
                 if (kind != (join ? Kind.JOIN : Kind.SINGLE))
@@ -374,9 +393,12 @@ public final class RoutingTableLoader {
                 routes, extractors, limits);
     }
 
-    private static ExtractorRegistry.Decoder decoder(String id) {
-        try { return ExtractorRegistry.decoder(id); }
-        catch (IllegalArgumentException e) { throw new RoutingTableException(e.getMessage()); }
+    private static ExtractorRegistry.Decoder decoder(String id, Policy policy) {
+        try {
+            return policy == Policy.PRODUCTION
+                    ? ExtractorRegistry.productionDecoder(id)
+                    : ExtractorRegistry.decoder(id);
+        } catch (IllegalArgumentException e) { throw new RoutingTableException(e.getMessage()); }
     }
 
     private static Map<?, ?> object(Object value, String where) {
