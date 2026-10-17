@@ -1871,6 +1871,11 @@ position extraction. Those implementations must change together before this revi
     bundle, validates the strongest member policy before execution, and commits the closing
     watermark only after applying the complete bundle atomically to the game's bundle handler.
     A missing close after 10 seconds, nested delimiter or policy violation closes `0x11`.
+    Scope mapping for the strongest-member rule: GLOBAL and FENCE map to global, VIEW to view, INTERACTION to
+    interaction, CONTROL to control and ORDINARY to ordinary. Global beats all; global beats interaction and
+    control; view beats control; view and interaction are incomparable, so a bundle holding both is global. The floor
+    is control. LANE and any unknown dependency promote to global, and a CHUNK member does too. ACK_JOIN and
+    BATCH_JOIN members, epoch changes and state changes inside a bundle close `0x11`.
     The clientbound opener is kind 4 (13.4), so the receiver knows the bundle's record count and
     total wire size from the opener itself, before any member arrives; that declaration is what
     13.12 admits and reserves, and the count and byte total are enforced exactly.

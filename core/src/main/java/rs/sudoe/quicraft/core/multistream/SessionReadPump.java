@@ -440,6 +440,16 @@ public final class SessionReadPump {
             return decoded == null;
         }
 
+        /** Wire footprint charged for this record at admission: the bytes its receive slot holds (13.12). */
+        long wireBytes() {
+            return footprint;
+        }
+
+        /** Bytes that inflating this record allocates (its declared Data Length); 0 when none is needed. */
+        long inflationBytes() {
+            return needsInflation() ? declared.dataLength : 0;
+        }
+
         /**
          * The packet content: the packet id and fields, uncompressed, without the inner length. The array
          * is the unit's own; callers must not modify it.

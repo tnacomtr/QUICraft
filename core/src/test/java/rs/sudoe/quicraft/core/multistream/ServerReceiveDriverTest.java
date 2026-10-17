@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package rs.sudoe.quicraft.core.multistream;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.routing.Dependency;
+import rs.sudoe.quicraft.core.routing.RouteV2;
+
+/** Serverbound serial driver: eligibility before inflation, one execution unit, terminal cleanup and END. */
+class ServerReceiveDriverTest {
+    private static final int PROTOCOL = 1;
+    private static final int PID_CONTROL = 2;
+    private static final int PID_REALTIME = 9;
+    private static final int CLOSE_ORDERING = 0x11;
+    private static final RouteV2.ServerboundLimits LIMITS = new RouteV2.ServerboundLimits(65536, 510, 8192, 5459);
+
+    /** One serverbound session: a byte source, the pump and the driver, with the sink's codes recorded. */
+    static final class Harness {
+        final SessionReadPumpTest.Streams source = new SessionReadPumpTest.Streams(4, 1 << 20);
+        final SessionReadPumpTest.Pools pools = new SessionReadPumpTest.Pools(1L << 20);
+        final SessionReadPump pump;
+        final SessionReceiveDriverTest.FakeGame game = new SessionReceiveDriverTest.FakeGame();
+        final List<Integer> codes = new ArrayList<Integer>();
+        final long[] now = {0L};
+        final ServerReceiveDriver driver;
+
+        Harness(boolean compressed) {
+            pump = new SessionReadPump(new ServerReadPartition(2), pools.node, pools.excess, "conn", "ip-a", null,
+                    LIMITS, compressed, source);
+            Map<Integer, RouteV2> routes = new HashMap<Integer, RouteV2>();
+            routes.put(PID_CONTROL, new RouteV2(RouteV2.StreamLane.CONTROL, Dependency.ORDINARY,
+                    null, null, false, null, null, null));
+            routes.put(PID_REALTIME, new RouteV2(RouteV2.StreamLane.REALTIME, Dependency.ORDINARY,
+                    null, null, false, null, null, null));
+            driver = new ServerReceiveDriver(2, pump, (s, r, route) -> true,
+                    new SessionReceiveDriverTest.RouteSourceImpl(routes), PROTOCOL, game, () -> now[0],
+                    (code, reason) -> codes.add(code));
+        }
+
+        void rounds(int n) throws Exception {
+            for (int i = 0; i < n; i++) driver.receive();
+        }
+    }
+
+    /** A compressed GAME record whose body is the zlib form of {@code packet}, with dependencies {@code deps}. */
+    static byte[] compressedRec(int stream, long seq, List<Record.Dependency> deps, byte[] packet) {
+        ByteArrayOutputStream content = new ByteArrayOutputStream();
+        VarInt.write(content, packet.length);
+        byte[] z = SessionReadPumpTest.deflate(packet);
+        content.write(z, 0, z.length);
+        return RecordCodec.encodeRecord(new Record(stream, seq, 0, deps, RecordCodec.KIND_GAME,
+                SessionReadPumpTest.inner(content.toByteArray())));
+    }
+
+    /** A stored GAME record in a compressed session: Data Length 0, so nothing is inflated (13.12). */
+    static byte[] storedRec(int stream, long seq, List<Record.Dependency> deps, byte[] packet) {
+        ByteArrayOutputStream content = new ByteArrayOutputStream();
+        VarInt.write(content, 0);
+        content.write(packet, 0, packet.length);
+        return RecordCodec.encodeRecord(new Record(stream, seq, 0, deps, RecordCodec.KIND_GAME,
+                SessionReadPumpTest.inner(content.toByteArray())));
+    }
+
+    @Test void serverboundUnitRunsEndToEnd() throws Exception {
+        Harness h = new Harness(false);
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_CONTROL));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("enqueued 0:1"), h.game.log.toString());
+        assertTrue(h.game.log.contains("deliver CONTROL 1s 1"), h.game.log.toString());
+        h.driver.acknowledged(LogicalStream.CONTROL, 1);
+        assertTrue(h.game.log.contains("applied 0:1"), h.game.log.toString());
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL), "applied releases the slot");
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse());
+        assertTrue(h.codes.isEmpty(), h.codes.toString());
+    }
+
+    @Test void blockedCompressedHeadIsNeverInflated() throws Exception {
+        Harness h = new Harness(true);
+        // REALTIME goes first and holds the executor; the compressed CONTROL head waits on its apply.
+        h.source.put(LogicalStream.REALTIME,
+                storedRec(1, 1, Collections.<Record.Dependency>emptyList(), new byte[] {(byte) PID_REALTIME}));
+        h.source.put(LogicalStream.CONTROL,
+                compressedRec(0, 1, SessionReceiveDriverTest.dep(1, 1), new byte[] {(byte) PID_CONTROL}));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("deliver REALTIME 1s 1"), h.game.log.toString());
+        assertEquals(0, h.pump.inflations(), "a blocked compressed head is never inflated");
+        assertFalse(h.game.log.contains("enqueued 0:1"), h.game.log.toString());
+        h.driver.acknowledged(LogicalStream.REALTIME, 1);
+        h.rounds(30);
+        assertEquals(1, h.pump.inflations(), "the head is inflated once it is eligible");
+        assertTrue(h.game.log.contains("deliver CONTROL 1s 1"), h.game.log.toString());
+        h.driver.acknowledged(LogicalStream.CONTROL, 1);
+        assertTrue(h.codes.isEmpty(), h.codes.toString());
+    }
+
+    @Test void routeViolationClosesAndReleasesTheSlot() throws Exception {
+        Harness h = new Harness(false);
+        // A REALTIME route on the CONTROL stream fails the route check before enqueue.
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_REALTIME));
+        h.rounds(30);
+        assertEquals(Collections.singletonList(CLOSE_ORDERING), h.codes);
+        assertEquals(0, h.game.deliveries());
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL));
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse());
+    }
+
+    @Test void closeDuringExecutionReleasesEverythingOnce() throws Exception {
+        Harness h = new Harness(false);
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_CONTROL));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("enqueued 0:1"), h.game.log.toString());
+        assertTrue(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL));
+        h.driver.close();
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL), "the receiver slot is released");
+        assertNull(h.driver.receiver().head(LogicalStream.CONTROL), "the receiver retains no head after close");
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse());
+        assertTrue(h.driver.closed());
+        assertTrue(h.codes.isEmpty(), "an external close does not call the sink");
+        h.driver.close();
+        h.driver.receive();
+        assertTrue(h.codes.isEmpty());
+    }
+
+    @Test void serverboundEndAppliesAsAFenceAndClosesCleanly() throws Exception {
+        Harness h = new Harness(false);
+        h.source.put(LogicalStream.CONTROL, SessionReceiveDriverTest.endWire(1));
+        h.rounds(30);
+        assertEquals(Collections.singletonList(0), h.codes);
+        assertEquals(0, h.game.decodes, "END is never decoded");
+        assertEquals(0, h.game.deliveries(), "END is never delivered");
+    }
+}
