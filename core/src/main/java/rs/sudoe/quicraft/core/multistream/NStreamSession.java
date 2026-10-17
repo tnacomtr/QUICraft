@@ -119,8 +119,8 @@ public final class NStreamSession implements MultistreamSession {
     private static final byte[] NO_REASON = new byte[0];
 
     /** Clocks and periods; tests shorten them, production uses {@link #DEFAULT}. */
-    public static final class Timing {
-        public static final Timing DEFAULT = new Timing(System::nanoTime, OPEN_TIMEOUT_NANOS, END_LINGER_NANOS,
+    static final class Timing {
+        static final Timing DEFAULT = new Timing(System::nanoTime, OPEN_TIMEOUT_NANOS, END_LINGER_NANOS,
                 TimeUnit.SECONDS.toNanos(1));
 
         final LongSupplier clock;
@@ -128,7 +128,7 @@ public final class NStreamSession implements MultistreamSession {
         final long endLingerNanos;
         final long tickNanos;
 
-        public Timing(LongSupplier clock, long openTimeoutNanos, long endLingerNanos, long tickNanos) {
+        Timing(LongSupplier clock, long openTimeoutNanos, long endLingerNanos, long tickNanos) {
             this.clock = clock;
             this.openTimeoutNanos = openTimeoutNanos;
             this.endLingerNanos = endLingerNanos;
@@ -160,7 +160,7 @@ public final class NStreamSession implements MultistreamSession {
      * Test hook: the pinned Netty's {@code QUICHE_ERR_STREAM_STOPPED}, or {@link Integer#MIN_VALUE}
      * when the probe cannot resolve it.
      */
-    public static int stopSendingErrCode() {
+    static int stopSendingErrCode() {
         return STOPPED_SENDING;
     }
 
@@ -168,7 +168,7 @@ public final class NStreamSession implements MultistreamSession {
      * The pinned Netty's {@code streamCapacity(long)} accessor for a connection class, or null when
      * it is not there. See {@link #peerStoppedReading}.
      */
-    public static java.lang.reflect.Method findStreamCapacity(Class<?> connectionClass) {
+    static java.lang.reflect.Method findStreamCapacity(Class<?> connectionClass) {
         Class<?> type = connectionClass;
         while (type != null) {
             try {
