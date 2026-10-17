@@ -85,6 +85,11 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
     providers.gradleProperty("quicraft.joinTimings").orNull?.let {
         property("quicraft.gametest.joinTimings", it)
     }
+    // Opt-in: write and print the live PLAY packet inventory (RoutingTableGameTest, protocol 775):
+    // -Pquicraft.emitPlayIds=true (default path) or -Pquicraft.emitPlayIds=<file>
+    providers.gradleProperty("quicraft.emitPlayIds").orNull?.let {
+        property("quicraft.gametest.emitPlayIds", it)
+    }
     // Opt-in: the real client against an outside server (ExternalServerGameTest), e.g. the
     // testkit's Velocity through testkit/run-real-client.sh: -Pquicraft.externalServer=host:port
     providers.gradleProperty("quicraft.externalServer").orNull?.let {
