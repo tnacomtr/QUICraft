@@ -55,6 +55,23 @@ class SessionSendDriverTest {
         }
     }
 
+    /** A rig with explicit record and ACK headroom, so a small cap can hold one maximum record beside the ACK bound. */
+    private static final class HeadroomRig {
+        final AtomicLong now = new AtomicLong(1_000_000_000L);
+        final PressureRanking ranking = new PressureRanking();
+        final OutboundPool pool;
+        final Object owner = new Object();
+        final SessionSendDriver driver;
+
+        HeadroomRig(long connectionCap, long maxRecordBytes, long ackByteLimit) throws Exception {
+            NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+            pool = new OutboundPool(node, 1L << 40, 1L << 40, connectionCap, ranking.view(now::get));
+            ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
+            driver = new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner,
+                    InetAddress.getLoopbackAddress(), null, now::get, maxRecordBytes, ackByteLimit);
+        }
+    }
+
     /** One written slice, grouped by stream in write order. */
     private static final class Drain {
         final List<SessionSendDriver.Write> writes = new ArrayList<SessionSendDriver.Write>();
@@ -524,10 +541,11 @@ class SessionSendDriverTest {
         ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
         Object ownerA = new Object();
         Object ownerB = new Object();
+        // The 100-byte IP cap is the smallest cap, so the headroom is 84 record bytes plus 16 ACK bytes.
         SessionSendDriver a = new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, ownerA,
-                ip, null, now::get);
+                ip, null, now::get, 84, 16);
         SessionSendDriver b = new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, ownerB,
-                ip, null, now::get);
+                ip, null, now::get, 84, 16);
         assertTrue(a.submit(frame(70), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
         assertTrue(b.submit(frame(30), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
 
@@ -626,6 +644,50 @@ class SessionSendDriverTest {
         assertTrue(driver.isClosed());
         assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
         assertEquals(0, rig.pool.reserved(rig.owner));
+    }
+
+    /**
+     * Open-bundle stall (round 3 review). Cap 100 with 86 record bytes and 14 ACK bytes. A CHUNK record is granted
+     * first, then a bundle is assigned behind it. The bundle is one charge, so nothing of it is offered before the
+     * whole run fits. Before the fix the opener was offered alone, the scheduler then served only that bundle, and
+     * the granted CHUNK could never be written.
+     */
+    @Test
+    void openBundleWaitsForOneChargeAndNeverStallsAnEarlierChunk() throws Exception {
+        HeadroomRig rig = new HeadroomRig(100, 86, 14);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.submit(frame(40), StreamSequencer.Fence.CHUNK, 0, 0).isAssigned());
+        List<OutboundPacket> members = new ArrayList<OutboundPacket>();
+        members.add(frame(52));
+        List<SentPacket> unit = driver.submitBundle(frame(1), members,
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL}, frame(1));
+        assertEquals(3, unit.size());
+        SessionSendDriver.Write early = driver.poll(stream -> stream < 2);
+        if (early != null) {
+            driver.released(early.token());
+        }
+        drainAndRelease(driver);
+        assertFalse(driver.isClosed());
+        assertEquals(0, driver.queuedRecords());
+        assertEquals(0, rig.pool.reserved(rig.owner));
+    }
+
+    /** The headroom check uses the smallest cap that applies to the connection: owner, IP, account or node. */
+    @Test
+    void headroomIsCheckedAgainstTheSmallestApplicableCap() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
+        OutboundPool ipLimited = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                90, 1L << 40, 1L << 40, ranking.view(now::get));
+        assertThrows(IllegalArgumentException.class, () -> new SessionSendDriver(SessionContext.of(1), profile,
+                ipLimited, ranking, new Object(), InetAddress.getLoopbackAddress(), null, now::get, 86, 14));
+        OutboundPool accountLimited = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, 90, 1L << 40, ranking.view(now::get));
+        assertThrows(IllegalArgumentException.class, () -> new SessionSendDriver(SessionContext.of(1), profile,
+                accountLimited, ranking, new Object(), InetAddress.getLoopbackAddress(), "alice", now::get, 86, 14));
+        assertNotNull(new SessionSendDriver(SessionContext.of(1), profile, accountLimited, ranking, new Object(),
+                InetAddress.getLoopbackAddress(), null, now::get, 86, 14));
     }
 
     /** Length of the first complete record in {@code bytes}: VarInt(record_length) plus its body. */

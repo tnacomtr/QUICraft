@@ -83,6 +83,15 @@ final class CappedLedger {
                 && bytes <= node.limit(pool);
     }
 
+    /**
+     * The smallest cap that can ever constrain a request of this account: owner, IP, account (when set) and node.
+     * Callers that need headroom beside a fixed amount of bytes compare against this value.
+     */
+    long smallestCap(Object account) {
+        long smallest = Math.min(ownerCap, Math.min(ipCap, node.limit(pool)));
+        return account == null ? smallest : Math.min(smallest, accountCap);
+    }
+
     /** Takes this owner's shed notice only; other owners' notices stay for their own callers. */
     boolean takeShed(Object owner) {
         return shed.remove(owner);

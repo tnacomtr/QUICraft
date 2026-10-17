@@ -85,6 +85,12 @@ public final class OutboundPool {
     /** The per-connection cap every owner in this pool is charged against. */
     public synchronized long perConnectionLimit() { return ledger.ownerCap(); }
 
+    /**
+     * The smallest cap that can constrain a request of this account: the per-connection, per-IP, per-account (when
+     * {@code account} is non-null) and node caps. Headroom checks compare against this value, not the owner cap alone.
+     */
+    public synchronized long smallestCap(Object account) { return ledger.smallestCap(account); }
+
     /** Number of queued refused requests. */
     public synchronized int waitingCount() { return ledger.waitingCount(); }
 }

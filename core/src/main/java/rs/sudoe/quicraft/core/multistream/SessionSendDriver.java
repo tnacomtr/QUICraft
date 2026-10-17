@@ -37,7 +37,10 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * So at most one ungranted ticket is outstanding for this owner, and a later record never takes bytes
  * ahead of an earlier one. Every prerequisite is assigned before its dependents, so by induction every
  * granted record's prerequisites are granted before it, and every granted record can be written and
- * released. A record is offered to the scheduler once granted. The one exception is a pending ACK_JOIN,
+ * released. A bundle run (13.15) is one charge of its total size, requested by its opener and offered
+ * as a whole once granted, so the scheduler never holds an open bundle whose bytes are still ungranted,
+ * and no earlier granted record waits behind it. A record is offered to the scheduler once granted.
+ * The one exception is a pending ACK_JOIN,
  * whose charge is taken at creation, out of assignment order (13.19). Such charges are bounded by the
  * ACK headroom (see the package constructor), so they never keep a record from fitting once the
  * earlier granted records release. A record's charge is released once every slice it wrote has been
@@ -115,9 +118,24 @@ public final class SessionSendDriver {
         boolean released;
         /** True for a pending ACK_JOIN's charge, which counts against the ACK headroom until released. */
         boolean ack;
+        /**
+         * The bundle run this record belongs to, or null when the charge is its own unit. Members after the first
+         * point at the first member, which holds the pool charge for the whole run (13.15).
+         */
+        Charge head;
+        /** On a run's head or a single charge: members not yet released. The pool charge is released at zero. */
+        int unreleased = 1;
+        /** Bytes reported to the ranking as progress when this record is released. */
+        long progress;
 
         Charge(long bytes) {
             this.bytes = bytes;
+            this.progress = bytes;
+        }
+
+        /** The charge that owns the pool bytes: the run's head, or this charge. */
+        Charge group() {
+            return head == null ? this : head;
         }
     }
 
@@ -190,8 +208,10 @@ public final class SessionSendDriver {
      *
      * <p>Headroom (13.19): a pending ACK_JOIN is charged at creation, before the record it covers, and it keeps
      * its bytes until the transport releases it. The bytes of all such ACKs, pending or sequenced but unreleased,
-     * are bounded by {@code ackByteLimit}, and {@link #createAck} backpressures at that limit. The connection cap
-     * must hold one maximum record beside every ACK byte, so {@code maxRecordBytes + ackByteLimit <= cap}.
+     * are bounded by {@code ackByteLimit}, and {@link #createAck} backpressures at that limit. The smallest cap that
+     * applies to the connection (owner, IP, account or node, see {@link OutboundPool#smallestCap}) must hold one
+     * maximum record beside every ACK byte, so {@code maxRecordBytes + ackByteLimit <= smallest cap}. A bundle run
+     * is at most {@link StreamSequencer#MAX_BUNDLE_ENCODED_BYTES}, which production sets as {@code maxRecordBytes}.
      * Then a record the ACKs wait on always fits beside them once earlier granted records release, and no ACK
      * can deadlock the connection. A cap below that sum throws.
      *
@@ -205,8 +225,9 @@ public final class SessionSendDriver {
                 || clock == null) {
             throw new IllegalArgumentException("send driver");
         }
-        if (maxRecordBytes <= 0 || ackByteLimit <= 0 || maxRecordBytes + ackByteLimit > pool.perConnectionLimit()) {
-            throw new IllegalArgumentException("connection cap cannot hold a maximum record beside pending ACK bytes");
+        // The headroom must fit under the smallest cap that applies to this connection: owner, IP, account or node.
+        if (maxRecordBytes <= 0 || ackByteLimit <= 0 || maxRecordBytes + ackByteLimit > pool.smallestCap(account)) {
+            throw new IllegalArgumentException("smallest cap cannot hold a maximum record beside pending ACK bytes");
         }
         this.ackByteLimit = ackByteLimit;
         this.context = context;
@@ -465,19 +486,20 @@ public final class SessionSendDriver {
             closeWith(CLOSE_ORDERING);
             return result;
         }
-        // Every member is checked before any is queued, so a refused unit leaves nothing queued.
+        // The run is one charge of its total size, so admissibility is checked on that total before anything is queued.
         List<byte[]> encodings = new ArrayList<byte[]>(records.size());
+        long runBytes = 0;
         for (Record record : records) {
             byte[] encoded = RecordCodec.encodeRecord(record);
-            if (!pool.admissible(account, encoded.length)) {
-                closeWith(CLOSE_RESOURCE);
-                return result;
-            }
+            runBytes += encoded.length;
             encodings.add(encoded);
         }
-        for (int i = 0; i < records.size(); i++) {
-            Record record = records.get(i);
-            enqueueEncoded(record, encodings.get(i), i < records.size() - 1);
+        if (!pool.admissible(account, runBytes)) {
+            closeWith(CLOSE_RESOURCE);
+            return result;
+        }
+        enqueueRun(records, encodings);
+        for (Record record : records) {
             result.add(handleOf(record));
         }
         return result;
@@ -576,14 +598,20 @@ public final class SessionSendDriver {
         charge.released = true;
         releaseCharge(charge);
         long now = clock.getAsLong();
-        ranking.progress(owner, charge.bytes, now);
+        ranking.progress(owner, charge.progress, now);
         ranking.setRetained(owner, pool.reserved(owner), now);
         pump();
     }
 
-    /** Releases one charge in the pool. An ACK charge also leaves the ACK headroom (13.19). */
+    /**
+     * Releases one record's share of a charge. The pool bytes of a bundle run are released once, when its last
+     * member is released. An ACK charge also leaves the ACK headroom (13.19).
+     */
     private void releaseCharge(Charge charge) {
-        pool.release(owner, charge.bytes);
+        Charge group = charge.group();
+        if (--group.unreleased == 0) {
+            pool.release(owner, group.bytes);
+        }
         if (charge.ack) {
             ackBytesHeld -= charge.bytes;
             ackEntriesHeld--;
@@ -614,6 +642,37 @@ public final class SessionSendDriver {
         toOffer.addLast(charge);
         queuedRecords++;
         queuedBytes += encoded.length;
+        pump();
+    }
+
+    /**
+     * Queues a bundle run as one unit (13.15). The first member carries the pool charge for the whole run, so the
+     * run is requested and granted once. Its members are contiguous in the queue, so {@link #pump()} offers all of
+     * them together, and no part of the run is offered while the run waits for bytes.
+     */
+    private void enqueueRun(List<Record> records, List<byte[]> encodings) {
+        long runBytes = 0;
+        for (byte[] encoded : encodings) {
+            runBytes += encoded.length;
+        }
+        Charge first = null;
+        for (int i = 0; i < records.size(); i++) {
+            Charge charge = new Charge(first == null ? runBytes : 0);
+            charge.record = records.get(i);
+            charge.encoded = encodings.get(i);
+            charge.continues = i < records.size() - 1;
+            charge.progress = charge.encoded.length;
+            if (first == null) {
+                first = charge;
+            } else {
+                charge.head = first;
+                first.unreleased++;
+            }
+            byRecord.put(charge.record, charge);
+            toOffer.addLast(charge);
+            queuedRecords++;
+            queuedBytes += charge.encoded.length;
+        }
         pump();
     }
 
@@ -664,11 +723,15 @@ public final class SessionSendDriver {
         }
         for (Iterator<Charge> it = toOffer.iterator(); it.hasNext();) {
             Charge charge = it.next();
-            if (!charge.requested) {
-                request(charge);
-            }
-            if (!granted(charge)) {
-                break;
+            // A bundle run's later members are queued right behind its head, which is removed only once granted,
+            // so reaching a member means its run is already granted.
+            if (charge.head == null) {
+                if (!charge.requested) {
+                    request(charge);
+                }
+                if (!granted(charge)) {
+                    break;
+                }
             }
             it.remove();
             scheduler.offer(charge.record, charge.encoded.length, charge.continues);
