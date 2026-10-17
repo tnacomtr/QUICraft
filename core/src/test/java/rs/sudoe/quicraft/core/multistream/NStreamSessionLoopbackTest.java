@@ -219,6 +219,16 @@ class NStreamSessionLoopbackTest {
         }
     }
 
+    /** The server session registers its connection with the inbound ranking its excess pool picks victims by. */
+    @Test
+    void serverSessionJoinsTheInboundRanking() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            assertEquals(1, rig.config.serverResources.inboundRanking().exactIpCount());
+            assertEquals(1, rig.config.serverResources.outboundRanking().exactIpCount());
+        }
+    }
+
     @Test
     void resourceReasonReachesPeer() throws Exception {
         // Generic: the client's decoded output can never fit its execution workspace.

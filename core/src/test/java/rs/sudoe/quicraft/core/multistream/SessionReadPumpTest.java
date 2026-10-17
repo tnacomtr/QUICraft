@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.resource.InboundExcessPool;
 import rs.sudoe.quicraft.core.resource.NodePools;
+import rs.sudoe.quicraft.core.resource.PressureRanking;
 import rs.sudoe.quicraft.core.routing.RouteV2;
 
 class SessionReadPumpTest {
@@ -409,6 +410,118 @@ class SessionReadPumpTest {
         second.close();
         assertEquals(0, pools.excess.reserved("conn"));
         assertEquals(0, partition.prefixInUse(), "the prefix slice is returned once the record is admitted");
+    }
+
+    /** Two holders of equal excess: one read much more from its peer, so the other is the shed victim (13.12). */
+    @Test void inboundRankingPicksTheSlowerHolderAsVictim() throws Exception {
+        final long[] now = {0};
+        java.util.function.LongSupplier clock = () -> now[0];
+        PressureRanking ranking = new PressureRanking();
+        NodePools node = new NodePools(1L << 30, 16384, 1L << 30, 10, false, E);
+        InboundExcessPool excess = new InboundExcessPool(node, E, E, ranking.view(clock));
+        java.net.InetAddress ipA = java.net.InetAddress.getByName("10.0.0.1");
+        java.net.InetAddress ipB = java.net.InetAddress.getByName("10.0.0.2");
+
+        // A charges its CONTROL record first, then keeps reading REALTIME records from its peer; B charges the
+        // same CONTROL record later and reads nothing else. Unranked, the earlier charge (A) would be the victim.
+        ByteArrayOutputStream fast = new ByteArrayOutputStream();
+        for (int i = 0; i < 200; i++) {
+            byte[] one = gameWire(LogicalStream.REALTIME, i + 1, filled(400, i));
+            fast.write(one, 0, one.length);
+        }
+        Source sourceA = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 1)), fast.toByteArray());
+        SessionReadPump a = new SessionReadPump(new ServerReadPartition(6), node, excess, "A", ipA, null, LIMITS,
+                false, sourceA, ranking, clock);
+        SessionReadPump.Unit heldA = null;
+        for (int i = 0; i < 1000 && heldA == null; i++) {
+            for (SessionReadPump.Unit unit : a.step()) {
+                if (unit.stream() == LogicalStream.CONTROL) heldA = unit; else unit.close();
+            }
+        }
+        assertNotNull(heldA);
+        now[0] += 1_000_000_000L;
+        Source sourceB = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 2)), new byte[0]);
+        SessionReadPump b = new SessionReadPump(new ServerReadPartition(6), node, excess, "B", ipB, null, LIMITS,
+                false, sourceB, ranking, clock);
+        SessionReadPump.Unit heldB = nextUnit(b);
+        assertEquals(LogicalStream.CONTROL, heldB.stream());
+        assertEquals(excess.reserved("A"), excess.reserved("B"), "equal excess holders");
+        assertTrue(excess.reserved("A") > 0);
+        for (int i = 0; i < 190; i++) {
+            now[0] += 100_000_000L;
+            for (SessionReadPump.Unit unit : a.step()) unit.close();
+        }
+
+        double scoreA = ranking.score("A", now[0]);
+        double scoreB = ranking.score("B", now[0]);
+        assertTrue(scoreA > 0 && scoreB > scoreA, "A " + scoreA + ", B " + scoreB);
+        // A third connection needs more than the pool has left: the ranking picks the victim, not charge order.
+        assertFalse(excess.reserve("C", "ip-c", null, 8192, false));
+        assertEquals(Collections.singletonList((Object) "B"), excess.drainShedOwners());
+
+        heldA.close();
+        heldB.close();
+        assertEquals(0, excess.reserved("A"));
+        a.cancel();
+        b.cancel();
+        assertEquals(0.0, ranking.score("A", now[0]), "a cancelled pump leaves the ranking");
+        assertEquals(0.0, ranking.score("B", now[0]));
+    }
+
+    /** A CONTROL record waiting for excess runs a refused wait, which ends once the excess is granted (13.12). */
+    @Test void excessWaitIsARefusedWaitInTheInboundRanking() throws Exception {
+        final long[] now = {0};
+        java.util.function.LongSupplier clock = () -> now[0];
+        PressureRanking ranking = new PressureRanking();
+        NodePools node = new NodePools(1L << 30, 8192, 1L << 30, 10, false, E);
+        InboundExcessPool excess = new InboundExcessPool(node, E, E, ranking.view(clock));
+        assertTrue(excess.reserve("blocker", "ip-b", null, 8192, true));
+        Source source = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 5)), new byte[0]);
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node, excess, "A",
+                java.net.InetAddress.getByName("10.0.0.1"), null, LIMITS, false, source, ranking, clock);
+        assertFalse(ranking.inRefusedWait("A"));
+        for (int i = 0; i < 20; i++) {
+            now[0] += 1_000_000L;
+            assertTrue(pump.step().isEmpty(), "CONTROL waits for excess");
+        }
+        assertEquals(1, excess.waitingCount());
+        assertTrue(ranking.inRefusedWait("A"), "the excess wait is a refused wait");
+        excess.release("blocker", 8192);
+        SessionReadPump.Unit unit = nextUnit(pump);
+        assertFalse(ranking.inRefusedWait("A"), "the grant ends the refused wait");
+        unit.close();
+        pump.cancel();
+        assertFalse(ranking.inRefusedWait("A"));
+    }
+
+    /** A local executor stall reported to the resources adds no inbound byte-seconds (13.12). */
+    @Test void executorStallIsExcludedFromInboundByteSeconds() throws Exception {
+        double plain = heldScoreAfter(false);
+        double stalled = heldScoreAfter(true);
+        assertTrue(plain > 0 && stalled < plain * 0.75, "plain " + plain + ", stalled " + stalled);
+    }
+
+    /** Holds one excess record for 20 s, 10 s of it inside a reported executor stall when {@code stall}. */
+    private static double heldScoreAfter(boolean stall) throws Exception {
+        final long[] now = {0};
+        NodePools node = new NodePools(1L << 30, 1L << 20, 1L << 30, 10, false, E);
+        SessionResources resources = new SessionResources(node, 1L << 20, 1L << 20, 1L << 20, E, E,
+                SessionResources.defaultProfile(), () -> now[0]);
+        Source source = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 5)), new byte[0]);
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node, resources.inboundExcess(), "A",
+                java.net.InetAddress.getByName("10.0.0.1"), null, LIMITS, false, source, resources.inboundRanking(),
+                () -> now[0]);
+        SessionReadPump.Unit unit = nextUnit(pump);
+        assertTrue(resources.inboundExcess().reserved("A") > 0, "the record holds excess");
+        now[0] += 5_000_000_000L;
+        if (stall) resources.executorStallStarted();
+        now[0] += 10_000_000_000L;
+        if (stall) resources.executorStallEnded();
+        now[0] += 5_000_000_000L;
+        double score = resources.inboundRanking().score("A", now[0]);
+        unit.close();
+        pump.cancel();
+        return score;
     }
 
     @Test void refusedDeclarationDoesNotAdvanceParser() throws Exception {

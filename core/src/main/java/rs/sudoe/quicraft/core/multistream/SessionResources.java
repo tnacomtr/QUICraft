@@ -154,6 +154,25 @@ public final class SessionResources {
         return outboundRanking;
     }
 
+    /** The inbound pressure ranking the inbound excess pool picks shed victims by (13.12). */
+    public PressureRanking inboundRanking() {
+        return inboundRanking;
+    }
+
+    /**
+     * Reports that the local game executor stalled: inbound bytes waiting on it are not the peer's pressure, so
+     * the stall's time is excluded from the inbound ranking's byte-seconds until {@link #executorStallEnded}
+     * (13.12). No platform adapter calls this yet.
+     */
+    public void executorStallStarted() {
+        inboundRanking.stallStart(clock.getAsLong());
+    }
+
+    /** Ends the stall reported with {@link #executorStallStarted}. */
+    public void executorStallEnded() {
+        inboundRanking.stallEnd(clock.getAsLong());
+    }
+
     public ServerProfile profile() {
         return profile;
     }

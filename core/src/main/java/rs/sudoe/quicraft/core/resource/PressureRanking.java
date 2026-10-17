@@ -225,6 +225,12 @@ public final class PressureRanking {
         refusedWaiters.remove(c);
     }
 
+    /** True while the connection is in a refused wait; false for an unknown connection. */
+    public synchronized boolean inRefusedWait(Object connection) {
+        Connection c = connections.get(connection);
+        return c != null && c.refusedWait;
+    }
+
     /** Worst-of pressure score of a connection at {@code nowNanos} (13.12); 0 for an unknown connection. */
     public synchronized double score(Object connection, long nowNanos) {
         Connection c = connections.get(connection);

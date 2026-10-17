@@ -67,6 +67,12 @@ import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
  * further submission. A failure decided on a caller's thread never releases charges there: the driver only stops,
  * and the close and the release run on the loop, after any slice it already polled was written. A game
  * acknowledgement is always queued onto the loop.
+ *
+ * <p>Pressure rankings. The send driver registers the connection with the outbound ranking and the server's read
+ * pump with the inbound ranking, keyed by the remote address.
+ *
+ * <p>TODO(U9): pool and ranking charges pass {@code account = null}, so the 13.12 per-account caps and account
+ * histories do not apply yet; U9 plumbs the login identity in.
  */
 public final class NStreamSession implements MultistreamSession {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -226,7 +232,8 @@ public final class NStreamSession implements MultistreamSession {
             SessionReceiveDriver.CloseSink closeSink = this::onReceiveClose;
             if (role == LaneSession.Role.SERVER) {
                 serverPump = new SessionReadPump(new ServerReadPartition(shards), resources.node(),
-                        resources.inboundExcess(), this, ip, null, limits, compressed, preambles);
+                        resources.inboundExcess(), this, ip, null, limits, compressed, preambles,
+                        resources.inboundRanking(), resources.clock());
                 serverDriver = new ServerReceiveDriver(shards, serverPump, validator, routes, protocolNumber, proxy,
                         timing.clock, closeSink);
             } else {
@@ -237,6 +244,9 @@ public final class NStreamSession implements MultistreamSession {
             }
         } catch (RuntimeException e) {
             sendDriver.close();
+            if (serverPump != null) {
+                serverPump.cancel(); // returns the inflater charge and leaves the inbound ranking
+            }
             throw e;
         }
         resources.register(this, this::shed);

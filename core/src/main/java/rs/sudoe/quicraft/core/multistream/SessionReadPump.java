@@ -2,15 +2,18 @@
 package rs.sudoe.quicraft.core.multistream;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.LongSupplier;
 import java.util.zip.DataFormatException;
 import java.util.zip.Inflater;
 
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.resource.InboundExcessPool;
+import rs.sudoe.quicraft.core.resource.PressureRanking;
 import rs.sudoe.quicraft.core.resource.ResourcePools;
 import rs.sudoe.quicraft.core.routing.RouteV2;
 
@@ -31,6 +34,13 @@ import rs.sudoe.quicraft.core.routing.RouteV2;
  *
  * <p>Each stream holds at most one unit. A unit's charges are returned by {@link Unit#close}, which the
  * caller invokes only after the game has executed the record.
+ *
+ * <p>Inbound pressure ranking (13.12). With a ranking, the pump registers the connection at construction,
+ * reports every byte read from the peer as progress, keeps the ranking's retained bytes equal to the
+ * connection's excess-pool charge after every change it makes, runs a refused wait while a CONTROL record
+ * waits for excess, and unregisters the connection in {@link #cancel()}. The inbound excess pool picks its
+ * shed victims by that ranking. A grant the pool makes on another connection's release is reported when this
+ * pump next polls it.
  *
  * <p>Not thread-safe; owned by the connection's receive path. This class is not wired into the live
  * receive path yet (the U8f cutover does that).
@@ -64,6 +74,8 @@ public final class SessionReadPump {
     private final ByteSource source;
     private final Lane control;
     private final Lane realtime;
+    private final PressureRanking ranking;
+    private final LongSupplier clock;
     private boolean inflaterCharged;
     private Inflater inflater;
     private int inflations;
@@ -87,9 +99,28 @@ public final class SessionReadPump {
     public SessionReadPump(ServerReadPartition partition, ResourcePools pools, InboundExcessPool excess,
                            Object owner, Object ip, Object account, RouteV2.ServerboundLimits limits,
                            boolean compressed, ByteSource source) {
+        this(partition, pools, excess, owner, ip, account, limits, compressed, source, null, null);
+    }
+
+    /**
+     * Creates the pump for one session and registers the connection with the inbound pressure ranking.
+     *
+     * @param ranking the inbound pressure ranking the excess pool picks victims by, or null for none
+     * @param clock monotonic nanosecond clock for the ranking; required with a ranking
+     * @throws IllegalArgumentException with a ranking but no clock, or an {@code ip} that is not an
+     *     {@link InetAddress}
+     * @see #SessionReadPump(ServerReadPartition, ResourcePools, InboundExcessPool, Object, Object, Object,
+     *     RouteV2.ServerboundLimits, boolean, ByteSource)
+     */
+    public SessionReadPump(ServerReadPartition partition, ResourcePools pools, InboundExcessPool excess,
+                           Object owner, Object ip, Object account, RouteV2.ServerboundLimits limits,
+                           boolean compressed, ByteSource source, PressureRanking ranking, LongSupplier clock) {
         if (partition == null || pools == null || excess == null || owner == null || ip == null
                 || limits == null || source == null) {
             throw new NullPointerException("session read pump argument");
+        }
+        if (ranking != null && (clock == null || !(ip instanceof InetAddress))) {
+            throw new IllegalArgumentException("an inbound ranking needs a clock and an InetAddress");
         }
         this.partition = partition;
         this.pools = pools;
@@ -108,6 +139,13 @@ public final class SessionReadPump {
         }
         this.control = new Lane(LogicalStream.CONTROL);
         this.realtime = new Lane(LogicalStream.REALTIME);
+        this.ranking = ranking;
+        this.clock = clock;
+        if (ranking != null) {
+            // TODO(U9): pass the login identity once it is plumbed; account is null until then.
+            ranking.connect(owner, (InetAddress) ip, account instanceof String ? (String) account : null,
+                    clock.getAsLong());
+        }
     }
 
     /**
@@ -147,6 +185,10 @@ public final class SessionReadPump {
             lane.excessWaiting = false;
         }
         excess.cancel(owner);
+        if (ranking != null) {
+            ranking.endRefusedWait(owner);
+            ranking.disconnect(owner, clock.getAsLong());
+        }
         if (inflater != null) {
             inflater.end();
             inflater = null;
@@ -229,6 +271,7 @@ public final class SessionReadPump {
                 return;
             }
             if (got > grant) throw new IllegalStateException("byte source returned more than was requested");
+            if (ranking != null) ranking.progress(owner, got, clock.getAsLong());
             lane.staged = true;
             record = lane.decoder.next(ByteBuffer.wrap(target, off, got));
         }
@@ -289,6 +332,7 @@ public final class SessionReadPump {
         if (lane.excessWaiting) {
             if (excess.reserved(owner) != footprint) return false; // still queued
             lane.excessWaiting = false;
+            if (ranking != null) ranking.endRefusedWait(owner);
         } else {
             boolean granted;
             try {
@@ -300,10 +344,12 @@ public final class SessionReadPump {
             }
             if (!granted) {
                 lane.excessWaiting = true;
+                if (ranking != null) ranking.beginRefusedWait(owner, clock.getAsLong());
                 return false;
             }
         }
         lane.excessCharge = footprint;
+        retained();
         return true;
     }
 
@@ -333,10 +379,16 @@ public final class SessionReadPump {
         if (unit.excessBytes > 0) {
             excess.release(owner, surplus);
             unit.excessBytes -= surplus;
+            retained();
         } else {
             partition.release(unit.lane.stream, (int) surplus);
             unit.partitionBytes -= surplus;
         }
+    }
+
+    /** Reports the connection's current excess-pool charge to the inbound ranking. */
+    private void retained() {
+        if (ranking != null) ranking.setRetained(owner, excess.reserved(owner), clock.getAsLong());
     }
 
     private static byte[] slice(Record record, int from, int to) {
@@ -467,9 +519,11 @@ public final class SessionReadPump {
             if (closed) return;
             closed = true;
             if (partitionBytes > 0) partition.release(lane.stream, (int) partitionBytes);
-            if (excessBytes > 0) excess.release(SessionReadPump.this.owner, excessBytes);
+            boolean excessReleased = excessBytes > 0;
+            if (excessReleased) excess.release(SessionReadPump.this.owner, excessBytes);
             partitionBytes = 0;
             excessBytes = 0;
+            if (excessReleased) retained();
             if (lane.held == this) lane.held = null;
         }
 
