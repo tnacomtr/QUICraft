@@ -1211,13 +1211,33 @@ before this revision can run.
    `lane`/`ack_join`/`batch_join`), `position`, and `epoch_change` (boolean).
    Position is `null` or the name of a reviewed per-version extractor. `extractors` maps
    names to versioned adapter decoder identifiers; these are a closed allowlist, not executable
-   scripts or heuristic offsets. Each implementation supplies golden packet bytes for every
-   identifier, including negative coordinates and malformed input. All entries/identifiers
-   are covered by R; no unversioned decoder choice or external file changes routing semantics.
-   An extractor returns one signed-32-bit chunk (x,z), a bounded list for multi-chunk packets,
-   or the special `join` result for joins with no position. Block positions use mathematical
-   floor division by 16, section positions their chunk x/z. Lists obey the game's packet
-   size/count bounds; multi-chunk packets use CONTROL/global, not single-shard guessing.
+   scripts or heuristic offsets. Identifiers come in two families: `primitive.*` names are
+   synthetic complete-layout test identifiers, and a shipped resource may name only
+   production-reviewed identifiers of the form `mc775.<layout>.v1`, which the production load
+   path alone accepts. Review evidence for a production identifier is a checked-in captured
+   vector: the uncompressed id+body bytes of a real packet, captured between decompression and
+   the game's decoder on the live client, together with the position/list the game itself
+   reports for that same packet, the live packet name and id, and the command that produced
+   the capture. Every identifier also has golden packet bytes from an independent oracle,
+   covering negative coordinates, boundaries, malformed input and truncation. All
+   entries/identifiers are covered by R; no unversioned decoder choice or external file
+   changes routing semantics.
+   An extractor consumes the leading fields of the uncompressed packet and nothing else: the
+   packet id, then exactly its layout's fields. Bytes after those fields are the rest of the
+   real packet and are ignored; a packet too short to supply the fields, a negative id, a
+   noncanonical or overflowing VarInt, and a malformed list count or length are rejected. An
+   extractor never scans for its fields, never rewrites the packet and never reads past a
+   declared length. It returns one signed-32-bit chunk (x,z), a bounded list for multi-chunk
+   packets, or the `join` result for joins with no position, whose layout is its id alone: a
+   join's body is never inspected, so a join packet of any body length is in contract. Block
+   positions use mathematical floor division by 16, section positions their chunk x/z.
+   A chunk list is a VarInt count, then that many entries, each a packed ChunkPos (x in the
+   low 32 bits, z in the high 32, big-endian), a VarInt payload length and that many payload
+   bytes; the extractor returns the entries' chunk coordinates and skips the payloads. Its
+   count bound is derived from this section's record cap, not chosen: a record of at most
+   2097208 bytes cannot carry more than 233023 entries (eight bytes of position plus at least
+   one byte of length each), and a larger count is refused before anything is allocated for
+   it. Multi-chunk packets use CONTROL/global, not single-shard guessing.
    Require a single-position extractor for ordinary chunk routes, `join` for chunk joins,
    null for other routes except globally routed multi-chunk packets. `lane` is REALTIME or
    chunk only; global/view/control/interaction/ordinary are CONTROL only; joins are chunk only.
