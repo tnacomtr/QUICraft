@@ -1144,11 +1144,21 @@ position extraction. Those implementations must change together before this revi
    Kind 0 GAME has exactly one Minecraft length-prefixed frame, including id and negotiated
    compression wrapper, without CFB8. Kind 1 END has empty body and is CONTROL/global only.
    Kinds 2 ACK_JOIN and 3 BATCH_JOIN carry one ordinary GAME frame of the designated packet
-   type (13.19), on a chunk stream only. Reject other kinds and trailing/invalid inner bytes.
+   type (13.19), on a chunk stream only. Kind 4 BUNDLE_OPEN is clientbound CONTROL only (13.15):
+   its body is `VarInt(unit_records) || VarInt(unit_wire_bytes) || one GAME frame`, where the
+   frame is the bundle's opening delimiter, encoded as in kind 0. `unit_records` counts every
+   record of the unit, opener and closer included, and must be 2..128. `unit_wire_bytes` is the
+   total wire size of all those records, outer length prefixes included, and must be at most
+   B = 2 MiB + 128 and at least the opener's own wire size. The members and the closer are
+   ordinary kind 0 GAME records that follow on CONTROL, consecutive, with no other record between
+   them. Reject kind 4 on REALTIME, a CHUNK stream, or serverbound (0x11). The unit fields are the
+   only addition to the body, so the header maximum is unchanged.
    Length excludes its own prefix. Header maximum is 54 bytes (1+5+5+1+7*6);
-   body maximum is 2097154 (three-byte length plus at most 2097151 content bytes).
-   Reject `record_length > 2097208` before allocating. Including the outer prefix, no
-   record exceeds 2097212 bytes. A low-sequence, low-epoch, zero-explicit-dependency record
+   body maximum is 2097154 (three-byte length plus at most 2097151 content bytes); a kind 4 body
+   adds its two unit VarInts (at most five bytes each) before the frame.
+   Reject `record_length > 2097208` before allocating, for every kind including 4, so a kind 4
+   opener's frame is bounded by that cap too (its delimiter is an empty packet in practice).
+   Including the outer prefix, no record exceeds 2097212 bytes. A low-sequence, low-epoch, zero-explicit-dependency record
    has a four-byte header, five bytes including a one-byte length; one small dependency
    adds two bytes. The ~5-byte target is not a constant-size or long-session claim.
 5. **13.5 Scoped CONTROL semantics.** CONTROL stays ordered, but is not itself a fence kind.
@@ -1400,6 +1410,11 @@ position extraction. Those implementations must change together before this revi
     applies at a time; all copies and decoder scratch must fit this workspace or fail closed.
     Worst application-held data is therefore 24 MiB + 1 KiB, not 16 MiB; allocations are lazy.
     Do not decompress other heads while the execution workspace is occupied.
+    A bundle opener (kind 4, 13.4) is admitted as a whole unit from its own declaration: its
+    unit_wire_bytes and unit_records are charged to the CONTROL slot at the opener, and the
+    stream reads the following kind 0 members and closer into that same slot until the declared
+    count is reached, with no commit in between. The declared bytes and the declared count must
+    both match what arrives exactly; a shortfall or excess in either closes `0x11`.
     **Progress argument:** all edges point backward in logical send order. Among pending
     stream heads there is an earliest unit whose prerequisites are already applied or earlier
     heads. Every stream has room to finish receiving its head even when every other slot is
@@ -1450,9 +1465,10 @@ position extraction. Those implementations must change together before this revi
      inner length and compression Data Length prefixes using P, with read grants limited
       to those prefix bytes until the declaration is known. Prefix staging ALWAYS comes
       from a fixed reserved slice of P, never the excess pool. Reserve 160 bytes of P for
-      staged prefixes and their read/parser copies (74 bytes per lane: a 5-byte record_length
-      VarInt plus the 69-byte prefix window of a 54-byte header and three at-most-5-byte lengths;
-      two lanes = 148 bytes, within 160; the prefix is parsed in place, with no body copy);
+      staged prefixes and their read/parser copies (79 bytes per lane: a 5-byte record_length
+      VarInt plus the 74-byte prefix window of a 54-byte header and four at-most-5-byte lengths
+      (the inner length, a kind 4 opener's unit_records and unit_wire_bytes, and the Data Length);
+      two lanes = 158 bytes, within 160; the prefix is parsed in place, with no body copy);
       validate this bound against the reviewed envelope/length encodings before enablement.
         The REALTIME 2 KiB parse/output-copy slice is also partitioned within P, never lent to
        CONTROL, so a CONTROL head waiting on REALTIME cannot consume it.
@@ -1855,6 +1871,9 @@ position extraction. Those implementations must change together before this revi
     bundle, validates the strongest member policy before execution, and commits the closing
     watermark only after applying the complete bundle atomically to the game's bundle handler.
     A missing close after 10 seconds, nested delimiter or policy violation closes `0x11`.
+    The clientbound opener is kind 4 (13.4), so the receiver knows the bundle's record count and
+    total wire size from the opener itself, before any member arrives; that declaration is what
+    13.12 admits and reserves, and the count and byte total are enforced exactly.
     These bundle buffering limits apply clientbound. Serverbound records remain bounded by
     the game's serverbound packet limits and the single-record admission rules in 13.12.
 16. **13.16 Compression.** Compression remains per Minecraft packet, not a shared compressed
