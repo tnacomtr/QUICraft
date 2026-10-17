@@ -52,10 +52,17 @@ public final class LaneLoopback implements AutoCloseable {
     public final CompletableFuture<Integer> serverSawClose;
     /** The application error code the client's connection saw the server close with. */
     public final CompletableFuture<Integer> clientSawClose;
+    /** The reason phrase of the client's application close, as the server's connection saw it. */
+    public final CompletableFuture<byte[]> serverSawReason;
+    /** The reason phrase of the server's application close, as the client's connection saw it. */
+    public final CompletableFuture<byte[]> clientSawReason;
 
     private LaneLoopback(EventLoopGroup group, Channel serverUdp, Channel clientUdp, QuicChannel clientConnection,
             CompletableFuture<QuicChannel> serverConnection, CompletableFuture<Integer> serverSawClose,
-            CompletableFuture<Integer> clientSawClose) {
+            CompletableFuture<Integer> clientSawClose, CompletableFuture<byte[]> serverSawReason,
+            CompletableFuture<byte[]> clientSawReason) {
+        this.serverSawReason = serverSawReason;
+        this.clientSawReason = clientSawReason;
         this.group = group;
         this.serverUdp = serverUdp;
         this.clientUdp = clientUdp;
@@ -71,6 +78,8 @@ public final class LaneLoopback implements AutoCloseable {
         CompletableFuture<QuicChannel> serverConnection = new CompletableFuture<>();
         CompletableFuture<Integer> serverSaw = new CompletableFuture<>();
         CompletableFuture<Integer> clientSaw = new CompletableFuture<>();
+        CompletableFuture<byte[]> serverReason = new CompletableFuture<>();
+        CompletableFuture<byte[]> clientReason = new CompletableFuture<>();
         try {
             QuicServerCodecBuilder server = Codecs.apply(new QuicServerCodecBuilder(), options.server, true);
             if (options.serverMaxStreamsBidi >= 0) {
@@ -87,7 +96,7 @@ public final class LaneLoopback implements AutoCloseable {
                     .handler(new ChannelInitializer<QuicChannel>() {
                         @Override
                         protected void initChannel(QuicChannel ch) {
-                            ch.pipeline().addLast(closeWatch(serverSaw));
+                            ch.pipeline().addLast(closeWatch(serverSaw, serverReason));
                             serverConnection.complete(ch);
                         }
                     })
@@ -116,7 +125,7 @@ public final class LaneLoopback implements AutoCloseable {
             Channel clientUdp = new Bootstrap().group(group).channel(NioDatagramChannel.class)
                     .handler(clientCodec).bind(0).sync().channel();
             QuicChannel clientConnection = QuicChannel.newBootstrap(clientUdp)
-                    .handler(closeWatch(clientSaw))
+                    .handler(closeWatch(clientSaw, clientReason))
                     .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
                         @Override
                         protected void initChannel(QuicStreamChannel stream) {
@@ -127,20 +136,28 @@ public final class LaneLoopback implements AutoCloseable {
                     })
                     .remoteAddress(serverUdp.localAddress()).connect().get(10, TimeUnit.SECONDS);
             return new LaneLoopback(group, serverUdp, clientUdp, clientConnection, serverConnection,
-                    serverSaw, clientSaw);
+                    serverSaw, clientSaw, serverReason, clientReason);
         } catch (Throwable t) {
             group.shutdownGracefully(0, 0, TimeUnit.SECONDS);
             throw t;
         }
     }
 
-    private static ChannelInboundHandlerAdapter closeWatch(CompletableFuture<Integer> seen) {
+    private static ChannelInboundHandlerAdapter closeWatch(CompletableFuture<Integer> seen,
+            CompletableFuture<byte[]> reason) {
         return new ChannelInboundHandlerAdapter() {
             @Override
             public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
                 if (evt instanceof QuicConnectionCloseEvent) {
                     QuicConnectionCloseEvent close = (QuicConnectionCloseEvent) evt;
                     seen.complete(close.isApplicationClose() ? close.error() : -1);
+                    byte[] phrase;
+                    try {
+                        phrase = close.reason();
+                    } catch (NullPointerException none) {
+                        phrase = null; // Netty's reason() clones a null phrase
+                    }
+                    reason.complete(phrase == null ? new byte[0] : phrase.clone());
                 }
                 ctx.fireUserEventTriggered(evt);
             }

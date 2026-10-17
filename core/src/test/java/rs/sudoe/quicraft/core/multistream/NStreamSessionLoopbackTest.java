@@ -1,0 +1,392 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package rs.sudoe.quicraft.core.multistream;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
+import io.netty.handler.codec.quic.QuicStreamChannel;
+import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import rs.sudoe.quicraft.core.CloseReason;
+import rs.sudoe.quicraft.core.resource.ResourcePools.Pool;
+import rs.sudoe.quicraft.core.routing.ProtocolState;
+import rs.sudoe.quicraft.core.transport.LaneLoopback;
+
+/**
+ * The N+2 session end to end over loopback QUIC (docs/protocol.md 13.3-13.20): stream layout and shard mapping
+ * for every N, fail-closed routing, the REALTIME slice, stream faults, close reasons, END, shedding and the
+ * outbound charge's release point.
+ */
+@Timeout(value = 120, unit = TimeUnit.SECONDS)
+class NStreamSessionLoopbackTest {
+    private static final int CLOSE_ORDERING = 0x11;
+    private static final int CLOSE_RESOURCE = 0x12;
+
+    private static LaneRig.Closed closed(NRig.Game game) throws Exception {
+        return game.closed.get(15, TimeUnit.SECONDS);
+    }
+
+    private static int shardStream(int x, int z, int n) {
+        return 2 + ShardHash.shardOf(x, z, 0, n);
+    }
+
+    @Test
+    void nStreamsRoundTripForEveryNegotiatedN() throws Exception {
+        for (int n = 1; n <= LogicalStream.MAX_CHUNKS; n++) {
+            try (NRig rig = NRig.start(n)) {
+                rig.activateBoth();
+                SessionContext context = SessionContext.of(n);
+                for (int i = 0; i < n + 2; i++) {
+                    assertEquals(context.quicIdOf(i), NRig.channel(rig.server, i).streamId(), "server stream " + i);
+                    assertEquals(context.quicIdOf(i), NRig.channel(rig.client, i).streamId(), "client stream " + i);
+                }
+                rig.server.send(ProtocolState.PLAY, NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "c"));
+                rig.server.send(ProtocolState.PLAY, NRig.REALTIME_ID, NRig.frame(NRig.REALTIME_ID, "r"));
+                Set<Integer> expectedShards = new HashSet<Integer>();
+                int chunks = 0;
+                for (int x = -4; x < 4; x++) {
+                    for (int z = -2; z < 2; z++) {
+                        rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(x, z, x + "," + z),
+                                NRig.chunkUncompressed(x, z));
+                        expectedShards.add(shardStream(x, z, n));
+                        chunks++;
+                    }
+                }
+                rig.client.send(ProtocolState.PLAY, NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "sc"));
+                rig.client.send(ProtocolState.PLAY, NRig.REALTIME_ID, NRig.frame(NRig.REALTIME_ID, "sr"));
+                int total = chunks + 2;
+                assertTrue(LaneRig.await(() -> rig.clientGame.packets().size() == total, 15_000),
+                        "n=" + n + " client got " + rig.clientGame.packets().size() + " of " + total);
+                assertTrue(LaneRig.await(() -> rig.serverGame.packets().size() == 2, 15_000), "n=" + n);
+                Set<Integer> usedShards = new HashSet<Integer>();
+                for (NRig.Got got : rig.clientGame.units()) {
+                    NRig.Pkt pkt = (NRig.Pkt) got.packets.get(0);
+                    int expected = pkt.id == NRig.CHUNK_ID ? shardStream(pkt.x, pkt.z, n)
+                            : pkt.id == NRig.REALTIME_ID ? LogicalStream.REALTIME : LogicalStream.CONTROL;
+                    assertEquals(expected, got.stream, "n=" + n + " " + got);
+                    if (pkt.id == NRig.CHUNK_ID) {
+                        usedShards.add(got.stream);
+                    }
+                }
+                assertEquals(expectedShards, usedShards, "n=" + n);
+                for (NRig.Got got : rig.serverGame.units()) {
+                    NRig.Pkt pkt = (NRig.Pkt) got.packets.get(0);
+                    assertEquals(pkt.id == NRig.REALTIME_ID ? LogicalStream.REALTIME : LogicalStream.CONTROL,
+                            got.stream, "n=" + n + " " + got);
+                }
+                assertFalse(rig.clientGame.closed.isDone(), "n=" + n);
+                assertFalse(rig.serverGame.closed.isDone(), "n=" + n);
+            }
+        }
+    }
+
+    @Test
+    void chunkRouteWithoutPositionFailsClosed() throws Exception {
+        byte[][] uncompressed = {null, {(byte) NRig.CHUNK_ID, 0, 0, 0, 1}};
+        for (byte[] bytes : uncompressed) {
+            try (NRig rig = NRig.start(2)) {
+                rig.activateBoth();
+                SentPacket handle = rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(1, 1, "x"),
+                        bytes);
+                assertFalse(handle.isAssigned());
+                assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code);
+                assertEquals(CLOSE_ORDERING, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
+                assertEquals(0, rig.clientGame.count(NRig.CHUNK_ID));
+            }
+        }
+    }
+
+    @Test
+    void joinRouteThroughPlainSendFailsClosed() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            SentPacket handle = rig.server.send(ProtocolState.PLAY, NRig.JOIN_ID, NRig.frame(NRig.JOIN_ID, "j"),
+                    new byte[] {(byte) NRig.JOIN_ID});
+            assertFalse(handle.isAssigned());
+            assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code);
+            assertEquals(CLOSE_ORDERING, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
+            assertEquals(0, rig.clientGame.count(NRig.JOIN_ID));
+        }
+    }
+
+    @Test
+    void realtimeUsesItsSliceWhileAChunkWaits() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            SessionResources res = rig.config.serverResources;
+            Object other = new Object();
+            InetAddress otherIp = InetAddress.getByName("10.0.0.1");
+            long free = res.node().limit(Pool.OUTBOUND) - res.node().reserved(Pool.OUTBOUND);
+            long ticket = res.outbound().reserveProtectedTicket(other, otherIp, null, free - 1024);
+            assertTrue(res.outbound().takeGrant(ticket), "the filler is granted");
+            rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(3, 4, repeat('k', 4096)),
+                    NRig.chunkUncompressed(3, 4));
+            rig.server.send(ProtocolState.PLAY, NRig.REALTIME_ID, NRig.frame(NRig.REALTIME_ID, "move"));
+            assertTrue(LaneRig.await(() -> rig.clientGame.count(NRig.REALTIME_ID) == 1, 10_000));
+            Thread.sleep(200);
+            assertEquals(0, rig.clientGame.count(NRig.CHUNK_ID), "the chunk waits for pool bytes");
+            res.outbound().cancel(other);
+            res.wakeWaiters();
+            assertTrue(LaneRig.await(() -> rig.clientGame.count(NRig.CHUNK_ID) == 1, 10_000));
+            assertFalse(rig.clientGame.closed.isDone());
+        }
+    }
+
+    private enum Fault { RESET, FIN, STOP }
+
+    @Test
+    void everyStreamResetFinStopAndMissingPreambleClosesSession() throws Exception {
+        int n = 2;
+        for (int index = 0; index < n + 2; index++) {
+            for (Fault fault : Fault.values()) {
+                try (NRig rig = NRig.start(n)) {
+                    rig.activateBoth();
+                    // CONTROL and REALTIME are tested in the client-to-server direction, CHUNK server to client.
+                    boolean chunk = index >= 2;
+                    NStreamSession writer = chunk ? rig.server : rig.client;
+                    NStreamSession reader = chunk ? rig.client : rig.server;
+                    QuicStreamChannel w = NRig.channel(writer, index);
+                    QuicStreamChannel r = NRig.channel(reader, index);
+                    if (fault == Fault.RESET) {
+                        w.shutdownOutput(7);
+                    } else if (fault == Fault.FIN) {
+                        w.shutdownOutput();
+                    } else {
+                        r.shutdownInput(7);
+                    }
+                    // Traffic on the faulted stream, so a writer that only learns of it by writing does.
+                    for (int i = 0; i < 4; i++) {
+                        if (chunk) {
+                            int x = 0;
+                            while (shardStream(x, 0, n) != index) {
+                                x++;
+                            }
+                            writer.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(x, 0, "f"),
+                                    NRig.chunkUncompressed(x, 0));
+                        } else {
+                            int id = index == LogicalStream.CONTROL ? NRig.CONTROL_ID : NRig.REALTIME_ID;
+                            writer.send(ProtocolState.PLAY, id, NRig.frame(id, "f"));
+                        }
+                        Thread.sleep(20);
+                    }
+                    String what = fault + " on logical stream " + index;
+                    assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code, what);
+                    assertEquals(CLOSE_ORDERING, closed(rig.clientGame).code, what);
+                }
+            }
+        }
+        // A wrong preamble on the client's REALTIME.
+        NRig.Config config = new NRig.Config();
+        config.clientSession = false;
+        try (NRig rig = NRig.start(config)) {
+            rig.activateServer();
+            QuicStreamChannel realtime = rig.net.clientStream();
+            assertEquals(4, realtime.streamId());
+            LaneLoopback.write(realtime, (byte) 2, (byte) 2);
+            assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code);
+            assertEquals(CLOSE_ORDERING, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
+        }
+        // REALTIME never opened: the server's open timeout.
+        config = new NRig.Config();
+        config.clientSession = false;
+        config.serverTiming = NRig.timing(50, 300);
+        try (NRig rig = NRig.start(config)) {
+            rig.activateServer();
+            assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code);
+            assertEquals(CLOSE_ORDERING, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
+        }
+        // No CHUNK stream ever opened: the client's open timeout.
+        config = new NRig.Config();
+        config.serverSession = false;
+        config.clientTiming = NRig.timing(50, 300);
+        try (NRig rig = NRig.start(config)) {
+            rig.activateClient();
+            assertEquals(CLOSE_ORDERING, closed(rig.clientGame).code);
+            assertEquals(CLOSE_ORDERING, (int) rig.net.serverSawClose.get(15, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void resourceReasonReachesPeer() throws Exception {
+        // Generic: the client's decoded output can never fit its execution workspace.
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            rig.clientGame.decodeReserveBytes = 1L << 40;
+            rig.server.send(ProtocolState.PLAY, NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "big"));
+            assertEquals(CLOSE_RESOURCE, closed(rig.clientGame).code);
+            assertEquals(CLOSE_RESOURCE, (int) rig.net.serverSawClose.get(15, TimeUnit.SECONDS));
+            assertArrayEquals("resource".getBytes(StandardCharsets.US_ASCII),
+                    rig.net.serverSawReason.get(15, TimeUnit.SECONDS));
+        }
+        // Classified: a chunk waits past its deadline for a CONTROL prerequisite the client never saw.
+        AtomicLong clientClock = new AtomicLong(System.nanoTime());
+        NRig.Config config = new NRig.Config();
+        config.clientTiming = new LaneSession.Timing(clientClock::get, TimeUnit.SECONDS.toNanos(3600),
+                TimeUnit.SECONDS.toNanos(10), TimeUnit.SECONDS.toNanos(3600));
+        try (NRig rig = NRig.start(config)) {
+            rig.activateBoth();
+            // The VIEW record is written (so the chunk behind it is ready) but its bytes never leave.
+            Captor captor = new Captor();
+            NRig.onLoop(rig.server, () -> rig.server.channelOf(LogicalStream.CONTROL).pipeline().addFirst(captor));
+            SentPacket view = rig.server.send(ProtocolState.PLAY, NRig.VIEW_ID, NRig.frame(NRig.VIEW_ID, "view"));
+            assertTrue(view.isAssigned());
+            rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(0, 0, "after view"),
+                    NRig.chunkUncompressed(0, 0), view);
+            assertTrue(LaneRig.await(() -> captor.size() > 0, 10_000), "the VIEW record was written");
+            for (int i = 0; i < 50 && !rig.clientGame.closed.isDone(); i++) {
+                Thread.sleep(100);
+                clientClock.addAndGet(TimeUnit.SECONDS.toNanos(11));
+                NRig.onLoop(rig.client, () -> {
+                    rig.client.tick();
+                    return null;
+                });
+            }
+            assertEquals(CLOSE_RESOURCE, closed(rig.clientGame).code);
+            assertEquals(CLOSE_RESOURCE, (int) rig.net.serverSawClose.get(15, TimeUnit.SECONDS));
+            assertArrayEquals(CloseReason.UNSEEN_PREREQUISITE, rig.net.serverSawReason.get(15, TimeUnit.SECONDS));
+            assertEquals(0, rig.clientGame.count(NRig.CHUNK_ID));
+        }
+    }
+
+    @Test
+    void endDrainsAllShardsAndClosesNormally() throws Exception {
+        int n = 4;
+        try (NRig rig = NRig.start(n)) {
+            rig.activateBoth();
+            int chunks = 0;
+            for (int x = 0; x < 8; x++) {
+                for (int z = 0; z < 5; z++) {
+                    rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(x, z, repeat('e', 1024)),
+                            NRig.chunkUncompressed(x, z));
+                    chunks++;
+                }
+            }
+            rig.server.end();
+            LaneRig.Closed client = closed(rig.clientGame);
+            assertEquals(0, client.code);
+            assertEquals(chunks, rig.clientGame.count(NRig.CHUNK_ID), "every shard drained before END");
+            assertEquals(0, closed(rig.serverGame).code);
+            assertEquals(0, (int) rig.net.serverSawClose.get(15, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void shedVictimClosesWith0x12() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            SessionResources res = rig.config.serverResources;
+            long baseline = res.outbound().reserved(rig.server);
+            for (int i = 2; i < 4; i++) {
+                rig.server.holdWrites(i, true);
+            }
+            rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(1, 1, repeat('s', 65536)),
+                    NRig.chunkUncompressed(1, 1));
+            assertTrue(LaneRig.await(() -> res.outbound().reserved(rig.server) > baseline + 65536, 10_000),
+                    "the held chunk is charged");
+            Object other = new Object();
+            long free = res.node().limit(Pool.OUTBOUND) - res.node().reserved(Pool.OUTBOUND);
+            long ticket = res.outbound().reserveTicket(other, InetAddress.getByName("10.0.0.2"), null,
+                    free + 32768);
+            assertFalse(res.outbound().takeGrant(ticket), "the request needs a victim");
+            res.dispatchShed();
+            assertEquals(CLOSE_RESOURCE, closed(rig.serverGame).code);
+            assertEquals(CLOSE_RESOURCE, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
+            assertArrayEquals("resource".getBytes(StandardCharsets.US_ASCII),
+                    rig.net.clientSawReason.get(15, TimeUnit.SECONDS));
+            assertTrue(LaneRig.await(() -> res.outbound().takeGrant(ticket), 10_000),
+                    "the victim's bytes go to the requester once its close is confirmed");
+            assertEquals(0, res.outbound().reserved(rig.server));
+        }
+    }
+
+    @Test
+    void outboundChargeHeldUntilWriteCompletes() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            SessionResources res = rig.config.serverResources;
+            long baseline = res.outbound().reserved(rig.server);
+            int stream = shardStream(5, 5, 2);
+            Captor captor = new Captor();
+            NRig.onLoop(rig.server, () -> rig.server.channelOf(stream).pipeline().addFirst(captor));
+            rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(5, 5, repeat('w', 16384)),
+                    NRig.chunkUncompressed(5, 5));
+            assertTrue(LaneRig.await(() -> captor.size() > 0, 10_000), "the chunk's write reached the channel");
+            Thread.sleep(200);
+            assertTrue(res.outbound().reserved(rig.server) > baseline + 16384,
+                    "the charge stays while the write is pending: " + res.outbound().reserved(rig.server));
+            NRig.onLoop(rig.server, () -> {
+                captor.release();
+                return null;
+            });
+            assertTrue(LaneRig.await(() -> res.outbound().reserved(rig.server) == baseline, 10_000),
+                    "the charge is released once the write completes");
+            assertTrue(LaneRig.await(() -> rig.clientGame.count(NRig.CHUNK_ID) == 1, 10_000));
+        }
+    }
+
+    /** Holds every outbound write until {@link #release}; after that it passes writes through. */
+    private static final class Captor extends ChannelOutboundHandlerAdapter {
+        private final List<Object[]> held = new ArrayList<Object[]>();
+        private ChannelHandlerContext ctx;
+        private boolean open;
+
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) {
+            this.ctx = ctx;
+        }
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+            if (open) {
+                ctx.write(msg, promise);
+                return;
+            }
+            synchronized (held) {
+                held.add(new Object[] {msg, promise});
+            }
+        }
+
+        @Override
+        public void flush(ChannelHandlerContext ctx) {
+            if (open) {
+                ctx.flush();
+            }
+        }
+
+        int size() {
+            synchronized (held) {
+                return held.size();
+            }
+        }
+
+        void release() {
+            open = true;
+            synchronized (held) {
+                for (Object[] w : held) {
+                    ctx.write(w[0], (ChannelPromise) w[1]);
+                }
+                held.clear();
+            }
+            ctx.flush();
+        }
+    }
+
+    private static String repeat(char c, int count) {
+        char[] chars = new char[count];
+        java.util.Arrays.fill(chars, c);
+        return new String(chars);
+    }
+}
