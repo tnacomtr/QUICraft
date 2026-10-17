@@ -180,6 +180,13 @@ public final class ClientReadPump {
                     && record.sequence() != pending.seen.get(pending.seen.size() - 1).sequence() + 1) {
                 throw bundleError("bundle record sequence " + record.sequence() + " is not consecutive");
             }
+            // Members share the opener's epoch and carry no external dependencies: those attach to the opener.
+            if (!pending.seen.isEmpty() && record.epoch() != pending.seen.get(0).epoch()) {
+                throw bundleError("bundle member epoch " + record.epoch() + " differs from the opener's");
+            }
+            if (!pending.seen.isEmpty() && !record.dependencies().isEmpty()) {
+                throw bundleError("bundle member carries " + record.dependencies().size() + " dependencies");
+            }
             pending.seen.add(record);
             if (pending.seen.size() < pending.records) return;
             if (pending.consumed != pending.wireBytes) {
