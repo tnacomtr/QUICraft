@@ -34,6 +34,8 @@ public final class QuicStreamWriteSink {
     private final IntPredicate writable = this::isWritable;
     private final IntPredicate gate;
     private final Settled settled;
+    /** Test hook: runs on the loop after each poll returned a slice and before that slice is written. */
+    private volatile Runnable beforeWrite;
 
     /** Told after each slice's write future completed and the driver was told; on the event loop. */
     interface Settled {
@@ -101,6 +103,10 @@ public final class QuicStreamWriteSink {
             if (write == null) {
                 return;
             }
+            Runnable hook = beforeWrite;
+            if (hook != null) {
+                hook.run();
+            }
             write(write);
         }
     }
@@ -127,6 +133,11 @@ public final class QuicStreamWriteSink {
             }
             settled.settled(success);
         });
+    }
+
+    /** Installs or clears the poll-to-write test hook. */
+    void beforeWriteForTest(Runnable hook) {
+        beforeWrite = hook;
     }
 
     private boolean isWritable(int stream) {

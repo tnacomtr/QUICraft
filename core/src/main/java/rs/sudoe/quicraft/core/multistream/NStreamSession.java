@@ -61,9 +61,12 @@ import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
  * record; after it is written the session lingers, then closes 0x0 itself if the peer has not closed first.
  *
  * <p>Threading. Stream setup, receive, writes, ticks and closes run on the connection's event loop. Outbound
- * submissions, including the ACK_JOIN and BATCH_JOIN passthroughs, go straight to the synchronized send driver
- * on the caller's thread, so their handles and answers are available at once and their order is the call order;
- * the session then drains on the loop. A game acknowledgement is always queued onto the loop.
+ * submissions, including END and the ACK_JOIN and BATCH_JOIN passthroughs, go straight to the synchronized send
+ * driver on the caller's thread, so their handles and answers are available at once and their order is the call
+ * order; the session then drains on the loop. After END, or after a send failed closed, the driver refuses every
+ * further submission. A failure decided on a caller's thread never releases charges there: the driver only stops,
+ * and the close and the release run on the loop, after any slice it already polled was written. A game
+ * acknowledgement is always queued onto the loop.
  */
 public final class NStreamSession implements MultistreamSession {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -214,6 +217,9 @@ public final class NStreamSession implements MultistreamSession {
         this.preambles = new PreambleFilter();
         this.sendDriver = new SessionSendDriver(context, resources.profile(), resources.outbound(),
                 resources.outboundRanking(), this, ip, null, timing.clock, role == LaneSession.Role.CLIENT);
+        // Submissions run on callers' threads; a close they trigger only stops the driver, and its charges are
+        // returned by release() on the loop, serialized with polling and writes (13.12).
+        sendDriver.releaseOnOwnerClose();
         try {
             this.sink = new QuicStreamWriteSink(sendDriver, streams, this::writeAllowed, this::onSettled);
             StreamReceiver.Validator validator = new ShardValidator(shards);
@@ -414,14 +420,26 @@ public final class NStreamSession implements MultistreamSession {
         return handles;
     }
 
+    /**
+     * Assigns END at once on the caller's thread, like every other submission, so its place is the call order and
+     * the driver refuses every later submission from then on (13.14). The loop then drains up to END.
+     */
     @Override
     public void end() {
+        if (closed || refused) {
+            return;
+        }
+        SentPacket handle = sendDriver.submitEnd();
+        if (!handle.isAssigned()) {
+            // Already ended, sealed or closed: nothing new to drain beyond what is scheduled.
+            afterSubmit();
+            return;
+        }
         run(() -> {
-            if (closed || endSubmitted) {
+            if (closed) {
                 return;
             }
             endSubmitted = true;
-            sendDriver.submitEnd();
             drainNow();
         });
     }
@@ -725,8 +743,9 @@ public final class NStreamSession implements MultistreamSession {
         refusal = why;
         refused = true;
         LOG.log(Level.FINE, "13.6: an outbound packet cannot be routed, closing 0x11: {0}", why);
-        // Nothing more is written: the driver stops at once, on this thread.
-        sendDriver.close();
+        // The caller's thread only refuses further submissions. The close, the driver's shutdown and its charge
+        // release run on the loop, so they cannot land between the loop's poll of a slice and its write.
+        sendDriver.seal();
         run(() -> fail(CLOSE_ORDERING, NO_REASON, why, null));
     }
 
@@ -745,10 +764,13 @@ public final class NStreamSession implements MultistreamSession {
     }
 
     private void drainNow() {
-        if (closed || !activated) {
+        if (closed) {
             return;
         }
-        sink.drain();
+        // After a refusal nothing more is written; afterWork closes the session on this loop.
+        if (activated && !refused) {
+            sink.drain();
+        }
         afterWork();
     }
 
@@ -1074,6 +1096,10 @@ public final class NStreamSession implements MultistreamSession {
 
     SessionSendDriver sendDriver() {
         return sendDriver;
+    }
+
+    QuicStreamWriteSink sink() {
+        return sink;
     }
 
     // --- Handlers.

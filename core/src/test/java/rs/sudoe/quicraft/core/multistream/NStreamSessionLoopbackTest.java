@@ -292,6 +292,73 @@ class NStreamSessionLoopbackTest {
         }
     }
 
+    /** END is terminal: every later submission is refused on the caller's thread and nothing follows END (13.14). */
+    @Test
+    void sendsAfterEndAreRefusedAndNothingFollowsEnd() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            assertTrue(rig.server.send(ProtocolState.PLAY, NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "before"))
+                    .isAssigned());
+            rig.server.end();
+            assertFalse(rig.server.send(ProtocolState.PLAY, NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "after"))
+                    .isAssigned());
+            assertFalse(rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(1, 1, "after"),
+                    NRig.chunkUncompressed(1, 1)).isAssigned());
+            assertFalse(rig.server.send(ProtocolState.PLAY, NRig.REALTIME_ID, NRig.frame(NRig.REALTIME_ID, "after"))
+                    .isAssigned());
+            assertTrue(rig.server.sendBundle(new OutboundPacket(NRig.frame(NRig.BUNDLE_OPEN, "")),
+                    java.util.Collections.singletonList(new OutboundPacket(NRig.frame(NRig.CONTROL_ID, "after"))),
+                    new OutboundPacket(NRig.frame(NRig.BUNDLE_CLOSE, ""))).isEmpty());
+            assertFalse(rig.server.createAck(1, new byte[] {1}, 8));
+            assertFalse(rig.server.beginBatch(1, new OutboundPacket(NRig.frame(NRig.VIEW_ID, "after"))).isAssigned());
+            assertEquals(0, closed(rig.clientGame).code);
+            assertEquals(0, closed(rig.serverGame).code);
+            for (NRig.Pkt pkt : rig.clientGame.packets()) {
+                assertEquals("before", pkt.label, "only the record before END is delivered: " + pkt);
+            }
+            assertEquals(1, rig.clientGame.packets().size());
+        }
+    }
+
+    /**
+     * A caller-thread refusal lands between the loop's poll of a slice and its write. The refusal only stops new
+     * submissions: the polled slice keeps its charge until it is written, the close and the release run on the
+     * loop afterwards, and the pool's accounting for the connection returns to zero.
+     */
+    @Test
+    void callerRefusalBetweenPollAndWriteKeepsTheSliceCharged() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            SessionResources res = rig.config.serverResources;
+            java.util.concurrent.atomic.AtomicBoolean fired = new java.util.concurrent.atomic.AtomicBoolean();
+            AtomicLong atPoll = new AtomicLong(-1);
+            AtomicLong afterRefusal = new AtomicLong(-1);
+            rig.server.sink().beforeWriteForTest(() -> {
+                if (!fired.compareAndSet(false, true)) {
+                    return;
+                }
+                atPoll.set(res.outbound().reserved(rig.server));
+                Thread caller = new Thread(() -> rig.server.send(ProtocolState.PLAY, NRig.JOIN_ID,
+                        NRig.frame(NRig.JOIN_ID, "j"), new byte[] {(byte) NRig.JOIN_ID}));
+                caller.start();
+                try {
+                    caller.join(10_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                afterRefusal.set(res.outbound().reserved(rig.server));
+            });
+            rig.server.send(ProtocolState.PLAY, NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, repeat('p', 4096)));
+            assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code);
+            assertTrue(fired.get(), "the hook ran between a poll and its write");
+            assertTrue(atPoll.get() > 4096, "the polled slice was charged: " + atPoll.get());
+            assertEquals(atPoll.get(), afterRefusal.get(), "nothing was released between the poll and the write");
+            assertTrue(LaneRig.await(() -> res.outbound().reserved(rig.server) == 0, 10_000),
+                    "the pool's accounting returns to zero: " + res.outbound().reserved(rig.server));
+            assertEquals(0, res.outbound().reserved(rig.server));
+        }
+    }
+
     @Test
     void shedVictimClosesWith0x12() throws Exception {
         try (NRig rig = NRig.start(2)) {

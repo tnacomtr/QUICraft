@@ -65,6 +65,17 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * <p>Producer overflow closes with 0x12 (resource). A bundle that breaks a wire limit closes
  * locally with 0x11 and is never split. The clock is a monotonic nanosecond source.
  *
+ * <p>Terminal submissions (13.14). Once END is assigned, or the owner {@link #seal() seals} the driver after a
+ * refusal, every later submission is refused under the same monitor: submits, bundles, epoch transitions, the
+ * ACK_JOIN calls and the batch calls assign nothing, so nothing follows END on the wire. Records assigned before
+ * keep draining.
+ *
+ * <p>Deferred release. An owner that writes from one thread while submissions arrive on others can ask, through
+ * {@link #releaseOnOwnerClose()}, that a close decided inside a submission only stops the driver (nothing more is
+ * assigned or polled) and leaves the charges in place until the owner calls {@link #close()} from its writing
+ * thread. A slice already polled is then still charged when it is written, and the release stays serialized with
+ * polling and writes.
+ *
  * <p>Not thread-safe beyond its own monitor; the caller is the connection's single send path.
  */
 public final class SessionSendDriver {
@@ -213,6 +224,12 @@ public final class SessionSendDriver {
     private int queuedRecords;
     private long queuedBytes;
     private boolean closed;
+    /** True once {@link #close()} returned every charge; with deferred release this can trail {@code closed}. */
+    private boolean released;
+    /** True once END was assigned or the owner sealed the driver: no later submission is accepted (13.14). */
+    private boolean sealed;
+    /** True when a close decided inside the driver waits for the owner's {@link #close()} to release charges. */
+    private boolean deferRelease;
     private int closeCode;
 
     /**
@@ -316,6 +333,24 @@ public final class SessionSendDriver {
         return context;
     }
 
+    /**
+     * Defers the release of a close decided inside the driver to the owner's {@link #close()} (see the class
+     * javadoc). The driver still stops at once: nothing more is assigned or polled.
+     */
+    synchronized void releaseOnOwnerClose() {
+        deferRelease = true;
+    }
+
+    /** Refuses every later submission, as after END; records already assigned keep draining. */
+    public synchronized void seal() {
+        sealed = true;
+    }
+
+    /** Whether END was assigned or the driver was sealed, so no submission is accepted any more. */
+    public synchronized boolean isSealed() {
+        return sealed;
+    }
+
     /** Whether the driver has closed; a closed driver assigns nothing and writes nothing. */
     public synchronized boolean isClosed() {
         return closed;
@@ -354,7 +389,7 @@ public final class SessionSendDriver {
     public synchronized SentPacket submit(OutboundPacket packet, StreamSequencer.Fence fence, boolean interaction,
             int chunkX, int chunkZ, Record.Dependency... semantic) {
         SentPacket handle = new SentPacket();
-        if (closed) {
+        if (closed || sealed) {
             return handle;
         }
         byte[] frame = packet.frame();
@@ -378,12 +413,14 @@ public final class SessionSendDriver {
      */
     public synchronized SentPacket submitEnd() {
         SentPacket handle = new SentPacket();
-        if (closed) {
+        if (closed || sealed) {
             return handle;
         }
         settleAcksLocked();
         batches.abort();
         Record record = sequencer.assignEnd();
+        // Terminal under this monitor, together with the assignment: nothing is accepted after END.
+        sealed = true;
         if (!enqueueRecord(record, false)) {
             return handle;
         }
@@ -403,7 +440,7 @@ public final class SessionSendDriver {
      */
     public synchronized SentPacket submitEpochTransition(OutboundPacket packet) {
         SentPacket handle = new SentPacket();
-        if (closed) {
+        if (closed || sealed) {
             return handle;
         }
         if (overflows(1, packet.frame().length)) {
@@ -427,7 +464,7 @@ public final class SessionSendDriver {
      * A queue limit or a charge no cap can admit closes the driver with 0x12 instead.
      */
     public synchronized boolean createAck(long id, byte[] payload, int chargedBytes) {
-        if (closed || payload == null) {
+        if (closed || sealed || payload == null) {
             return false;
         }
         long now = clock.getAsLong();
@@ -458,26 +495,41 @@ public final class SessionSendDriver {
 
     /** Records an already assigned covered update in a pending ACK_JOIN (13.19). */
     public synchronized void coverAssigned(long ackId, SentPacket covered) {
+        if (closed || sealed) {
+            return;
+        }
         acks.coverAssigned(ackId, covered.logicalStream(), covered.sequence());
     }
 
     /** Adds a covered update that is not assigned yet (13.19). */
     public synchronized boolean coverPending(long ackId, long updateToken) {
+        if (closed || sealed) {
+            return false;
+        }
         return acks.coverPending(ackId, updateToken);
     }
 
     /** Resolves a pending covered update with its assigned handle (13.19). */
     public synchronized void assignedPending(long updateToken, SentPacket covered) {
+        if (closed || sealed) {
+            return;
+        }
         acks.assignedPending(updateToken, covered.logicalStream(), covered.sequence());
     }
 
     /** Removes a suppressed covered update from coverage (13.19). */
     public synchronized void suppressPending(long updateToken) {
+        if (closed || sealed) {
+            return;
+        }
         acks.suppressPending(updateToken);
     }
 
     /** Marks an ACK_JOIN as lacking exact coverage, so it uses the safe superset (13.19). */
     public synchronized void markInexact(long ackId) {
+        if (closed || sealed) {
+            return;
+        }
         acks.markInexact(ackId);
     }
 
@@ -487,7 +539,7 @@ public final class SessionSendDriver {
      */
     public synchronized SentPacket takeAck(long ackId) {
         PendingAck pending = pendingAcks.get(ackId);
-        if (pending == null || closed) {
+        if (pending == null || closed || sealed) {
             return null;
         }
         long now = clock.getAsLong();
@@ -504,7 +556,7 @@ public final class SessionSendDriver {
 
     /** Settles every pending ACK_JOIN at its deadline (13.19). Complete ones are sequenced; others are dropped. */
     public synchronized void expireAcks() {
-        if (closed) {
+        if (closed || sealed) {
             return;
         }
         long now = clock.getAsLong();
@@ -522,6 +574,9 @@ public final class SessionSendDriver {
 
     /** Starts a batch: its CONTROL/view-gate start waits for the previous BATCH_JOIN (13.19). */
     public synchronized SentPacket beginBatch(long batchId, OutboundPacket start) {
+        if (closed || sealed) {
+            return new SentPacket();
+        }
         Record.Dependency previous = batches.previousJoinDependency();
         SentPacket handle = submit(start, StreamSequencer.Fence.VIEW, 0, 0,
                 previous == null ? new Record.Dependency[0] : new Record.Dependency[] {previous});
@@ -533,6 +588,9 @@ public final class SessionSendDriver {
 
     /** Assigns one install of the active batch on its hashed CHUNK stream (13.19). */
     public synchronized SentPacket batchInstall(long batchId, OutboundPacket install, int chunkX, int chunkZ) {
+        if (closed || sealed) {
+            return new SentPacket();
+        }
         SentPacket handle = submit(install, StreamSequencer.Fence.CHUNK, chunkX, chunkZ, new Record.Dependency[0]);
         if (handle.isAssigned() && !closed) {
             batches.chunk(batchId, handle.logicalStream(), handle.sequence(), sequencer.epoch());
@@ -543,7 +601,7 @@ public final class SessionSendDriver {
     /** Ends the active batch with its BATCH_JOIN on CHUNK[0] (13.19). */
     public synchronized SentPacket finishBatch(long batchId, OutboundPacket join) {
         SentPacket handle = new SentPacket();
-        if (closed) {
+        if (closed || sealed) {
             return handle;
         }
         Record.Dependency[] deps = batches.finish(batchId, sequencer.epoch());
@@ -574,7 +632,7 @@ public final class SessionSendDriver {
     public synchronized List<SentPacket> submitBundle(OutboundPacket opening, List<OutboundPacket> members,
             StreamSequencer.Fence[] scopes, OutboundPacket closing, Record.Dependency... external) {
         List<SentPacket> result = new ArrayList<SentPacket>();
-        if (closed) {
+        if (closed || sealed) {
             return result;
         }
         int units = members.size() + 2;
@@ -683,10 +741,11 @@ public final class SessionSendDriver {
      * nothing.
      */
     public synchronized void close() {
-        if (closed) {
+        if (released) {
             return;
         }
         closed = true;
+        released = true;
         // Releases every owner charge exactly once, the REALTIME slice included (it is the owner's first charge).
         pool.cancel(owner);
         for (Charge charge : tokens.values()) {
@@ -706,6 +765,11 @@ public final class SessionSendDriver {
 
     private void closeWith(int code) {
         closeCode = code;
+        if (deferRelease) {
+            // Stops at once; the owner's close() returns the charges on its writing thread.
+            closed = true;
+            return;
+        }
         close();
     }
 
@@ -727,7 +791,10 @@ public final class SessionSendDriver {
         long now = clock.getAsLong();
         ranking.progress(owner, charge.progress, now);
         ranking.setRetained(owner, pool.reserved(owner), now);
-        pump();
+        if (!closed) {
+            // A stopped driver awaiting its owner's close requests nothing new.
+            pump();
+        }
     }
 
     /**

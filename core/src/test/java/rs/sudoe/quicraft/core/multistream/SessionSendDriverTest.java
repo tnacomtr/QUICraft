@@ -145,6 +145,133 @@ class SessionSendDriverTest {
         assertEquals(realtime.sequence(), deps[LogicalStream.REALTIME]);
     }
 
+    /** After END every submission path assigns nothing, and END is the last record on the wire (13.14). */
+    @Test
+    void nothingIsAcceptedAfterEnd() throws Exception {
+        Rig rig = new Rig(2, 100);
+        SessionSendDriver driver = rig.driver;
+        SentPacket before = driver.submit(frame(4), StreamSequencer.Fence.CONTROL_FENCE, 0, 0);
+        SentPacket end = driver.submitEnd();
+        assertTrue(end.isAssigned());
+        assertTrue(driver.isSealed());
+        assertFalse(driver.submit(frame(4), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertFalse(driver.submit(frame(4), StreamSequencer.Fence.CHUNK, 1, 1).isAssigned());
+        assertFalse(driver.submit(frame(4), StreamSequencer.Fence.REALTIME, 0, 0).isAssigned());
+        assertFalse(driver.submitAfter(frame(4), StreamSequencer.Fence.GLOBAL, 0, 0, before).isAssigned());
+        assertFalse(driver.submitEpochTransition(frame(4)).isAssigned());
+        assertTrue(driver.submitBundle(frame(1), Arrays.asList(frame(2)),
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL}, frame(1)).isEmpty());
+        assertFalse(driver.createAck(1, new byte[] {1}, 8));
+        assertNull(driver.takeAck(1));
+        assertFalse(driver.coverPending(1, 1));
+        assertFalse(driver.beginBatch(1, frame(2)).isAssigned());
+        assertFalse(driver.batchInstall(1, frame(9), 1, 1).isAssigned());
+        assertFalse(driver.finishBatch(1, frame(2)).isAssigned());
+        assertFalse(driver.submitEnd().isAssigned(), "a second END");
+        assertFalse(driver.isClosed(), "refusing after END does not close");
+
+        Drain drain = drainAndRelease(driver);
+        byte[] control = drain.stream(LogicalStream.CONTROL);
+        int first = firstRecordLength(control);
+        byte[] rest = Arrays.copyOfRange(control, first, control.length);
+        assertEquals(rest.length, firstRecordLength(rest), "exactly two records on CONTROL");
+        assertEquals(RecordCodec.KIND_END, RecordCodec.decodeRecord(rest, LogicalStream.CONTROL).kind());
+        for (int stream = 1; stream < 4; stream++) {
+            assertEquals(0, drain.stream(stream).length, "nothing on stream " + stream);
+        }
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner));
+    }
+
+    /**
+     * END raced by submissions on other threads: each submission lands either before END, covered by its
+     * dependencies, or not at all. Nothing is assigned after END on any stream.
+     */
+    @Test
+    void endIsAtomicAgainstConcurrentSubmissions() throws Exception {
+        for (int round = 0; round < 20; round++) {
+            Rig rig = new Rig(2, 100_000);
+            SessionSendDriver driver = rig.driver;
+            List<SentPacket> handles = java.util.Collections.synchronizedList(new ArrayList<SentPacket>());
+            java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+            List<Thread> threads = new ArrayList<Thread>();
+            for (int t = 0; t < 4; t++) {
+                final int seed = t;
+                Thread thread = new Thread(() -> {
+                    try {
+                        start.await();
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    for (int i = 0; i < 200; i++) {
+                        StreamSequencer.Fence fence = (i + seed) % 3 == 0 ? StreamSequencer.Fence.CHUNK
+                                : (i + seed) % 3 == 1 ? StreamSequencer.Fence.REALTIME
+                                : StreamSequencer.Fence.ORDINARY_CONTROL;
+                        handles.add(driver.submit(frame(2), fence, i, seed));
+                    }
+                });
+                thread.start();
+                threads.add(thread);
+            }
+            start.countDown();
+            Thread.yield();
+            SentPacket end = driver.submitEnd();
+            for (Thread thread : threads) {
+                thread.join(10_000);
+            }
+            assertTrue(end.isAssigned());
+            Drain drain = drainAndRelease(driver);
+            byte[] control = drain.stream(LogicalStream.CONTROL);
+            Record last = null;
+            for (int at = 0; at < control.length;) {
+                byte[] rest = Arrays.copyOfRange(control, at, control.length);
+                last = RecordCodec.decodeRecord(rest, LogicalStream.CONTROL);
+                at += firstRecordLength(rest);
+            }
+            assertNotNull(last);
+            assertEquals(RecordCodec.KIND_END, last.kind(), "END is the last CONTROL record");
+            long[] covered = new long[4];
+            covered[LogicalStream.CONTROL] = end.sequence();
+            for (Record.Dependency dep : last.dependencies()) covered[dep.streamIndex()] = dep.sequence();
+            synchronized (handles) {
+                for (SentPacket handle : handles) {
+                    if (handle.isAssigned()) {
+                        assertTrue(handle.sequence() <= covered[handle.logicalStream()],
+                                "round " + round + ": " + handle.logicalStream() + "#" + handle.sequence()
+                                        + " assigned after END");
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Deferred release (13.12): a close decided inside a submission on a caller's thread stops the driver but keeps
+     * the charge of a slice the owner already polled, so the slice is still charged when written; the owner's close
+     * returns everything once, and the write's late completion releases nothing twice.
+     */
+    @Test
+    void closeInsideASubmissionDefersReleaseToTheOwner() throws Exception {
+        Rig rig = new Rig(2, 2);
+        SessionSendDriver driver = rig.driver;
+        driver.releaseOnOwnerClose();
+        driver.submit(frame(64), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        SessionSendDriver.Write polled = driver.poll(stream -> true);
+        assertNotNull(polled);
+        long held = rig.pool.reserved(rig.owner);
+        assertTrue(held > rig.slice, "the polled record is charged");
+        driver.submit(frame(1), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        driver.submit(frame(1), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        driver.submit(frame(1), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        assertTrue(driver.isClosed(), "the queue limit closed the driver");
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertNull(driver.poll(stream -> true), "a stopped driver offers nothing");
+        assertTrue(rig.pool.reserved(rig.owner) >= held, "the polled slice stays charged until the owner closes");
+        driver.close();
+        assertEquals(0, rig.pool.reserved(rig.owner));
+        driver.released(polled.token());
+        assertEquals(0, rig.pool.reserved(rig.owner), "the late completion releases nothing twice");
+    }
+
     @Test
     void serverboundDriverCarriesTheInteractionFlagAndRefusesChunks() throws Exception {
         NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
