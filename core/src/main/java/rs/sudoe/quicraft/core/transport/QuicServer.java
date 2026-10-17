@@ -952,7 +952,7 @@ public final class QuicServer implements Closeable {
                                 shared.accepted.incrementAndGet(socketIndex);
                             }
                             connection.pipeline().addLast(new Connection(shared.acceptor, shared.tokens,
-                                    shared.config.earlyData, shared.unconfirmed, shared.v3, shared.nodeBudget,
+                                    shared.config.earlyData, shared.unconfirmed, shared.v3,
                                     shared.sessionResources));
                         };
                         Admitted admitted = Admitted.admit(connection, shared.admission, shared.v3 != null
@@ -1489,7 +1489,6 @@ public final class QuicServer implements Closeable {
         private final Unconfirmed unconfirmed;
         /** Non-null enables the {@code /3} stream map of 13.3 on this connection (13.1). */
         private final V3Listener v3;
-        private final ReceiveBudget nodeBudget;
         private final SessionResources sessionResources;
         private final List<ServerStream> waiting = new ArrayList<>(1);
         private final List<V3ConnectionImpl> waitingV3 = new ArrayList<>(1);
@@ -1500,8 +1499,7 @@ public final class QuicServer implements Closeable {
         private java.util.concurrent.ScheduledFuture<?> confirmDeadline;
 
         Connection(StreamAcceptor acceptor, EarlyTokens tokens, boolean earlyData, Unconfirmed unconfirmed,
-                V3Listener v3, ReceiveBudget nodeBudget, SessionResources sessionResources) {
-            this.nodeBudget = nodeBudget;
+                V3Listener v3, SessionResources sessionResources) {
             this.sessionResources = sessionResources;
             this.acceptor = acceptor;
             this.tokens = tokens;
