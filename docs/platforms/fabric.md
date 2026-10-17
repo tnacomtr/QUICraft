@@ -144,6 +144,11 @@ xvfb-run -a ./gradlew :fabric-26x:runClientGameTest \
 # DISPLAY of an earlier run: add --no-configuration-cache
 ```
 
+The protocol-775 routing fixture `core/src/test/resources/rs/sudoe/quicraft/core/routing/play-ids-775.txt`
+is regenerated from the live game by `RoutingTableGameTest` (it checks the shipped table against the
+live ids first, then emits): add `-Pquicraft.emitPlayIds=<file>` to the command above and check the
+emitted file in. Never edit it by hand.
+
 Results (2026-10-11, commit after 5026691): all pass on 26.1, 26.1.1, 26.1.2, 26.2, 26.3 and
 1.21.11, each with five 0-RTT joins and the TCP retry after a first-flight mismatch. The mod
 classes compiled against each 26.x version are byte-identical (31 classes), so the single jar

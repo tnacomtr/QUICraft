@@ -25,7 +25,8 @@ import rs.sudoe.quicraft.core.Faults;
 class ShippedRoutingTableTest {
     private static final int PROTOCOL = 775;
     private static final String RESOURCE = RoutingTableLoader.resourcePath(PROTOCOL);
-    private static final Map<Integer, String> PACKET_NAMES = packetNames();
+    /** The 21 routed ids and their names, also read by {@link PlayIdInventoryTest}. */
+    static final Map<Integer, String> PACKET_NAMES = packetNames();
 
     @Test
     void theShippedTableParsesAndIsTheRegistryAnswer() throws Exception {
