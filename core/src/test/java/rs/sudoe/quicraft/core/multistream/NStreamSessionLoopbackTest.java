@@ -342,6 +342,31 @@ class NStreamSessionLoopbackTest {
         }
     }
 
+    /**
+     * The peer never answers END and never closes. The sender's streams stay open, so the only exit
+     * is the linger deadline: after a shortened linger it closes 0x0 on its own, without waiting for
+     * the peer (13.14).
+     */
+    @Test
+    void theEndSenderClosesAfterTheLingerWhenThePeerNeverDoes() throws Exception {
+        NRig.Config config = new NRig.Config();
+        config.serverSession = false; // a raw peer: it reads the client's streams but never answers
+        config.clientTiming = new NStreamSession.Timing(System::nanoTime, TimeUnit.SECONDS.toNanos(3600),
+                TimeUnit.MILLISECONDS.toNanos(400), TimeUnit.MILLISECONDS.toNanos(20));
+        try (NRig rig = NRig.start(config)) {
+            rig.activateClient();
+            long start = System.nanoTime();
+            rig.client.end();
+            SessionRigSupport.Closed client = closed(rig.clientGame);
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            assertEquals(0, client.code, client.toString());
+            assertFalse(client.byPeer, "the sender closes on its own linger: " + client);
+            assertTrue(elapsedMillis >= 350, "waited for the peer: closed after " + elapsedMillis + " ms");
+            assertTrue(elapsedMillis < 5000, "the configured linger ended the wait: " + elapsedMillis + " ms");
+            assertEquals(0, (int) rig.net.serverSawClose.get(15, TimeUnit.SECONDS));
+        }
+    }
+
     /** END is terminal: every later submission is refused on the caller's thread and nothing follows END (13.14). */
     @Test
     void sendsAfterEndAreRefusedAndNothingFollowsEnd() throws Exception {
