@@ -14,6 +14,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -112,6 +113,30 @@ class GameLanesV3LoopbackTest {
             assertEquals(2, received.size(), "the peer received the packet and its ack: " + received);
             assertArrayEquals(frame(8, "move"), ((Packet) received.get(0)).frame,
                     "the platform's own encoding reached the peer");
+            assertEquals(Lane.CONTROL, ((GameLanes.Ack) received.get(1)).lane());
+        }
+    }
+
+    /**
+     * U8f: the production sink's uncompressed-bytes send delegates to the legacy session. The bytes
+     * are for the extractor and the legacy session ignores them, so the peer gets the plain frame.
+     */
+    @Test
+    void theUncompressedSendOverloadDelegatesToTheLegacySession() throws Exception {
+        try (Rig rig = new Rig()) {
+            rig.activateServer(NO_LEFTOVER);
+            rig.activateClient(NO_LEFTOVER);
+
+            Method session = GameLanes.class.getDeclaredMethod("session");
+            session.setAccessible(true);
+            GameLanes.Session sink = (GameLanes.Session) session.invoke(rig.clientLanes);
+            byte[] frame = frame(8, "move");
+            sink.send(ProtocolState.PLAY, 8, frame, new byte[] {9, 9, 9});
+
+            List<Object> received = rig.serverGame.await(2);
+            assertEquals(2, received.size(), "the peer received the packet and its ack: " + received);
+            assertArrayEquals(frame, ((Packet) received.get(0)).frame,
+                    "the legacy session sent the frame; the uncompressed bytes were not used");
             assertEquals(Lane.CONTROL, ((GameLanes.Ack) received.get(1)).lane());
         }
     }

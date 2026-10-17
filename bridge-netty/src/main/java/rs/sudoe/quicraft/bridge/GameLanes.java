@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.function.Supplier;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.SentPacket;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
@@ -189,9 +190,66 @@ public final class GameLanes implements LaneGame {
         /** Submits one outbound GAME packet and answers the lane the session assigned, or null. */
         Lane send(ProtocolState state, int packetId, byte[] frame);
 
+        /**
+         * As {@link #send(ProtocolState, int, byte[])}, with the packet's uncompressed bytes (for the
+         * extractor) and the packets this one semantically depends on. Fails closed unless the session
+         * supports it.
+         */
+        default Lane send(ProtocolState state, int packetId, byte[] frame, byte[] uncompressedPacket,
+                SentPacket... after) {
+            throw new UnsupportedOperationException("send with uncompressed bytes");
+        }
+
         void applied(Lane lane, long sequence);
 
         void abort(int code);
+
+        // Additive ACK_JOIN and BATCH_JOIN passthroughs (13.19), mirroring SessionSendDriver. The legacy
+        // session supports none of them, so each default fails closed.
+
+        default boolean createAck(long id, byte[] payload, int chargedBytes) {
+            throw new UnsupportedOperationException("createAck");
+        }
+
+        default void coverAssigned(long ackId, SentPacket covered) {
+            throw new UnsupportedOperationException("coverAssigned");
+        }
+
+        default boolean coverPending(long ackId, long updateToken) {
+            throw new UnsupportedOperationException("coverPending");
+        }
+
+        default void assignedPending(long updateToken, SentPacket covered) {
+            throw new UnsupportedOperationException("assignedPending");
+        }
+
+        default void suppressPending(long updateToken) {
+            throw new UnsupportedOperationException("suppressPending");
+        }
+
+        default void markInexact(long ackId) {
+            throw new UnsupportedOperationException("markInexact");
+        }
+
+        default SentPacket takeAck(long ackId) {
+            throw new UnsupportedOperationException("takeAck");
+        }
+
+        default void expireAcks() {
+            throw new UnsupportedOperationException("expireAcks");
+        }
+
+        default SentPacket beginBatch(long batchId, OutboundPacket start) {
+            throw new UnsupportedOperationException("beginBatch");
+        }
+
+        default SentPacket batchInstall(long batchId, OutboundPacket install, int chunkX, int chunkZ) {
+            throw new UnsupportedOperationException("batchInstall");
+        }
+
+        default SentPacket finishBatch(long batchId, OutboundPacket join) {
+            throw new UnsupportedOperationException("finishBatch");
+        }
     }
 
     private final Channel game;
@@ -576,6 +634,14 @@ public final class GameLanes implements LaneGame {
             SentPacket handle = session.send(state, packetId, frame);
             // Assigned inline when this runs on the session's loop, which is the game's own loop for
             // a hosted connection; an off-loop submission reports null.
+            return handle.isAssigned() ? handle.lane() : null;
+        }
+
+        @Override
+        public Lane send(ProtocolState state, int packetId, byte[] frame, byte[] uncompressedPacket,
+                SentPacket... after) {
+            // The legacy session sizes the packet from the frame, so the uncompressed bytes are not used.
+            SentPacket handle = session.send(state, packetId, frame, after);
             return handle.isAssigned() ? handle.lane() : null;
         }
 
