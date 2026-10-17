@@ -4,7 +4,6 @@ package rs.sudoe.quicraft.core.transport;
 import java.nio.ByteBuffer;
 import java.util.function.Consumer;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
-import rs.sudoe.quicraft.core.multistream.LaneSession;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.SessionContext;
 
@@ -14,7 +13,7 @@ import rs.sudoe.quicraft.core.multistream.SessionContext;
  * cutover. It extends {@link QuicByteStream} so the existing acceptor path hands it to the game
  * exactly like a {@code /2} stream; the extra methods are the {@code /3} lifecycle.
  *
- * <p>Stream 0 is the game's byte stream until {@link #activate}, and the {@link LaneSession}'s
+ * <p>Stream 0 is the game's byte stream until {@link #activate}, and the session's
  * CONTROL stream after it. At the byte boundary of 12.11/12.12 the application calls
  * {@link #detachForActivation} and then {@link #activate}: from activation on the session owns
  * stream 0, and the application sends and closes through it, never through {@link #write} or
@@ -62,7 +61,7 @@ public interface V3Connection extends QuicByteStream {
     void detachForActivation(Consumer<ByteBuffer> leftover);
 
     /**
-     * Activation (12.11/12.12): this side's switch is validated, so the three-lane session takes
+     * Activation (12.11/12.12): this side's switch is validated, so the session takes
      * over stream 0 with the game side {@code game}. {@code controlLeftover} is what the
      * application read past the switch (null when none): the start of the 13.4 record stream.
      *
@@ -90,8 +89,7 @@ public interface V3Connection extends QuicByteStream {
 
     /**
      * The activated session, or null before {@link #activate} has run on the event loop. The game
-     * sends, ends and aborts through it after activation. While the legacy flag is set this is the
-     * three-lane {@link LaneSession}; otherwise the N+2 session.
+     * sends, ends and aborts through it after activation (the N+2 session).
      */
     MultistreamSession session();
 

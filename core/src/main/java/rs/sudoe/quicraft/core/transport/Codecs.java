@@ -76,13 +76,9 @@ final class Codecs {
         return configured;
     }
 
-    /**
-     * The server's window on its own bidi streams (13.13 reverse CHUNK): one byte by spec, or the legacy
-     * 8 KiB while {@link TransportConfig#LEGACY_LANE_SESSION} keeps the legacy LaneSession in place.
-     */
+    /** The server's window on its own bidi streams (13.13 reverse CHUNK): the one-byte spec value. */
     private static long serverOpenedStreamData() {
-        return TransportConfig.LEGACY_LANE_SESSION ? TransportConfig.LEGACY_LANE_REVERSE_STREAM_DATA
-                : TransportConfig.MULTISTREAM_REVERSE_CHUNK_STREAM_DATA;
+        return TransportConfig.MULTISTREAM_REVERSE_CHUNK_STREAM_DATA;
     }
 
     private static QuicCongestionControlAlgorithm algorithm(TransportConfig.CongestionControl cc) {

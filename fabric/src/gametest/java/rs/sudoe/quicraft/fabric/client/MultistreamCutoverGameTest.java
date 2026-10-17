@@ -59,7 +59,8 @@ import rs.sudoe.quicraft.core.connect.V3Plan;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.discovery.AdvertisementCache;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
-import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.MultistreamSession;
+import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.RecordCodec;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
@@ -76,7 +77,7 @@ import rs.sudoe.quicraft.fabric.Hooks;
  * The client's {@code quicraft/3} join, played against a scripted server: the real game pipeline
  * (vanilla handlers, the boundary-aware cipher decoder, the bridge channel), the real
  * {@link V3Client}, hooks and {@code V3Plan}, and core's real {@link BindingSession} on both ends. Only
- * the QUIC connection is fake, so the lanes themselves (a {@code LaneSession} needs a QUIC channel)
+ * the QUIC connection is fake, so the lanes themselves (a {@code NStreamSession} needs a QUIC channel)
  * stop at {@code activate}: the activation leftover is checked, not the records after it.
  *
  * <p>It proves the order of docs/protocol.md 12.10 to 12.13 on the client against vanilla's own
@@ -512,7 +513,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             rig.loop.submit(() -> {
                 // Encoding and compression happen once on the normal pipeline path; Sink queues
                 // the final 40 KiB frame, whose exact bytes are charged against the cap.
-                for (int i = 0; i < LaneSession.MAX_UNSENT_PACKETS; i++) {
+                for (int i = 0; i < NStreamSession.MAX_UNSENT_PACKETS; i++) {
                     Packet<?> packet = new net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket(
                             new rs.sudoe.quicraft.fabric.net.FallbackPayload(new byte[40 * 1024]));
                     attempted[0]++;
@@ -526,7 +527,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(rig.awaitCondition(() -> rig.fake.abortCode == 0x11),
                     "the 16 MiB queue cap closes with 0x11: " + rig.fake.abortCode);
             check(rig.client.state() == V3Client.State.FAILED, "the queue failure is recorded");
-            check(attempted[0] < LaneSession.MAX_UNSENT_PACKETS,
+            check(attempted[0] < NStreamSession.MAX_UNSENT_PACKETS,
                     "the byte cap, not the 1024 packet cap, ended the run at " + attempted[0]);
         }
     }
@@ -1292,7 +1293,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
                 // 12.12: SERVER_SWITCH was the last encrypted packet; records follow, unencrypted.
                 // CONTROL record 1: a keep-alive in configuration, as the next thing a server would send.
                 byte[] keepAlive = frame(new net.minecraft.network.protocol.common.ClientboundKeepAlivePacket(99L));
-                recordsAfterSwitch = RecordCodec.encodeGame(1L, 0L, 0L, 0L, keepAlive);
+                recordsAfterSwitch = RecordCodec.encodeRecord(new rs.sudoe.quicraft.core.multistream.Record(
+                        0, 1L, 0L, java.util.Collections.emptyList(), RecordCodec.KIND_GAME, keepAlive));
                 synchronized (Server.this) {
                     outbound.write(recordsAfterSwitch, 0, recordsAfterSwitch.length);
                     switched = true;
@@ -1401,7 +1403,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         }
 
         @Override
-        public LaneSession session() {
+        public MultistreamSession session() {
             return null;
         }
 

@@ -9,11 +9,10 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
 
 /**
  * The activated {@code /3} session of one connection, as the transport and the game bridge see it
- * (docs/protocol.md 13). Two implementations exist while the cutover is in progress: the legacy
- * three-lane {@link LaneSession} and the N+2 {@link NStreamSession}. The transport picks one at
- * activation; callers use only this interface.
+ * (docs/protocol.md 13). The N+2 {@link NStreamSession} is the implementation; callers use only
+ * this interface.
  *
- * <p>Threading and lifecycle are those of {@link LaneSession}: {@link #acceptStream} runs on the
+ * <p>Threading and lifecycle are those of {@link NStreamSession}: {@link #acceptStream} runs on the
  * connection's event loop, every other method may be called from any thread and is marshalled onto
  * that loop in call order.
  *

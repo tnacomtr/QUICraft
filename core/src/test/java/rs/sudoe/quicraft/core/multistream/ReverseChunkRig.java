@@ -72,7 +72,7 @@ public final class ReverseChunkRig implements AutoCloseable {
     /** Native send capacity, not a Java write-queue or connection-close proxy for credit. */
     public long capacity(int shard) throws Exception {
         QuicStreamChannel stream = clientChunk(shard);
-        return stream.eventLoop().submit(() -> ((Long) LaneSession.findStreamCapacity(stream.parent().getClass())
+        return stream.eventLoop().submit(() -> ((Long) NStreamSession.findStreamCapacity(stream.parent().getClass())
                 .invoke(stream.parent(), stream.streamId())).longValue()).get(5, TimeUnit.SECONDS);
     }
 

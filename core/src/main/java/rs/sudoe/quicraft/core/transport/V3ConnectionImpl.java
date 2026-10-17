@@ -21,7 +21,6 @@ import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
-import rs.sudoe.quicraft.core.multistream.LaneSession;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.SessionResources;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
@@ -33,7 +32,7 @@ import rs.sudoe.quicraft.core.multistream.SessionContext;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 
 /**
- * {@link V3Connection} over one Netty QUIC connection, its stream 0 and one {@link LaneSession}.
+ * {@link V3Connection} over one Netty QUIC connection, its stream 0 and one {@link NStreamSession}.
  *
  * <p>Stream 0 is the game's byte stream until {@link #activate}: the peer's {@link PreambleV2} is
  * read and stripped here, and nothing reaches the game until the gate opens (after the handshake,
@@ -45,7 +44,7 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * <p>This class is stream 0's own preamble handler rather than a {@link PreambleStream}: {@code /3}
  * uses {@link PreambleV2} (version 2), which the v1 {@code Preamble} parser and encoder reject.
  *
- * <p>At activation the {@link LaneSession} installs its handler first in stream 0's pipeline, so
+ * <p>At activation the {@link NStreamSession} installs its handler first in stream 0's pipeline, so
  * this class stops seeing stream-0 bytes; until then {@link #acceptPeerStream} keeps a peer stream
  * that may not be delivered yet (the client's WORLD stream, 13.3).
  */
@@ -62,7 +61,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     private final QuicChannel connection;
     private final QuicStreamChannel control;
     private final NettyQuicByteStream raw;
-    private final LaneSession.Role role;
+    private final NStreamSession.Role role;
     private final PreambleV2.Parser parser = new PreambleV2.Parser();
 
     // Client role (null on a server).
@@ -119,7 +118,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     static V3ConnectionImpl client(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
             EarlyCache cache, List<Object> serverKey, String joinInputs, byte[] sentEarly, RoutingTable table,
             boolean handshakeComplete) {
-        return new V3ConnectionImpl(connection, control, raw, LaneSession.Role.CLIENT, table, cache, serverKey,
+        return new V3ConnectionImpl(connection, control, raw, NStreamSession.Role.CLIENT, table, cache, serverKey,
                 joinInputs, sentEarly, null, null, handshakeComplete);
     }
 
@@ -133,7 +132,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     static V3ConnectionImpl server(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
             V3Listener listener, PreambleHandler handler, boolean handshakeComplete, ReceiveBudget node,
             SessionResources resources) {
-        V3ConnectionImpl impl = new V3ConnectionImpl(connection, control, raw, LaneSession.Role.SERVER, null, null,
+        V3ConnectionImpl impl = new V3ConnectionImpl(connection, control, raw, NStreamSession.Role.SERVER, null, null,
                 null, null, null, listener, handler, handshakeComplete);
         impl.node = node == null ? ReceiveBudget.unlimited() : node;
         impl.resources = resources;
@@ -147,7 +146,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     private ReceiveBudget node = ReceiveBudget.unlimited();
 
     private V3ConnectionImpl(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
-            LaneSession.Role role, RoutingTable table, EarlyCache cache, List<Object> serverKey, String joinInputs,
+            NStreamSession.Role role, RoutingTable table, EarlyCache cache, List<Object> serverKey, String joinInputs,
             byte[] sentEarly, V3Listener listener, PreambleHandler preambleHandler, boolean handshakeComplete) {
         if (connection == null || control == null || raw == null || role == null) {
             throw new IllegalArgumentException("null argument");
@@ -167,7 +166,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         this.listener = listener;
         this.preambleHandler = preambleHandler;
         this.handshakeComplete = handshakeComplete;
-        if (role == LaneSession.Role.CLIENT) {
+        if (role == NStreamSession.Role.CLIENT) {
             if (sentEarly != null) {
                 gameWrote = true; // the server may act on the 0-RTT flight
             } else if (joinInputs != null) {
@@ -245,7 +244,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
             return;
         }
         stream.config().setAutoRead(false);
-        if (role == LaneSession.Role.SERVER) {
+        if (role == NStreamSession.Role.SERVER) {
             // 13.3: a client stream before the server's own activation is fatal.
             Codecs.closeLater(connection, true, MultistreamProtocolException.CLOSE_ORDERING);
             return;
@@ -417,7 +416,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
             throw new IllegalStateException("Game writes after /3 activation must use the session");
         }
         gameWrote = true;
-        if (role == LaneSession.Role.CLIENT) {
+        if (role == NStreamSession.Role.CLIENT) {
             clientWrite(data);
         } else {
             raw.write(data);
@@ -515,14 +514,14 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
      * Keeps bytes for the game or for the session's activation leftover. After the detach stream 0
      * is no longer read, so only a read already in flight can still land here, one 16 KiB chunk. The
      * bytes later become the session's admitted overdraft (13.12), so they are bounded here: more
-     * than {@link LaneSession#MAX_KEPT_AFTER_DETACH} can only mean a local read-control fault, and
+     * than {@link NStreamSession#MAX_KEPT_AFTER_DETACH} can only mean a local read-control fault, and
      * the connection closes with the internal-error code, never 0x11, because the peer cannot make
      * this larger.
      */
     private void keep(ByteBuffer data) {
-        if (detached && keptBytes + data.remaining() > LaneSession.MAX_KEPT_AFTER_DETACH) {
+        if (detached && keptBytes + data.remaining() > NStreamSession.MAX_KEPT_AFTER_DETACH) {
             LOG.log(Level.FINE, "stream 0 delivered more than {0} bytes after the detach; closing",
-                    LaneSession.MAX_KEPT_AFTER_DETACH);
+                    NStreamSession.MAX_KEPT_AFTER_DETACH);
             discarding = true;
             kept.clear();
             keptBytes = 0;
@@ -547,7 +546,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     public void onClosed(Throwable cause) {
         rawClosed = true;
         rawCloseCause = cause;
-        if (!gateOpen && role == LaneSession.Role.CLIENT && sentEarly == null) {
+        if (!gateOpen && role == NStreamSession.Role.CLIENT && sentEarly == null) {
             // Without 0-RTT data the gate waits only for the server's preamble: if the connection
             // ends first, the game must still see the close.
             openGate();
@@ -558,7 +557,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     // --- Preamble handling.
 
     private void onPreamble(byte[] token) {
-        if (role == LaneSession.Role.CLIENT) {
+        if (role == NStreamSession.Role.CLIENT) {
             try {
                 // 13.2: the reply must name exactly one N inside this client's offer (1..6).
                 context = SessionContext.accept(parser.minShards(), parser.maxShards(),
@@ -613,7 +612,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     /** On the event loop: the server's early-name recorder, if one is set. */
     private void onPeerData(ByteBuffer data) {
-        if (role != LaneSession.Role.SERVER) {
+        if (role != NStreamSession.Role.SERVER) {
             return;
         }
         FlightRecorder r = earlyName;
@@ -804,7 +803,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         if (activated || rawClosed) {
             return;
         }
-        if (role == LaneSession.Role.SERVER && !handshakeComplete) {
+        if (role == NStreamSession.Role.SERVER && !handshakeComplete) {
             // 12.7 (user decision 2026-10-16): the server enters configuration only after processing
             // a 1-RTT packet, so configuration-stage messages prove its own handshake is complete. It
             // must refuse to start binding (0x10) before that, whatever the game asks.
@@ -851,16 +850,12 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     }
 
     /**
-     * The session factory: the legacy three-lane session while {@link TransportConfig#LEGACY_LANE_SESSION}
-     * holds, otherwise the N+2 session (13.3) over the listener's (or the client's) shared resources.
+     * The session factory (13.3): the N+2 session over the listener's (or the client's) shared resources.
      */
     private MultistreamSession newSession(RoutingTable resolved, LaneGame game, SessionContext negotiated) {
-        if (TransportConfig.LEGACY_LANE_SESSION) {
-            return new LaneSession(connection, role, control, resolved, game, node, negotiated);
-        }
         SessionResources shared = resources;
         if (shared == null) {
-            shared = role == LaneSession.Role.CLIENT ? SessionResources.client() : SessionResources.production(null);
+            shared = role == NStreamSession.Role.CLIENT ? SessionResources.client() : SessionResources.production(null);
             resources = shared;
         }
         return new NStreamSession(connection, role, control, resolved, game, negotiated, shared);

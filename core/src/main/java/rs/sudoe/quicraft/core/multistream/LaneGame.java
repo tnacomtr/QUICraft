@@ -6,10 +6,10 @@ import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 
 /**
- * What a {@link LaneSession} needs from the game side. No Minecraft classes: packets are opaque
+ * What a {@link NStreamSession} needs from the game side. No Minecraft classes: packets are opaque
  * objects the game's own decoder produced. Every callback runs on the connection's event loop;
  * a game that applies packets on another thread hops threads itself and acknowledges with
- * {@link LaneSession#applied} when its serial handler has applied the packet (13.10).
+ * {@link NStreamSession#applied} when its serial handler has applied the packet (13.10).
  */
 public interface LaneGame {
     /** Executor tick stall began; implementations may record timer-exclusion intervals (13.10). */
@@ -25,23 +25,21 @@ public interface LaneGame {
      * The uncompressed bytes of one decoded GAME record, as the receiver obtained them before
      * decoding (the input to position extraction, 13.8). {@code logicalStream} is the LogicalStream
      * index (CONTROL, REALTIME, or the CHUNK shard), since two shards can share a lane and a sequence.
-     * Additive: the default ignores them. Contract only: {@link LaneSession} does not invoke this yet;
-     * the U8d receive driver wires the call.
+     * Additive: the default ignores them.
      */
     default void onDecodedUncompressed(Lane lane, int logicalStream, long sequence, byte[] uncompressedFrame) { }
 
     /**
      * A delivery unit was successfully enqueued for the game's serial handler (Q, 13.10).
      * {@code logicalStream} as for {@link #onDecodedUncompressed}. Additive:
-     * the default ignores it. Enqueue does not release dependencies; only {@link LaneSession#applied} does.
-     * Contract only: not invoked by {@link LaneSession} until U8d.
+     * the default ignores it. Enqueue does not release dependencies; only {@link NStreamSession#applied} does.
      */
     default void onEnqueued(Lane lane, int logicalStream, long sequence) { }
 
     /**
      * The game's serial handler finished applying a delivery unit (D, 13.10), once the
      * acknowledgement is accepted. {@code logicalStream} as for {@link #onDecodedUncompressed}.
-     * Additive: the default ignores it. Contract only: not invoked by {@link LaneSession} until U8d.
+     * Additive: the default ignores it.
      */
     default void onApplicationComplete(Lane lane, int logicalStream, long sequence) { }
 
@@ -86,7 +84,7 @@ public interface LaneGame {
     /**
      * Hands over one decoded packet or one whole bundle, in dependency order and never a partial
      * bundle (13.15). The game applies it, in order, and then calls
-     * {@link LaneSession#applied(Lane, long)} with the same lane and {@code sequence}, from any
+     * {@link NStreamSession#applied(Lane, long)} with the same lane and {@code sequence}, from any
      * thread. Nothing later is decoded or delivered before that acknowledgement.
      *
      * @param sequence the final sequence to acknowledge (never an intermediate bundle member)

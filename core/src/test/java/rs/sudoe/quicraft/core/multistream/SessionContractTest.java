@@ -9,8 +9,6 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.netty.handler.codec.quic.QuicChannel;
-import io.netty.handler.codec.quic.QuicStreamChannel;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -27,8 +25,6 @@ import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.binding.ExporterSource;
 import rs.sudoe.quicraft.core.routing.Lane;
-import rs.sudoe.quicraft.core.routing.ProtocolState;
-import rs.sudoe.quicraft.core.routing.RoutingTable;
 
 /** The U8a integration contract: selected N, logical stream identity and additive API freezes. */
 class SessionContractTest {
@@ -102,7 +98,6 @@ class SessionContractTest {
     void invalidSharedCountIsLocalMisuse() {
         assertThrows(IllegalArgumentException.class, () -> SessionContext.of(0));
         assertThrows(IllegalArgumentException.class, () -> SessionContext.of(7));
-        assertThrows(IllegalArgumentException.class, () -> SessionContext.legacyLogicalIndex(null));
     }
 
     private static int reply(int min, int max) {
@@ -133,13 +128,6 @@ class SessionContractTest {
     }
 
     @Test
-    void legacyCategoriesMapToTheirFixedLogicalIndices() {
-        assertEquals(0, SessionContext.legacyLogicalIndex(Lane.CONTROL));
-        assertEquals(1, SessionContext.legacyLogicalIndex(Lane.REALTIME));
-        assertEquals(2, SessionContext.legacyLogicalIndex(Lane.WORLD));
-    }
-
-    @Test
     void sentPacketCarriesLogicalStreamIdentityNotOnlyItsCategory() {
         SentPacket first = new SentPacket();
         SentPacket second = new SentPacket();
@@ -153,11 +141,6 @@ class SessionContractTest {
         assertEquals(5L, first.sequence());
         assertEquals(5L, second.sequence());
         assertNotEquals(first.logicalStream(), second.logicalStream());
-        // The legacy assignment derives the logical stream from the category.
-        SentPacket legacy = new SentPacket();
-        legacy.assign(Lane.REALTIME, 9L);
-        assertEquals(1, legacy.logicalStream());
-        assertEquals(Lane.REALTIME, legacy.lane());
     }
 
     // --- Binding owner (12.7, 12.8).
@@ -260,81 +243,20 @@ class SessionContractTest {
         return result.machine();
     }
 
-    // --- Legacy acknowledgement and compatibility (13.10, 13.6).
-
-    // Same-category multi-shard acknowledgement (two CHUNK shards sharing a sequence) is deferred to U8d.
-    @Test
-    void legacyApplyRefusesAnotherLanesSameSequence() {
-        ReceiverHarness h = new ReceiverHarness();
-        h.offer(Lane.CONTROL, 1);
-        h.offer(Lane.WORLD, 1);
-        assertEquals(1, h.calls.size(), "one delivery is outstanding at a time");
-        ReceiverScheduler.Delivery first = h.calls.get(0);
-        assertEquals(Lane.CONTROL, first.lane());
-        // Same sequence, other lane: not the outstanding delivery, so it is refused (0x11).
-        assertEquals(0x11, assertThrows(OrderingException.class,
-                () -> h.scheduler.applied(Lane.WORLD, 1, 0)).closeCode());
-        assertEquals(1, h.calls.size(), "a refused acknowledgement releases nothing");
-        h.scheduler.applied(first.lane(), first.sequence(), 0);
-        assertEquals(2, h.calls.size(), "the acknowledgement releases the next delivery");
-        ReceiverScheduler.Delivery second = h.calls.get(1);
-        assertEquals(Lane.WORLD, second.lane());
-        h.scheduler.applied(second.lane(), second.sequence(), 0);
-    }
+    // --- Additive API (13.10).
 
     @Test
-    void oldSessionSignaturesRemainCallable() throws Exception {
-        Class<?> session = LaneSession.class;
-        Class<?> role = LaneSession.Role.class;
-        assertNotNull(session.getConstructor(QuicChannel.class, role, QuicStreamChannel.class, RoutingTable.class,
-                LaneGame.class));
-        assertNotNull(session.getConstructor(QuicChannel.class, role, QuicStreamChannel.class, RoutingTable.class,
-                LaneGame.class, rs.sudoe.quicraft.core.multistream.ReceiveBudget.class));
-        assertNotNull(session.getConstructor(QuicChannel.class, role, QuicStreamChannel.class, RoutingTable.class,
-                LaneGame.class, rs.sudoe.quicraft.core.multistream.ReceiveBudget.class, SessionContext.class));
-        assertNotNull(session.getMethod("send", ProtocolState.class, int.class, byte[].class, SentPacket[].class));
-        assertNotNull(session.getMethod("sendBundle", OutboundPacket.class, java.util.List.class,
-                OutboundPacket.class));
-        assertNotNull(session.getMethod("end"));
-        assertNotNull(session.getMethod("abort", int.class));
-        assertNotNull(session.getMethod("applied", Lane.class, long.class));
-        assertNotNull(session.getMethod("outboundLane", ProtocolState.class, int.class));
-        assertNotNull(session.getMethod("bindGame", LaneGame.class));
-        assertNotNull(session.getMethod("context"));
+    void additiveLaneGameCallbacksRemainDefault() throws Exception {
         for (String name : new String[] {"onExecutorTickStallStart", "onExecutorTickStallEnd"}) {
             assertDefaultMethod(LaneGame.class, name);
         }
         assertDefaultMethod(LaneGame.class, "onDecodedUncompressed", Lane.class, int.class, long.class, byte[].class);
         assertDefaultMethod(LaneGame.class, "onEnqueued", Lane.class, int.class, long.class);
         assertDefaultMethod(LaneGame.class, "onApplicationComplete", Lane.class, int.class, long.class);
-        assertTrue(LaneSession.class.getMethod("context").getReturnType() == SessionContext.class);
     }
 
     private static void assertDefaultMethod(Class<?> type, String name, Class<?>... params) throws Exception {
         Method method = type.getMethod(name, params);
         assertTrue(method.isDefault(), name + " must be an additive default method");
-    }
-
-    /**
-     * Drives the real receiver through its public surface. Each offered record is a CONTROL or
-     * WORLD envelope with no dependencies, so only the outstanding delivery is ever in {@code calls}.
-     */
-    private static final class ReceiverHarness {
-        final java.util.List<ReceiverScheduler.Delivery> calls = new java.util.ArrayList<ReceiverScheduler.Delivery>();
-        final ReceiverScheduler scheduler = new ReceiverScheduler(this::onDecode, this::onDelivery);
-
-        private void onDecode(Envelope e, boolean insideBundle, long now) {
-            scheduler.reserveDecoded(e, 0, e.bodyLength(), now);
-            scheduler.decoded(e, e.bundle(), e.stateChange(), e.body(), now);
-        }
-
-        private void onDelivery(ReceiverScheduler.Delivery d) {
-            calls.add(d);
-        }
-
-        void offer(Lane lane, long sequence) {
-            scheduler.offer(new Envelope(lane, Envelope.Kind.GAME, sequence, new long[] {0, 0, 0}, 0, null,
-                    Envelope.Bundle.NONE, false), 0);
-        }
     }
 }

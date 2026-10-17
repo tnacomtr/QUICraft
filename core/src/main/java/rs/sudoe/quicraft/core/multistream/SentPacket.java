@@ -16,11 +16,6 @@ public final class SentPacket {
 
     SentPacket() {}
 
-    /** Legacy three-lane assignment: the logical stream is the category's legacy index. */
-    void assign(Lane lane, long sequence) {
-        assign(lane, SessionContext.legacyLogicalIndex(lane), sequence);
-    }
-
     /** Assignment with the logical stream identity (13.3), written before the lane is published. */
     void assign(Lane lane, int logicalStream, long sequence) {
         this.sequence = sequence;

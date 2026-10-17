@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Protocol;
@@ -79,19 +80,107 @@ import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
 public final class NStreamSession implements MultistreamSession {
     private static final Logger LOG = Logger.getLogger("QUICraft");
 
-    static final int CLOSE_NORMAL = 0x0;
-    static final int CLOSE_INTERNAL_ERROR = 0x2;
-    static final int CLOSE_ORDERING = MultistreamProtocolException.CLOSE_ORDERING;
+    /** Which end of the connection this session is. */
+    public enum Role {
+        CLIENT,
+        SERVER
+    }
+
+    /** Normal close after the peer's END (13.14). */
+    public static final int CLOSE_NORMAL = 0x0;
+    /** Local fault, not the peer's doing. */
+    public static final int CLOSE_INTERNAL_ERROR = 0x2;
+    /** Protocol, ordering or resource failure (13.3, 13.12, 13.14). */
+    public static final int CLOSE_ORDERING = MultistreamProtocolException.CLOSE_ORDERING;
     static final int CLOSE_RESOURCE = Protocol.CLOSE_RESOURCE;
+    /** 13.12: unsent application queue cap, packets. */
+    public static final int MAX_UNSENT_PACKETS = 1024;
+    /** 13.12: unsent application queue cap, bytes. */
+    public static final long MAX_UNSENT_BYTES = 16L * 1024 * 1024;
+    /** 13.14: the peer's streams must be open within this long after activation. */
+    public static final long OPEN_TIMEOUT_NANOS = 10_000_000_000L;
+    /** 13.14: how long the END sender waits for the peer to close. */
+    public static final long END_LINGER_NANOS = 10_000_000_000L;
+    /**
+     * The most activation leftover (the game's bytes past the switch packet plus what stream 0 kept
+     * after the detach) one session takes as an admitted overdraft. A read delivers at most one 16 KiB
+     * chunk and stream 0 stops reading at the detach, so an honest leftover is a few chunks; more is
+     * a local invariant failure (0x2). The peer cannot make it larger, so this is not a protocol limit
+     * the peer has to know.
+     */
+    public static final int MAX_ACTIVATION_LEFTOVER = 64 * 1024;
+    /**
+     * The most stream 0 may keep after the detach (13.12): half the leftover bound, leaving the rest
+     * for the game's own bytes past the switch packet. See {@link #MAX_ACTIVATION_LEFTOVER}.
+     */
+    public static final int MAX_KEPT_AFTER_DETACH = MAX_ACTIVATION_LEFTOVER / 2;
     /** Receive steps per pump task before it yields the loop. */
     private static final int MAX_STEPS = 64;
     private static final byte[] NO_REASON = new byte[0];
 
+    /** Clocks and periods; tests shorten them, production uses {@link #DEFAULT}. */
+    public static final class Timing {
+        public static final Timing DEFAULT = new Timing(System::nanoTime, OPEN_TIMEOUT_NANOS, END_LINGER_NANOS,
+                TimeUnit.SECONDS.toNanos(1));
+
+        final LongSupplier clock;
+        final long openTimeoutNanos;
+        final long endLingerNanos;
+        final long tickNanos;
+
+        public Timing(LongSupplier clock, long openTimeoutNanos, long endLingerNanos, long tickNanos) {
+            this.clock = clock;
+            this.openTimeoutNanos = openTimeoutNanos;
+            this.endLingerNanos = endLingerNanos;
+            this.tickNanos = tickNanos;
+        }
+    }
+
     /**
-     * quiche's {@code QUICHE_ERR_STREAM_STOPPED} for the idle STOP_SENDING probe (13.14); see
-     * {@link LaneSession#stopSendingErrCode()}.
+     * quiche's {@code QUICHE_ERR_STREAM_STOPPED}, read once from the pinned Netty's package-private
+     * {@code Quiche} class (13.14). {@link Integer#MIN_VALUE} when it cannot be read, which disables
+     * the idle STOP_SENDING probe and leaves detection to the lane's first write.
      */
-    private static final int STOPPED_SENDING = LaneSession.stopSendingErrCode();
+    private static final int STOPPED_SENDING = quicheErrStreamStopped();
+
+    private static int quicheErrStreamStopped() {
+        try {
+            Class<?> quiche = Class.forName(
+                    QuicStreamChannel.class.getName().replace("QuicStreamChannel", "Quiche"));
+            java.lang.reflect.Field field = quiche.getDeclaredField("QUICHE_ERR_STREAM_STOPPED");
+            field.setAccessible(true);
+            return field.getInt(null);
+        } catch (Throwable t) {
+            LOG.log(Level.FINE, "cannot read QUICHE_ERR_STREAM_STOPPED from the pinned Netty", t);
+            return Integer.MIN_VALUE;
+        }
+    }
+
+    /**
+     * Test hook: the pinned Netty's {@code QUICHE_ERR_STREAM_STOPPED}, or {@link Integer#MIN_VALUE}
+     * when the probe cannot resolve it.
+     */
+    public static int stopSendingErrCode() {
+        return STOPPED_SENDING;
+    }
+
+    /**
+     * The pinned Netty's {@code streamCapacity(long)} accessor for a connection class, or null when
+     * it is not there. See {@link #peerStoppedReading}.
+     */
+    public static java.lang.reflect.Method findStreamCapacity(Class<?> connectionClass) {
+        Class<?> type = connectionClass;
+        while (type != null) {
+            try {
+                java.lang.reflect.Method method = type.getDeclaredMethod("streamCapacity", long.class);
+                method.setAccessible(true);
+                return method;
+            } catch (NoSuchMethodException next) {
+                type = type.getSuperclass();
+            }
+        }
+        return null;
+    }
 
     /**
      * Shard placement and evidence per frontier kind (docs/protocol.md 13.7, 13.9, 13.19).
@@ -242,12 +331,12 @@ public final class NStreamSession implements MultistreamSession {
     }
 
     private final QuicChannel connection;
-    private final LaneSession.Role role;
+    private final Role role;
     private final QuicStreamChannel controlChannel;
     private final RoutingTable table;
     private final SessionContext context;
     private final SessionResources resources;
-    private final LaneSession.Timing timing;
+    private final Timing timing;
     private final EventLoop loop;
     private final boolean compressed;
     private final int shards;
@@ -301,13 +390,13 @@ public final class NStreamSession implements MultistreamSession {
      * @throws IllegalArgumentException when the table is not schema 2 or lacks the PLAY serverbound limits a
      *     server needs, or when the resources' smallest outbound cap cannot hold the driver's headroom
      */
-    public NStreamSession(QuicChannel connection, LaneSession.Role role, QuicStreamChannel control,
+    public NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control,
             RoutingTable table, LaneGame game, SessionContext context, SessionResources resources) {
-        this(connection, role, control, table, game, context, resources, LaneSession.Timing.DEFAULT, false);
+        this(connection, role, control, table, game, context, resources, Timing.DEFAULT, false);
     }
 
-    NStreamSession(QuicChannel connection, LaneSession.Role role, QuicStreamChannel control, RoutingTable table,
-            LaneGame game, SessionContext context, SessionResources resources, LaneSession.Timing timing,
+    NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
+            LaneGame game, SessionContext context, SessionResources resources, Timing timing,
             boolean compressed) {
         if (connection == null || role == null || control == null || table == null || context == null
                 || resources == null || timing == null) {
@@ -331,7 +420,7 @@ public final class NStreamSession implements MultistreamSession {
         this.shards = context.shardCount();
         this.streams = context.logicalStreamCount();
         this.protocolNumber = table.protocolNumber();
-        this.sendDirection = role == LaneSession.Role.CLIENT ? Direction.SERVERBOUND : Direction.CLIENTBOUND;
+        this.sendDirection = role == Role.CLIENT ? Direction.SERVERBOUND : Direction.CLIENTBOUND;
         this.routes = table::routeV2For;
         this.extractors = extractorsOf(table);
         this.channels = new QuicStreamChannel[streams];
@@ -340,7 +429,7 @@ public final class NStreamSession implements MultistreamSession {
         this.bound = game != null;
         InetAddress ip = addressOf(connection);
         RouteV2.ServerboundLimits limits = null;
-        if (role == LaneSession.Role.SERVER) {
+        if (role == Role.SERVER) {
             limits = table.serverboundLimits().get(ProtocolState.PLAY);
             if (limits == null) {
                 throw new IllegalArgumentException("the table has no PLAY serverbound limits (13.7)");
@@ -349,16 +438,16 @@ public final class NStreamSession implements MultistreamSession {
         this.source = new QuicStreamByteSource(streams);
         this.preambles = new PreambleFilter();
         this.sendDriver = new SessionSendDriver(context, resources.profile(), resources.outbound(),
-                resources.outboundRanking(), this, ip, null, timing.clock, role == LaneSession.Role.CLIENT);
+                resources.outboundRanking(), this, ip, null, timing.clock, role == Role.CLIENT);
         // Submissions run on callers' threads; a close they trigger only stops the driver, and its charges are
         // returned by release() on the loop, serialized with polling and writes (13.12).
         sendDriver.releaseOnOwnerClose();
         try {
             this.sink = new QuicStreamWriteSink(sendDriver, streams, this::writeAllowed, this::onSettled);
             StreamReceiver.Validator validator = new ShardValidator(shards,
-                    role == LaneSession.Role.SERVER ? Direction.SERVERBOUND : Direction.CLIENTBOUND);
+                    role == Role.SERVER ? Direction.SERVERBOUND : Direction.CLIENTBOUND);
             SessionReceiveDriver.CloseSink closeSink = this::onReceiveClose;
-            if (role == LaneSession.Role.SERVER) {
+            if (role == Role.SERVER) {
                 serverPump = new SessionReadPump(new ServerReadPartition(shards), resources.node(),
                         resources.inboundExcess(), this, ip, null, limits, compressed, preambles,
                         resources.inboundRanking(), resources.clock());
@@ -447,7 +536,7 @@ public final class NStreamSession implements MultistreamSession {
                 }
             }
             boolean allowed = index > 0 && stream.type() == QuicStreamType.BIDIRECTIONAL && !stream.isLocalCreated()
-                    && (role == LaneSession.Role.SERVER ? index == LogicalStream.REALTIME : index >= 2);
+                    && (role == Role.SERVER ? index == LogicalStream.REALTIME : index >= 2);
             if (!allowed) {
                 fail(CLOSE_ORDERING, NO_REASON, "stream " + id + " is not allowed for N=" + shards + " (13.3)", null);
                 return;
@@ -456,12 +545,12 @@ public final class NStreamSession implements MultistreamSession {
                 fail(CLOSE_ORDERING, NO_REASON, "second open of stream " + id + " (13.3)", null);
                 return;
             }
-            if (role == LaneSession.Role.SERVER && !activated) {
+            if (role == Role.SERVER && !activated) {
                 fail(CLOSE_ORDERING, NO_REASON, "REALTIME before the server's activation (13.3)", null);
                 return;
             }
             seen[index] = true;
-            if (role == LaneSession.Role.SERVER) {
+            if (role == Role.SERVER) {
                 // The server answers on REALTIME with its own preamble before any record (13.3).
                 writePreamble(stream, index);
                 attach(index, stream, true, true);
@@ -697,7 +786,7 @@ public final class NStreamSession implements MultistreamSession {
         preambles.leftover = leftover;
         seen[LogicalStream.CONTROL] = true;
         attach(LogicalStream.CONTROL, controlChannel, true, true);
-        if (role == LaneSession.Role.CLIENT) {
+        if (role == Role.CLIENT) {
             openOwn(LogicalStream.REALTIME);
         } else {
             for (int index = 2; index < streams; index++) {
@@ -711,7 +800,7 @@ public final class NStreamSession implements MultistreamSession {
     }
 
     /**
-     * Stream-0 takeover (13.14), as in {@link LaneSession}: every handler the single-stream owner installed is
+     * Stream-0 takeover (13.14): every handler the single-stream owner installed is
      * removed, and {@link ControlCloseGuard} turns any later close of stream 0 into END.
      */
     private void takeOverStreamZero() {
@@ -1021,7 +1110,7 @@ public final class NStreamSession implements MultistreamSession {
     private boolean sendStopped(QuicStreamChannel stream) {
         if (!streamCapacityLookedUp) {
             streamCapacityLookedUp = true;
-            streamCapacityMethod = LaneSession.findStreamCapacity(connection.getClass());
+            streamCapacityMethod = findStreamCapacity(connection.getClass());
         }
         if (streamCapacityMethod == null || STOPPED_SENDING == Integer.MIN_VALUE) {
             return false;
@@ -1285,7 +1374,7 @@ public final class NStreamSession implements MultistreamSession {
         PreambleFilter() {
             for (int index = 1; index < streams; index++) {
                 // A server reads only REALTIME; a client reads REALTIME and every CHUNK stream.
-                if (index == LogicalStream.REALTIME || role == LaneSession.Role.CLIENT) {
+                if (index == LogicalStream.REALTIME || role == Role.CLIENT) {
                     parsers[index] = new AuxPreamble.Parser();
                 }
             }

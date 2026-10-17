@@ -37,7 +37,7 @@ import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.connect.TransportSelection;
 import rs.sudoe.quicraft.core.connect.V3Plan;
-import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
@@ -405,10 +405,10 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             framedFramesObserved++;
             GameLanes current = lanes;
             if (!backlog.isEmpty() || current == null || !current.isWritable()) {
-                if (backlog.size() >= LaneSession.MAX_UNSENT_PACKETS
-                        || backlogBytes + frame.length > LaneSession.MAX_UNSENT_BYTES) {
+                if (backlog.size() >= NStreamSession.MAX_UNSENT_PACKETS
+                        || backlogBytes + frame.length > NStreamSession.MAX_UNSENT_BYTES) {
                     promise.tryFailure(new ClosedChannelException());
-                    failActive("send queue overflow", LaneSession.CLOSE_ORDERING);
+                    failActive("send queue overflow", NStreamSession.CLOSE_ORDERING);
                     return;
                 }
                 backlog.add(new QueuedFrame(sendState, packetId, frame, promise));
@@ -431,7 +431,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             queued.promise.trySuccess();
         } catch (Throwable t) {
             queued.promise.tryFailure(t);
-            failActive("lane send failed", LaneSession.CLOSE_INTERNAL_ERROR);
+            failActive("lane send failed", NStreamSession.CLOSE_INTERNAL_ERROR);
         }
     }
 
@@ -828,7 +828,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
      * gets a clear reason on the disconnect screen; the QUIC connection is closed.
      */
     void failActive(String reason) {
-        failActive(reason, LaneSession.CLOSE_INTERNAL_ERROR);
+        failActive(reason, NStreamSession.CLOSE_INTERNAL_ERROR);
     }
 
     void failActive(String reason, int code) {

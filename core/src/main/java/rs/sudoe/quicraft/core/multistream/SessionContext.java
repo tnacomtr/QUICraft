@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.multistream;
 
-import rs.sudoe.quicraft.core.routing.Lane;
-
 /**
  * The negotiated shape of one {@code /3} connection (docs/protocol.md 13.2-13.3): the selected
  * shard count N and the N+2 logical streams it implies. Created once, when the preambles have
@@ -86,26 +84,6 @@ public final class SessionContext {
     /** The logical index of a permitted QUIC stream id (13.3). */
     public int logicalIndexOf(long quicId) {
         return LogicalStream.logicalIndex(quicId, shardCount);
-    }
-
-    /**
-     * The logical index a legacy three-lane category occupies: CONTROL 0, REALTIME 1 and WORLD 2,
-     * which is CHUNK[0]. This maps a packet's category to its stream identity for the legacy
-     * session only. It is never used to translate a game acknowledgement to a delivery: that is
-     * checked against the single outstanding delivery.
-     */
-    public static int legacyLogicalIndex(Lane lane) {
-        if (lane == null) {
-            throw new IllegalArgumentException("lane");
-        }
-        switch (lane) {
-            case CONTROL:
-                return LogicalStream.CONTROL;
-            case REALTIME:
-                return LogicalStream.REALTIME;
-            default:
-                return 2;
-        }
     }
 
     @Override

@@ -31,7 +31,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.multistream.Envelope;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
-import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.SentPacket;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
@@ -125,13 +125,13 @@ class GameLanesTest {
         });
         GameLanes lanes = GameLanes.forTest(channel, codec, session, ProtocolState.PLAY, null);
 
-        lanes.onClosed(LaneSession.CLOSE_ORDERING, false, null);
+        lanes.onClosed(NStreamSession.CLOSE_ORDERING, false, null);
 
         assertTrue(lanes.isClosed());
         assertFalse(channel.isOpen(), "13.14: the game's channel goes away with the connection");
         GameLanes.LaneClosedException cause = (GameLanes.LaneClosedException) seen.get();
         assertNotNull(cause);
-        assertEquals(LaneSession.CLOSE_ORDERING, cause.code());
+        assertEquals(NStreamSession.CLOSE_ORDERING, cause.code());
         assertTrue(cause.getMessage().contains("0x11"),
                 "13.14: the cause names the application error code: " + cause.getMessage());
     }
@@ -142,7 +142,7 @@ class GameLanesTest {
         EmbeddedChannel channel = new EmbeddedChannel();
         GameLanes lanes = GameLanes.forTest(channel, codec, new FakeSession(), ProtocolState.PLAY, null);
 
-        lanes.onClosed(LaneSession.CLOSE_NORMAL, true, null);
+        lanes.onClosed(NStreamSession.CLOSE_NORMAL, true, null);
 
         assertFalse(channel.isOpen());
         channel.checkException();
@@ -227,7 +227,7 @@ class GameLanesTest {
 
         assertFalse(write.get().isSuccess(), "13.6: a wrong-lane packet is never put on the wire");
         assertTrue(seen.get() instanceof GameLanes.LaneMismatchException, String.valueOf(seen.get()));
-        assertEquals(Collections.singletonList(LaneSession.CLOSE_ORDERING), session.aborted,
+        assertEquals(Collections.singletonList(NStreamSession.CLOSE_ORDERING), session.aborted,
                 "13.6/13.14: a routing disagreement is an ordering failure");
         assertTrue(session.sent.isEmpty(),
                 "13.6: the refusal happens before the session is handed the packet, so it could not "
@@ -255,7 +255,7 @@ class GameLanesTest {
 
         assertFalse(write.isSuccess());
         assertTrue(session.sent.isEmpty());
-        assertEquals(Collections.singletonList(LaneSession.CLOSE_ORDERING), session.aborted);
+        assertEquals(Collections.singletonList(NStreamSession.CLOSE_ORDERING), session.aborted);
         channel.close().sync();
     }
 
@@ -332,7 +332,7 @@ class GameLanesTest {
 
         assertFalse(write.get().isSuccess());
         assertNotNull(seen.get());
-        assertEquals(Collections.singletonList(LaneSession.CLOSE_INTERNAL_ERROR), session.aborted);
+        assertEquals(Collections.singletonList(NStreamSession.CLOSE_INTERNAL_ERROR), session.aborted);
         channel.close().sync();
     }
 

@@ -284,7 +284,7 @@ public final class QuicBridgeChannel extends AbstractChannel {
 
     /**
      * The {@code /3} cutover of docs/protocol.md 12.11/12.12, 13.2 and 13.14: hands stream 0 to a
-     * {@link rs.sudoe.quicraft.core.multistream.LaneSession}, so the lane session becomes its only
+     * {@link rs.sudoe.quicraft.core.multistream.NStreamSession}, so the lane session becomes its only
      * owner and this channel stops being the game's transport.
      *
      * <p>Call it on this channel's event loop, at the byte boundary of the peer's final switch

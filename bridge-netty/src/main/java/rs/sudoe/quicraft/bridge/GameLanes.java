@@ -14,8 +14,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Supplier;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
-import rs.sudoe.quicraft.core.multistream.LaneSession;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
+import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.SentPacket;
 import rs.sudoe.quicraft.core.routing.Lane;
@@ -23,7 +23,7 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
 
 /**
  * The game's side of a {@code /3} connection: the {@link LaneGame} of
- * {@link rs.sudoe.quicraft.core.multistream.LaneSession} for a game pipeline, over the bridge
+ * {@link rs.sudoe.quicraft.core.multistream.NStreamSession} for a game pipeline, over the bridge
  * channel the connection runs on. No Minecraft classes: what a game packet is, how it is encoded
  * and where it routes are the platform's, behind {@link Codec}.
  *
@@ -39,7 +39,7 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
  * <p><b>Outbound.</b> {@link #installOutbound()} adds one handler at the tail of the game pipeline,
  * so it sees every packet the game writes before the game's own encoder does. Each packet is asked
  * for its routing answer ({@link Codec#routeOf}), the answer is validated against the routing table
- * ({@link LaneSession#outboundLane}) <em>before</em> the session is handed anything, then encoded by
+ * ({@link NStreamSession#outboundLane}) <em>before</em> the session is handed anything, then encoded by
  * the platform and submitted through the session, which assigns the sequence (13.6, 13.9). Nothing
  * the game writes reaches stream 0 afterwards. A lane the table disagrees with is a routing bug and
  * fails the connection with {@code 0x11} without a byte reaching the wire.</p>
@@ -181,7 +181,7 @@ public final class GameLanes implements LaneGame {
 
         private static String describe(int code, boolean byPeer) {
             String hex = code < 0 ? "no application error code" : String.format("0x%x", Integer.valueOf(code));
-            if (code == LaneSession.CLOSE_ORDERING) {
+            if (code == NStreamSession.CLOSE_ORDERING) {
                 return "the multi-stream connection closed with 0x11 (ordering or resource failure)"
                         + (byPeer ? ", by the peer" : "");
             }
@@ -287,7 +287,7 @@ public final class GameLanes implements LaneGame {
     private volatile Session session;
 
     /**
-     * Production: a game pipeline over the {@link LaneSession} that activation creates. Build it
+     * Production: a game pipeline over the {@link NStreamSession} that activation creates. Build it
      * before calling
      * {@link rs.sudoe.quicraft.core.transport.V3Connection#activate(LaneGame, int, java.nio.ByteBuffer)}
      * and pass {@code connection::session} as the source, so the session is picked up exactly when it
@@ -523,7 +523,7 @@ public final class GameLanes implements LaneGame {
     /** Event loop only: the game channel goes away, with a cause that names the code (13.14). */
     private void closeGameChannel(int code, boolean byPeer, Throwable cause) {
         try {
-            if (code != LaneSession.CLOSE_NORMAL) {
+            if (code != NStreamSession.CLOSE_NORMAL) {
                 // The game's disconnect handling sees why, in the exception's own message.
                 game.pipeline().fireExceptionCaught(new LaneClosedException(code, byPeer, cause));
             }
@@ -544,8 +544,8 @@ public final class GameLanes implements LaneGame {
         }
         try {
             // 13.6: a lane the routing table disagrees with is an ordering failure, not an internal one.
-            session().abort(t instanceof LaneMismatchException ? LaneSession.CLOSE_ORDERING
-                    : LaneSession.CLOSE_INTERNAL_ERROR);
+            session().abort(t instanceof LaneMismatchException ? NStreamSession.CLOSE_ORDERING
+                    : NStreamSession.CLOSE_INTERNAL_ERROR);
         } catch (Throwable notAttached) {
             // No session to abort: the write that failed is already failed and the game's pipeline
             // has the cause, so there is nothing else this side can do.

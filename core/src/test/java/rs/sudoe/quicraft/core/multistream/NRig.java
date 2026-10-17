@@ -84,8 +84,8 @@ final class NRig implements AutoCloseable {
                 SessionResources.defaultProfile(), System::nanoTime);
     }
 
-    static LaneSession.Timing timing(long tickMillis, long openTimeoutMillis) {
-        return new LaneSession.Timing(System::nanoTime, TimeUnit.MILLISECONDS.toNanos(openTimeoutMillis),
+    static NStreamSession.Timing timing(long tickMillis, long openTimeoutMillis) {
+        return new NStreamSession.Timing(System::nanoTime, TimeUnit.MILLISECONDS.toNanos(openTimeoutMillis),
                 TimeUnit.SECONDS.toNanos(10), TimeUnit.MILLISECONDS.toNanos(tickMillis));
     }
 
@@ -250,8 +250,8 @@ final class NRig implements AutoCloseable {
         boolean serverSession = true;
         boolean clientSession = true;
         boolean compressed;
-        LaneSession.Timing serverTiming = timing(50, 10_000);
-        LaneSession.Timing clientTiming = timing(50, 10_000);
+        NStreamSession.Timing serverTiming = timing(50, 10_000);
+        NStreamSession.Timing clientTiming = timing(50, 10_000);
         SessionResources serverResources = resources();
         SessionResources clientResources = resources();
         RoutingTable table = TABLE;
@@ -333,7 +333,7 @@ final class NRig implements AutoCloseable {
             SessionContext context = SessionContext.of(config.shards);
             if (config.serverSession) {
                 serverConnection.eventLoop().submit(() -> {
-                    server = new NStreamSession(serverConnection, LaneSession.Role.SERVER, serverControl, config.table,
+                    server = new NStreamSession(serverConnection, NStreamSession.Role.SERVER, serverControl, config.table,
                             serverGame, context, config.serverResources, config.serverTiming, config.compressed);
                     serverGame.session = server;
                     serverRef = server;
@@ -344,7 +344,7 @@ final class NRig implements AutoCloseable {
             }
             if (config.clientSession) {
                 net.clientConnection.eventLoop().submit(() -> {
-                    client = new NStreamSession(net.clientConnection, LaneSession.Role.CLIENT, clientControl,
+                    client = new NStreamSession(net.clientConnection, NStreamSession.Role.CLIENT, clientControl,
                             config.table,
                             clientGame, context, config.clientResources, config.clientTiming, config.compressed);
                     clientGame.session = client;

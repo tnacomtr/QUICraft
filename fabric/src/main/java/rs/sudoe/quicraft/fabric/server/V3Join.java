@@ -36,7 +36,7 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.binding.BindingDriver;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
-import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
@@ -482,7 +482,7 @@ public final class V3Join {
         filter = new OutboundFilter(true);
         pipeline.addLast(FILTER, filter);
         outboundState = encoderState(pipeline);
-        outHold = new OutboundHold(new LaneSender(), LaneSession.MAX_UNSENT_PACKETS, LaneSession.MAX_UNSENT_BYTES,
+        outHold = new OutboundHold(new LaneSender(), NStreamSession.MAX_UNSENT_PACKETS, NStreamSession.MAX_UNSENT_BYTES,
                 node);
         backlog = new AckBacklog((lane, sequence) -> lanes.applied(lane, sequence), this::offerBehindHandlers, node,
                 AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);

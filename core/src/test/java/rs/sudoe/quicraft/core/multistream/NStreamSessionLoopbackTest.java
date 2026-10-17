@@ -36,7 +36,7 @@ class NStreamSessionLoopbackTest {
     private static final int CLOSE_ORDERING = 0x11;
     private static final int CLOSE_RESOURCE = 0x12;
 
-    private static LaneRig.Closed closed(NRig.Game game) throws Exception {
+    private static SessionRigSupport.Closed closed(NRig.Game game) throws Exception {
         return game.closed.get(15, TimeUnit.SECONDS);
     }
 
@@ -69,9 +69,9 @@ class NStreamSessionLoopbackTest {
                 rig.client.send(ProtocolState.PLAY, NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "sc"));
                 rig.client.send(ProtocolState.PLAY, NRig.REALTIME_ID, NRig.frame(NRig.REALTIME_ID, "sr"));
                 int total = chunks + 2;
-                assertTrue(LaneRig.await(() -> rig.clientGame.packets().size() == total, 15_000),
+                assertTrue(SessionRigSupport.await(() -> rig.clientGame.packets().size() == total, 15_000),
                         "n=" + n + " client got " + rig.clientGame.packets().size() + " of " + total);
-                assertTrue(LaneRig.await(() -> rig.serverGame.packets().size() == 2, 15_000), "n=" + n);
+                assertTrue(SessionRigSupport.await(() -> rig.serverGame.packets().size() == 2, 15_000), "n=" + n);
                 Set<Integer> usedShards = new HashSet<Integer>();
                 for (NRig.Got got : rig.clientGame.units()) {
                     NRig.Pkt pkt = (NRig.Pkt) got.packets.get(0);
@@ -136,12 +136,12 @@ class NStreamSessionLoopbackTest {
             rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(3, 4, repeat('k', 4096)),
                     NRig.chunkUncompressed(3, 4));
             rig.server.send(ProtocolState.PLAY, NRig.REALTIME_ID, NRig.frame(NRig.REALTIME_ID, "move"));
-            assertTrue(LaneRig.await(() -> rig.clientGame.count(NRig.REALTIME_ID) == 1, 10_000));
+            assertTrue(SessionRigSupport.await(() -> rig.clientGame.count(NRig.REALTIME_ID) == 1, 10_000));
             Thread.sleep(200);
             assertEquals(0, rig.clientGame.count(NRig.CHUNK_ID), "the chunk waits for pool bytes");
             res.outbound().cancel(other);
             res.wakeWaiters();
-            assertTrue(LaneRig.await(() -> rig.clientGame.count(NRig.CHUNK_ID) == 1, 10_000));
+            assertTrue(SessionRigSupport.await(() -> rig.clientGame.count(NRig.CHUNK_ID) == 1, 10_000));
             assertFalse(rig.clientGame.closed.isDone());
         }
     }
@@ -245,7 +245,7 @@ class NStreamSessionLoopbackTest {
         // Classified: a chunk waits past its deadline for a CONTROL prerequisite the client never saw.
         AtomicLong clientClock = new AtomicLong(System.nanoTime());
         NRig.Config config = new NRig.Config();
-        config.clientTiming = new LaneSession.Timing(clientClock::get, TimeUnit.SECONDS.toNanos(3600),
+        config.clientTiming = new NStreamSession.Timing(clientClock::get, TimeUnit.SECONDS.toNanos(3600),
                 TimeUnit.SECONDS.toNanos(10), TimeUnit.SECONDS.toNanos(3600));
         try (NRig rig = NRig.start(config)) {
             rig.activateBoth();
@@ -256,7 +256,7 @@ class NStreamSessionLoopbackTest {
             assertTrue(view.isAssigned());
             rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(0, 0, "after view"),
                     NRig.chunkUncompressed(0, 0), view);
-            assertTrue(LaneRig.await(() -> captor.size() > 0, 10_000), "the VIEW record was written");
+            assertTrue(SessionRigSupport.await(() -> captor.size() > 0, 10_000), "the VIEW record was written");
             for (int i = 0; i < 50 && !rig.clientGame.closed.isDone(); i++) {
                 Thread.sleep(100);
                 clientClock.addAndGet(TimeUnit.SECONDS.toNanos(11));
@@ -295,7 +295,7 @@ class NStreamSessionLoopbackTest {
                 }
             }
             rig.server.end();
-            LaneRig.Closed client = closed(rig.clientGame);
+            SessionRigSupport.Closed client = closed(rig.clientGame);
             assertEquals(0, client.code);
             assertEquals(chunks, rig.clientGame.count(NRig.CHUNK_ID), "every shard drained before END");
             assertEquals(0, closed(rig.serverGame).code);
@@ -364,7 +364,7 @@ class NStreamSessionLoopbackTest {
             assertTrue(fired.get(), "the hook ran between a poll and its write");
             assertTrue(atPoll.get() > 4096, "the polled slice was charged: " + atPoll.get());
             assertEquals(atPoll.get(), afterRefusal.get(), "nothing was released between the poll and the write");
-            assertTrue(LaneRig.await(() -> res.outbound().reserved(rig.server) == 0, 10_000),
+            assertTrue(SessionRigSupport.await(() -> res.outbound().reserved(rig.server) == 0, 10_000),
                     "the pool's accounting returns to zero: " + res.outbound().reserved(rig.server));
             assertEquals(0, res.outbound().reserved(rig.server));
         }
@@ -460,7 +460,7 @@ class NStreamSessionLoopbackTest {
             for (SentPacket handle : handles) {
                 assertEquals(LogicalStream.CONTROL, handle.logicalStream());
             }
-            assertTrue(LaneRig.await(() -> bundleUnit(rig.clientGame, "cm") != null, 15_000),
+            assertTrue(SessionRigSupport.await(() -> bundleUnit(rig.clientGame, "cm") != null, 15_000),
                     () -> "bundle delivered: " + rig.clientGame.units() + " " + rig.clientGame.closed.getNow(null));
             NRig.Got got = bundleUnit(rig.clientGame, "cm");
             assertEquals(LogicalStream.CONTROL, got.stream);
@@ -498,7 +498,7 @@ class NStreamSessionLoopbackTest {
             List<SentPacket> handles = bundle(rig.server, NRig.frame(NRig.INTERACTION_ID, "im"),
                     NRig.frame(NRig.CONTROL_ID, "cm"));
             assertEquals(4, handles.size(), "the bundle was accepted");
-            assertTrue(LaneRig.await(() -> bundleUnit(rig.clientGame, "im") != null, 15_000),
+            assertTrue(SessionRigSupport.await(() -> bundleUnit(rig.clientGame, "im") != null, 15_000),
                     () -> "bundle delivered: " + rig.clientGame.units() + " " + rig.clientGame.closed.getNow(null));
             assertEquals(LogicalStream.CONTROL, bundleUnit(rig.clientGame, "im").stream);
             assertFalse(rig.clientGame.closed.isDone());
@@ -541,8 +541,8 @@ class NStreamSessionLoopbackTest {
             rig.serverGame.autoApply = false;
             byte[] body = new byte[16000];
             body[0] = (byte) NRig.CONTROL_ID;
-            rig.client.send(ProtocolState.PLAY, NRig.CONTROL_ID, LaneRig.frame(0, body));
-            assertTrue(LaneRig.await(() -> rig.serverGame.count(NRig.CONTROL_ID) == 1, 10_000));
+            rig.client.send(ProtocolState.PLAY, NRig.CONTROL_ID, SessionRigSupport.frame(0, body));
+            assertTrue(SessionRigSupport.await(() -> rig.serverGame.count(NRig.CONTROL_ID) == 1, 10_000));
             assertTrue(res.inboundExcess().reserved(rig.server) > 0, "the inbound unit owns excess");
             assertTrue(res.node().reserved(Pool.INFLATER) > 0, "the victim owns inflater state");
             assertTrue(res.outbound().reserved(rig.server) > 0, "the victim owns outbound headroom");
@@ -609,7 +609,7 @@ class NStreamSessionLoopbackTest {
             }
             rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(1, 1, repeat('s', 65536)),
                     NRig.chunkUncompressed(1, 1));
-            assertTrue(LaneRig.await(() -> res.outbound().reserved(rig.server) > baseline + 65536, 10_000),
+            assertTrue(SessionRigSupport.await(() -> res.outbound().reserved(rig.server) > baseline + 65536, 10_000),
                     "the held chunk is charged");
             Object other = new Object();
             long free = res.node().limit(Pool.OUTBOUND) - res.node().reserved(Pool.OUTBOUND);
@@ -621,7 +621,7 @@ class NStreamSessionLoopbackTest {
             assertEquals(CLOSE_RESOURCE, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
             assertArrayEquals("resource".getBytes(StandardCharsets.US_ASCII),
                     rig.net.clientSawReason.get(15, TimeUnit.SECONDS));
-            assertTrue(LaneRig.await(() -> res.outbound().takeGrant(ticket), 10_000),
+            assertTrue(SessionRigSupport.await(() -> res.outbound().takeGrant(ticket), 10_000),
                     "the victim's bytes go to the requester once its close is confirmed");
             assertEquals(0, res.outbound().reserved(rig.server));
         }
@@ -638,7 +638,7 @@ class NStreamSessionLoopbackTest {
             NRig.onLoop(rig.server, () -> rig.server.channelOf(stream).pipeline().addFirst(captor));
             rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(5, 5, repeat('w', 16384)),
                     NRig.chunkUncompressed(5, 5));
-            assertTrue(LaneRig.await(() -> captor.size() > 0, 10_000), "the chunk's write reached the channel");
+            assertTrue(SessionRigSupport.await(() -> captor.size() > 0, 10_000), "the chunk's write reached the channel");
             Thread.sleep(200);
             assertTrue(res.outbound().reserved(rig.server) > baseline + 16384,
                     "the charge stays while the write is pending: " + res.outbound().reserved(rig.server));
@@ -646,9 +646,9 @@ class NStreamSessionLoopbackTest {
                 captor.release();
                 return null;
             });
-            assertTrue(LaneRig.await(() -> res.outbound().reserved(rig.server) == baseline, 10_000),
+            assertTrue(SessionRigSupport.await(() -> res.outbound().reserved(rig.server) == baseline, 10_000),
                     "the charge is released once the write completes");
-            assertTrue(LaneRig.await(() -> rig.clientGame.count(NRig.CHUNK_ID) == 1, 10_000));
+            assertTrue(SessionRigSupport.await(() -> rig.clientGame.count(NRig.CHUNK_ID) == 1, 10_000));
         }
     }
 

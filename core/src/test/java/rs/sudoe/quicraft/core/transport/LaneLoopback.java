@@ -41,8 +41,6 @@ public final class LaneLoopback implements AutoCloseable {
         public int serverMaxStreamsUni = -1;
         public StreamSink serverSink = stream -> {};
         public StreamSink clientSink = stream -> {};
-        /** Only tests constructing the retired three-lane session may request its reverse window. */
-        public boolean legacyReverseWindow;
     }
 
     public final EventLoopGroup group;
@@ -84,9 +82,6 @@ public final class LaneLoopback implements AutoCloseable {
         CompletableFuture<byte[]> clientReason = new CompletableFuture<>();
         try {
             QuicServerCodecBuilder server = Codecs.apply(new QuicServerCodecBuilder(), options.server, true);
-            if (options.legacyReverseWindow) {
-                server.initialMaxStreamDataBidirectionalLocal(TransportConfig.LEGACY_LANE_REVERSE_STREAM_DATA);
-            }
             if (options.serverMaxStreamsBidi >= 0) {
                 server.initialMaxStreamsBidirectional(options.serverMaxStreamsBidi);
             }

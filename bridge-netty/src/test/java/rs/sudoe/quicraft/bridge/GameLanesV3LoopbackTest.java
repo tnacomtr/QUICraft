@@ -33,7 +33,7 @@ import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.multistream.Envelope;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
-import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.RecordCodec;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
@@ -168,9 +168,9 @@ class GameLanesV3LoopbackTest {
             ChannelFuture write = rig.clientChannel.writeAndFlush("spawn");
             assertFalse(write.isSuccess(), "13.6: the wrong-lane packet is never handed to the session");
 
-            assertEquals(LaneSession.CLOSE_ORDERING, rig.clientGame.awaitClose(10),
+            assertEquals(NStreamSession.CLOSE_ORDERING, rig.clientGame.awaitClose(10),
                     "the local side fails with 0x11");
-            assertEquals(LaneSession.CLOSE_ORDERING, rig.serverGame.awaitClose(10),
+            assertEquals(NStreamSession.CLOSE_ORDERING, rig.serverGame.awaitClose(10),
                     "and the peer sees the whole connection close with 0x11 (13.14)");
             assertTrue(rig.serverGame.seen.isEmpty(),
                     "13.6: nothing the peer decoded can be the wrong-lane packet: " + rig.serverGame.seen);
