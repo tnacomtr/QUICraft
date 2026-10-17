@@ -37,6 +37,7 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
+import rs.sudoe.quicraft.core.multistream.SessionResources;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 /**
@@ -497,6 +498,8 @@ public final class QuicServer implements Closeable {
         final ReceiveBudget nodeBudget;
         /** /3 staged pre-login admission (12.13); null for /2 or without a resource pool. */
         final PreLoginRegistry preLogin;
+        /** The N+2 sessions' pools, ranking and shed dispatch, one per listener (13.12); null for /2. */
+        final SessionResources sessionResources;
         /** The ingress guard's datagram budget, shared by every socket's guard. */
         final ConnectionAdmission ingress;
         /** One instance for every socket's codec: it holds the listener's Retry key. */
@@ -526,6 +529,7 @@ public final class QuicServer implements Closeable {
             this.preLogin = v3 != null && config.resourcePools != null
                     ? new PreLoginRegistry(config.resourcePools, config.sessionCallsPerPrefix,
                             config.declaredBytesPerPrefix, new java.util.Random()) : null;
+            this.sessionResources = v3 != null ? SessionResources.production(config.resourcePools) : null;
             this.acceptor = acceptor;
             this.v3 = v3;
             this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
@@ -948,7 +952,8 @@ public final class QuicServer implements Closeable {
                                 shared.accepted.incrementAndGet(socketIndex);
                             }
                             connection.pipeline().addLast(new Connection(shared.acceptor, shared.tokens,
-                                    shared.config.earlyData, shared.unconfirmed, shared.v3, shared.nodeBudget));
+                                    shared.config.earlyData, shared.unconfirmed, shared.v3, shared.nodeBudget,
+                                    shared.sessionResources));
                         };
                         Admitted admitted = Admitted.admit(connection, shared.admission, shared.v3 != null
                                 ? shared.nodeBudget : null, shared.preLogin, shared.config.preLoginOnline, install,
@@ -1485,6 +1490,7 @@ public final class QuicServer implements Closeable {
         /** Non-null enables the {@code /3} stream map of 13.3 on this connection (13.1). */
         private final V3Listener v3;
         private final ReceiveBudget nodeBudget;
+        private final SessionResources sessionResources;
         private final List<ServerStream> waiting = new ArrayList<>(1);
         private final List<V3ConnectionImpl> waitingV3 = new ArrayList<>(1);
         /** The /3 connection of stream 0, if one was offered. */
@@ -1494,8 +1500,9 @@ public final class QuicServer implements Closeable {
         private java.util.concurrent.ScheduledFuture<?> confirmDeadline;
 
         Connection(StreamAcceptor acceptor, EarlyTokens tokens, boolean earlyData, Unconfirmed unconfirmed,
-                V3Listener v3, ReceiveBudget nodeBudget) {
+                V3Listener v3, ReceiveBudget nodeBudget, SessionResources sessionResources) {
             this.nodeBudget = nodeBudget;
+            this.sessionResources = sessionResources;
             this.acceptor = acceptor;
             this.tokens = tokens;
             this.earlyData = earlyData;
@@ -1520,7 +1527,7 @@ public final class QuicServer implements Closeable {
          */
         void offerV3(QuicStreamChannel control) {
             V3ConnectionImpl connection = V3ConnectionImpl.server((QuicChannel) ctx.channel(), control,
-                    new NettyQuicByteStream(control), v3, this::onPreambleV3, handshakeDone, nodeBudget);
+                    new NettyQuicByteStream(control), v3, this::onPreambleV3, handshakeDone, nodeBudget, sessionResources);
             v3Connection = connection;
             connection.start();
         }

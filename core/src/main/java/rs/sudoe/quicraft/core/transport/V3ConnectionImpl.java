@@ -22,6 +22,8 @@ import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.NStreamSession;
+import rs.sudoe.quicraft.core.multistream.SessionResources;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
@@ -124,11 +126,22 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     /** The server's side: the routing table is resolved at activation from {@code listener}. */
     static V3ConnectionImpl server(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
             V3Listener listener, PreambleHandler handler, boolean handshakeComplete, ReceiveBudget node) {
+        return server(connection, control, raw, listener, handler, handshakeComplete, node, null);
+    }
+
+    /** As above, with the listener's N+2 session resources (13.12); null builds them on first activation. */
+    static V3ConnectionImpl server(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
+            V3Listener listener, PreambleHandler handler, boolean handshakeComplete, ReceiveBudget node,
+            SessionResources resources) {
         V3ConnectionImpl impl = new V3ConnectionImpl(connection, control, raw, LaneSession.Role.SERVER, null, null,
                 null, null, null, listener, handler, handshakeComplete);
         impl.node = node == null ? ReceiveBudget.unlimited() : node;
+        impl.resources = resources;
         return impl;
     }
+
+    /** The N+2 sessions' shared resources; the client uses the process-wide instance. */
+    private SessionResources resources;
 
     /** The node's shared receive budget the lane session reserves against (13.12). */
     private ReceiveBudget node = ReceiveBudget.unlimited();
@@ -815,7 +828,13 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         kept.clear();
         keptBytes = 0;
         // The session installs itself first in stream 0's pipeline and drives reads itself.
-        LaneSession started = new LaneSession(connection, role, control, resolved, game, node, negotiated);
+        MultistreamSession started;
+        try {
+            started = newSession(resolved, game, negotiated);
+        } catch (RuntimeException e) {
+            failActivation("the session cannot start: " + e.getMessage());
+            return;
+        }
         session = started;
         activated = true;
         for (QuicStreamChannel stream : early) {
@@ -823,6 +842,22 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         }
         early.clear();
         started.activate(leftover);
+    }
+
+    /**
+     * The session factory: the legacy three-lane session while {@link TransportConfig#LEGACY_LANE_SESSION}
+     * holds, otherwise the N+2 session (13.3) over the listener's (or the client's) shared resources.
+     */
+    private MultistreamSession newSession(RoutingTable resolved, LaneGame game, SessionContext negotiated) {
+        if (TransportConfig.LEGACY_LANE_SESSION) {
+            return new LaneSession(connection, role, control, resolved, game, node, negotiated);
+        }
+        SessionResources shared = resources;
+        if (shared == null) {
+            shared = role == LaneSession.Role.CLIENT ? SessionResources.client() : SessionResources.production(null);
+            resources = shared;
+        }
+        return new NStreamSession(connection, role, control, resolved, game, negotiated, shared);
     }
 
     /** Concatenates the application's leftover and what core read after the detach; null for none. */
