@@ -188,6 +188,8 @@ class SessionReceiveDriverTest {
         h.driver.acknowledged(3, 1);
         assertEquals(Collections.singletonList(CLOSE_ORDERING), h.codes);
         assertEquals(2, h.game.deliveries(), "the epoch-2 record on stream 2 is never delivered");
+        assertFalse(h.game.log.contains("applied 3:1"), "a violated apply is not reported as completed");
+        assertTrue(h.slots.holdsHead(3), "a violated apply does not commit the pump unit");
     }
 
     @Test void wrongRouteNeverReachesGameQueue() throws Exception {
@@ -257,6 +259,21 @@ class SessionReceiveDriverTest {
         h.rounds(1);
         assertTrue(h.codes.isEmpty(), "active time is 9 s at 69 s");
         h.now[0] = TimeUnit.SECONDS.toNanos(70);
+        h.rounds(1);
+        assertEquals(Collections.singletonList(CLOSE_RESOURCE), h.codes);
+    }
+
+    @Test void stallEndStopsTheExclusion() throws Exception {
+        Harness h = new Harness();
+        h.source.put(2, rec(2, 1, 0, dep(LogicalStream.CONTROL, 1), PID_CHUNK));
+        h.rounds(5);
+        h.driver.stallStarted();
+        h.now[0] = TimeUnit.SECONDS.toNanos(5);
+        h.driver.stallEnded();
+        h.now[0] = TimeUnit.SECONDS.toNanos(14);
+        h.rounds(1);
+        assertTrue(h.codes.isEmpty(), "a 5 s stall leaves 9 s of active time at 14 s");
+        h.now[0] = TimeUnit.SECONDS.toNanos(15);
         h.rounds(1);
         assertEquals(Collections.singletonList(CLOSE_RESOURCE), h.codes);
     }
