@@ -239,6 +239,26 @@ class NStreamSessionLoopbackTest {
         }
     }
 
+    /**
+     * The peer stops reading a lane with nothing in flight. Netty reports no event for the incoming
+     * STOP_SENDING and the writer never touches the lane again, so only the periodic send-capacity
+     * probe (13.14) can notice: the writer closes 0x11 by its own decision.
+     */
+    @Test
+    void aStopSendingOnAnIdleLaneClosesBothSidesWith0x11WithoutAWrite() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            NRig.channel(rig.client, LogicalStream.REALTIME).shutdownInput(0x43);
+            SessionRigSupport.Closed server = closed(rig.serverGame);
+            assertEquals(CLOSE_ORDERING, server.code, server.toString());
+            assertFalse(server.byPeer, "the probe closes locally, with no write to learn it from: " + server);
+            SessionRigSupport.Closed client = closed(rig.clientGame);
+            assertEquals(CLOSE_ORDERING, client.code, client.toString());
+            assertTrue(client.byPeer, "the client only sees the writer's close: " + client);
+            assertEquals(0, rig.clientGame.count(NRig.REALTIME_ID), "no REALTIME record was needed to notice");
+        }
+    }
+
     /** The server session registers its connection with the inbound ranking its excess pool picks victims by. */
     @Test
     void serverSessionJoinsTheInboundRanking() throws Exception {
