@@ -1036,9 +1036,10 @@ activation, even after Login Success. A shed closes before Login Success and cli
 
 **Revised draft, 2026-10-16. This replaces the unshipped three-lane `/3` draft in place; no old-draft compatibility is required. Implementation remains disabled by default. Security review is required before release or enablement.**
 
-This is spec only. Current `core/multistream` still has the 33-byte three-lane record codec,
-full CONTROL fences and shared auxiliary budget; `core/routing` still uses schema 1 without
-position extraction. Those implementations must change together before this revision can run.
+This is spec only. The 33-byte three-lane record codec and the three-lane session it belonged to
+are gone: `core/multistream` implements 13.4's compact header over the N+2 stream map (13.3).
+`core/routing` still uses schema 1 without position extraction, so the implementation must change
+before this revision can run.
 
 ### Direction (2026-10-16): specified, not implemented
 
