@@ -25,6 +25,8 @@ import rs.sudoe.quicraft.core.resource.PressureRanking;
 
 class SessionSendDriverTest {
     private static final long MB = 1L << 20;
+    /** The REALTIME slice used by small-cap rigs; caps in those rigs are raised by this amount (13.12). */
+    private static final long TEST_SLICE = 32;
 
     /** A rig with generous pools, a manual clock and the given profile limits. */
     private static final class Rig {
@@ -33,24 +35,32 @@ class SessionSendDriverTest {
         final OutboundPool pool;
         final Object owner = new Object();
         final SessionSendDriver driver;
+        /** The REALTIME slice this driver holds for the connection. */
+        final long slice;
 
         Rig(int shards, int queuePackets) throws Exception {
             this(shards, queuePackets, 1L << 40);
         }
 
-        /** A rig whose per-connection outbound cap is {@code connectionCap} bytes. */
+        /**
+         * A rig whose record and ACK budget is {@code connectionCap} bytes. Small caps also hold the REALTIME slice,
+         * so the pool cap is raised by {@link #TEST_SLICE} and the budget is unchanged.
+         */
         Rig(int shards, int queuePackets, long connectionCap) throws Exception {
+            boolean large = connectionCap >= ReceiveSlots.BYTES_PER_STREAM + AckJoinTracker.MAX_BYTES;
+            slice = large ? SessionSendDriver.DEFAULT_REALTIME_SLICE_BYTES : TEST_SLICE;
             NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
-            pool = new OutboundPool(node, 1L << 40, 1L << 40, connectionCap, ranking.view(now::get));
+            pool = new OutboundPool(node, 1L << 40, 1L << 40, large ? connectionCap : connectionCap + TEST_SLICE,
+                    ranking.view(now::get));
             ServerProfile profile = new ServerProfile(1, 1, 1024, .5, queuePackets, 1L << 40, 4, 4, 4);
-            if (connectionCap >= ReceiveSlots.BYTES_PER_STREAM + AckJoinTracker.MAX_BYTES) {
+            if (large) {
                 driver = new SessionSendDriver(SessionContext.of(shards), profile, pool, ranking, owner,
                         InetAddress.getLoopbackAddress(), null, now::get);
             } else {
                 // A small test cap is split between one maximum record and the ACK headroom (the check in the constructor).
                 driver = new SessionSendDriver(SessionContext.of(shards), profile, pool, ranking, owner,
                         InetAddress.getLoopbackAddress(), null, now::get, connectionCap - connectionCap / 4,
-                        connectionCap / 4);
+                        connectionCap / 4, TEST_SLICE);
             }
         }
     }
@@ -62,13 +72,15 @@ class SessionSendDriverTest {
         final OutboundPool pool;
         final Object owner = new Object();
         final SessionSendDriver driver;
+        /** The REALTIME slice this driver holds; the pool cap is raised by it (13.12). */
+        final long slice = TEST_SLICE;
 
         HeadroomRig(long connectionCap, long maxRecordBytes, long ackByteLimit) throws Exception {
             NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
-            pool = new OutboundPool(node, 1L << 40, 1L << 40, connectionCap, ranking.view(now::get));
+            pool = new OutboundPool(node, 1L << 40, 1L << 40, connectionCap + TEST_SLICE, ranking.view(now::get));
             ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
             driver = new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner,
-                    InetAddress.getLoopbackAddress(), null, now::get, maxRecordBytes, ackByteLimit);
+                    InetAddress.getLoopbackAddress(), null, now::get, maxRecordBytes, ackByteLimit, TEST_SLICE);
         }
     }
 
@@ -290,10 +302,10 @@ class SessionSendDriverTest {
         assertEquals(charged, rig.pool.reserved(rig.owner), "slices that are not the last do not release");
         SessionSendDriver.Write second = slices.get(slices.size() - 1);
         driver.released(second.token());
-        assertEquals(0, rig.pool.reserved(rig.owner), "the last slice's release frees the whole record");
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "the last slice's release frees the whole record");
         driver.released(second.token());
         driver.failed(second.token());
-        assertEquals(0, rig.pool.reserved(rig.owner), "a repeated completion releases nothing again");
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "a repeated completion releases nothing again");
     }
 
     @Test
@@ -322,15 +334,15 @@ class SessionSendDriverTest {
         PressureRanking ranking = new PressureRanking();
         // A per-connection cap of 100 bytes: the second record's reservation waits for the first release.
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                1L << 40, 1L << 40, 100, ranking.view(now::get));
+                1L << 40, 1L << 40, 100 + TEST_SLICE, ranking.view(now::get));
         Object owner = new Object();
         SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
                 new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
-                InetAddress.getLoopbackAddress(), null, now::get, 75, 25);
+                InetAddress.getLoopbackAddress(), null, now::get, 75, 25, TEST_SLICE);
         SentPacket first = driver.submit(frame(40), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
         SentPacket second = driver.submit(frame(80), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
         assertTrue(first.isAssigned() && second.isAssigned());
-        assertTrue(pool.reserved(owner) <= 100, "only the first reservation is granted");
+        assertTrue(pool.reserved(owner) <= 100 + TEST_SLICE, "only the first reservation is granted");
 
         SessionSendDriver.Write written = driver.poll(stream -> true);
         assertNotNull(written);
@@ -432,13 +444,13 @@ class SessionSendDriverTest {
         assertNotNull(first);
         assertEquals(LogicalStream.REALTIME, first.stream());
         assertNull(driver.poll(stream -> true), "the 86-byte chunk waits for its grant; nothing after it is granted");
-        assertEquals(46, rig.pool.reserved(rig.owner), "only the granted realtime record is charged");
+        assertEquals(rig.slice + 46, rig.pool.reserved(rig.owner), "only the granted realtime record is charged");
         driver.released(first.token());
 
         Drain rest = drainAndRelease(driver);
         assertEquals(3, rest.writes.size(), "the waiting chunk, then the records behind it, are written");
         assertEquals(waiting.sequence(), RecordCodec.decodeRecord(rest.writes.get(0).bytes(), 2).sequence());
-        assertEquals(0, rig.pool.reserved(rig.owner));
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "only the slice is held once every record is released");
         assertFalse(driver.isClosed());
     }
 
@@ -452,11 +464,11 @@ class SessionSendDriverTest {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                1L << 40, 1L << 40, 100, ranking.view(now::get));
+                1L << 40, 1L << 40, 100 + TEST_SLICE, ranking.view(now::get));
         Object owner = new Object();
         SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
                 new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
-                InetAddress.getLoopbackAddress(), null, now::get, 86, 14);
+                InetAddress.getLoopbackAddress(), null, now::get, 86, 14, TEST_SLICE);
         SentPacket realtime = driver.submit(frame(40), StreamSequencer.Fence.REALTIME, 0, 0);
         SentPacket chunk = driver.submit(frame(80), StreamSequencer.Fence.CHUNK, 0, 0);
         SentPacket fence = driver.submitAfter(frame(10), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0, chunk);
@@ -472,7 +484,7 @@ class SessionSendDriverTest {
         assertEquals(2, rest.writes.size(), "the chunk is granted once realtime is released, then the fence");
         assertEquals(chunk.sequence(), RecordCodec.decodeRecord(rest.writes.get(0).bytes(), 2).sequence());
         assertEquals(fence.sequence(), RecordCodec.decodeRecord(rest.writes.get(1).bytes(), 0).sequence());
-        assertEquals(0, pool.reserved(owner));
+        assertEquals(TEST_SLICE, pool.reserved(owner), "only the slice is held");
         assertFalse(driver.isClosed());
     }
 
@@ -486,13 +498,13 @@ class SessionSendDriverTest {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                1L << 40, 1L << 40, 102, ranking.view(now::get));
+                1L << 40, 1L << 40, 102 + TEST_SLICE, ranking.view(now::get));
         Object owner = new Object();
         SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
                 new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
-                InetAddress.getLoopbackAddress(), null, now::get, 86, 16);
+                InetAddress.getLoopbackAddress(), null, now::get, 86, 16, TEST_SLICE);
         assertTrue(driver.createAck(1, frame(2).frame(), 16));
-        assertEquals(16, pool.reserved(owner), "the ack is charged at creation");
+        assertEquals(16 + TEST_SLICE, pool.reserved(owner), "the ack is charged at creation");
         assertTrue(driver.coverPending(1, 42));
         assertFalse(driver.createAck(2, frame(2).frame(), 16),
                 "a second precharged ack would starve the covered update, so the producer pauses");
@@ -506,7 +518,7 @@ class SessionSendDriverTest {
 
         Drain drain = drainAndRelease(driver);
         assertEquals(2, drain.writes.size(), "the covered update and the ack are both written");
-        assertEquals(0, pool.reserved(owner), "every charge is released");
+        assertEquals(TEST_SLICE, pool.reserved(owner), "every record charge is released; the slice remains");
         assertTrue(driver.createAck(4, frame(2).frame(), 16), "released headroom is available again");
         driver.close();
         assertEquals(0, pool.reserved(owner));
@@ -518,12 +530,12 @@ class SessionSendDriverTest {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                1L << 40, 1L << 40, 100, ranking.view(now::get));
+                1L << 40, 1L << 40, 100 + TEST_SLICE, ranking.view(now::get));
         ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
         assertThrows(IllegalArgumentException.class, () -> new SessionSendDriver(SessionContext.of(1), profile,
-                pool, ranking, new Object(), InetAddress.getLoopbackAddress(), null, now::get, 86, 16));
+                pool, ranking, new Object(), InetAddress.getLoopbackAddress(), null, now::get, 86, 16, TEST_SLICE));
         assertNotNull(new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, new Object(),
-                InetAddress.getLoopbackAddress(), null, now::get, 84, 16));
+                InetAddress.getLoopbackAddress(), null, now::get, 84, 16, TEST_SLICE));
     }
 
     /**
@@ -535,17 +547,18 @@ class SessionSendDriverTest {
     void shedNoticeReachesOnlyTheVictimDriver() throws Exception {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
+        // The IP cap holds the two REALTIME slices beside the 100-byte budget.
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                100, 1L << 40, 1L << 40, ranking.view(now::get));
+                100 + 2 * TEST_SLICE, 1L << 40, 1L << 40, ranking.view(now::get));
         InetAddress ip = InetAddress.getLoopbackAddress();
         ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
         Object ownerA = new Object();
         Object ownerB = new Object();
         // The 100-byte IP cap is the smallest cap, so the headroom is 84 record bytes plus 16 ACK bytes.
         SessionSendDriver a = new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, ownerA,
-                ip, null, now::get, 84, 16);
+                ip, null, now::get, 84, 16, TEST_SLICE);
         SessionSendDriver b = new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, ownerB,
-                ip, null, now::get, 84, 16);
+                ip, null, now::get, 84, 16, TEST_SLICE);
         assertTrue(a.submit(frame(70), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
         assertTrue(b.submit(frame(30), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
 
@@ -579,11 +592,11 @@ class SessionSendDriverTest {
         assertEquals(charged, rig.pool.reserved(rig.owner), "the last slice alone does not release the record");
         for (int i = slices.size() - 2; i >= 0; i--) {
             driver.released(slices.get(i).token());
-            assertEquals(i == 0 ? 0 : charged, rig.pool.reserved(rig.owner),
+            assertEquals(i == 0 ? rig.slice : charged, rig.pool.reserved(rig.owner),
                     "the charge is released only when the final outstanding slice completes");
         }
         driver.failed(slice.token());
-        assertEquals(0, rig.pool.reserved(rig.owner), "a repeated completion releases nothing again");
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "a repeated completion releases nothing again");
     }
 
     /** A pending ACK_JOIN counts against the queue limits from creation, so a saturated queue closes 0x12. */
@@ -669,7 +682,7 @@ class SessionSendDriverTest {
         drainAndRelease(driver);
         assertFalse(driver.isClosed());
         assertEquals(0, driver.queuedRecords());
-        assertEquals(0, rig.pool.reserved(rig.owner));
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner));
     }
 
     /** The headroom check uses the smallest cap that applies to the connection: owner, IP, account or node. */
@@ -681,13 +694,190 @@ class SessionSendDriverTest {
         OutboundPool ipLimited = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
                 90, 1L << 40, 1L << 40, ranking.view(now::get));
         assertThrows(IllegalArgumentException.class, () -> new SessionSendDriver(SessionContext.of(1), profile,
-                ipLimited, ranking, new Object(), InetAddress.getLoopbackAddress(), null, now::get, 86, 14));
+                ipLimited, ranking, new Object(), InetAddress.getLoopbackAddress(), null, now::get, 86, 14, TEST_SLICE));
         OutboundPool accountLimited = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
                 1L << 40, 90, 1L << 40, ranking.view(now::get));
         assertThrows(IllegalArgumentException.class, () -> new SessionSendDriver(SessionContext.of(1), profile,
-                accountLimited, ranking, new Object(), InetAddress.getLoopbackAddress(), "alice", now::get, 86, 14));
+                accountLimited, ranking, new Object(), InetAddress.getLoopbackAddress(), "alice", now::get, 86, 14,
+                TEST_SLICE));
         assertNotNull(new SessionSendDriver(SessionContext.of(1), profile, accountLimited, ranking, new Object(),
-                InetAddress.getLoopbackAddress(), null, now::get, 86, 14));
+                InetAddress.getLoopbackAddress(), null, now::get, 86, 14, TEST_SLICE));
+    }
+
+    /** Polls every selectable slice without releasing any, collecting them in write order. */
+    private static void pollAll(SessionSendDriver driver, List<SessionSendDriver.Write> into) {
+        SessionSendDriver.Write write;
+        while ((write = driver.poll(stream -> true)) != null) {
+            into.add(write);
+        }
+    }
+
+    /** True when a slice of {@code handle}'s record was written among {@code writes}. */
+    private static boolean wrote(List<SessionSendDriver.Write> writes, SentPacket handle) throws Exception {
+        for (SessionSendDriver.Write write : writes) {
+            if (write.stream() == handle.logicalStream()
+                    && RecordCodec.decodeRecord(write.bytes(), write.stream()).sequence() == handle.sequence()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A REALTIME record of at most the slice is written while an earlier CHUNK waits at the owner cap (13.12). The
+     * REALTIME record never touches the ledger, so the owner cap does not hold it.
+     */
+    @Test
+    void realtimeIsWrittenWhileOwnChunkWaitsAtOwnerCap() throws Exception {
+        Rig rig = new Rig(1, 1000, 100);
+        SessionSendDriver driver = rig.driver;
+        SentPacket first = driver.submit(frame(80), StreamSequencer.Fence.CHUNK, 0, 0);
+        SentPacket waiting = driver.submit(frame(80), StreamSequencer.Fence.CHUNK, 0, 0);
+        SentPacket realtime = driver.submit(frame(4), StreamSequencer.Fence.REALTIME, 0, 0);
+        assertTrue(first.isAssigned() && waiting.isAssigned() && realtime.isAssigned());
+
+        List<SessionSendDriver.Write> held = new ArrayList<SessionSendDriver.Write>();
+        pollAll(driver, held);
+        assertTrue(wrote(held, first), "the first chunk is granted");
+        assertTrue(wrote(held, realtime), "the realtime record is written while the chunk waits");
+        assertFalse(wrote(held, waiting), "the second chunk waits for the owner cap");
+        for (SessionSendDriver.Write write : held) {
+            driver.released(write.token());
+        }
+        Drain rest = drainAndRelease(driver);
+        assertTrue(wrote(rest.writes, waiting), "the waiting chunk is written once bytes are released");
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "only the slice is held");
+    }
+
+    /**
+     * Two drivers share one IP whose cap holds both slices beside 100 record bytes. A's second chunk waits at the IP
+     * cap, and B's REALTIME record is still written: it never waits for the IP ledger waiter (13.12).
+     */
+    @Test
+    void realtimeIsWrittenWhileAnotherDriverOnTheSameIpWaitsAtTheIpCap() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                100 + 2 * TEST_SLICE, 1L << 40, 1L << 40, ranking.view(now::get));
+        InetAddress ip = InetAddress.getLoopbackAddress();
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
+        SessionSendDriver a = new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, new Object(),
+                ip, null, now::get, 75, 25, TEST_SLICE);
+        SessionSendDriver b = new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, new Object(),
+                ip, null, now::get, 75, 25, TEST_SLICE);
+        SentPacket chunk = a.submit(frame(80), StreamSequencer.Fence.CHUNK, 0, 0);
+        SentPacket waiting = a.submit(frame(80), StreamSequencer.Fence.CHUNK, 0, 0);
+        SentPacket realtime = b.submit(frame(4), StreamSequencer.Fence.REALTIME, 0, 0);
+        assertTrue(chunk.isAssigned() && waiting.isAssigned() && realtime.isAssigned());
+
+        List<SessionSendDriver.Write> heldA = new ArrayList<SessionSendDriver.Write>();
+        List<SessionSendDriver.Write> heldB = new ArrayList<SessionSendDriver.Write>();
+        pollAll(a, heldA);
+        pollAll(b, heldB);
+        assertTrue(wrote(heldA, chunk), "A's first chunk is granted");
+        assertTrue(wrote(heldB, realtime), "B's realtime record is written while A's chunk waits at the IP cap");
+        assertTrue(pool.drainShedOwners().isEmpty(), "B holds only its slice and is never shed for A's chunk");
+        assertFalse(wrote(heldA, waiting), "A's second chunk waits at the IP cap");
+        for (SessionSendDriver.Write write : heldA) {
+            a.released(write.token());
+        }
+        for (SessionSendDriver.Write write : heldB) {
+            b.released(write.token());
+        }
+        assertTrue(wrote(drainAndRelease(a).writes, waiting), "A's waiting chunk is written once the IP has room");
+    }
+
+    /**
+     * A REALTIME record above the slice takes the main queue at its position, then a smaller REALTIME record that fits
+     * the slice still waits for it, because REALTIME is written in stream order (13.12).
+     */
+    @Test
+    void oversizeRealtimeTakesTheMainQueue() throws Exception {
+        Rig rig = new Rig(1, 1000, 100);
+        SessionSendDriver driver = rig.driver;
+        SentPacket chunk = driver.submit(frame(70), StreamSequencer.Fence.CHUNK, 0, 0);
+        // 32 + 77 is held by the chunk, so the 46-byte oversize record waits in the main queue.
+        SentPacket oversize = driver.submit(frame(40), StreamSequencer.Fence.REALTIME, 0, 0);
+        SentPacket small = driver.submit(frame(4), StreamSequencer.Fence.REALTIME, 0, 0);
+        assertTrue(chunk.isAssigned() && oversize.isAssigned() && small.isAssigned());
+
+        List<SessionSendDriver.Write> held = new ArrayList<SessionSendDriver.Write>();
+        pollAll(driver, held);
+        assertTrue(wrote(held, chunk), "the chunk is granted");
+        assertFalse(wrote(held, oversize), "the oversize realtime record waits for the main queue");
+        assertFalse(wrote(held, small), "the small realtime record waits for the earlier realtime record");
+        for (SessionSendDriver.Write write : held) {
+            driver.released(write.token());
+        }
+        Drain rest = drainAndRelease(driver);
+        List<Long> realtimeOrder = new ArrayList<Long>();
+        for (SessionSendDriver.Write write : rest.writes) {
+            if (write.stream() == LogicalStream.REALTIME) {
+                realtimeOrder.add(RecordCodec.decodeRecord(write.bytes(), write.stream()).sequence());
+            }
+        }
+        assertEquals(Arrays.asList(oversize.sequence(), small.sequence()), realtimeOrder,
+                "realtime records are written in assignment order");
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner));
+    }
+
+    /**
+     * A CONTROL record depends on a REALTIME record, and both queues are under pressure: a CHUNK waits at the owner
+     * cap, and an oversize REALTIME record waits behind it. Every record is written (13.12, 13.9).
+     */
+    @Test
+    void interactionDependingOnRealtimeCompletesUnderPressure() throws Exception {
+        Rig rig = new Rig(1, 1000, 100);
+        SessionSendDriver driver = rig.driver;
+        SentPacket chunkA = driver.submit(frame(70), StreamSequencer.Fence.CHUNK, 0, 0);
+        SentPacket realtime = driver.submit(frame(4), StreamSequencer.Fence.REALTIME, 0, 0);
+        SentPacket chunkB = driver.submit(frame(70), StreamSequencer.Fence.CHUNK, 0, 0);
+        SentPacket control = driver.submitAfter(frame(10), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0, realtime);
+        SentPacket oversize = driver.submit(frame(40), StreamSequencer.Fence.REALTIME, 0, 0);
+        assertTrue(chunkA.isAssigned() && realtime.isAssigned() && chunkB.isAssigned()
+                && control.isAssigned() && oversize.isAssigned());
+
+        Drain rest = drainAndRelease(driver);
+        assertEquals(5, rest.writes.size(), "every record is written");
+        assertTrue(wrote(rest.writes, chunkA) && wrote(rest.writes, realtime) && wrote(rest.writes, chunkB)
+                && wrote(rest.writes, control) && wrote(rest.writes, oversize));
+        assertFalse(driver.isClosed());
+        assertEquals(0, driver.queuedRecords());
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner));
+    }
+
+    /** The slice is charged once and released exactly once: local REALTIME records never charge the pool (13.12). */
+    @Test
+    void realtimeSliceIsReleasedExactlyOnce() throws Exception {
+        Rig rig = new Rig(1, 1000, 100);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.submit(frame(4), StreamSequencer.Fence.REALTIME, 0, 0).isAssigned());
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "a local realtime record charges only the slice");
+        driver.close();
+        assertEquals(0, rig.pool.reserved(rig.owner), "close releases the slice");
+        driver.close();
+        assertEquals(0, rig.pool.reserved(rig.owner), "a second close releases nothing again");
+        assertTrue(driver.isClosed());
+    }
+
+    /**
+     * A bundle run whose total wire bytes exceed maxRecordBytes can never be granted, so it is refused before anything
+     * is queued: no sequence is taken and the queue is unchanged (review round 5).
+     */
+    @Test
+    void bundleRunLargerThanMaxRecordBytesIsRejectedBeforeQueueing() throws Exception {
+        HeadroomRig rig = new HeadroomRig(1000, 200, 50);
+        SessionSendDriver driver = rig.driver;
+        List<OutboundPacket> members = new ArrayList<OutboundPacket>();
+        members.add(frame(100));
+        members.add(frame(100));
+        StreamSequencer.Fence[] scopes = {StreamSequencer.Fence.ORDINARY_CONTROL, StreamSequencer.Fence.ORDINARY_CONTROL};
+        assertThrows(IllegalArgumentException.class, () -> driver.submitBundle(frame(1), members, scopes, frame(1)));
+        assertFalse(driver.isClosed());
+        assertEquals(0, driver.queuedRecords());
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "nothing beyond the slice is charged");
+        SentPacket next = driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        assertEquals(1, next.sequence(), "the refused run took no sequence numbers");
     }
 
     /** Length of the first complete record in {@code bytes}: VarInt(record_length) plus its body. */

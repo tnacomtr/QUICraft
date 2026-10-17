@@ -48,6 +48,19 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * written, in any completion order. Each charge is released exactly once. Closing the driver releases
  * every outstanding charge and drops every queued reservation.
  *
+ * <p>REALTIME slice (13.12). Each play connection charges a fixed slice of {@code S} bytes (default
+ * {@link #DEFAULT_REALTIME_SLICE_BYTES}) from the pool once, as its first ticket, and holds it until close. A REALTIME
+ * record whose wire size is at most S is granted from that slice locally, in assignment order, with at most one
+ * waiting record, and it never touches the pool ledger. A larger REALTIME record takes the main queue at its global
+ * position, and is then written on the REALTIME stream in REALTIME order. Nothing is granted before the slice.
+ *
+ * <p>Deadlock argument. Each queue grants in assignment order. Each queue's budget holds the largest record it
+ * accepts: the slice holds at least S, and the main budget holds {@code maxRecordBytes + ackByteLimit}. Every
+ * prerequisite is assigned before its dependents. Take the globally earliest unreleased record X. Its prerequisites
+ * are already released. The bytes its queue holds belong only to records earlier in that queue, which are released
+ * too, so X fits, is granted, written and released. The slice is a per-connection playing reservation, charged once
+ * and released exactly once at close.
+ *
  * <p>Producer overflow closes with 0x12 (resource). A bundle that breaks a wire limit closes
  * locally with 0x11 and is never split. The clock is a monotonic nanosecond source.
  *
@@ -62,6 +75,9 @@ public final class SessionSendDriver {
     private static final int CONTROL = LogicalStream.CONTROL;
     private static final int REALTIME = LogicalStream.REALTIME;
     private static final int FIRST_CHUNK = 2;
+
+    /** The REALTIME outbound slice per play connection, 2 KiB (13.12 provisional default). */
+    public static final long DEFAULT_REALTIME_SLICE_BYTES = 2048;
 
     /** One slice to write now. Report its completion with {@link #released(long)} or {@link #failed(long)}. */
     public static final class Write {
@@ -127,6 +143,10 @@ public final class SessionSendDriver {
         int unreleased = 1;
         /** Bytes reported to the ranking as progress when this record is released. */
         long progress;
+        /** True for a REALTIME record granted from the REALTIME slice rather than the pool (13.12). */
+        boolean local;
+        /** True for a REALTIME record larger than the slice, which takes the main queue (13.12). */
+        boolean viaMain;
 
         Charge(long bytes) {
             this.bytes = bytes;
@@ -171,11 +191,20 @@ public final class SessionSendDriver {
     private final BatchJoinTracker batches = new BatchJoinTracker();
     private final Map<Long, PendingAck> pendingAcks = new HashMap<Long, PendingAck>();
     private final ArrayDeque<Charge> toOffer = new ArrayDeque<Charge>();
+    /** Every REALTIME record in assignment order; the REALTIME stream is offered only in this order. */
+    private final ArrayDeque<Charge> realtimeOrder = new ArrayDeque<Charge>();
+    /** The per-connection REALTIME slice S: one pool charge taken first and held until close. */
+    private final long realtimeSliceBytes;
+    private final Charge slice;
+    /** Bytes of local REALTIME records granted from the slice and not yet released. */
+    private long sliceHeld;
     private final ArrayDeque<Charge> orphans = new ArrayDeque<Charge>();
     private final IdentityHashMap<Record, Charge> byRecord = new IdentityHashMap<Record, Charge>();
     private final Map<Long, Charge> tokens = new HashMap<Long, Charge>();
     /** The ACK headroom: bytes and entries of ACK charges created and not yet released (13.19). */
     private final long ackByteLimit;
+    /** The largest record wire size, and so the largest bundle run, the connection can write (13.12). */
+    private final long maxRecordBytes;
     private long ackBytesHeld;
     private int ackEntriesHeld;
     private int pendingGrants;
@@ -221,15 +250,33 @@ public final class SessionSendDriver {
     SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
             PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
             long maxRecordBytes, long ackByteLimit) {
+        this(context, profile, pool, ranking, owner, ip, account, clock, maxRecordBytes, ackByteLimit,
+                DEFAULT_REALTIME_SLICE_BYTES);
+    }
+
+    /**
+     * The sender with explicit headroom and REALTIME slice. The slice (13.12) is charged once, first, and the check
+     * {@code maxRecordBytes + ackByteLimit + realtimeSliceBytes <= smallest cap} holds the slice beside one maximum
+     * record and every ACK byte.
+     *
+     * @param realtimeSliceBytes the REALTIME slice S, at least the largest REALTIME record that the slice serves
+     */
+    SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
+            PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
+            long maxRecordBytes, long ackByteLimit, long realtimeSliceBytes) {
         if (context == null || profile == null || pool == null || ranking == null || owner == null
                 || clock == null) {
             throw new IllegalArgumentException("send driver");
         }
         // The headroom must fit under the smallest cap that applies to this connection: owner, IP, account or node.
-        if (maxRecordBytes <= 0 || ackByteLimit <= 0 || maxRecordBytes + ackByteLimit > pool.smallestCap(account)) {
+        if (maxRecordBytes <= 0 || ackByteLimit <= 0 || realtimeSliceBytes <= 0
+                || maxRecordBytes + ackByteLimit + realtimeSliceBytes > pool.smallestCap(account)) {
             throw new IllegalArgumentException("smallest cap cannot hold a maximum record beside pending ACK bytes");
         }
+        this.realtimeSliceBytes = realtimeSliceBytes;
+        this.slice = new Charge(realtimeSliceBytes);
         this.ackByteLimit = ackByteLimit;
+        this.maxRecordBytes = maxRecordBytes;
         this.context = context;
         this.profile = profile;
         this.pool = pool;
@@ -241,6 +288,8 @@ public final class SessionSendDriver {
         this.sequencer = new StreamSequencer(context.shardCount());
         this.scheduler = new SendScheduler(profile);
         ranking.connect(owner, ip, account, clock.getAsLong());
+        // The slice is the first ticket of this owner, requested before any record (13.12).
+        request(slice);
     }
 
     /** The negotiated session shape. */
@@ -461,6 +510,8 @@ public final class SessionSendDriver {
      * @return the handles of the unit in stream order, or an empty list when the driver refused the unit and
      *         closed (0x11 for a bundle over its limits, 0x12 for a member no cap can admit); nothing is written
      *         after such a close
+     * @throws IllegalArgumentException when the run's total wire bytes exceed {@code maxRecordBytes}: it could never be
+     *         granted, so it is refused before anything is queued, and the sequencer and queues are unchanged
      */
     public synchronized List<SentPacket> submitBundle(OutboundPacket opening, List<OutboundPacket> members,
             StreamSequencer.Fence[] scopes, OutboundPacket closing, Record.Dependency... external) {
@@ -478,6 +529,22 @@ public final class SessionSendDriver {
         if (overflows(units, bytes)) {
             closeWith(CLOSE_RESOURCE);
             return result;
+        }
+        // The exact unit total is computed without assigning anything, so a refused run leaves the sequencer unchanged.
+        long unitBytes;
+        try {
+            unitBytes = sequencer.bundleWireBytes(opening.frame(), frames, scopes, closing.frame(), external);
+        } catch (IllegalArgumentException refused) {
+            closeWith(CLOSE_ORDERING);
+            return result;
+        }
+        // A run no cap can admit closes 0x12 as before; a run that fits the caps but not one maximum record is refused.
+        if (!pool.admissible(account, unitBytes)) {
+            closeWith(CLOSE_RESOURCE);
+            return result;
+        }
+        if (unitBytes > maxRecordBytes) {
+            throw new IllegalArgumentException("bundle run larger than maxRecordBytes");
         }
         List<Record> records;
         try {
@@ -562,6 +629,7 @@ public final class SessionSendDriver {
             return;
         }
         closed = true;
+        // Releases every owner charge exactly once, the REALTIME slice included (it is the owner's first charge).
         pool.cancel(owner);
         for (Charge charge : tokens.values()) {
             charge.released = true;
@@ -572,6 +640,7 @@ public final class SessionSendDriver {
         tokens.clear();
         byRecord.clear();
         toOffer.clear();
+        realtimeOrder.clear();
         orphans.clear();
         pendingAcks.clear();
         ranking.disconnect(owner, clock.getAsLong());
@@ -608,6 +677,10 @@ public final class SessionSendDriver {
      * member is released. An ACK charge also leaves the ACK headroom (13.19).
      */
     private void releaseCharge(Charge charge) {
+        if (charge.local) {
+            sliceHeld -= charge.bytes;
+            return;
+        }
         Charge group = charge.group();
         if (--group.unreleased == 0) {
             pool.release(owner, group.bytes);
@@ -639,7 +712,16 @@ public final class SessionSendDriver {
         charge.encoded = encoded;
         charge.continues = continues;
         byRecord.put(record, charge);
-        toOffer.addLast(charge);
+        if (record.streamIndex() == REALTIME) {
+            // Every REALTIME record keeps its stream position; one above the slice also takes the main queue (13.12).
+            charge.viaMain = encoded.length > realtimeSliceBytes;
+            realtimeOrder.addLast(charge);
+            if (charge.viaMain) {
+                toOffer.addLast(charge);
+            }
+        } else {
+            toOffer.addLast(charge);
+        }
         queuedRecords++;
         queuedBytes += encoded.length;
         pump();
@@ -679,7 +761,9 @@ public final class SessionSendDriver {
     /** Asks the pool for this charge. A refused request is granted later from the pool's queue. */
     private void request(Charge charge) {
         charge.requested = true;
-        charge.ticket = pool.reserveTicket(owner, ip, account, charge.bytes);
+        // The slice is protected: a connection holding only its slice is never a shed victim (13.12).
+        charge.ticket = charge == slice ? pool.reserveProtectedTicket(owner, ip, account, charge.bytes)
+                : pool.reserveTicket(owner, ip, account, charge.bytes);
         if (pool.takeGrant(charge.ticket)) {
             charge.granted = true;
             return;
@@ -721,6 +805,19 @@ public final class SessionSendDriver {
                 releaseCharge(orphan);
             }
         }
+        // Nothing is granted before the REALTIME slice: it is the owner's first ticket (13.12).
+        if (granted(slice)) {
+            pumpMain();
+            pumpRealtime();
+        }
+        ranking.setRetained(owner, pool.reserved(owner), clock.getAsLong());
+    }
+
+    /**
+     * Grants and offers the main queue in assignment order. An oversize REALTIME record is granted here, at its
+     * position, and is offered by {@link #pumpRealtime()} in REALTIME order.
+     */
+    private void pumpMain() {
         for (Iterator<Charge> it = toOffer.iterator(); it.hasNext();) {
             Charge charge = it.next();
             // A bundle run's later members are queued right behind its head, which is removed only once granted,
@@ -734,9 +831,36 @@ public final class SessionSendDriver {
                 }
             }
             it.remove();
+            if (!charge.viaMain) {
+                scheduler.offer(charge.record, charge.encoded.length, charge.continues);
+            }
+        }
+    }
+
+    /**
+     * Offers REALTIME records in REALTIME order. A record of at most the slice is granted from the slice when it fits
+     * the bytes that earlier REALTIME releases freed; it never waits for the main queue or the ledger. An oversize one
+     * is offered once the main queue has granted it. The walk stops at the first record that cannot go yet, so at
+     * most one REALTIME record waits, and only for REALTIME stream order or slice bytes.
+     */
+    private void pumpRealtime() {
+        for (Iterator<Charge> it = realtimeOrder.iterator(); it.hasNext();) {
+            Charge charge = it.next();
+            if (charge.viaMain) {
+                if (!charge.granted) {
+                    break;
+                }
+            } else {
+                if (sliceHeld + charge.bytes > realtimeSliceBytes) {
+                    break;
+                }
+                sliceHeld += charge.bytes;
+                charge.local = true;
+                charge.granted = true;
+            }
+            it.remove();
             scheduler.offer(charge.record, charge.encoded.length, charge.continues);
         }
-        ranking.setRetained(owner, pool.reserved(owner), clock.getAsLong());
     }
 
     /** Takes this owner's shed notice, if any. Other owners' notices stay in the pool for their drivers. */

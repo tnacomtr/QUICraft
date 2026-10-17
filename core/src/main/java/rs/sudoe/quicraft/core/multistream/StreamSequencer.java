@@ -166,25 +166,13 @@ public final class StreamSequencer {
         if (assigned[CONTROL] + members.size() + 2 > MAX_SEQUENCE) {
             throw new IllegalStateException("sequence exhausted");
         }
-        // The opener is kind 4 (13.4, 13.15): its body carries unit_records and unit_wire_bytes, the
-        // exact wire total of every record of the unit, prefixes included. Members and the closing
-        // record are unconstrained CONTROL records with no dependency entries, so only their
-        // sequences vary; the opener's own header depends on its sequence, dependencies and the
-        // VarInt length of unit_wire_bytes, which is solved as a fixed point.
         Record openingPlan = plan(CONTROL, scope, opening, false, 0, external, false);
-        long openingSequence = openingPlan.sequence();
-        long tail = 0;
-        long sequence = openingSequence;
-        for (byte[] member : members) {
-            tail += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, member.length);
-        }
-        tail += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, closing.length);
-        int unitRecords = members.size() + 2;
-        long unitBytes = unitWireBytes(openingSequence, epoch, openingPlan.dependencies(), unitRecords,
-                opening.length, tail);
+        long unitBytes = unitBytesOf(openingPlan, opening, members, closing);
         if (unitBytes > MAX_BUNDLE_ENCODED_BYTES) {
             throw new IllegalArgumentException("bundle encoded bytes");
         }
+        long openingSequence = openingPlan.sequence();
+        int unitRecords = members.size() + 2;
         Record opener = new Record(CONTROL, openingSequence, epoch, openingPlan.dependencies(),
                 RecordCodec.KIND_BUNDLE_OPEN, openerBody(unitRecords, unitBytes, opening));
         assigned[CONTROL] = openingSequence;
@@ -197,6 +185,49 @@ public final class StreamSequencer {
         result.add(close);
         applyFrontier(scope, close.sequence());
         return Collections.unmodifiableList(result);
+    }
+
+    /**
+     * The exact unit wire total {@link #assignBundle} would check for this bundle now, computed without assigning
+     * anything, so the sequencer state is unchanged. Refuses the same shapes as {@code assignBundle}: null parts,
+     * a member count over {@link #MAX_BUNDLE_MEMBERS} and a unit over {@link #MAX_BUNDLE_ENCODED_BYTES}.
+     *
+     * @throws IllegalArgumentException for any of those shapes, or a REALTIME or null member scope
+     */
+    long bundleWireBytes(byte[] opening, List<byte[]> members, Fence[] memberScopes, byte[] closing,
+            Record.Dependency... external) {
+        if (opening == null || closing == null || members == null || memberScopes == null) {
+            throw new IllegalArgumentException("bundle");
+        }
+        if (members.size() > MAX_BUNDLE_MEMBERS || members.size() != memberScopes.length) {
+            throw new IllegalArgumentException("bundle members");
+        }
+        for (byte[] member : members) {
+            if (member == null) {
+                throw new IllegalArgumentException("bundle member");
+            }
+        }
+        Fence scope = bundleScope(memberScopes);
+        long unitBytes = unitBytesOf(plan(CONTROL, scope, opening, false, 0, external, false), opening, members, closing);
+        if (unitBytes > MAX_BUNDLE_ENCODED_BYTES) {
+            throw new IllegalArgumentException("bundle encoded bytes");
+        }
+        return unitBytes;
+    }
+
+    /**
+     * The unit wire total of 13.4 for an opener planned at its sequence: members and the closer take the next
+     * CONTROL sequences, and the opener's own size is solved as a fixed point in {@link #unitWireBytes}.
+     */
+    private long unitBytesOf(Record openingPlan, byte[] opening, List<byte[]> members, byte[] closing) {
+        long tail = 0;
+        long sequence = openingPlan.sequence();
+        for (byte[] member : members) {
+            tail += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, member.length);
+        }
+        tail += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, closing.length);
+        return unitWireBytes(openingPlan.sequence(), epoch, openingPlan.dependencies(), members.size() + 2,
+                opening.length, tail);
     }
 
     /**
