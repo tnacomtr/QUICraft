@@ -3,10 +3,18 @@ package rs.sudoe.quicraft.fabric.gametest;
 
 import static rs.sudoe.quicraft.fabric.gametest.GameTests.check;
 
+import java.io.IOException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.minecraft.SharedConstants;
@@ -27,10 +35,22 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  *
  * <p>The game classes are reached by reflection: this source set is shared with the 1.21.11 jar,
  * where the same names are obfuscated and the test has nothing to pin. It returns early there.
+ *
+ * <p>With {@code -Pquicraft.emitPlayIds} (system property {@code quicraft.gametest.emitPlayIds}, see
+ * docs/platforms/fabric.md) it also writes and prints the full inventory of both directions, one
+ * {@code <direction> <id> <name>} line per packet sorted by id. That is how core's
+ * {@code play-ids-775.txt} fixture is regenerated from the live game instead of hand-edited. Without
+ * the property the run is unchanged.
  */
 public class RoutingTableGameTest implements FabricClientGameTest {
     /** The shipped 26.1.2 protocol number. */
     private static final int PROTOCOL = 775;
+
+    /** Makes the test emit the inventory: -Pquicraft.emitPlayIds=true (default path) or a file path. */
+    private static final String EMIT_PROPERTY = "quicraft.gametest.emitPlayIds";
+
+    /** Marks the emitted inventory on stdout. */
+    private static final String BLOCK = "QUICraft play packet inventory, protocol " + PROTOCOL;
 
     /**
      * Every non-CONTROL route, as {@code direction lane live-id name}. Anything not listed is CONTROL
@@ -70,7 +90,10 @@ public class RoutingTableGameTest implements FabricClientGameTest {
             return;
         }
         try {
-            pin();
+            Map<String, Integer> clientbound = liveIds("CLIENTBOUND_TEMPLATE");
+            Map<String, Integer> serverbound = liveIds("SERVERBOUND_TEMPLATE");
+            pin(clientbound, serverbound);
+            emit(clientbound, serverbound);
         } catch (AssertionError e) {
             throw e;
         } catch (Exception e) {
@@ -78,9 +101,8 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         }
     }
 
-    private static void pin() throws Exception {
-        Map<String, Integer> clientbound = liveIds("CLIENTBOUND_TEMPLATE");
-        Map<String, Integer> serverbound = liveIds("SERVERBOUND_TEMPLATE");
+    private static void pin(Map<String, Integer> clientbound, Map<String, Integer> serverbound)
+            throws Exception {
         Map<RouteKey, Route> routes = RoutingRegistry.forProtocol(PROTOCOL)
                 .orElseThrow(() -> new AssertionError("no routing table ships for protocol " + PROTOCOL))
                 .routes();
@@ -111,6 +133,68 @@ public class RoutingTableGameTest implements FabricClientGameTest {
             check(route.dependency() == expectedDependency,
                     "the shipped table gives " + name + " the dependency " + route.dependency());
         }
+    }
+
+    /**
+     * With {@link #EMIT_PROPERTY} set, writes the full inventory to a file and prints it between
+     * BEGIN/END markers so either capture path works. Emission happens after the pins pass, so a
+     * version whose ids don't match the shipped table emits nothing.
+     */
+    private static void emit(Map<String, Integer> clientbound, Map<String, Integer> serverbound)
+            throws IOException {
+        String target = System.getProperty(EMIT_PROPERTY);
+        if (target == null) {
+            return;
+        }
+        List<String> lines = inventory(clientbound, serverbound);
+        StringBuilder block = new StringBuilder(BLOCK).append(" BEGIN\n");
+        for (String line : lines) {
+            block.append(line).append('\n');
+        }
+        block.append(BLOCK).append(" END");
+        System.out.println(block);
+
+        Path path = Paths.get(target.isEmpty() || target.equals("true")
+                ? "play-ids-" + PROTOCOL + ".txt"
+                : target);
+        Path parent = path.toAbsolutePath().getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        StringBuilder file = new StringBuilder();
+        file.append("# QUICraft PLAY packet inventory, protocol ").append(PROTOCOL)
+                .append(", live game, both directions.\n");
+        file.append("# <direction> <id> <name>, one line per packet;")
+                .append(" ids ascending per direction, clientbound first.\n");
+        file.append("# emitted by fabric/src/gametest RoutingTableGameTest")
+                .append(" from the game's own protocol templates.\n");
+        file.append("# regenerate: ./gradlew :<module>:runClientGameTest")
+                .append(" -Pquicraft.emitPlayIds=<file>\n");
+        for (String line : lines) {
+            file.append(line).append('\n');
+        }
+        Files.write(path, file.toString().getBytes(StandardCharsets.UTF_8));
+        System.out.println("[QUICraft] play packet inventory written to " + path.toAbsolutePath());
+    }
+
+    /** One {@code <direction> <id> <name>} line per live play packet, ids ascending per direction. */
+    private static List<String> inventory(Map<String, Integer> clientbound, Map<String, Integer> serverbound) {
+        List<String> lines = new ArrayList<String>();
+        lines.addAll(directionLines(Direction.CLIENTBOUND, clientbound));
+        lines.addAll(directionLines(Direction.SERVERBOUND, serverbound));
+        return lines;
+    }
+
+    private static List<String> directionLines(Direction direction, Map<String, Integer> ids) {
+        Map<Integer, String> byId = new TreeMap<Integer, String>();
+        for (Map.Entry<String, Integer> entry : ids.entrySet()) {
+            byId.put(entry.getValue(), entry.getKey());
+        }
+        List<String> lines = new ArrayList<String>();
+        for (Map.Entry<Integer, String> entry : byId.entrySet()) {
+            lines.add(direction.wireName() + " " + entry.getKey() + " " + entry.getValue());
+        }
+        return lines;
     }
 
     /** Packet name to id for one template of the live play protocol, read through the game's own API. */
