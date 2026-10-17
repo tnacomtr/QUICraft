@@ -148,6 +148,11 @@ final class CappedLedger {
         reclaim();
     }
 
+    /** The per-owner (per-connection) cap this ledger charges against. */
+    long ownerCap() {
+        return ownerCap;
+    }
+
     long reserved(Object owner) {
         Holder holder = holders.get(owner);
         return holder == null ? 0 : holder.bytes;

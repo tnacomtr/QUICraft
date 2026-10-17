@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -42,8 +43,15 @@ class SessionSendDriverTest {
             NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
             pool = new OutboundPool(node, 1L << 40, 1L << 40, connectionCap, ranking.view(now::get));
             ServerProfile profile = new ServerProfile(1, 1, 1024, .5, queuePackets, 1L << 40, 4, 4, 4);
-            driver = new SessionSendDriver(SessionContext.of(shards), profile, pool, ranking, owner,
-                    InetAddress.getLoopbackAddress(), null, now::get);
+            if (connectionCap >= ReceiveSlots.BYTES_PER_STREAM + AckJoinTracker.MAX_BYTES) {
+                driver = new SessionSendDriver(SessionContext.of(shards), profile, pool, ranking, owner,
+                        InetAddress.getLoopbackAddress(), null, now::get);
+            } else {
+                // A small test cap is split between one maximum record and the ACK headroom (the check in the constructor).
+                driver = new SessionSendDriver(SessionContext.of(shards), profile, pool, ranking, owner,
+                        InetAddress.getLoopbackAddress(), null, now::get, connectionCap - connectionCap / 4,
+                        connectionCap / 4);
+            }
         }
     }
 
@@ -143,6 +151,8 @@ class SessionSendDriverTest {
         assertEquals(2, join.logicalStream(), "joins are always CHUNK[0]");
         assertEquals(2, join.sequence());
 
+        // A sequenced ack keeps its entry until it is written and released, so write it out first.
+        drainAndRelease(driver);
         // Backpressure: the 129th pending ack is refused, nothing stored.
         for (int id = 100; id < 100 + 128; id++) {
             assertTrue(driver.createAck(id, frame(1).frame(), 1), "entry " + id);
@@ -299,7 +309,7 @@ class SessionSendDriverTest {
         Object owner = new Object();
         SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
                 new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
-                InetAddress.getLoopbackAddress(), null, now::get);
+                InetAddress.getLoopbackAddress(), null, now::get, 75, 25);
         SentPacket first = driver.submit(frame(40), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
         SentPacket second = driver.submit(frame(80), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
         assertTrue(first.isAssigned() && second.isAssigned());
@@ -388,12 +398,11 @@ class SessionSendDriverTest {
     }
 
     /**
-     * Charges 46, 86 and 16 under a 100-byte owner cap. The 86 waits, so it is not the aggregate that
-     * decides grants: the 16 on another stream is granted and written, and the 16 behind the 86 waits
-     * for it on its own stream. After the releases nothing stalls.
+     * A record waiting for its grant holds back every later record, on every stream, until it is granted: the
+     * grant order is the assignment order (class javadoc). Round 2 let later records on other streams overtake.
      */
     @Test
-    void ownerCapSkipDoesNotStallOtherStreams() throws Exception {
+    void ownerCapWaitHoldsEveryLaterRecordInAssignmentOrder() throws Exception {
         Rig rig = new Rig(1, 1000, 100);
         SessionSendDriver driver = rig.driver;
         SentPacket realtime = driver.submit(frame(40), StreamSequencer.Fence.REALTIME, 0, 0);
@@ -403,22 +412,101 @@ class SessionSendDriverTest {
         assertTrue(realtime.isAssigned() && waiting.isAssigned() && behind.isAssigned() && control.isAssigned());
 
         SessionSendDriver.Write first = driver.poll(stream -> true);
-        SessionSendDriver.Write second = driver.poll(stream -> true);
         assertNotNull(first);
-        assertNotNull(second);
-        assertEquals(new java.util.HashSet<Integer>(Arrays.asList(0, 1)),
-                new java.util.HashSet<Integer>(Arrays.asList(first.stream(), second.stream())),
-                "the granted CONTROL and REALTIME records are written");
-        assertNull(driver.poll(stream -> true), "the chunk stream waits for the 86-byte grant");
+        assertEquals(LogicalStream.REALTIME, first.stream());
+        assertNull(driver.poll(stream -> true), "the 86-byte chunk waits for its grant; nothing after it is granted");
+        assertEquals(46, rig.pool.reserved(rig.owner), "only the granted realtime record is charged");
         driver.released(first.token());
-        driver.released(second.token());
 
         Drain rest = drainAndRelease(driver);
-        assertEquals(2, rest.writes.size(), "the 86-byte head and the record behind it are written");
+        assertEquals(3, rest.writes.size(), "the waiting chunk, then the records behind it, are written");
         assertEquals(waiting.sequence(), RecordCodec.decodeRecord(rest.writes.get(0).bytes(), 2).sequence());
-        assertEquals(behind.sequence(), RecordCodec.decodeRecord(rest.writes.get(1).bytes(), 2).sequence());
         assertEquals(0, rig.pool.reserved(rig.owner));
         assertFalse(driver.isClosed());
+    }
+
+    /**
+     * Trace A (round 2 deadlock). Cap 100: REALTIME R=46 is granted, CHUNK U=86 waits for its grant, and a CONTROL
+     * fence C=16 depends on U. Round 2 granted C at once, so after R released, C's 16 bytes left 84 free for U's 86
+     * and nothing could be written. C must wait behind U's grant.
+     */
+    @Test
+    void grantWaitOnChunkDoesNotLetDependentFenceHoldBytes() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, 1L << 40, 100, ranking.view(now::get));
+        Object owner = new Object();
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
+                new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
+                InetAddress.getLoopbackAddress(), null, now::get, 86, 14);
+        SentPacket realtime = driver.submit(frame(40), StreamSequencer.Fence.REALTIME, 0, 0);
+        SentPacket chunk = driver.submit(frame(80), StreamSequencer.Fence.CHUNK, 0, 0);
+        SentPacket fence = driver.submitAfter(frame(10), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0, chunk);
+        assertTrue(realtime.isAssigned() && chunk.isAssigned() && fence.isAssigned());
+
+        SessionSendDriver.Write first = driver.poll(stream -> true);
+        assertNotNull(first);
+        assertEquals(LogicalStream.REALTIME, first.stream());
+        assertNull(driver.poll(stream -> true), "the chunk waits for its grant, and the fence waits behind it");
+        driver.released(first.token());
+
+        Drain rest = drainAndRelease(driver);
+        assertEquals(2, rest.writes.size(), "the chunk is granted once realtime is released, then the fence");
+        assertEquals(chunk.sequence(), RecordCodec.decodeRecord(rest.writes.get(0).bytes(), 2).sequence());
+        assertEquals(fence.sequence(), RecordCodec.decodeRecord(rest.writes.get(1).bytes(), 0).sequence());
+        assertEquals(0, pool.reserved(owner));
+        assertFalse(driver.isClosed());
+    }
+
+    /**
+     * Trace B (round 2 deadlock). Cap 102 holds one maximum record of 86 beside one 16-byte ACK. A second 16-byte
+     * ACK would leave 70 bytes for the covered update's 86, which could never be granted while both ACKs wait for it.
+     * The headroom bound refuses the second ACK, and a sequenced ACK keeps its headroom until it is released.
+     */
+    @Test
+    void precommittedAckBytesNeverStarveTheCoveredUpdate() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, 1L << 40, 102, ranking.view(now::get));
+        Object owner = new Object();
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
+                new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
+                InetAddress.getLoopbackAddress(), null, now::get, 86, 16);
+        assertTrue(driver.createAck(1, frame(2).frame(), 16));
+        assertEquals(16, pool.reserved(owner), "the ack is charged at creation");
+        assertTrue(driver.coverPending(1, 42));
+        assertFalse(driver.createAck(2, frame(2).frame(), 16),
+                "a second precharged ack would starve the covered update, so the producer pauses");
+
+        SentPacket covered = driver.submit(frame(80), StreamSequencer.Fence.CHUNK, 0, 0);
+        assertTrue(covered.isAssigned());
+        driver.assignedPending(42, covered);
+        assertNotNull(driver.takeAck(1));
+        assertFalse(driver.createAck(3, frame(2).frame(), 16),
+                "a sequenced ack still holds its headroom until the transport releases it");
+
+        Drain drain = drainAndRelease(driver);
+        assertEquals(2, drain.writes.size(), "the covered update and the ack are both written");
+        assertEquals(0, pool.reserved(owner), "every charge is released");
+        assertTrue(driver.createAck(4, frame(2).frame(), 16), "released headroom is available again");
+        driver.close();
+        assertEquals(0, pool.reserved(owner));
+    }
+
+    /** The headroom check: a cap that cannot hold a maximum record beside the ACK bound is refused at construction. */
+    @Test
+    void connectionCapWithoutRecordAndAckHeadroomIsRefused() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, 1L << 40, 100, ranking.view(now::get));
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
+        assertThrows(IllegalArgumentException.class, () -> new SessionSendDriver(SessionContext.of(1), profile,
+                pool, ranking, new Object(), InetAddress.getLoopbackAddress(), null, now::get, 86, 16));
+        assertNotNull(new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, new Object(),
+                InetAddress.getLoopbackAddress(), null, now::get, 84, 16));
     }
 
     /**

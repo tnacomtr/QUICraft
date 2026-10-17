@@ -6,12 +6,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.IntPredicate;
 import java.util.function.LongSupplier;
 
@@ -32,16 +30,20 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * stream position at that call. Pending ACK_JOINs live outside the sequenced FIFOs; they take a
  * sequence only when {@link #takeAck} or {@link #expireAcks} resolves them.
  *
- * <p>Charges: a record's bytes are reserved when it is sequenced, unless an earlier record on the
- * same stream is still waiting for its grant. Each reservation is tracked by its own ticket, so a
- * granted record can wait behind an ungranted earlier record on its stream without blocking other
- * streams. A stream never requests a later record before the earlier one is granted; that keeps a
- * later record's bytes from blocking the earlier one. A record is offered to the scheduler only
- * once granted and after every earlier record of its stream was offered. Its charge is released
- * once every slice it wrote has been reported through {@link #released(long)} or
- * {@link #failed(long)}, after the record has been fully written, in any completion order. Each
- * charge is released exactly once. Closing the driver releases every outstanding charge and drops
- * every queued reservation.
+ * <p>Charges and grant order (invariant): a record's bytes are reserved when it is sequenced. Pool
+ * tickets are requested strictly in assignment order across all streams. The driver walks its queue
+ * of sequenced records in the order {@link StreamSequencer} assigned them, requests the next record
+ * only after every earlier record was granted, and stops at the first record that is not granted.
+ * So at most one ungranted ticket is outstanding for this owner, and a later record never takes bytes
+ * ahead of an earlier one. Every prerequisite is assigned before its dependents, so by induction every
+ * granted record's prerequisites are granted before it, and every granted record can be written and
+ * released. A record is offered to the scheduler once granted. The one exception is a pending ACK_JOIN,
+ * whose charge is taken at creation, out of assignment order (13.19). Such charges are bounded by the
+ * ACK headroom (see the package constructor), so they never keep a record from fitting once the
+ * earlier granted records release. A record's charge is released once every slice it wrote has been
+ * reported through {@link #released(long)} or {@link #failed(long)}, after the record has been fully
+ * written, in any completion order. Each charge is released exactly once. Closing the driver releases
+ * every outstanding charge and drops every queued reservation.
  *
  * <p>Producer overflow closes with 0x12 (resource). A bundle that breaks a wire limit closes
  * locally with 0x11 and is never split. The clock is a monotonic nanosecond source.
@@ -111,6 +113,8 @@ public final class SessionSendDriver {
         boolean finished;
         int outstanding;
         boolean released;
+        /** True for a pending ACK_JOIN's charge, which counts against the ACK headroom until released. */
+        boolean ack;
 
         Charge(long bytes) {
             this.bytes = bytes;
@@ -152,6 +156,10 @@ public final class SessionSendDriver {
     private final ArrayDeque<Charge> orphans = new ArrayDeque<Charge>();
     private final IdentityHashMap<Record, Charge> byRecord = new IdentityHashMap<Record, Charge>();
     private final Map<Long, Charge> tokens = new HashMap<Long, Charge>();
+    /** The ACK headroom: bytes and entries of ACK charges created and not yet released (13.19). */
+    private final long ackByteLimit;
+    private long ackBytesHeld;
+    private int ackEntriesHeld;
     private int pendingGrants;
     private long nextToken = 1;
     private int queuedRecords;
@@ -168,13 +176,39 @@ public final class SessionSendDriver {
      * @param ip the connection's source address for the per-IP cap
      * @param account the connection's account, or null
      * @param clock a monotonic nanosecond clock
+     * @throws IllegalArgumentException when the connection cap cannot hold the headroom (see the package constructor)
      */
     public SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
             PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock) {
+        this(context, profile, pool, ranking, owner, ip, account, clock, ReceiveSlots.BYTES_PER_STREAM,
+                AckJoinTracker.MAX_BYTES);
+    }
+
+    /**
+     * The sender with explicit ACK headroom. Production uses the wire maximum of one record and the 64 KiB ACK
+     * bound; tests pass smaller values so that small connection caps can reproduce both deadlock traces.
+     *
+     * <p>Headroom (13.19): a pending ACK_JOIN is charged at creation, before the record it covers, and it keeps
+     * its bytes until the transport releases it. The bytes of all such ACKs, pending or sequenced but unreleased,
+     * are bounded by {@code ackByteLimit}, and {@link #createAck} backpressures at that limit. The connection cap
+     * must hold one maximum record beside every ACK byte, so {@code maxRecordBytes + ackByteLimit <= cap}.
+     * Then a record the ACKs wait on always fits beside them once earlier granted records release, and no ACK
+     * can deadlock the connection. A cap below that sum throws.
+     *
+     * @param maxRecordBytes the largest record wire size the connection can write
+     * @param ackByteLimit the most ACK bytes precharged at once, from creation until transport release
+     */
+    SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
+            PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
+            long maxRecordBytes, long ackByteLimit) {
         if (context == null || profile == null || pool == null || ranking == null || owner == null
                 || clock == null) {
             throw new IllegalArgumentException("send driver");
         }
+        if (maxRecordBytes <= 0 || ackByteLimit <= 0 || maxRecordBytes + ackByteLimit > pool.perConnectionLimit()) {
+            throw new IllegalArgumentException("connection cap cannot hold a maximum record beside pending ACK bytes");
+        }
+        this.ackByteLimit = ackByteLimit;
         this.context = context;
         this.profile = profile;
         this.pool = pool;
@@ -274,12 +308,21 @@ public final class SessionSendDriver {
             closeWith(CLOSE_RESOURCE);
             return false;
         }
+        // Granted orphans (dropped ACKs) give their headroom back first. Headroom backpressure (13.19): the
+        // producer pauses, nothing is stored, and no charge is taken.
+        pump();
+        if (ackEntriesHeld >= AckJoinTracker.MAX_ENTRIES || ackBytesHeld + chargedBytes > ackByteLimit) {
+            return false;
+        }
         if (!acks.create(id, chargedBytes, now)) {
             return false;
         }
+        ackEntriesHeld++;
+        ackBytesHeld += chargedBytes;
         queuedRecords++;
         queuedBytes += queued;
         Charge charge = new Charge(chargedBytes);
+        charge.ack = true;
         request(charge);
         pendingAcks.put(id, new PendingAck(payload, charge, now, queued));
         return true;
@@ -531,11 +574,20 @@ public final class SessionSendDriver {
             return;
         }
         charge.released = true;
-        pool.release(owner, charge.bytes);
+        releaseCharge(charge);
         long now = clock.getAsLong();
         ranking.progress(owner, charge.bytes, now);
         ranking.setRetained(owner, pool.reserved(owner), now);
         pump();
+    }
+
+    /** Releases one charge in the pool. An ACK charge also leaves the ACK headroom (13.19). */
+    private void releaseCharge(Charge charge) {
+        pool.release(owner, charge.bytes);
+        if (charge.ack) {
+            ackBytesHeld -= charge.bytes;
+            ackEntriesHeld--;
+        }
     }
 
     /**
@@ -596,9 +648,10 @@ public final class SessionSendDriver {
     }
 
     /**
-     * Moves charges forward. Orphans are released once granted. Each stream's records are requested
-     * and offered in sequence order: a stream stops at its first record that is not granted, so a
-     * later record on that stream is neither requested nor offered yet. Other streams are not held.
+     * Moves charges forward. Orphans are released once granted. Sequenced records are requested and offered in
+     * global assignment order (see the class javadoc): the walk stops at the first record that is not granted,
+     * so no later record, on any stream, is requested or offered before it. A pending ACK_JOIN's charge was
+     * requested at creation, so it is only waited on here, at its assignment position.
      */
     private void pump() {
         for (Iterator<Charge> it = orphans.iterator(); it.hasNext();) {
@@ -606,22 +659,16 @@ public final class SessionSendDriver {
             if (granted(orphan)) {
                 it.remove();
                 orphan.released = true;
-                pool.release(owner, orphan.bytes);
+                releaseCharge(orphan);
             }
         }
-        Set<Integer> blocked = new HashSet<Integer>();
         for (Iterator<Charge> it = toOffer.iterator(); it.hasNext();) {
             Charge charge = it.next();
-            int stream = charge.record.streamIndex();
-            if (blocked.contains(stream)) {
-                continue;
-            }
             if (!charge.requested) {
                 request(charge);
             }
             if (!granted(charge)) {
-                blocked.add(stream);
-                continue;
+                break;
             }
             it.remove();
             scheduler.offer(charge.record, charge.encoded.length, charge.continues);

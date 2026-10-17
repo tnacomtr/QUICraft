@@ -82,6 +82,9 @@ public final class OutboundPool {
     /** Charged outbound bytes for one owner. */
     public synchronized long reserved(Object owner) { return ledger.reserved(owner); }
 
+    /** The per-connection cap every owner in this pool is charged against. */
+    public synchronized long perConnectionLimit() { return ledger.ownerCap(); }
+
     /** Number of queued refused requests. */
     public synchronized int waitingCount() { return ledger.waitingCount(); }
 }
