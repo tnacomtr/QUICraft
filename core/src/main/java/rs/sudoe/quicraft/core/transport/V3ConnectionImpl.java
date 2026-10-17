@@ -24,7 +24,6 @@ import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.SessionResources;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
-import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
 import rs.sudoe.quicraft.core.multistream.LogicalStream;
 import rs.sudoe.quicraft.core.multistream.PreambleV2;
@@ -122,28 +121,20 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
                 joinInputs, sentEarly, null, null, handshakeComplete);
     }
 
-    /** The server's side: the routing table is resolved at activation from {@code listener}. */
+    /**
+     * The server's side: the routing table is resolved at activation from {@code listener}, and
+     * {@code resources} are its N+2 session resources (13.12); null builds them on first activation.
+     */
     static V3ConnectionImpl server(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
-            V3Listener listener, PreambleHandler handler, boolean handshakeComplete, ReceiveBudget node) {
-        return server(connection, control, raw, listener, handler, handshakeComplete, node, null);
-    }
-
-    /** As above, with the listener's N+2 session resources (13.12); null builds them on first activation. */
-    static V3ConnectionImpl server(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
-            V3Listener listener, PreambleHandler handler, boolean handshakeComplete, ReceiveBudget node,
-            SessionResources resources) {
+            V3Listener listener, PreambleHandler handler, boolean handshakeComplete, SessionResources resources) {
         V3ConnectionImpl impl = new V3ConnectionImpl(connection, control, raw, NStreamSession.Role.SERVER, null, null,
                 null, null, null, listener, handler, handshakeComplete);
-        impl.node = node == null ? ReceiveBudget.unlimited() : node;
         impl.resources = resources;
         return impl;
     }
 
     /** The N+2 sessions' shared resources; the client uses the process-wide instance. */
     private SessionResources resources;
-
-    /** The node's shared receive budget the lane session reserves against (13.12). */
-    private ReceiveBudget node = ReceiveBudget.unlimited();
 
     private V3ConnectionImpl(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
             NStreamSession.Role role, RoutingTable table, EarlyCache cache, List<Object> serverKey, String joinInputs,

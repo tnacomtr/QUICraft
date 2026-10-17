@@ -1527,7 +1527,7 @@ public final class QuicServer implements Closeable {
          */
         void offerV3(QuicStreamChannel control) {
             V3ConnectionImpl connection = V3ConnectionImpl.server((QuicChannel) ctx.channel(), control,
-                    new NettyQuicByteStream(control), v3, this::onPreambleV3, handshakeDone, nodeBudget, sessionResources);
+                    new NettyQuicByteStream(control), v3, this::onPreambleV3, handshakeDone, sessionResources);
             v3Connection = connection;
             connection.start();
         }
