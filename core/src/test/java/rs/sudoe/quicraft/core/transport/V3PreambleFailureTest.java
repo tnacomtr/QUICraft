@@ -61,6 +61,30 @@ class V3PreambleFailureTest {
         assertEquals(1, game.closes.size(), "the game still sees the close, exactly once");
     }
 
+    /** With a 0-RTT flight in the air the gate stays shut, but a failed negotiation still ends it. */
+    @Test
+    void anInvalidReplyAfterAZeroRttFlightStillDeliversTheCloseOnce() throws Exception {
+        Fakes fakes = new Fakes();
+        V3ConnectionImpl impl = V3ConnectionImpl.client(fakes.connection, fakes.control,
+                new NettyQuicByteStream(fakes.control), null, null, null, new byte[] {1, 2, 3}, TABLE, true);
+        impl.start();
+        Game game = new Game();
+        attachGame(impl, game);
+
+        byte[] reply = {0x04, 0x02, 0x00, 0x02, 0x03};
+        ByteBuffer coalesced = ByteBuffer.allocate(reply.length + 3);
+        coalesced.put(reply).put(new byte[] {5, 6, 7}).flip();
+        impl.onData(coalesced);
+        fakes.connectionChannel.runPendingTasks();
+        impl.onClosed(null);
+        impl.onClosed(null);
+
+        assertEquals(MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION, fakes.closeCode(),
+                "the invalid reply closes the connection with 0x1");
+        assertEquals(0, game.delivered.size(), "no game bytes after a failed negotiation");
+        assertEquals(1, game.closes.size(), "the game sees the close exactly once, 0-RTT or not");
+    }
+
     // --- Proxies and recorders.
 
     private static void attachGame(V3ConnectionImpl impl, Game game) throws Exception {

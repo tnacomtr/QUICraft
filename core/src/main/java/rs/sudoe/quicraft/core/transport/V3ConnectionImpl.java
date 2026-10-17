@@ -616,7 +616,8 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     // --- Gate.
 
     private void drain() {
-        if (!gateOpen) {
+        // A failed negotiation is terminal: its close reaches the game even while 0-RTT holds the gate.
+        if (!gateOpen && !negotiationFailed) {
             return;
         }
         Listener l = game;
