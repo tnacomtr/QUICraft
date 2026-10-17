@@ -1044,6 +1044,10 @@ public final class QuicServer implements Closeable {
         private boolean refused;
         private boolean closed;
         private boolean handshakeDone;
+        /** The handshake's completion, kept so a game connection installed after a pending wait can be told. */
+        private io.netty.handler.ssl.SslHandshakeCompletionEvent handshakeEvent;
+        /** When the connection was first accepted: the 30 s hard cap (12.13) runs from here, through every retry. */
+        private final long acceptedAt = System.nanoTime();
         private final List<Held> held = new ArrayList<>();
         private java.util.concurrent.ScheduledFuture<?> deadline;
         private java.util.concurrent.ScheduledFuture<?> pendingDeadline;
@@ -1082,6 +1086,12 @@ public final class QuicServer implements Closeable {
 
         /** Runs the admission steps still missing. Each step either proceeds, waits (pending) or refuses. */
         private void step() {
+            if (preLogin != null && System.nanoTime() - acceptedAt >= PreLoginTracker.HARD_CAP_NANOS) {
+                // 12.13: the 30 s hard cap runs from the first accepted packet, through every retry.
+                LOG.log(Level.FINE, "QUIC /3 connection refused: its pre-login wait ran out");
+                refuse(true, Protocol.CLOSE_RESOURCE);
+                return;
+            }
             InetAddress source = sourceOf(connection);
             if (lease == null && source != null) {
                 try {
@@ -1089,7 +1099,7 @@ public final class QuicServer implements Closeable {
                     if (lease == null && preLogin != null) {
                         // 12.13: a validated /3 newcomer over the open-connection limits sheds a pre-login victim
                         // instead of being dropped. The victim's lease is returned when its close is confirmed.
-                        if (preLogin.shedForLease(source, STAGED_LANES, this::wake).pending) {
+                        if (preLogin.shedForLease(source, STAGED_LANES, connection, this::wake).pending) {
                             waiting();
                             return;
                         }
@@ -1119,7 +1129,7 @@ public final class QuicServer implements Closeable {
                         return;
                     }
                     PreLoginRegistry.Admission attempt = preLogin.attempt(source, connection, STAGED_LANES, online,
-                            System::nanoTime, this::shedClose, this::wake);
+                            System::nanoTime, acceptedAt, this::shedClose, this::wake);
                     if (attempt.pending) {
                         waiting();
                         return;
@@ -1166,25 +1176,33 @@ public final class QuicServer implements Closeable {
             pending = true;
             if (pendingDeadline == null) {
                 // The newcomer's staged deadline: a victim that never closes must not hold it forever.
+                long remaining = Math.max(0L, acceptedAt + PreLoginTracker.HARD_CAP_NANOS - System.nanoTime());
                 pendingDeadline = connection.eventLoop().schedule(() -> {
                     if (pending && !closed) {
                         LOG.log(Level.FINE, "QUIC /3 connection refused: its pre-login wait ran out");
                         refuse(true, Protocol.CLOSE_RESOURCE);
                     }
-                }, PreLoginTracker.HARD_CAP_NANOS, java.util.concurrent.TimeUnit.NANOSECONDS);
+                }, remaining, java.util.concurrent.TimeUnit.NANOSECONDS);
             }
         }
 
         /** A shed victim's close was confirmed: retries this newcomer on its own event loop, never inline. */
         private void wake() {
-            connection.eventLoop().execute(() -> {
+            Runnable retry = () -> {
                 if (pending && !closed) {
                     step();
                     if (ready) {
                         grant();
                     }
                 }
-            });
+            };
+            java.util.Queue<Runnable> hold = heldWakes;
+            if (hold != null) {
+                // Test seam: the dispatch waits in the queue until the test runs it.
+                hold.add(() -> connection.eventLoop().execute(retry));
+                return;
+            }
+            connection.eventLoop().execute(retry);
         }
 
         private void refuse(boolean stagedRefusal, int code) {
@@ -1193,6 +1211,9 @@ public final class QuicServer implements Closeable {
             cancel(pendingDeadline);
             pendingDeadline = null;
             connection.attr(REFUSED).set(Boolean.TRUE);
+            if (preLogin != null) {
+                preLogin.settle(connection);
+            }
             Codecs.closeLater(connection, stagedRefusal, code);
         }
 
@@ -1230,6 +1251,10 @@ public final class QuicServer implements Closeable {
                 lease.confirm();
             }
             install.run();
+            if (handshakeEvent != null) {
+                // The handshake completed while this connection waited: the game connection never saw the event.
+                connection.pipeline().context(this).fireUserEventTriggered(handshakeEvent);
+            }
             List<Held> streams = new ArrayList<>(held);
             held.clear();
             for (Held h : streams) {
@@ -1291,6 +1316,7 @@ public final class QuicServer implements Closeable {
             if (evt instanceof SslHandshakeCompletionEvent && ((SslHandshakeCompletionEvent) evt).isSuccess()
                     && !handshakeDone) {
                 handshakeDone = true;
+                handshakeEvent = (SslHandshakeCompletionEvent) evt;
                 if (deadline != null) {
                     deadline.cancel(false);
                 }
@@ -1316,13 +1342,10 @@ public final class QuicServer implements Closeable {
             pendingDeadline = null;
             cancel(stagedCheck);
             held.clear();
-            if (staged != null) {
-                staged.close();
-            }
-            if (lease != null) {
-                ConnectionAdmission.Lease released = lease;
-                lease = null;
-                released.close();
+            releaseCharges(lease, staged);
+            lease = null;
+            if (preLogin != null) {
+                preLogin.settle(connection);
             }
             if (reserved > 0) {
                 reservedPool.release(reserved);
@@ -1330,6 +1353,25 @@ public final class QuicServer implements Closeable {
             }
         }
     }
+
+    /**
+     * Gives back a closed connection's open-connection lease, then its pre-login charge. The order is the contract:
+     * a shed victim's close wakes its newcomer, which must find the slot already free (12.13).
+     */
+    static void releaseCharges(ConnectionAdmission.Lease lease, PreLoginRegistry.Entry staged) {
+        if (lease != null) {
+            lease.close();
+        }
+        if (staged != null) {
+            staged.close();
+        }
+    }
+
+    /**
+     * Test seam (package-private, null in production): while set, each pending newcomer's wake is queued here instead
+     * of being dispatched to its event loop, so a test decides when the newcomer retries.
+     */
+    static volatile java.util.Queue<Runnable> heldWakes;
 
     /**
      * §12.13: the pre-login accounting of a {@code /3} connection, or null for {@code /2} connections and

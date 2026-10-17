@@ -200,6 +200,11 @@ final class ConnectionAdmission {
         return (long) pending * 4 >= maxOpen;
     }
 
+    /** The open connections right now, across all addresses. For tests. */
+    synchronized int openConnections() {
+        return open;
+    }
+
     /** Leases not yet {@linkplain Lease#confirm() confirmed} or closed, for tests. */
     synchronized int pendingLeases() {
         return pending;
