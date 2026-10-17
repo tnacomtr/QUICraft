@@ -93,27 +93,25 @@ public final class NStreamSession implements MultistreamSession {
     private static final int STOPPED_SENDING = LaneSession.stopSendingErrCode();
 
     /**
-     * Shard placement and exact referenced CONTROL classes (13.7-13.10). The latest frontier at the
-     * original send-order point cannot decrease on an ordered referencing stream. Only fences occupy
-     * the ordered ring: ordinary CONTROL traffic and never-referencing streams cannot grow it.
-     * The lazy long/byte arrays use at most 36 KiB per connection (4,096 entries), plus fixed
-     * object/array and per-stream reference overhead, outside the read/decode share.
-     * Pruning ignores streams that have never referenced. Overflow evicts, never closes 0x12.
-     * An honest reference is the latest fence at its send point; falling below the retained floor
-     * therefore means lagging by more than the cap's worth of fences. QUIC flow-control windows
-     * and RTT-scale delays make that impossible in practice, so such a reference closes 0x11.
+     * Shard placement and evidence per frontier kind (docs/protocol.md 13.7, 13.9, 13.19).
+     * Serverbound REALTIME uses max(G,C), allowing global/view/control (lines 1262-1265).
+     * Clientbound REALTIME likewise adds C to G (lines 1327-1339); view sets C too (1332).
+     * Ordinary CHUNK uses max(G,V), allowing global/view (1330, 1340).
+     * ACK_JOIN coverage includes current CONTROL A[0], of any class (2040-2044).
+     * BATCH_JOIN adds its view start to the normal G/V frontier (1341, 2092-2097), so allows
+     * global/view. INTERACTION references any applied REALTIME record (1263-1265, 1336-1337).
+     * References are monotonic per stream and kind, never across kinds. Each class-checked kind
+     * has its own lazy 4,096-long ring, only on the receiving side (at most 96 KiB clientbound,
+     * 32 KiB serverbound, plus fixed overhead). Only overflow evicts; older evidence is unprovable.
      */
     static final class ShardValidator implements StreamReceiver.Validator {
         private static final int MAX_CONTROL_HISTORY = 4096;
         private final int shards;
         private final int cap;
-        private final long[] controlReferences;
-        private long[] sequences;
-        private byte[] classes;
-        private int head;
-        private int size;
-        private long realtimeReference;
-        private long floor = 1;
+        private enum Kind { REALTIME, CHUNK, ACK_JOIN, BATCH_JOIN, INTERACTION }
+        private final Direction direction;
+        private final long[][] references;
+        private final FenceRing[] rings = new FenceRing[Kind.values().length];
         private long highest;
 
         ShardValidator(int shards) {
@@ -131,81 +129,67 @@ public final class NStreamSession implements MultistreamSession {
             }
             this.shards = shards;
             this.cap = cap;
-            controlReferences = new long[direction == Direction.SERVERBOUND ? 1 : shards + 1];
+            this.direction = direction;
+            references = new long[direction == Direction.SERVERBOUND ? 2 : shards + 2][Kind.values().length];
         }
 
         @Override
         public boolean valid(int stream, Record record, ReceiveRoute route) {
-            if (route.lane() == ReceiveRoute.Lane.CHUNK) {
+            if (route.lane() == ReceiveRoute.Lane.CHUNK && !route.join()) {
                 Extractor.Position position = route.position();
                 if (position == null || stream != 2
                         + ShardHash.shardOf(position.chunkX, position.chunkZ, record.epoch(), shards)) {
                     return false;
                 }
             }
+            Kind kind = kind(route);
             for (Record.Dependency dependency : record.dependencies()) {
                 long reference = dependency.sequence();
                 if (reference == 0) continue; // Zero/absent frontiers are not evidence.
-                if (dependency.streamIndex() == LogicalStream.CONTROL && stream > 0) {
-                    if (reference < controlReferences[stream - 1] || reference < floor) {
-                        return false;
+                if (isFrontier(kind, dependency)) {
+                    if (reference < references[stream][kind.ordinal()]) return false;
+                    if (kind != Kind.ACK_JOIN && kind != Kind.INTERACTION && reference <= highest) {
+                        FenceRing ring = rings[kind.ordinal()];
+                        if (ring == null || !ring.accepts(reference)) return false;
                     }
-                    if (reference <= highest && (referenceClass(reference)
-                            & (stream == LogicalStream.REALTIME ? 1 : 2)) == 0) {
-                        return false;
-                    }
-                } else if (dependency.streamIndex() == LogicalStream.REALTIME
-                        && stream == LogicalStream.CONTROL && reference < realtimeReference) {
-                    return false;
                 }
             }
             // Commit references only after every check succeeded. Unapplied targets stay unknown here;
             // StreamReceiver waits for D before invoking us, then checks their exact applied class.
             for (Record.Dependency dependency : record.dependencies()) {
                 if (dependency.sequence() == 0) continue;
-                if (dependency.streamIndex() == LogicalStream.CONTROL && stream > 0) {
-                    controlReferences[stream - 1] = dependency.sequence();
-                } else if (dependency.streamIndex() == LogicalStream.REALTIME
-                        && stream == LogicalStream.CONTROL) {
-                    // Every applied REALTIME sequence necessarily has a REALTIME route (checkRoute).
-                    realtimeReference = dependency.sequence();
+                if (isFrontier(kind, dependency)) {
+                    references[stream][kind.ordinal()] = dependency.sequence();
                 }
             }
-            prune();
             return true;
         }
 
-        private int referenceClass(long sequence) {
-            int low = 0;
-            int high = size - 1;
-            while (low <= high) {
-                int middle = (low + high) >>> 1;
-                int slot = (head + middle) % cap;
-                if (sequences[slot] < sequence) low = middle + 1;
-                else if (sequences[slot] > sequence) high = middle - 1;
-                else return classes[slot];
+        private Kind kind(ReceiveRoute route) {
+            if (route.lane() == ReceiveRoute.Lane.REALTIME) return Kind.REALTIME;
+            if (route.lane() == ReceiveRoute.Lane.CHUNK) {
+                if (route.fence() == Dependency.ACK_JOIN) return Kind.ACK_JOIN;
+                if (route.fence() == Dependency.BATCH_JOIN) return Kind.BATCH_JOIN;
+                return Kind.CHUNK;
             }
-            return 0;
+            return route.fence() == Dependency.INTERACTION ? Kind.INTERACTION : null;
         }
 
-        private void dropOldest() {
-            floor = Math.max(floor, sequences[head] + 1);
-            head = (head + 1) % cap;
-            size--;
-            if (size > 0) floor = Math.max(floor, sequences[head]);
+        private boolean isFrontier(Kind kind, Record.Dependency dependency) {
+            return kind != null && dependency.streamIndex() ==
+                    (kind == Kind.INTERACTION ? LogicalStream.REALTIME : LogicalStream.CONTROL);
         }
 
-        private void prune() {
-            long minimum = Long.MAX_VALUE;
-            for (long reference : controlReferences) {
-                if (reference != 0) minimum = Math.min(minimum, reference);
-            }
-            if (minimum == Long.MAX_VALUE) return;
-            while (size > 0 && sequences[head] < minimum) dropOldest();
+        private void remember(Kind kind, long first, long last) {
+            int index = kind.ordinal();
+            if (rings[index] == null) rings[index] = new FenceRing(cap);
+            for (long sequence = first; sequence <= last; sequence++) rings[index].add(sequence);
         }
 
         int retainedEntries() {
-            return size;
+            int count = 0;
+            for (FenceRing ring : rings) if (ring != null) count += ring.size;
+            return count;
         }
 
         @Override
@@ -213,22 +197,45 @@ public final class NStreamSession implements MultistreamSession {
             if (stream == LogicalStream.CONTROL) {
                 Dependency fence = route.fence();
                 boolean common = fence == Dependency.GLOBAL || fence == Dependency.FENCE || fence == Dependency.VIEW;
-                if (common || fence == Dependency.CONTROL) {
-                    if (sequences == null) {
-                        sequences = new long[cap];
-                        classes = new byte[cap];
-                    }
-                    for (long sequence = first; sequence <= last; sequence++) {
-                        if (size == cap) dropOldest();
-                        int slot = (head + size) % cap;
-                        sequences[slot] = sequence;
-                        classes[slot] = (byte) (common ? 3 : 1);
-                        size++;
-                    }
-                    floor = Math.max(floor, sequences[head]);
+                if (common || fence == Dependency.CONTROL) remember(Kind.REALTIME, first, last);
+                if (common && direction == Direction.CLIENTBOUND) {
+                    remember(Kind.CHUNK, first, last);
+                    remember(Kind.BATCH_JOIN, first, last);
                 }
                 highest = last;
-                prune();
+            }
+        }
+
+        private static final class FenceRing {
+            private final long[] sequences;
+            private int head;
+            private int size;
+            private long floor = 1;
+
+            FenceRing(int cap) { sequences = new long[cap]; }
+
+            void add(long sequence) {
+                if (size == sequences.length) {
+                    floor = sequences[head] + 1;
+                    head = (head + 1) % sequences.length;
+                    size--;
+                }
+                sequences[(head + size) % sequences.length] = sequence;
+                size++;
+            }
+
+            boolean accepts(long sequence) {
+                if (sequence < floor) return true;
+                int low = 0;
+                int high = size - 1;
+                while (low <= high) {
+                    int middle = (low + high) >>> 1;
+                    long value = sequences[(head + middle) % sequences.length];
+                    if (value < sequence) low = middle + 1;
+                    else if (value > sequence) high = middle - 1;
+                    else return true;
+                }
+                return false;
             }
         }
     }

@@ -1273,6 +1273,13 @@ position extraction. Those implementations must change together before this revi
    valid while A[REALTIME]=0. Exact packet ids are the routing unit;
    sub-actions sharing an id cannot be separately routed. Missing or wrong dependencies
    provable from received records close `0x11`.
+
+   Receivers validate the referenced class per frontier kind; frontier references are
+   monotonic per stream and kind. A receiver MAY bound fence-class evidence to the latest
+   4,096 fences of each kind. A reference older than retained evidence is accepted as
+   unprovable. A decrease, or a retained-range sequence that is not a fence of the required
+   class, closes `0x11`.
+
     Reject missing/unknown fields, duplicate keys/routes, and multiple routes for the same
     `(state,direction,packet_id)` with different lanes or fence classes,
    unsupported schema/identifiers and invalid combinations before offering `/3`.
