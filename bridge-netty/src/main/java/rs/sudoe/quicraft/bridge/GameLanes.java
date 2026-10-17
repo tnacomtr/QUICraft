@@ -214,8 +214,8 @@ public final class GameLanes implements LaneGame {
 
         void abort(int code);
 
-        // Additive ACK_JOIN and BATCH_JOIN passthroughs (13.19), mirroring SessionSendDriver. The legacy
-        // session supports none of them, so each default fails closed.
+        // Additive ACK_JOIN and BATCH_JOIN passthroughs (13.19), mirroring SessionSendDriver; the
+        // defaults fail closed.
 
         default boolean createAck(long id, byte[] payload, int chargedBytes) {
             throw new UnsupportedOperationException("createAck");
@@ -639,8 +639,8 @@ public final class GameLanes implements LaneGame {
     }
 
     /**
-     * Production {@link Session}: the activated session of the connection, the legacy three-lane one
-     * or the N+2 one. The additive methods are forwarded; the legacy session fails them closed.
+     * Production {@link Session}: the activated N+2 session of the connection. The additive methods
+     * are forwarded to it.
      */
     private static final class SessionSink implements Session {
         private final MultistreamSession session;
@@ -660,15 +660,15 @@ public final class GameLanes implements LaneGame {
         @Override
         public Lane send(ProtocolState state, int packetId, byte[] frame) {
             SentPacket handle = session.send(state, packetId, frame);
-            // Assigned inline when this runs on the session's loop, which is the game's own loop for
-            // a hosted connection; an off-loop submission reports null.
+            // The N+2 session sequences on the caller's thread, so the lane is known here; only a
+            // refused submission (END, a close, a routing failure) reports null.
             return handle.isAssigned() ? handle.lane() : null;
         }
 
         @Override
         public Lane send(ProtocolState state, int packetId, byte[] frame, byte[] uncompressedPacket,
                 SentPacket... after) {
-            // The legacy session sizes the packet from the frame and ignores the uncompressed bytes.
+            // The N+2 session extracts a CHUNK route's position from the uncompressed bytes (13.8).
             SentPacket handle = session.send(state, packetId, frame, uncompressedPacket, after);
             return handle.isAssigned() ? handle.lane() : null;
         }
