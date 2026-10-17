@@ -6,9 +6,12 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.IntPredicate;
 import java.util.function.LongSupplier;
 
@@ -29,11 +32,16 @@ import rs.sudoe.quicraft.core.routing.Lane;
  * stream position at that call. Pending ACK_JOINs live outside the sequenced FIFOs; they take a
  * sequence only when {@link #takeAck} or {@link #expireAcks} resolves them.
  *
- * <p>Charges: a record's bytes are reserved when it is sequenced. A record is offered to the
- * scheduler only once the pool has granted its reservation (granted in reservation order), and
- * its charge is released only when the transport reports the last slice released through
- * {@link #released(long)} or {@link #failed(long)}. Each charge is released exactly once. Closing
- * the driver releases every outstanding charge and drops every queued reservation.
+ * <p>Charges: a record's bytes are reserved when it is sequenced, unless an earlier record on the
+ * same stream is still waiting for its grant. Each reservation is tracked by its own ticket, so a
+ * granted record can wait behind an ungranted earlier record on its stream without blocking other
+ * streams. A stream never requests a later record before the earlier one is granted; that keeps a
+ * later record's bytes from blocking the earlier one. A record is offered to the scheduler only
+ * once granted and after every earlier record of its stream was offered. Its charge is released
+ * once every slice it wrote has been reported through {@link #released(long)} or
+ * {@link #failed(long)}, after the record has been fully written, in any completion order. Each
+ * charge is released exactly once. Closing the driver releases every outstanding charge and drops
+ * every queued reservation.
  *
  * <p>Producer overflow closes with 0x12 (resource). A bundle that breaks a wire limit closes
  * locally with 0x11 and is never split. The clock is a monotonic nanosecond source.
@@ -85,32 +93,45 @@ public final class SessionSendDriver {
         }
     }
 
+    /**
+     * Bound on a record's encoded size beyond its payload: header, length prefix and bundle varints (13.4).
+     * Used only to estimate a pending ACK_JOIN's queue count before it is sequenced.
+     */
+    private static final int RECORD_OVERHEAD = RecordCodec.COMPACT_MAX_HEADER + 3 + 8;
+
     /** One outbound charge: a sequenced record, or a pending ACK_JOIN that will become one. */
     private static final class Charge {
         final long bytes;
-        final long end;
         Record record;
         byte[] encoded;
         boolean continues;
-        long lastToken = -1;
+        long ticket;
+        boolean requested;
+        boolean granted;
+        boolean finished;
+        int outstanding;
         boolean released;
 
-        Charge(long bytes, long end) {
+        Charge(long bytes) {
             this.bytes = bytes;
-            this.end = end;
         }
     }
 
-    /** A pending ACK_JOIN: its payload and its charge, which transfers to the record when sequenced. */
+    /**
+     * A pending ACK_JOIN: its payload and its charge, which transfers to the record when sequenced.
+     * Its queue count is {@code queuedBytes}, the estimate counted from creation until it is sequenced.
+     */
     private static final class PendingAck {
         final byte[] payload;
         final Charge charge;
         final long createdNanos;
+        final long queuedBytes;
 
-        PendingAck(byte[] payload, Charge charge, long createdNanos) {
+        PendingAck(byte[] payload, Charge charge, long createdNanos, long queuedBytes) {
             this.payload = payload;
             this.charge = charge;
             this.createdNanos = createdNanos;
+            this.queuedBytes = queuedBytes;
         }
     }
 
@@ -131,10 +152,7 @@ public final class SessionSendDriver {
     private final ArrayDeque<Charge> orphans = new ArrayDeque<Charge>();
     private final IdentityHashMap<Record, Charge> byRecord = new IdentityHashMap<Record, Charge>();
     private final Map<Long, Charge> tokens = new HashMap<Long, Charge>();
-    private long reservedTotal;
-    private long releasedTotal;
-    private long lastEnd;
-    private boolean refused;
+    private int pendingGrants;
     private long nextToken = 1;
     private int queuedRecords;
     private long queuedBytes;
@@ -204,8 +222,10 @@ public final class SessionSendDriver {
         }
         int stream = streamFor(fence, chunkX, chunkZ);
         Record record = sequencer.assign(stream, fence, frame, false, semantic);
+        if (!enqueueRecord(record, false)) {
+            return handle;
+        }
         handle.assign(laneOf(stream), stream, record.sequence());
-        enqueueRecord(record, false);
         return handle;
     }
 
@@ -231,25 +251,37 @@ public final class SessionSendDriver {
         settleAcksLocked();
         batches.abort();
         Record record = sequencer.assignEpochTransition(packet.frame());
+        if (!enqueueRecord(record, false)) {
+            return handle;
+        }
         handle.assign(Lane.CONTROL, CONTROL, record.sequence());
-        enqueueRecord(record, false);
         return handle;
     }
 
     /**
      * Registers a pending ACK_JOIN (13.19). Its charge is taken now and carried over to the record when
-     * the ack is sequenced. Returns false, storing nothing, when the tracker's entry or byte limit would
-     * be exceeded; the caller then pauses its producer.
+     * the ack is sequenced, and it counts against the queue limits from now on. Returns false, storing
+     * nothing, when the tracker's entry or byte limit would be exceeded; the caller then pauses its producer.
+     * A queue limit or a charge no cap can admit closes the driver with 0x12 instead.
      */
     public synchronized boolean createAck(long id, byte[] payload, int chargedBytes) {
         if (closed || payload == null) {
             return false;
         }
         long now = clock.getAsLong();
+        long queued = payload.length + RECORD_OVERHEAD;
+        if (overflows(1, queued) || !pool.admissible(account, chargedBytes)) {
+            closeWith(CLOSE_RESOURCE);
+            return false;
+        }
         if (!acks.create(id, chargedBytes, now)) {
             return false;
         }
-        pendingAcks.put(id, new PendingAck(payload, reserve(chargedBytes), now));
+        queuedRecords++;
+        queuedBytes += queued;
+        Charge charge = new Charge(chargedBytes);
+        request(charge);
+        pendingAcks.put(id, new PendingAck(payload, charge, now, queued));
         return true;
     }
 
@@ -349,9 +381,11 @@ public final class SessionSendDriver {
             return handle;
         }
         Record record = sequencer.assignJoin(3, join.frame(), deps);
+        if (!enqueueRecord(record, false)) {
+            return handle;
+        }
         batches.recordJoin(record.sequence());
         handle.assign(Lane.WORLD, FIRST_CHUNK, record.sequence());
-        enqueueRecord(record, false);
         return handle;
     }
 
@@ -360,7 +394,9 @@ public final class SessionSendDriver {
      * member, then the closing delimiter. A bundle over 126 members or over B closes 0x11 locally and
      * assigns nothing.
      *
-     * @return the handles of the unit in stream order, or an empty list when nothing was assigned
+     * @return the handles of the unit in stream order, or an empty list when the driver refused the unit and
+     *         closed (0x11 for a bundle over its limits, 0x12 for a member no cap can admit); nothing is written
+     *         after such a close
      */
     public synchronized List<SentPacket> submitBundle(OutboundPacket opening, List<OutboundPacket> members,
             StreamSequencer.Fence[] scopes, OutboundPacket closing, Record.Dependency... external) {
@@ -386,10 +422,20 @@ public final class SessionSendDriver {
             closeWith(CLOSE_ORDERING);
             return result;
         }
+        // Every member is checked before any is queued, so a refused unit leaves nothing queued.
+        List<byte[]> encodings = new ArrayList<byte[]>(records.size());
+        for (Record record : records) {
+            byte[] encoded = RecordCodec.encodeRecord(record);
+            if (!pool.admissible(account, encoded.length)) {
+                closeWith(CLOSE_RESOURCE);
+                return result;
+            }
+            encodings.add(encoded);
+        }
         for (int i = 0; i < records.size(); i++) {
             Record record = records.get(i);
+            enqueueEncoded(record, encodings.get(i), i < records.size() - 1);
             result.add(handleOf(record));
-            enqueueRecord(record, i < records.size() - 1);
         }
         return result;
     }
@@ -408,7 +454,7 @@ public final class SessionSendDriver {
         if (checkShed()) {
             return null;
         }
-        drainGrants();
+        pump();
         SendScheduler.Selection selection = scheduler.pollSelection(writable);
         if (selection == null) {
             return null;
@@ -421,8 +467,9 @@ public final class SessionSendDriver {
                 selection.offset() + selection.length());
         long token = nextToken++;
         tokens.put(token, charge);
+        charge.outstanding++;
         if (selection.last()) {
-            charge.lastToken = token;
+            charge.finished = true;
             byRecord.remove(selection.record());
             queuedRecords--;
             queuedBytes -= charge.encoded.length;
@@ -470,23 +517,44 @@ public final class SessionSendDriver {
         close();
     }
 
+    /**
+     * Settles one slice. The record's charge is released once it was fully written and its last
+     * outstanding slice has completed, whatever the completion order.
+     */
     private void settle(long token) {
         Charge charge = tokens.remove(token);
-        if (charge == null || charge.released || token != charge.lastToken) {
+        if (charge == null) {
+            return;
+        }
+        charge.outstanding--;
+        if (!charge.finished || charge.outstanding > 0 || charge.released) {
             return;
         }
         charge.released = true;
         pool.release(owner, charge.bytes);
-        releasedTotal += charge.bytes;
         long now = clock.getAsLong();
         ranking.progress(owner, charge.bytes, now);
         ranking.setRetained(owner, pool.reserved(owner), now);
-        drainGrants();
+        pump();
     }
 
-    private void enqueueRecord(Record record, boolean continues) {
+    /**
+     * Encodes and queues a freshly sequenced record. A record no cap can ever admit closes the driver with
+     * 0x12 instead, and returns false: nothing is written after the close, so its sequence number is never
+     * visible to the peer.
+     */
+    private boolean enqueueRecord(Record record, boolean continues) {
         byte[] encoded = RecordCodec.encodeRecord(record);
-        Charge charge = reserve(encoded.length);
+        if (!pool.admissible(account, encoded.length)) {
+            closeWith(CLOSE_RESOURCE);
+            return false;
+        }
+        enqueueEncoded(record, encoded, continues);
+        return true;
+    }
+
+    private void enqueueEncoded(Record record, byte[] encoded, boolean continues) {
+        Charge charge = new Charge(encoded.length);
         charge.record = record;
         charge.encoded = encoded;
         charge.continues = continues;
@@ -494,42 +562,76 @@ public final class SessionSendDriver {
         toOffer.addLast(charge);
         queuedRecords++;
         queuedBytes += encoded.length;
+        pump();
     }
 
-    private Charge reserve(long bytes) {
-        reservedTotal += bytes;
-        Charge charge = new Charge(bytes, reservedTotal);
-        lastEnd = reservedTotal;
-        boolean granted = pool.reserve(owner, ip, account, bytes);
-        if (!granted && !refused) {
-            refused = true;
+    /** Asks the pool for this charge. A refused request is granted later from the pool's queue. */
+    private void request(Charge charge) {
+        charge.requested = true;
+        charge.ticket = pool.reserveTicket(owner, ip, account, charge.bytes);
+        if (pool.takeGrant(charge.ticket)) {
+            charge.granted = true;
+            return;
+        }
+        if (pendingGrants == 0) {
             ranking.beginRefusedWait(owner, clock.getAsLong());
         }
-        return charge;
+        pendingGrants++;
     }
 
-    /** Moves granted reservations forward: releases orphans, offers sequenced records in order. */
-    private void drainGrants() {
-        long granted = releasedTotal + pool.reserved(owner);
-        while (!orphans.isEmpty() && orphans.peekFirst().end <= granted) {
-            Charge orphan = orphans.pollFirst();
-            orphan.released = true;
-            pool.release(owner, orphan.bytes);
-            releasedTotal += orphan.bytes;
+    /** True once the pool has charged this request; the grant is consumed by the first true answer. */
+    private boolean granted(Charge charge) {
+        if (charge.granted) {
+            return true;
         }
-        while (!toOffer.isEmpty() && toOffer.peekFirst().end <= granted) {
-            Charge charge = toOffer.pollFirst();
-            scheduler.offer(charge.record, charge.encoded.length, charge.continues);
+        if (!charge.requested || !pool.takeGrant(charge.ticket)) {
+            return false;
         }
-        if (refused && granted >= lastEnd) {
-            refused = false;
+        charge.granted = true;
+        pendingGrants--;
+        if (pendingGrants == 0) {
             ranking.endRefusedWait(owner);
+        }
+        return true;
+    }
+
+    /**
+     * Moves charges forward. Orphans are released once granted. Each stream's records are requested
+     * and offered in sequence order: a stream stops at its first record that is not granted, so a
+     * later record on that stream is neither requested nor offered yet. Other streams are not held.
+     */
+    private void pump() {
+        for (Iterator<Charge> it = orphans.iterator(); it.hasNext();) {
+            Charge orphan = it.next();
+            if (granted(orphan)) {
+                it.remove();
+                orphan.released = true;
+                pool.release(owner, orphan.bytes);
+            }
+        }
+        Set<Integer> blocked = new HashSet<Integer>();
+        for (Iterator<Charge> it = toOffer.iterator(); it.hasNext();) {
+            Charge charge = it.next();
+            int stream = charge.record.streamIndex();
+            if (blocked.contains(stream)) {
+                continue;
+            }
+            if (!charge.requested) {
+                request(charge);
+            }
+            if (!granted(charge)) {
+                blocked.add(stream);
+                continue;
+            }
+            it.remove();
+            scheduler.offer(charge.record, charge.encoded.length, charge.continues);
         }
         ranking.setRetained(owner, pool.reserved(owner), clock.getAsLong());
     }
 
+    /** Takes this owner's shed notice, if any. Other owners' notices stay in the pool for their drivers. */
     private boolean checkShed() {
-        if (pool.drainShedOwners().contains(owner)) {
+        if (pool.takeShed(owner)) {
             closeWith(CLOSE_RESOURCE);
             return true;
         }
@@ -539,6 +641,7 @@ public final class SessionSendDriver {
     private boolean overflows(int records, long bytes) {
         return queuedRecords + records > profile.queuePacketLimit || queuedBytes + bytes > profile.queueByteLimit;
     }
+
 
     private void settleAcksLocked() {
         List<AckJoinTracker.Ready> ready = acks.settleForTransition(sequencer.assigned()[CONTROL],
@@ -570,8 +673,7 @@ public final class SessionSendDriver {
         charge.continues = false;
         byRecord.put(record, charge);
         toOffer.addLast(charge);
-        queuedRecords++;
-        queuedBytes += encoded.length;
+        queuedBytes += encoded.length - pending.queuedBytes;
         return handle;
     }
 
@@ -579,6 +681,8 @@ public final class SessionSendDriver {
     private void dropAck(long ackId, PendingAck pending) {
         pendingAcks.remove(ackId);
         orphans.addLast(pending.charge);
+        queuedRecords--;
+        queuedBytes -= pending.queuedBytes;
     }
 
     private boolean expiredAt(PendingAck pending, long now) {

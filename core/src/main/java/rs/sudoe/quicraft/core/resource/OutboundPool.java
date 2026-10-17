@@ -55,6 +55,30 @@ public final class OutboundPool {
     /** Returns and clears owners selected for local 0x12 closure. */
     public synchronized List<Object> drainShedOwners() { return ledger.drainShed(); }
 
+    /**
+     * Takes the shed notice of one owner only, leaving every other owner's notice in place. A shed owner
+     * is closed by its own caller, so no caller drains notices that belong to someone else.
+     */
+    public synchronized boolean takeShed(Object owner) { return ledger.takeShed(owner); }
+
+    /**
+     * Reserves like {@link #reserve} but returns a ticket. A refused request is granted later from the FIFO
+     * queue; {@link #takeGrant} then reports it once, so grants are tracked per request, never inferred
+     * from the owner's total.
+     */
+    public synchronized long reserveTicket(Object owner, Object ip, Object account, long bytes) {
+        return ledger.reserveTicket(owner, ip, account, bytes);
+    }
+
+    /** True once for a ticket from {@link #reserveTicket} that has been charged; the grant is consumed. */
+    public synchronized boolean takeGrant(long ticket) { return ledger.takeGrant(ticket); }
+
+    /**
+     * True when a request of {@code bytes} could ever be admitted for this account under the caps. A request
+     * that fails this check would throw from a reserve call, so callers check it before assigning anything.
+     */
+    public synchronized boolean admissible(Object account, long bytes) { return ledger.admissible(account, bytes); }
+
     /** Charged outbound bytes for one owner. */
     public synchronized long reserved(Object owner) { return ledger.reserved(owner); }
 
