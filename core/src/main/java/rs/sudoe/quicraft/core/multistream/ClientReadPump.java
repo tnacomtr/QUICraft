@@ -6,6 +6,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.LongSupplier;
 
 import rs.sudoe.quicraft.core.Protocol;
 
@@ -77,6 +78,7 @@ public final class ClientReadPump {
 
     private final ReceiveSlots slots;
     private final boolean compressed;
+    private final LongSupplier clock;
     private final SessionReadPump.ByteSource source;
     private final Lane[] lanes;
     private int cursor;
@@ -89,11 +91,24 @@ public final class ClientReadPump {
      * @param source the byte source, indexed by logical stream
      */
     public ClientReadPump(int chunks, ReceiveSlots slots, boolean compressed, SessionReadPump.ByteSource source) {
-        if (slots == null || source == null) throw new NullPointerException("client read pump argument");
+        this(chunks, slots, compressed, source, System::nanoTime);
+    }
+
+    /**
+     * As above, with an injected monotonic clock for the pending-opener age (13.15 missing-close timer).
+     *
+     * @param clock monotonic nanosecond clock; read when a bundle opener is admitted
+     */
+    public ClientReadPump(int chunks, ReceiveSlots slots, boolean compressed, SessionReadPump.ByteSource source,
+                          LongSupplier clock) {
+        if (slots == null || source == null || clock == null) {
+            throw new NullPointerException("client read pump argument");
+        }
         LogicalStream.validateShardCount(chunks);
         this.slots = slots;
         this.compressed = compressed;
         this.source = source;
+        this.clock = clock;
         this.lanes = new Lane[chunks + 2];
         for (int s = 0; s < lanes.length; s++) lanes[s] = new Lane(s);
     }
@@ -115,6 +130,20 @@ public final class ClientReadPump {
             pumpLane(lanes[(start + i) % lanes.length], done);
         }
         return done;
+    }
+
+    /**
+     * Returns the clock reading at which the oldest incomplete bundle opener was admitted, or -1 when no
+     * bundle is incomplete. The receive driver compares it with the 10 s missing-close limit (13.15).
+     */
+    public long oldestPendingOpenerNanos() {
+        long oldest = -1;
+        for (Lane lane : lanes) {
+            if (lane.pending != null && (oldest < 0 || lane.pending.admittedNanos < oldest)) {
+                oldest = lane.pending.admittedNanos;
+            }
+        }
+        return oldest;
     }
 
     /** Releases a completed unit's slot after the game has executed it. */
@@ -228,7 +257,7 @@ public final class ClientReadPump {
             throw bundleError("bundle of " + d.unitRecords + " records and " + d.unitWireBytes
                     + " wire bytes does not fit stream " + lane.stream + "'s slot");
         }
-        Pending pending = new Pending((int) d.unitRecords, d.unitWireBytes);
+        Pending pending = new Pending((int) d.unitRecords, d.unitWireBytes, clock.getAsLong());
         pending.declared = 1;
         pending.consumed = wire;
         lane.pending = pending;
@@ -262,15 +291,18 @@ public final class ClientReadPump {
     private static final class Pending {
         final int records;
         final long wireBytes;
+        /** Clock reading when the opener was admitted (13.15). */
+        final long admittedNanos;
         final List<Record> seen = new ArrayList<>();
         /** Records declared so far, opener included. */
         int declared;
         /** Wire bytes of the records declared so far, prefixes included. */
         long consumed;
 
-        Pending(int records, long wireBytes) {
+        Pending(int records, long wireBytes, long admittedNanos) {
             this.records = records;
             this.wireBytes = wireBytes;
+            this.admittedNanos = admittedNanos;
         }
     }
 

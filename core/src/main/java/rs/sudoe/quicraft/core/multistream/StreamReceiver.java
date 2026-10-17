@@ -133,6 +133,8 @@ public final class StreamReceiver {
     private final long[] applied;
     private final Unit[] head;
     private final ReceiveSlots slots;
+    /** True when the connection's read pump owns the slot charge (see the pump-slot constructor). */
+    private final boolean slotsHeldByPump;
     private final Validator validator;
     private final LongSupplier clock;
     private final Set<Long> withheld = new HashSet<Long>();
@@ -160,9 +162,29 @@ public final class StreamReceiver {
      * @param clock monotonic nanosecond transport clock
      */
     public StreamReceiver(int chunks, Direction direction, Validator validator, LongSupplier clock) {
+        this(chunks, direction, new ReceiveSlots(chunks), false, validator, clock);
+    }
+
+    /**
+     * Receiver whose stream slots are charged by the connection's {@link ClientReadPump}. The pump admits
+     * each head unit at read time; {@link #offer} then only checks that the stream holds exactly that
+     * unit's bytes and records, and never charges again. The owner releases the slot once, by committing
+     * the pump unit after {@link #applied}; this receiver does not release it.
+     *
+     * @param chunks negotiated chunk count N, 1..6, equal to the pump's
+     * @param slots the pump's clientbound slots, the single owner of the head charge
+     * @param validator injected shard, fence and join checks
+     * @param clock monotonic nanosecond transport clock
+     */
+    public StreamReceiver(int chunks, ReceiveSlots slots, Validator validator, LongSupplier clock) {
+        this(chunks, Direction.CLIENTBOUND, slots, true, validator, clock);
+    }
+
+    private StreamReceiver(int chunks, Direction direction, ReceiveSlots slots, boolean slotsHeldByPump,
+                           Validator validator, LongSupplier clock) {
         LogicalStream.validateShardCount(chunks);
-        if (direction == null || validator == null || clock == null) {
-            throw new IllegalArgumentException("direction, validator and clock are required");
+        if (direction == null || slots == null || validator == null || clock == null) {
+            throw new IllegalArgumentException("direction, slots, validator and clock are required");
         }
         this.direction = direction;
         streams = chunks + 2;
@@ -170,7 +192,8 @@ public final class StreamReceiver {
         enqueued = new long[streams];
         applied = new long[streams];
         head = new Unit[streams];
-        slots = new ReceiveSlots(chunks);
+        this.slots = slots;
+        this.slotsHeldByPump = slotsHeldByPump;
         this.validator = validator;
         this.clock = clock;
     }
@@ -270,7 +293,12 @@ public final class StreamReceiver {
         if (head[stream] != null) {
             return Admission.busy();
         }
-        if (!slots.admitHead(stream, wireBytes, recordCount)) {
+        if (slotsHeldByPump) {
+            if (!slots.holdsHead(stream) || slots.heldBytes(stream) != wireBytes
+                    || slots.heldRecords(stream) != recordCount) {
+                return Admission.violation("pump slot on stream " + stream + " does not match the unit");
+            }
+        } else if (!slots.admitHead(stream, wireBytes, recordCount)) {
             return Admission.busy();
         }
         Unit unit = new Unit(record, closingSequence, new BlockedHeadTimer(clock, true));
@@ -392,7 +420,9 @@ public final class StreamReceiver {
         rememberWithheldChains();
         head[stream] = null;
         applied[stream] = unit.closing;
-        slots.releaseHead(stream);
+        if (!slotsHeldByPump) {
+            slots.releaseHead(stream);
+        }
         withheld.removeIf(key -> (key >>> SEQUENCE_BITS) == stream && (key & SEQUENCE_MASK) <= unit.closing);
         if (unit.route.epochChange()) {
             epoch = epoch + 1;
