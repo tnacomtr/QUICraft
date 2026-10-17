@@ -11,7 +11,8 @@ import io.netty.handler.codec.quic.QuicStreamChannel;
 public final class ReadGrantAllocator extends DefaultMaxMessagesRecvByteBufAllocator {
     private int limit = 16 * 1024;
 
-    private ReadGrantAllocator() {
+    /** Package-private so tests can exercise a cached handle without a live QUIC channel. */
+    ReadGrantAllocator() {
         super(1);
     }
 
@@ -30,7 +31,19 @@ public final class ReadGrantAllocator extends DefaultMaxMessagesRecvByteBufAlloc
     }
 
     static void limit(QuicStreamChannel stream, int bytes) {
-        ((ReadGrantAllocator) stream.config().getRecvByteBufAllocator()).limit = bytes;
+        ((ReadGrantAllocator) stream.config().getRecvByteBufAllocator()).setLimit(bytes);
+    }
+
+    /**
+     * Sets the grant the next read may allocate. A handle cached by QUIC reads this field on every
+     * call, so the change applies without replacing the handle. Callers keep the value at most the
+     * read grant they reserved.
+     */
+    void setLimit(int bytes) {
+        if (bytes < 0 || bytes > ServerReadPartition.MAX_READ_GRANT) {
+            throw new IllegalArgumentException("read grant " + bytes);
+        }
+        limit = bytes;
     }
 
     @Override

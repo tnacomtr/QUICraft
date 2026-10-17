@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
@@ -564,6 +565,49 @@ class RecordCodecTest {
         out.write(body, 0, body.length);
         return out.toByteArray();
     }
+
+    /**
+     * 13.12: the declarations are read in place from the staged prefix. A full-window prefix of a
+     * compressed GAME record reads its declarations and allocates no per-call body copy.
+     */
+    @Test
+    void inspectPrefixReadsDeclarationsInPlaceWithoutCopyingTheBody() throws Exception {
+        byte[] prefix = new byte[RecordCodec.CompactDecoder.PREFIX_WINDOW];
+        // Compact header: GAME, sequence 1, epoch 0, no dependencies (4 bytes).
+        prefix[0] = 0;
+        prefix[1] = 1;
+        byte[] inner = VarInt.encode(20000);
+        System.arraycopy(inner, 0, prefix, 4, inner.length);
+        prefix[4 + inner.length] = 0; // Data Length 0: stored
+        for (int i = 4 + inner.length + 1; i < prefix.length; i++) prefix[i] = 0x55; // packet bytes
+        long recordLength = 4 + inner.length + 20000;
+
+        RecordCodec.Declarations d = RecordCodec.inspectPrefix(prefix, prefix.length, recordLength, true);
+        assertEquals(4, d.headerLength);
+        assertEquals(inner.length, d.innerLengthBytes);
+        assertEquals(1, d.dataLengthBytes);
+        assertEquals(0, d.dataLength);
+        assertEquals(19999, d.payloadLength);
+
+        java.lang.management.ThreadMXBean bean = java.lang.management.ManagementFactory.getThreadMXBean();
+        assumeTrue(bean instanceof com.sun.management.ThreadMXBean
+                && ((com.sun.management.ThreadMXBean) bean).isThreadAllocatedMemorySupported());
+        com.sun.management.ThreadMXBean sun = (com.sun.management.ThreadMXBean) bean;
+        long thread = Thread.currentThread().getId();
+        int calls = 5000;
+        for (int i = 0; i < calls; i++) RecordCodec.inspectPrefix(prefix, prefix.length, recordLength, true);
+        long before = sun.getThreadAllocatedBytes(thread);
+        for (int i = 0; i < calls; i++) RecordCodec.inspectPrefix(prefix, prefix.length, recordLength, true);
+        long allocated = sun.getThreadAllocatedBytes(thread) - before;
+        assertTrue(allocated / calls < MAX_INSPECT_BYTES_PER_CALL,
+                "inspectPrefix allocated " + (allocated / calls) + " bytes per call");
+    }
+
+    /**
+     * Per-call allocation ceiling for inspectPrefix. Measured: 240 bytes per call without a body copy,
+     * 328 with the 69-byte copy (the mutation this test must catch). 288 sits between them.
+     */
+    private static final long MAX_INSPECT_BYTES_PER_CALL = 288;
 
     private static void assertClose(byte[] bytes, RecordCodec.Decoder decoder) {
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,

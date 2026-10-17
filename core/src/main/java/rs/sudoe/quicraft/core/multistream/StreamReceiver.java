@@ -41,6 +41,7 @@ import rs.sudoe.quicraft.core.routing.Direction;
 public final class StreamReceiver {
     /** Record kind values (13.4): END is CONTROL-only; ACK_JOIN and BATCH_JOIN are chunk-only. */
     private static final int KIND_END = RecordCodec.KIND_END;
+    private static final int KIND_BUNDLE_OPEN = RecordCodec.KIND_BUNDLE_OPEN;
     private static final int KIND_ACK_JOIN = 2;
     private static final int KIND_BATCH_JOIN = 3;
     /** Largest epoch value on the wire: minimal signed-31-bit VarInt (13.4, 13.18). */
@@ -240,6 +241,12 @@ public final class StreamReceiver {
         }
         if (record.kind() == KIND_END && stream != LogicalStream.CONTROL) {
             return Admission.violation("END record outside CONTROL");
+        }
+        if (record.kind() == KIND_BUNDLE_OPEN) {
+            if (stream != LogicalStream.CONTROL || direction == Direction.SERVERBOUND) {
+                return Admission.violation("bundle open outside clientbound CONTROL (13.15) on stream " + stream);
+            }
+            if (recordCount < 2) return Admission.violation("bundle open with fewer than two records (13.15)");
         }
         Admission depCheck = checkDependencies(stream, record);
         if (depCheck != null) {
