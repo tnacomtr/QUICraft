@@ -359,6 +359,154 @@ class NStreamSessionLoopbackTest {
         }
     }
 
+    /** Copies every outbound byte of a stream and passes the write on unchanged. */
+    private static final class Tap extends ChannelOutboundHandlerAdapter {
+        private final java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+            if (msg instanceof io.netty.buffer.ByteBuf) {
+                io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) msg;
+                byte[] copy = new byte[buf.readableBytes()];
+                buf.getBytes(buf.readerIndex(), copy);
+                synchronized (bytes) {
+                    bytes.write(copy, 0, copy.length);
+                }
+            }
+            ctx.write(msg, promise);
+        }
+
+        /** Every complete record written so far, in order. */
+        List<Record> records(int stream) throws MultistreamProtocolException {
+            byte[] all;
+            synchronized (bytes) {
+                all = bytes.toByteArray();
+            }
+            List<Record> out = new ArrayList<Record>();
+            int at = 0;
+            while (at < all.length) {
+                int length = 0;
+                int shift = 0;
+                int prefix = at;
+                int b;
+                do {
+                    b = all[prefix++] & 0xff;
+                    length |= (b & 0x7f) << shift;
+                    shift += 7;
+                } while ((b & 0x80) != 0);
+                byte[] one = java.util.Arrays.copyOfRange(all, at, prefix + length);
+                out.add(RecordCodec.decodeRecord(one, stream));
+                at = prefix + length;
+            }
+            return out;
+        }
+    }
+
+    private static List<OutboundPacket> members(byte[]... frames) {
+        List<OutboundPacket> out = new ArrayList<OutboundPacket>();
+        for (byte[] frame : frames) {
+            out.add(new OutboundPacket(frame));
+        }
+        return out;
+    }
+
+    private static List<SentPacket> bundle(NStreamSession session, byte[]... memberFrames) {
+        return session.sendBundle(new OutboundPacket(NRig.frame(NRig.BUNDLE_OPEN, "")), members(memberFrames),
+                new OutboundPacket(NRig.frame(NRig.BUNDLE_CLOSE, "")));
+    }
+
+    /** The delivered bundle unit whose members include {@code label}, or null. */
+    private static NRig.Got bundleUnit(NRig.Game game, String label) {
+        for (NRig.Got got : game.units()) {
+            if (got.packets.size() > 1) {
+                for (Object p : got.packets) {
+                    if (label.equals(((NRig.Pkt) p).label)) {
+                        return got;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A bundle with CHUNK and REALTIME members needs no position: it rides CONTROL as one unit, is promoted to
+     * global (its opener waits for the latest record on every stream), and the client delivers it whole (13.15).
+     */
+    @Test
+    void bundleWithChunkAndRealtimeMembersRoundTripsAsGlobal() throws Exception {
+        int n = 2;
+        try (NRig rig = NRig.start(n)) {
+            rig.activateBoth();
+            Tap tap = new Tap();
+            NRig.onLoop(rig.server, () -> rig.server.channelOf(LogicalStream.CONTROL).pipeline().addFirst(tap));
+            SentPacket chunk = rig.server.send(ProtocolState.PLAY, NRig.CHUNK_ID, NRig.chunkFrame(1, 1, "plain"),
+                    NRig.chunkUncompressed(1, 1));
+            assertTrue(chunk.isAssigned());
+            List<SentPacket> handles = bundle(rig.server, NRig.frame(NRig.CONTROL_ID, "m"),
+                    NRig.chunkFrame(7, 7, "cm"), NRig.frame(NRig.REALTIME_ID, "rm"));
+            assertEquals(5, handles.size(), "the bundle was accepted");
+            for (SentPacket handle : handles) {
+                assertEquals(LogicalStream.CONTROL, handle.logicalStream());
+            }
+            assertTrue(LaneRig.await(() -> bundleUnit(rig.clientGame, "cm") != null, 15_000),
+                    () -> "bundle delivered: " + rig.clientGame.units() + " " + rig.clientGame.closed.getNow(null));
+            NRig.Got got = bundleUnit(rig.clientGame, "cm");
+            assertEquals(LogicalStream.CONTROL, got.stream);
+            assertEquals(5, got.packets.size());
+            assertFalse(rig.clientGame.closed.isDone());
+            assertFalse(rig.serverGame.closed.isDone());
+            Record opener = null;
+            for (Record record : tap.records(LogicalStream.CONTROL)) {
+                if (record.kind() == RecordCodec.KIND_BUNDLE_OPEN) {
+                    opener = record;
+                }
+            }
+            assertTrue(opener != null, "the opener was written on CONTROL");
+            long onShard = 0;
+            for (Record.Dependency dep : opener.dependencies()) {
+                if (dep.streamIndex() == chunk.logicalStream()) {
+                    onShard = dep.sequence();
+                }
+            }
+            assertEquals(chunk.sequence(), onShard, "a global bundle waits for the earlier CHUNK record");
+        }
+    }
+
+    /** INTERACTION is serverbound only in a reviewed table, so a test table adds it clientbound (13.15). */
+    @Test
+    void bundleWithInteractionMemberRoundTrips() throws Exception {
+        NRig.Config config = new NRig.Config();
+        config.table = rs.sudoe.quicraft.core.routing.RoutingTables.withRoute(NRig.TABLE,
+                new rs.sudoe.quicraft.core.routing.RouteKey(NRig.TABLE.protocolNumber(), ProtocolState.PLAY,
+                        rs.sudoe.quicraft.core.routing.Direction.CLIENTBOUND, NRig.INTERACTION_ID),
+                new rs.sudoe.quicraft.core.routing.RouteV2(rs.sudoe.quicraft.core.routing.RouteV2.StreamLane.CONTROL,
+                        rs.sudoe.quicraft.core.routing.Dependency.INTERACTION, null, null, false, null, null, null));
+        try (NRig rig = NRig.start(config)) {
+            rig.activateBoth();
+            List<SentPacket> handles = bundle(rig.server, NRig.frame(NRig.INTERACTION_ID, "im"),
+                    NRig.frame(NRig.CONTROL_ID, "cm"));
+            assertEquals(4, handles.size(), "the bundle was accepted");
+            assertTrue(LaneRig.await(() -> bundleUnit(rig.clientGame, "im") != null, 15_000),
+                    () -> "bundle delivered: " + rig.clientGame.units() + " " + rig.clientGame.closed.getNow(null));
+            assertEquals(LogicalStream.CONTROL, bundleUnit(rig.clientGame, "im").stream);
+            assertFalse(rig.clientGame.closed.isDone());
+            assertFalse(rig.serverGame.closed.isDone());
+        }
+    }
+
+    /** A join member may never be bundled: the sender refuses the bundle and closes 0x11 without writing it. */
+    @Test
+    void bundleWithJoinMemberClosesOrdering() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            assertTrue(bundle(rig.server, NRig.frame(NRig.CONTROL_ID, "m"), NRig.frame(NRig.JOIN_ID, "j")).isEmpty());
+            assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code);
+            assertEquals(CLOSE_ORDERING, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
+            assertEquals(null, bundleUnit(rig.clientGame, "m"));
+        }
+    }
+
     @Test
     void shedVictimClosesWith0x12() throws Exception {
         try (NRig rig = NRig.start(2)) {

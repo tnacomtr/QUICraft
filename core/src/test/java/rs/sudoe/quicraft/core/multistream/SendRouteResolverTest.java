@@ -155,4 +155,42 @@ final class SendRouteResolverTest {
     void epochChangeFailsClosedThroughThePlainSendPath() {
         assertTrue(resolve(PID_EPOCH, null).failed());
     }
+    private static SendRouteResolver.BundleScopes bundle(int... pids) {
+        return SendRouteResolver.bundleScopes(table(), PROTOCOL, Direction.SERVERBOUND, STATE, pids);
+    }
+
+    private static StreamSequencer.Fence bundleScope(int... pids) {
+        SendRouteResolver.BundleScopes scopes = bundle(pids);
+        assertFalse(scopes.failed(), String.valueOf(scopes.failure()));
+        return StreamSequencer.bundleScope(scopes.scopes());
+    }
+
+    /** The 13.15 strongest-member mapping, without position extraction. */
+    @Test
+    void bundleMembersMapToTheStrongestScope() {
+        assertEquals(StreamSequencer.Fence.CONTROL_FENCE, bundleScope(PID_ORDINARY), "the floor is control");
+        assertEquals(StreamSequencer.Fence.CONTROL_FENCE, bundleScope(PID_CONTROL, PID_ORDINARY));
+        assertEquals(StreamSequencer.Fence.VIEW, bundleScope(PID_VIEW, PID_CONTROL));
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_GLOBAL, PID_VIEW));
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_FENCE));
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_LANE), "a LANE dependency promotes");
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_ORDINARY, PID_REALTIME), "a REALTIME member");
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_CONTROL, 999), "an unknown member");
+        // CHUNK members need no position here, even when their extractor would fail or is missing.
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_ORDINARY, PID_CHUNK));
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_CHUNK_BAD_EXTRACTOR));
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_CHUNK_NO_EXTRACTOR));
+        // INTERACTION is above control; it and VIEW are incomparable, so both together are global.
+        assertEquals(StreamSequencer.Fence.CONTROL_FENCE, bundleScope(PID_INTERACTION, PID_ORDINARY));
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_INTERACTION, PID_VIEW));
+        assertEquals(StreamSequencer.Fence.GLOBAL, bundleScope(PID_VIEW, PID_ORDINARY, PID_INTERACTION));
+    }
+
+    @Test
+    void joinAndEpochBundleMembersFailClosed() {
+        assertTrue(bundle(PID_ORDINARY, PID_ACK_JOIN).failed());
+        assertTrue(bundle(PID_BATCH_JOIN).failed());
+        assertTrue(bundle(PID_CONTROL, PID_EPOCH).failed());
+        assertNull(bundle(PID_EPOCH).scopes());
+    }
 }

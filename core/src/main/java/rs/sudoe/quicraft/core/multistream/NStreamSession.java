@@ -390,25 +390,22 @@ public final class NStreamSession implements MultistreamSession {
             return new ArrayList<SentPacket>();
         }
         List<OutboundPacket> copy = new ArrayList<OutboundPacket>(members);
-        StreamSequencer.Fence[] scopes = new StreamSequencer.Fence[copy.size()];
-        for (int i = 0; i < scopes.length; i++) {
-            int id = packetIdOf(copy.get(i).frame(), compressed);
-            if (id < 0) {
+        int[] ids = new int[copy.size()];
+        for (int i = 0; i < ids.length; i++) {
+            ids[i] = packetIdOf(copy.get(i).frame(), compressed);
+            if (ids[i] < 0) {
                 refuse("bundle member " + i + " has no readable packet id (13.15)");
                 return new ArrayList<SentPacket>();
             }
-            SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(routes, extractors, protocolNumber,
-                    sendDirection, ProtocolState.PLAY, id, null);
-            String why = resolved.failed() ? resolved.failure()
-                    : resolved.interaction() ? "an INTERACTION route"
-                    : resolved.fence() == StreamSequencer.Fence.REALTIME ? "a REALTIME route"
-                    : resolved.fence() == StreamSequencer.Fence.CHUNK ? "a CHUNK route" : null;
-            if (why != null) {
-                refuse("bundle member " + i + " (packet " + id + ") has " + why + " (13.15)");
-                return new ArrayList<SentPacket>();
-            }
-            scopes[i] = resolved.fence();
         }
+        // The 13.15 strongest-member scope, without position extraction; the sequencer combines the scopes.
+        SendRouteResolver.BundleScopes resolved = SendRouteResolver.bundleScopes(routes, protocolNumber,
+                sendDirection, ProtocolState.PLAY, ids);
+        if (resolved.failed()) {
+            refuse(resolved.failure());
+            return new ArrayList<SentPacket>();
+        }
+        StreamSequencer.Fence[] scopes = resolved.scopes();
         List<SentPacket> handles;
         try {
             handles = sendDriver.submitBundle(open, copy, scopes, close);

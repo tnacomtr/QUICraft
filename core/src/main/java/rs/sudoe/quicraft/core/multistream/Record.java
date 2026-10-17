@@ -73,6 +73,16 @@ public final class Record {
     /** Bundle opener only: total wire size of the unit, length prefixes included (13.4). */
     public long unitWireBytes() { return unitFields()[1]; }
 
+    /**
+     * The GAME frame this record carries: the whole payload, or for a bundle opener the opening delimiter after
+     * its unit fields (13.4).
+     */
+    public byte[] gameFrame() {
+        if (!isBundleOpen()) return payload();
+        int skip = (int) unitFields()[2];
+        return Arrays.copyOfRange(payload, payloadOffset + skip, payloadOffset + payloadLength);
+    }
+
     private long[] unitFields() {
         if (!isBundleOpen()) throw new IllegalStateException("not a bundle opener");
         try {

@@ -20,6 +20,8 @@ import rs.sudoe.quicraft.core.routing.RouteV2;
  * INTERACTION to ORDINARY_CONTROL (INTERACTION also sets the interaction flag); REALTIME lane to REALTIME;
  * CHUNK lane to CHUNK[ShardHash] of the extracted position. An unknown packet id is a global fence (13.5).
  * ACK_JOIN, BATCH_JOIN and epoch-change routes need adapter metadata and are rejected here.
+ *
+ * <p>Bundle members are mapped by {@link #bundleScopes} instead, without position extraction (13.15).
  */
 public final class SendRouteResolver {
 
@@ -70,7 +72,93 @@ public final class SendRouteResolver {
         }
     }
 
+    /** The member scopes of one bundle for {@link StreamSequencer#bundleScope}, or a fail-closed reason. */
+    public static final class BundleScopes {
+        private final StreamSequencer.Fence[] scopes;
+        private final String failure;
+
+        private BundleScopes(StreamSequencer.Fence[] scopes, String failure) {
+            this.scopes = scopes;
+            this.failure = failure;
+        }
+
+        /** One scope per member, in order; null when the bundle must fail closed. */
+        public StreamSequencer.Fence[] scopes() { return scopes; }
+
+        /** True when the bundle must not be written and the session closes 0x11. */
+        public boolean failed() { return failure != null; }
+
+        /** Why the bundle fails closed, or null. */
+        public String failure() { return failure; }
+    }
+
     private SendRouteResolver() {
+    }
+
+    /**
+     * Maps each bundle member to a sequencer scope with the 13.15 strongest-member rule. No position is extracted:
+     * bundle context is the only exception to individual chunk routing.
+     *
+     * <p>Mapping: GLOBAL and FENCE to GLOBAL; VIEW to VIEW; CONTROL to CONTROL_FENCE; ORDINARY to ORDINARY_CONTROL;
+     * a REALTIME (LANE) member, an unknown packet id or an unknown dependency to GLOBAL; a CHUNK member to CHUNK,
+     * which {@link StreamSequencer#bundleScope} promotes to global. INTERACTION maps to CONTROL_FENCE: the sequencer
+     * has no clientbound interaction scope, the bundle floor is control anyway, and a control fence already waits
+     * for the latest REALTIME record that an interaction depends on. View and interaction are incomparable, so a
+     * bundle holding both is global. An ACK_JOIN or BATCH_JOIN member or an epoch change fails closed.
+     *
+     * @param packetIds the members' packet ids, in order
+     */
+    public static BundleScopes bundleScopes(SessionReceiveDriver.RouteSource routes, int protocolNumber,
+            Direction direction, ProtocolState state, int[] packetIds) {
+        StreamSequencer.Fence[] scopes = new StreamSequencer.Fence[packetIds.length];
+        int interaction = -1;
+        boolean view = false;
+        for (int i = 0; i < packetIds.length; i++) {
+            RouteV2 v2 = routes.routeFor(new RouteKey(protocolNumber, state, direction, packetIds[i]));
+            if (v2 == null) {
+                scopes[i] = StreamSequencer.Fence.GLOBAL;
+                continue;
+            }
+            if (v2.dependency == Dependency.ACK_JOIN || v2.dependency == Dependency.BATCH_JOIN) {
+                return new BundleScopes(null, "bundle member " + i + " (packet " + packetIds[i]
+                        + ") is a join (13.15)");
+            }
+            if (v2.epochChange) {
+                return new BundleScopes(null, "bundle member " + i + " (packet " + packetIds[i]
+                        + ") changes the epoch (13.15)");
+            }
+            if (v2.lane == RouteV2.StreamLane.CHUNK) {
+                scopes[i] = StreamSequencer.Fence.CHUNK;
+                continue;
+            }
+            if (v2.lane != RouteV2.StreamLane.CONTROL) {
+                scopes[i] = StreamSequencer.Fence.GLOBAL;
+                continue;
+            }
+            switch (v2.dependency) {
+                case VIEW:
+                    scopes[i] = StreamSequencer.Fence.VIEW;
+                    view = true;
+                    break;
+                case CONTROL:
+                    scopes[i] = StreamSequencer.Fence.CONTROL_FENCE;
+                    break;
+                case ORDINARY:
+                    scopes[i] = StreamSequencer.Fence.ORDINARY_CONTROL;
+                    break;
+                case INTERACTION:
+                    scopes[i] = StreamSequencer.Fence.CONTROL_FENCE;
+                    interaction = i;
+                    break;
+                default:
+                    scopes[i] = StreamSequencer.Fence.GLOBAL;
+                    break;
+            }
+        }
+        if (view && interaction >= 0) {
+            scopes[interaction] = StreamSequencer.Fence.GLOBAL;
+        }
+        return new BundleScopes(scopes, null);
     }
 
     /**

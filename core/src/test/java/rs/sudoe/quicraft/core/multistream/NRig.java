@@ -252,6 +252,7 @@ final class NRig implements AutoCloseable {
         LaneSession.Timing clientTiming = timing(50, 10_000);
         SessionResources serverResources = resources();
         SessionResources clientResources = resources();
+        RoutingTable table = TABLE;
     }
 
     final Config config;
@@ -330,7 +331,7 @@ final class NRig implements AutoCloseable {
             SessionContext context = SessionContext.of(config.shards);
             if (config.serverSession) {
                 serverConnection.eventLoop().submit(() -> {
-                    server = new NStreamSession(serverConnection, LaneSession.Role.SERVER, serverControl, TABLE,
+                    server = new NStreamSession(serverConnection, LaneSession.Role.SERVER, serverControl, config.table,
                             serverGame, context, config.serverResources, config.serverTiming, false);
                     serverGame.session = server;
                     serverRef = server;
@@ -341,7 +342,8 @@ final class NRig implements AutoCloseable {
             }
             if (config.clientSession) {
                 net.clientConnection.eventLoop().submit(() -> {
-                    client = new NStreamSession(net.clientConnection, LaneSession.Role.CLIENT, clientControl, TABLE,
+                    client = new NStreamSession(net.clientConnection, LaneSession.Role.CLIENT, clientControl,
+                            config.table,
                             clientGame, context, config.clientResources, config.clientTiming, false);
                     clientGame.session = client;
                     clientRef = client;

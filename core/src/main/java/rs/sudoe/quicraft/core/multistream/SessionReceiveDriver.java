@@ -296,7 +296,7 @@ public final class SessionReceiveDriver {
             LaneGame.Decoded decoded;
             long before = attempt.reserved;
             try {
-                decoded = game.decode(lane, record.sequence(), record.payload(), inside, attempt);
+                decoded = game.decode(lane, record.sequence(), record.gameFrame(), inside, attempt);
             } catch (RetryLater retry) {
                 return retryLater();
             } catch (Exception e) {
@@ -325,7 +325,7 @@ public final class SessionReceiveDriver {
             if (decoded.uncompressed() != null) {
                 game.onDecodedUncompressed(lane, stream, record.sequence(), decoded.uncompressed());
             }
-            ReceiveRoute route = routeOf(decoded);
+            ReceiveRoute route = bundle ? bundleMemberRoute(decoded) : routeOf(decoded);
             if (route == null) {
                 fail(ReceiveClose.peerViolation("no usable route for packet " + decoded.packetId()));
                 return false;
@@ -414,7 +414,8 @@ public final class SessionReceiveDriver {
 
     /**
      * Builds one bundle's route from its member routes (13.15). Returns null when a member may not join a
-     * bundle: an ACK_JOIN or BATCH_JOIN, an epoch change, or a REALTIME member.
+     * bundle: an ACK_JOIN or BATCH_JOIN, or an epoch change. A REALTIME (LANE) or CHUNK member promotes the
+     * bundle to global.
      */
     private static ReceiveRoute combineBundle(List<ReceiveRoute> members) {
         boolean global = false;
@@ -422,8 +423,7 @@ public final class SessionReceiveDriver {
         boolean interaction = false;
         for (ReceiveRoute member : members) {
             if (member.join() || member.epochChange()) return null;
-            if (member.lane() == ReceiveRoute.Lane.REALTIME) return null;
-            if (member.lane() == ReceiveRoute.Lane.CHUNK) {
+            if (member.lane() != ReceiveRoute.Lane.CONTROL) {
                 global = true;
                 continue;
             }
@@ -457,6 +457,23 @@ public final class SessionReceiveDriver {
             scope = Dependency.CONTROL;
         }
         return new ReceiveRoute(ReceiveRoute.Lane.CONTROL, scope, null, false, false);
+    }
+
+    /**
+     * The route of one bundle record (13.15). Bundle context is the only exception to individual lane routing: a
+     * REALTIME or CHUNK packet rides CONTROL inside the bundle and promotes it to global, so its route is a CONTROL
+     * global route with no position extracted, and the per-member lane and shard checks see a CONTROL route. Join
+     * and epoch-change flags are kept, so {@link #combineBundle} still refuses those members.
+     */
+    private ReceiveRoute bundleMemberRoute(LaneGame.Decoded decoded) {
+        RouteV2 v2 = routes.routeFor(new RouteKey(protocolNumber, decoded.state(), Direction.CLIENTBOUND,
+                decoded.packetId()));
+        if (v2 == null) {
+            return new ReceiveRoute(ReceiveRoute.Lane.CONTROL, Dependency.GLOBAL, null, false, false);
+        }
+        boolean join = v2.dependency == Dependency.ACK_JOIN || v2.dependency == Dependency.BATCH_JOIN;
+        Dependency scope = v2.lane == RouteV2.StreamLane.CONTROL ? v2.dependency : Dependency.GLOBAL;
+        return new ReceiveRoute(ReceiveRoute.Lane.CONTROL, scope, null, v2.epochChange, join);
     }
 
     /**
