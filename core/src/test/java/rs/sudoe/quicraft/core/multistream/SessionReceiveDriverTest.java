@@ -42,6 +42,12 @@ class SessionReceiveDriverTest {
         long reserveBytes;
 
         @Override
+        public Decoded decodeInflated(rs.sudoe.quicraft.core.routing.Lane lane, long sequence, byte[] content,
+                                      boolean insideBundle, Reservation reservation) {
+            return decode(lane, sequence, content, insideBundle, reservation);
+        }
+
+        @Override
         public Decoded decode(rs.sudoe.quicraft.core.routing.Lane lane, long sequence, byte[] frame,
                               boolean insideBundle, Reservation reservation) {
             decodes++;

@@ -222,7 +222,7 @@ public final class ServerReceiveDriver {
         long before = attempt.reserved;
         LaneGame.Decoded decoded;
         try {
-            decoded = game.decode(lane, entry.sequence, content, false, attempt);
+            decoded = game.decodeInflated(lane, entry.sequence, content, false, attempt);
         } catch (RetryLater e) {
             fail(ReceiveClose.resourceWait("execution workspace"));
             return false;

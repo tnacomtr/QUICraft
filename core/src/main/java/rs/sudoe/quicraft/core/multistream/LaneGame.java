@@ -70,6 +70,20 @@ public interface LaneGame {
                    Reservation reservation) throws Exception;
 
     /**
+     * Decodes one serverbound GAME record whose content is already inflated: the packet id and body
+     * exactly as the client sent them, with the Minecraft VarInt length and any compression wrapper
+     * removed (the serverbound receive driver inflates before it reaches the game, 13.4, 13.12).
+     * Same eligibility, reservation and retry rules as {@link #decode}.
+     *
+     * <p>Additive and fail-closed: the default throws, so a game that does not implement it closes the
+     * connection with 0x11 instead of decoding the wrong bytes.</p>
+     */
+    default Decoded decodeInflated(Lane lane, long sequence, byte[] content, boolean insideBundle,
+                                   Reservation reservation) throws Exception {
+        throw new UnsupportedOperationException("serverbound inflated decode is not implemented by this game");
+    }
+
+    /**
      * Hands over one decoded packet or one whole bundle, in dependency order and never a partial
      * bundle (13.15). The game applies it, in order, and then calls
      * {@link LaneSession#applied(Lane, long)} with the same lane and {@code sequence}, from any
