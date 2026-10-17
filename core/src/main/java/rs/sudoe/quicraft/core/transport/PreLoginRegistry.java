@@ -50,6 +50,11 @@ final class PreLoginRegistry {
      */
     private final Set<Entry> shedding = new HashSet<>();
     /**
+     * Pending newcomers waiting for a shed victim's close to be confirmed (12.13). Each is run once, outside the
+     * registry lock, when a confirmed close frees bytes owed to a newcomer; a woken newcomer retries its attempt.
+     */
+    private final List<Runnable> waiters = new ArrayList<>();
+    /**
      * Declared-length charges that could not be granted at once (12.13 wait set). Drained in priority order
      * (coarse holding, fine holding, arrival, id) whenever bytes are released; a granted waiter keeps its
      * bytes until its connection claims the frame, closes, or expires.
@@ -98,16 +103,18 @@ final class PreLoginRegistry {
      */
     synchronized Entry admit(InetAddress source, Object owner, int shards, boolean online, LongSupplier clock,
             Runnable closeConnection) {
-        return attempt(source, owner, shards, online, clock, closeConnection).entry;
+        return attempt(source, owner, shards, online, clock, closeConnection, null).entry;
     }
 
     /**
      * One admission attempt (12.13). Returns the admitted entry, or refusal, or pending: victims were picked
      * (or are still closing) and their bytes are not confirmed released yet. A pending newcomer is not granted
      * and no second victim is picked while a shed is unconfirmed; the caller retries after the confirmation.
+     *
+     * @param waiter run once when a shed victim's close is confirmed while this attempt is pending; null for none
      */
     synchronized Admission attempt(InetAddress source, Object owner, int shards, boolean online, LongSupplier clock,
-            Runnable closeConnection) {
+            Runnable closeConnection, Runnable waiter) {
         InetAddress coarse = coarsePrefix(source);
         long share = PreLoginTracker.stagedShare(shards);
         boolean shedAny = false;
@@ -126,6 +133,7 @@ final class PreLoginRegistry {
                 if (!shedding.isEmpty()) {
                     // The freed bytes are owed to this newcomer: the wait set is not served until it settles.
                     pendingNow = true;
+                    addWaiter(waiter);
                     return Admission.PENDING;
                 }
                 Entry victim = pickVictim();
@@ -137,6 +145,7 @@ final class PreLoginRegistry {
                 // or refused, so a waiter cannot take it and force a further shed.
                 shed(victim, false);
                 shedAny = true;
+                // The victim's bytes stay charged until its close is confirmed, so the next pass pends.
             }
         } finally {
             if (!pendingNow && (shedAny || drainOwed)) {
@@ -145,25 +154,62 @@ final class PreLoginRegistry {
         }
     }
 
+    /** {@link #shedForLease(InetAddress, int, Runnable)} without a waiter: true when the newcomer must wait. */
+    synchronized boolean shedForLease(InetAddress source, int shards) {
+        return shedForLease(source, shards, null).pending;
+    }
+
     /**
      * Frees one open-connection slot for a validated newcomer when the listener's global limits are full
      * (12.13): sheds one pre-login victim in the order of {@link #admit}, unless the newcomer's own prefix is
-     * already over its fair share. The victim's close gives back its lease synchronously, so the caller can
-     * take it at once. Returns false when nobody is sheddable: the caller refuses the newcomer.
+     * already over its fair share. The victim's lease is not free until its close is confirmed, so a pending
+     * result means the caller waits and retries (the waiter runs at the confirmation). Refused when nobody is
+     * sheddable or the newcomer is over its share.
      */
-    synchronized boolean shedForLease(InetAddress source, int shards) {
+    synchronized Admission shedForLease(InetAddress source, int shards, Runnable waiter) {
         if (overFairShare(coarsePrefix(source), PreLoginTracker.stagedShare(shards))) {
-            return false;
+            return Admission.REFUSED;
+        }
+        if (!shedding.isEmpty()) {
+            addWaiter(waiter);
+            return Admission.PENDING;
         }
         Entry victim = pickVictim();
         if (victim == null) {
-            return false;
+            return Admission.REFUSED;
         }
         LOG.log(Level.FINE, "shedding a staged /3 connection to free an open-connection slot");
-        // The victim's pool bytes are kept for the newcomer's admit, which serves the wait set once it settles.
+        // The victim's pool bytes and its lease are kept until its close is confirmed.
         shed(victim, false);
         drainOwed = true;
-        return true;
+        addWaiter(waiter);
+        return Admission.PENDING;
+    }
+
+    private void addWaiter(Runnable waiter) {
+        if (waiter != null) {
+            waiters.add(waiter);
+        }
+    }
+
+    /** Takes the pending newcomers to wake (under the lock); they run after the lock is released. */
+    private List<Runnable> takeWaiters() {
+        if (waiters.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        List<Runnable> woken = new ArrayList<>(waiters);
+        waiters.clear();
+        return woken;
+    }
+
+    private static void wake(List<Runnable> woken) {
+        for (Runnable waiter : woken) {
+            try {
+                waiter.run();
+            } catch (RuntimeException e) {
+                LOG.log(Level.FINE, "waking a pending /3 newcomer failed", e);
+            }
+        }
     }
 
     /**
@@ -701,6 +747,7 @@ final class PreLoginRegistry {
         /** Releases the connection's charge, from either pool, and any session call it still holds. Idempotent. */
         @Override
         public void close() {
+            List<Runnable> woken;
             synchronized (PreLoginRegistry.this) {
                 while (sessionCalls > 0) {
                     endSessionCall();
@@ -711,10 +758,14 @@ final class PreLoginRegistry {
                 tracker.close();
                 if (confirmedShed) {
                     drainOwed = true;
+                    woken = takeWaiters();
                 } else {
                     drainDeclaredWaiters();
+                    woken = java.util.Collections.emptyList();
                 }
             }
+            // Outside the lock: a woken newcomer re-enters the registry on its own event loop.
+            wake(woken);
         }
 
         private void promoteIfNeeded(Runnable promotion) {

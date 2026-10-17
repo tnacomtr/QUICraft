@@ -75,9 +75,6 @@ public final class QuicServer implements Closeable {
     /** The /3 connection's staged pre-login lifecycle (12.13), see {@link #preLoginStage}. */
     private static final io.netty.util.AttributeKey<PreLoginConnection> PRE_LOGIN =
             io.netty.util.AttributeKey.valueOf(QuicServer.class, "preLogin");
-    /** The connection's open-connection lease, so a shed can give its slot back at once (12.13). */
-    private static final io.netty.util.AttributeKey<ConnectionAdmission.Lease> LEASE =
-            io.netty.util.AttributeKey.valueOf(QuicServer.class, "openLease");
     /**
      * Chunk streams charged for a staged connection. N is not negotiated before OFFER, so every
      * staged connection is charged for the largest N (13.2): conservative, and at most six streams.
@@ -945,18 +942,24 @@ public final class QuicServer implements Closeable {
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
+                        Runnable install = () -> {
+                            if (shared.accepted != null) {
+                                // Written only by this socket's own loop, so no synchronization.
+                                shared.accepted.incrementAndGet(socketIndex);
+                            }
+                            connection.pipeline().addLast(new Connection(shared.acceptor, shared.tokens,
+                                    shared.config.earlyData, shared.unconfirmed, shared.v3, shared.nodeBudget));
+                        };
                         Admitted admitted = Admitted.admit(connection, shared.admission, shared.v3 != null
-                                ? shared.nodeBudget : null, shared.preLogin, shared.config.preLoginOnline);
+                                ? shared.nodeBudget : null, shared.preLogin, shared.config.preLoginOnline, install,
+                                stream -> initStream(stream, shared));
                         if (admitted == null) {
                             return;
                         }
-                        if (shared.accepted != null) {
-                            // Written only by this socket's own loop, so no synchronization.
-                            shared.accepted.incrementAndGet(socketIndex);
+                        connection.pipeline().addLast(admitted);
+                        if (admitted.isReady()) {
+                            admitted.grant();
                         }
-                        connection.pipeline().addLast(admitted,
-                                new Connection(shared.acceptor, shared.tokens, shared.config.earlyData,
-                                        shared.unconfirmed, shared.v3, shared.nodeBudget));
                     }
                 })
                 .streamHandler(new ChannelInitializer<QuicStreamChannel>() {
@@ -965,24 +968,12 @@ public final class QuicServer implements Closeable {
                         if (stream.parent().hasAttr(REFUSED)) {
                             return; // closing with CONNECTION_REFUSED already
                         }
-                        Connection connection = stream.parent().pipeline().get(Connection.class);
-                        if (connection == null || stream.type() != QuicStreamType.BIDIRECTIONAL
-                                || stream.isLocalCreated()) {
-                            Codecs.closeLater(stream.parent(), true, Protocol.CLOSE_PROTOCOL_VIOLATION);
+                        Admitted admitted = stream.parent().pipeline().get(Admitted.class);
+                        if (admitted != null && admitted.isPending()) {
+                            admitted.hold(stream); // initialized once the newcomer is granted
                             return;
                         }
-                        if (shared.v3 != null) {
-                            rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
-                            // /3 (13.3): stream 0 is CONTROL, the client's stream 4 is REALTIME, and
-                            // any other stream is fatal 0x11.
-                            if (stream.streamId() == 0) {
-                                connection.offerV3(stream);
-                            } else {
-                                connection.acceptV3(stream);
-                            }
-                            return;
-                        }
-                        connection.offer(new NettyQuicByteStream(stream));
+                        initStream(stream, shared);
                     }
                 });
         if (idGenerator != null) {
@@ -994,47 +985,113 @@ public final class QuicServer implements Closeable {
         return builder.build();
     }
 
+    /** Installs the handlers of one stream of an admitted connection (the codec's stream initializer). */
+    private static void initStream(QuicStreamChannel stream, Shared shared) {
+        Connection connection = stream.parent().pipeline().get(Connection.class);
+        if (connection == null || stream.type() != QuicStreamType.BIDIRECTIONAL
+                || stream.isLocalCreated()) {
+            Codecs.closeLater(stream.parent(), true, Protocol.CLOSE_PROTOCOL_VIOLATION);
+            return;
+        }
+        if (shared.v3 != null) {
+            rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
+            // /3 (13.3): stream 0 is CONTROL, the client's stream 4 is REALTIME, and
+            // any other stream is fatal 0x11.
+            if (stream.streamId() == 0) {
+                connection.offerV3(stream);
+            } else {
+                connection.acceptV3(stream);
+            }
+            return;
+        }
+        connection.offer(new NettyQuicByteStream(stream));
+    }
+
     /**
-     * Per connection, first in its pipeline: holds its open-connection lease, confirms it when the
-     * handshake completes and releases it on close, and closes a connection whose handshake hasn't
-     * completed within {@link #handshakeMillis}.
+     * Per connection, first in its pipeline: holds its open-connection lease and its pre-login charge, confirms the
+     * lease when the handshake completes, releases both on close, and closes a connection whose handshake hasn't
+     * completed within {@link #handshakeMillis}. A validated /3 newcomer that must wait for a shed victim's close
+     * (12.13) is pending: the game connection and its streams are held until the newcomer is granted, and the
+     * newcomer is refused at its staged deadline.
      */
     private static final class Admitted extends ChannelInboundHandlerAdapter {
-        /** Null when admission failed open. */
-        private final ConnectionAdmission.Lease lease;
+        /** The waiting-streams state of one stream that arrived while pending. */
+        private static final class Held {
+            final QuicStreamChannel stream;
+            final boolean autoRead;
+
+            Held(QuicStreamChannel stream, boolean autoRead) {
+                this.stream = stream;
+                this.autoRead = autoRead;
+            }
+        }
+
+        private final QuicChannel connection;
+        private final ConnectionAdmission admission;
+        private final ReceiveBudget nodeBudget;
+        private final PreLoginRegistry preLogin;
+        private final boolean online;
+        /** Installs the game connection once the newcomer is granted. */
+        private final Runnable install;
+        /** Initializes a stream that arrived while the newcomer was pending. */
+        private final java.util.function.Consumer<QuicStreamChannel> initStream;
+
+        /** Null when admission failed open, or not yet acquired. */
+        private ConnectionAdmission.Lease lease;
+        private PreLoginRegistry.Entry staged;
+        private boolean pending;
+        private boolean ready;
+        private boolean refused;
+        private boolean closed;
         private boolean handshakeDone;
+        private final List<Held> held = new ArrayList<>();
         private java.util.concurrent.ScheduledFuture<?> deadline;
+        private java.util.concurrent.ScheduledFuture<?> pendingDeadline;
+        private java.util.concurrent.ScheduledFuture<?> stagedCheck;
 
         /** Bytes this connection reserved against the node budget, 0 when none. */
         private long reserved;
         private ReceiveBudget reservedPool;
-        /** The staged pre-login charge while the connection is pre-login; null otherwise. */
-        private PreLoginRegistry.Entry staged;
-        private java.util.concurrent.ScheduledFuture<?> stagedCheck;
 
-        private Admitted(ConnectionAdmission.Lease lease) {
-            this.lease = lease;
+        private Admitted(QuicChannel connection, ConnectionAdmission admission, ReceiveBudget nodeBudget,
+                PreLoginRegistry preLogin, boolean online, Runnable install,
+                java.util.function.Consumer<QuicStreamChannel> initStream) {
+            this.connection = connection;
+            this.admission = admission;
+            this.nodeBudget = nodeBudget;
+            this.preLogin = preLogin;
+            this.online = online;
+            this.install = install;
+            this.initStream = initStream;
         }
 
         /**
-         * Takes an open-connection lease, released when the connection closes. Over a limit (not
-         * expected: the token handler checked first), closes it with CONNECTION_REFUSED and
-         * returns null. Runs inside the codec's read (the channel is registered there), where the
-         * remote address is already set; fails open.
+         * Runs admission: takes an open-connection lease, then charges the pre-login pool (or the node budget
+         * without it). Runs inside the codec's read (the channel is registered there), where the remote address is
+         * already set. Returns null when the connection is refused (already closing). Otherwise the result is ready
+         * ({@link #isReady}, call {@link #grant} once in the pipeline) or pending (waiting for a shed close).
          */
-        static Admitted admit(QuicChannel connection, ConnectionAdmission admission,
-                ReceiveBudget nodeBudget, PreLoginRegistry preLogin, boolean online) {
-            ConnectionAdmission.Lease lease = null;
-            try {
-                java.net.SocketAddress remote = connection.remoteSocketAddress();
-                if (remote instanceof InetSocketAddress && ((InetSocketAddress) remote).getAddress() != null) {
-                    lease = admission.tryAcquire(((InetSocketAddress) remote).getAddress());
+        static Admitted admit(QuicChannel connection, ConnectionAdmission admission, ReceiveBudget nodeBudget,
+                PreLoginRegistry preLogin, boolean online, Runnable install,
+                java.util.function.Consumer<QuicStreamChannel> initStream) {
+            Admitted admitted = new Admitted(connection, admission, nodeBudget, preLogin, online, install, initStream);
+            connection.closeFuture().addListener(f -> admitted.closed());
+            admitted.step();
+            return admitted.refused ? null : admitted;
+        }
+
+        /** Runs the admission steps still missing. Each step either proceeds, waits (pending) or refuses. */
+        private void step() {
+            InetAddress source = sourceOf(connection);
+            if (lease == null && source != null) {
+                try {
+                    lease = admission.tryAcquire(source);
                     if (lease == null && preLogin != null) {
-                        // 12.13: a validated /3 newcomer over the open-connection limits sheds a pre-login
-                        // victim instead of being dropped; the victim's close returns its lease at once.
-                        InetAddress source = ((InetSocketAddress) remote).getAddress();
-                        if (preLogin.shedForLease(source, STAGED_LANES)) {
-                            lease = admission.tryAcquire(source);
+                        // 12.13: a validated /3 newcomer over the open-connection limits sheds a pre-login victim
+                        // instead of being dropped. The victim's lease is returned when its close is confirmed.
+                        if (preLogin.shedForLease(source, STAGED_LANES, this::wake).pending) {
+                            waiting();
+                            return;
                         }
                     }
                     if (lease == null) {
@@ -1046,76 +1103,139 @@ public final class QuicServer implements Closeable {
                         // sees the close, which reaches the game.
                         LOG.log(Level.FINE, "QUIC connection over the open-connection limits after admission; "
                                 + "refusing it");
-                        connection.attr(REFUSED).set(Boolean.TRUE);
-                        Codecs.closeLater(connection, false, CONNECTION_REFUSED);
-                        return null;
+                        refuse(false, CONNECTION_REFUSED);
+                        return;
                     }
+                } catch (Throwable t) {
+                    LOG.log(Level.FINE, "QUIC open-connection check failed; admitting the connection", t);
                 }
-            } catch (Throwable t) {
-                LOG.log(Level.FINE, "QUIC open-connection check failed; admitting the connection", t);
-            }
-            Admitted admitted = new Admitted(lease);
-            if (lease != null) {
-                connection.attr(LEASE).set(lease);
             }
             if (preLogin != null) {
                 // 12.13: /3 is staged from its first accepted Initial, charged to the pre-login pool
                 // instead of the node budget until promotion (Login Success online, activation offline).
-                PreLoginRegistry.Entry entry = stage(connection, preLogin, online);
-                if (entry == null) {
-                    if (lease != null) {
-                        lease.close();
+                if (staged == null) {
+                    if (source == null) {
+                        refuse(true, Protocol.CLOSE_RESOURCE);
+                        return;
                     }
-                    LOG.log(Level.FINE, "QUIC /3 connection refused: the pre-login pool has no room");
-                    connection.attr(REFUSED).set(Boolean.TRUE);
-                    Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
-                    return null;
+                    PreLoginRegistry.Admission attempt = preLogin.attempt(source, connection, STAGED_LANES, online,
+                            System::nanoTime, this::shedClose, this::wake);
+                    if (attempt.pending) {
+                        waiting();
+                        return;
+                    }
+                    if (attempt.entry == null) {
+                        LOG.log(Level.FINE, "QUIC /3 connection refused: the pre-login pool has no room");
+                        refuse(true, Protocol.CLOSE_RESOURCE);
+                        return;
+                    }
+                    staged = attempt.entry;
                 }
-                admitted.staged = entry;
-                connection.attr(PRE_LOGIN).set(entry);
-            } else if (nodeBudget != null) {
+            } else if (nodeBudget != null && reservedPool == null) {
                 // 13.12: the connection's initial receive-credit exposure counts against the node
                 // budget, and one that does not fit is refused (TCP is untouched).
                 long exposure = TransportConfig.V3_INITIAL_EXPOSURE_BYTES;
                 if (!nodeBudget.tryReserve(exposure)) {
-                    if (lease != null) {
-                        lease.close();
-                    }
                     LOG.log(Level.FINE, "QUIC /3 connection over the node pending-bytes budget; refusing it");
-                    connection.attr(REFUSED).set(Boolean.TRUE);
-                    Codecs.closeLater(connection, false, CONNECTION_REFUSED);
-                    return null;
+                    refuse(false, CONNECTION_REFUSED);
+                    return;
                 }
-                admitted.reserved = exposure;
-                admitted.reservedPool = nodeBudget;
+                reserved = exposure;
+                reservedPool = nodeBudget;
             }
-            // The Lease keeps its own key; the channel's address is cleared when it is freed.
-            connection.closeFuture().addListener(f -> admitted.closed());
-            return admitted;
+            pending = false;
+            ready = true;
+            cancel(pendingDeadline);
+            pendingDeadline = null;
+        }
+
+        /** The remote IP, or null when the connection has none (admission then fails open or refuses). */
+        private static InetAddress sourceOf(QuicChannel connection) {
+            try {
+                java.net.SocketAddress remote = connection.remoteSocketAddress();
+                if (remote instanceof InetSocketAddress) {
+                    return ((InetSocketAddress) remote).getAddress();
+                }
+            } catch (RuntimeException e) {
+                LOG.log(Level.FINE, "QUIC remote address unavailable", e);
+            }
+            return null;
+        }
+
+        private void waiting() {
+            pending = true;
+            if (pendingDeadline == null) {
+                // The newcomer's staged deadline: a victim that never closes must not hold it forever.
+                pendingDeadline = connection.eventLoop().schedule(() -> {
+                    if (pending && !closed) {
+                        LOG.log(Level.FINE, "QUIC /3 connection refused: its pre-login wait ran out");
+                        refuse(true, Protocol.CLOSE_RESOURCE);
+                    }
+                }, PreLoginTracker.HARD_CAP_NANOS, java.util.concurrent.TimeUnit.NANOSECONDS);
+            }
+        }
+
+        /** A shed victim's close was confirmed: retries this newcomer on its own event loop, never inline. */
+        private void wake() {
+            connection.eventLoop().execute(() -> {
+                if (pending && !closed) {
+                    step();
+                    if (ready) {
+                        grant();
+                    }
+                }
+            });
+        }
+
+        private void refuse(boolean stagedRefusal, int code) {
+            refused = true;
+            pending = false;
+            cancel(pendingDeadline);
+            pendingDeadline = null;
+            connection.attr(REFUSED).set(Boolean.TRUE);
+            Codecs.closeLater(connection, stagedRefusal, code);
+        }
+
+        /** The pool shed's close (12.13). Non-blocking; the charge and the lease go when the close is confirmed. */
+        private void shedClose() {
+            Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
+        }
+
+        boolean isReady() {
+            return ready;
+        }
+
+        boolean isPending() {
+            return pending;
+        }
+
+        /** Holds a stream that arrived while pending: no reads until it is initialized on the grant. */
+        void hold(QuicStreamChannel stream) {
+            boolean autoRead = stream.config().isAutoRead();
+            stream.config().setAutoRead(false);
+            held.add(new Held(stream, autoRead));
         }
 
         /**
-         * Charges the staged share for this connection, shedding other staged connections under the
-         * fair-share rules (12.13). Null when none can be shed: the caller refuses. A connection without a
-         * source address is refused too, since it cannot be charged to a prefix.
+         * Grants a ready newcomer on its own loop: the game connection is installed behind this handler, its staged
+         * state starts its checks, and any streams held while pending are initialized.
          */
-        private static PreLoginRegistry.Entry stage(QuicChannel connection, PreLoginRegistry preLogin, boolean online) {
-            java.net.SocketAddress remote = connection.remoteSocketAddress();
-            if (!(remote instanceof InetSocketAddress) || ((InetSocketAddress) remote).getAddress() == null) {
-                return null;
+        void grant() {
+            ready = false;
+            if (staged != null) {
+                connection.attr(PRE_LOGIN).set(staged);
+                scheduleStagedCheck(connection.eventLoop(), connection);
             }
-            return preLogin.admit(((InetSocketAddress) remote).getAddress(), connection, STAGED_LANES, online,
-                    System::nanoTime, () -> {
-                        releaseLease(connection);
-                        Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
-                    });
-        }
-
-        /** Gives a connection's open-connection lease back now, before its close completes (12.13). */
-        private static void releaseLease(QuicChannel connection) {
-            ConnectionAdmission.Lease held = connection.attr(LEASE).getAndSet(null);
-            if (held != null) {
-                held.close();
+            if (handshakeDone && lease != null) {
+                lease.confirm();
+            }
+            install.run();
+            List<Held> streams = new ArrayList<>(held);
+            held.clear();
+            for (Held h : streams) {
+                initStream.accept(h.stream);
+                h.stream.config().setAutoRead(h.autoRead);
+                h.stream.read();
             }
         }
 
@@ -1136,18 +1256,15 @@ public final class QuicServer implements Closeable {
                 // stays, so the lease is still confirmed and released.
                 LOG.log(Level.FINE, "scheduling the QUIC handshake deadline failed; this connection has none", t);
             }
-            if (staged != null) {
-                scheduleStagedCheck(ctx, connection);
-            }
         }
 
         /**
          * §12.13: once a second, closes a still-staged connection whose client-wait deadline or 30 s hard cap
          * has passed, locally with 0x12. Stops when the connection leaves the pre-login stage.
          */
-        private void scheduleStagedCheck(ChannelHandlerContext ctx, QuicChannel connection) {
+        private void scheduleStagedCheck(io.netty.util.concurrent.EventExecutor executor, QuicChannel connection) {
             try {
-                stagedCheck = ctx.executor().scheduleAtFixedRate(() -> {
+                stagedCheck = executor.scheduleAtFixedRate(() -> {
                     if (staged.tracker().state() != PreLoginTracker.State.STAGED) {
                         stagedCheck.cancel(false);
                         return;
@@ -1177,25 +1294,35 @@ public final class QuicServer implements Closeable {
                 if (deadline != null) {
                     deadline.cancel(false);
                 }
-                if (lease != null) {
+                if (lease != null && !pending && !ready) {
                     lease.confirm();
                 }
             }
             ctx.fireUserEventTriggered(evt);
         }
 
+        private static void cancel(java.util.concurrent.ScheduledFuture<?> task) {
+            if (task != null) {
+                task.cancel(false);
+            }
+        }
+
         private void closed() {
-            if (deadline != null) {
-                deadline.cancel(false);
-            }
-            if (stagedCheck != null) {
-                stagedCheck.cancel(false);
-            }
+            closed = true;
+            pending = false;
+            ready = false;
+            cancel(deadline);
+            cancel(pendingDeadline);
+            pendingDeadline = null;
+            cancel(stagedCheck);
+            held.clear();
             if (staged != null) {
                 staged.close();
             }
             if (lease != null) {
-                lease.close();
+                ConnectionAdmission.Lease released = lease;
+                lease = null;
+                released.close();
             }
             if (reserved > 0) {
                 reservedPool.release(reserved);

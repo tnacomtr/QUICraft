@@ -548,4 +548,59 @@ class PreLoginRegistryTest {
                 "an expired connection is refused a declared-length charge");
         assertEquals(2 * STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN));
     }
+
+    /**
+     * 12.13: a newcomer that meets an unconfirmed shed is pending, not refused. It is woken only when the victim's
+     * close is confirmed, and then it is admitted.
+     */
+    @Test
+    void pendingNewcomerIsAdmittedAfterVictimCloseConfirms() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(poolFor(1), 4, new Random(1));
+        List<Conn> shed = new ArrayList<>();
+        Conn victim = admit(registry, "victim", "192.0.2.1", false, shed);
+        List<String> woken = new ArrayList<>();
+
+        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+                System::nanoTime, () -> victim.closed = true, () -> woken.add("newcomer"));
+        assertTrue(first.pending, "the victim's bytes are still charged, so the newcomer waits");
+        assertNull(first.entry, "pending is not an admission");
+        assertTrue(victim.closed, "the victim was asked to close");
+        assertTrue(woken.isEmpty(), "the newcomer is not woken before the victim's close is confirmed");
+
+        victim.entry.close();
+        assertEquals(Arrays.asList("newcomer"), woken, "the confirmed close wakes the pending newcomer once");
+
+        PreLoginRegistry.Admission second = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+                System::nanoTime, () -> { }, () -> woken.add("again"));
+        assertFalse(second.pending, "after the confirmation the retry is decided");
+        assertNotNull(second.entry, "the newcomer is admitted, not refused");
+        assertEquals(Arrays.asList("newcomer"), woken, "an admitted newcomer registers no waiter");
+    }
+
+    /**
+     * 12.13: an open-connection slot is not free while the victim that gives it up is still closing. The newcomer
+     * waits, no second victim is shed meanwhile, and it is woken only when the victim's close is confirmed.
+     */
+    @Test
+    void leaseIsNotReusedBeforeVictimCloseConfirms() throws Exception {
+        PreLoginRegistry registry = new PreLoginRegistry(poolFor(2), 4, new Random(1));
+        List<Conn> shed = new ArrayList<>();
+        Conn victim = admit(registry, "victim", "192.0.2.1", false, shed);
+        Conn other = admit(registry, "other", "192.0.2.2", false, shed);
+        List<String> woken = new ArrayList<>();
+
+        PreLoginRegistry.Admission lease = registry.shedForLease(ip("198.51.100.1"), 6, () -> woken.add("lease"));
+        assertTrue(lease.pending, "the newcomer waits for the victim's lease to come back");
+        assertTrue(victim.closed || other.closed, "one victim was shed");
+        Conn shedOne = victim.closed ? victim : other;
+        Conn kept = shedOne == victim ? other : victim;
+
+        PreLoginRegistry.Admission again = registry.shedForLease(ip("198.51.100.1"), 6, () -> woken.add("again"));
+        assertTrue(again.pending, "a second newcomer also waits");
+        assertFalse(kept.closed, "no second victim is shed while the first close is unconfirmed");
+        assertTrue(woken.isEmpty(), "nothing is woken before the victim's close is confirmed");
+
+        shedOne.entry.close();
+        assertEquals(Arrays.asList("lease", "again"), woken, "the confirmed close wakes both waiters");
+    }
 }
