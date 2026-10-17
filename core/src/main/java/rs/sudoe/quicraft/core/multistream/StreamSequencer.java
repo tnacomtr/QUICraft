@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.multistream;
 
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -165,22 +166,30 @@ public final class StreamSequencer {
         if (assigned[CONTROL] + members.size() + 2 > MAX_SEQUENCE) {
             throw new IllegalStateException("sequence exhausted");
         }
-        // Wire size with every header (13.12): the opening record is planned exactly, because its
-        // scope and external dependencies decide its header; members and the closing record are
-        // unconstrained CONTROL records with no dependency entries, so only their sequences vary.
+        // The opener is kind 4 (13.4, 13.15): its body carries unit_records and unit_wire_bytes, the
+        // exact wire total of every record of the unit, prefixes included. Members and the closing
+        // record are unconstrained CONTROL records with no dependency entries, so only their
+        // sequences vary; the opener's own header depends on its sequence, dependencies and the
+        // VarInt length of unit_wire_bytes, which is solved as a fixed point.
         Record openingPlan = plan(CONTROL, scope, opening, false, 0, external, false);
-        long bytes = compactWireSize(openingPlan.sequence(), openingPlan.epoch(),
-                openingPlan.dependencies(), opening.length);
-        long sequence = openingPlan.sequence();
+        long openingSequence = openingPlan.sequence();
+        long tail = 0;
+        long sequence = openingSequence;
         for (byte[] member : members) {
-            bytes += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, member.length);
+            tail += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, member.length);
         }
-        bytes += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, closing.length);
-        if (bytes > MAX_BUNDLE_ENCODED_BYTES) {
+        tail += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, closing.length);
+        int unitRecords = members.size() + 2;
+        long unitBytes = unitWireBytes(openingSequence, epoch, openingPlan.dependencies(), unitRecords,
+                opening.length, tail);
+        if (unitBytes > MAX_BUNDLE_ENCODED_BYTES) {
             throw new IllegalArgumentException("bundle encoded bytes");
         }
+        Record opener = new Record(CONTROL, openingSequence, epoch, openingPlan.dependencies(),
+                RecordCodec.KIND_BUNDLE_OPEN, openerBody(unitRecords, unitBytes, opening));
+        assigned[CONTROL] = openingSequence;
         List<Record> result = new ArrayList<Record>(members.size() + 2);
-        result.add(place(CONTROL, scope, opening, false, 0, external));
+        result.add(opener);
         for (byte[] member : members) {
             result.add(place(CONTROL, Fence.ORDINARY_CONTROL, member, false, 0, null, true));
         }
@@ -313,6 +322,33 @@ public final class StreamSequencer {
         }
         long recordLength = header + bodyLength;
         return varIntBytes(recordLength) + recordLength;
+    }
+
+    /**
+     * The exact unit wire total of 13.4 as a fixed point: the opener's size depends on the VarInt length
+     * of the total it declares, so the total is iterated from below until it is stable. The map is
+     * monotone and bounded, so this converges in a few steps.
+     */
+    private static long unitWireBytes(long openingSequence, long epoch, List<Record.Dependency> dependencies,
+            int unitRecords, int openingLength, long tail) {
+        long total = tail;
+        for (int i = 0; i < 64; i++) {
+            long next = tail + compactWireSize(openingSequence, epoch, dependencies,
+                    varIntBytes(unitRecords) + varIntBytes(total) + openingLength);
+            if (next == total) {
+                return total;
+            }
+            total = next;
+        }
+        throw new IllegalStateException("bundle unit size");
+    }
+
+    private static byte[] openerBody(int unitRecords, long unitBytes, byte[] opening) {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        VarInt.write(body, unitRecords);
+        VarInt.write(body, (int) unitBytes);
+        body.write(opening, 0, opening.length);
+        return body.toByteArray();
     }
 
     private static int varIntBytes(long value) {
