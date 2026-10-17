@@ -225,6 +225,7 @@ class SessionReceiveDriverTest {
         assertEquals(Collections.singletonList(CLOSE_ORDERING), h.codes);
         assertEquals(0L, h.slots.workspaceInUse());
         assertFalse(h.slots.holdsHead(LogicalStream.CONTROL));
+        assertNull(h.driver.receiver().head(LogicalStream.CONTROL), "the receiver drops the failed head");
         h.driver.close();
         assertEquals(1, h.codes.size());
     }
@@ -254,6 +255,7 @@ class SessionReceiveDriverTest {
         assertEquals(0L, h.slots.workspaceInUse());
         assertFalse(h.slots.holdsHead(LogicalStream.CONTROL));
         assertTrue(h.codes.isEmpty(), "an external close does not call the sink");
+        assertNull(h.driver.receiver().head(LogicalStream.CONTROL), "the receiver retains no head after close");
         assertTrue(h.driver.closed());
         h.driver.close();
         h.driver.receive();
@@ -316,6 +318,21 @@ class SessionReceiveDriverTest {
         assertEquals(wire.length + 200L, h.slots.workspaceInUse(), "the delivered unit holds exactly its charges");
     }
 
+    @Test void fullyOccupiedWorkspaceIsARetryNotAClose() throws Exception {
+        Harness h = new Harness();
+        assertTrue(h.slots.reserveWorkspace(ReceiveSlots.EXECUTION_WORKSPACE), "another holder takes all of it");
+        byte[] wire = rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_CONTROL);
+        h.source.put(LogicalStream.CONTROL, wire);
+        h.rounds(30);
+        assertTrue(h.codes.isEmpty(), "the unit's own wire charge waits for the workspace");
+        assertEquals(0, h.game.deliveries());
+        assertTrue(h.slots.holdsHead(LogicalStream.CONTROL));
+        h.slots.releaseWorkspace(ReceiveSlots.EXECUTION_WORKSPACE);
+        h.rounds(1);
+        assertEquals(1, h.game.deliveries(), h.game.log.toString());
+        assertTrue(h.codes.isEmpty());
+    }
+
     @Test void closeWhileWaitingForWorkspaceReleasesOnce() throws Exception {
         Harness h = new Harness();
         long occupied = ReceiveSlots.EXECUTION_WORKSPACE - 100;
@@ -326,6 +343,7 @@ class SessionReceiveDriverTest {
         assertTrue(h.slots.holdsHead(LogicalStream.CONTROL));
         h.driver.close();
         assertFalse(h.slots.holdsHead(LogicalStream.CONTROL), "the queued unit's slot is released");
+        assertNull(h.driver.receiver().head(LogicalStream.CONTROL), "the queued head is dropped");
         assertEquals(occupied, h.slots.workspaceInUse(), "only the other holder's bytes remain");
         assertTrue(h.codes.isEmpty());
         h.slots.releaseWorkspace(occupied);

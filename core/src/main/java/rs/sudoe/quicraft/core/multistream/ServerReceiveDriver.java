@@ -371,6 +371,7 @@ public final class ServerReceiveDriver {
                 receiver.slots().releaseHead(stream);
             }
         }
+        receiver.discard();
         releaseCharge(reservedWorkspace);
         waiting.clear();
         Arrays.fill(held, null);

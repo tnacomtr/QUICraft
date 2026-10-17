@@ -122,6 +122,7 @@ class ServerReceiveDriverTest {
         assertTrue(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL));
         h.driver.close();
         assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL), "the receiver slot is released");
+        assertNull(h.driver.receiver().head(LogicalStream.CONTROL), "the receiver retains no head after close");
         assertEquals(0L, h.driver.receiver().slots().workspaceInUse());
         assertTrue(h.driver.closed());
         assertTrue(h.codes.isEmpty(), "an external close does not call the sink");

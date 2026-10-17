@@ -282,8 +282,8 @@ public final class SessionReceiveDriver {
         }
         Lane lane = laneOf(stream);
         if (!charge(entry.wireBytes)) {
-            fail(ReceiveClose.resourceWait("execution workspace"));
-            return false;
+            // Another holder has the workspace for now: wait and retry, as for decoded output.
+            return retryLater();
         }
         Attempt attempt = new Attempt();
         List<Object> packets = new ArrayList<Object>(entry.unit.recordCount());
@@ -558,6 +558,7 @@ public final class SessionReceiveDriver {
         closed = true;
         executing = null;
         pump.cancel();
+        receiver.discard();
         releaseCharge(reservedWorkspace);
         waiting.clear();
         Arrays.fill(held, null);

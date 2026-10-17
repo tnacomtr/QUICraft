@@ -380,6 +380,20 @@ public final class StreamReceiver {
         return held;
     }
 
+    /**
+     * Terminal cleanup: drops every retained head unit (and its record) and stops its timer. Releases no slot:
+     * the owner of each slot charge releases it (the pump, or the driver's own cleanup in owned-slot mode).
+     */
+    public void discard() {
+        for (int stream = 0; stream < head.length; stream++) {
+            if (head[stream] != null) {
+                head[stream].timer.stop();
+                head[stream] = null;
+            }
+        }
+        withheld.clear();
+    }
+
     /** Returns the record held as the head of a stream, or null. */
     public Record head(int stream) {
         checkStream(stream);
