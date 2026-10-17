@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.function.Supplier;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.SentPacket;
 import rs.sudoe.quicraft.core.routing.Lane;
@@ -291,7 +292,7 @@ public final class GameLanes implements LaneGame {
      * @param state the protocol state of the activation (12.4: configuration)
      * @param deliverFrom where decoded packets enter the game pipeline, or null for its head
      */
-    public GameLanes(Channel game, Codec codec, Supplier<LaneSession> session, ProtocolState state,
+    public GameLanes(Channel game, Codec codec, Supplier<? extends MultistreamSession> session, ProtocolState state,
                      ChannelHandlerContext deliverFrom) {
         this(game, codec, state, deliverFrom, laneSessionSource(session));
     }
@@ -315,14 +316,14 @@ public final class GameLanes implements LaneGame {
         this.deliverFrom = deliverFrom;
     }
 
-    private static Supplier<Session> laneSessionSource(final Supplier<LaneSession> sessions) {
+    private static Supplier<Session> laneSessionSource(final Supplier<? extends MultistreamSession> sessions) {
         if (sessions == null) {
             throw new IllegalArgumentException("session");
         }
         return new Supplier<Session>() {
             @Override
             public Session get() {
-                LaneSession session = sessions.get();
+                MultistreamSession session = sessions.get();
                 return session == null ? null : new LaneSessionSink(session);
             }
         };
@@ -613,11 +614,14 @@ public final class GameLanes implements LaneGame {
         }
     }
 
-    /** Production {@link Session}: the activated lane session of the connection. */
+    /**
+     * Production {@link Session}: the activated session of the connection, the legacy three-lane one
+     * or the N+2 one. The additive methods are forwarded; the legacy session fails them closed.
+     */
     private static final class LaneSessionSink implements Session {
-        private final LaneSession session;
+        private final MultistreamSession session;
 
-        LaneSessionSink(LaneSession session) {
+        LaneSessionSink(MultistreamSession session) {
             if (session == null) {
                 throw new IllegalArgumentException("session");
             }
@@ -640,8 +644,8 @@ public final class GameLanes implements LaneGame {
         @Override
         public Lane send(ProtocolState state, int packetId, byte[] frame, byte[] uncompressedPacket,
                 SentPacket... after) {
-            // The legacy session sizes the packet from the frame, so the uncompressed bytes are not used.
-            SentPacket handle = session.send(state, packetId, frame, after);
+            // The legacy session sizes the packet from the frame and ignores the uncompressed bytes.
+            SentPacket handle = session.send(state, packetId, frame, uncompressedPacket, after);
             return handle.isAssigned() ? handle.lane() : null;
         }
 
@@ -653,6 +657,61 @@ public final class GameLanes implements LaneGame {
         @Override
         public void abort(int code) {
             session.abort(code);
+        }
+
+        @Override
+        public boolean createAck(long id, byte[] payload, int chargedBytes) {
+            return session.createAck(id, payload, chargedBytes);
+        }
+
+        @Override
+        public void coverAssigned(long ackId, SentPacket covered) {
+            session.coverAssigned(ackId, covered);
+        }
+
+        @Override
+        public boolean coverPending(long ackId, long updateToken) {
+            return session.coverPending(ackId, updateToken);
+        }
+
+        @Override
+        public void assignedPending(long updateToken, SentPacket covered) {
+            session.assignedPending(updateToken, covered);
+        }
+
+        @Override
+        public void suppressPending(long updateToken) {
+            session.suppressPending(updateToken);
+        }
+
+        @Override
+        public void markInexact(long ackId) {
+            session.markInexact(ackId);
+        }
+
+        @Override
+        public SentPacket takeAck(long ackId) {
+            return session.takeAck(ackId);
+        }
+
+        @Override
+        public void expireAcks() {
+            session.expireAcks();
+        }
+
+        @Override
+        public SentPacket beginBatch(long batchId, OutboundPacket start) {
+            return session.beginBatch(batchId, start);
+        }
+
+        @Override
+        public SentPacket batchInstall(long batchId, OutboundPacket install, int chunkX, int chunkZ) {
+            return session.batchInstall(batchId, install, chunkX, chunkZ);
+        }
+
+        @Override
+        public SentPacket finishBatch(long batchId, OutboundPacket join) {
+            return session.finishBatch(batchId, join);
         }
     }
 }

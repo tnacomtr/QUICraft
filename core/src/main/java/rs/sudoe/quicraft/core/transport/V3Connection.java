@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 import java.util.function.Consumer;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.SessionContext;
 
 /**
@@ -88,10 +89,11 @@ public interface V3Connection extends QuicByteStream {
     void activate(LaneGame game, int protocolNumber, ByteBuffer controlLeftover);
 
     /**
-     * The activated three-lane session, or null before {@link #activate} has run on the event
-     * loop. The game sends, ends and aborts through it after activation.
+     * The activated session, or null before {@link #activate} has run on the event loop. The game
+     * sends, ends and aborts through it after activation. While the legacy flag is set this is the
+     * three-lane {@link LaneSession}; otherwise the N+2 session.
      */
-    LaneSession session();
+    MultistreamSession session();
 
     /**
      * The shard count N selected by the preamble exchange (13.2), fixed for the connection. Available

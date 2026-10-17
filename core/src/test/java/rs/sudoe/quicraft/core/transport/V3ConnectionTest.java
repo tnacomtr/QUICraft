@@ -597,7 +597,7 @@ class V3ConnectionTest {
     static final class Game implements LaneGame {
         final List<Object> delivered = Collections.synchronizedList(new ArrayList<Object>());
         final CompletableFuture<Integer> closed = new CompletableFuture<Integer>();
-        volatile LaneSession session;
+        volatile rs.sudoe.quicraft.core.multistream.MultistreamSession session;
         volatile boolean echo;
 
         @Override

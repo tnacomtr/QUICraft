@@ -79,7 +79,7 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * quiche stream-stopped result) is the only API-visible state that changes without sending bytes;
  * see {@link #peerStoppedReading}.
  */
-public final class LaneSession {
+public final class LaneSession implements MultistreamSession {
     private static final Logger LOG = Logger.getLogger("QUICraft");
 
     /** Which end of the connection this session is. */
@@ -408,6 +408,16 @@ public final class LaneSession {
         final SentPacket handle = new SentPacket();
         run(() -> doSend(state, packetId, frame, handle, after));
         return handle;
+    }
+
+    /**
+     * As {@link #send(ProtocolState, int, byte[], SentPacket...)}. The legacy session routes by the
+     * schema-1 lane table and sizes the packet from its frame, so the uncompressed bytes are unused.
+     */
+    @Override
+    public SentPacket send(ProtocolState state, int packetId, byte[] frame, byte[] uncompressedPacket,
+                           SentPacket... after) {
+        return send(state, packetId, frame, after);
     }
 
     /**

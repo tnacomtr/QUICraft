@@ -22,6 +22,7 @@ import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.LaneSession;
+import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
 import rs.sudoe.quicraft.core.multistream.LogicalStream;
@@ -84,7 +85,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     private java.util.function.Consumer<String> nameCallback;
 
     private volatile RoutingTable table;
-    private volatile LaneSession session;
+    private volatile MultistreamSession session;
     /** The negotiated shard count (13.2); null until both preambles are read. Written on the event loop. */
     private volatile SessionContext context;
     private volatile boolean handshakeComplete;
@@ -225,7 +226,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
      * the stream handler's {@code initChannel}, on the event loop.
      */
     void acceptPeerStream(QuicStreamChannel stream) {
-        LaneSession current = session;
+        MultistreamSession current = session;
         if (current != null) {
             current.acceptStream(stream);
             return;
@@ -311,13 +312,13 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     }
 
     @Override
-    public LaneSession session() {
+    public MultistreamSession session() {
         return session;
     }
 
     @Override
     public void end() {
-        LaneSession current = session;
+        MultistreamSession current = session;
         if (current != null) {
             current.end();
         } else {
@@ -327,7 +328,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     @Override
     public void abort(int code) {
-        LaneSession current = session;
+        MultistreamSession current = session;
         if (current != null) {
             current.abort(code);
         } else {
@@ -425,7 +426,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
      */
     @Override
     public void close() {
-        LaneSession current = session;
+        MultistreamSession current = session;
         if (current != null) {
             current.end();
             return;
