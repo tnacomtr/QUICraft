@@ -76,14 +76,17 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
     private long extra;
     private boolean promotionRequested;
     private State state = State.STAGED;
+    /** Set by {@link #onShed}: the staged charge stays until {@link #close()} confirms the victim's close. */
+    private boolean shedding;
 
-    private PreLoginTracker(ResourcePools pools, Object owner, int shards, boolean online, LongSupplier clock) {
+    private PreLoginTracker(ResourcePools pools, Object owner, int shards, boolean online, LongSupplier clock,
+            long acceptedAt) {
         this.pools = Objects.requireNonNull(pools, "pools");
         this.owner = Objects.requireNonNull(owner, "owner");
         this.online = online;
         this.clock = Objects.requireNonNull(clock, "clock");
         this.stagedShare = stagedShare(shards);
-        this.acceptedAt = clock.getAsLong();
+        this.acceptedAt = acceptedAt;
     }
 
     /**
@@ -97,7 +100,17 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
      */
     public static PreLoginTracker tryOpen(ResourcePools pools, Object owner, int shards, boolean online,
             LongSupplier clock) {
-        PreLoginTracker tracker = new PreLoginTracker(pools, owner, shards, online, clock);
+        return tryOpen(pools, owner, shards, online, clock, clock.getAsLong());
+    }
+
+    /**
+     * {@link #tryOpen(ResourcePools, Object, int, boolean, LongSupplier)} for a connection accepted at
+     * {@code acceptedAt} on {@code clock}'s timeline: the 30 s hard cap runs from that time, so a newcomer
+     * that waited (12.13) keeps its original deadline rather than a fresh one.
+     */
+    public static PreLoginTracker tryOpen(ResourcePools pools, Object owner, int shards, boolean online,
+            LongSupplier clock, long acceptedAt) {
+        PreLoginTracker tracker = new PreLoginTracker(pools, owner, shards, online, clock, acceptedAt);
         if (!pools.reserve(ResourcePools.Pool.PRE_LOGIN, owner, tracker.stagedShare)) {
             return null;
         }
@@ -159,7 +172,8 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
 
     /** Releases up to {@code bytes} of extra charges once early data or a completed frame is consumed. */
     public void releaseExtra(long bytes) {
-        if (bytes <= 0 || state != State.STAGED) {
+        // A shed victim keeps every byte until its close is confirmed (12.13); close releases them all.
+        if (bytes <= 0 || state != State.STAGED || shedding) {
             return;
         }
         long releasable = Math.min(bytes, extra);
@@ -246,7 +260,7 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
         if (state == State.PROMOTED) {
             return true;
         }
-        if (state != State.STAGED) {
+        if (state != State.STAGED || shedding) {
             return false;
         }
         if (expired()) {
@@ -263,14 +277,21 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
     }
 
     /**
-     * §12.13: a pre-login shed releases a staged connection's charge. Only {@link PreLoginRegistry}
-     * calls it, and only for a staged connection; a promoted one is never a shed victim.
+     * §12.13: marks a staged connection as a shed victim. Its charge is NOT released here: the bytes stay
+     * charged until its close is confirmed by {@link #close()}, so the requester is granted only from confirmed
+     * bytes. Only {@link PreLoginRegistry} calls it, and only for a staged connection; a promoted one is never a
+     * shed victim. Refuses further charges and promotion.
      */
     @Override
     public void onShed() {
         if (state == State.STAGED) {
-            close();
+            shedding = true;
         }
+    }
+
+    /** True once this staged connection has been selected as a shed victim and its close is not yet confirmed. */
+    public boolean isShedding() {
+        return shedding;
     }
 
     /** Releases the connection's charge from whichever pool it holds. Idempotent. */
@@ -297,7 +318,7 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
         if (bytes == 0) {
             return true;
         }
-        if (state != State.STAGED || !pools.reserve(ResourcePools.Pool.PRE_LOGIN, owner, bytes)) {
+        if (state != State.STAGED || shedding || !pools.reserve(ResourcePools.Pool.PRE_LOGIN, owner, bytes)) {
             return false;
         }
         extra += bytes;

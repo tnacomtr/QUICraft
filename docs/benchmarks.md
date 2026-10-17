@@ -865,3 +865,22 @@ Not run yet. These measurements are planned for the 2026-10-16 direction in `doc
   REALTIME load, including all progress reservations occupied (`protocol.md` 13.12-13.20).
 - Per-connection memory and peak concurrent players per node. The values in each planned
   server profile will be taken from these runs, not chosen in advance.
+
+## Phase 9 follow-up: continuity trim and declared-waiter drain (2026-10-17)
+
+Not measured yet. Nothing below is a result, and no index has been added. The entries record what
+to measure so the scans are not forgotten.
+
+- `PressureRanking.trimContinuity` (`core/src/main/java/rs/sudoe/quicraft/core/resource/PressureRanking.java`,
+  around line 364): each trim scans the access-ordered continuity map from its oldest entry, first for an
+  expired record, then for a record whose bucket has live users. Under churn the map sits at its bound of
+  131072 entries, so every insert past the bound can cost a scan of up to 131072 entries. Measure the trim
+  cost per insert under sustained churn at that bound.
+- `PreLoginRegistry.drainDeclaredWaiters` (`core/src/main/java/rs/sudoe/quicraft/core/transport/PreLoginRegistry.java`,
+  around line 338): `declaredInFlight` (line 275) and `bytesByFine` (line 286) each walk the staged and shedding
+  sets, so one drain is O(declared waiters x staged). Measure a drain with declared waiters at 50,000 staged
+  entries, and a drain after a release.
+- Pending admission (U8b): a pending newcomer is woken on every confirmed shed (`PreLoginRegistry.waiters`), so a
+  confirmed close costs O(waiters) plus one retry per woken newcomer. Measure it in the same 50k run.
+- Index either scan only if these measurements show it matters at the scale target (50,000 concurrent players
+  per node). Until then both stay as written.
