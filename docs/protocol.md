@@ -1278,7 +1278,11 @@ position extraction. Those implementations must change together before this revi
    monotonic per stream and kind. A receiver MAY bound fence-class evidence to the latest
    4,096 fences of each kind. A reference older than retained evidence is accepted as
    unprovable. A decrease, or a retained-range sequence that is not a fence of the required
-   class, closes `0x11`.
+   class, closes `0x11`. Accepting an unprovable old reference grants nothing: a dependency
+   only delays application, an old target is already applied, and a peer can already reorder
+   its own sends, so the game must tolerate any peer order as it does over TCP. Retaining
+   unbounded evidence would be a memory attack, and closing below the window would
+   disconnect honest peers whose streams lag.
 
     Reject missing/unknown fields, duplicate keys/routes, and multiple routes for the same
     `(state,direction,packet_id)` with different lanes or fence classes,
