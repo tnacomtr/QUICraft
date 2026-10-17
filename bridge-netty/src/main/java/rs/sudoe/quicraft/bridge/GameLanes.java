@@ -189,7 +189,7 @@ public final class GameLanes implements LaneGame {
         }
     }
 
-    /** The one place this class talks to the session; {@link LaneSessionSink} is production. */
+    /** The one place this class talks to the session; {@link SessionSink} is production. */
     interface Session {
         /**
          * The lane the routing table assigns to one outbound packet (13.6), without submitting it:
@@ -333,7 +333,7 @@ public final class GameLanes implements LaneGame {
             @Override
             public Session get() {
                 MultistreamSession session = sessions.get();
-                return session == null ? null : new LaneSessionSink(session);
+                return session == null ? null : new SessionSink(session);
             }
         };
     }
@@ -642,10 +642,10 @@ public final class GameLanes implements LaneGame {
      * Production {@link Session}: the activated session of the connection, the legacy three-lane one
      * or the N+2 one. The additive methods are forwarded; the legacy session fails them closed.
      */
-    private static final class LaneSessionSink implements Session {
+    private static final class SessionSink implements Session {
         private final MultistreamSession session;
 
-        LaneSessionSink(MultistreamSession session) {
+        SessionSink(MultistreamSession session) {
             if (session == null) {
                 throw new IllegalArgumentException("session");
             }
