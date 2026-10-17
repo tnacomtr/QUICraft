@@ -223,9 +223,9 @@ class SessionSendDriverTest {
             byte[] control = drain.stream(LogicalStream.CONTROL);
             Record last = null;
             for (int at = 0; at < control.length;) {
-                byte[] rest = Arrays.copyOfRange(control, at, control.length);
-                last = RecordCodec.decodeRecord(rest, LogicalStream.CONTROL);
-                at += firstRecordLength(rest);
+                int length = firstRecordLength(Arrays.copyOfRange(control, at, control.length));
+                last = RecordCodec.decodeRecord(Arrays.copyOfRange(control, at, at + length), LogicalStream.CONTROL);
+                at += length;
             }
             assertNotNull(last);
             assertEquals(RecordCodec.KIND_END, last.kind(), "END is the last CONTROL record");
