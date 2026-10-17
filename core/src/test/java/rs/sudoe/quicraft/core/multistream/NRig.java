@@ -153,6 +153,7 @@ final class NRig implements AutoCloseable {
         final CompletableFuture<LaneRig.Closed> closed = new CompletableFuture<>();
         volatile NStreamSession session;
         volatile long decodeReserveBytes;
+        volatile boolean autoApply = true;
         private volatile int lastStream = -1;
 
         @Override
@@ -202,7 +203,7 @@ final class NRig implements AutoCloseable {
         @Override
         public void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle) {
             got.add(new Got(lane, lastStream, sequence, packets));
-            session.applied(lane, sequence);
+            if (autoApply) session.applied(lane, sequence);
         }
 
         @Override
@@ -248,6 +249,7 @@ final class NRig implements AutoCloseable {
         int shards = 2;
         boolean serverSession = true;
         boolean clientSession = true;
+        boolean compressed;
         LaneSession.Timing serverTiming = timing(50, 10_000);
         LaneSession.Timing clientTiming = timing(50, 10_000);
         SessionResources serverResources = resources();
@@ -332,7 +334,7 @@ final class NRig implements AutoCloseable {
             if (config.serverSession) {
                 serverConnection.eventLoop().submit(() -> {
                     server = new NStreamSession(serverConnection, LaneSession.Role.SERVER, serverControl, config.table,
-                            serverGame, context, config.serverResources, config.serverTiming, false);
+                            serverGame, context, config.serverResources, config.serverTiming, config.compressed);
                     serverGame.session = server;
                     serverRef = server;
                     for (QuicStreamChannel s : serverEarly) {
@@ -344,7 +346,7 @@ final class NRig implements AutoCloseable {
                 net.clientConnection.eventLoop().submit(() -> {
                     client = new NStreamSession(net.clientConnection, LaneSession.Role.CLIENT, clientControl,
                             config.table,
-                            clientGame, context, config.clientResources, config.clientTiming, false);
+                            clientGame, context, config.clientResources, config.clientTiming, config.compressed);
                     clientGame.session = client;
                     clientRef = client;
                     for (QuicStreamChannel s : clientEarly) {

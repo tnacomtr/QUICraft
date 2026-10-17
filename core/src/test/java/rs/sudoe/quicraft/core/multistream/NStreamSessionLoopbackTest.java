@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
@@ -514,6 +515,86 @@ class NStreamSessionLoopbackTest {
             assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code);
             assertEquals(CLOSE_ORDERING, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
             assertEquals(null, bundleUnit(rig.clientGame, "m"));
+        }
+    }
+
+    @Test
+    void inboundShedReleasesHeldExcessBeforeConfirmingClosure() throws Exception {
+        inboundShed(false);
+    }
+
+    @Test
+    void inboundCleanupFinishesWhenAUnitReleaseThrows() throws Exception {
+        inboundShed(true);
+    }
+
+    private void inboundShed(boolean brokenReservation) throws Exception {
+        NRig.Config config = new NRig.Config();
+        config.compressed = true;
+        config.serverResources = new SessionResources(new rs.sudoe.quicraft.core.resource.NodePools(64L << 20,
+                rs.sudoe.quicraft.core.resource.NodePools.MIN_EXCESS, NRig.OUTBOUND_BYTES, 10, false,
+                rs.sudoe.quicraft.core.resource.NodePools.MIN_EXCESS), NRig.OUTBOUND_BYTES, NRig.OUTBOUND_BYTES,
+                NRig.OUTBOUND_BYTES, 16L << 20, 16L << 20, SessionResources.defaultProfile(), System::nanoTime);
+        try (NRig rig = NRig.start(config)) {
+            rig.activateBoth();
+            SessionResources res = config.serverResources;
+            rig.serverGame.autoApply = false;
+            byte[] body = new byte[16000];
+            body[0] = (byte) NRig.CONTROL_ID;
+            rig.client.send(ProtocolState.PLAY, NRig.CONTROL_ID, LaneRig.frame(0, body));
+            assertTrue(LaneRig.await(() -> rig.serverGame.count(NRig.CONTROL_ID) == 1, 10_000));
+            assertTrue(res.inboundExcess().reserved(rig.server) > 0, "the inbound unit owns excess");
+            assertTrue(res.node().reserved(Pool.INFLATER) > 0, "the victim owns inflater state");
+            assertTrue(res.outbound().reserved(rig.server) > 0, "the victim owns outbound headroom");
+            java.lang.reflect.Field driverField = NStreamSession.class.getDeclaredField("serverDriver");
+            driverField.setAccessible(true);
+            ServerReceiveDriver driver = (ServerReceiveDriver) driverField.get(rig.server);
+            assertTrue(driver.receiver().slots().workspaceInUse() > 0, "the executing unit owns workspace");
+            Object other = new Object();
+            long free = res.node().limit(Pool.INBOUND_EXCESS) - res.node().reserved(Pool.INBOUND_EXCESS);
+            // Consume the free node budget, then ask for the victim's retained bytes.
+            assertTrue(res.inboundExcess().reserve(other, InetAddress.getByName("10.0.0.2"), null,
+                    free, false));
+            // Only the session has peer-attributable ranked pressure; the filler is unranked.
+            Object requester = new Object();
+            assertFalse(res.inboundExcess().reserve(requester, InetAddress.getByName("10.0.0.3"), null,
+                    1, false));
+            java.util.concurrent.atomic.AtomicBoolean cleanAtConfirm = new java.util.concurrent.atomic.AtomicBoolean();
+            java.lang.reflect.Method shed = NStreamSession.class.getDeclaredMethod("shed", Runnable.class);
+            shed.setAccessible(true);
+            res.register(rig.server, confirm -> {
+                try {
+                    // Fault injection: simulate an independently lost reservation. Unit.close now throws,
+                    // but the inflater, workspace and rankings must still be released.
+                    if (brokenReservation) res.inboundExcess().confirmClosed(rig.server);
+                    shed.invoke(rig.server, (Runnable) () -> {
+                        cleanAtConfirm.set(res.inboundExcess().reserved(rig.server) == 0
+                                && res.node().reserved(Pool.INFLATER) == 0
+                                && res.outbound().reserved(rig.server) == 0
+                                && driver.receiver().slots().workspaceInUse() == 0);
+                        confirm.run();
+                    });
+                } catch (ReflectiveOperationException e) {
+                    throw new IllegalStateException(e);
+                }
+            });
+            res.dispatchShed();
+            assertEquals(CLOSE_RESOURCE, closed(rig.serverGame).code);
+            NRig.onLoop(rig.server, () -> null); // the callback follows notification on the same task
+            assertTrue(cleanAtConfirm.get(), "all owners release before the shed confirmation");
+            assertEquals(0, res.inboundExcess().reserved(rig.server));
+            assertEquals(0, res.node().reserved(Pool.INFLATER));
+            assertEquals(0, res.outbound().reserved(rig.server));
+            assertEquals(0, driver.receiver().slots().workspaceInUse());
+            assertThrows(IllegalStateException.class,
+                    () -> res.inboundRanking().setRetained(rig.server, 0, System.nanoTime()));
+            assertThrows(IllegalStateException.class,
+                    () -> res.outboundRanking().setRetained(rig.server, 0, System.nanoTime()));
+            res.inboundExcess().cancel(requester);
+            long granted = res.inboundExcess().reserved(requester);
+            if (granted > 0) res.inboundExcess().release(requester, granted);
+            long held = res.inboundExcess().reserved(other);
+            if (held > 0) res.inboundExcess().release(other, held);
         }
     }
 

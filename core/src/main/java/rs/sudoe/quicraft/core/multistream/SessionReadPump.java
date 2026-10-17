@@ -173,30 +173,37 @@ public final class SessionReadPump {
     public void cancel() {
         if (!open) return;
         open = false;
-        for (Lane lane : new Lane[] {control, realtime}) {
-            lane.decoder.cancel();
+        ReceiveCleanup.run(() -> cancelLane(control), () -> cancelLane(realtime), () -> excess.cancel(owner), () -> {
+            if (ranking != null) {
+                ReceiveCleanup.run(() -> ranking.endRefusedWait(owner),
+                        () -> ranking.disconnect(owner, clock.getAsLong()));
+            }
+        }, () -> {
+            if (inflater != null) {
+                inflater.end();
+                inflater = null;
+            }
+        }, () -> {
+            if (inflaterCharged) {
+                pools.release(ResourcePools.Pool.INFLATER, owner, INFLATER_BYTES);
+                inflaterCharged = false;
+            }
+        });
+    }
+
+    private void cancelLane(Lane lane) {
+        ReceiveCleanup.run(lane.decoder::cancel, () -> {
             if (lane.held != null) lane.held.close();
+        }, () -> {
             if (lane.partitionCharge > 0) partition.release(lane.stream, (int) lane.partitionCharge);
-            releasePrefix(lane);
+        }, () -> releasePrefix(lane), () -> {
             lane.partitionCharge = 0;
             lane.staged = false;
             lane.excessCharge = 0;
             lane.admitted = false;
             lane.excessWaiting = false;
-        }
-        excess.cancel(owner);
-        if (ranking != null) {
-            ranking.endRefusedWait(owner);
-            ranking.disconnect(owner, clock.getAsLong());
-        }
-        if (inflater != null) {
-            inflater.end();
-            inflater = null;
-        }
-        if (inflaterCharged) {
-            pools.release(ResourcePools.Pool.INFLATER, owner, INFLATER_BYTES);
-            inflaterCharged = false;
-        }
+            lane.held = null;
+        });
     }
 
     /**
@@ -518,13 +525,19 @@ public final class SessionReadPump {
         public void close() {
             if (closed) return;
             closed = true;
-            if (partitionBytes > 0) partition.release(lane.stream, (int) partitionBytes);
+            long partitionCharge = partitionBytes;
+            long excessCharge = excessBytes;
             boolean excessReleased = excessBytes > 0;
-            if (excessReleased) excess.release(SessionReadPump.this.owner, excessBytes);
             partitionBytes = 0;
             excessBytes = 0;
-            if (excessReleased) retained();
             if (lane.held == this) lane.held = null;
+            ReceiveCleanup.run(() -> {
+                if (partitionCharge > 0) partition.release(lane.stream, (int) partitionCharge);
+            }, () -> {
+                if (excessReleased) excess.release(SessionReadPump.this.owner, excessCharge);
+            }, () -> {
+                if (excessReleased) retained();
+            });
         }
 
     }

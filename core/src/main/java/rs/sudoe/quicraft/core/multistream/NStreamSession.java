@@ -30,6 +30,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.routing.Direction;
+import rs.sudoe.quicraft.core.routing.Dependency;
 import rs.sudoe.quicraft.core.routing.Extractor;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
@@ -92,11 +93,15 @@ public final class NStreamSession implements MultistreamSession {
     private static final int STOPPED_SENDING = LaneSession.stopSendingErrCode();
 
     /**
-     * The production shard check (13.8): a CHUNK record with a position must be on the shard its position and
-     * epoch hash to. Records of other routes are checked by the receiver's own lane rules.
+     * Shard placement and referenced CONTROL fence classes (13.7-13.10). Keep the latest applied interval
+     * of each class, not an unbounded packet history. A forgotten or unreceived target is not evidence of
+     * peer misconduct; only a retained, applied target can fail the class check. Non-CONTROL targets have
+     * their lane checked by StreamReceiver itself.
      */
     static final class ShardValidator implements StreamReceiver.Validator {
         private final int shards;
+        private final long[] opening = new long[Dependency.values().length];
+        private final long[] closing = new long[Dependency.values().length];
 
         ShardValidator(int shards) {
             LogicalStream.validateShardCount(shards);
@@ -105,6 +110,19 @@ public final class NStreamSession implements MultistreamSession {
 
         @Override
         public boolean valid(int stream, Record record, ReceiveRoute route) {
+            for (Record.Dependency dependency : record.dependencies()) {
+                if (dependency.streamIndex() != LogicalStream.CONTROL) {
+                    continue;
+                }
+                for (Dependency fence : Dependency.values()) {
+                    int index = fence.ordinal();
+                    long sequence = dependency.sequence();
+                    if (opening[index] != 0 && sequence >= opening[index] && sequence <= closing[index]
+                            && !acceptsControlFence(route, fence)) {
+                        return false;
+                    }
+                }
+            }
             if (route.lane() != ReceiveRoute.Lane.CHUNK) {
                 return true;
             }
@@ -113,6 +131,24 @@ public final class NStreamSession implements MultistreamSession {
                 return false;
             }
             return stream == 2 + ShardHash.shardOf(position.chunkX, position.chunkZ, record.epoch(), shards);
+        }
+
+        private boolean acceptsControlFence(ReceiveRoute route, Dependency fence) {
+            if (fence == Dependency.GLOBAL || fence == Dependency.FENCE || fence == Dependency.VIEW) {
+                return true;
+            }
+            return route.lane() == ReceiveRoute.Lane.REALTIME && fence == Dependency.CONTROL;
+        }
+
+        @Override
+        public void applied(int stream, long first, long last, ReceiveRoute route) {
+            if (stream == LogicalStream.CONTROL) {
+                int index = route.fence().ordinal();
+                if (closing[index] != first - 1 || opening[index] == 0) {
+                    opening[index] = first;
+                }
+                closing[index] = last;
+            }
         }
     }
 
@@ -898,16 +934,23 @@ public final class NStreamSession implements MultistreamSession {
         loop.execute(() -> {
             try {
                 if (closed) {
+                    release();
                     confirm.run();
                     return;
                 }
                 LOG.log(Level.FINE, "13.12: closing a shed connection with 0x12");
                 closed = true;
-                connection.close(true, CLOSE_RESOURCE,
-                        Unpooled.wrappedBuffer(SessionReceiveDriver.GENERIC_RESOURCE_REASON.clone()));
-                confirm.run();
-                release();
-                notifyClosed(CLOSE_RESOURCE, false, new IOException("shed under outbound pressure (13.12)"));
+                try {
+                    connection.close(true, CLOSE_RESOURCE,
+                            Unpooled.wrappedBuffer(SessionReceiveDriver.GENERIC_RESOURCE_REASON.clone()));
+                } finally {
+                    try {
+                        release();
+                        notifyClosed(CLOSE_RESOURCE, false, new IOException("shed under resource pressure (13.12)"));
+                    } finally {
+                        confirm.run();
+                    }
+                }
             } catch (Throwable t) {
                 LOG.log(Level.FINE, "shedding failed", t);
             }
@@ -959,7 +1002,7 @@ public final class NStreamSession implements MultistreamSession {
         io.netty.util.concurrent.ScheduledFuture<?> scheduled = ticker;
         ticker = null;
         if (scheduled != null) {
-            scheduled.cancel(false);
+            quietly(() -> scheduled.cancel(false), "ticker");
         }
         quietly(sendDriver::close, "send driver");
         if (serverDriver != null) {

@@ -50,6 +50,9 @@ public final class StreamReceiver {
 
     /** Injected checks the policy cannot make alone: shard placement and fence validation (13.10, 13.18). */
     public interface Validator {
+        /** Records an applied route, including the closing sequence of an atomic bundle. */
+        default void applied(int stream, long opening, long closing, ReceiveRoute route) { }
+
         /** Returns true when the record's declared route and position are valid for its stream and epoch. */
         boolean valid(int stream, Record record, ReceiveRoute route);
     }
@@ -434,6 +437,7 @@ public final class StreamReceiver {
         rememberWithheldChains();
         head[stream] = null;
         applied[stream] = unit.closing;
+        validator.applied(stream, sequence, unit.closing, unit.route);
         if (!slotsHeldByPump) {
             slots.releaseHead(stream);
         }

@@ -365,16 +365,21 @@ public final class ServerReceiveDriver {
     private void terminate() {
         closed = true;
         executing = null;
-        pump.cancel();
+        ReceiveCleanup.run(pump::cancel, this::releaseHeldSlots, receiver::discard,
+                () -> releaseCharge(reservedWorkspace), waiting::clear, () -> Arrays.fill(held, null));
+    }
+
+    private void releaseHeldSlots() {
+        Runnable[] releases = new Runnable[held.length];
         for (int stream = 0; stream < held.length; stream++) {
-            if (held[stream] != null && receiver.slots().holdsHead(stream)) {
-                receiver.slots().releaseHead(stream);
-            }
+            final int index = stream;
+            releases[stream] = () -> {
+                if (held[index] != null && receiver.slots().holdsHead(index)) {
+                    receiver.slots().releaseHead(index);
+                }
+            };
         }
-        receiver.discard();
-        releaseCharge(reservedWorkspace);
-        waiting.clear();
-        Arrays.fill(held, null);
+        ReceiveCleanup.run(releases);
     }
 
     private static byte[] closeReason(ReceiveClose close) {
