@@ -55,8 +55,49 @@ public final class OutboundPool {
     /** Returns and clears owners selected for local 0x12 closure. */
     public synchronized List<Object> drainShedOwners() { return ledger.drainShed(); }
 
+    /**
+     * Takes the shed notice of one owner only, leaving every other owner's notice in place. A shed owner
+     * is closed by its own caller, so no caller drains notices that belong to someone else.
+     */
+    public synchronized boolean takeShed(Object owner) { return ledger.takeShed(owner); }
+
+    /**
+     * Reserves like {@link #reserve} but returns a ticket. A refused request is granted later from the FIFO
+     * queue; {@link #takeGrant} then reports it once, so grants are tracked per request, never inferred
+     * from the owner's total.
+     */
+    public synchronized long reserveTicket(Object owner, Object ip, Object account, long bytes) {
+        return ledger.reserveTicket(owner, ip, account, bytes);
+    }
+
+    /**
+     * Requests the per-connection /3 REALTIME slice (13.12) as a protected ticket: once granted, a holder holding
+     * nothing beyond it is never shed. It is released only by {@link #cancel}.
+     */
+    public synchronized long reserveProtectedTicket(Object owner, Object ip, Object account, long bytes) {
+        return ledger.reserveProtectedTicket(owner, ip, account, bytes);
+    }
+
+    /** True once for a ticket from {@link #reserveTicket} that has been charged; the grant is consumed. */
+    public synchronized boolean takeGrant(long ticket) { return ledger.takeGrant(ticket); }
+
+    /**
+     * True when a request of {@code bytes} could ever be admitted for this account under the caps. A request
+     * that fails this check would throw from a reserve call, so callers check it before assigning anything.
+     */
+    public synchronized boolean admissible(Object account, long bytes) { return ledger.admissible(account, bytes); }
+
     /** Charged outbound bytes for one owner. */
     public synchronized long reserved(Object owner) { return ledger.reserved(owner); }
+
+    /** The per-connection cap every owner in this pool is charged against. */
+    public synchronized long perConnectionLimit() { return ledger.ownerCap(); }
+
+    /**
+     * The smallest cap that can constrain a request of this account: the per-connection, per-IP, per-account (when
+     * {@code account} is non-null) and node caps. Headroom checks compare against this value, not the owner cap alone.
+     */
+    public synchronized long smallestCap(Object account) { return ledger.smallestCap(account); }
 
     /** Number of queued refused requests. */
     public synchronized int waitingCount() { return ledger.waitingCount(); }

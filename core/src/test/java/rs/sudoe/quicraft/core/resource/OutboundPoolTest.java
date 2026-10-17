@@ -35,6 +35,20 @@ class OutboundPoolTest {
         assertEquals(30, pool.reserved("c"));
     }
 
+    @Test void aHolderOfOnlyItsProtectedSliceIsNeverShed() {
+        NodePools node = new NodePools(1000, 0, 1000, 10, false, 0);
+        OutboundPool pool = new OutboundPool(node, 100, 100, 100, ranks(Collections.<Object, Double>emptyMap()));
+        assertTrue(pool.takeGrant(pool.reserveProtectedTicket("a", "ip-a", null, 40)));
+        assertTrue(pool.takeGrant(pool.reserveProtectedTicket("b", "ip-a", null, 40)));
+        assertFalse(pool.reserve("c", "ip-a", null, 30));
+        assertTrue(pool.drainShedOwners().isEmpty(), "holders of only their slice are not victims");
+        pool.cancel("c");
+        assertTrue(pool.reserve("a", "ip-a", null, 1));
+        assertFalse(pool.reserve("d", "ip-a", null, 30));
+        assertEquals(java.util.Arrays.asList((Object) "a"), pool.drainShedOwners(),
+                "bytes beyond the slice make the holder a victim again");
+    }
+
     @Test void accountCapSupplementsIpCapAndShedsOnlySameAccount() {
         NodePools node = new NodePools(1000, 0, 1000, 10, false, 0);
         OutboundPool pool = new OutboundPool(node, 100, 20, 100, ranks(Collections.<Object, Double>emptyMap()));

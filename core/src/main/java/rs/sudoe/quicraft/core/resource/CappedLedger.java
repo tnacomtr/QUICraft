@@ -4,6 +4,8 @@ package rs.sudoe.quicraft.core.resource;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -14,7 +16,8 @@ import java.util.Map;
  * <p>A request is granted only when it fits every applicable cap: the node pool, the per-source-IP cap,
  * the per-account cap (when authenticated) and the per-owner cap. Refused requests wait in FIFO order.
  * Under pressure the ledger picks victims: holders whose release relieves at least one binding deficit
- * of the waiting request, excluding the requester and holders blocked only by a local executor stall.
+ * of the waiting request, excluding the requester, holders blocked only by a local executor stall and holders
+ * holding nothing beyond a protected reservation (the /3 REALTIME slice).
  * Victims are ordered by {@link HolderRank} descending, then retained bytes descending, then oldest
  * acquisition. Deficits and eligibility are recomputed after every reclamation, and reclamation stops as
  * soon as the waiting request fits.</p>
@@ -40,8 +43,11 @@ final class CappedLedger {
     private final Map<Object, Holder> holders = new LinkedHashMap<Object, Holder>();
     private final List<Request> waiting = new ArrayList<Request>();
     private final List<Object> shed = new ArrayList<Object>();
+    /** Tracked tickets granted and not yet taken by their caller, mapped to their holder. */
+    private final Map<Long, Holder> grants = new HashMap<Long, Holder>();
     private long sequence;
     private long tick;
+    private long nextTicket;
 
     CappedLedger(NodePools node, ResourcePools.Pool pool, long ipCap, long accountCap, long ownerCap, HolderRank rank) {
         if (node == null || pool == null || rank == null) throw new IllegalArgumentException("ledger");
@@ -56,23 +62,77 @@ final class CappedLedger {
 
     /** Grants or queues a request; returns true only when the bytes are charged now (13.12). */
     boolean reserve(Object owner, Object ip, Object account, long bytes, boolean localStall) {
+        return !enqueue(owner, ip, account, bytes, localStall, false, false).pending;
+    }
+
+    /**
+     * Grants or queues a request and returns its ticket. The ticket is granted through {@link #takeGrant}
+     * once its bytes are charged, whether that happened now or later from the queue.
+     */
+    long reserveTicket(Object owner, Object ip, Object account, long bytes) {
+        return enqueue(owner, ip, account, bytes, false, true, false).ticket;
+    }
+
+    /**
+     * As {@link #reserveTicket}, for a protected reservation (the /3 REALTIME outbound slice, 13.12). Once
+     * granted, these bytes never make their holder a shed victim: a holder holding only protected bytes is
+     * skipped by victim selection. They are released only by {@link #cancel}.
+     */
+    long reserveProtectedTicket(Object owner, Object ip, Object account, long bytes) {
+        return enqueue(owner, ip, account, bytes, false, true, true).ticket;
+    }
+
+    /** True once, for a tracked ticket that has been charged and not yet taken; removes the grant. */
+    boolean takeGrant(long ticket) {
+        return grants.remove(ticket) != null;
+    }
+
+    /** True when a request of {@code bytes} could ever be admitted under the owner, IP, account and node caps. */
+    boolean admissible(Object account, long bytes) {
+        return bytes <= ownerCap && bytes <= ipCap && (account == null || bytes <= accountCap)
+                && bytes <= node.limit(pool);
+    }
+
+    /**
+     * The smallest cap that can ever constrain a request of this account: owner, IP, account (when set) and node.
+     * Callers that need headroom beside a fixed amount of bytes compare against this value.
+     */
+    long smallestCap(Object account) {
+        long smallest = Math.min(ownerCap, Math.min(ipCap, node.limit(pool)));
+        return account == null ? smallest : Math.min(smallest, accountCap);
+    }
+
+    /** Takes this owner's shed notice only; other owners' notices stay for their own callers. */
+    boolean takeShed(Object owner) {
+        return shed.remove(owner);
+    }
+
+    private Request enqueue(Object owner, Object ip, Object account, long bytes, boolean localStall, boolean tracked,
+            boolean protect) {
         if (owner == null || ip == null || bytes < 0) throw new IllegalArgumentException("request");
         // A request no cap can ever admit is a local failure, never a wait: queueing it would block FIFO forever.
-        if (bytes > ownerCap || bytes > ipCap || (account != null && bytes > accountCap) || bytes > node.limit(pool)) {
+        if (!admissible(account, bytes)) {
             throw new IllegalArgumentException("request of " + bytes + " bytes exceeds a cap that can never admit it");
         }
         Holder holder = holder(owner, ip, account);
+        Request request = new Request(holder, bytes, ++tick, tracked ? ++nextTicket : 0, tracked, protect);
         // An owner already selected for closure takes no new bytes; it is refused without queueing.
-        if (holder.shed) return false;
+        if (holder.shed) return request;
         holder.localStall = localStall;
         if (!blockedForNew(holder, bytes) && fitsNow(holder, bytes)) {
-            charge(holder, bytes);
-            return true;
+            grant(request);
+            return request;
         }
-        Request request = new Request(holder, bytes, ++tick);
         waiting.add(request);
         reclaim();
-        return !request.pending;
+        return request;
+    }
+
+    private void grant(Request request) {
+        charge(request.holder, request.bytes);
+        request.pending = false;
+        if (request.protect) request.holder.protectedBytes = add(request.holder.protectedBytes, request.bytes);
+        if (request.tracked) grants.put(request.ticket, request.holder);
     }
 
     /** Releases bytes whose ownership ended, then retries waiters FIFO before new charges (13.12). */
@@ -81,7 +141,7 @@ final class CappedLedger {
         if (holder == null || bytes < 0 || bytes > holder.bytes) throw new IllegalStateException("release exceeds reservation");
         node.release(pool, owner, bytes);
         holder.bytes -= bytes;
-        if (holder.bytes == 0 && !hasWait(holder) && !holder.shed) holders.remove(owner);
+        if (holder.bytes == 0 && !hasWait(holder) && !holder.shed && !holdsGrant(holder)) holders.remove(owner);
         reclaim();
     }
 
@@ -103,8 +163,15 @@ final class CappedLedger {
         if (holder.bytes > 0) node.release(pool, owner, holder.bytes);
         holder.bytes = 0;
         removeWaits(holder);
+        removeGrants(holder);
+        shed.remove(owner);
         holders.remove(owner);
         reclaim();
+    }
+
+    /** The per-owner (per-connection) cap this ledger charges against. */
+    long ownerCap() {
+        return ownerCap;
     }
 
     long reserved(Object owner) {
@@ -201,9 +268,8 @@ final class CappedLedger {
             for (int index = 0; index < waiting.size(); index++) {
                 Request request = waiting.get(index);
                 if (blockedByEarlier(index, request) || !fitsNow(request.holder, request.bytes)) continue;
-                charge(request.holder, request.bytes);
-                request.pending = false;
                 waiting.remove(index);
+                grant(request);
                 changed = true;
                 break;
             }
@@ -238,7 +304,8 @@ final class CappedLedger {
         for (Holder candidate : candidates) {
             // A waiter reclaims only from holders charged before it queued: a grant made from the queue after
             // this arrival is protected from it, so retries never shed what FIFO just admitted.
-            if (candidate == request.holder || candidate.bytes == 0 || candidate.localStall || candidate.shed) continue;
+            if (candidate == request.holder || candidate.bytes <= candidate.protectedBytes || candidate.localStall
+                    || candidate.shed) continue;
             if (candidate.lastCharge > request.enqueued) continue;
             if (relieves(candidate, request)) return candidate;
         }
@@ -285,6 +352,16 @@ final class CappedLedger {
         return result;
     }
 
+    private boolean holdsGrant(Holder holder) {
+        return grants.containsValue(holder);
+    }
+
+    private void removeGrants(Holder holder) {
+        for (Iterator<Map.Entry<Long, Holder>> it = grants.entrySet().iterator(); it.hasNext();) {
+            if (it.next().getValue() == holder) it.remove();
+        }
+    }
+
     private boolean hasWait(Holder holder) {
         for (Request request : waiting) if (request.holder == holder) return true;
         return false;
@@ -301,6 +378,8 @@ final class CappedLedger {
         final Object account;
         final long sequence;
         long bytes;
+        /** Granted protected bytes (the REALTIME slice); a holder with no more than these is never a victim. */
+        long protectedBytes;
         long lastCharge;
         boolean localStall;
         boolean shed;
@@ -318,12 +397,18 @@ final class CappedLedger {
         final Holder holder;
         final long bytes;
         final long enqueued;
+        final long ticket;
+        final boolean tracked;
+        final boolean protect;
         boolean pending = true;
 
-        Request(Holder holder, long bytes, long enqueued) {
+        Request(Holder holder, long bytes, long enqueued, long ticket, boolean tracked, boolean protect) {
             this.holder = holder;
             this.bytes = bytes;
             this.enqueued = enqueued;
+            this.ticket = ticket;
+            this.tracked = tracked;
+            this.protect = protect;
         }
     }
 }

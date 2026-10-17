@@ -1573,7 +1573,17 @@ position extraction. Those implementations must change together before this revi
       authenticated account, enforcing all applicable caps, including queued binding bytes.
       Pre-authentication uses IP; account caps supplement, not replace, IP caps. Measure then
       set these pool sizes/caps at 50,000 players; they are not idle reservations or proven
-      capacity. Use the same binding-cap eligibility/recompute rule as inbound. Shed only
+      capacity.
+      **REALTIME outbound slice.** Each /3 play connection charges one fixed REALTIME outbound
+      slice (provisional default 2 KiB; 50,000 connections hold about 98 MiB) as its first
+      outbound charge, holds it until close and releases it exactly once. Clientbound REALTIME
+      records whose wire size fits the slice are granted from it locally, FIFO in REALTIME order,
+      independent of every other outbound wait; a larger REALTIME record takes the ordinary
+      outbound queue at its position and is still written on REALTIME. The slice is protected: a
+      connection holding nothing beyond its slice is never a shed victim, while bytes beyond it
+      make the connection a normal candidate. The sender requires maximum record + ACK headroom +
+      slice <= the smallest applicable outbound cap.
+      Use the same binding-cap eligibility/recompute rule as inbound. Shed only
       outbound byte holders with `0x12`, never a requester holding no outbound bytes.
       Atomically retry waiting outbound grants FIFO from released capacity before new
       charges. Skip a still-ineligible wait without blocking grants under unrelated caps;

@@ -230,7 +230,9 @@ class StreamSequencerTest {
         // are 5 bytes of header each (1-byte length prefix). The member body is about 2 MiB, so its
         // record_length takes a 4-byte VarInt and its header is 8 bytes.
         long memberHeader = 8;
-        long delimiterHeaders = 5 + 5;
+        // The opener is kind 4 (13.4): its body adds VarInt(unit_records), 1 byte for 3 records, and
+        // VarInt(unit_wire_bytes), 4 bytes for a total near B (above 2^21), so 5 bytes more than a kind 0 opener.
+        long delimiterHeaders = 5 + 5 + 5;
         StreamSequencer exact = new StreamSequencer(1);
         byte[] atLimit = new byte[(int) (StreamSequencer.MAX_BUNDLE_ENCODED_BYTES - delimiterHeaders - memberHeader)];
         List<Record> accepted = exact.assignBundle(NONE, Collections.singletonList(atLimit),

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.multistream;
 
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -165,22 +166,18 @@ public final class StreamSequencer {
         if (assigned[CONTROL] + members.size() + 2 > MAX_SEQUENCE) {
             throw new IllegalStateException("sequence exhausted");
         }
-        // Wire size with every header (13.12): the opening record is planned exactly, because its
-        // scope and external dependencies decide its header; members and the closing record are
-        // unconstrained CONTROL records with no dependency entries, so only their sequences vary.
         Record openingPlan = plan(CONTROL, scope, opening, false, 0, external, false);
-        long bytes = compactWireSize(openingPlan.sequence(), openingPlan.epoch(),
-                openingPlan.dependencies(), opening.length);
-        long sequence = openingPlan.sequence();
-        for (byte[] member : members) {
-            bytes += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, member.length);
-        }
-        bytes += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, closing.length);
-        if (bytes > MAX_BUNDLE_ENCODED_BYTES) {
+        long unitBytes = unitBytesOf(openingPlan, opening, members, closing);
+        if (unitBytes > MAX_BUNDLE_ENCODED_BYTES) {
             throw new IllegalArgumentException("bundle encoded bytes");
         }
+        long openingSequence = openingPlan.sequence();
+        int unitRecords = members.size() + 2;
+        Record opener = new Record(CONTROL, openingSequence, epoch, openingPlan.dependencies(),
+                RecordCodec.KIND_BUNDLE_OPEN, openerBody(unitRecords, unitBytes, opening));
+        assigned[CONTROL] = openingSequence;
         List<Record> result = new ArrayList<Record>(members.size() + 2);
-        result.add(place(CONTROL, scope, opening, false, 0, external));
+        result.add(opener);
         for (byte[] member : members) {
             result.add(place(CONTROL, Fence.ORDINARY_CONTROL, member, false, 0, null, true));
         }
@@ -188,6 +185,49 @@ public final class StreamSequencer {
         result.add(close);
         applyFrontier(scope, close.sequence());
         return Collections.unmodifiableList(result);
+    }
+
+    /**
+     * The exact unit wire total {@link #assignBundle} would check for this bundle now, computed without assigning
+     * anything, so the sequencer state is unchanged. Refuses the same shapes as {@code assignBundle}: null parts,
+     * a member count over {@link #MAX_BUNDLE_MEMBERS} and a unit over {@link #MAX_BUNDLE_ENCODED_BYTES}.
+     *
+     * @throws IllegalArgumentException for any of those shapes, or a REALTIME or null member scope
+     */
+    long bundleWireBytes(byte[] opening, List<byte[]> members, Fence[] memberScopes, byte[] closing,
+            Record.Dependency... external) {
+        if (opening == null || closing == null || members == null || memberScopes == null) {
+            throw new IllegalArgumentException("bundle");
+        }
+        if (members.size() > MAX_BUNDLE_MEMBERS || members.size() != memberScopes.length) {
+            throw new IllegalArgumentException("bundle members");
+        }
+        for (byte[] member : members) {
+            if (member == null) {
+                throw new IllegalArgumentException("bundle member");
+            }
+        }
+        Fence scope = bundleScope(memberScopes);
+        long unitBytes = unitBytesOf(plan(CONTROL, scope, opening, false, 0, external, false), opening, members, closing);
+        if (unitBytes > MAX_BUNDLE_ENCODED_BYTES) {
+            throw new IllegalArgumentException("bundle encoded bytes");
+        }
+        return unitBytes;
+    }
+
+    /**
+     * The unit wire total of 13.4 for an opener planned at its sequence: members and the closer take the next
+     * CONTROL sequences, and the opener's own size is solved as a fixed point in {@link #unitWireBytes}.
+     */
+    private long unitBytesOf(Record openingPlan, byte[] opening, List<byte[]> members, byte[] closing) {
+        long tail = 0;
+        long sequence = openingPlan.sequence();
+        for (byte[] member : members) {
+            tail += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, member.length);
+        }
+        tail += compactWireSize(++sequence, epoch, NO_DEPENDENCIES, closing.length);
+        return unitWireBytes(openingPlan.sequence(), epoch, openingPlan.dependencies(), members.size() + 2,
+                opening.length, tail);
     }
 
     /**
@@ -313,6 +353,33 @@ public final class StreamSequencer {
         }
         long recordLength = header + bodyLength;
         return varIntBytes(recordLength) + recordLength;
+    }
+
+    /**
+     * The exact unit wire total of 13.4 as a fixed point: the opener's size depends on the VarInt length
+     * of the total it declares, so the total is iterated from below until it is stable. The map is
+     * monotone and bounded, so this converges in a few steps.
+     */
+    private static long unitWireBytes(long openingSequence, long epoch, List<Record.Dependency> dependencies,
+            int unitRecords, int openingLength, long tail) {
+        long total = tail;
+        for (int i = 0; i < 64; i++) {
+            long next = tail + compactWireSize(openingSequence, epoch, dependencies,
+                    varIntBytes(unitRecords) + varIntBytes(total) + openingLength);
+            if (next == total) {
+                return total;
+            }
+            total = next;
+        }
+        throw new IllegalStateException("bundle unit size");
+    }
+
+    private static byte[] openerBody(int unitRecords, long unitBytes, byte[] opening) {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        VarInt.write(body, unitRecords);
+        VarInt.write(body, (int) unitBytes);
+        body.write(opening, 0, opening.length);
+        return body.toByteArray();
     }
 
     private static int varIntBytes(long value) {
