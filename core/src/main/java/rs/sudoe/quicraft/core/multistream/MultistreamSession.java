@@ -52,6 +52,28 @@ public interface MultistreamSession {
     /** Submits one vanilla bundle (13.15); returns the handles in wire order. */
     List<SentPacket> sendBundle(OutboundPacket open, List<OutboundPacket> members, OutboundPacket close);
 
+    /**
+     * Submits one bundle whose members are covered by registered update tokens (U2b, 13.19), with
+     * the same wire shape as {@link #sendBundle} and one atomic transaction: every token is
+     * validated, then the whole run is assigned and enqueued, then each distinct token is consumed
+     * once. Returns the opener, every member and the closer as handles in wire order.
+     *
+     * <p>{@code memberCoverage[i]} names the tokens covering member {@code i}; the outer list's
+     * length must equal the member count and empty inner lists leave a member uncovered. Null
+     * entries are invalid. A token may cover several members; it is consumed once at its highest
+     * covered member sequence, or at the closing delimiter when the strongest-member routing
+     * promotes the bundle to GLOBAL. A foreign, suppressed, retired or already assigned token
+     * rejects the whole call before any sequence is assigned. This operation assigns and completes
+     * no scope and seals no ack coverage.
+     *
+     * <p>Additive: an implementation that does not support it fails closed with
+     * {@link UnsupportedOperationException}.
+     */
+    default List<SentPacket> sendCoveredBundle(OutboundPacket open, List<OutboundPacket> members,
+            OutboundPacket close, List<List<UpdateToken>> memberCoverage) {
+        throw new UnsupportedOperationException("sendCoveredBundle");
+    }
+
     /** Normal shutdown (13.14): END as a full fence after everything submitted so far. */
     void end();
 

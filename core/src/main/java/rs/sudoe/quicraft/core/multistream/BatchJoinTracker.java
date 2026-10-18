@@ -49,6 +49,55 @@ public final class BatchJoinTracker {
     }
 
     /**
+     * Validates a chunk_batch_start marker without changing batch state (U2b, 13.19). The caller
+     * runs this before assigning the start record, then commits with {@link #begin} only after that
+     * record was enqueued; the assigned start sequence is validated at commit.
+     *
+     * @throws IllegalArgumentException for an invalid id or epoch, or a nested batch
+     */
+    public synchronized void validateBegin(long id, long epoch) {
+        if (id <= 0 || epoch < 0) {
+            throw new IllegalArgumentException("batch");
+        }
+        if (active) {
+            throw new IllegalArgumentException("nested batch");
+        }
+    }
+
+    /**
+     * Validates one chunk install marker against the active batch and a predicted logical chunk
+     * stream without changing batch state (U2b, 13.19). The caller runs this before assigning the
+     * install record, then commits with {@link #chunk} only after that record was enqueued; the
+     * assigned sequence and stream are validated at commit.
+     *
+     * @param logicalStreamCount the session's logical stream count, so a predicted stream outside
+     *        {@code [CHUNK0, logicalStreamCount)} is refused
+     * @throws IllegalArgumentException for an unmatched marker, an epoch mismatch or an illegal
+     *         predicted chunk stream
+     */
+    public synchronized void validateInstall(long id, int logicalStream, long epoch, int logicalStreamCount) {
+        require(id, epoch);
+        if (logicalStream < CHUNK0 || logicalStream >= logicalStreamCount) {
+            throw new IllegalArgumentException("batch chunk");
+        }
+    }
+
+    /**
+     * Returns the BATCH_JOIN dependencies a finish marker would commit, validating the marker
+     * without changing batch state for a valid marker (U2b, 13.19). The caller invokes this before
+     * assigning the join, then commits with {@link #finish} only after that record was enqueued.
+     *
+     * <p>Non-mutating even on a refused marker: an epoch mismatch throws and leaves the batch
+     * active. Only {@link #finish} or {@link #abort} discard it.
+     *
+     * @throws IllegalArgumentException for an unmatched marker or an epoch mismatch
+     */
+    public synchronized Record.Dependency[] previewFinish(long id, long epoch) {
+        require(id, epoch);
+        return dependencies();
+    }
+
+    /**
      * Records one assigned chunk install of the active batch (13.19). Its stream must be a chunk
      * stream and its epoch must equal the batch epoch.
      */
@@ -77,12 +126,18 @@ public final class BatchJoinTracker {
             clearActive();
         }
         require(id, epoch);
+        Record.Dependency[] dependencies = dependencies();
+        clearActive();
+        return dependencies;
+    }
+
+    /** The finish dependencies of the active batch, without changing its state. */
+    private Record.Dependency[] dependencies() {
         List<Record.Dependency> dependencies = new ArrayList<Record.Dependency>();
         dependencies.add(new Record.Dependency(LogicalStream.CONTROL, startSequence));
         for (Map.Entry<Integer, Long> install : installs.entrySet()) {
             dependencies.add(new Record.Dependency(install.getKey(), install.getValue()));
         }
-        clearActive();
         return dependencies.toArray(new Record.Dependency[dependencies.size()]);
     }
 

@@ -246,19 +246,23 @@ public final class StreamSequencer {
      * or GLOBAL member. A REALTIME or null member is rejected.
      */
     public static Fence bundleScope(Fence... memberScopes) {
-        Fence scope = Fence.CONTROL_FENCE;
+        // Every member is inspected before any result is returned, so an invalid later scope is never skipped.
+        boolean promoted = false;
+        boolean view = false;
         for (Fence member : memberScopes) {
             if (member == null || member == Fence.REALTIME) {
                 throw new IllegalArgumentException("bundle member scope");
             }
             if (member == Fence.CHUNK || member == Fence.GLOBAL) {
-                return Fence.GLOBAL;
-            }
-            if (member == Fence.VIEW) {
-                scope = Fence.VIEW;
+                promoted = true;
+            } else if (member == Fence.VIEW) {
+                view = true;
             }
         }
-        return scope;
+        if (promoted) {
+            return Fence.GLOBAL;
+        }
+        return view ? Fence.VIEW : Fence.CONTROL_FENCE;
     }
 
     /** Returns the per-stream last assigned sequence, indexed by logical stream (13.9). */

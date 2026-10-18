@@ -8,6 +8,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.IntPredicate;
@@ -752,11 +753,20 @@ public final class SessionSendDriver {
         if (closed || sealed) {
             return new SentPacket();
         }
+        // The marker and its packet are validated before the start takes a sequence; the batch
+        // state is committed only after the start record was successfully enqueued (U2b).
+        long epoch = sequencer.epoch();
+        batches.validateBegin(batchId, epoch);
+        byte[] frame = snapshotFrame(start, "batch start");
+        if (overflows(1, frame.length)) {
+            closeWith(CLOSE_RESOURCE);
+            return new SentPacket();
+        }
         Record.Dependency previous = batches.previousJoinDependency();
-        SentPacket handle = submit(start, StreamSequencer.Fence.VIEW, 0, 0,
+        SentPacket handle = submit(new OutboundPacket(frame), StreamSequencer.Fence.VIEW, 0, 0,
                 previous == null ? new Record.Dependency[0] : new Record.Dependency[] {previous});
-        if (handle.isAssigned() && !closed) {
-            batches.begin(batchId, handle.sequence(), sequencer.epoch());
+        if (handle.isAssigned() && !closed && !sealed) {
+            batches.begin(batchId, handle.sequence(), epoch);
         }
         return handle;
     }
@@ -766,29 +776,57 @@ public final class SessionSendDriver {
         if (closed || sealed) {
             return new SentPacket();
         }
-        SentPacket handle = submit(install, StreamSequencer.Fence.CHUNK, chunkX, chunkZ, new Record.Dependency[0]);
-        if (handle.isAssigned() && !closed) {
-            batches.chunk(batchId, handle.logicalStream(), handle.sequence(), sequencer.epoch());
+        long epoch = sequencer.epoch();
+        int predicted = streamFor(StreamSequencer.Fence.CHUNK, chunkX, chunkZ);
+        batches.validateInstall(batchId, predicted, epoch, context.logicalStreamCount());
+        byte[] frame = snapshotFrame(install, "batch install");
+        if (overflows(1, frame.length)) {
+            closeWith(CLOSE_RESOURCE);
+            return new SentPacket();
+        }
+        SentPacket handle = submit(new OutboundPacket(frame), StreamSequencer.Fence.CHUNK, chunkX, chunkZ,
+                new Record.Dependency[0]);
+        if (handle.isAssigned() && !closed && !sealed) {
+            batches.chunk(batchId, handle.logicalStream(), handle.sequence(), epoch);
         }
         return handle;
     }
 
-    /** Ends the active batch with its BATCH_JOIN on CHUNK[0] (13.19). */
+    /**
+     * Ends the active batch with its BATCH_JOIN on CHUNK[0] (13.19).
+     *
+     * <p>The join is assigned before it is enqueued, so {@code assignJoin} can consume a CHUNK[0]
+     * sequence that is never written. That is not a leak and not a gap on the wire: a refused
+     * enqueue (a record no applicable cap can admit) closes the driver with 0x12 first, and a closed
+     * driver writes nothing further, so the consumed sequence is never visible to the peer. The
+     * batch and the previous-JOIN chain are committed only after the enqueue succeeds.
+     */
     public synchronized SentPacket finishBatch(long batchId, OutboundPacket join) {
         SentPacket handle = new SentPacket();
         if (closed || sealed) {
             return handle;
         }
-        Record.Dependency[] deps = batches.finish(batchId, sequencer.epoch());
-        if (overflows(1, join.frame().length)) {
+        // Validate the marker and compute its dependencies before assigning the join; the batch is
+        // cleared and the previous-JOIN chain advances only after the join was enqueued (U2b).
+        long epoch = sequencer.epoch();
+        Record.Dependency[] deps = batches.previewFinish(batchId, epoch);
+        byte[] frame = snapshotFrame(join, "batch join");
+        if (overflows(1, frame.length)) {
             closeWith(CLOSE_RESOURCE);
             return handle;
         }
-        Record record = sequencer.assignJoin(3, join.frame(), deps);
-        if (!enqueueRecord(record, false)) {
+        Record record = sequencer.assignJoin(3, frame, deps);
+        try {
+            if (!enqueueRecord(record, false)) {
+                return handle;
+            }
+            batches.finish(batchId, epoch);
+            batches.recordJoin(record.sequence());
+        } catch (RuntimeException failure) {
+            closeCause = failure;
+            closeWith(CLOSE_RESOURCE);
             return handle;
         }
-        batches.recordJoin(record.sequence());
         handle.assign(Lane.WORLD, FIRST_CHUNK, record.sequence());
         return handle;
     }
@@ -979,6 +1017,196 @@ public final class SessionSendDriver {
     }
 
     /**
+     * Assigns one bundle as one CONTROL run and atomically resolves the update tokens covering its
+     * members (U2b, 13.19). The wire shape is that of
+     * {@link #submitBundle(OutboundPacket, List, StreamSequencer.Fence[], OutboundPacket,
+     * Record.Dependency...)}. Under this driver's monitor it snapshots every input, then validates
+     * all tokens without consuming them, the frames, the member scopes, the delimiter and run
+     * constraints, the dependencies, the aggregate size and admission, and only then assigns and
+     * enqueues the whole run and consumes each distinct token once. No partial member is accepted
+     * and no per-member submission is made.
+     *
+     * <p>Token resolution (13.19): a token covering one or more members is consumed once at its
+     * highest covered member's CONTROL sequence. When the strongest-member rule promotes the bundle
+     * to GLOBAL, every listed token instead resolves to the closing delimiter, so every
+     * participating scope covers the entire atomic bundle. This method opens, completes and seals
+     * no scope; the caller still owns those lifecycle events.
+     *
+     * <p>Rejections: a foreign, suppressed, retired, already resolved or null token anywhere, a
+     * null or empty frame, a null coverage list or an invalid member scope throws before anything is
+     * assigned, queued or charged, and every token stays live. A queue overflow or a run no
+     * applicable cap can admit is the existing terminal resource refusal: it assigns and enqueues
+     * no member and acquires no run charge. A run larger than {@code maxRecordBytes} is refused
+     * with {@link IllegalArgumentException} before assignment.
+     *
+     * @param memberScopes one scope per member, in order
+     * @param memberCoverage one token list per member, in order; empty lists are allowed
+     * @return the opener, every member and the closer as handles in wire order
+     * @throws AckJoinTracker.ForeignHandleException when a token belongs to another tracker
+     * @throws IllegalArgumentException for an invalid token, frame, coverage, scope or run shape
+     */
+    public synchronized List<SentPacket> submitCoveredBundle(OutboundPacket opening, List<OutboundPacket> members,
+            StreamSequencer.Fence[] memberScopes, OutboundPacket closing,
+            List<List<MultistreamSession.UpdateToken>> memberCoverage) {
+        List<SentPacket> result = new ArrayList<SentPacket>();
+        if (closed || sealed) {
+            return result;
+        }
+        if (opening == null || closing == null || members == null || memberScopes == null
+                || memberCoverage == null) {
+            throw new IllegalArgumentException("bundle");
+        }
+        // Snapshot every input before validating: later caller mutations cannot change what this
+        // atomic assignment writes or which sequences its tokens resolve to. The scopes are copied
+        // once here and that exact copy serves validation and assignment alike.
+        StreamSequencer.Fence[] scopes = memberScopes.clone();
+        int count = members.size();
+        if (scopes.length != count || memberCoverage.size() != count) {
+            throw new IllegalArgumentException("bundle coverage");
+        }
+        byte[] openingFrame = snapshotFrame(opening, "bundle opener");
+        byte[] closingFrame = snapshotFrame(closing, "bundle closer");
+        List<byte[]> frames = new ArrayList<byte[]>(count);
+        long rawBytes = openingFrame.length + closingFrame.length;
+        // Complete GAME framing (13.4) of the opener, every member and the closer is checked here, before any
+        // sequence is taken. RecordCodec would reject the same bytes only after assignment, which would close the
+        // session instead of refusing the call.
+        validateGameFrame(openingFrame, "bundle opener");
+        validateGameFrame(closingFrame, "bundle closer");
+        for (int i = 0; i < count; i++) {
+            byte[] frame = snapshotFrame(members.get(i), "bundle member");
+            validateGameFrame(frame, "bundle member");
+            frames.add(frame);
+            rawBytes += frame.length;
+        }
+        List<List<MultistreamSession.UpdateToken>> coverage = new ArrayList<List<MultistreamSession.UpdateToken>>(count);
+        Map<MultistreamSession.UpdateToken, Integer> tokenMember =
+                new LinkedHashMap<MultistreamSession.UpdateToken, Integer>();
+        for (int i = 0; i < count; i++) {
+            List<MultistreamSession.UpdateToken> listed = memberCoverage.get(i);
+            if (listed == null) {
+                throw new IllegalArgumentException("bundle coverage");
+            }
+            List<MultistreamSession.UpdateToken> tokens = new ArrayList<MultistreamSession.UpdateToken>(listed);
+            coverage.add(tokens);
+            for (MultistreamSession.UpdateToken token : tokens) {
+                if (token == null) {
+                    throw new IllegalArgumentException("bundle token");
+                }
+                // Non-consuming for every token, including earlier ones in this same call: one bad
+                // token anywhere rejects the whole run without consuming any live token.
+                if (!acks.validateScopeToken(token)) {
+                    throw new IllegalArgumentException("unknown, resolved, suppressed or retired update token");
+                }
+                Integer previous = tokenMember.get(token);
+                if (previous == null || previous.intValue() < i) {
+                    tokenMember.put(token, Integer.valueOf(i));
+                }
+            }
+        }
+        // Run shape, scopes, dependencies and encoded aggregate are all checked before assignment.
+        StreamSequencer.Fence bundleFence = StreamSequencer.bundleScope(scopes);
+        long unitBytes = sequencer.bundleWireBytes(openingFrame, frames, scopes, closingFrame);
+        if (sequencer.assigned()[CONTROL] + (long) count + 2 > StreamSequencer.MAX_SEQUENCE) {
+            throw new IllegalArgumentException("sequence exhausted");
+        }
+        if (overflows(count + 2, rawBytes)) {
+            closeWith(CLOSE_RESOURCE);
+            return result;
+        }
+        if (!pool.admissible(account, unitBytes)) {
+            closeWith(CLOSE_RESOURCE);
+            return result;
+        }
+        if (unitBytes > maxRecordBytes) {
+            throw new IllegalArgumentException("bundle run larger than maxRecordBytes");
+        }
+        // Assignment is the one point of no return inside this call. From here on, sequences are consumed
+        // internally (the CONTROL sequence and the scope frontiers move) and the caller still gets no handle
+        // for a failed call. That internal consumption is deliberate terminal cleanup, not a partial write:
+        // every failure below closes the driver locally, which releases the run's single charge, drops the
+        // queue, clears the causal-scope and token state (AckJoinTracker.closeScopes) and writes nothing.
+        // Encoding cannot fail for a validated run: every frame passed RecordCodec.validateBody above, and the
+        // record header and length bounds are fixed by the 13.4 constants. The catch is a defensive net only.
+        List<Record> records = sequencer.assignBundle(openingFrame, frames, scopes, closingFrame);
+        List<byte[]> encodings = new ArrayList<byte[]>(records.size());
+        long runBytes = 0;
+        try {
+            for (Record record : records) {
+                byte[] encoded = RecordCodec.encodeRecord(record);
+                runBytes += encoded.length;
+                encodings.add(encoded);
+            }
+            // runBytes equals unitBytes exactly (same compact size formulas). Its check repeats the one above, and
+            // the owner, IP and account caps are fixed at construction, so this refusal is not reached while the
+            // node limit holds still. It is kept as a defensive 0x12 close and no test claims to cover it.
+            if (!pool.admissible(account, runBytes)) {
+                closeCause = new IllegalStateException("covered bundle exceeds every applicable cap");
+                closeWith(CLOSE_RESOURCE);
+                return result;
+            }
+            enqueueRun(records, encodings);
+        } catch (RuntimeException failure) {
+            // Encoding, enqueue or pump (including its clock reading) failed after the run took sequences.
+            // The run cannot be completed consistently: close locally with the original cause. No token was
+            // consumed yet and the caller receives no handles.
+            closeCause = failure;
+            closeWith(CLOSE_RESOURCE);
+            return result;
+        }
+        // Token resolution runs after the run is enqueued (U2b). Every token was validated above under this
+        // monitor, so a failure here is a local defect. Partial consumption before the failure is not a leak:
+        // the close below drops every causal-scope and token entry (AckJoinTracker.closeScopes) and releases the
+        // run's single charge with the queue, and the caller receives no handles.
+        try {
+            int closingIndex = records.size() - 1;
+            for (Map.Entry<MultistreamSession.UpdateToken, Integer> entry : tokenMember.entrySet()) {
+                long sequence = bundleFence == StreamSequencer.Fence.GLOBAL
+                        ? records.get(closingIndex).sequence()
+                        : records.get(1 + entry.getValue().intValue()).sequence();
+                acks.assignScopeToken(entry.getKey(), CONTROL, sequence);
+            }
+        } catch (RuntimeException failure) {
+            // The tokens were validated under this same monitor; a failure here is a local defect
+            // and the queued run cannot be completed consistently. Close with the cause (terminal cleanup).
+            closeCause = failure;
+            closeWith(CLOSE_RESOURCE);
+            return new ArrayList<SentPacket>();
+        }
+        for (Record record : records) {
+            result.add(handleOf(record));
+        }
+        return result;
+    }
+
+    /** Copies one packet's frame after validating that it carries at least a packet id. */
+    private static byte[] snapshotFrame(OutboundPacket packet, String what) {
+        if (packet == null) {
+            throw new IllegalArgumentException(what);
+        }
+        byte[] frame = packet.frame();
+        if (frame == null || frame.length < 1) {
+            throw new IllegalArgumentException(what);
+        }
+        return frame.clone();
+    }
+
+    /**
+     * Checks that a snapshotted frame is one complete GAME body (13.4): a VarInt inner length of 1 to
+     * {@link RecordCodec#MAX_INNER_CONTENT} followed by exactly that many bytes. It applies RecordCodec's own rule
+     * unchanged, so a frame it would refuse after assignment is refused here before any sequence is taken.
+     *
+     * @throws IllegalArgumentException when the frame is not one complete GAME body
+     */
+    private static void validateGameFrame(byte[] frame, String what) {
+        try {
+            RecordCodec.validateBody(RecordCodec.KIND_GAME, frame, 0, frame.length, true);
+        } catch (MultistreamProtocolException malformed) {
+            throw new IllegalArgumentException(what + ": " + malformed.getMessage(), malformed);
+        }
+    }
+
+    /**
      * Selects the next slice to write, or returns null when nothing is granted, ready and writable.
      * The caller writes the slice, then reports its outcome with {@link #released(long)} or
      * {@link #failed(long)}.
@@ -1036,6 +1264,8 @@ public final class SessionSendDriver {
         }
         closed = true;
         released = true;
+        // A terminal close discards active batch installs; the previous-JOIN chain is retained (13.19).
+        batches.abort();
         // Releases every owner charge exactly once, the REALTIME slice included (it is the owner's first charge).
         pool.cancel(owner);
         for (Charge charge : tokens.values()) {
@@ -1047,6 +1277,10 @@ public final class SessionSendDriver {
         tokens.clear();
         byRecord.clear();
         toOffer.clear();
+        // Every queued reservation was just dropped, so the admission counters must not keep charging them.
+        // poll() refuses a closed driver and released()/failed() find no token, so nothing can decrement below zero.
+        queuedRecords = 0;
+        queuedBytes = 0;
         realtimeOrder.clear();
         orphans.clear();
         pendingAcks.clear();

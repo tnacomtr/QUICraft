@@ -18,6 +18,8 @@ import io.netty.handler.codec.quic.QuicStreamType;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -741,6 +743,150 @@ class NStreamSessionLoopbackTest {
             assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code);
             assertEquals(CLOSE_ORDERING, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
             assertEquals(null, bundleUnit(rig.clientGame, "m"));
+        }
+    }
+
+    /**
+     * A covered bundle is one CONTROL run carrying the game's members, and every distinct token is
+     * consumed once by the same atomic transaction (U2b, 13.19). The scope is still the caller's to
+     * complete.
+     */
+    @Test
+    void coveredBundleRoundTripsAndConsumesEveryTokenOnce() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            MultistreamSession.CausalScope scope = rig.server.openScope();
+            MultistreamSession.UpdateToken first = rig.server.registerUpdate(scope);
+            MultistreamSession.UpdateToken repeated = rig.server.registerUpdate(scope);
+            List<List<MultistreamSession.UpdateToken>> coverage =
+                    new ArrayList<List<MultistreamSession.UpdateToken>>();
+            coverage.add(Arrays.asList(first));
+            coverage.add(Arrays.asList(repeated, first));
+            coverage.add(Collections.<MultistreamSession.UpdateToken>emptyList());
+
+            List<SentPacket> handles = rig.server.sendCoveredBundle(
+                    new OutboundPacket(NRig.frame(NRig.BUNDLE_OPEN, "")),
+                    members(NRig.frame(NRig.CONTROL_ID, "a"), NRig.frame(NRig.CONTROL_ID, "b"),
+                            NRig.frame(NRig.CONTROL_ID, "c")),
+                    new OutboundPacket(NRig.frame(NRig.BUNDLE_CLOSE, "")), coverage);
+
+            assertEquals(5, handles.size(), "opener, three members and closer");
+            for (SentPacket handle : handles) {
+                assertEquals(LogicalStream.CONTROL, handle.logicalStream());
+            }
+            assertEquals(0, rig.server.sendDriver().trackerRetainedTokens(),
+                    "each distinct token is consumed exactly once");
+            assertTrue(SessionRigSupport.await(() -> bundleUnit(rig.clientGame, "b") != null, 15_000),
+                    () -> "covered bundle delivered: " + rig.clientGame.units());
+            NRig.Got got = bundleUnit(rig.clientGame, "b");
+            assertEquals(5, got.packets.size(), "the client receives the whole unit");
+            assertEquals(LogicalStream.CONTROL, got.stream);
+            rig.server.completeScope(scope);
+            assertFalse(rig.clientGame.closed.isDone());
+            assertFalse(rig.serverGame.closed.isDone());
+        }
+    }
+
+    /** A promoted covered bundle keeps its CHUNK member atomic on CONTROL and consumes the tokens. */
+    @Test
+    void coveredBundleGlobalPromotionRoundTrips() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            MultistreamSession.CausalScope scope = rig.server.openScope();
+            MultistreamSession.UpdateToken token = rig.server.registerUpdate(scope);
+            List<SentPacket> handles = rig.server.sendCoveredBundle(
+                    new OutboundPacket(NRig.frame(NRig.BUNDLE_OPEN, "")),
+                    members(NRig.frame(NRig.CONTROL_ID, "cm"), NRig.chunkFrame(7, 7, "km")),
+                    new OutboundPacket(NRig.frame(NRig.BUNDLE_CLOSE, "")),
+                    Arrays.asList(Arrays.asList(token), Collections.<MultistreamSession.UpdateToken>emptyList()));
+            assertEquals(4, handles.size());
+            assertEquals(0, rig.server.sendDriver().trackerRetainedTokens());
+            assertTrue(SessionRigSupport.await(() -> bundleUnit(rig.clientGame, "km") != null, 15_000),
+                    () -> "promoted covered bundle delivered: " + rig.clientGame.units());
+            NRig.Got got = bundleUnit(rig.clientGame, "km");
+            assertEquals(LogicalStream.CONTROL, got.stream, "a chunk member never splits the atomic run");
+            assertEquals(4, got.packets.size());
+            rig.server.completeScope(scope);
+            assertFalse(rig.clientGame.closed.isDone());
+        }
+    }
+
+    /**
+     * A suppressed token at the first, middle or last member rejects the call before any assignment:
+     * the session stays open, the other live token stays live and a later send still sequences.
+     */
+    @Test
+    void coveredBundleRejectsBadTokenAtEveryMemberPosition() throws Exception {
+        for (int position = 0; position < 3; position++) {
+            try (NRig rig = NRig.start(2)) {
+                rig.activateBoth();
+                MultistreamSession.CausalScope liveScope = rig.server.openScope();
+                MultistreamSession.UpdateToken live = rig.server.registerUpdate(liveScope);
+                MultistreamSession.UpdateToken bad = rig.server.registerUpdate(rig.server.openScope());
+                rig.server.suppressUpdate(bad);
+                List<List<MultistreamSession.UpdateToken>> coverage =
+                        new ArrayList<List<MultistreamSession.UpdateToken>>();
+                for (int i = 0; i < 3; i++) {
+                    coverage.add(new ArrayList<MultistreamSession.UpdateToken>());
+                }
+                coverage.get(position).add(bad);
+                coverage.get((position + 1) % 3).add(live);
+                long before = rig.server.sendDriver().assignedSequence(LogicalStream.CONTROL);
+                int queuedBefore = rig.server.sendDriver().queuedRecords();
+
+                assertThrows(IllegalArgumentException.class, () -> rig.server.sendCoveredBundle(
+                        new OutboundPacket(NRig.frame(NRig.BUNDLE_OPEN, "")),
+                        members(NRig.frame(NRig.CONTROL_ID, "a"), NRig.frame(NRig.CONTROL_ID, "b"),
+                                NRig.frame(NRig.CONTROL_ID, "c")),
+                        new OutboundPacket(NRig.frame(NRig.BUNDLE_CLOSE, "")), coverage),
+                        "suppressed token at member " + position);
+
+                assertEquals(before, rig.server.sendDriver().assignedSequence(LogicalStream.CONTROL),
+                        "position " + position + " took no sequence");
+                assertEquals(queuedBefore, rig.server.sendDriver().queuedRecords(),
+                        "position " + position + " queued nothing");
+                assertEquals(1, rig.server.sendDriver().trackerRetainedTokens(),
+                        "the live token survived");
+                assertFalse(rig.serverGame.closed.isDone(), "caller misuse keeps the session open");
+                assertTrue(rig.server.send(ProtocolState.PLAY, NRig.CONTROL_ID,
+                        NRig.frame(NRig.CONTROL_ID, "later")).isAssigned(),
+                        "the session still accepts a valid send");
+                assertFalse(rig.clientGame.closed.isDone());
+            }
+        }
+    }
+
+    /** An unreadable member frame or a join route at any position fails closed 0x11, writing no unit. */
+    @Test
+    void coveredBundleUnreadableFrameOrJoinRouteAtEveryPositionFailsClosed() throws Exception {
+        for (int position = 0; position < 3; position++) {
+            for (int kind = 0; kind < 2; kind++) {
+                final int at = position;
+                final int which = kind;
+                try (NRig rig = NRig.start(2)) {
+                    rig.activateBoth();
+                    MultistreamSession.UpdateToken token = rig.server.registerUpdate(rig.server.openScope());
+                    List<OutboundPacket> members = members(NRig.frame(NRig.CONTROL_ID, "a"),
+                            NRig.frame(NRig.CONTROL_ID, "b"), NRig.frame(NRig.CONTROL_ID, "c"));
+                    members.set(at, which == 0
+                            ? new OutboundPacket(new byte[] {0})
+                            : new OutboundPacket(NRig.frame(NRig.JOIN_ID, "join")));
+                    List<List<MultistreamSession.UpdateToken>> coverage =
+                            new ArrayList<List<MultistreamSession.UpdateToken>>();
+                    for (int i = 0; i < 3; i++) {
+                        coverage.add(new ArrayList<MultistreamSession.UpdateToken>());
+                    }
+                    coverage.get(at).add(token);
+
+                    assertTrue(rig.server.sendCoveredBundle(
+                            new OutboundPacket(NRig.frame(NRig.BUNDLE_OPEN, "")), members,
+                            new OutboundPacket(NRig.frame(NRig.BUNDLE_CLOSE, "")), coverage).isEmpty(),
+                            "member " + at + " kind " + which + " was refused");
+                    assertEquals(CLOSE_ORDERING, closed(rig.serverGame).code);
+                    assertEquals(CLOSE_ORDERING, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
+                    assertEquals(null, bundleUnit(rig.clientGame, "a"));
+                }
+            }
         }
     }
 
