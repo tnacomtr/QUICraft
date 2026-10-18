@@ -8,12 +8,25 @@ import java.util.function.LongSupplier;
  * Transport-clock timer for a dependency-blocked lane head or a refused local resource wait
  * (protocol.md 13.10 and 13.12).
  *
- * <p>The wait starts once and is never reset when prerequisites change. It runs on the local
- * monotonic transport clock. For a blocked head it excludes recorded game-executor tick stalls,
- * but only up to {@link #STALL_ALLOWANCE_NANOS} in total per wait; after that allowance is used up,
- * further stall time counts and the timer expires. The 10 second base and 60 second allowance give
- * a retention of at most 70 seconds. Local resource waits construct the timer with
- * {@code excludeStalls=false}, so executor stalls never pause them.
+ * <p>The wait starts once and is never reset when prerequisites change: {@link #start()} while the timer
+ * is already running is ignored. The base is 10 seconds of transport time. A blocked head additionally
+ * excludes recorded game-executor tick stalls, but only up to {@link #STALL_ALLOWANCE_NANOS} in total per
+ * wait; after that allowance is used up, further stall time counts and the timer expires. The 10 second
+ * base and 60 second allowance give a retention of at most 70 seconds. Local resource waits construct the
+ * timer with {@code excludeStalls=false}, so executor stalls never pause them.
+ *
+ * <p>Stall notifications are accepted only while the wait is running, and every reported interval is
+ * clipped to that wait with wait-relative offsets: an interval that starts before the wait contributes
+ * only from the wait's start, and an end reported past the current clock reading contributes only up to
+ * that reading. Overlapping reported intervals are excluded once (their union, no double count), and the
+ * recorded exclusion saturates at the allowance before any addition, so it can neither overflow nor go
+ * negative. Late observation of a completed interval yields the same exclusion as timely observation;
+ * nothing is applied retroactively to a wait that already ended.
+ *
+ * <p>All timestamps compared here are readings of the timer's clock. Offsets are differences of readings,
+ * so clocks with negative origins (for example {@link System#nanoTime()}) are fine, under the assumption
+ * that two readings compared for one wait are less than half a long range apart, which makes the
+ * difference unambiguous (no wrap).
  *
  * <p>Not thread-safe; the owning receive path drives it.
  */
@@ -27,9 +40,11 @@ public final class BlockedHeadTimer {
     private final boolean excludeStalls;
     private boolean running;
     private long startedAt;
-    private long stallTotal;
+    private long excluded;
+    private boolean covered;
+    private long coveredEndOffset;
     private boolean inStall;
-    private long stallBeganAt;
+    private long stallBeganOffset;
 
     /**
      * @param clock monotonic nanosecond transport clock, not wall time
@@ -50,8 +65,11 @@ public final class BlockedHeadTimer {
         }
         running = true;
         startedAt = clock.getAsLong();
-        stallTotal = 0;
+        excluded = 0;
+        covered = false;
+        coveredEndOffset = 0;
         inStall = false;
+        stallBeganOffset = 0;
     }
 
     /** Stops the wait, for example when the head is enqueued (Q) or released. */
@@ -65,20 +83,41 @@ public final class BlockedHeadTimer {
         return running;
     }
 
-    /** Records the start of a tick stall observed by the game executor (LaneGame hook). */
+    /** Records the start of a tick stall observed by the game executor, now (LaneGame hook). */
     public void stallStarted() {
+        stallStarted(clock.getAsLong());
+    }
+
+    /**
+     * Records the start of a tick stall at an explicit monotonic time (13.10's clock discipline: the stall
+     * is timestamped by the executor's own completion record, not by when a watchdog noticed it). The start
+     * is taken only while the wait is running and is stored as an offset from the wait's start, so an
+     * interval that began before the wait contributes only from the wait's start. While an interval is
+     * open, further start notifications are ignored.
+     */
+    public void stallStarted(long atNanos) {
         if (running && excludeStalls && !inStall) {
             inStall = true;
-            stallBeganAt = clock.getAsLong();
+            stallBeganOffset = waitOffset(atNanos);
         }
     }
 
-    /** Records the end of a tick stall observed by the game executor (LaneGame hook). */
+    /** Records the end of a tick stall, now (LaneGame hook). */
     public void stallEnded() {
-        if (inStall) {
-            stallTotal += clock.getAsLong() - stallBeganAt;
-            inStall = false;
+        stallEnded(clock.getAsLong());
+    }
+
+    /**
+     * Records the end of a tick stall at an explicit monotonic time; an end before the start excludes
+     * nothing, and an end observed after the interval already happened excludes the same time it would
+     * have excluded when reported live.
+     */
+    public void stallEnded(long atNanos) {
+        if (!inStall) {
+            return;
         }
+        inStall = false;
+        record(atNanos);
     }
 
     /** Returns the stall time excluded so far, capped at the 60 second allowance. */
@@ -86,8 +125,11 @@ public final class BlockedHeadTimer {
         if (!running || !excludeStalls) {
             return 0;
         }
-        long total = stallTotal + (inStall ? clock.getAsLong() - stallBeganAt : 0);
-        return Math.min(total, STALL_ALLOWANCE_NANOS);
+        long total = excluded;
+        if (inStall) {
+            total = addCapped(total, coverage(waitOffset(clock.getAsLong())));
+        }
+        return total;
     }
 
     /** Reports whether any recorded stall time was excluded, which blocks the 0x12 phrase (13.12). */
@@ -95,16 +137,72 @@ public final class BlockedHeadTimer {
         return excludedNanos() > 0;
     }
 
-    /** Returns the active wait time: elapsed transport time minus the excluded stall time. */
+    /** Returns the active wait time: elapsed transport time minus the excluded stall time, never negative. */
     public long activeNanos() {
         if (!running) {
             return 0;
         }
-        return (clock.getAsLong() - startedAt) - excludedNanos();
+        long elapsed = waitOffset(clock.getAsLong());
+        return Math.max(0, elapsed - excludedNanos());
     }
 
     /** Reports whether the wait has reached its 10 second base. */
     public boolean expired() {
         return running && activeNanos() >= TIMEOUT_NANOS;
+    }
+
+    /** A clock reading relative to the wait start; a reading before the wait clips to zero. */
+    private long waitOffset(long atNanos) {
+        long offset = atNanos - startedAt;
+        return offset < 0 ? 0 : offset;
+    }
+
+    /** Records a reported stall interval end, clipped to the observation and to already covered time. */
+    private void record(long endNanos) {
+        if (!running || !excludeStalls) {
+            return;
+        }
+        long endOffset = waitOffset(endNanos);
+        long nowOffset = waitOffset(clock.getAsLong());
+        if (endOffset > nowOffset) {
+            endOffset = nowOffset;
+        }
+        long began = stallBeganOffset;
+        if (covered && began < coveredEndOffset) {
+            began = coveredEndOffset;
+        }
+        if (began < 0) {
+            began = 0;
+        }
+        if (endOffset <= began) {
+            return;
+        }
+        excluded = addCapped(excluded, endOffset - began);
+        covered = true;
+        coveredEndOffset = endOffset;
+    }
+
+    /** Coverage of the currently open interval at {@code nowOffset}, clipped to this wait. */
+    private long coverage(long nowOffset) {
+        long began = stallBeganOffset;
+        if (covered && began < coveredEndOffset) {
+            began = coveredEndOffset;
+        }
+        if (began < 0) {
+            began = 0;
+        }
+        return nowOffset > began ? nowOffset - began : 0;
+    }
+
+    /** Adds to the exclusion, saturating at the allowance before any addition can overflow. */
+    private static long addCapped(long total, long delta) {
+        if (delta <= 0) {
+            return total;
+        }
+        long remaining = STALL_ALLOWANCE_NANOS - total;
+        if (remaining <= 0 || delta >= remaining) {
+            return STALL_ALLOWANCE_NANOS;
+        }
+        return total + delta;
     }
 }

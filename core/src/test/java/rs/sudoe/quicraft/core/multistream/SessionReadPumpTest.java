@@ -514,9 +514,9 @@ class SessionReadPumpTest {
         SessionReadPump.Unit unit = nextUnit(pump);
         assertTrue(resources.inboundExcess().reserved("A") > 0, "the record holds excess");
         now[0] += 5_000_000_000L;
-        if (stall) resources.executorStallStarted();
+        if (stall) resources.stallPairing().enter(now[0]);
         now[0] += 10_000_000_000L;
-        if (stall) resources.executorStallEnded();
+        if (stall) resources.stallPairing().exit(now[0]);
         now[0] += 5_000_000_000L;
         double score = resources.inboundRanking().score("A", now[0]);
         unit.close();
