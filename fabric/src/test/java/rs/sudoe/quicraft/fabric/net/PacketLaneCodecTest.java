@@ -13,6 +13,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
+import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.buffer.UnpooledHeapByteBuf;
 import io.netty.channel.embedded.EmbeddedChannel;
 import java.lang.reflect.Field;
 import net.minecraft.SharedConstants;
@@ -238,12 +240,42 @@ class PacketLaneCodecTest {
         PacketLaneCodec codec = new PacketLaneCodec(channel.pipeline(), REFLECTION);
         byte[] packet = finishConfigurationPacket();
 
-        assertThrows(IllegalStateException.class, () -> codec.decodeInflated(Unpooled.wrappedBuffer(packet),
-                ProtocolState.CONFIGURATION, (add, total) -> {
-                    throw new IllegalStateException("over budget (13.12)");
-                }));
+        // The content fails loudly if anything copies it: the reservation must refuse first.
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> codec.decodeInflated(new NoCopyBuf(packet), ProtocolState.CONFIGURATION,
+                        (add, total) -> {
+                            throw new IllegalStateException("over budget (13.12)");
+                        }));
+        assertEquals("over budget (13.12)", refused.getMessage());
         assertNotNull(channel.pipeline().get("decoder"), "nothing reached the pipeline");
         channel.finishAndReleaseAll();
+    }
+
+    /** A buffer whose every byte-exposing access fails: proves the reservation ran before any copy. */
+    private static final class NoCopyBuf extends UnpooledHeapByteBuf {
+        NoCopyBuf(byte[] bytes) {
+            super(UnpooledByteBufAllocator.DEFAULT, bytes, bytes.length);
+        }
+
+        @Override
+        public byte[] array() {
+            throw new AssertionError("the packet was copied before the reservation");
+        }
+
+        @Override
+        public java.nio.ByteBuffer nioBuffer() {
+            throw new AssertionError("the packet was copied before the reservation");
+        }
+
+        @Override
+        public java.nio.ByteBuffer nioBuffer(int index, int length) {
+            throw new AssertionError("the packet was copied before the reservation");
+        }
+
+        @Override
+        public ByteBuf getBytes(int index, byte[] dst, int dstIndex, int length) {
+            throw new AssertionError("the packet was copied before the reservation");
+        }
     }
 
     @Test

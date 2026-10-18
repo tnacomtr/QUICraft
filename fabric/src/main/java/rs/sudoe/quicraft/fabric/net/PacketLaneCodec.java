@@ -146,10 +146,11 @@ public final class PacketLaneCodec implements GameLanes.Codec {
             throw new IllegalStateException("no inbound protocol is configured (13.16)");
         }
         ProtocolInfo<?> info = access.decoderProtocol(decoder);
+        // 13.12: charge the retained packet copy before that copy exists, so an over-budget
+        // reservation refuses it without allocating anything.
+        int retained = content.readableBytes();
+        reservation.reserve(retained, retained);
         byte[] packet = ByteBufUtil.getBytes(content);
-        // 13.12: charge the retained packet copy before it exists; the pump already inflated the
-        // record under its own budget, so only these bytes are new.
-        reservation.reserve(packet.length, packet.length);
         int id = FrameCodec.packetId(packet);
         decodedSizes.accept(packet.length);
         boolean compressed = pipeline.get(DECOMPRESS) instanceof CompressionDecoder;
