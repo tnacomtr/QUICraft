@@ -193,6 +193,29 @@ class CausalScopeTest {
         assertEquals(AckJoinTracker.MAX_SCOPES, acks.scopeCount());
     }
 
+    // 9b. A duplicate cover at exactly the membership cap is a no-op, never a capacity failure:
+    // the driver maps CapacityException to a local 0x12 close, and re-covering an existing member
+    // must not close a healthy session (review finding). Distinct-member overflow is unreachable
+    // while MAX_SCOPES == MAX_COVER_PER_ACK; if that ever changes, the capacity branch applies.
+    @Test void duplicateCoverAtCapIsANoOp() {
+        AckJoinTracker acks = new AckJoinTracker();
+        assertTrue(acks.create(1, 4, 0));
+        CausalScope first = null;
+        for (int i = 0; i < AckJoinTracker.MAX_COVER_PER_ACK; i++) {
+            CausalScope scope = acks.openScope();
+            if (first == null) {
+                first = scope;
+            }
+            acks.coverScope(1, scope);
+            acks.completeScope(scope);
+        }
+        acks.coverScope(1, first);
+        acks.coverScope(1, first);
+        acks.sealAckCoverage(1);
+        assertNotNull(acks.take(1, 1, 0, null),
+                "the duplicate cover left coverage intact and the ack resolvable once complete");
+    }
+
     // 10. Foreign-session rejection: two trackers whose local ids both start at 1 (Defect 2).
     @Test void foreignTrackerHandlesRejected() {
         AckJoinTracker a = new AckJoinTracker();

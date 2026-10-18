@@ -36,7 +36,7 @@ public final class AckJoinTracker {
     /** Max live (open or completed, not retired) causal scopes per connection (U1, 13.19). */
     public static final int MAX_SCOPES = 128;
     /** Max scopes covering one ack, bounding per-ack membership (U1, 13.19). */
-    private static final int MAX_COVER_PER_ACK = 128;
+    public static final int MAX_COVER_PER_ACK = 128;
     /** Max live (unresolved) update tokens per scope; resolved tokens are dropped at once (U1, 13.19). */
     public static final int MAX_TOKENS_PER_SCOPE = 128;
     /** Frontier keys of a tracker that does not know its session shape (U1, 13.19). */
@@ -518,12 +518,16 @@ public final class AckJoinTracker {
             covered = new HashSet<Long>();
             ackScopes.put(ackId, covered);
         }
+        if (covered.contains(id)) {
+            // 13.19: a duplicate cover is a no-op, and it must stay one even at the cap, or re-covering
+            // an existing member would be mapped to a resource close by the driver.
+            return;
+        }
         if (covered.size() >= MAX_COVER_PER_ACK) {
             throw new CapacityException("ack scope cap");
         }
-        if (covered.add(id)) {
-            scopeAcks.computeIfAbsent(id, k -> new HashSet<Long>()).add(ackId);
-        }
+        covered.add(id);
+        scopeAcks.computeIfAbsent(id, k -> new HashSet<Long>()).add(ackId);
     }
 
     /**
