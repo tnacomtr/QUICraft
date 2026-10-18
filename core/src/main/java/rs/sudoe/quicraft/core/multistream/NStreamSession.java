@@ -382,6 +382,12 @@ public final class NStreamSession implements MultistreamSession {
     private boolean executing;
     private int executingStream = -1;
     private long executingSequence;
+    /** When the executing unit became pending on the game executor; -1 when none is (13.10). */
+    private long pendingSince = -1;
+    /** True while this connection is recorded as stalled on the game executor (13.10). */
+    private boolean stallOpen;
+    /** The executor generation this session last synchronized with (see {@link ExecutorStallWatch#replaceExecutor}). */
+    private long watchGeneration;
     private boolean endSubmitted;
     private long endWrittenAt;
     private io.netty.util.concurrent.ScheduledFuture<?> ticker;
@@ -733,6 +739,74 @@ public final class NStreamSession implements MultistreamSession {
     }
 
     @Override
+    public void stallStarted(final long atNanos) {
+        run(() -> {
+            if (!closed && !stallOpen) {
+                openStall(atNanos);
+            }
+        });
+    }
+
+    @Override
+    public void stallEnded(final long atNanos) {
+        run(() -> {
+            if (stallOpen) {
+                closeStall(atNanos);
+            }
+        });
+    }
+
+    /**
+     * Derives this connection's stall from the side's executor watch (13.10, loop only). A stall is open only while
+     * unit work is pending on the executor past the threshold. Start and end use the watch's qualifying and
+     * completion instants, so the watchdog's own delay never counts.
+     */
+    private void syncExecutorStall(long t) {
+        ExecutorStallWatch watch = resources.executorWatch();
+        if (watch.generation() != watchGeneration) {
+            // The executor was replaced: a stall against the old one ends now, and pending work restarts its clock.
+            watchGeneration = watch.generation();
+            if (stallOpen) {
+                closeStall(t);
+            }
+            if (pendingSince >= 0) {
+                pendingSince = t;
+            }
+        }
+        long since = watch.stalledSince(t, pendingSince);
+        if (since >= 0) {
+            if (!stallOpen) {
+                openStall(since);
+            }
+        } else if (stallOpen) {
+            // The completion that ended the stall is the end instant, not the moment it was observed.
+            closeStall(Math.max(watch.lastCompletion(), pendingSince));
+        }
+    }
+
+    private void openStall(long atNanos) {
+        stallOpen = true;
+        resources.stallPairing().enter(atNanos);
+        if (serverDriver != null) {
+            serverDriver.stallStarted(atNanos);
+        }
+        if (clientDriver != null) {
+            clientDriver.stallStarted(atNanos);
+        }
+    }
+
+    private void closeStall(long atNanos) {
+        stallOpen = false;
+        resources.stallPairing().exit(atNanos);
+        if (serverDriver != null) {
+            serverDriver.stallEnded(atNanos);
+        }
+        if (clientDriver != null) {
+            clientDriver.stallEnded(atNanos);
+        }
+    }
+
+    @Override
     public void applied(final Lane lane, final long sequence) {
         // Always queued: a game may acknowledge from inside deliver, which runs in the receive driver.
         loop.execute(() -> guarded(() -> doApplied(lane, sequence)));
@@ -1009,6 +1083,11 @@ public final class NStreamSession implements MultistreamSession {
             return;
         }
         executing = false;
+        pendingSince = -1;
+        if (stallOpen) {
+            // The pending work drained: the executor is no longer owed anything, so the stall ends here.
+            closeStall(now());
+        }
         try {
             if (serverDriver != null) {
                 serverDriver.acknowledged(executingStream, sequence);
@@ -1144,6 +1223,9 @@ public final class NStreamSession implements MultistreamSession {
             fail(CLOSE_ORDERING, NO_REASON, "a peer stream did not open in time (13.3)", null);
             return;
         }
+        // 13.10: stall evidence is synced before any close deadline is evaluated, so a stall the watchdog has not yet
+        // been told about cannot expire a deadline.
+        syncExecutorStall(t);
         if (game != null && !receiveOnce()) {
             return;
         }
@@ -1267,6 +1349,12 @@ public final class NStreamSession implements MultistreamSession {
         ticker = null;
         if (scheduled != null) {
             quietly(() -> scheduled.cancel(false), "ticker");
+        }
+        if (stallOpen) {
+            // A session that closes while stalled still leaves the listener's pairing, or the ranking would keep
+            // excluding time for a connection that no longer exists.
+            stallOpen = false;
+            quietly(() -> resources.stallPairing().exit(now()), "executor stall pairing");
         }
         quietly(sendDriver::close, "send driver");
         if (serverDriver != null) {
@@ -1521,6 +1609,7 @@ public final class NStreamSession implements MultistreamSession {
         @Override
         public void onEnqueued(Lane lane, int logicalStream, long sequence) {
             executing = true;
+            pendingSince = now();
             executingStream = logicalStream;
             executingSequence = sequence;
             game.onEnqueued(lane, logicalStream, sequence);

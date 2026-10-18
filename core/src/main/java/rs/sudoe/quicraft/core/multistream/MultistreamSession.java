@@ -69,6 +69,21 @@ public interface MultistreamSession {
     /** True while the unsent queue is below its backpressure mark. */
     boolean isWritable();
 
+    /**
+     * The game executor stalled from {@code atNanos} (13.10), on this side's executor clock. Additive: the default
+     * throws, so a session without stall support never silently counts executor time toward its close clocks. The
+     * stall is also derived from the side's {@link ExecutorStallWatch}; explicit reports are for platforms that
+     * time their own stalls.
+     */
+    default void stallStarted(long atNanos) {
+        throw new UnsupportedOperationException("executor stall reporting");
+    }
+
+    /** The executor stall that began with {@link #stallStarted(long)} ended at {@code atNanos} (13.10). */
+    default void stallEnded(long atNanos) {
+        throw new UnsupportedOperationException("executor stall reporting");
+    }
+
     // Additive ACK_JOIN and BATCH_JOIN passthroughs (13.19), mirroring SessionSendDriver.
 
     default boolean createAck(long id, byte[] payload, int chargedBytes) {
