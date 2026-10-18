@@ -3,7 +3,10 @@ package rs.sudoe.quicraft.fabric.gametest;
 
 import static rs.sudoe.quicraft.fabric.gametest.GameTests.check;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
@@ -11,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -36,18 +40,36 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * <p>The game classes are reached by reflection: this source set is shared with the 1.21.11 jar,
  * where the same names are obfuscated and the test has nothing to pin. It returns early there.
  *
+ * <p>On the module's own game version it also compares the complete live play protocol, both
+ * directions and every id, against the checked-in {@code play-ids-775.txt} (core's routing test
+ * resources). A new, removed or renamed packet therefore fails here until the fixture is refreshed;
+ * a module version bump to another protocol fails loudly too. Rows that test the same jar on another
+ * release through a {@code -P<module>.minecraft} override skip visibly instead.
+ *
  * <p>With {@code -Pquicraft.emitPlayIds} (system property {@code quicraft.gametest.emitPlayIds}, see
- * docs/platforms/fabric.md) it also writes and prints the full inventory of both directions, one
- * {@code <direction> <id> <name>} line per packet sorted by id. That is how core's
- * {@code play-ids-775.txt} fixture is regenerated from the live game instead of hand-edited. Without
- * the property the run is unchanged.
+ * docs/platforms/fabric.md) it writes and prints the full inventory of both directions, one
+ * {@code <direction> <id> <name>} line per packet sorted by id. That is how the fixture is
+ * regenerated from the live game instead of hand-edited; a refresh run skips the comparison.
  */
 public class RoutingTableGameTest implements FabricClientGameTest {
     /** The shipped 26.1.2 protocol number. */
     private static final int PROTOCOL = 775;
 
+    /** The checked-in inventory, on the gametest runtime classpath (quicraft.fabric-conventions). */
+    private static final String INVENTORY_RESOURCE =
+            "rs/sudoe/quicraft/core/routing/play-ids-" + PROTOCOL + ".txt";
+
+    /** The same file from the repository root, for the refresh command. */
+    private static final String FIXTURE_PATH = "core/src/test/resources/" + INVENTORY_RESOURCE;
+
     /** Makes the test emit the inventory: -Pquicraft.emitPlayIds=true (default path) or a file path. */
     private static final String EMIT_PROPERTY = "quicraft.gametest.emitPlayIds";
+
+    /**
+     * Set by the build: whether this module is built for its own game version, with no
+     * {@code -P<module>.minecraft} override. True means a protocol change is a stale fixture.
+     */
+    private static final String PINNED_PROPERTY = "quicraft.gametest.pinnedVersion";
 
     /** Marks the emitted inventory on stdout. */
     private static final String BLOCK = "QUICraft play packet inventory, protocol " + PROTOCOL;
@@ -86,14 +108,31 @@ public class RoutingTableGameTest implements FabricClientGameTest {
 
     @Override
     public void runTest(ClientGameTestContext context) {
-        if (SharedConstants.getProtocolVersion() != PROTOCOL) {
+        if (!liveProtocolAvailable()) {
+            System.out.println("[QUICraft] the play protocol classes are obfuscated in this jar"
+                    + " (1.21.11); the protocol-" + PROTOCOL + " inventory check does not apply");
+            return;
+        }
+        int liveProtocol = SharedConstants.getProtocolVersion();
+        if (liveProtocol != PROTOCOL) {
+            String message = "the live game is PLAY protocol " + liveProtocol
+                    + ", but the checked-in inventory pins " + PROTOCOL + " (" + INVENTORY_RESOURCE + ")";
+            if (Boolean.parseBoolean(System.getProperty(PINNED_PROPERTY, "true"))) {
+                throw new AssertionError(message + ". Refresh the fixture: " + refreshCommand());
+            }
+            System.out.println("[QUICraft] " + message + "; this row tests another release"
+                    + " (a -P<module>.minecraft override), skipping");
             return;
         }
         try {
             Map<String, Integer> clientbound = liveIds("CLIENTBOUND_TEMPLATE");
             Map<String, Integer> serverbound = liveIds("SERVERBOUND_TEMPLATE");
             pin(clientbound, serverbound);
-            emit(clientbound, serverbound);
+            if (emit(clientbound, serverbound)) {
+                System.out.println("[QUICraft] refresh run: the checked-in inventory comparison is skipped");
+                return;
+            }
+            compareInventory(clientbound, serverbound);
         } catch (AssertionError e) {
             throw e;
         } catch (Exception e) {
@@ -137,14 +176,14 @@ public class RoutingTableGameTest implements FabricClientGameTest {
 
     /**
      * With {@link #EMIT_PROPERTY} set, writes the full inventory to a file and prints it between
-     * BEGIN/END markers so either capture path works. Emission happens after the pins pass, so a
-     * version whose ids don't match the shipped table emits nothing.
+     * BEGIN/END markers so either capture path works, then returns true. Emission happens after the
+     * pins pass, so a version whose ids don't match the shipped table emits nothing.
      */
-    private static void emit(Map<String, Integer> clientbound, Map<String, Integer> serverbound)
+    private static boolean emit(Map<String, Integer> clientbound, Map<String, Integer> serverbound)
             throws IOException {
         String target = System.getProperty(EMIT_PROPERTY);
         if (target == null) {
-            return;
+            return false;
         }
         List<String> lines = inventory(clientbound, serverbound);
         StringBuilder block = new StringBuilder(BLOCK).append(" BEGIN\n");
@@ -175,6 +214,117 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         }
         Files.write(path, file.toString().getBytes(StandardCharsets.UTF_8));
         System.out.println("[QUICraft] play packet inventory written to " + path.toAbsolutePath());
+        return true;
+    }
+
+    /**
+     * The complete live play protocol must equal the checked-in inventory, both directions and every
+     * id. The routed subset in {@link #EXPECTED} cannot catch a new CONTROL packet, so the whole
+     * mapping is compared here.
+     */
+    private static void compareInventory(Map<String, Integer> clientbound, Map<String, Integer> serverbound)
+            throws IOException {
+        Map<Direction, Map<Integer, String>> checkedIn = readInventory();
+        Map<Direction, Map<Integer, String>> live =
+                new EnumMap<Direction, Map<Integer, String>>(Direction.class);
+        live.put(Direction.CLIENTBOUND, byId(clientbound));
+        live.put(Direction.SERVERBOUND, byId(serverbound));
+        for (Direction direction : Direction.values()) {
+            Map<Integer, String> expected = checkedIn.get(direction);
+            Map<Integer, String> actual = live.get(direction);
+            check(expected.equals(actual), "the checked-in " + direction.wireName()
+                    + " PLAY protocol does not match the live game (" + differences(expected, actual)
+                    + "). The fixture is stale: refresh it with " + refreshCommand());
+        }
+    }
+
+    /** The checked-in inventory as direction to id to name, parsed like the emitted lines. */
+    private static Map<Direction, Map<Integer, String>> readInventory() throws IOException {
+        InputStream in = RoutingTableGameTest.class.getClassLoader().getResourceAsStream(INVENTORY_RESOURCE);
+        check(in != null, "the checked-in inventory " + INVENTORY_RESOURCE
+                + " is not on the gametest classpath (quicraft.fabric-conventions.gradle.kts)");
+        Map<Direction, Map<Integer, String>> byDirection =
+                new EnumMap<Direction, Map<Integer, String>>(Direction.class);
+        for (Direction direction : Direction.values()) {
+            byDirection.put(direction, new TreeMap<Integer, String>());
+        }
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            String line;
+            int number = 0;
+            while ((line = reader.readLine()) != null) {
+                number++;
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || trimmed.charAt(0) == '#') {
+                    continue;
+                }
+                String[] parts = trimmed.split("\\s+");
+                check(parts.length == 3, INVENTORY_RESOURCE + " line " + number
+                        + " is not <direction> <id> <name>: " + line);
+                Direction direction = Direction.of(parts[0]);
+                int id = Integer.parseInt(parts[1]);
+                String previous = byDirection.get(direction).put(id, parts[2]);
+                check(previous == null, INVENTORY_RESOURCE + " line " + number + " repeats "
+                        + direction.wireName() + " id " + id + " (" + previous + " and " + parts[2] + ")");
+            }
+        }
+        return byDirection;
+    }
+
+    /** What differs, compactly: missing ids, unexpected ids and ids bound to another name. */
+    private static String differences(Map<Integer, String> expected, Map<Integer, String> actual) {
+        StringBuilder message = new StringBuilder();
+        int shown = 0;
+        for (Map.Entry<Integer, String> entry : expected.entrySet()) {
+            String liveName = actual.get(entry.getKey());
+            if (liveName == null) {
+                shown = appendDifference(message, shown, "missing " + entry.getKey() + "=" + entry.getValue());
+            } else if (!liveName.equals(entry.getValue())) {
+                shown = appendDifference(message, shown, "id " + entry.getKey() + " is " + liveName
+                        + ", not " + entry.getValue());
+            }
+        }
+        for (Map.Entry<Integer, String> entry : actual.entrySet()) {
+            if (!expected.containsKey(entry.getKey())) {
+                shown = appendDifference(message, shown,
+                        "unexpected " + entry.getKey() + "=" + entry.getValue());
+            }
+        }
+        return shown == 0 ? "the same entries" : message.toString();
+    }
+
+    private static int appendDifference(StringBuilder message, int shown, String difference) {
+        if (shown == 10) {
+            message.append(", ...");
+        } else if (shown < 10) {
+            message.append(shown == 0 ? "" : ", ").append(difference);
+        }
+        return shown + 1;
+    }
+
+    /** The refresh command, run from the repository root (docs/platforms/fabric.md has the caveat). */
+    private static String refreshCommand() {
+        return "xvfb-run -a -s \"-screen 0 1280x720x24\" ./gradlew :fabric-26x:runClientGameTest"
+                + " -Pquicraft.emitPlayIds=" + FIXTURE_PATH
+                + ", then update PROTOCOL and core's PlayIdInventoryTest and check all three in";
+    }
+
+    /** Whether the game's play protocol can be read by name (false on 1.21.11, where it is obfuscated). */
+    private static boolean liveProtocolAvailable() {
+        try {
+            Class.forName("net.minecraft.network.protocol.game.GameProtocols");
+            return true;
+        } catch (ClassNotFoundException | LinkageError e) {
+            return false;
+        }
+    }
+
+    /** The same mapping as id to name. */
+    private static Map<Integer, String> byId(Map<String, Integer> ids) {
+        Map<Integer, String> byId = new TreeMap<Integer, String>();
+        for (Map.Entry<String, Integer> entry : ids.entrySet()) {
+            byId.put(entry.getValue(), entry.getKey());
+        }
+        return byId;
     }
 
     /** One {@code <direction> <id> <name>} line per live play packet, ids ascending per direction. */
@@ -186,12 +336,8 @@ public class RoutingTableGameTest implements FabricClientGameTest {
     }
 
     private static List<String> directionLines(Direction direction, Map<String, Integer> ids) {
-        Map<Integer, String> byId = new TreeMap<Integer, String>();
-        for (Map.Entry<String, Integer> entry : ids.entrySet()) {
-            byId.put(entry.getValue(), entry.getKey());
-        }
         List<String> lines = new ArrayList<String>();
-        for (Map.Entry<Integer, String> entry : byId.entrySet()) {
+        for (Map.Entry<Integer, String> entry : byId(ids).entrySet()) {
             lines.add(direction.wireName() + " " + entry.getKey() + " " + entry.getValue());
         }
         return lines;
