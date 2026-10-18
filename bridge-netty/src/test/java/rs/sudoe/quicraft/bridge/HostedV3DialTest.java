@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -15,17 +16,21 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import io.netty.channel.ReflectiveChannelFactory;
 import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.multistream.LaneGame;
+import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
@@ -50,9 +55,31 @@ class HostedV3DialTest {
     private static final int PROTOCOL = 4242;
     private static final RoutingTable TABLE = RoutingTableLoader.parse(
             "{\"schema\":1,\"protocol\":4242,\"default\":\"control\",\"routes\":[]}");
+    /**
+     * A valid schema-2 table for the session test (13.7): no routes, so every packet is
+     * CONTROL/global, with the limits every state must declare.
+     */
+    private static final RoutingTable TABLE_V2 = RoutingTableLoader.parse(tableV2Json());
     private static ServerIdentity identity;
+    private EventLoopGroup serverGroup;
+    private EventLoop serverLoop;
     private EventLoopGroup clientGroup;
     private EventLoop clientLoop;
+
+    private static String tableV2Json() {
+        String limit = "{\"maxServerboundRecord\":32768,\"maxServerboundRealtimeRecord\":510,"
+                + "\"maxDecodedFootprint\":1048576,\"ordinaryReadAllowance\":5619,"
+                + "\"decodeFootprintBound\":\"primitive.raw_copies.v1\"}";
+        StringBuilder limits = new StringBuilder();
+        for (String state : new String[] {"handshaking", "status", "login", "configuration", "play"}) {
+            if (limits.length() != 0) {
+                limits.append(',');
+            }
+            limits.append('"').append(state).append("\":").append(limit);
+        }
+        return "{\"schema\":2,\"protocol\":4242,\"default\":\"global\",\"extractors\":{},"
+                + "\"serverboundLimits\":{" + limits + "},\"routes\":[]}";
+    }
 
     @BeforeAll
     static void setUpClass() throws Exception {
@@ -64,12 +91,15 @@ class HostedV3DialTest {
 
     @BeforeEach
     void setUp() {
+        serverGroup = new NioEventLoopGroup(1);
+        serverLoop = serverGroup.next();
         clientGroup = new NioEventLoopGroup(1);
         clientLoop = clientGroup.next();
     }
 
     @AfterEach
     void tearDown() {
+        serverGroup.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
         clientGroup.shutdownGracefully(0, 1, TimeUnit.SECONDS).syncUninterruptibly();
     }
 
@@ -101,6 +131,102 @@ class HostedV3DialTest {
             assertTrue(clientLoop.inEventLoop(onLoop.get()), "the exporter ran on the game's loop");
             assertEquals(32, ((byte[]) exported.get()).length);
             client.close();
+        }
+    }
+
+    /**
+     * The N+2 session's periodic tick must run on the hosted loop (13.12). Activation schedules it
+     * through {@code HostedEventLoop.scheduleAtFixedRate}; before that primitive existed the
+     * schedule threw, the connection closed {@code 0x2}, and a real {@code /3} join could never
+     * leave the configuration stage.
+     */
+    @Test
+    void aSessionActivatedOnHostedLoopsRunsItsTicker() throws Exception {
+        DatagramChannel serverUdp = udp(serverLoop);
+        CompletableFuture<V3Connection> accepted = new CompletableFuture<>();
+        try (QuicServer server = QuicServer.bind(GameHost.loop(serverLoop), GameHost.socket(serverUdp), identity,
+                TransportConfig.DEFAULT, stream -> accepted.complete((V3Connection) stream),
+                new V3Listener() {
+                    @Override
+                    public RoutingTable tableFor(int protocolNumber) {
+                        return protocolNumber == PROTOCOL ? TABLE_V2 : null;
+                    }
+                })) {
+            V3Connection client = GameHost.connectV3(clientLoop,
+                    new ReflectiveChannelFactory<>(NioDatagramChannel.class), server.localAddress(),
+                    identity.fingerprint(), TABLE_V2, TransportConfig.DEFAULT, null, false)
+                    .get(10, TimeUnit.SECONDS);
+            V3Connection serverSide = accepted.get(10, TimeUnit.SECONDS);
+            await(serverSide::handshakeComplete, 10_000);
+            await(() -> negotiated(serverSide), 10_000);
+            await(() -> negotiated(client), 10_000);
+            StubGame clientGame = new StubGame();
+            StubGame serverGame = new StubGame();
+            client.activate(clientGame, null);
+            serverSide.activate(serverGame, PROTOCOL, null);
+            await(() -> client.session() != null && serverSide.session() != null, 5_000);
+            // Several ticks of the session's periodic task: it used to throw here and close 0x2.
+            Thread.sleep(300);
+            assertTrue(client.isOpen(), "the client /3 connection stayed open: " + clientGame);
+            assertTrue(serverSide.isOpen(), "the server /3 connection stayed open: " + serverGame);
+            assertFalse(clientGame.closed, "the client game saw a close");
+            assertFalse(serverGame.closed, "the server game saw a close");
+            client.end();
+            serverSide.end();
+        }
+    }
+
+    private static DatagramChannel udp(EventLoop loop) throws InterruptedException {
+        DatagramChannel channel = new NioDatagramChannel();
+        loop.register(channel).sync();
+        channel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0)).sync();
+        return channel;
+    }
+
+    private static boolean negotiated(V3Connection connection) {
+        try {
+            connection.sessionContext();
+            return true;
+        } catch (IllegalStateException notYet) {
+            return false;
+        }
+    }
+
+    private static void await(BooleanSupplier condition, long millis) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("condition not met within " + millis + " ms");
+            }
+            Thread.sleep(10);
+        }
+    }
+
+    /** Records a close; no record is expected in this test. */
+    private static final class StubGame implements LaneGame {
+        volatile boolean closed;
+
+        @Override
+        public Decoded decode(Lane lane, long sequence, byte[] frame, boolean insideBundle, Reservation reservation) {
+            throw new UnsupportedOperationException("no records in this test");
+        }
+
+        @Override
+        public void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle) {
+            throw new UnsupportedOperationException("no records in this test");
+        }
+
+        @Override
+        public void onWritabilityChanged(boolean writable) { }
+
+        @Override
+        public void onClosed(int code, boolean byPeer, Throwable cause) {
+            closed = true;
+        }
+
+        @Override
+        public String toString() {
+            return closed ? "closed" : "open";
         }
     }
 
