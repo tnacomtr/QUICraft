@@ -697,6 +697,97 @@ class V3ConnectionTest {
         }
     }
 
+    // --- Latch and notification tests (defect fix verification).
+
+    @Test
+    void twoInlineActivationsAfterFailureNotifyExactlyOnce() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            assertTrue(await(pair.client::handshakeComplete, 5_000), "the client's handshake");
+            assertTrue(await(() -> negotiated(pair.serverSide) != null, 5_000), "negotiated");
+            assertTrue(await(() -> negotiated(pair.client) != null, 5_000), "negotiated");
+            SessionResources serverResources = serverResources(pair.serverSide);
+            assertNotNull(serverResources, "server resources");
+            serverResources.progressWatch().invalidate();
+
+            pair.serverSide.detachForActivation(leftover -> { });
+            pair.serverSide.activate(pair.serverGame, 4242, false, ByteBuffer.wrap(LOGIN_FLIGHT));
+            // The first activation fails with 0x12; the second must be inert.
+            pair.serverSide.activate(pair.serverGame, 4242, false, ByteBuffer.wrap(LOGIN_FLIGHT));
+
+            assertSingleLocalClose(pair.serverGame, "server");
+        }
+    }
+
+    @Test
+    void aLateReentrantActivateAfterActivationFailureIsInert() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            assertTrue(await(pair.client::handshakeComplete, 5_000), "the client's handshake");
+            assertTrue(await(() -> negotiated(pair.serverSide) != null, 5_000), "negotiated");
+            assertTrue(await(() -> negotiated(pair.client) != null, 5_000), "negotiated");
+            SessionResources serverResources = serverResources(pair.serverSide);
+            assertNotNull(serverResources, "server resources");
+            serverResources.progressWatch().invalidate();
+
+            pair.serverSide.detachForActivation(leftover -> { });
+            pair.serverSide.activate(pair.serverGame, 4242, false, ByteBuffer.wrap(LOGIN_FLIGHT));
+            assertTrue(await(() -> pair.serverGame.closeCause.isDone(), 5_000),
+                    "first activation notifies");
+            int countAfterFirst = pair.serverGame.closedCount.get();
+            assertEquals(1, countAfterFirst, "exactly one notification after first failure");
+
+            // A reentrant / late activate after the failure must not notify again.
+            pair.serverSide.activate(pair.serverGame, 4242, false, ByteBuffer.wrap(LOGIN_FLIGHT));
+            assertEquals(1, pair.serverGame.closedCount.get(),
+                    "reentrant activation does not notify again");
+        }
+    }
+
+    @Test
+    void aThrowingLaneGamePreservesTheOriginalExceptionAndPeerSeesOnly0x12() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            assertTrue(await(pair.client::handshakeComplete, 5_000), "the client's handshake");
+            assertTrue(await(() -> negotiated(pair.serverSide) != null, 5_000), "negotiated");
+            assertTrue(await(() -> negotiated(pair.client) != null, 5_000), "negotiated");
+            SessionResources serverResources = serverResources(pair.serverSide);
+            assertNotNull(serverResources, "server resources");
+            serverResources.progressWatch().invalidate();
+
+            CompletableFuture<SeenClose> close = watchCloseEvent(channelOf(pair.client));
+            ThrowingGame throwingGame = new ThrowingGame();
+
+            pair.serverSide.detachForActivation(leftover -> { });
+            pair.serverSide.activate(throwingGame, 4242, false, ByteBuffer.wrap(LOGIN_FLIGHT));
+
+            SeenClose seen = close.get(10, TimeUnit.SECONDS);
+            assertEquals(Protocol.CLOSE_RESOURCE, seen.code, "the peer sees 0x12");
+            assertEquals(0, seen.reason.length, "0x12 is sent with an empty wire reason");
+
+            assertTrue(await(() -> throwingGame.closeCause.isDone(), 5_000),
+                    "the original cause is preserved");
+            assertTrue(throwingGame.closeCause.get() instanceof StallClock.UnavailableException,
+                    "the preserved cause is the UnavailableException");
+            assertEquals(1, throwingGame.closedCount.get(),
+                    "exactly one callback attempt despite the throw");
+            assertFalse(throwingGame.closeByPeer, "the close is local");
+        }
+    }
+
+    /** A LaneGame that throws from {@code onClosed} after recording the close, so the catch block
+     * in {@code doActivate} catches it but must not produce a second notification or a 0x10 close. */
+    static final class ThrowingGame extends Game {
+        @Override
+        public void onClosed(int code, boolean byPeer, Throwable cause) {
+            super.onClosed(code, byPeer, cause);
+            throw new IllegalStateException("simulated LaneGame failure after recording the close");
+        }
+    }
+
     /**
      * Contract C: the server's resources belong to the listener. The server factory rejects a null
      * set before constructing anything; this is an ownership/programming-contract error, not a wire
@@ -818,7 +909,7 @@ class V3ConnectionTest {
     }
 
     /** A game that records deliveries, acknowledges them itself, and can echo them back. */
-    static final class Game implements LaneGame {
+    static class Game implements LaneGame {
         final List<Object> delivered = Collections.synchronizedList(new ArrayList<Object>());
         final CompletableFuture<Integer> closed = new CompletableFuture<Integer>();
         final CompletableFuture<Throwable> closeCause = new CompletableFuture<Throwable>();

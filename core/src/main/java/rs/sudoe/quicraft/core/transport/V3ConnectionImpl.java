@@ -113,6 +113,8 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
      */
     private boolean negotiationFailed;
     private volatile boolean activated;
+    /** Terminal latch: a failed activation (StallClock.UnavailableException) is final. */
+    private boolean activationFailed;
 
     /** The client's side: the routing table comes from the dial and a token is stored for it. */
     static V3ConnectionImpl client(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
@@ -811,7 +813,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     private void doActivate(LaneGame game, int protocolNumber, boolean compressed, String account,
             ByteBuffer controlLeftover) {
-        if (activated || rawClosed) {
+        if (activated || rawClosed || activationFailed) {
             return;
         }
         if (role == NStreamSession.Role.SERVER && !handshakeComplete) {
@@ -852,6 +854,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
             // Close 0x12 and tell the game with the cause so it classifies this as a local resource
             // close, which is the same classification the session would use mid-connection.
             LOG.log(Level.FINE, "activating /3 with no stall source: closing 0x12", e);
+            activationFailed = true;
             Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
             try {
                 game.onClosed(Protocol.CLOSE_RESOURCE, false, e);
