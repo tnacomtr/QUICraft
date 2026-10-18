@@ -169,31 +169,33 @@ public final class SessionResources {
     }
 
     /**
-     * The production resources of one listener with the 13.12 defaults. {@code shared} is reused when it is
-     * the listener's {@link NodePools}, so the N+2 sessions and pre-login admission charge the same node;
-     * otherwise the sessions get node pools of their own.
+     * The production resources of one listener with the 13.12 defaults and cumulative stall accounting.
+     * {@code shared} is reused when it is the listener's {@link NodePools}, so the N+2 sessions and pre-login
+     * admission charge the same node; otherwise the sessions get node pools of their own. The pools of the
+     * returned resources belong to the listener, never to one admission.
      */
     public static SessionResources production(ResourcePools shared) {
-        return create(shared, ExecutorStallWatch.SERVER);
+        return create(shared);
     }
 
-    /** The resources of one side, watching that side's game executor (13.10). */
-    private static SessionResources create(ResourcePools shared, ExecutorStallWatch executor) {
+    /** The cumulative resources of one side, with its one owner clock (13.10). */
+    private static SessionResources create(ResourcePools shared) {
         NodePools node = shared instanceof NodePools ? (NodePools) shared
                 : new NodePools(NODE_BYTES, INBOUND_EXCESS_NODE_BYTES, OUTBOUND_NODE_BYTES, PRE_LOGIN_PERCENT, false,
                         NodePools.MIN_EXCESS);
         return new SessionResources(node, OUTBOUND_IP_BYTES, OUTBOUND_ACCOUNT_BYTES, OUTBOUND_CONNECTION_BYTES,
-                INBOUND_IP_BYTES, INBOUND_ACCOUNT_BYTES, defaultProfile(), System::nanoTime, executor);
+                INBOUND_IP_BYTES, INBOUND_ACCOUNT_BYTES, defaultProfile(), System::nanoTime,
+                Accounting.CUMULATIVE);
     }
 
-    /** The client endpoint's resources, one per process, built on first use. */
+    /** The client endpoint's cumulative resources, one per process, built on first use. */
     public static SessionResources client() {
         SessionResources current = client;
         if (current == null) {
             synchronized (SessionResources.class) {
                 current = client;
                 if (current == null) {
-                    current = create(null, ExecutorStallWatch.CLIENT);
+                    current = create(null);
                     client = current;
                 }
             }
@@ -259,6 +261,11 @@ public final class SessionResources {
     public StallClock stallClock() {
         requireCumulative("stallClock");
         return progress;
+    }
+
+    /** True when this set uses the one cumulative progress watch; the production factories always do. */
+    boolean cumulative() {
+        return accounting == Accounting.CUMULATIVE;
     }
 
     private void requireLegacy(String accessor) {

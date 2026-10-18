@@ -272,6 +272,8 @@ public final class ServerReceiveDriver {
         } catch (RetryLater e) {
             fail(ReceiveClose.resourceWait("execution workspace"));
             return false;
+        } catch (StallClock.UnavailableException e) {
+            throw e;
         } catch (Exception e) {
             fail(ReceiveClose.peerViolation("decode failed: " + e));
             return false;

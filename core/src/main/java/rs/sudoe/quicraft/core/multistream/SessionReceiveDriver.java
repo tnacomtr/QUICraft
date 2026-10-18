@@ -352,6 +352,8 @@ public final class SessionReceiveDriver {
                 decoded = game.decode(lane, record.sequence(), record.gameFrame(), inside, attempt);
             } catch (RetryLater retry) {
                 return retryLater();
+            } catch (StallClock.UnavailableException e) {
+                throw e;
             } catch (Exception e) {
                 fail(ReceiveClose.peerViolation("decode failed: " + e));
                 return false;

@@ -40,6 +40,7 @@ import rs.sudoe.quicraft.core.routing.RouteKey;
 import rs.sudoe.quicraft.core.routing.RouteV2;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
  * The N+2 {@code /3} session of one connection (docs/protocol.md 13.3-13.20): CONTROL on QUIC stream 0,
@@ -73,6 +74,11 @@ import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
  *
  * <p>Pressure rankings. The send driver registers the connection with the outbound ranking and the server's read
  * pump with the inbound ranking, keyed by the remote address.
+ *
+ * <p>Stall accounting (13.10). Every receive timer and both rankings take one reading of the resources' shared
+ * cumulative source; this session keeps no stall state and accepts no boundary reports. Until a detector is
+ * installed on that source it reports zero exclusion, which is conservative (real time counts) and NOT
+ * release-ready.
  *
  * <p>Account key (13.12). The pool and ranking charges of this connection carry the account the platform passes:
  * the authenticated profile UUID as a String on an online-authenticated server connection, and {@code null}
@@ -120,11 +126,8 @@ public final class NStreamSession implements MultistreamSession {
     private static final int MAX_STEPS = 64;
     private static final byte[] NO_REASON = new byte[0];
 
-    /** Clocks and periods; tests shorten them, production uses {@link #DEFAULT}. */
+    /** Clocks and periods; tests shorten them, production uses {@link #defaults(SessionResources)}. */
     static final class Timing {
-        static final Timing DEFAULT = new Timing(System::nanoTime, OPEN_TIMEOUT_NANOS, END_LINGER_NANOS,
-                TimeUnit.SECONDS.toNanos(1));
-
         final LongSupplier clock;
         final long openTimeoutNanos;
         final long endLingerNanos;
@@ -135,6 +138,18 @@ public final class NStreamSession implements MultistreamSession {
             this.openTimeoutNanos = openTimeoutNanos;
             this.endLingerNanos = endLingerNanos;
             this.tickNanos = tickNanos;
+        }
+
+        /**
+         * The production timing of one session: the 13.14 default durations on the resources' owner clock. The
+         * session's transport deadlines and its stall accounting must share that one clock, so callers never
+         * create an independent clock for a session.
+         */
+        static Timing defaults(SessionResources resources) {
+            if (resources == null) {
+                throw new IllegalArgumentException("session resources");
+            }
+            return new Timing(resources.clock(), OPEN_TIMEOUT_NANOS, END_LINGER_NANOS, TimeUnit.SECONDS.toNanos(1));
         }
     }
 
@@ -382,12 +397,6 @@ public final class NStreamSession implements MultistreamSession {
     private boolean executing;
     private int executingStream = -1;
     private long executingSequence;
-    /** When the executing unit became pending on the game executor; -1 when none is (13.10). */
-    private long pendingSince = -1;
-    /** True while this connection is recorded as stalled on the game executor (13.10). */
-    private boolean stallOpen;
-    /** The executor generation this session last synchronized with (see {@link ExecutorStallWatch#replaceExecutor}). */
-    private long watchGeneration;
     private boolean endSubmitted;
     private long endWrittenAt;
     private io.netty.util.concurrent.ScheduledFuture<?> ticker;
@@ -406,7 +415,7 @@ public final class NStreamSession implements MultistreamSession {
     public NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control,
             RoutingTable table, LaneGame game, SessionContext context, SessionResources resources,
             boolean compressed) {
-        this(connection, role, control, table, game, context, resources, Timing.DEFAULT, compressed, null);
+        this(connection, role, control, table, game, context, resources, Timing.defaults(resources), compressed, null);
     }
 
     /**
@@ -418,7 +427,7 @@ public final class NStreamSession implements MultistreamSession {
     public NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control,
             RoutingTable table, LaneGame game, SessionContext context, SessionResources resources,
             boolean compressed, String account) {
-        this(connection, role, control, table, game, context, resources, Timing.DEFAULT, compressed, account);
+        this(connection, role, control, table, game, context, resources, Timing.defaults(resources), compressed, account);
     }
 
     NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
@@ -436,6 +445,12 @@ public final class NStreamSession implements MultistreamSession {
         }
         if (account != null && account.isEmpty()) {
             throw new IllegalArgumentException("account key must be null or non-empty");
+        }
+        if (!resources.cumulative()) {
+            throw new IllegalArgumentException("the N+2 session needs cumulative session resources (13.10)");
+        }
+        if (timing.clock != resources.clock()) {
+            throw new IllegalArgumentException("the session timing clock must be the resources' owner clock (13.10)");
         }
         this.account = account;
         if (control.streamId() != 0 || control.type() != QuicStreamType.BIDIRECTIONAL) {
@@ -474,7 +489,8 @@ public final class NStreamSession implements MultistreamSession {
         this.source = new QuicStreamByteSource(streams);
         this.preambles = new PreambleFilter();
         this.sendDriver = new SessionSendDriver(context, resources.profile(), resources.outbound(),
-                resources.outboundRanking(), this, ip, account, timing.clock, role == Role.CLIENT);
+                resources.outboundRanking(), this, ip, account, resources.clock(), role == Role.CLIENT,
+                SessionResources.Accounting.CUMULATIVE);
         // Submissions run on callers' threads; a close they trigger only stops the driver, and its charges are
         // returned by release() on the loop, serialized with polling and writes (13.12).
         sendDriver.releaseOnOwnerClose();
@@ -486,14 +502,14 @@ public final class NStreamSession implements MultistreamSession {
             if (role == Role.SERVER) {
                 serverPump = new SessionReadPump(new ServerReadPartition(shards), resources.node(),
                         resources.inboundExcess(), this, ip, account, limits, compressed, preambles,
-                        resources.inboundRanking(), resources.clock());
+                        resources.inboundRanking(), resources.clock(), SessionResources.Accounting.CUMULATIVE);
                 serverDriver = new ServerReceiveDriver(shards, serverPump, validator, routes, protocolNumber, proxy,
-                        timing.clock, closeSink);
+                        resources.clock(), closeSink, resources.stallClock());
             } else {
                 ReceiveSlots slots = new ReceiveSlots(shards);
-                clientPump = new ClientReadPump(shards, slots, compressed, preambles, timing.clock);
+                clientPump = new ClientReadPump(shards, slots, compressed, preambles, resources.clock());
                 clientDriver = new SessionReceiveDriver(shards, clientPump, slots, validator, routes, protocolNumber,
-                        extractors, proxy, timing.clock, closeSink);
+                        extractors, proxy, resources.clock(), closeSink, resources.stallClock());
             }
         } catch (RuntimeException e) {
             sendDriver.close();
@@ -596,6 +612,8 @@ public final class NStreamSession implements MultistreamSession {
             }
             schedulePump();
             scheduleDrain();
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
         } catch (Throwable t) {
             failFrom(t);
         }
@@ -635,6 +653,9 @@ public final class NStreamSession implements MultistreamSession {
         SentPacket handle;
         try {
             handle = sendDriver.submitEpochTransition(new OutboundPacket(frame));
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return new SentPacket();
         } catch (RuntimeException e) {
             refuse("epoch transition " + packetId + " in " + state + " was refused: " + e.getMessage());
             return new SentPacket();
@@ -665,6 +686,9 @@ public final class NStreamSession implements MultistreamSession {
         try {
             handle = sendDriver.submit(new OutboundPacket(frame), resolved.fence(), resolved.interaction(),
                     resolved.chunkX(), resolved.chunkZ(), dependenciesOf(after));
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return new SentPacket();
         } catch (RuntimeException e) {
             refuse("packet " + packetId + " in " + state + " was refused: " + e.getMessage());
             return new SentPacket();
@@ -701,6 +725,9 @@ public final class NStreamSession implements MultistreamSession {
         List<SentPacket> handles;
         try {
             handles = sendDriver.submitBundle(open, copy, scopes, close);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return new ArrayList<SentPacket>();
         } catch (RuntimeException e) {
             refuse("bundle refused: " + e.getMessage());
             return new ArrayList<SentPacket>();
@@ -718,7 +745,13 @@ public final class NStreamSession implements MultistreamSession {
         if (closed || refused) {
             return;
         }
-        SentPacket handle = sendDriver.submitEnd();
+        SentPacket handle;
+        try {
+            handle = sendDriver.submitEnd();
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return;
+        }
         if (!handle.isAssigned()) {
             // Already ended, sealed or closed: nothing new to drain beyond what is scheduled.
             afterSubmit();
@@ -736,74 +769,6 @@ public final class NStreamSession implements MultistreamSession {
     @Override
     public void abort(int code) {
         run(() -> fail(code, NO_REASON, "aborted by the owner", null));
-    }
-
-    @Override
-    public void stallStarted(final long atNanos) {
-        run(() -> {
-            if (!closed && !stallOpen) {
-                openStall(atNanos);
-            }
-        });
-    }
-
-    @Override
-    public void stallEnded(final long atNanos) {
-        run(() -> {
-            if (stallOpen) {
-                closeStall(atNanos);
-            }
-        });
-    }
-
-    /**
-     * Derives this connection's stall from the side's executor watch (13.10, loop only). A stall is open only while
-     * unit work is pending on the executor past the threshold. Start and end use the watch's qualifying and
-     * completion instants, so the watchdog's own delay never counts.
-     */
-    private void syncExecutorStall(long t) {
-        ExecutorStallWatch watch = resources.executorWatch();
-        if (watch.generation() != watchGeneration) {
-            // The executor was replaced: a stall against the old one ends now, and pending work restarts its clock.
-            watchGeneration = watch.generation();
-            if (stallOpen) {
-                closeStall(t);
-            }
-            if (pendingSince >= 0) {
-                pendingSince = t;
-            }
-        }
-        long since = watch.stalledSince(t, pendingSince);
-        if (since >= 0) {
-            if (!stallOpen) {
-                openStall(since);
-            }
-        } else if (stallOpen) {
-            // The completion that ended the stall is the end instant, not the moment it was observed.
-            closeStall(Math.max(watch.lastCompletion(), pendingSince));
-        }
-    }
-
-    private void openStall(long atNanos) {
-        stallOpen = true;
-        resources.stallPairing().enter(atNanos);
-        if (serverDriver != null) {
-            serverDriver.stallStarted(atNanos);
-        }
-        if (clientDriver != null) {
-            clientDriver.stallStarted(atNanos);
-        }
-    }
-
-    private void closeStall(long atNanos) {
-        stallOpen = false;
-        resources.stallPairing().exit(atNanos);
-        if (serverDriver != null) {
-            serverDriver.stallEnded(atNanos);
-        }
-        if (clientDriver != null) {
-            clientDriver.stallEnded(atNanos);
-        }
     }
 
     @Override
@@ -836,72 +801,133 @@ public final class NStreamSession implements MultistreamSession {
 
     @Override
     public boolean createAck(long id, byte[] payload, int chargedBytes) {
-        boolean created = sendDriver.createAck(id, payload, chargedBytes);
+        boolean created;
+        try {
+            created = sendDriver.createAck(id, payload, chargedBytes);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return false;
+        }
         afterSubmit();
         return created;
     }
 
     @Override
     public void coverAssigned(long ackId, SentPacket covered) {
-        sendDriver.coverAssigned(ackId, covered);
+        try {
+            sendDriver.coverAssigned(ackId, covered);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return;
+        }
         afterSubmit();
     }
 
     @Override
     public boolean coverPending(long ackId, long updateToken) {
-        boolean covered = sendDriver.coverPending(ackId, updateToken);
+        boolean covered;
+        try {
+            covered = sendDriver.coverPending(ackId, updateToken);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return false;
+        }
         afterSubmit();
         return covered;
     }
 
     @Override
     public void assignedPending(long updateToken, SentPacket covered) {
-        sendDriver.assignedPending(updateToken, covered);
+        try {
+            sendDriver.assignedPending(updateToken, covered);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return;
+        }
         afterSubmit();
     }
 
     @Override
     public void suppressPending(long updateToken) {
-        sendDriver.suppressPending(updateToken);
+        try {
+            sendDriver.suppressPending(updateToken);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return;
+        }
         afterSubmit();
     }
 
     @Override
     public void markInexact(long ackId) {
-        sendDriver.markInexact(ackId);
+        try {
+            sendDriver.markInexact(ackId);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return;
+        }
         afterSubmit();
     }
 
     @Override
     public SentPacket takeAck(long ackId) {
-        SentPacket handle = sendDriver.takeAck(ackId);
+        SentPacket handle;
+        try {
+            handle = sendDriver.takeAck(ackId);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return new SentPacket();
+        }
         afterSubmit();
         return handle;
     }
 
     @Override
     public void expireAcks() {
-        sendDriver.expireAcks();
+        try {
+            sendDriver.expireAcks();
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return;
+        }
         afterSubmit();
     }
 
     @Override
     public SentPacket beginBatch(long batchId, OutboundPacket start) {
-        SentPacket handle = sendDriver.beginBatch(batchId, start);
+        SentPacket handle;
+        try {
+            handle = sendDriver.beginBatch(batchId, start);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return new SentPacket();
+        }
         afterSubmit();
         return handle;
     }
 
     @Override
     public SentPacket batchInstall(long batchId, OutboundPacket install, int chunkX, int chunkZ) {
-        SentPacket handle = sendDriver.batchInstall(batchId, install, chunkX, chunkZ);
+        SentPacket handle;
+        try {
+            handle = sendDriver.batchInstall(batchId, install, chunkX, chunkZ);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return new SentPacket();
+        }
         afterSubmit();
         return handle;
     }
 
     @Override
     public SentPacket finishBatch(long batchId, OutboundPacket join) {
-        SentPacket handle = sendDriver.finishBatch(batchId, join);
+        SentPacket handle;
+        try {
+            handle = sendDriver.finishBatch(batchId, join);
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return new SentPacket();
+        }
         afterSubmit();
         return handle;
     }
@@ -1083,17 +1109,14 @@ public final class NStreamSession implements MultistreamSession {
             return;
         }
         executing = false;
-        pendingSince = -1;
-        if (stallOpen) {
-            // The pending work drained: the executor is no longer owed anything, so the stall ends here.
-            closeStall(now());
-        }
         try {
             if (serverDriver != null) {
                 serverDriver.acknowledged(executingStream, sequence);
             } else {
                 clientDriver.acknowledged(executingStream, sequence);
             }
+        } catch (StallClock.UnavailableException e) {
+            throw e;
         } catch (IllegalStateException e) {
             fail(CLOSE_ORDERING, NO_REASON, "acknowledgement refused: " + e.getMessage(), e);
             return;
@@ -1211,6 +1234,14 @@ public final class NStreamSession implements MultistreamSession {
 
     /** One periodic tick (13.12, 13.14): STOP_SENDING probe, open timeout, receive deadlines, ACK expiry, END. */
     void tick() {
+        try {
+            tickNow();
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+        }
+    }
+
+    private void tickNow() {
         if (closed || !activated) {
             return;
         }
@@ -1223,9 +1254,6 @@ public final class NStreamSession implements MultistreamSession {
             fail(CLOSE_ORDERING, NO_REASON, "a peer stream did not open in time (13.3)", null);
             return;
         }
-        // 13.10: stall evidence is synced before any close deadline is evaluated, so a stall the watchdog has not yet
-        // been told about cannot expire a deadline.
-        syncExecutorStall(t);
         if (game != null && !receiveOnce()) {
             return;
         }
@@ -1350,12 +1378,6 @@ public final class NStreamSession implements MultistreamSession {
         if (scheduled != null) {
             quietly(() -> scheduled.cancel(false), "ticker");
         }
-        if (stallOpen) {
-            // A session that closes while stalled still leaves the listener's pairing, or the ranking would keep
-            // excluding time for a connection that no longer exists.
-            stallOpen = false;
-            quietly(() -> resources.stallPairing().exit(now()), "executor stall pairing");
-        }
         quietly(sendDriver::close, "send driver");
         if (serverDriver != null) {
             quietly(serverDriver::close, "server receive driver");
@@ -1407,13 +1429,25 @@ public final class NStreamSession implements MultistreamSession {
     private void guarded(Runnable task) {
         try {
             task.run();
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
         } catch (Throwable t) {
             failFrom(t);
         }
     }
 
+    /**
+     * A cumulative accounting source can no longer describe this session's executor incarnation. That is a local
+     * resource failure, not a peer or ordering violation: close 0x12 with the cause, release every charge, and let
+     * the caller treat the close as a local resource event (no failure-cache entry).
+     */
+    private void closeOnUnavailable(StallClock.UnavailableException cause) {
+        sendDriver.seal();
+        run(() -> fail(CLOSE_RESOURCE, NO_REASON, "stall accounting is unavailable", cause));
+    }
+
     private long now() {
-        return timing.clock.getAsLong();
+        return resources.clock().getAsLong();
     }
 
     private static ByteBuffer copy(ByteBuffer from) {
@@ -1609,7 +1643,6 @@ public final class NStreamSession implements MultistreamSession {
         @Override
         public void onEnqueued(Lane lane, int logicalStream, long sequence) {
             executing = true;
-            pendingSince = now();
             executingStream = logicalStream;
             executingSequence = sequence;
             game.onEnqueued(lane, logicalStream, sequence);

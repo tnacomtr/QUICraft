@@ -21,6 +21,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import rs.sudoe.quicraft.core.CloseReason;
@@ -303,8 +304,10 @@ class NStreamSessionLoopbackTest {
         }
         // Classified: a chunk waits past its deadline for a CONTROL prerequisite the client never saw.
         AtomicLong clientClock = new AtomicLong(System.nanoTime());
+        LongSupplier clientClockSource = clientClock::get;
         NRig.Config config = new NRig.Config();
-        config.clientTiming = new NStreamSession.Timing(clientClock::get, TimeUnit.SECONDS.toNanos(3600),
+        config.clientResources = NRig.resources(clientClockSource);
+        config.clientTiming = new NStreamSession.Timing(clientClockSource, TimeUnit.SECONDS.toNanos(3600),
                 TimeUnit.SECONDS.toNanos(10), TimeUnit.SECONDS.toNanos(3600));
         try (NRig rig = NRig.start(config)) {
             rig.activateBoth();
@@ -371,7 +374,7 @@ class NStreamSessionLoopbackTest {
     void theEndSenderClosesAfterTheLingerWhenThePeerNeverDoes() throws Exception {
         NRig.Config config = new NRig.Config();
         config.serverSession = false; // a raw peer: it reads the client's streams but never answers
-        config.clientTiming = new NStreamSession.Timing(System::nanoTime, TimeUnit.SECONDS.toNanos(3600),
+        config.clientTiming = new NStreamSession.Timing(NRig.SYSTEM_CLOCK, TimeUnit.SECONDS.toNanos(3600),
                 TimeUnit.MILLISECONDS.toNanos(400), TimeUnit.MILLISECONDS.toNanos(20));
         try (NRig rig = NRig.start(config)) {
             rig.activateClient();
@@ -618,7 +621,8 @@ class NStreamSessionLoopbackTest {
         config.serverResources = new SessionResources(new rs.sudoe.quicraft.core.resource.NodePools(64L << 20,
                 rs.sudoe.quicraft.core.resource.NodePools.MIN_EXCESS, NRig.OUTBOUND_BYTES, 10, false,
                 rs.sudoe.quicraft.core.resource.NodePools.MIN_EXCESS), NRig.OUTBOUND_BYTES, NRig.OUTBOUND_BYTES,
-                NRig.OUTBOUND_BYTES, 16L << 20, 16L << 20, SessionResources.defaultProfile(), System::nanoTime);
+                NRig.OUTBOUND_BYTES, 16L << 20, 16L << 20, SessionResources.defaultProfile(), NRig.SYSTEM_CLOCK,
+                SessionResources.Accounting.CUMULATIVE);
         try (NRig rig = NRig.start(config)) {
             rig.activateBoth();
             SessionResources res = config.serverResources;
@@ -737,7 +741,7 @@ class NStreamSessionLoopbackTest {
     }
 
     /** Holds every outbound write until {@link #release}; after that it passes writes through. */
-    private static final class Captor extends ChannelOutboundHandlerAdapter {
+    static final class Captor extends ChannelOutboundHandlerAdapter {
         private final List<Object[]> held = new ArrayList<Object[]>();
         private ChannelHandlerContext ctx;
         private boolean open;

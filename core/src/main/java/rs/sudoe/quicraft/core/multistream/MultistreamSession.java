@@ -70,16 +70,19 @@ public interface MultistreamSession {
     boolean isWritable();
 
     /**
-     * The game executor stalled from {@code atNanos} (13.10), on this side's executor clock. Additive: the default
-     * throws, so a session without stall support never silently counts executor time toward its close clocks. The
-     * stall is also derived from the side's {@link ExecutorStallWatch}; explicit reports are for platforms that
-     * time their own stalls.
+     * The game executor stalled from {@code atNanos} (13.10). Additive: the default throws, so a session never
+     * silently counts executor time toward its close clocks from a report it cannot trust. A cumulative session
+     * derives its exclusion from the listener-owned accounting source; explicit reports remain unsupported and
+     * the default keeps throwing.
      */
     default void stallStarted(long atNanos) {
         throw new UnsupportedOperationException("executor stall reporting");
     }
 
-    /** The executor stall that began with {@link #stallStarted(long)} ended at {@code atNanos} (13.10). */
+    /**
+     * The executor stall that began with {@link #stallStarted(long)} ended at {@code atNanos} (13.10). Additive:
+     * the default throws, as for {@link #stallStarted(long)}; a cumulative session takes no explicit report.
+     */
     default void stallEnded(long atNanos) {
         throw new UnsupportedOperationException("executor stall reporting");
     }
