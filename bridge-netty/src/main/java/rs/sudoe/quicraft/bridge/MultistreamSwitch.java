@@ -115,19 +115,21 @@ public final class MultistreamSwitch {
      * the advertisement.
      */
     public static Reason probe(boolean flag) {
-        return probe(flag, QuicSupport.hasKeyingMaterialExport(), QuicSupport.hasMaxFlowControlWindows());
+        return probe(flag, QuicSupport::hasKeyingMaterialExport, QuicSupport::hasMaxFlowControlWindows);
     }
 
     /**
-     * {@link #probe(boolean)} with the two native probes injected, so the routing/schema decision
-     * is testable on any host (a native without the exporter or the window caps would otherwise
-     * short-circuit before the routing check).
+     * {@link #probe(boolean)} with the two native probes injected as lazy suppliers, so the
+     * documented short-circuit order is preserved and testable: flag, exporter, routing/schema,
+     * window. A supplier is invoked only when its check is reached, so {@code probe(false)} touches
+     * no native capability and a rejected exporter never probes the window caps.
      */
-    static Reason probe(boolean flag, boolean exporterCapable, boolean windowsCappable) {
+    static Reason probe(boolean flag, java.util.function.BooleanSupplier exporterCapable,
+            java.util.function.BooleanSupplier windowsCappable) {
         if (!flag) {
             return Reason.FLAG_OFF;
         }
-        if (!exporterCapable) {
+        if (!exporterCapable.getAsBoolean()) {
             return Reason.NO_EXPORTER;
         }
         boolean loaded = false;
@@ -143,7 +145,7 @@ public final class MultistreamSwitch {
         if (advertisedRouting().isEmpty()) {
             return Reason.NO_ROUTING_SCHEMA;
         }
-        if (!windowsCappable) {
+        if (!windowsCappable.getAsBoolean()) {
             return Reason.NO_WINDOW_CAPS;
         }
         return Reason.ENABLED;

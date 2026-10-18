@@ -8,6 +8,8 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
@@ -66,7 +68,7 @@ class MultistreamSwitchTest {
         // 13.7: a schema-1 resource loads, but it cannot drive /3 and must not be advertised.
         assertEquals(1, RoutingRegistry.forProtocol(775).get().schema(),
                 "this tree ships schema 1 until U9a-2b lands the reviewed schema-2 table");
-        assertEquals(MultistreamSwitch.Reason.NO_ROUTING_SCHEMA, MultistreamSwitch.probe(true, true, true),
+        assertEquals(MultistreamSwitch.Reason.NO_ROUTING_SCHEMA, MultistreamSwitch.probe(true, () -> true, () -> true),
                 "13.7: the advertisement names only a reviewed schema-2 resource");
         // The public probe short-circuits on a native without the exporter, so guard that assertion.
         assertEquals(QuicSupport.hasKeyingMaterialExport() ? MultistreamSwitch.Reason.NO_ROUTING_SCHEMA
@@ -100,6 +102,44 @@ class MultistreamSwitchTest {
         assertFalse(MultistreamSwitch.servesProtocol(775), "a shipped schema-1 table cannot drive /3");
         assertFalse(MultistreamSwitch.servesProtocol(1234), "a protocol without a resource cannot drive /3");
         assertTrue(MultistreamSwitch.serves(RoutingTableLoader.parse(tableV2Json())));
+    }
+
+    /**
+     * 12.1/12.3: the probes stay lazy and ordered (flag, exporter, routing/schema, window). The
+     * suppliers record invocations, so an eagerly evaluated window probe, or a flag-off that
+     * touches native state, fails here. The routing rejection assumes the schema-1 table this tree
+     * ships until U9a-2b.
+     */
+    @Test
+    void theProbeShortCircuitsWithoutTouchingLaterCapabilities() {
+        AtomicInteger exporterCalls = new AtomicInteger();
+        AtomicInteger windowCalls = new AtomicInteger();
+        BooleanSupplier exporter = () -> {
+            exporterCalls.incrementAndGet();
+            return true;
+        };
+        BooleanSupplier windows = () -> {
+            windowCalls.incrementAndGet();
+            return true;
+        };
+
+        assertEquals(MultistreamSwitch.Reason.FLAG_OFF,
+                MultistreamSwitch.probe(false, exporter, windows));
+        assertEquals(0, exporterCalls.get(), "flag off must not probe the exporter");
+        assertEquals(0, windowCalls.get(), "flag off must not probe the window caps");
+
+        assertEquals(MultistreamSwitch.Reason.NO_EXPORTER,
+                MultistreamSwitch.probe(true, () -> false, windows));
+        assertEquals(0, windowCalls.get(), "the window probe must not run before the exporter rejection");
+
+        exporterCalls.set(0);
+        windowCalls.set(0);
+        assertEquals(MultistreamSwitch.Reason.NO_ROUTING_SCHEMA,
+                MultistreamSwitch.probe(true, exporter, windows));
+        assertEquals(1, exporterCalls.get(), "the exporter is probed exactly once");
+        assertEquals(0, windowCalls.get(), "the window probe must not run before the routing rejection");
+        // The window rejection itself needs a schema-2 resource to get past routing, so
+        // decide(true, true, true, false) covers it; here the ordering is the subject.
     }
 
     @Test
