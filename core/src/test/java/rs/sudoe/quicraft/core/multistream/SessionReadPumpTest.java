@@ -17,7 +17,9 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.resource.InboundExcessPool;
 import rs.sudoe.quicraft.core.resource.NodePools;
 import rs.sudoe.quicraft.core.resource.PressureRanking;
+import rs.sudoe.quicraft.core.resource.ResourcePools;
 import rs.sudoe.quicraft.core.routing.RouteV2;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 class SessionReadPumpTest {
     /** Connection excess E = L + F + 16 KiB for the test limits (13.12). */
@@ -506,11 +508,11 @@ class SessionReadPumpTest {
         final long[] now = {0};
         NodePools node = new NodePools(1L << 30, 1L << 20, 1L << 30, 10, false, E);
         SessionResources resources = new SessionResources(node, 1L << 20, 1L << 20, 1L << 20, E, E,
-                SessionResources.defaultProfile(), () -> now[0]);
+                SessionResources.defaultProfile(), () -> now[0], SessionResources.Accounting.LEGACY);
         Source source = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 5)), new byte[0]);
         SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node, resources.inboundExcess(), "A",
                 java.net.InetAddress.getByName("10.0.0.1"), null, LIMITS, false, source, resources.inboundRanking(),
-                () -> now[0]);
+                () -> now[0], SessionResources.Accounting.LEGACY);
         SessionReadPump.Unit unit = nextUnit(pump);
         assertTrue(resources.inboundExcess().reserved("A") > 0, "the record holds excess");
         now[0] += 5_000_000_000L;
@@ -658,5 +660,124 @@ class SessionReadPumpTest {
             assertTrue(requested <= 16 * 1024, "grant within the 16 KiB cap");
         }
         unit.close();
+    }
+
+    /** A cumulative pump registers, reports and cancels through the no-time calls of the shared source. */
+    @Test void cumulativePumpUsesTheCumulativeSourceForEveryRankingCall() throws Exception {
+        final long[] now = {0};
+        NodePools node = new NodePools(1L << 30, 1L << 20, 1L << 30, 10, false, E);
+        SessionResources resources = new SessionResources(node, 1L << 20, 1L << 20, 1L << 20, E, E,
+                SessionResources.defaultProfile(), () -> now[0], SessionResources.Accounting.CUMULATIVE);
+        byte[] packet = filled(300, 9);
+        Source source = new Source(compressedWire(LogicalStream.CONTROL, 1, packet, packet.length), new byte[0]);
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node, resources.inboundExcess(),
+                "A", java.net.InetAddress.getByName("10.0.0.1"), null, LIMITS, true, source,
+                resources.inboundRanking(), () -> now[0], SessionResources.Accounting.CUMULATIVE);
+        assertTrue(node.reserved(ResourcePools.Pool.INFLATER, "A") > 0);
+        try (SessionReadPump.Unit unit = nextUnit(pump)) {
+            assertEquals(LogicalStream.CONTROL, unit.stream());
+        }
+        resources.progressWatch().invalidate();
+        assertThrows(StallClock.UnavailableException.class, () -> resources.inboundRanking().score("A"),
+                "the registered connection samples the invalid shared watch");
+        pump.cancel();
+        assertEquals(0.0, resources.inboundRanking().score("A"), "cancel unregistered the connection");
+        assertEquals(0, node.reserved(ResourcePools.Pool.INFLATER, "A"), "cancel returned the inflater charge");
+        pump.cancel();
+    }
+
+    /** A cumulative pump runs a refused wait, its grant and its retained reporting without timestamped calls. */
+    @Test void cumulativePumpRunsAnExcessWaitAndRetainedWithoutTimestamps() throws Exception {
+        final long[] now = {0};
+        NodePools node = new NodePools(1L << 30, 8192, 1L << 30, 10, false, E);
+        SessionResources resources = new SessionResources(node, 1L << 20, 1L << 20, 1L << 20, E, E,
+                SessionResources.defaultProfile(), () -> now[0], SessionResources.Accounting.CUMULATIVE);
+        assertTrue(resources.inboundExcess().reserve("blocker", "ip-b", null, 8192, true));
+        Source source = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 5)), new byte[0]);
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node, resources.inboundExcess(),
+                "A", java.net.InetAddress.getByName("10.0.0.1"), null, LIMITS, false, source,
+                resources.inboundRanking(), () -> now[0], SessionResources.Accounting.CUMULATIVE);
+        for (int i = 0; i < 20; i++) {
+            now[0] += 1_000_000L;
+            assertTrue(pump.step().isEmpty(), "CONTROL waits for excess");
+        }
+        assertTrue(resources.inboundRanking().inRefusedWait("A"), "the excess wait is a refused wait");
+        resources.inboundExcess().release("blocker", 8192);
+        SessionReadPump.Unit unit = nextUnit(pump);
+        assertFalse(resources.inboundRanking().inRefusedWait("A"), "the grant ends the refused wait");
+        unit.close();
+        pump.cancel();
+        assertFalse(resources.inboundRanking().inRefusedWait("A"));
+    }
+
+    /** A cumulative pump without a ranking and any pump without a stated mode are rejected before charges. */
+    @Test void cumulativePumpNeedsARankingAndEveryPumpAStatedMode() throws Exception {
+        NodePools node = new NodePools(1L << 30, 1L << 20, 1L << 30, 10, false, E);
+        java.net.InetAddress ip = java.net.InetAddress.getByName("10.0.0.1");
+        Source source = new Source(new byte[0], new byte[0]);
+        InboundExcessPool excess = new InboundExcessPool(node, E, E, owner -> 0.0);
+        assertThrows(IllegalArgumentException.class, () -> new SessionReadPump(new ServerReadPartition(6), node,
+                excess, "A", ip, null, LIMITS, true, source, null, null, SessionResources.Accounting.CUMULATIVE),
+                "a cumulative pump needs a ranking");
+        assertEquals(0, node.reserved(ResourcePools.Pool.INFLATER, "A"), "rejected before the inflater charge");
+        assertThrows(NullPointerException.class, () -> new SessionReadPump(new ServerReadPartition(6), node,
+                excess, "A", ip, null, LIMITS, true, source, null, null, null), "a pump needs a stated mode");
+        assertEquals(0, node.reserved(ResourcePools.Pool.INFLATER, "A"));
+        // The old unranked legacy pump keeps working without a ranking or a clock.
+        SessionReadPump unranked = new SessionReadPump(new ServerReadPartition(6), node, excess, "B", ip, null,
+                LIMITS, true, source);
+        assertTrue(node.reserved(ResourcePools.Pool.INFLATER, "B") > 0);
+        unranked.cancel();
+        assertEquals(0, node.reserved(ResourcePools.Pool.INFLATER, "B"));
+    }
+
+    /** A failed connect returns the inflater charge, and a mode the ranking rejects takes no reading at all. */
+    @Test void cumulativePumpConstructorRollsBackTheInflaterOnARejectedConnect() throws Exception {
+        NodePools node = new NodePools(1L << 30, 1L << 20, 1L << 30, 10, false, E);
+        java.net.InetAddress ip = java.net.InetAddress.getByName("10.0.0.1");
+        byte[] packet = filled(300, 8);
+        SessionResourcesTest.Scripted gone = new SessionResourcesTest.Scripted();
+        gone.reading(0, 0, false);
+        PressureRanking invalid = new PressureRanking(gone);
+        assertThrows(StallClock.UnavailableException.class, () -> new SessionReadPump(new ServerReadPartition(6),
+                node, new InboundExcessPool(node, E, E, invalid.view()), "A", ip, null, LIMITS, true,
+                new Source(compressedWire(LogicalStream.CONTROL, 1, packet, packet.length), new byte[0]),
+                invalid, () -> 0, SessionResources.Accounting.CUMULATIVE));
+        assertEquals(0, node.reserved(ResourcePools.Pool.INFLATER, "A"), "the acquired inflater charge is unwound");
+        assertEquals(1, gone.taken(), "the failed connect took its one reading and no cleanup reading");
+        assertEquals(0.0, invalid.score("A"), "no registration was acquired");
+
+        // A cumulative ranking rejects a legacy pump's timestamped connect before it can take a reading.
+        SessionResourcesTest.Scripted untouched = new SessionResourcesTest.Scripted();
+        PressureRanking cumulative = new PressureRanking(untouched);
+        assertThrows(IllegalStateException.class, () -> new SessionReadPump(new ServerReadPartition(6), node,
+                new InboundExcessPool(node, E, E, cumulative.view()), "B", ip, null, LIMITS, true,
+                new Source(compressedWire(LogicalStream.CONTROL, 1, packet, packet.length), new byte[0]),
+                cumulative, () -> 0, SessionResources.Accounting.LEGACY));
+        assertEquals(0, node.reserved(ResourcePools.Pool.INFLATER, "B"), "the inflater charge is unwound");
+        assertEquals(0, untouched.taken(), "a mode the ranking rejects takes no reading");
+    }
+
+    /** Cancel returns the pool charges even when the ranking cleanup itself throws, and reports that failure. */
+    @Test void cancelReturnsTheInflaterEvenWhenTheCleanupDisconnectThrows() throws Exception {
+        NodePools node = new NodePools(1L << 30, 1L << 20, 1L << 30, 10, false, E);
+        java.net.InetAddress ip = java.net.InetAddress.getByName("10.0.0.1");
+        SessionResourcesTest.Scripted scripted = new SessionResourcesTest.Scripted();
+        scripted.reading(0, 0, true);
+        scripted.reading(0, 5, true);
+        PressureRanking ranking = new PressureRanking(scripted);
+        byte[] packet = filled(300, 9);
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node,
+                new InboundExcessPool(node, E, E, ranking.view()), "A", ip, null, LIMITS, true,
+                new Source(compressedWire(LogicalStream.CONTROL, 1, packet, packet.length), new byte[0]),
+                ranking, () -> 0, SessionResources.Accounting.CUMULATIVE);
+        assertTrue(node.reserved(ResourcePools.Pool.INFLATER, "A") > 0);
+        assertThrows(StallClock.UnavailableException.class, pump::cancel, "the cleanup failure is reported");
+        assertEquals(0, node.reserved(ResourcePools.Pool.INFLATER, "A"), "the inflater charge is returned anyway");
+        // A malformed reading releases nothing, so the connection stays registered until a coherent cleanup.
+        scripted.reading(10, 5, true);
+        ranking.disconnect("A");
+        assertEquals(3, scripted.taken(), "the coherent disconnect released the still-registered connection");
+        assertEquals(0.0, ranking.score("A"));
     }
 }

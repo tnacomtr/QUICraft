@@ -76,6 +76,7 @@ public final class SessionReadPump {
     private final Lane realtime;
     private final PressureRanking ranking;
     private final LongSupplier clock;
+    private final SessionResources.Accounting accounting;
     private boolean inflaterCharged;
     private Inflater inflater;
     private int inflations;
@@ -99,28 +100,49 @@ public final class SessionReadPump {
     public SessionReadPump(ServerReadPartition partition, ResourcePools pools, InboundExcessPool excess,
                            Object owner, Object ip, Object account, RouteV2.ServerboundLimits limits,
                            boolean compressed, ByteSource source) {
-        this(partition, pools, excess, owner, ip, account, limits, compressed, source, null, null);
+        this(partition, pools, excess, owner, ip, account, limits, compressed, source, null, null,
+                SessionResources.Accounting.LEGACY);
+    }
+
+    /**
+     * As below, with the legacy timestamped ranking calls.
+     *
+     * @see #SessionReadPump(ServerReadPartition, ResourcePools, InboundExcessPool, Object, Object, Object,
+     *     RouteV2.ServerboundLimits, boolean, ByteSource, PressureRanking, LongSupplier,
+     *     SessionResources.Accounting)
+     */
+    public SessionReadPump(ServerReadPartition partition, ResourcePools pools, InboundExcessPool excess,
+                           Object owner, Object ip, Object account, RouteV2.ServerboundLimits limits,
+                           boolean compressed, ByteSource source, PressureRanking ranking, LongSupplier clock) {
+        this(partition, pools, excess, owner, ip, account, limits, compressed, source, ranking, clock,
+                SessionResources.Accounting.LEGACY);
     }
 
     /**
      * Creates the pump for one session and registers the connection with the inbound pressure ranking.
      *
-     * @param ranking the inbound pressure ranking the excess pool picks victims by, or null for none
+     * @param ranking the inbound pressure ranking the excess pool picks victims by, or null for none; a
+     *     CUMULATIVE pump needs one
      * @param clock monotonic nanosecond clock for the ranking; required with a ranking
+     * @param accounting the stated ranking mode: LEGACY makes the timestamped calls with this pump's clock,
+     *     CUMULATIVE the ranking's no-time calls from its shared stall source
+     * @throws NullPointerException for a null argument, {@code accounting} included
      * @throws IllegalArgumentException with a ranking but no clock, or an {@code ip} that is not an
-     *     {@link InetAddress}
-     * @see #SessionReadPump(ServerReadPartition, ResourcePools, InboundExcessPool, Object, Object, Object,
-     *     RouteV2.ServerboundLimits, boolean, ByteSource)
+     *     {@link InetAddress}, or a CUMULATIVE pump without a ranking
      */
     public SessionReadPump(ServerReadPartition partition, ResourcePools pools, InboundExcessPool excess,
                            Object owner, Object ip, Object account, RouteV2.ServerboundLimits limits,
-                           boolean compressed, ByteSource source, PressureRanking ranking, LongSupplier clock) {
+                           boolean compressed, ByteSource source, PressureRanking ranking, LongSupplier clock,
+                           SessionResources.Accounting accounting) {
         if (partition == null || pools == null || excess == null || owner == null || ip == null
-                || limits == null || source == null) {
+                || limits == null || source == null || accounting == null) {
             throw new NullPointerException("session read pump argument");
         }
         if (ranking != null && (clock == null || !(ip instanceof InetAddress))) {
             throw new IllegalArgumentException("an inbound ranking needs a clock and an InetAddress");
+        }
+        if (ranking == null && accounting == SessionResources.Accounting.CUMULATIVE) {
+            throw new IllegalArgumentException("a cumulative session read pump needs a ranking");
         }
         this.partition = partition;
         this.pools = pools;
@@ -131,6 +153,7 @@ public final class SessionReadPump {
         this.limits = limits;
         this.compressed = compressed;
         this.source = source;
+        this.accounting = accounting;
         if (compressed) {
             if (!pools.reserve(ResourcePools.Pool.INFLATER, owner, INFLATER_BYTES)) {
                 throw new IllegalStateException("node INFLATER pool refused the session");
@@ -142,8 +165,44 @@ public final class SessionReadPump {
         this.ranking = ranking;
         this.clock = clock;
         if (ranking != null) {
-            ranking.connect(owner, (InetAddress) ip, account instanceof String ? (String) account : null,
-                    clock.getAsLong());
+            try {
+                connectRanking();
+            } catch (RuntimeException | Error failure) {
+                // The registration was not acquired: only the inflater charge taken above is unwound.
+                try {
+                    ReceiveCleanup.run(this::releaseInflaterCharge);
+                } catch (RuntimeException | Error cleanup) {
+                    failure.addSuppressed(cleanup);
+                }
+                throw failure;
+            }
+        }
+    }
+
+    /** Registers this connection with the ranking, timestamped in LEGACY and cumulative otherwise. */
+    private void connectRanking() {
+        String accountKey = account instanceof String ? (String) account : null;
+        if (accounting == SessionResources.Accounting.CUMULATIVE) {
+            ranking.connect(owner, (InetAddress) ip, accountKey);
+        } else {
+            ranking.connect(owner, (InetAddress) ip, accountKey, clock.getAsLong());
+        }
+    }
+
+    /** Unregisters this connection from the ranking, timestamped in LEGACY and cumulative otherwise. */
+    private void disconnectRanking() {
+        if (accounting == SessionResources.Accounting.CUMULATIVE) {
+            ranking.disconnect(owner);
+        } else {
+            ranking.disconnect(owner, clock.getAsLong());
+        }
+    }
+
+    /** Returns the connection's inflater charge once, if it was taken. */
+    private void releaseInflaterCharge() {
+        if (inflaterCharged) {
+            pools.release(ResourcePools.Pool.INFLATER, owner, INFLATER_BYTES);
+            inflaterCharged = false;
         }
     }
 
@@ -174,20 +233,14 @@ public final class SessionReadPump {
         open = false;
         ReceiveCleanup.run(() -> cancelLane(control), () -> cancelLane(realtime), () -> excess.cancel(owner), () -> {
             if (ranking != null) {
-                ReceiveCleanup.run(() -> ranking.endRefusedWait(owner),
-                        () -> ranking.disconnect(owner, clock.getAsLong()));
+                ReceiveCleanup.run(() -> ranking.endRefusedWait(owner), this::disconnectRanking);
             }
         }, () -> {
             if (inflater != null) {
                 inflater.end();
                 inflater = null;
             }
-        }, () -> {
-            if (inflaterCharged) {
-                pools.release(ResourcePools.Pool.INFLATER, owner, INFLATER_BYTES);
-                inflaterCharged = false;
-            }
-        });
+        }, this::releaseInflaterCharge);
     }
 
     private void cancelLane(Lane lane) {
@@ -277,7 +330,13 @@ public final class SessionReadPump {
                 return;
             }
             if (got > grant) throw new IllegalStateException("byte source returned more than was requested");
-            if (ranking != null) ranking.progress(owner, got, clock.getAsLong());
+            if (ranking != null) {
+                if (accounting == SessionResources.Accounting.CUMULATIVE) {
+                    ranking.progress(owner, got);
+                } else {
+                    ranking.progress(owner, got, clock.getAsLong());
+                }
+            }
             lane.staged = true;
             record = lane.decoder.next(ByteBuffer.wrap(target, off, got));
         }
@@ -350,7 +409,13 @@ public final class SessionReadPump {
             }
             if (!granted) {
                 lane.excessWaiting = true;
-                if (ranking != null) ranking.beginRefusedWait(owner, clock.getAsLong());
+                if (ranking != null) {
+                    if (accounting == SessionResources.Accounting.CUMULATIVE) {
+                        ranking.beginRefusedWait(owner);
+                    } else {
+                        ranking.beginRefusedWait(owner, clock.getAsLong());
+                    }
+                }
                 return false;
             }
         }
@@ -394,7 +459,14 @@ public final class SessionReadPump {
 
     /** Reports the connection's current excess-pool charge to the inbound ranking. */
     private void retained() {
-        if (ranking != null) ranking.setRetained(owner, excess.reserved(owner), clock.getAsLong());
+        if (ranking == null) {
+            return;
+        }
+        if (accounting == SessionResources.Accounting.CUMULATIVE) {
+            ranking.setRetained(owner, excess.reserved(owner));
+        } else {
+            ranking.setRetained(owner, excess.reserved(owner), clock.getAsLong());
+        }
     }
 
     private static byte[] slice(Record record, int from, int to) {

@@ -14,6 +14,7 @@ import rs.sudoe.quicraft.core.resource.NodePools;
 import rs.sudoe.quicraft.core.resource.OutboundPool;
 import rs.sudoe.quicraft.core.resource.PressureRanking;
 import rs.sudoe.quicraft.core.resource.ResourcePools;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
  * The shared resources of every N+2 session of one listener (docs/protocol.md 13.12): the node pools, the
@@ -56,6 +57,19 @@ public final class SessionResources {
     /** The PRE_LOGIN share of the node budget, in percent. */
     public static final int PRE_LOGIN_PERCENT = 10;
 
+    /**
+     * The stall accounting of one resource set (13.10, 13.12). {@link #LEGACY} keeps the listed timestamped
+     * ranking calls, one clock reading per call site, and the per-side {@link ExecutorStallWatch};
+     * {@link #CUMULATIVE} drives every ranking from the one {@link ExecutorProgressWatch} of this resource set
+     * through its no-time calls. A caller states its mode explicitly; nothing inspects or guesses it.
+     */
+    enum Accounting {
+        /** Timestamped ranking calls and the legacy executor watch and stall pairing. */
+        LEGACY,
+        /** Cumulative ranking calls from this set's shared progress watch. */
+        CUMULATIVE
+    }
+
     /** A registered connection that can be closed as a shed victim. */
     interface Victim {
         /**
@@ -72,6 +86,10 @@ public final class SessionResources {
     private final InboundExcessPool inboundExcess;
     private final PressureRanking outboundRanking;
     private final PressureRanking inboundRanking;
+    private final ExecutorStallWatch executor;
+    private final ExecutorStallPairing stallPairing;
+    private final ExecutorProgressWatch progress;
+    private final Accounting accounting;
     private final ServerProfile profile;
     private final LongSupplier clock;
     private final Map<Object, Victim> victims = new ConcurrentHashMap<Object, Victim>();
@@ -91,14 +109,60 @@ public final class SessionResources {
      */
     SessionResources(NodePools node, long outboundIp, long outboundAccount, long outboundConnection,
             long inboundIp, long inboundAccount, ServerProfile profile, LongSupplier clock) {
-        if (node == null || profile == null || clock == null) {
+        this(node, outboundIp, outboundAccount, outboundConnection, inboundIp, inboundAccount, profile, clock,
+                Accounting.LEGACY);
+    }
+
+    /**
+     * Builds the resources of one listener in one explicit accounting mode (13.10, 13.12). LEGACY watches the
+     * executor with a fresh {@link ExecutorStallWatch} on {@code clock}; CUMULATIVE owns one
+     * {@link ExecutorProgressWatch} on the same clock and drives both rankings from it.
+     *
+     * @param accounting the mode every consumer must state; null is rejected
+     */
+    SessionResources(NodePools node, long outboundIp, long outboundAccount, long outboundConnection,
+            long inboundIp, long inboundAccount, ServerProfile profile, LongSupplier clock, Accounting accounting) {
+        this(node, outboundIp, outboundAccount, outboundConnection, inboundIp, inboundAccount, profile, clock,
+                accounting, accounting == Accounting.LEGACY ? new ExecutorStallWatch(clock) : null);
+    }
+
+    /** As above, watching the game executor {@code executor} for this side's connections (13.10). */
+    SessionResources(NodePools node, long outboundIp, long outboundAccount, long outboundConnection,
+            long inboundIp, long inboundAccount, ServerProfile profile, LongSupplier clock,
+            ExecutorStallWatch executor) {
+        this(node, outboundIp, outboundAccount, outboundConnection, inboundIp, inboundAccount, profile, clock,
+                Accounting.LEGACY, executor);
+    }
+
+    private SessionResources(NodePools node, long outboundIp, long outboundAccount, long outboundConnection,
+            long inboundIp, long inboundAccount, ServerProfile profile, LongSupplier clock, Accounting accounting,
+            ExecutorStallWatch legacyExecutor) {
+        if (node == null || profile == null || clock == null || accounting == null) {
             throw new IllegalArgumentException("session resources");
         }
         this.node = node;
         this.profile = profile;
         this.clock = clock;
+        this.accounting = accounting;
+        if (accounting == Accounting.CUMULATIVE) {
+            this.executor = null;
+            this.stallPairing = null;
+            this.progress = new ExecutorProgressWatch(clock);
+            this.outboundRanking = new PressureRanking(progress);
+            this.inboundRanking = new PressureRanking(progress);
+            this.outbound = new OutboundPool(node, outboundIp, outboundAccount, outboundConnection,
+                    outboundRanking.view());
+            this.inboundExcess = new InboundExcessPool(node, inboundIp, inboundAccount, inboundRanking.view());
+            return;
+        }
+        if (legacyExecutor == null) {
+            throw new IllegalArgumentException("session resources");
+        }
+        this.executor = legacyExecutor;
+        this.progress = null;
         this.outboundRanking = new PressureRanking();
         this.inboundRanking = new PressureRanking();
+        this.stallPairing = new ExecutorStallPairing(inboundRanking);
         this.outbound = new OutboundPool(node, outboundIp, outboundAccount, outboundConnection,
                 outboundRanking.view(clock));
         this.inboundExcess = new InboundExcessPool(node, inboundIp, inboundAccount, inboundRanking.view(clock));
@@ -110,11 +174,16 @@ public final class SessionResources {
      * otherwise the sessions get node pools of their own.
      */
     public static SessionResources production(ResourcePools shared) {
+        return create(shared, ExecutorStallWatch.SERVER);
+    }
+
+    /** The resources of one side, watching that side's game executor (13.10). */
+    private static SessionResources create(ResourcePools shared, ExecutorStallWatch executor) {
         NodePools node = shared instanceof NodePools ? (NodePools) shared
                 : new NodePools(NODE_BYTES, INBOUND_EXCESS_NODE_BYTES, OUTBOUND_NODE_BYTES, PRE_LOGIN_PERCENT, false,
                         NodePools.MIN_EXCESS);
         return new SessionResources(node, OUTBOUND_IP_BYTES, OUTBOUND_ACCOUNT_BYTES, OUTBOUND_CONNECTION_BYTES,
-                INBOUND_IP_BYTES, INBOUND_ACCOUNT_BYTES, defaultProfile(), System::nanoTime);
+                INBOUND_IP_BYTES, INBOUND_ACCOUNT_BYTES, defaultProfile(), System::nanoTime, executor);
     }
 
     /** The client endpoint's resources, one per process, built on first use. */
@@ -124,7 +193,7 @@ public final class SessionResources {
             synchronized (SessionResources.class) {
                 current = client;
                 if (current == null) {
-                    current = production(null);
+                    current = create(null, ExecutorStallWatch.CLIENT);
                     client = current;
                 }
             }
@@ -160,17 +229,48 @@ public final class SessionResources {
     }
 
     /**
-     * Reports that the local game executor stalled: inbound bytes waiting on it are not the peer's pressure, so
-     * the stall's time is excluded from the inbound ranking's byte-seconds until {@link #executorStallEnded}
-     * (13.12). No platform adapter calls this yet.
+     * The game executor this side's connections watch for stalls (13.10): {@link ExecutorStallWatch#SERVER} on a
+     * server listener, {@link ExecutorStallWatch#CLIENT} on the client. Legacy accounting only.
      */
-    public void executorStallStarted() {
-        inboundRanking.stallStart(clock.getAsLong());
+    public ExecutorStallWatch executorWatch() {
+        requireLegacy("executorWatch");
+        return executor;
     }
 
-    /** Ends the stall reported with {@link #executorStallStarted}. */
-    public void executorStallEnded() {
-        inboundRanking.stallEnd(clock.getAsLong());
+    /**
+     * The listener-wide pairing of executor stalls into the inbound ranking (13.12): one start when the first
+     * session enters a stall, one end when the last leaves it. Legacy accounting only.
+     */
+    ExecutorStallPairing stallPairing() {
+        requireLegacy("stallPairing");
+        return stallPairing;
+    }
+
+    /**
+     * The one cumulative progress watch of this resource set (13.10): the shared source of both rankings' stall
+     * exclusion. Cumulative accounting only.
+     */
+    public ExecutorProgressWatch progressWatch() {
+        requireCumulative("progressWatch");
+        return progress;
+    }
+
+    /** The same watch as the generic {@link StallClock} consumers take one reading per operation from. */
+    public StallClock stallClock() {
+        requireCumulative("stallClock");
+        return progress;
+    }
+
+    private void requireLegacy(String accessor) {
+        if (accounting != Accounting.LEGACY) {
+            throw new IllegalStateException(accessor + " is legacy accounting only");
+        }
+    }
+
+    private void requireCumulative(String accessor) {
+        if (accounting != Accounting.CUMULATIVE) {
+            throw new IllegalStateException(accessor + " is cumulative accounting only");
+        }
     }
 
     public ServerProfile profile() {
