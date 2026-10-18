@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.routing.Dependency;
 import rs.sudoe.quicraft.core.routing.Direction;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 class StreamReceiverTest {
     private static final long SEC = 1_000_000_000L;
@@ -553,5 +554,184 @@ class StreamReceiverTest {
         assertEquals(1, f.receiver.epoch());
         assertNull(f.receiver.pendingViolation());
         assertEquals(2, f.receiver.nextToEnqueue(), "the chunk head is released normally");
+    }
+
+    @Test void cumulativeConstructorsRejectANullSource() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new StreamReceiver(2, Direction.CLIENTBOUND, (s, r, route) -> true, (StallClock) null));
+        assertThrows(IllegalArgumentException.class,
+                () -> new StreamReceiver(2, new ReceiveSlots(2), (s, r, route) -> true, (StallClock) null));
+    }
+
+    @Test void cumulativeReceiverCoversBothDirectionsFromOneSharedSource() {
+        ScriptedSource source = new ScriptedSource();
+        StreamReceiver clientbound = cumulative(Direction.CLIENTBOUND, source);
+        StreamReceiver serverbound = cumulative(Direction.SERVERBOUND, source);
+        assertAdmitted(clientbound, rec(2, 1, 0, dep(3, 1)));
+        assertAdmitted(serverbound, rec(1, 1, 0, dep(0, 1)));
+        source.set(15 * SEC, 10 * SEC);
+        assertNull(clientbound.expiredWait(), "5 s of active time on the shared source");
+        assertNull(serverbound.expiredWait());
+        source.set(20 * SEC, 10 * SEC);
+        ReceiveClose clientClose = clientbound.expiredWait();
+        ReceiveClose serverClose = serverbound.expiredWait();
+        assertNotNull(clientClose);
+        assertNotNull(serverClose);
+        assertEquals(0x12, clientClose.errorCode());
+        assertEquals(0x12, serverClose.errorCode());
+        assertNull(clientClose.reason(), "consumed stall time blocks the phrase");
+        assertNull(serverClose.reason());
+    }
+
+    @Test void cumulativeWaitStartingInsideAnOpenStallExcludesOnlyItsOwnStallTime() {
+        ScriptedSource source = new ScriptedSource().set(5 * SEC, 4 * SEC);
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1)));
+        source.set(9 * SEC, 8 * SEC);
+        assertNull(rx.expiredWait(), "the stall time before the wait started is not excluded");
+        source.set(16 * SEC, 8 * SEC);
+        assertNull(rx.expiredWait(), "7 s of active time after the stall ended");
+        source.set(19 * SEC, 8 * SEC);
+        ReceiveClose close = rx.expiredWait();
+        assertNotNull(close);
+        assertEquals(0x12, close.errorCode());
+        assertNull(close.reason());
+    }
+
+    @Test void cumulativeLateObservationMatchesFrequentObservation() {
+        ScriptedSource frequent = new ScriptedSource();
+        ScriptedSource late = new ScriptedSource();
+        StreamReceiver observed = cumulative(Direction.CLIENTBOUND, frequent);
+        StreamReceiver unobserved = cumulative(Direction.CLIENTBOUND, late);
+        assertAdmitted(observed, rec(2, 1, 0, dep(3, 1)));
+        assertAdmitted(unobserved, rec(2, 1, 0, dep(3, 1)));
+        frequent.set(4 * SEC, 0);
+        assertNull(observed.expiredWait());
+        frequent.set(8 * SEC, 4 * SEC);
+        assertNull(observed.expiredWait(), "4 s of active time");
+        frequent.set(12 * SEC, 5 * SEC);
+        assertNull(observed.expiredWait(), "7 s of active time");
+        frequent.set(15 * SEC, 5 * SEC);
+        ReceiveClose frequently = observed.expiredWait();
+        late.set(15 * SEC, 5 * SEC);
+        ReceiveClose once = unobserved.expiredWait();
+        assertNotNull(frequently);
+        assertNotNull(once, "a late single observation excludes the same 5 s");
+        assertEquals(frequently.errorCode(), once.errorCode());
+        assertEquals(frequently.unseenPrerequisite(), once.unseenPrerequisite());
+    }
+
+    @Test void cumulativeStallCompletedBetweenObservationsStillExcludes() {
+        ScriptedSource source = new ScriptedSource().set(2 * SEC, 0);
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1)));
+        source.set(15 * SEC, 7 * SEC);
+        assertNull(rx.expiredWait(), "a 7 s stall completed entirely between the two observations");
+        source.set(19 * SEC, 7 * SEC);
+        ReceiveClose close = rx.expiredWait();
+        assertNotNull(close);
+        assertEquals(0x12, close.errorCode());
+        assertNull(close.reason(), "consumed stall time blocks the phrase");
+    }
+
+    @Test void cumulativeDeadlineCapAndResourceClassificationMatchTheBoundaryRules() {
+        ScriptedSource source = new ScriptedSource();
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1)));
+        source.set(65 * SEC, 65 * SEC);
+        assertNull(rx.expiredWait(), "60 of the 65 s is excluded, leaving 5 s active");
+        source.set(70 * SEC, 70 * SEC);
+        ReceiveClose capped = rx.expiredWait();
+        assertNotNull(capped);
+        assertEquals(0x12, capped.errorCode());
+        assertNull(capped.reason(), "consumed stall time blocks the phrase");
+
+        ScriptedSource plain = new ScriptedSource();
+        StreamReceiver waiting = cumulative(Direction.CLIENTBOUND, plain);
+        assertAdmitted(waiting, rec(2, 1, 0, dep(3, 1)));
+        plain.set(10 * SEC, 0);
+        ReceiveClose unseen = waiting.expiredWait();
+        assertNotNull(unseen, "10 s of transport time without any stall time");
+        assertEquals(0x12, unseen.errorCode());
+        assertEquals("unseen-prerequisite",
+                new String(unseen.reason(), java.nio.charset.StandardCharsets.US_ASCII));
+    }
+
+    @Test void cumulativeReceiverRejectsBoundaryHooksEvenWithNoHeads() {
+        ScriptedSource source = new ScriptedSource();
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertThrows(IllegalStateException.class, rx::stallStarted);
+        assertThrows(IllegalStateException.class, () -> rx.stallStarted(5 * SEC));
+        assertThrows(IllegalStateException.class, rx::stallEnded);
+        assertThrows(IllegalStateException.class, () -> rx.stallEnded(6 * SEC));
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1)));
+        assertThrows(IllegalStateException.class, rx::stallStarted, "a held head changes nothing");
+        assertThrows(IllegalStateException.class, () -> rx.stallEnded(6 * SEC));
+        source.set(10 * SEC, 0);
+        ReceiveClose close = rx.expiredWait();
+        assertNotNull(close, "the rejected hooks changed no state");
+        assertEquals(0x12, close.errorCode());
+        assertEquals("unseen-prerequisite",
+                new String(close.reason(), java.nio.charset.StandardCharsets.US_ASCII));
+    }
+
+    @Test void invalidCumulativeSourcePropagatesWithoutAFallbackOutcome() {
+        ScriptedSource invalid = new ScriptedSource();
+        invalid.valid = false;
+        StreamReceiver refused = cumulative(Direction.CLIENTBOUND, invalid);
+        assertThrows(StallClock.UnavailableException.class, () -> offer(refused, rec(2, 1, 0, dep(3, 1))));
+        assertNull(refused.head(2), "a rejected start publishes no head");
+        assertFalse(refused.slots().holdsHead(2), "a rejected start charges no slot");
+
+        ScriptedSource goingInvalid = new ScriptedSource();
+        StreamReceiver running = cumulative(Direction.CLIENTBOUND, goingInvalid);
+        assertAdmitted(running, rec(2, 1, 0, dep(3, 1)));
+        goingInvalid.valid = false;
+        assertThrows(StallClock.UnavailableException.class, running::expiredWait);
+        assertNull(running.pendingViolation(), "an unavailable source is not a peer ordering violation");
+        assertThrows(StallClock.UnavailableException.class, running::expiredWait,
+                "the invalid incarnation stays unavailable");
+    }
+
+    @Test void legacyTimestampedStallHooksStillExcludeThroughTheBoundaryClock() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 1)));
+        f.receiver.stallStarted(0);
+        f.now.set(10 * SEC);
+        f.receiver.stallEnded(10 * SEC);
+        f.now.set(20 * SEC);
+        ReceiveClose close = f.receiver.expiredWait();
+        assertNotNull(close, "10 s of stall excluded, 10 s active");
+        assertEquals(0x12, close.errorCode());
+        assertNull(close.reason(), "consumed stall time blocks the phrase");
+    }
+
+    /** A cumulative receiver over {@code source}. */
+    private static StreamReceiver cumulative(Direction direction, StallClock source) {
+        return new StreamReceiver(2, direction, (s, r, route) -> true, source);
+    }
+
+    /** A scripted cumulative source whose every reading is one coherent pair. */
+    private static final class ScriptedSource implements StallClock {
+        long nowNanos;
+        long excludedNanos;
+        boolean valid = true;
+
+        ScriptedSource set(long nowNanos, long excludedNanos) {
+            this.nowNanos = nowNanos;
+            this.excludedNanos = excludedNanos;
+            return this;
+        }
+
+        @Override public Sample sample() {
+            final long now = nowNanos;
+            final long excluded = excludedNanos;
+            final boolean validReading = valid;
+            return new Sample() {
+                @Override public long nowNanos() { return now; }
+                @Override public long excludedNanos() { return excluded; }
+                @Override public boolean valid() { return validReading; }
+            };
+        }
     }
 }

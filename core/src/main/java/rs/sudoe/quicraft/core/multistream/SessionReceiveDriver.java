@@ -15,6 +15,7 @@ import rs.sudoe.quicraft.core.routing.Extractor;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.RouteKey;
 import rs.sudoe.quicraft.core.routing.RouteV2;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
  * Serial delivery driver for clientbound receive (protocol.md 13.10, 13.12, 13.15, 13.16, 13.18).
@@ -105,6 +106,9 @@ public final class SessionReceiveDriver {
     private boolean closed;
 
     /**
+     * Legacy boundary mode: the blocked-head timer is driven by the forwarded
+     * {@link #stallStarted(long)} and {@link #stallEnded(long)} notifications on {@code clock}.
+     *
      * @param chunks negotiated chunk count N, 1..6, equal to the pump's
      * @param pump the clientbound read pump; it charges and commits the slots
      * @param slots the pump's slots; the receiver shares them and never charges again
@@ -127,6 +131,45 @@ public final class SessionReceiveDriver {
         this.pump = pump;
         this.validator = validator;
         this.receiver = new StreamReceiver(chunks, slots, validator, clock);
+        this.routes = routes;
+        this.protocolNumber = protocolNumber;
+        this.extractors = extractors;
+        this.game = game;
+        this.clock = clock;
+        this.sink = sink;
+        this.streams = chunks + 2;
+        this.held = new Entry[streams];
+    }
+
+    /**
+     * Cumulative mode: the receiver's blocked-head timer reads {@code source} (13.10), so a late
+     * observation excludes exactly what a timely one would have. {@code clock} stays the session's
+     * non-excluding transport clock for the bundle-close deadline (13.15), which never excludes stalls.
+     * Boundary stall notifications forwarded through this driver throw in this mode.
+     *
+     * @param chunks negotiated chunk count N, 1..6, equal to the pump's
+     * @param pump the clientbound read pump; it charges and commits the slots
+     * @param slots the pump's slots; the receiver shares them and never charges again
+     * @param validator injected shard, fence and join checks, also run on each bundle member
+     * @param routes route lookup for the connection's protocol
+     * @param protocolNumber the negotiated protocol number, for route keys
+     * @param extractors reviewed extractors by name, for CHUNK positions
+     * @param game the game side: decode, deliver, acknowledgements
+     * @param clock the same non-excluding clock the pump was built with
+     * @param sink receives the one close
+     * @param source the stall accounting source of the executor incarnation, never replaced; not null
+     */
+    public SessionReceiveDriver(int chunks, ClientReadPump pump, ReceiveSlots slots,
+                                StreamReceiver.Validator validator, RouteSource routes, int protocolNumber,
+                                Map<String, Extractor> extractors, LaneGame game, LongSupplier clock,
+                                CloseSink sink, StallClock source) {
+        if (pump == null || slots == null || validator == null || routes == null || extractors == null
+                || game == null || clock == null || sink == null || source == null) {
+            throw new IllegalArgumentException("driver arguments and the stall source are required");
+        }
+        this.pump = pump;
+        this.validator = validator;
+        this.receiver = new StreamReceiver(chunks, slots, validator, source);
         this.routes = routes;
         this.protocolNumber = protocolNumber;
         this.extractors = extractors;
@@ -207,6 +250,16 @@ public final class SessionReceiveDriver {
     /** Forwards the end of a game-executor tick stall to the receiver. */
     public void stallEnded() {
         receiver.stallEnded();
+    }
+
+    /** Forwards the start of a stall timestamped at {@code atNanos} (13.10 clock discipline). */
+    public void stallStarted(long atNanos) {
+        receiver.stallStarted(atNanos);
+    }
+
+    /** Forwards the end of a stall timestamped at {@code atNanos}. */
+    public void stallEnded(long atNanos) {
+        receiver.stallEnded(atNanos);
     }
 
     /**

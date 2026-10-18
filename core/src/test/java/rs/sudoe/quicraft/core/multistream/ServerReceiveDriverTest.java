@@ -4,14 +4,17 @@ package rs.sudoe.quicraft.core.multistream;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.routing.Dependency;
 import rs.sudoe.quicraft.core.routing.RouteV2;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /** Serverbound serial driver: eligibility before inflation, one execution unit, terminal cleanup and END. */
 class ServerReceiveDriverTest {
@@ -28,10 +31,16 @@ class ServerReceiveDriverTest {
         final SessionReadPump pump;
         final SessionReceiveDriverTest.FakeGame game = new SessionReceiveDriverTest.FakeGame();
         final List<Integer> codes = new ArrayList<Integer>();
+        final List<String> reasons = new ArrayList<String>();
         final long[] now = {0L};
+        final CumulativeSource stalls = new CumulativeSource(now);
         final ServerReceiveDriver driver;
 
         Harness(boolean compressed) {
+            this(compressed, false);
+        }
+
+        Harness(boolean compressed, boolean cumulative) {
             pump = new SessionReadPump(new ServerReadPartition(2), pools.node, pools.excess, "conn", "ip-a", null,
                     LIMITS, compressed, source);
             Map<Integer, RouteV2> routes = new HashMap<Integer, RouteV2>();
@@ -39,9 +48,17 @@ class ServerReceiveDriverTest {
                     null, null, false, null, null, null));
             routes.put(PID_REALTIME, new RouteV2(RouteV2.StreamLane.REALTIME, Dependency.ORDINARY,
                     null, null, false, null, null, null));
-            driver = new ServerReceiveDriver(2, pump, (s, r, route) -> true,
-                    new SessionReceiveDriverTest.RouteSourceImpl(routes), PROTOCOL, game, () -> now[0],
-                    (code, reason) -> codes.add(code));
+            SessionReceiveDriver.CloseSink sink = (code, reason) -> {
+                codes.add(code);
+                reasons.add(new String(reason, StandardCharsets.US_ASCII));
+            };
+            driver = cumulative
+                    ? new ServerReceiveDriver(2, pump, (s, r, route) -> true,
+                            new SessionReceiveDriverTest.RouteSourceImpl(routes), PROTOCOL, game, () -> now[0],
+                            sink, stalls)
+                    : new ServerReceiveDriver(2, pump, (s, r, route) -> true,
+                            new SessionReceiveDriverTest.RouteSourceImpl(routes), PROTOCOL, game, () -> now[0],
+                            sink);
         }
 
         void rounds(int n) throws Exception {
@@ -138,5 +155,86 @@ class ServerReceiveDriverTest {
         assertEquals(Collections.singletonList(0), h.codes);
         assertEquals(0, h.game.decodes, "END is never decoded");
         assertEquals(0, h.game.deliveries(), "END is never delivered");
+    }
+
+    @Test void cumulativeServerboundExpiryUsesTheSharedSourceAndSuppressesThePhrase() throws Exception {
+        Harness h = new Harness(false, true);
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(1, 1), PID_CONTROL));
+        h.rounds(30);
+        assertNotNull(h.driver.receiver().head(LogicalStream.CONTROL), "the blocked head owns the wait");
+        h.now[0] = TimeUnit.SECONDS.toNanos(20);
+        h.stalls.excluded = TimeUnit.SECONDS.toNanos(20);
+        h.rounds(1);
+        assertTrue(h.codes.isEmpty(), "every second of the wait is excluded");
+        h.now[0] = TimeUnit.SECONDS.toNanos(30);
+        h.stalls.excluded = TimeUnit.SECONDS.toNanos(20);
+        h.rounds(1);
+        assertEquals(Collections.singletonList(0x12), h.codes);
+        assertEquals(Collections.singletonList("resource"), h.reasons,
+                "consumed stall time removes the phrase, so the generic resource reason is sent");
+    }
+
+    @Test void legacyServerboundDriverStillForwardsBoundaryStalls() throws Exception {
+        Harness h = new Harness(false);
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(1, 1), PID_CONTROL));
+        h.rounds(30);
+        assertNotNull(h.driver.receiver().head(LogicalStream.CONTROL), "the blocked head owns the wait");
+        h.driver.stallStarted(0);
+        h.now[0] = TimeUnit.SECONDS.toNanos(10);
+        h.driver.stallEnded(TimeUnit.SECONDS.toNanos(10));
+        h.now[0] = TimeUnit.SECONDS.toNanos(20);
+        h.rounds(1);
+        assertEquals(Collections.singletonList(0x12), h.codes, "10 s excluded leaves 10 s active");
+        assertEquals(Collections.singletonList("resource"), h.reasons, "consumed stall time blocks the phrase");
+    }
+
+    @Test void cumulativeServerboundDriverRejectsBoundaryHooksWithoutHeads() throws Exception {
+        Harness h = new Harness(false, true);
+        assertThrows(IllegalStateException.class, () -> h.driver.stallStarted(1L));
+        assertThrows(IllegalStateException.class, () -> h.driver.stallEnded(1L));
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_CONTROL));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("enqueued 0:1"), h.game.log.toString());
+        h.driver.acknowledged(LogicalStream.CONTROL, 1);
+        assertTrue(h.codes.isEmpty(), "the rejected hooks changed nothing");
+    }
+
+    @Test void invalidCumulativeSourcePropagatesFromTheServerboundDriver() throws Exception {
+        Harness h = new Harness(false, true);
+        h.stalls.valid = false;
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(1, 1), PID_CONTROL));
+        assertThrows(StallClock.UnavailableException.class, () -> h.rounds(30));
+        assertTrue(h.codes.isEmpty(), "an unavailable source is not converted to a close");
+        assertFalse(h.driver.closed());
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL),
+                "a rejected start charges no slot");
+        h.driver.close();
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse());
+    }
+
+    /** A cumulative source coherent with the harness's non-excluding transport clock. */
+    private static final class CumulativeSource implements StallClock {
+        private final long[] now;
+        long excluded;
+        boolean valid = true;
+
+        CumulativeSource(long[] now) {
+            this.now = now;
+        }
+
+        @Override public Sample sample() {
+            final long nowReading = now[0];
+            final long excludedReading = excluded;
+            final boolean validReading = valid;
+            return new Sample() {
+                @Override public long nowNanos() { return nowReading; }
+                @Override public long excludedNanos() { return excludedReading; }
+                @Override public boolean valid() { return validReading; }
+            };
+        }
     }
 }

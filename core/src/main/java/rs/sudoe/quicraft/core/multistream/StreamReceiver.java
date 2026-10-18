@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.function.LongSupplier;
 import rs.sudoe.quicraft.core.routing.Direction;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
  * Receiver-side ordering policy for the N+2 streams of one direction (protocol.md 13.10, 13.12,
@@ -35,6 +36,12 @@ import rs.sudoe.quicraft.core.routing.Direction;
  * <p>Protocol violations are returned as {@link ReceiveClose} values with code 0x11, never thrown.
  * Refusals (a stream already holds its head) are returned as {@link Admission#busy()}. Nothing here
  * closes a connection by itself; the caller acts on the returned close.
+ *
+ * <p>The blocked-head timers of a receiver run in one of two modes and never mix them. A receiver built
+ * with a {@link LongSupplier} is boundary-driven: intervals arrive through {@link #stallStarted(long)} and
+ * {@link #stallEnded(long)}. A receiver built with a {@link StallClock} is cumulative: every timer reads
+ * that one source, so an observation taken late excludes exactly what a timely one would have, and the
+ * boundary hooks throw {@link IllegalStateException} before reading any clock or touching any state.
  *
  * <p>Not thread-safe; the receive path that owns the connection drives it.
  */
@@ -139,7 +146,10 @@ public final class StreamReceiver {
     /** True when the connection's read pump owns the slot charge (see the pump-slot constructor). */
     private final boolean slotsHeldByPump;
     private final Validator validator;
+    /** The boundary transport clock; null in cumulative mode. */
     private final LongSupplier clock;
+    /** The cumulative stall source of the executor incarnation; null in boundary mode. */
+    private final StallClock source;
     private final Set<Long> withheld = new HashSet<Long>();
     private long epoch;
     private boolean transitionPending;
@@ -148,7 +158,7 @@ public final class StreamReceiver {
     private ReceiveClose violation;
 
     /**
-     * Clientbound receiver, kept for existing callers.
+     * Clientbound receiver, kept for existing callers (legacy boundary mode).
      *
      * @param chunks negotiated chunk count N, 1..6
      * @param validator injected shard, fence and join checks
@@ -159,20 +169,38 @@ public final class StreamReceiver {
     }
 
     /**
+     * Legacy boundary-mode receiver: its timers are driven by {@link #stallStarted(long)} and
+     * {@link #stallEnded(long)} notifications on {@code clock}.
+     *
      * @param chunks negotiated chunk count N, 1..6
      * @param direction sending direction this receiver serves; serverbound allows epoch 0 only (13.18)
      * @param validator injected shard, fence and join checks
      * @param clock monotonic nanosecond transport clock
      */
     public StreamReceiver(int chunks, Direction direction, Validator validator, LongSupplier clock) {
-        this(chunks, direction, new ReceiveSlots(chunks), false, validator, clock);
+        this(chunks, direction, new ReceiveSlots(chunks), false, validator, clock, null);
     }
 
     /**
-     * Receiver whose stream slots are charged by the connection's {@link ClientReadPump}. The pump admits
-     * each head unit at read time; {@link #offer} then only checks that the stream holds exactly that
-     * unit's bytes and records, and never charges again. The owner releases the slot once, by committing
-     * the pump unit after {@link #applied}; this receiver does not release it.
+     * Cumulative receiver: every blocked-head timer reads {@code source}, so an observation taken late
+     * excludes exactly what a timely one would have (13.10). {@code source} is required and is not
+     * replaced for the life of the receiver.
+     *
+     * @param chunks negotiated chunk count N, 1..6
+     * @param direction sending direction this receiver serves; serverbound allows epoch 0 only (13.18)
+     * @param validator injected shard, fence and join checks
+     * @param source the stall accounting source of the executor incarnation
+     */
+    public StreamReceiver(int chunks, Direction direction, Validator validator, StallClock source) {
+        this(chunks, direction, new ReceiveSlots(chunks), false, validator, null, requireSource(source));
+    }
+
+    /**
+     * Receiver whose stream slots are charged by the connection's {@link ClientReadPump}, kept for existing
+     * callers (legacy boundary mode). The pump admits each head unit at read time; {@link #offer} then only
+     * checks that the stream holds exactly that unit's bytes and records, and never charges again. The owner
+     * releases the slot once, by committing the pump unit after {@link #applied}; this receiver does not
+     * release it.
      *
      * @param chunks negotiated chunk count N, 1..6, equal to the pump's
      * @param slots the pump's clientbound slots, the single owner of the head charge
@@ -180,14 +208,30 @@ public final class StreamReceiver {
      * @param clock monotonic nanosecond transport clock
      */
     public StreamReceiver(int chunks, ReceiveSlots slots, Validator validator, LongSupplier clock) {
-        this(chunks, Direction.CLIENTBOUND, slots, true, validator, clock);
+        this(chunks, Direction.CLIENTBOUND, slots, true, validator, clock, null);
+    }
+
+    /**
+     * Cumulative pump-slot receiver: as {@link #StreamReceiver(int, ReceiveSlots, Validator, LongSupplier)},
+     * but every blocked-head timer reads {@code source} (13.10). {@code source} is required.
+     *
+     * @param chunks negotiated chunk count N, 1..6, equal to the pump's
+     * @param slots the pump's clientbound slots, the single owner of the head charge
+     * @param validator injected shard, fence and join checks
+     * @param source the stall accounting source of the executor incarnation
+     */
+    public StreamReceiver(int chunks, ReceiveSlots slots, Validator validator, StallClock source) {
+        this(chunks, Direction.CLIENTBOUND, slots, true, validator, null, requireSource(source));
     }
 
     private StreamReceiver(int chunks, Direction direction, ReceiveSlots slots, boolean slotsHeldByPump,
-                           Validator validator, LongSupplier clock) {
+                           Validator validator, LongSupplier clock, StallClock source) {
         LogicalStream.validateShardCount(chunks);
-        if (direction == null || slots == null || validator == null || clock == null) {
-            throw new IllegalArgumentException("direction, slots, validator and clock are required");
+        if (direction == null || slots == null || validator == null) {
+            throw new IllegalArgumentException("direction, slots and validator are required");
+        }
+        if ((clock == null) == (source == null)) {
+            throw new IllegalArgumentException("exactly one of the boundary clock and the stall source is required");
         }
         this.direction = direction;
         streams = chunks + 2;
@@ -199,6 +243,15 @@ public final class StreamReceiver {
         this.slotsHeldByPump = slotsHeldByPump;
         this.validator = validator;
         this.clock = clock;
+        this.source = source;
+    }
+
+    /** Rejects a null cumulative source before a receiver exists. */
+    private static StallClock requireSource(StallClock source) {
+        if (source == null) {
+            throw new IllegalArgumentException("source is required");
+        }
+        return source;
     }
 
     /**
@@ -301,17 +354,25 @@ public final class StreamReceiver {
                     || slots.heldRecords(stream) != recordCount) {
                 return Admission.violation("pump slot on stream " + stream + " does not match the unit");
             }
-        } else if (!slots.admitHead(stream, wireBytes, recordCount)) {
+        }
+        // The local unit is prepared, and its timer started only when a prerequisite wait actually
+        // begins, before head/admitted are published or an own slot is acquired: a cumulative start
+        // that cannot trust its source throws with no receiver state changed. ready(unit) reads only
+        // the unit's own record and the applied watermarks, so it needs no published head.
+        Unit unit = new Unit(record, closingSequence, newBlockedHeadTimer());
+        boolean blocked = !ready(unit);
+        if (blocked) {
+            unit.timer.start();
+        }
+        if (!slotsHeldByPump && !slots.admitHead(stream, wireBytes, recordCount)) {
+            unit.timer.stop();
             return Admission.busy();
         }
-        Unit unit = new Unit(record, closingSequence, new BlockedHeadTimer(clock, true));
         head[stream] = unit;
         admitted[stream] = closingSequence;
-        if (!ready(unit)) {
-            unit.timer.start();
-            if (stalled) {
-                unit.timer.stallStarted();
-            }
+        if (blocked && stalled) {
+            // stalled is only ever set by the boundary hooks, which a cumulative receiver rejects.
+            unit.timer.stallStarted();
         }
         return Admission.admitted();
     }
@@ -486,23 +547,38 @@ public final class StreamReceiver {
 
     /**
      * Forwards a recorded game-executor tick stall (LaneGame). Heads admitted while it continues start
-     * excluded too, until {@link #stallEnded()} (13.10).
+     * excluded too, until {@link #stallEnded()} (13.10). A cumulative receiver derives stall time from
+     * its source instead: it rejects every boundary hook before reading a clock or changing any state.
      */
     public void stallStarted() {
+        requireBoundaryMode();
+        stallStarted(clock.getAsLong());
+    }
+
+    /** As {@link #stallStarted()}, timestamped at {@code atNanos} (13.10; see {@link BlockedHeadTimer#stallStarted(long)}). */
+    public void stallStarted(long atNanos) {
+        requireBoundaryMode();
         stalled = true;
         for (Unit unit : head) {
             if (unit != null) {
-                unit.timer.stallStarted();
+                unit.timer.stallStarted(atNanos);
             }
         }
     }
 
     /** Forwards the end of a recorded game-executor tick stall (LaneGame). */
     public void stallEnded() {
+        requireBoundaryMode();
+        stallEnded(clock.getAsLong());
+    }
+
+    /** As {@link #stallEnded()}, timestamped at {@code atNanos}. */
+    public void stallEnded(long atNanos) {
+        requireBoundaryMode();
         stalled = false;
         for (Unit unit : head) {
             if (unit != null) {
-                unit.timer.stallEnded();
+                unit.timer.stallEnded(atNanos);
             }
         }
     }
@@ -826,6 +902,18 @@ public final class StreamReceiver {
             throw new IllegalStateException("not the current head of stream " + stream);
         }
         return unit;
+    }
+
+    /** Creates the blocked-head timer in the receiver's accounting mode (13.10). */
+    private BlockedHeadTimer newBlockedHeadTimer() {
+        return source == null ? new BlockedHeadTimer(clock, true) : new BlockedHeadTimer(source, true);
+    }
+
+    /** Rejects a boundary stall notification in cumulative mode before any clock read or state change. */
+    private void requireBoundaryMode() {
+        if (source != null) {
+            throw new IllegalStateException("a cumulative receiver has no boundary stall notifications");
+        }
     }
 
     private void checkStream(int stream) {
