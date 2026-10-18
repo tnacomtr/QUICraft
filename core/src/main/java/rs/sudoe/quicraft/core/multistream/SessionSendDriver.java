@@ -954,8 +954,9 @@ public final class SessionSendDriver {
      * @return the handles of the unit in stream order, or an empty list when the driver refused the unit and
      *         closed (0x11 for a bundle over its limits, 0x12 for a member no cap can admit); nothing is written
      *         after such a close
-     * @throws IllegalArgumentException when the run's total wire bytes exceed {@code maxRecordBytes}: it could never be
-     *         granted, so it is refused before anything is queued, and the sequencer and queues are unchanged
+     * @throws IllegalArgumentException when the opener, a member or the closer is not one complete GAME body
+     *         (13.4), or the run's total wire bytes exceed {@code maxRecordBytes}: either could never be granted,
+     *         so it is refused before anything is queued, and the sequencer and queues are unchanged
      */
     public synchronized List<SentPacket> submitBundle(OutboundPacket opening, List<OutboundPacket> members,
             StreamSequencer.Fence[] scopes, OutboundPacket closing, Record.Dependency... external) {
@@ -964,11 +965,20 @@ public final class SessionSendDriver {
             return result;
         }
         int units = members.size() + 2;
-        long bytes = opening.frame().length + closing.frame().length;
+        byte[] openingFrame = opening.frame();
+        byte[] closingFrame = closing.frame();
+        // Complete GAME framing (13.4) of the opener, every member and the closer is checked before any sequence
+        // is taken. RecordCodec would reject the same bytes only after assignment, which would consume CONTROL
+        // sequences and move the scope frontier while the driver stays open.
+        validateGameFrame(openingFrame, "bundle opener");
+        validateGameFrame(closingFrame, "bundle closer");
+        long bytes = openingFrame.length + closingFrame.length;
         List<byte[]> frames = new ArrayList<byte[]>(members.size());
         for (OutboundPacket member : members) {
-            frames.add(member.frame());
-            bytes += member.frame().length;
+            byte[] frame = member.frame();
+            validateGameFrame(frame, "bundle member");
+            frames.add(frame);
+            bytes += frame.length;
         }
         if (overflows(units, bytes)) {
             closeWith(CLOSE_RESOURCE);
@@ -977,7 +987,7 @@ public final class SessionSendDriver {
         // The exact unit total is computed without assigning anything, so a refused run leaves the sequencer unchanged.
         long unitBytes;
         try {
-            unitBytes = sequencer.bundleWireBytes(opening.frame(), frames, scopes, closing.frame(), external);
+            unitBytes = sequencer.bundleWireBytes(openingFrame, frames, scopes, closingFrame, external);
         } catch (IllegalArgumentException refused) {
             closeWith(CLOSE_ORDERING);
             return result;
@@ -992,7 +1002,7 @@ public final class SessionSendDriver {
         }
         List<Record> records;
         try {
-            records = sequencer.assignBundle(opening.frame(), frames, scopes, closing.frame(), external);
+            records = sequencer.assignBundle(openingFrame, frames, scopes, closingFrame, external);
         } catch (IllegalArgumentException refused) {
             closeWith(CLOSE_ORDERING);
             return result;

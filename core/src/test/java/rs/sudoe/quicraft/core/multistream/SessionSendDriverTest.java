@@ -1866,6 +1866,41 @@ class SessionSendDriverTest {
     }
 
     /**
+     * The plain bundle path applies the same GAME framing rule as the covered path: each malformed opener,
+     * member or closer is refused before any sequence is taken, so the CONTROL sequence, queue count, pool
+     * charge and pending update token are unchanged and the driver stays open. Covers an inner length of zero
+     * and an inner length longer than the carried bytes.
+     */
+    @Test
+    void bundleRejectsMalformedGameFramesInPlaceAtEveryPosition() throws Exception {
+        StreamSequencer.Fence ordinary = StreamSequencer.Fence.ORDINARY_CONTROL;
+        OutboundPacket[] malformed = {
+            new OutboundPacket(new byte[] {0}),
+            new OutboundPacket(new byte[] {2, 7}),
+        };
+        for (OutboundPacket bad : malformed) {
+            Rig rig = new Rig(2, 1000);
+            SessionSendDriver driver = rig.driver;
+            MultistreamSession.UpdateToken live = driver.registerUpdate(driver.openScope());
+
+            assertRejectedInPlace(rig, live, "malformed opener", () -> driver.submitBundle(bad, packets(2),
+                    new StreamSequencer.Fence[] {ordinary}, frame(1)));
+            assertRejectedInPlace(rig, live, "malformed closer", () -> driver.submitBundle(frame(1),
+                    packets(2), new StreamSequencer.Fence[] {ordinary}, bad));
+            for (int position = 0; position < 3; position++) {
+                List<OutboundPacket> members = packets(2, 2, 2);
+                members.set(position, bad);
+                assertRejectedInPlace(rig, live, "malformed member " + position,
+                        () -> driver.submitBundle(frame(1), members,
+                                new StreamSequencer.Fence[] {ordinary, ordinary, ordinary}, frame(1)));
+            }
+            assertTrue(driver.submitCovered(live, frame(2), ordinary, false, 0, 0).isAssigned(),
+                    "the live token still resolves after every malformed refusal");
+            driver.close();
+        }
+    }
+
+    /**
      * Every member scope is inspected, not only the ones before the first CHUNK or GLOBAL. An invalid later scope
      * (REALTIME or null) refuses the whole bundle in place, and the sequencer rule agrees with the driver.
      */
