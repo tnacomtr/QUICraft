@@ -145,9 +145,15 @@ xvfb-run -a ./gradlew :fabric-26x:runClientGameTest \
 ```
 
 The protocol-775 routing fixture `core/src/test/resources/rs/sudoe/quicraft/core/routing/play-ids-775.txt`
-is regenerated from the live game by `RoutingTableGameTest` (it checks the shipped table against the
-live ids first, then emits): add `-Pquicraft.emitPlayIds=<file>` to the command above and check the
-emitted file in. Never edit it by hand.
+is captured from the live game, never edited by hand. `RoutingTableGameTest` compares the complete
+live play protocol against it on every run, both directions and every id, and a module version bump
+to another protocol fails until it is refreshed; matrix rows for other releases skip visibly. To
+refresh, add `-Pquicraft.emitPlayIds=core/src/test/resources/rs/sudoe/quicraft/core/routing/play-ids-775.txt`
+to the command above (a refresh run skips the comparison), then update `PROTOCOL` and core's
+`PlayIdInventoryTest`. Temporary caveat until the `ServerMultistreamGameTest` failure is fixed
+(agent/p5-msv-gametest): the full suite stops before `RoutingTableGameTest`, so for the refresh run
+narrow `fabric/src/gametest/resources/fabric.mod.json`'s `fabric-client-gametest` entrypoint list to
+`RoutingTableGameTest` locally and revert it afterwards; never commit the narrowing.
 
 Results (2026-10-11, commit after 5026691): all pass on 26.1, 26.1.1, 26.1.2, 26.2, 26.3 and
 1.21.11, each with five 0-RTT joins and the TCP retry after a first-flight mismatch. The mod
