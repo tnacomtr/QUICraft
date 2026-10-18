@@ -184,4 +184,77 @@ class BlockedHeadTimerTest {
         assertEquals(1 * SEC, timer.excludedNanos(), "an end past the reading excludes only up to it");
         assertEquals(0, timer.activeNanos(), "no negative active time");
     }
+
+    @Test void negativeClockOriginKeepsExclusionsWaitRelative() {
+        AtomicLong now = new AtomicLong();
+        BlockedHeadTimer timer = new BlockedHeadTimer(now::get, true);
+        now.set(-20 * SEC);
+        timer.start();
+        now.set(-10 * SEC);
+        timer.stallStarted(-15 * SEC);
+        now.set(-2 * SEC);
+        timer.stallEnded(-5 * SEC);
+        assertEquals(10 * SEC, timer.excludedNanos(), "[-15 s, -5 s] is inside the wait starting at -20 s");
+        assertEquals(8 * SEC, timer.activeNanos(), "18 s elapsed minus 10 s excluded");
+        assertTrue(timer.stallConsumed());
+
+        AtomicLong beforeNow = new AtomicLong();
+        BlockedHeadTimer before = new BlockedHeadTimer(beforeNow::get, true);
+        beforeNow.set(-20 * SEC);
+        before.start();
+        beforeNow.set(-5 * SEC);
+        before.stallStarted(-30 * SEC);
+        before.stallEnded(-25 * SEC);
+        assertEquals(0, before.excludedNanos(), "an interval ending before the wait excludes nothing");
+        assertEquals(15 * SEC, before.activeNanos());
+    }
+
+    @Test void signedClockWrapKeepsShortIntervalAndActiveTimeCorrect() {
+        AtomicLong now = new AtomicLong();
+        BlockedHeadTimer timer = new BlockedHeadTimer(now::get, true);
+        long origin = Long.MAX_VALUE - 3 * SEC;
+        now.set(origin);
+        timer.start();
+        now.set(origin + 2 * SEC);
+        timer.stallStarted();
+        now.set(origin + 5 * SEC);
+        assertTrue(now.get() < 0, "the reading wrapped past Long.MAX_VALUE");
+        timer.stallEnded();
+        assertEquals(3 * SEC, timer.excludedNanos(), "a 3 s interval across the wrap");
+        assertEquals(2 * SEC, timer.activeNanos(), "5 s elapsed minus 3 s excluded");
+        assertFalse(timer.expired());
+    }
+
+    @Test void signedClockWrapKeepsTheAllowanceAndDeadlineCorrect() {
+        AtomicLong now = new AtomicLong();
+        BlockedHeadTimer timer = new BlockedHeadTimer(now::get, true);
+        long origin = Long.MAX_VALUE - 3 * SEC;
+        now.set(origin);
+        timer.start();
+        timer.stallStarted();
+        now.set(origin + 65 * SEC);
+        assertTrue(now.get() < 0, "the reading wrapped past Long.MAX_VALUE");
+        timer.stallEnded();
+        assertEquals(60 * SEC, timer.excludedNanos(), "the allowance still caps across the wrap");
+        assertFalse(timer.expired(), "active time is 65 - 60 = 5 seconds");
+        now.set(origin + 70 * SEC);
+        assertTrue(timer.expired(), "active time is 70 - 60 = 10 seconds");
+    }
+
+    @Test void outOfOrderStartCountsOnlyItsUncoveredTail() {
+        AtomicLong now = new AtomicLong();
+        BlockedHeadTimer timer = new BlockedHeadTimer(now::get, true);
+        timer.start();
+        now.set(5 * SEC);
+        timer.stallStarted(5 * SEC);
+        now.set(7 * SEC);
+        timer.stallEnded(7 * SEC);
+        assertEquals(2 * SEC, timer.excludedNanos());
+        now.set(8 * SEC);
+        timer.stallStarted(2 * SEC);
+        now.set(9 * SEC);
+        timer.stallEnded(6 * SEC);
+        assertEquals(2 * SEC, timer.excludedNanos(),
+                "an earlier start after a later one is out of order and is not rejoined into the union");
+    }
 }

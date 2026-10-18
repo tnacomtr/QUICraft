@@ -18,15 +18,19 @@ import java.util.function.LongSupplier;
  * <p>Stall notifications are accepted only while the wait is running, and every reported interval is
  * clipped to that wait with wait-relative offsets: an interval that starts before the wait contributes
  * only from the wait's start, and an end reported past the current clock reading contributes only up to
- * that reading. Overlapping reported intervals are excluded once (their union, no double count), and the
- * recorded exclusion saturates at the allowance before any addition, so it can neither overflow nor go
- * negative. Late observation of a completed interval yields the same exclusion as timely observation;
- * nothing is applied retroactively to a wait that already ended.
+ * that reading. Overlapping intervals are counted once, but only under the precondition that interval
+ * pairs arrive in nondecreasing start-timestamp order (an end may overlap the next start). An earlier
+ * start reported after a later one is out of order and not supported: that interval counts only the time
+ * after the already covered end, not the full union. The recorded exclusion saturates at the allowance
+ * before any addition, so it can neither overflow nor go negative. Late observation of a completed
+ * interval yields the same exclusion as timely observation; nothing is applied retroactively to a wait
+ * that already ended.
  *
  * <p>All timestamps compared here are readings of the timer's clock. Offsets are differences of readings,
  * so clocks with negative origins (for example {@link System#nanoTime()}) are fine, under the assumption
  * that two readings compared for one wait are less than half a long range apart, which makes the
- * difference unambiguous (no wrap).
+ * difference unambiguous (including a signed long wrap of the clock). Interval pairs are likewise
+ * expected in nondecreasing start order under that same comparison.
  *
  * <p>Not thread-safe; the owning receive path drives it.
  */
