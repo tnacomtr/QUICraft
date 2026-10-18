@@ -230,6 +230,10 @@ public final class V3Join {
             // 12.7: never start binding before the server's own TLS handshake completed.
             throw new IllegalStateException("the server's TLS handshake is not complete");
         }
+        // 13.2: the binding must carry the N the preamble exchange selected. It is read here, before
+        // the pipeline is touched and before the secret is consumed, so an unnegotiated context
+        // fails the join closed (12.14) with no half-installed pipeline and no cipher cutover.
+        int shardCount = connection.sessionContext().shardCount();
         ChannelPipeline pipeline = channel.pipeline();
         protocol = SharedConstants.getProtocolVersion();
         table = MultistreamSwitch.tableFor(protocol);
@@ -268,8 +272,8 @@ public final class V3Join {
             }
             Forward forward = new Forward();
             session = new BindingSession(BindingStateMachine.Role.SERVER, connection::exporterValue, shared,
-                    mode, protocol, fingerprint, table.digest(), System::nanoTime, 0L, forward, channel.eventLoop(),
-                    channel.eventLoop()::inEventLoop);
+                    mode, protocol, shardCount, fingerprint, table.digest(), System::nanoTime, 0L, forward,
+                    channel.eventLoop(), channel.eventLoop()::inEventLoop);
             payloads = new BindingPayloads(session, new Platform(), this::sendBindingPayload);
             forward.target = payloads;
         } finally {

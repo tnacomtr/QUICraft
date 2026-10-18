@@ -318,10 +318,14 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                 offerWaitNanos = millis * 1_000_000L;
             }
             byte[] shared = onlineMode ? secret : null;
+            // 13.2: the binding must carry the N the preamble exchange selected. The read lives
+            // inside this try, before the session exists, so an unnegotiated context fails the join
+            // closed (12.14) instead of binding a guessed N.
+            int shardCount = v3.sessionContext().shardCount();
             session = new BindingSession(BindingStateMachine.Role.CLIENT, v3::exporterValue, shared,
                     onlineMode ? BindingStateMachine.MODE_ONLINE : BindingStateMachine.MODE_OFFLINE, protocolNumber,
-                    plan.fingerprintBytes(), plan.routingDigest(), System::nanoTime, offerWaitNanos, this, loop,
-                    loop::inEventLoop);
+                    shardCount, plan.fingerprintBytes(), plan.routingDigest(), System::nanoTime, offerWaitNanos, this,
+                    loop, loop::inEventLoop);
             wipeSecret();
             payloads = new BindingPayloads(session, this, this);
             payloads.onConfigurationEntered(System.nanoTime());

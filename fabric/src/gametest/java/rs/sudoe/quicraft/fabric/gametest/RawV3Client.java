@@ -18,6 +18,9 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 import rs.sudoe.quicraft.core.binding.BindingDriver;
+import rs.sudoe.quicraft.core.binding.BindingFormatException;
+import rs.sudoe.quicraft.core.binding.BindingKind;
+import rs.sudoe.quicraft.core.binding.BindingMessage;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.multistream.Envelope;
@@ -49,12 +52,31 @@ final class RawV3Client {
         volatile Throwable failure;
         volatile boolean closed;
         volatile String closeCause;
+        /** The shard count the transport negotiated in the preamble (V3Connection.sessionContext()). */
+        volatile int negotiatedN;
+        /** The shard count this raw client's binding was built with (see the bindingN override). */
+        volatile int boundN;
+        /** The N the server's OFFER carried, decoded from the payload itself, not from the binding. */
+        volatile int serverOfferN;
+        /** This client's local UDP port, to correlate server-side evidence with this very attempt. */
+        volatile int clientPort = -1;
+        /** 12.11 ran: the raw client dropped its outbound cipher and answered the SERVER_SWITCH. */
+        volatile boolean switchSent;
+        /** 12.12 ran: the raw client verified the server's switch and cut over its inbound cipher. */
+        volatile boolean switchVerified;
+        /** The outbound AES/CFB8 cipher was still in place when this attempt settled. */
+        volatile boolean outboundCipherRetained;
+        /** The inbound AES/CFB8 cipher was still in place when this attempt settled. */
+        volatile boolean inboundCipherRetained;
 
         @Override
         public String toString() {
             return "activated=" + activated + " configRecords=" + configRecords + " finished="
                     + finishedConfiguration + " playPackets=" + playPackets + " closed=" + closed + " cause="
-                    + closeCause + " failure=" + failure + " events=" + events;
+                    + closeCause + " failure=" + failure + " negotiatedN=" + negotiatedN + " boundN=" + boundN
+                    + " serverOfferN=" + serverOfferN + " clientPort=" + clientPort + " switchSent=" + switchSent
+                    + " switchVerified=" + switchVerified + " outboundCipherRetained=" + outboundCipherRetained
+                    + " inboundCipherRetained=" + inboundCipherRetained + " events=" + events;
         }
     }
 
@@ -95,14 +117,17 @@ final class RawV3Client {
     private byte[] secret;
     private Cipher decryptIn;
     private Cipher encryptOut;
+    /** Test only: 0 binds the negotiated N; anything else binds that N regardless of the transport. */
+    private final int bindingN;
 
     private RawV3Client(V3Connection connection, RoutingTable table, byte[] fingerprint, int playPacketsWanted,
-            boolean online) {
+            boolean online, int bindingN) {
         this.online = online;
         this.connection = connection;
         this.table = table;
         this.fingerprint = fingerprint;
         this.playPacketsWanted = playPacketsWanted;
+        this.bindingN = bindingN;
     }
 
     static final class Join implements AutoCloseable {
@@ -128,13 +153,24 @@ final class RawV3Client {
      */
     static Join start(InetSocketAddress server, Fingerprint fingerprint, RoutingTable table, int playPacketsWanted,
             boolean online) throws Exception {
-        return start(server, fingerprint, table, playPacketsWanted, online, false);
+        return start(server, fingerprint, table, playPacketsWanted, online, false, 0);
     }
 
     static Join start(InetSocketAddress server, Fingerprint fingerprint, RoutingTable table, int playPacketsWanted,
             boolean online, boolean lenient) throws Exception {
+        return start(server, fingerprint, table, playPacketsWanted, online, lenient, 0);
+    }
+
+    /**
+     * Starts a join. {@code bindingN} is a test-only override: 0 binds the transport's negotiated
+     * shard count, anything else binds that N regardless of it, to drive a peer N mismatch.
+     */
+    static Join start(InetSocketAddress server, Fingerprint fingerprint, RoutingTable table, int playPacketsWanted,
+            boolean online, boolean lenient, int bindingN) throws Exception {
         V3Connection connection = QuicClient.connectV3(server, fingerprint, table, null).get(15, TimeUnit.SECONDS);
-        RawV3Client client = new RawV3Client(connection, table, digest(fingerprint), playPacketsWanted, online);
+        RawV3Client client = new RawV3Client(connection, table, digest(fingerprint), playPacketsWanted, online,
+                bindingN);
+        client.result.clientPort = connection.localAddress() == null ? -1 : connection.localAddress().getPort();
         client.lenient = lenient;
         connection.setListener(client.new Listener());
         connection.setAutoRead(true);
@@ -176,6 +212,7 @@ final class RawV3Client {
 
         @Override
         public void onClosed(Throwable cause) {
+            captureRetainedCiphers();
             result.closed = true;
             result.closeCause = String.valueOf(cause);
             done.complete(result);
@@ -222,8 +259,14 @@ final class RawV3Client {
                 connection.flush();
                 phase = 1;
                 result.events.add("login finished, configuration entered");
+                // 13.2: the binding must carry the N the preamble exchange agreed on; the override
+                // exists only for tests that drive a peer mismatch.
+                int negotiatedN = connection.sessionContext().shardCount();
+                int shards = bindingN == 0 ? negotiatedN : bindingN;
+                result.negotiatedN = negotiatedN;
+                result.boundN = shards;
                 binding = new BindingSession(BindingStateMachine.Role.CLIENT, connection::exporterValue, secret,
-                        online ? BindingStateMachine.MODE_ONLINE : BindingStateMachine.MODE_OFFLINE, SharedConstants.getProtocolVersion(), fingerprint, table.digest(), System::nanoTime, 0L,
+                        online ? BindingStateMachine.MODE_ONLINE : BindingStateMachine.MODE_OFFLINE, SharedConstants.getProtocolVersion(), shards, fingerprint, table.digest(), System::nanoTime, 0L,
                         new BindingDriver.Callbacks() {
                             @Override
                             public void send(byte[] payload) {
@@ -234,6 +277,7 @@ final class RawV3Client {
                             @Override
                             public void activateOutbound() {
                                 // 12.11: the cipher stops right after the last encrypted byte.
+                                result.switchSent = true;
                                 encryptOut = null;
                                 result.events.add("client switch sent");
                             }
@@ -241,11 +285,16 @@ final class RawV3Client {
                             @Override
                             public void activateInbound() {
                                 inboundSwitched = true;
+                                result.switchVerified = true;
+                                // 12.12: the server's switch was the last encrypted frame, so this
+                                // direction's cipher stops too.
+                                decryptIn = null;
                                 result.events.add("server switch verified");
                             }
 
                             @Override
                             public void fail(int code, String reason) {
+                                captureRetainedCiphers();
                                 result.failure = new IllegalStateException("binding failed: " + reason);
                                 done.complete(result);
                             }
@@ -290,7 +339,30 @@ final class RawV3Client {
             throw new IllegalStateException("12.10: payload on " + channel + " arrived before activation");
         }
         offerSeen = true;
-        binding.onPayload(Arrays.copyOfRange(packet, position[0], packet.length));
+        byte[] payload = Arrays.copyOfRange(packet, position[0], packet.length);
+        noteOffer(payload);
+        binding.onPayload(payload);
+    }
+
+    /**
+     * Records the N the server's OFFER carried, decoded from the payload itself, so the tests prove
+     * the wire message's N and not this fixture's local binding choice.
+     */
+    private void noteOffer(byte[] payload) {
+        try {
+            BindingMessage message = BindingMessage.decode(payload);
+            if (message.kind() == BindingKind.OFFER) {
+                result.serverOfferN = message.shardCount();
+            }
+        } catch (BindingFormatException ignored) {
+            // Not a decodable binding message: the machine rejects it and no N evidence is recorded.
+        }
+    }
+
+    /** Captures, at the moment an attempt settles, whether Minecraft's ciphers are still in place. */
+    private void captureRetainedCiphers() {
+        result.outboundCipherRetained = encryptOut != null;
+        result.inboundCipherRetained = decryptIn != null;
     }
 
     private void activateLanes() {
@@ -386,6 +458,7 @@ final class RawV3Client {
 
         @Override
         public void onClosed(int code, boolean byPeer, Throwable cause) {
+            captureRetainedCiphers();
             result.closed = true;
             result.closeCause = "code " + code + (byPeer ? " by peer " : " ") + cause;
             done.complete(result);

@@ -75,6 +75,31 @@ public class ServerMultistreamGameTest implements FabricClientGameTest {
             check(result.activated, "binding activated the lanes: " + result);
             check(result.finishedConfiguration, "the configuration stage finished over records: " + result);
             check(result.playPackets >= 5, "the server sent play packets over the lanes: " + result);
+            // 13.2: N is the exchange's, not a constant. The raw client binds the N it negotiated,
+            // and the server's OFFER must carry that same N.
+            check(result.negotiatedN > 1, "the preamble negotiated an N above 1: " + result);
+            check(result.boundN == result.negotiatedN, "the raw client bound the negotiated N: " + result);
+            check(result.serverOfferN == result.negotiatedN,
+                    "the server's OFFER carried the negotiated N: " + result);
+            // 12.7/13.2: a peer that binds a different N fails the exchange before activation. The
+            // offline profile has no cipher to retain, so this case checks the failure and the
+            // absence of activation; the online case checks the cipher retention too.
+            RawV3Client.Result mismatch;
+            try (RawV3Client.Join join = RawV3Client.start(new InetSocketAddress(InetAddress.getLoopbackAddress(),
+                    ad.port()), ad.fingerprint(), table, 5, false, false, 1)) {
+                for (int tick = 0; tick < 1200 && !join.done.isDone(); tick++) {
+                    context.waitTick();
+                }
+                mismatch = join.result;
+            }
+            QuicraftFabricTestLog.info("offline /3 wrong-N join: " + mismatch);
+            check(mismatch.failure != null, "the wrong-N binding failed on the client: " + mismatch);
+            check(!mismatch.activated, "no activation on the client: " + mismatch);
+            check(!mismatch.switchSent && !mismatch.switchVerified, "no switch ran: " + mismatch);
+            check(mismatch.boundN == 1, "the raw client bound N=1 on purpose: " + mismatch);
+            check(mismatch.negotiatedN > 1, "the transport still negotiated N>1: " + mismatch);
+            check(mismatch.serverOfferN == mismatch.negotiatedN,
+                    "the server's OFFER carried its own negotiated N: " + mismatch);
             // The world builder leaves the client on its create-world screen when no game client joins.
             context.setScreen(net.minecraft.client.gui.screens.TitleScreen::new);
         } finally {

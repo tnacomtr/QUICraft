@@ -7,6 +7,7 @@ import io.netty.channel.EventLoop;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Field;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -24,6 +25,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import javax.crypto.Cipher;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
@@ -62,6 +64,7 @@ import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.RecordCodec;
+import rs.sudoe.quicraft.core.multistream.SessionContext;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
@@ -109,6 +112,10 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             onlineExchange(protocol, table.get(), Integer.MAX_VALUE);
             onlineExchange(protocol, table.get(), 7);
             offlineExchange(protocol, table.get());
+            onlineExchangeBindsTheNegotiatedN(protocol, table.get());
+            offlineExchangeBindsTheNegotiatedN(protocol, table.get());
+            aPeerBindingAnotherNFailsAndKeepsTheCipher(protocol, table.get());
+            anUnnegotiatedShardCountFailsClosed(protocol, table.get());
             aTamperedFingerprintFallsBackToTcp(protocol, table.get());
             helloWithoutAuthenticationFallsBack(protocol, table.get());
             encryptionWithoutAuthenticationFallsBack(protocol, table.get());
@@ -199,6 +206,119 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         } finally {
             System.clearProperty(V3Client.OFFLINE_TEST_PROPERTY);
         }
+    }
+
+    /**
+     * 13.2: the client adapter binds the N the preamble negotiated, here 3, not a constant 1. The
+     * scripted server takes its N from the same connection context, so before the fix this exchange
+     * fails (the client offers 1 against the server's 3) and it can only pass once the client reads
+     * the negotiated N.
+     */
+    private static void onlineExchangeBindsTheNegotiatedN(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = Rig.negotiated(protocol, table, false, 3)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            check(rig.server.boundN == 3, "the scripted server bound the negotiated N, got " + rig.server.boundN);
+            rig.run(Integer.MAX_VALUE);
+
+            check(rig.awaitState(V3Client.State.ACTIVE), "the N=3 exchange activated, state " + rig.client.state());
+            check(rig.fake.activated, "core's activate() ran");
+            check(rig.channel.pipeline().get("decrypt") == null, "the boundary decoder removed itself");
+            check(rig.awaitCondition(() -> rig.channel.pipeline().get("encrypt") == null),
+                    "the encrypt handler was removed after CLIENT_SWITCH");
+            check(rig.plan.isActivated(), "the plan recorded the activation");
+            check(V3Notices.isEmpty(), "nothing to tell the player");
+        }
+    }
+
+    /** 12.19 and 13.2: the offline profile binds the negotiated N too, here 3. */
+    private static void offlineExchangeBindsTheNegotiatedN(int protocol, RoutingTable table) throws Exception {
+        System.setProperty(V3Client.OFFLINE_TEST_PROPERTY, "true");
+        try (Rig rig = Rig.negotiated(protocol, table, true, 3)) {
+            rig.login(false, false);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            check(rig.server.boundN == 3, "the scripted server bound the negotiated N, got " + rig.server.boundN);
+            rig.run(Integer.MAX_VALUE);
+
+            check(rig.awaitState(V3Client.State.ACTIVE), "the offline N=3 exchange activated, state "
+                    + rig.client.state());
+            check(rig.fake.activated, "core's activate() ran");
+        } finally {
+            System.clearProperty(V3Client.OFFLINE_TEST_PROPERTY);
+        }
+    }
+
+    /**
+     * 12.7/13.2: a server that binds another N than the transport negotiated must fail the exchange,
+     * and 12.14 says a failure keeps Minecraft's cipher in place. The scripted server binds 1 while
+     * the context says 3; before the fix the client also binds 1, so the wrong N would slip through
+     * and this exchange would activate.
+     */
+    private static void aPeerBindingAnotherNFailsAndKeepsTheCipher(int protocol, RoutingTable table)
+            throws Exception {
+        try (Rig rig = Rig.negotiated(protocol, table, false, 3)) {
+            rig.server.peerBindingN = 1;
+            rig.login(true, true);
+            // Minecraft's cipher is installed and the cutover decoder holds the decrypt slot before
+            // the exchange starts; 12.13 drops either only at an activation direction.
+            check(rig.channel.pipeline().get("encrypt") != null, "the outbound cipher was installed");
+            BoundaryCipherDecoder decoder = (BoundaryCipherDecoder) rig.channel.pipeline().get("decrypt");
+            check(decoder != null, "the cutover decoder held the decrypt slot");
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+
+            check(rig.awaitState(V3Client.State.FAILED), "the wrong-N OFFER failed the exchange, state "
+                    + rig.client.state());
+            rig.expectFallback("channel binding failed");
+            // The fallback closes the QUIC channel, and netty destroys a closed channel's pipeline, so
+            // the handlers cannot be read afterwards. The decoder captured before the failure can:
+            // 12.13 sets stopRequested and finished only at the inbound cutover, and the Fake records
+            // the two activation calls that carry both cutovers. Together they show the failure ran
+            // before either activation direction, with Minecraft's cipher still in place.
+            check(!rig.fake.detached && !rig.fake.activated, "no activation direction ran: detached="
+                    + rig.fake.detached + " activated=" + rig.fake.activated);
+            check(!decoderStopped(decoder), "the failure never dropped the inbound cipher");
+        }
+    }
+
+    /**
+     * 13.2: a connection that never negotiated a session context fails the join closed instead of
+     * binding a guessed N. This is the fail-closed boundary the negotiated read replaced.
+     */
+    private static void anUnnegotiatedShardCountFailsClosed(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = Rig.unnegotiated(protocol, table)) {
+            rig.login(true, true);
+            // The cipher is installed before the negotiated read; the failure must leave it alone.
+            check(rig.channel.pipeline().get("encrypt") != null, "the outbound cipher was installed");
+            BoundaryCipherDecoder decoder = (BoundaryCipherDecoder) rig.channel.pipeline().get("decrypt");
+            check(decoder != null, "the cutover decoder held the decrypt slot");
+            rig.client.onConfigurationStarted();
+
+            check(rig.awaitState(V3Client.State.FAILED), "the unnegotiated context failed closed, state "
+                    + rig.client.state());
+            rig.expectFallback("internal error");
+            check(!rig.fake.detached && !rig.fake.activated, "no activation direction ran: detached="
+                    + rig.fake.detached + " activated=" + rig.fake.activated);
+            check(!decoderStopped(decoder), "the failure never dropped the inbound cipher");
+        }
+    }
+
+    /**
+     * The inbound cutover's own state, read after the channel is gone: 12.13 sets these only when the
+     * decoder stops for the switch, so a false pair means Minecraft's cipher was never dropped.
+     */
+    private static boolean decoderStopped(BoundaryCipherDecoder decoder) throws Exception {
+        Field stop = BoundaryCipherDecoder.class.getDeclaredField("stopRequested");
+        stop.setAccessible(true);
+        Field finished = BoundaryCipherDecoder.class.getDeclaredField("finished");
+        finished.setAccessible(true);
+        return stop.getBoolean(decoder) || finished.getBoolean(decoder);
     }
 
     /** 12.9: an OFFER for another fingerprint ends in 0x10, a TCP retry, the user's wording and no pin. */
@@ -990,7 +1110,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         final EventLoop loop = group.next();
         final Path dir;
         final ClientV3State files;
-        final Fake fake = new Fake(loop);
+        final Fake fake;
         final Connection connection = new Connection(PacketFlow.CLIENTBOUND);
         final ServerIdentity identity;
         final byte[] secret = new byte[16];
@@ -1005,14 +1125,20 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         Server server;
 
         Rig(int protocol, RoutingTable table, boolean quicOnly, boolean offline) throws Exception {
-            this(protocol, table, quicOnly, offline, null);
+            this(protocol, table, quicOnly, offline, null, Fake::new);
         }
 
         Rig(int protocol, RoutingTable table, boolean quicOnly, boolean offline, String pinned) throws Exception {
+            this(protocol, table, quicOnly, offline, pinned, Fake::new);
+        }
+
+        Rig(int protocol, RoutingTable table, boolean quicOnly, boolean offline, String pinned,
+                Function<EventLoop, Fake> fakes) throws Exception {
             V3Notices.clear();
             this.pinned = pinned;
             this.protocol = protocol;
             this.table = table;
+            this.fake = fakes.apply(loop);
             new SecureRandom().nextBytes(secret);
             key = new SecretKeySpec(secret, "AES");
             dir = Files.createTempDirectory("quicraft-cutover");
@@ -1057,6 +1183,17 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             connection.setupOutboundProtocol(ConfigurationProtocols.SERVERBOUND);
             connection.setupInboundProtocol(ConfigurationProtocols.CLIENTBOUND, listener.proxy());
             this.server = new Server(this, offline);
+        }
+
+        /** A rig whose connection negotiated {@code shardCount}, for the 13.2 cases. */
+        static Rig negotiated(int protocol, RoutingTable table, boolean offline, int shardCount) throws Exception {
+            return new Rig(protocol, table, false, offline, null,
+                    loop -> new Fake(loop, SessionContext.of(shardCount)));
+        }
+
+        /** A rig whose connection never negotiated a session context, for the fail-closed case. */
+        static Rig unnegotiated(int protocol, RoutingTable table) throws Exception {
+            return new Rig(protocol, table, false, false, null, loop -> new Fake(loop, null));
         }
 
         /** What the login mixins do, in vanilla's order: Hello, S, the session join, then the key. */
@@ -1182,6 +1319,10 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         final Cipher decrypt;
         final byte[] fingerprint;
         BindingSession session;
+        /** Test only: 0 binds the transport's negotiated N; anything else binds that N. */
+        int peerBindingN;
+        /** The N this scripted server's binding actually used. */
+        int boundN = -1;
         final ByteArrayOutputStream outbound = new ByteArrayOutputStream();
         final ByteArrayOutputStream inbound = new ByteArrayOutputStream();
         /** The §13 record bytes the server sends right behind SERVER_SWITCH, unencrypted (12.12). */
@@ -1203,9 +1344,11 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         }
 
         void start() {
+            int shards = peerBindingN == 0 ? rig.fake.sessionContext().shardCount() : peerBindingN;
+            boundN = shards;
             session = new BindingSession(BindingStateMachine.Role.SERVER, rig.fake::exporterValue,
                     offline ? null : rig.secret, offline ? BindingStateMachine.MODE_OFFLINE : BindingStateMachine.MODE_ONLINE,
-                    rig.protocol, fingerprint, rig.plan.routingDigest(), System::nanoTime, 0, new BindingSessionCallbacks(),
+                    rig.protocol, shards, fingerprint, rig.plan.routingDigest(), System::nanoTime, 0, new BindingSessionCallbacks(),
                     null, null);
             session.onConfigurationEntered(System.nanoTime());
         }
@@ -1322,6 +1465,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
     /** A {@link V3Connection} with no QUIC behind it: what the client writes is captured, what the test injects is read. */
     private static final class Fake implements V3Connection {
         final EventLoop loop;
+        /** Test only: the negotiated context, or null for the deliberately unnegotiated case. */
+        final SessionContext context;
         final ByteArrayOutputStream written = new ByteArrayOutputStream();
         final byte[] exporter = new byte[32];
         volatile Listener listener;
@@ -1335,7 +1480,13 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         final ByteArrayOutputStream kept = new ByteArrayOutputStream();
 
         Fake(EventLoop loop) {
+            // TEST ONLY: the default every older scenario runs with.
+            this(loop, SessionContext.of(1));
+        }
+
+        Fake(EventLoop loop, SessionContext context) {
             this.loop = loop;
+            this.context = context;
             Arrays.fill(exporter, (byte) 0x5A);
         }
 
@@ -1407,6 +1558,14 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         @Override
         public MultistreamSession session() {
             return null;
+        }
+
+        @Override
+        public SessionContext sessionContext() {
+            if (context == null) {
+                throw new IllegalStateException("test: this connection never negotiated a session context");
+            }
+            return context;
         }
 
         @Override

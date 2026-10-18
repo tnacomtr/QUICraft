@@ -3,6 +3,7 @@
   "minVersion": "0.8",
   "package": "rs.sudoe.quicraft.fabric.gametest.mixin",
   "compatibilityLevel": "JAVA_21",
+  "mixins": ["V3JoinBindingObserverMixin"],
   "client": ["ConnectionTimingMixin"],
   "injectors": {
     "defaultRequire": 1
