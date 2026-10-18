@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.routing.Dependency;
 import rs.sudoe.quicraft.core.routing.Direction;
@@ -664,6 +665,7 @@ class StreamReceiverTest {
         assertThrows(IllegalStateException.class, () -> rx.stallStarted(5 * SEC));
         assertThrows(IllegalStateException.class, rx::stallEnded);
         assertThrows(IllegalStateException.class, () -> rx.stallEnded(6 * SEC));
+        assertEquals(0, source.samples, "a rejected boundary hook takes no source reading");
         assertAdmitted(rx, rec(2, 1, 0, dep(3, 1)));
         assertThrows(IllegalStateException.class, rx::stallStarted, "a held head changes nothing");
         assertThrows(IllegalStateException.class, () -> rx.stallEnded(6 * SEC));
@@ -706,9 +708,78 @@ class StreamReceiverTest {
         assertNull(close.reason(), "consumed stall time blocks the phrase");
     }
 
+    @Test void refusedLegacySlotReturnsBusyWithoutReadingTheClock() {
+        CountingClock clock = new CountingClock();
+        StreamReceiver rx = new StreamReceiver(2, (s, r, route) -> true, clock);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1)));
+        assertEquals(1, clock.reads, "the blocked wait start read the clock once");
+        rx.discard(); // drops the head; by contract it releases no slot
+        clock.armed = true; // any further read is a regression
+        assertEquals(StreamReceiver.Admission.Kind.BUSY, offer(rx, rec(2, 2, 0, dep(3, 1))).kind());
+        assertEquals(1, clock.reads, "a refused slot must perform zero clock reads");
+    }
+
+    @Test void legacyNoArgBoundaryHooksReadEachRunningTimersClockAndNothingWithoutHeads() {
+        CountingClock clock = new CountingClock();
+        StreamReceiver rx = new StreamReceiver(2, (s, r, route) -> true, clock);
+        rx.stallStarted();
+        rx.stallEnded();
+        assertEquals(0, clock.reads, "a receiver with no heads reads no clock at all");
+
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1)));
+        rx.stallStarted();
+        clock.nowNanos = 10 * SEC;
+        rx.stallEnded();
+        clock.nowNanos = 20 * SEC;
+        ReceiveClose close = rx.expiredWait();
+        assertNotNull(close, "the per-timer no-arg hooks recorded the stall");
+        assertEquals(0x12, close.errorCode());
+        assertNull(close.reason(), "consumed stall time blocks the phrase");
+    }
+
+    @Test void legacyNoArgBoundaryHooksReadEveryRunningTimerAtItsOwnClock() {
+        CountingClock one = new CountingClock();
+        StreamReceiver single = new StreamReceiver(2, (s, r, route) -> true, one);
+        assertAdmitted(single, rec(2, 1, 0, dep(3, 1)));
+        int oneBefore = one.reads;
+        single.stallStarted();
+        int startReads = one.reads - oneBefore;
+        one.nowNanos = 5 * SEC;
+        single.stallEnded();
+        int endReads = one.reads - oneBefore - startReads;
+        assertTrue(startReads > 0, "a held timer's no-arg hook reads its own clock");
+
+        CountingClock two = new CountingClock();
+        StreamReceiver pair = new StreamReceiver(2, (s, r, route) -> true, two);
+        assertAdmitted(pair, rec(2, 1, 0, dep(3, 1)));
+        assertAdmitted(pair, rec(3, 1, 0, dep(0, 1)));
+        int pairBefore = two.reads;
+        pair.stallStarted();
+        assertEquals(2 * startReads, two.reads - pairBefore, "each held timer runs its own no-arg hook");
+        two.nowNanos = 5 * SEC;
+        pair.stallEnded();
+        assertEquals(2 * (startReads + endReads), two.reads - pairBefore,
+                "each held timer ends its own interval at its own clock");
+    }
+
     /** A cumulative receiver over {@code source}. */
     private static StreamReceiver cumulative(Direction direction, StallClock source) {
         return new StreamReceiver(2, direction, (s, r, route) -> true, source);
+    }
+
+    /** A transport clock that counts its reads and can refuse to be read at all. */
+    private static final class CountingClock implements LongSupplier {
+        long nowNanos;
+        int reads;
+        boolean armed;
+
+        @Override public long getAsLong() {
+            if (armed) {
+                throw new IllegalStateException("the clock must not be read here");
+            }
+            reads++;
+            return nowNanos;
+        }
     }
 
     /** A scripted cumulative source whose every reading is one coherent pair. */
@@ -716,6 +787,7 @@ class StreamReceiverTest {
         long nowNanos;
         long excludedNanos;
         boolean valid = true;
+        int samples;
 
         ScriptedSource set(long nowNanos, long excludedNanos) {
             this.nowNanos = nowNanos;
@@ -724,6 +796,7 @@ class StreamReceiverTest {
         }
 
         @Override public Sample sample() {
+            samples++;
             final long now = nowNanos;
             final long excluded = excludedNanos;
             final boolean validReading = valid;

@@ -355,24 +355,22 @@ public final class StreamReceiver {
                 return Admission.violation("pump slot on stream " + stream + " does not match the unit");
             }
         }
-        // The local unit is prepared, and its timer started only when a prerequisite wait actually
-        // begins, before head/admitted are published or an own slot is acquired: a cumulative start
-        // that cannot trust its source throws with no receiver state changed. ready(unit) reads only
-        // the unit's own record and the applied watermarks, so it needs no published head.
-        Unit unit = new Unit(record, closingSequence, newBlockedHeadTimer());
-        boolean blocked = !ready(unit);
-        if (blocked) {
-            unit.timer.start();
+        if (source != null) {
+            return admitCumulative(stream, record, closingSequence, wireBytes, recordCount);
         }
+        // Legacy boundary mode keeps its original ordering: a refused own slot returns BUSY before any
+        // clock read or state change, and the timer starts only after the head is published.
         if (!slotsHeldByPump && !slots.admitHead(stream, wireBytes, recordCount)) {
-            unit.timer.stop();
             return Admission.busy();
         }
+        Unit unit = new Unit(record, closingSequence, new BlockedHeadTimer(clock, true));
         head[stream] = unit;
         admitted[stream] = closingSequence;
-        if (blocked && stalled) {
-            // stalled is only ever set by the boundary hooks, which a cumulative receiver rejects.
-            unit.timer.stallStarted();
+        if (!ready(unit)) {
+            unit.timer.start();
+            if (stalled) {
+                unit.timer.stallStarted();
+            }
         }
         return Admission.admitted();
     }
@@ -546,13 +544,19 @@ public final class StreamReceiver {
     }
 
     /**
-     * Forwards a recorded game-executor tick stall (LaneGame). Heads admitted while it continues start
+     * Forwards a recorded game-executor tick stall (LaneGame). Each held, running timer reads its own
+     * clock; a receiver with no heads reads no clock at all. Heads admitted while it continues start
      * excluded too, until {@link #stallEnded()} (13.10). A cumulative receiver derives stall time from
      * its source instead: it rejects every boundary hook before reading a clock or changing any state.
      */
     public void stallStarted() {
         requireBoundaryMode();
-        stallStarted(clock.getAsLong());
+        stalled = true;
+        for (Unit unit : head) {
+            if (unit != null) {
+                unit.timer.stallStarted();
+            }
+        }
     }
 
     /** As {@link #stallStarted()}, timestamped at {@code atNanos} (13.10; see {@link BlockedHeadTimer#stallStarted(long)}). */
@@ -566,10 +570,15 @@ public final class StreamReceiver {
         }
     }
 
-    /** Forwards the end of a recorded game-executor tick stall (LaneGame). */
+    /** Forwards the end of a recorded game-executor tick stall (LaneGame), one read per held timer. */
     public void stallEnded() {
         requireBoundaryMode();
-        stallEnded(clock.getAsLong());
+        stalled = false;
+        for (Unit unit : head) {
+            if (unit != null) {
+                unit.timer.stallEnded();
+            }
+        }
     }
 
     /** As {@link #stallEnded()}, timestamped at {@code atNanos}. */
@@ -904,9 +913,25 @@ public final class StreamReceiver {
         return unit;
     }
 
-    /** Creates the blocked-head timer in the receiver's accounting mode (13.10). */
-    private BlockedHeadTimer newBlockedHeadTimer() {
-        return source == null ? new BlockedHeadTimer(clock, true) : new BlockedHeadTimer(source, true);
+    /**
+     * Cumulative admission: the local unit is prepared and its timer started only when a prerequisite
+     * wait actually begins, before the head is published and, in owned-slot mode, before the stream's
+     * slot is acquired. A start that cannot trust its source throws with no receiver state changed; a
+     * refused own slot discards the prepared timer and publishes nothing.
+     */
+    private Admission admitCumulative(int stream, Record record, long closingSequence, long wireBytes,
+                                      int recordCount) {
+        Unit unit = new Unit(record, closingSequence, new BlockedHeadTimer(source, true));
+        if (!ready(unit)) {
+            unit.timer.start();
+        }
+        if (!slotsHeldByPump && !slots.admitHead(stream, wireBytes, recordCount)) {
+            unit.timer.stop();
+            return Admission.busy();
+        }
+        head[stream] = unit;
+        admitted[stream] = closingSequence;
+        return Admission.admitted();
     }
 
     /** Rejects a boundary stall notification in cumulative mode before any clock read or state change. */
