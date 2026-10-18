@@ -90,6 +90,11 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
     providers.gradleProperty("quicraft.emitPlayIds").orNull?.let {
         property("quicraft.gametest.emitPlayIds", it)
     }
+    // Opt-in: capture real frames for the reviewed extractor layouts (ExtractorVectorGameTest):
+    // -Pquicraft.emitExtractorVectors=<file>
+    providers.gradleProperty("quicraft.emitExtractorVectors").orNull?.let {
+        property("quicraft.gametest.emitExtractorVectors", it)
+    }
     // Opt-in: the real client against an outside server (ExternalServerGameTest), e.g. the
     // testkit's Velocity through testkit/run-real-client.sh: -Pquicraft.externalServer=host:port
     providers.gradleProperty("quicraft.externalServer").orNull?.let {

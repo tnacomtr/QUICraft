@@ -22,7 +22,8 @@
       "rs.sudoe.quicraft.fabric.gametest.ServerMultistreamFaultGameTest",
       "rs.sudoe.quicraft.fabric.gametest.JoinTimingGameTest",
       "rs.sudoe.quicraft.fabric.gametest.ExternalServerGameTest",
-      "rs.sudoe.quicraft.fabric.gametest.RoutingTableGameTest"
+      "rs.sudoe.quicraft.fabric.gametest.RoutingTableGameTest",
+      "rs.sudoe.quicraft.fabric.gametest.ExtractorVectorGameTest"
     ]
   },
   "mixins": ["quicraft-gametest.mixins.json"],

@@ -129,11 +129,15 @@ client and an in-process dedicated server with the mod, headless under Xvfb.
 | `JoinTimingGameTest` | opt-in (`-Pquicraft.joinTimings=N`): join timings over TCP, QUIC with a full handshake and QUIC resumed (checked to skip the certificate), see docs/benchmarks.md |
 | `FaultInjectionGameTest` | every hook throwing on client and server (`Hooks.setFaultInjection`): server list ping works, join over TCP, full play session |
 | `AsyncFaultInjectionGameTest` | each stage of the asynchronous connect throwing on its own (status query, QUIC connect, using the winner, installing a TCP winner): join over TCP each time |
+| `ExtractorVectorGameTest` | opt-in (`-Pquicraft.emitExtractorVectors=<file>`): captures the uncompressed clientbound frames behind the reviewed `mc775.*` extractor layouts from the live game, with the position or list the game itself reports for each, and writes core's checked-in `captured-775-vectors.txt`; joins over TCP so the frames ride the vanilla pipeline |
 
 ```sh
 xvfb-run -a ./gradlew :fabric-26x:runClientGameTest :fabric-1.21.11:runClientGameTest
 # another game version in the 26.x range:
 xvfb-run -a ./gradlew :fabric-26x:runClientGameTest -Pfabric-26x.minecraft=26.3 -Pfabric-26x.fabricApi=0.162.0+26.3
+# regenerate core's captured extractor vectors (protocol 775; runs the whole client suite):
+xvfb-run -a ./gradlew :fabric-26x:runClientGameTest \
+  -Pquicraft.emitExtractorVectors=core/src/test/resources/rs/sudoe/quicraft/core/routing/captured-775-vectors.txt
 ```
 
 Results (2026-10-11, commit after 5026691): all pass on 26.1, 26.1.1, 26.1.2, 26.2, 26.3 and
