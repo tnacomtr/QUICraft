@@ -957,6 +957,8 @@ the Phase 0 parameters and delegates measurement and container cleanup to
   `matrix-status.txt`. Container cleanup stays with `run-baseline.sh`.
 
 `matrix-summarize` exits `0` only when every requested profile has verified TCP, `/2` and `/3`
-cells. It exits `1` when `/3` evidence is rejected, a measured run failed, or an artifact could not
-be read. It exits `2` while `/3` evidence is absent, which is the expected state before U3. The
-presence of `/2` results never turns that `2` into a pass.
+cells and every measured run is usable evidence. It exits `1` when `/3` evidence is rejected, a
+measured run failed or disconnected, a measured run comes from a different schema, a required
+metric field is missing, or an artifact could not be read. It exits `2` while `/3` evidence is
+absent, which is the expected state before U3. The presence of `/2` results never turns that `2`
+into a pass.

@@ -26,15 +26,22 @@ import rs.sudoe.quicraft.testkit.Args;
  * fail-closed {@code /3} assertion: a {@code /3} cell is verified only when every contributing
  * {@code /3} run passed {@link NegotiatedTransportCheck}. A {@code /2} run is never promoted, and a
  * rejected or missing {@code /3} arm is printed without a median. The process exit status is 0 only
- * when every requested profile has a verified TCP, {@code /2} and {@code /3} cell; 1 if {@code /3}
- * evidence is present but invalid; 2 while {@code /3} evidence is absent, which is the expected
- * state before U3.
+ * when every requested profile has a verified TCP, {@code /2} and {@code /3} cell and every
+ * measured run is usable evidence; 1 if any measured run is incompatible, malformed, failed or
+ * disconnected, or if {@code /3} evidence is present but invalid; 2 while {@code /3} evidence is
+ * absent, which is the expected state before U3.
  */
 public final class MatrixSummarize {
     /** The six profiles defined by testkit/netem/profiles.sh. */
     public static final String DEFAULT_PROFILES = "clean loss delay delayloss reorder jitter";
 
     private static final Gson GSON = new Gson();
+
+    /** Metric fields a run must carry; Gson would otherwise deserialize a missing one as zero. */
+    private static final List<String> REQUIRED_NUMBERS = List.of("joinMs", "chunkLoadMs", "rttMedianMs");
+
+    /** Flags that classify and gate a run; Gson would otherwise default a missing one to false. */
+    private static final List<String> REQUIRED_FLAGS = List.of("warmup", "ok", "disconnected");
 
     private record Metric(String label, ToDoubleFunction<RunResult> value) {}
 
@@ -58,7 +65,8 @@ public final class MatrixSummarize {
         for (String profile : profiles) {
             byProfile.put(profile, new ArrayList<>());
         }
-        int unclassified = 0;
+        int incompatibleRuns = 0;
+        int malformedRuns = 0;
         int invalidFiles = 0;
         List<RunResult> all = new ArrayList<>();
 
@@ -82,17 +90,19 @@ public final class MatrixSummarize {
                 for (JsonElement element : doc.getAsJsonArray("runs")) {
                     RunResult run;
                     try {
-                        run = GSON.fromJson(element, RunResult.class);
+                        run = parseRun(element);
                     } catch (RuntimeException e) {
-                        invalidFiles++;
+                        malformedRuns++;
                         continue;
                     }
-                    if (run == null || run.warmup()) {
+                    if (run.warmup()) {
                         continue;
                     }
                     if (run.transportVersion() == null || run.schemaVersion() != BenchmarkSchema.VERSION) {
-                        // Legacy results, and anything from a different schema, are never compared.
-                        unclassified++;
+                        // A measured run from another schema cannot be compared with current
+                        // evidence. Counting it as rejected makes mixed evidence fail closed
+                        // instead of silently dropping the incompatible half.
+                        incompatibleRuns++;
                         continue;
                     }
                     byProfile.get(profile).add(run);
@@ -121,11 +131,15 @@ public final class MatrixSummarize {
         boolean artifactsValid = invalidFiles == 0;
         long failedRuns = all.stream().filter(run -> !run.ok()).count();
         long disconnects = all.stream().filter(RunResult::disconnected).count();
+        long inconsistent = all.stream().filter(run -> run.ok() && run.disconnected()).count();
+        // A disconnect means the join did not survive the bench window, so an ok flag alongside it
+        // is contradictory evidence. Either way the matrix may not pass.
+        boolean rejected = !artifactsValid || incompatibleRuns > 0 || malformedRuns > 0
+                || failedRuns > 0 || disconnects > 0;
         boolean complete = rows.stream().allMatch(row -> row.tcp().status() == ComparisonRow.Status.VERIFIED
                 && row.quic2().status() == ComparisonRow.Status.VERIFIED
                 && row.quic3().status() == ComparisonRow.Status.VERIFIED);
-        String gate = anyFailClosed || !artifactsValid || failedRuns > 0
-                ? "FAIL-CLOSED" : complete ? "PASS" : "INCOMPLETE";
+        String gate = anyFailClosed || rejected ? "FAIL-CLOSED" : complete ? "PASS" : "INCOMPLETE";
 
         StringBuilder md = new StringBuilder();
         md.append("Transport-neutral comparison rows. Medians are computed from existing run artifacts,")
@@ -140,12 +154,16 @@ public final class MatrixSummarize {
                     row.quic3().render(), row.quic3().detail()));
         }
         md.append('\n');
-        if (unclassified > 0) {
-            md.append("Unclassified measured runs (legacy result or different schema): ")
-                    .append(unclassified).append('\n');
-        }
         if (invalidFiles > 0) {
             md.append("Unreadable JSON files skipped: ").append(invalidFiles).append('\n');
+        }
+        if (incompatibleRuns > 0 || malformedRuns > 0 || inconsistent > 0) {
+            md.append("Rejected measured runs: ")
+                    .append(incompatibleRuns + malformedRuns + inconsistent)
+                    .append(" (incompatible schema or transport: ").append(incompatibleRuns)
+                    .append(", missing required fields: ").append(malformedRuns)
+                    .append(", success reported after a disconnect: ").append(inconsistent)
+                    .append(")\n");
         }
         md.append("Failed measured runs: ").append(failedRuns)
                 .append(" (disconnects: ").append(disconnects).append(")\n");
@@ -157,13 +175,40 @@ public final class MatrixSummarize {
             Files.writeString(Path.of(out), md.toString(), StandardCharsets.UTF_8);
         }
 
-        if (anyFailClosed) {
-            return 1;
-        }
-        if (!artifactsValid || failedRuns > 0) {
+        if (anyFailClosed || rejected) {
             return 1;
         }
         return complete ? 0 : 2;
+    }
+
+    /**
+     * Deserializes one run only after its required fields are present and typed. Gson fills a
+     * missing primitive with zero or false, which would turn a partial artifact into a verified
+     * zero-valued metric or hide a disconnect.
+     */
+    private static RunResult parseRun(JsonElement element) {
+        if (element == null || !element.isJsonObject()) {
+            throw new IllegalArgumentException("run is not a JSON object");
+        }
+        JsonObject run = element.getAsJsonObject();
+        for (String field : REQUIRED_NUMBERS) {
+            JsonElement value = run.get(field);
+            if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()
+                    || !Double.isFinite(value.getAsDouble())) {
+                throw new IllegalArgumentException("run is missing a finite numeric " + field);
+            }
+        }
+        for (String field : REQUIRED_FLAGS) {
+            JsonElement value = run.get(field);
+            if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()) {
+                throw new IllegalArgumentException("run is missing boolean " + field);
+            }
+        }
+        RunResult parsed = GSON.fromJson(run, RunResult.class);
+        if (parsed == null) {
+            throw new IllegalArgumentException("run did not deserialize");
+        }
+        return parsed;
     }
 
     /** The netem profile a result file belongs to, with a fallback for pre-{@code netemProfile} files. */
@@ -196,7 +241,7 @@ public final class MatrixSummarize {
             return ComparisonRow.Cell.notRun(version, "no measured runs");
         }
         double[] values = matching.stream()
-                .filter(RunResult::ok)
+                .filter(run -> run.ok() && !run.disconnected())
                 .mapToDouble(metric.value())
                 .filter(value -> value >= 0)
                 .toArray();
@@ -248,7 +293,7 @@ public final class MatrixSummarize {
         }
 
         double[] values = matching.stream()
-                .filter(RunResult::ok)
+                .filter(run -> run.ok() && !run.disconnected())
                 .mapToDouble(metric.value())
                 .filter(value -> value >= 0)
                 .toArray();

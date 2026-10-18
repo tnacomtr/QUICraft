@@ -24,6 +24,8 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
+# shellcheck source=lib/git-state.sh
+. "$here/lib/git-state.sh"
 
 BATCHES="${BATCHES:-3}"
 RUNS="${RUNS:-20}"
@@ -99,16 +101,13 @@ else
     wait_for_log velocity 'Done (' 120
 fi
 
-build_commit="$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)"
-if [[ "$build_commit" != unknown ]] && ! git -C "$root" diff --quiet 2>/dev/null; then
-    build_commit="$build_commit-dirty"
-fi
+build_commit="$(git_build_commit "$root")"
 
 {
     echo "started: $stamp"
     echo "target=$TARGET batches=$BATCHES runs=$RUNS runs_loss=$RUNS_loss runs_reorder=$RUNS_reorder warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS transports=[$TRANSPORTS] scenario=$SCENARIO quicraft_plugin=$QUICRAFT_PLUGIN"
     echo "build: $build_commit"
-    echo "git: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo none)$(git -C "$root" diff --quiet 2>/dev/null || echo ' (dirty)')"
+    echo "git: $(git_state "$root")"
     echo "kernel: $(uname -r)"
     echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
 } > "$results/environment.txt"

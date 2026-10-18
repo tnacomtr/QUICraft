@@ -24,6 +24,8 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
+# shellcheck source=lib/git-state.sh
+. "$here/lib/git-state.sh"
 
 PROFILES="${PROFILES:-clean loss delay delayloss reorder jitter}"
 TRANSPORTS="${TRANSPORTS:-tcp quic}"
@@ -74,10 +76,7 @@ if [[ -e "$run_dir" ]]; then
 fi
 mkdir -p "$run_dir"
 
-build_commit="$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)"
-if [[ "$build_commit" != unknown ]] && ! git -C "$root" diff --quiet 2>/dev/null; then
-    build_commit="$build_commit-dirty"
-fi
+build_commit="$(git_build_commit "$root")"
 
 baseline_status="not-run"
 matrix_status="not-run"

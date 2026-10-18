@@ -27,6 +27,16 @@ final class RunFixtures {
                 TransportVersion.QUIC_3.alpn(), true, joinMs, chunkLoadMs, rttMs);
     }
 
+    /** The same run, marked as disconnected before the bench ended it. */
+    static RunResult disconnected(RunResult run) {
+        return new RunResult(run.run(), run.warmup(), run.ok(), run.phasesMs(), run.joinMs(),
+                run.chunkLoadMs(), run.chunks(), run.rttMedianMs(), run.rttP95Ms(), run.rttSamples(),
+                run.rttLost(), true, run.error(), run.net(), run.quic(), run.zeroRtt(),
+                run.schemaVersion(), run.transportVersion(), run.streamCount(), run.buildCommit(),
+                run.routingTableId(), run.routingTableDigest(), run.routingTableSchema(),
+                run.negotiatedAlpn(), run.negotiatedTransportVerified());
+    }
+
     static RunResult run(TransportVersion version, boolean ok, int schemaVersion, int streamCount,
             String buildCommit, String routingTableId, String routingTableDigest, int routingTableSchema,
             String negotiatedAlpn, boolean negotiatedTransportVerified, double joinMs, double chunkLoadMs,

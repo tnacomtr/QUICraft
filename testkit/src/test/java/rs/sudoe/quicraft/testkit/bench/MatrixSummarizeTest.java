@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -152,6 +153,82 @@ class MatrixSummarizeTest {
     }
 
     @Test
+    void aMeasuredRunFromAnotherSchemaFailsClosedEvenWithValidRows() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, 1),
+                RunFixtures.tcp(20, 200, 2));
+        write("clean-quic.json", "clean-quic", "clean",
+                RunFixtures.quic2(30, 300, 3),
+                RunFixtures.quic2(40, 400, 4));
+        write("clean-quic3.json", "clean-quic3", "clean",
+                RunFixtures.quic3(50, 500, 5),
+                RunFixtures.quic3(60, 600, 6));
+        write("clean-quic3-wrong-schema.json", "clean-quic3", "clean",
+                RunFixtures.run(TransportVersion.QUIC_3, true, BenchmarkSchema.VERSION - 1, 3,
+                        RunFixtures.COMMIT, "protocol-775", RunFixtures.DIGEST,
+                        BenchmarkSchema.ROUTING_SCHEMA_V3, TransportVersion.QUIC_3.alpn(), true,
+                        70, 700, 7));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("Rejected measured runs: 1"), text);
+        assertTrue(text.contains("incompatible schema or transport: 1"), text);
+        assertTrue(text.contains("Matrix /3 gate: FAIL-CLOSED"), text);
+        String join = line(text, "| clean | join (ms) |");
+        assertTrue(join.contains("55.0 (n=2)"), join);
+        assertFalse(join.contains("70.0"), join);
+    }
+
+    @Test
+    void aSuccessfulRunThatDisconnectedFailsTheGate() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, 1));
+        write("clean-quic.json", "clean-quic", "clean",
+                RunFixtures.quic2(30, 300, 3));
+        write("clean-quic3.json", "clean-quic3", "clean",
+                RunFixtures.disconnected(RunFixtures.quic3(50, 500, 5)),
+                RunFixtures.quic3(60, 600, 6));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("Failed measured runs: 0 (disconnects: 1)"), text);
+        assertTrue(text.contains("success reported after a disconnect: 1"), text);
+        assertTrue(text.contains("Matrix /3 gate: FAIL-CLOSED"), text);
+        String join = line(text, "| clean | join (ms) |");
+        assertTrue(join.contains("60.0 (n=1)"), join);
+        assertFalse(join.contains("55.0"), join);
+    }
+
+    @Test
+    void missingRequiredFieldsFailClosedInsteadOfDeserializingToZero() throws IOException {
+        JsonObject tcp = GSON.toJsonTree(RunFixtures.tcp(10, 100, 1)).getAsJsonObject();
+        tcp.remove("joinMs");
+        JsonObject quic2 = GSON.toJsonTree(RunFixtures.quic2(30, 300, 3)).getAsJsonObject();
+        quic2.remove("disconnected");
+        writeRaw("clean-tcp.json", "clean-tcp", "clean", tcp);
+        writeRaw("clean-quic.json", "clean-quic", "clean", quic2);
+        write("clean-quic3.json", "clean-quic3", "clean",
+                RunFixtures.quic3(50, 500, 5));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("missing required fields: 2"), text);
+        assertTrue(text.contains("Matrix /3 gate: FAIL-CLOSED"), text);
+        String join = line(text, "| clean | join (ms) |");
+        assertTrue(join.contains("not run (no measured runs)"), join);
+        assertFalse(join.contains("| 0.0 (n="), join);
+    }
+
+    @Test
     void profileOfPrefersTheBaseNetemProfileAndFallsBackForLegacyFiles() {
         JsonObject current = new JsonObject();
         current.addProperty("profile", "clean-tcp");
@@ -176,6 +253,20 @@ class MatrixSummarizeTest {
         doc.addProperty("profile", profile);
         doc.addProperty("netemProfile", netemProfile);
         doc.add("runs", GSON.toJsonTree(runs));
+        Files.writeString(dir.resolve(file), GSON.toJson(doc), StandardCharsets.UTF_8);
+    }
+
+    /** Writes hand-built run objects so a test can omit fields a real writer always emits. */
+    private void writeRaw(String file, String profile, String netemProfile, JsonObject... runs)
+            throws IOException {
+        JsonObject doc = new JsonObject();
+        doc.addProperty("profile", profile);
+        doc.addProperty("netemProfile", netemProfile);
+        JsonArray array = new JsonArray();
+        for (JsonObject run : runs) {
+            array.add(run);
+        }
+        doc.add("runs", array);
         Files.writeString(dir.resolve(file), GSON.toJson(doc), StandardCharsets.UTF_8);
     }
 
