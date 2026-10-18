@@ -17,6 +17,7 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
+import java.lang.reflect.Constructor;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -39,6 +40,7 @@ import rs.sudoe.quicraft.core.multistream.LogicalStream;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.OutboundPacket;
+import rs.sudoe.quicraft.core.multistream.Record;
 import rs.sudoe.quicraft.core.multistream.SentPacket;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
@@ -458,6 +460,129 @@ class GameLanesTest {
     }
 
     @Test
+    void theAckLifecycleFacadeDelegatesToTheConnectionSession() {
+        AckSession session = new AckSession();
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), session,
+                ProtocolState.PLAY, null);
+        byte[] payload = new byte[] {1, 2, 3};
+
+        assertTrue(lanes.createAck(1L, payload, payload.length),
+                "the session's own answer is what the facade returns");
+        assertArrayEquals(payload, session.ackPayloads.get(1L),
+                "the payload reaches the one session unchanged");
+        SentPacket assigned = sentPacketForTest();
+        lanes.coverAssigned(1L, assigned);
+        assertSame(assigned, session.coveredHandles.get(0),
+                "the handle reaches the one session unchanged");
+        lanes.markInexact(1L);
+
+        MultistreamSession.CausalScope scope = lanes.openScope();
+        lanes.completeScope(scope);
+        lanes.coverScope(1L, scope);
+        lanes.sealAckCoverage(1L);
+        assertSame(session.resolvedHandle, lanes.takeAck(1L),
+                "the session's own resolved handle is what the facade returns");
+        assertEquals(0, session.tracker.pendingCount(), "the one tracker resolved and released the ack");
+        assertEquals(1, session.resolvedAcks.size());
+        assertEquals(LogicalStream.CONTROL, session.resolvedAcks.get(0)[0].streamIndex());
+        assertEquals(9, session.resolvedAcks.get(0)[0].sequence(),
+                "markInexact reached the same tracker, so the safe superset was used");
+
+        lanes.expireAcks();
+        assertEquals(Arrays.asList("createAck:1:3", "coverAssigned:1", "markInexact:1",
+                "takeAck:1", "expireAcks"), session.ackCalls,
+                "every facade call reached the one session, in order");
+    }
+
+    @Test
+    void ackIdsAreOwnedByTheSessionThatAcceptedThem() {
+        AckSession first = new AckSession();
+        AckSession second = new AckSession();
+        GameLanes firstLanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), first,
+                ProtocolState.PLAY, null);
+        GameLanes secondLanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), second,
+                ProtocolState.PLAY, null);
+        byte[] payload = new byte[] {1};
+
+        assertTrue(firstLanes.createAck(7L, payload, 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> secondLanes.coverAssigned(7L, sentPacketForTest()),
+                "an ack id only exists in the session that accepted it");
+        assertThrows(IllegalArgumentException.class, () -> secondLanes.markInexact(7L));
+        assertThrows(IllegalArgumentException.class, () -> secondLanes.sealAckCoverage(7L));
+        assertNull(secondLanes.takeAck(7L), "a foreign id never resolves another session's ack");
+
+        assertTrue(secondLanes.createAck(7L, payload, 1),
+                "ack ids are per session, so the same number is a different ack");
+        secondLanes.sealAckCoverage(7L);
+        assertNotNull(secondLanes.takeAck(7L), "the second session resolved its own ack 7");
+        assertNull(secondLanes.takeAck(7L), "an ack resolves once");
+        assertEquals(1, first.tracker.pendingCount(),
+                "resolving the other session's ack 7 left the first one pending");
+        assertNull(firstLanes.takeAck(7L), "the first ack 7 is still unsealed");
+
+        firstLanes.sealAckCoverage(7L);
+        assertNotNull(firstLanes.takeAck(7L), "the first session still owns its own ack 7");
+    }
+
+    @Test
+    void anAckResolvesOnlyAfterItsCoverageIsSealedAndComplete() {
+        AckSession session = new AckSession();
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), session,
+                ProtocolState.PLAY, null);
+        byte[] payload = new byte[] {1};
+
+        assertTrue(lanes.createAck(1L, payload, 1));
+        assertNull(lanes.takeAck(1L), "an unsealed ack never resolves");
+
+        MultistreamSession.CausalScope scope = lanes.openScope();
+        MultistreamSession.UpdateToken token = lanes.registerUpdate(scope);
+        lanes.sendCovered(token, ProtocolState.PLAY, 8, new byte[] {8}, null);
+        lanes.coverScope(1L, scope);
+        lanes.sealAckCoverage(1L);
+        assertNull(lanes.takeAck(1L), "a covering scope that is still live keeps the ack pending");
+
+        lanes.completeScope(scope);
+        assertSame(session.resolvedHandle, lanes.takeAck(1L),
+                "a sealed ack with every covering scope complete resolves");
+        assertEquals(0, session.tracker.pendingCount());
+        assertEquals(1, session.resolvedAcks.get(0).length);
+        assertEquals(LogicalStream.CONTROL, session.resolvedAcks.get(0)[0].streamIndex());
+        assertEquals(1, session.resolvedAcks.get(0)[0].sequence(),
+                "the completed scope's assigned frontier is the ack's dependency");
+    }
+
+    @Test
+    void expireAcksDropsAPendingAckAtItsDeadline() {
+        AckSession session = new AckSession();
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), session,
+                ProtocolState.PLAY, null);
+
+        assertTrue(lanes.createAck(2L, new byte[] {1}, 1));
+        assertEquals(1, session.tracker.pendingCount());
+
+        lanes.expireAcks();
+
+        assertEquals(0, session.tracker.pendingCount(), "the session dropped the unsealed ack");
+        assertEquals(1, session.tracker.droppedCount(), "and counted the drop");
+        assertNull(lanes.takeAck(2L), "a dropped ack never resolves");
+        assertEquals(Arrays.asList("createAck:2:1", "expireAcks", "takeAck:2"), session.ackCalls);
+    }
+
+    @Test
+    void theFacadeOfALegacySessionFailsClosedOnEveryAckLifecycleMethod() {
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), new FakeSession(),
+                ProtocolState.PLAY, null);
+        assertThrows(UnsupportedOperationException.class,
+                () -> lanes.createAck(1L, new byte[] {1}, 1));
+        assertThrows(UnsupportedOperationException.class,
+                () -> lanes.coverAssigned(1L, sentPacketForTest()));
+        assertThrows(UnsupportedOperationException.class, () -> lanes.markInexact(1L));
+        assertThrows(UnsupportedOperationException.class, () -> lanes.takeAck(1L));
+        assertThrows(UnsupportedOperationException.class, lanes::expireAcks);
+    }
+
+    @Test
     void aCoveredBundleIsOneAtomicSessionTransaction() {
         CausalSession session = new CausalSession();
         GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), session,
@@ -534,6 +659,21 @@ class GameLanesTest {
         assertThrows(UnsupportedOperationException.class, () -> lanes.completeScope(null));
         assertThrows(UnsupportedOperationException.class, () -> lanes.coverScope(1L, null));
         assertThrows(UnsupportedOperationException.class, () -> lanes.sealAckCoverage(1L));
+    }
+
+    /**
+     * One standing {@link SentPacket}: the constructor and assignment are core-internal, so the
+     * bridge test obtains the opaque handle the facade passes around through the one seam that
+     * exists. A real producer gets its handles from the session's send operations.
+     */
+    static SentPacket sentPacketForTest() {
+        try {
+            Constructor<SentPacket> constructor = SentPacket.class.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            return constructor.newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("SentPacket construction moved", e);
+        }
     }
 
     /** A codec the test drives: what a frame decodes to and how a packet routes are the test's. */
@@ -617,7 +757,7 @@ class GameLanesTest {
      * used. The production session's atomic bundle transaction and effective GLOBAL promotion are
      * exercised end to end in {@link GameLanesV3LoopbackTest}.
      */
-    static final class CausalSession implements GameLanes.Session {
+    static class CausalSession implements GameLanes.Session {
         final AckJoinTracker tracker = new AckJoinTracker(LogicalStream.MAX_CHUNKS + 2);
         final List<String> covered = new ArrayList<>();
         final List<byte[]> coveredFrames = new ArrayList<>();
@@ -731,6 +871,67 @@ class GameLanesTest {
         @Override
         public void sealAckCoverage(long ackId) {
             tracker.sealAckCoverage(ackId);
+        }
+    }
+
+    /**
+     * The ACK lifecycle over the same real {@link AckJoinTracker} as {@link CausalSession}, so the
+     * facade's ownership, sealing and deadline rules are the tracker's own. The {@link SentPacket}
+     * values are sentinels: assignment is core-internal, so this fake records the handle it was
+     * given and merges a fixed frontier for it instead of reading an assigned sequence.
+     */
+    static final class AckSession extends CausalSession {
+        final List<String> ackCalls = new ArrayList<>();
+        final Map<Long, byte[]> ackPayloads = new HashMap<>();
+        final List<SentPacket> coveredHandles = new ArrayList<>();
+        final List<Record.Dependency[]> resolvedAcks = new ArrayList<>();
+        final SentPacket resolvedHandle = sentPacketForTest();
+        final Record.Dependency[] safeSuperset =
+                { new Record.Dependency(LogicalStream.CONTROL, 9) };
+        long now = System.nanoTime();
+        long coveredSequence = 4;
+
+        @Override
+        public boolean createAck(long id, byte[] payload, int chargedBytes) {
+            ackCalls.add("createAck:" + id + ":" + chargedBytes);
+            if (payload == null) {
+                throw new IllegalArgumentException("payload");
+            }
+            ackPayloads.put(id, payload.clone());
+            return tracker.create(id, chargedBytes, now);
+        }
+
+        @Override
+        public void coverAssigned(long ackId, SentPacket covered) {
+            ackCalls.add("coverAssigned:" + ackId);
+            coveredHandles.add(covered);
+            tracker.coverAssigned(ackId, LogicalStream.CONTROL, coveredSequence++);
+        }
+
+        @Override
+        public void markInexact(long ackId) {
+            ackCalls.add("markInexact:" + ackId);
+            tracker.markInexact(ackId);
+        }
+
+        @Override
+        public SentPacket takeAck(long ackId) {
+            ackCalls.add("takeAck:" + ackId);
+            AckJoinTracker.Ready ready = tracker.take(ackId, now, 0, safeSuperset);
+            if (ready == null) {
+                return null;
+            }
+            resolvedAcks.add(ready.dependencies());
+            return resolvedHandle;
+        }
+
+        @Override
+        public void expireAcks() {
+            ackCalls.add("expireAcks");
+            now += AckJoinTracker.DEADLINE_NANOS + 1;
+            for (AckJoinTracker.Ready ready : tracker.expire(now, 0, safeSuperset)) {
+                resolvedAcks.add(ready.dependencies());
+            }
         }
     }
 

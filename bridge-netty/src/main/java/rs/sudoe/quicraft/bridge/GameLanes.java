@@ -524,6 +524,60 @@ public final class GameLanes implements LaneGame {
         session().applied(lane, sequence);
     }
 
+    // --- ACK lifecycle (U1/U2, 13.19).
+    // Additive passthroughs to the one session activation created. The facade owns no pending ack
+    // table, so an ack id is meaningful only in the session that accepted it: another connection
+    // does not know it. Call them on the session's submission thread, in the same order as the
+    // packets they cover, like every other send operation.
+
+    /**
+     * Registers one pending ACK_JOIN with this connection's session (13.19) and answers whether it
+     * was accepted. The ack id is connection-local: a duplicate id is caller misuse, and another
+     * connection's session never knows it. The charge is taken now, and a refused ack stores
+     * nothing so the producer can pause. A local limit no cap can admit closes the connection with
+     * 0x12 instead.
+     */
+    public boolean createAck(long id, byte[] payload, int chargedBytes) {
+        return session().createAck(id, payload, chargedBytes);
+    }
+
+    /**
+     * Adds an already assigned covered update to a pending ACK_JOIN (13.19). Cover every update
+     * before {@link #takeAck}; an unknown ack id is rejected by the session before anything is
+     * merged.
+     */
+    public void coverAssigned(long ackId, SentPacket covered) {
+        session().coverAssigned(ackId, covered);
+    }
+
+    /**
+     * Marks a pending ACK_JOIN as lacking exact coverage (13.19). Once every non-suppressed covered
+     * update is assigned, the ack resolves to the session's safe superset instead of a partial
+     * frontier.
+     */
+    public void markInexact(long ackId) {
+        session().markInexact(ackId);
+    }
+
+    /**
+     * Sequences a pending ACK_JOIN if its coverage is complete (13.19): the ack's membership is
+     * sealed and every covering scope is complete. Returns the session's answer: an assigned handle
+     * when it resolves, or null while it is still unresolved, was already resolved, or was dropped
+     * at its deadline. A session that closed on a local failure may answer an unassigned handle.
+     */
+    public SentPacket takeAck(long ackId) {
+        return session().takeAck(ackId);
+    }
+
+    /**
+     * Settles every pending ACK_JOIN at its deadline (13.19): complete ones are sequenced in the
+     * current state and epoch, the others are dropped and counted. Call it before a protocol-state,
+     * epoch or disconnect transition, which must not carry a pending ack.
+     */
+    public void expireAcks() {
+        session().expireAcks();
+    }
+
     // --- Causal scopes (U1/U2, 13.19).
     // Additive passthroughs to the session activation created. This object owns no tracker and
     // allocates no scope identity, so every handle stays bound to the connection's own tracker and

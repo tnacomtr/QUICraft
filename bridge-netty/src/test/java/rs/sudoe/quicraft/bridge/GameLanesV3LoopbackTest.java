@@ -380,11 +380,8 @@ class GameLanesV3LoopbackTest {
             rig.activateServer(NO_LEFTOVER);
             rig.activateClient(NO_LEFTOVER);
 
-            Method session = GameLanes.class.getDeclaredMethod("session");
-            session.setAccessible(true);
-            GameLanes.Session sink = (GameLanes.Session) session.invoke(rig.clientLanes);
-            assertTrue(sink.createAck(1L, new byte[] {1, 2, 3}, 3),
-                    "the session took the pending ack");
+            assertTrue(rig.clientLanes.createAck(1L, new byte[] {1, 2, 3}, 3),
+                    "the public facade reached the session with the pending ack");
 
             MultistreamSession.CausalScope scope = rig.clientLanes.openScope();
             MultistreamSession.UpdateToken token = rig.clientLanes.registerUpdate(scope);
