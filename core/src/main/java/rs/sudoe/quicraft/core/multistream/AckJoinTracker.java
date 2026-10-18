@@ -385,6 +385,23 @@ public final class AckJoinTracker {
     }
 
     /**
+     * True when {@code token} was issued by this tracker and is still live and unresolved, so
+     * {@link #assignScopeToken} or {@link #suppressScopeToken} would accept it right now (U2,
+     * 13.19). Non-consuming: it changes no scope, token or frontier state. A handle from another
+     * tracker throws {@link ForeignHandleException}; a token whose scope retired (for example when
+     * its ack resolved or expired) or that was already resolved or suppressed returns false.
+     */
+    public synchronized boolean validateScopeToken(MultistreamSession.UpdateToken tokenId) {
+        long token = tokenIdOf(tokenId);
+        Long scopeId = tokenScope.get(token);
+        if (scopeId == null) {
+            return false;
+        }
+        Scope scope = scopes.get(scopeId);
+        return scope != null && !scope.complete && scope.unresolved.contains(token);
+    }
+
+    /**
      * Opens a new causal scope and returns its opaque handle (U1, 13.19). The id is monotonic per
      * tracker and never reused; the handle carries this tracker's owner identity. Throws
      * {@link CapacityException} when the cap is exceeded.

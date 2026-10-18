@@ -495,4 +495,25 @@ class CausalScopeTest {
         assertEquals(0, acks.pendingCount());
         assertEquals(1, acks.droppedCount(), "the sealed ack is resolved, not dropped");
     }
+
+    // 26. validateScopeToken is non-consuming and tracks the token lifecycle without mutation.
+    @Test void validateScopeTokenIsNonConsumingAndTracksLifecycle() {
+        AckJoinTracker acks = new AckJoinTracker();
+        CausalScope scope = acks.openScope();
+        UpdateToken token = acks.registerUpdate(scope);
+        assertTrue(acks.validateScopeToken(token));
+        assertTrue(acks.validateScopeToken(token), "validation changes no scope or token state");
+        acks.assignScopeToken(token, 2, 5);
+        assertFalse(acks.validateScopeToken(token), "a resolved token is invalid");
+
+        UpdateToken suppressed = acks.registerUpdate(scope);
+        assertTrue(acks.validateScopeToken(suppressed));
+        acks.suppressScopeToken(suppressed);
+        assertFalse(acks.validateScopeToken(suppressed), "a suppressed token is invalid");
+
+        AckJoinTracker other = new AckJoinTracker();
+        UpdateToken foreign = other.registerUpdate(other.openScope());
+        assertThrows(AckJoinTracker.ForeignHandleException.class, () -> acks.validateScopeToken(foreign),
+                "a handle from another tracker is rejected, never aliased to a local id");
+    }
 }

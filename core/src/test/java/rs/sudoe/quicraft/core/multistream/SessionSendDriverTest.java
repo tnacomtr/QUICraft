@@ -128,6 +128,15 @@ class SessionSendDriverTest {
         return 2 + ShardHash.shardOf(x, z, epoch, shards);
     }
 
+    /** A chunk X whose shard is not 0, so a join on CHUNK[0] carries its frontier explicitly. */
+    private static int nonzeroShardX(int shards) {
+        int x = 0;
+        while (ShardHash.shardOf(x, 0, 0, shards) == 0) {
+            x++;
+        }
+        return x;
+    }
+
     @Test
     void endIsAnEmptyGlobalControlRecordAfterEveryEarlierRecord() throws Exception {
         Rig rig = new Rig(2, 100);
@@ -424,6 +433,13 @@ class SessionSendDriverTest {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /** The decoded record of a single-slice handle among the drained writes. */
+    private static Record recordOf(Drain drain, SentPacket handle) {
+        Record record = decodeQuietly(drain.writes.get(startIndex(drain, handle)), handle.logicalStream());
+        assertNotNull(record, "record " + handle.logicalStream() + "#" + handle.sequence());
+        return record;
     }
 
     @Test
@@ -965,6 +981,182 @@ class SessionSendDriverTest {
         assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
         assertTrue(driver.closeCause() instanceof AckJoinTracker.CapacityException,
                 "the original typed cause is retained, not masked");
+        driver.close();
+    }
+
+    /** The join's decoded record waits for the covered update's assigned stream and sequence. */
+    @Test
+    void coveredSendResolvesTokenAndAckCarriesItsFrontier() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(1, frame(2).frame(), 64));
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        assertEquals(1, driver.trackerRetainedTokens(), "one live token before assignment");
+
+        SentPacket covered = driver.submitCovered(token, frame(3), StreamSequencer.Fence.CHUNK, false,
+                nonzeroShardX(2), 0);
+        assertTrue(covered.isAssigned());
+        assertEquals(0, driver.trackerRetainedTokens(),
+                "the token is consumed in the same monitor as the sequence assignment");
+        assertFalse(driver.validateScopeToken(token), "a resolved token is not valid any more");
+
+        driver.completeScope(scope);
+        driver.coverScope(1, scope);
+        driver.sealAckCoverage(1);
+        SentPacket join = driver.takeAck(1);
+        assertNotNull(join, "the complete, sealed scope releases the ack");
+
+        Drain drain = drainAndRelease(driver);
+        boolean seesCovered = false;
+        for (Record.Dependency dep : recordOf(drain, join).dependencies()) {
+            seesCovered |= dep.streamIndex() == covered.logicalStream() && dep.sequence() == covered.sequence();
+        }
+        assertTrue(seesCovered, "the join waits for the covered update's assigned frontier");
+        driver.close();
+    }
+
+    /**
+     * Every invalid token is rejected by the non-consuming pre-validation, before the sequencer
+     * moves: foreign (ForeignHandleException), retired, suppressed and reused tokens assign no
+     * sequence, leave the queue unchanged and never consume a live token.
+     */
+    @Test
+    void coveredTokenIsValidatedBeforeAnyAssignment() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        Rig other = new Rig(2, 1000);
+        MultistreamSession.UpdateToken foreign = other.driver.registerUpdate(other.driver.openScope());
+
+        assertThrows(AckJoinTracker.ForeignHandleException.class,
+                () -> driver.submitCovered(foreign, frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, false, 0, 0));
+        assertEquals(0, driver.queuedRecords(), "a foreign token queues nothing");
+        assertEquals(1, driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).sequence(),
+                "a foreign token assigned no sequence");
+
+        // A token whose ack expires unresolved is retired with its scope.
+        assertTrue(driver.createAck(7, frame(2).frame(), 8));
+        MultistreamSession.CausalScope retiredScope = driver.openScope();
+        MultistreamSession.UpdateToken retired = driver.registerUpdate(retiredScope);
+        driver.coverScope(7, retiredScope);
+        driver.sealAckCoverage(7);
+        rig.now.addAndGet(AckJoinTracker.DEADLINE_NANOS + 1);
+        assertNull(driver.takeAck(7));
+        assertFalse(driver.validateScopeToken(retired), "the retired token is not valid");
+        assertThrows(IllegalArgumentException.class,
+                () -> driver.submitCovered(retired, frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, false, 0, 0));
+        assertEquals(2, driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).sequence(),
+                "a retired token assigned no sequence");
+
+        // Suppression makes the token invalid, and validation itself never consumes it.
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken suppressed = driver.registerUpdate(scope);
+        driver.suppressUpdate(suppressed);
+        assertFalse(driver.validateScopeToken(suppressed), "a suppressed token is not valid");
+        assertThrows(IllegalArgumentException.class,
+                () -> driver.submitCovered(suppressed, frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, false, 0, 0));
+        assertEquals(3, driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).sequence(),
+                "a suppressed token assigned no sequence");
+
+        MultistreamSession.UpdateToken live = driver.registerUpdate(scope);
+        assertTrue(driver.validateScopeToken(live));
+        assertTrue(driver.validateScopeToken(live), "validation is non-consuming");
+        SentPacket covered = driver.submitCovered(live, frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, false, 0, 0);
+        assertTrue(covered.isAssigned(), "the still-live token assigns after repeated validation");
+        assertThrows(IllegalArgumentException.class,
+                () -> driver.submitCovered(live, frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, false, 0, 0));
+        assertEquals(covered.sequence() + 1,
+                driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).sequence(),
+                "reusing a resolved token assigned no sequence");
+        driver.close();
+        other.driver.close();
+    }
+
+    /**
+     * The documented post-validation race: the token becomes unresolvable after validation but before
+     * assignment. The driver closes locally 0x12 with the cause, writes nothing, and never turns the
+     * failure into a suppression or a peer classification.
+     */
+    @Test
+    void postValidationTokenRaceClosesResourceWithCause() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        assertTrue(driver.validateScopeToken(token));
+        // Consume the token between validation and the assignment attempt.
+        driver.assignScopeToken(token, 0, 1);
+
+        SentPacket handle = driver.submitCoveredAssigned(token, frame(2), StreamSequencer.Fence.ORDINARY_CONTROL,
+                false, 0, 0);
+        assertFalse(handle.isAssigned(), "the raced record is never handed out");
+        assertTrue(driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertTrue(driver.closeCause() instanceof IllegalArgumentException,
+                "the resolution failure is retained as the local cause");
+        assertEquals(0, rig.pool.reserved(rig.owner), "the close releases every charge");
+    }
+
+    /** A refused route throws before assignment, leaves the token live and takes no sequence. */
+    @Test
+    void refusedCoveredRouteLeavesTokenLiveAndNoSequenceGap() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        assertThrows(IllegalArgumentException.class,
+                () -> driver.submitCovered(token, frame(2), StreamSequencer.Fence.CHUNK, true, 0, 0));
+        assertTrue(driver.validateScopeToken(token), "a refused route does not consume the token");
+        assertEquals(0, driver.queuedRecords());
+
+        SentPacket next = driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        assertEquals(1, next.sequence(), "the refused route assigned no sequence");
+        SentPacket covered = driver.submitCovered(token, frame(2), StreamSequencer.Fence.CHUNK, false, 0, 0);
+        assertTrue(covered.isAssigned());
+        assertEquals(1, covered.sequence(), "the chunk sequence is contiguous");
+        driver.close();
+    }
+
+    /**
+     * ACK first, then a view gate, then the covered update (13.19): the pending ack stays outside
+     * the FIFO under a 102-byte cap, so both non-ACK records assign, the update keeps its order
+     * behind the gate, and the resolved join follows it with the update's frontier.
+     */
+    @Test
+    void pendingAckDoesNotReorderFenceAndCoveredUpdateUnderPressure() throws Exception {
+        HeadroomRig rig = new HeadroomRig(102, 86, 16);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(1, frame(2).frame(), 16));
+        SentPacket fence = driver.submit(frame(1), StreamSequencer.Fence.VIEW, 0, 0);
+        assertTrue(fence.isAssigned());
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        SentPacket update = driver.submitCovered(token, frame(78), StreamSequencer.Fence.CHUNK, false,
+                nonzeroShardX(2), 0);
+        assertTrue(update.isAssigned(), "the covered update assigns while its ACK is pending");
+        assertFalse(update.logicalStream() == LogicalStream.CONTROL, "the update uses a chunk stream");
+        driver.completeScope(scope);
+        driver.coverScope(1, scope);
+        driver.sealAckCoverage(1);
+        SentPacket join = driver.takeAck(1);
+        assertNotNull(join, "the ack resolves after its covered update was assigned");
+        assertEquals(2, join.logicalStream(), "joins are always CHUNK[0]");
+        assertTrue(update.logicalStream() != join.logicalStream(),
+                "the update shard differs from CHUNK[0], so its frontier is explicit");
+
+        Drain drain = drainAndRelease(driver);
+        boolean updateWaitsForFence = false;
+        for (Record.Dependency dep : recordOf(drain, update).dependencies()) {
+            updateWaitsForFence |= dep.streamIndex() == LogicalStream.CONTROL && dep.sequence() == fence.sequence();
+        }
+        assertTrue(updateWaitsForFence, "the covered update keeps its order behind the view gate");
+        boolean joinWaitsForUpdate = false;
+        for (Record.Dependency dep : recordOf(drain, join).dependencies()) {
+            joinWaitsForUpdate |= dep.streamIndex() == update.logicalStream()
+                    && dep.sequence() == update.sequence();
+        }
+        assertTrue(joinWaitsForUpdate, "the join carries the covered update frontier");
+        assertEquals(TEST_SLICE, rig.pool.reserved(rig.owner), "every record charge is released");
         driver.close();
     }
 

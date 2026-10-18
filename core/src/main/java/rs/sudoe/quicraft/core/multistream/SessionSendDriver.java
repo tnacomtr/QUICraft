@@ -511,6 +511,86 @@ public final class SessionSendDriver {
         return handle;
     }
 
+    /**
+     * Assigns one covered GAME record and resolves its update token atomically (U2, 13.19). The
+     * token is validated first, without consuming it, so a foreign, already resolved, suppressed or
+     * retired token throws before any sequence is assigned and leaves the sequencer unchanged. The
+     * sequenced submission and {@link AckJoinTracker#assignScopeToken} then run under this monitor:
+     * no other submission or poll can observe or write the record before the tracker has merged its
+     * frontier. If resolution still fails (the documented post-validation race), the driver closes
+     * locally with 0x12 and keeps the cause; it never fabricates a suppression and never attributes
+     * the failure to the peer.
+     *
+     * @throws AckJoinTracker.ForeignHandleException when the token belongs to another tracker
+     * @throws IllegalArgumentException when the token is no longer live and unresolved
+     */
+    public synchronized SentPacket submitCovered(MultistreamSession.UpdateToken token, OutboundPacket packet,
+            StreamSequencer.Fence fence, boolean interaction, int chunkX, int chunkZ) {
+        SentPacket handle = new SentPacket();
+        if (closed || sealed) {
+            return handle;
+        }
+        requireCoveredToken(token);
+        return submitCoveredAssigned(token, packet, fence, interaction, chunkX, chunkZ);
+    }
+
+    /**
+     * The sequenced part of {@link #submitCovered}, after the caller pre-validated the token. Package
+     * private so the post-validation race path can be driven deterministically in tests: a token that
+     * became unresolvable after validation must close 0x12 with the cause, not suppress or throw.
+     */
+    synchronized SentPacket submitCoveredAssigned(MultistreamSession.UpdateToken token, OutboundPacket packet,
+            StreamSequencer.Fence fence, boolean interaction, int chunkX, int chunkZ) {
+        SentPacket handle = new SentPacket();
+        if (closed || sealed) {
+            return handle;
+        }
+        byte[] frame = packet.frame();
+        if (overflows(1, frame.length)) {
+            closeCause = new IllegalStateException("covered submission overflows the queue");
+            closeWith(CLOSE_RESOURCE);
+            return handle;
+        }
+        int stream = streamFor(fence, chunkX, chunkZ);
+        // The sequencer validates the route shape before it moves any sequence or frontier.
+        Record record = sequencer.assign(stream, fence, frame, interaction);
+        if (!enqueueRecord(record, false)) {
+            if (closeCause == null) {
+                closeCause = new IllegalStateException("covered record exceeds every applicable cap");
+            }
+            return handle;
+        }
+        try {
+            acks.assignScopeToken(token, stream, record.sequence());
+        } catch (RuntimeException failure) {
+            // The token was consumed or retired after validation: the record is assigned but never
+            // pollable now, so the local close discards it with the connection.
+            closeCause = failure;
+            closeWith(CLOSE_RESOURCE);
+            return handle;
+        }
+        handle.assign(laneOf(stream), stream, record.sequence());
+        return handle;
+    }
+
+    /** Rejects a token that cannot be assigned, without consuming it or assigning a sequence. */
+    private void requireCoveredToken(MultistreamSession.UpdateToken token) {
+        if (!acks.validateScopeToken(token)) {
+            throw new IllegalArgumentException("unknown, resolved, suppressed or retired update token");
+        }
+    }
+
+    /**
+     * True while {@code token} is live and unresolved and {@link #submitCovered} would accept it.
+     * Non-consuming; a foreign handle throws {@link AckJoinTracker.ForeignHandleException}.
+     */
+    public synchronized boolean validateScopeToken(MultistreamSession.UpdateToken token) {
+        if (closed || sealed) {
+            return false;
+        }
+        return acks.validateScopeToken(token);
+    }
+
     /** Assigns an ordinary GAME record whose predecessors are existing handles. */
     public synchronized SentPacket submitAfter(OutboundPacket packet, StreamSequencer.Fence fence, int chunkX,
             int chunkZ, SentPacket... after) {
@@ -701,11 +781,11 @@ public final class SessionSendDriver {
         return handle;
     }
 
-    // --- Causal-scope driver operations (U1, 13.19) ---
-    // These delegate to the tracker. The matching MultistreamSession defaults throw; NStreamSession
-    // wiring (translating handles at the session boundary) is deferred to a later phase.
+    // --- Causal-scope driver operations (U1/U2, 13.19) ---
+    // These delegate to the tracker and are reached by NStreamSession's overrides. The session adds
+    // no policy; the send path resolves a token in submitCovered above.
 
-    /** Opens a causal scope, returning its opaque handle. No send-path integration (U1). */
+    /** Opens a causal scope, returning its opaque handle. Reached through NStreamSession (U2). */
     public synchronized MultistreamSession.CausalScope openScope() {
         if (closed || sealed) {
             return null;
@@ -718,7 +798,7 @@ public final class SessionSendDriver {
         }
     }
 
-    /** Registers an update token in the scope, returning its opaque handle. No send-path integration (U1). */
+    /** Registers an update token in the scope, returning its opaque handle. Reached through NStreamSession (U2). */
     public synchronized MultistreamSession.UpdateToken registerUpdate(MultistreamSession.CausalScope scope) {
         if (closed || sealed) {
             return null;
@@ -795,8 +875,8 @@ public final class SessionSendDriver {
 
     /**
      * Maps a typed causal-scope capacity failure to a local resource close (0x12), keeping the
-     * cause for diagnostics. U1 has no adapter wiring yet; U2 completes the send-path integration
-     * and the per-call handling at the session boundary.
+     * cause for diagnostics. U2 wires the session boundary; production adapters still do not call
+     * the coverage hooks, so every refusal remains local and never enters a failure cache.
      */
     private void capacityFailure(AckJoinTracker.CapacityException failure) {
         closeCause = failure;

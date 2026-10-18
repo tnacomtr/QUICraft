@@ -154,7 +154,9 @@ public interface MultistreamSession {
 
     /**
      * Submits one GAME packet covered by the registered update, resolving the token by assignment
-     * (U1, 13.19). The token is consumed: it can never later be suppressed or re-resolved.
+     * (U1, 13.19). The token is consumed: it can never later be suppressed or re-resolved. A token
+     * that is foreign, already resolved, suppressed or retired is rejected with an
+     * {@link IllegalArgumentException} before any sequence is assigned (U2).
      */
     default SentPacket sendCovered(UpdateToken token, ProtocolState state, int packetId, byte[] frame,
             byte[] uncompressedPacket) {

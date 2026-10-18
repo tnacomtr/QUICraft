@@ -97,6 +97,51 @@ class NStreamSessionLoopbackTest {
         }
     }
 
+    /**
+     * Every causal-scope operation reaches the send driver through the session (U2, 13.19): scopes
+     * and updates are allocated, covered send assigns and consumes the token, reuse is rejected
+     * without a sequence, suppression and completion are enforced, and the ack-membership calls are
+     * delegated (an unknown ack is rejected by the driver, not by the session default).
+     */
+    @Test
+    void causalScopeOperationsDelegateThroughTheSession() throws Exception {
+        try (NRig rig = NRig.start(2)) {
+            rig.activateBoth();
+            MultistreamSession.CausalScope scope = rig.server.openScope();
+            assertNotNull(scope, "the session opens scopes through the driver");
+            MultistreamSession.UpdateToken token = rig.server.registerUpdate(scope);
+            assertNotNull(token, "the session registers updates through the driver");
+            assertEquals(1, rig.server.sendDriver().trackerRetainedTokens());
+
+            SentPacket covered = rig.server.sendCovered(token, ProtocolState.PLAY, NRig.CONTROL_ID,
+                    NRig.frame(NRig.CONTROL_ID, "u"), NRig.frame(NRig.CONTROL_ID, "u"));
+            assertTrue(covered.isAssigned(), "the session routes sendCovered to the driver");
+            assertEquals(0, rig.server.sendDriver().trackerRetainedTokens());
+
+            assertThrows(IllegalArgumentException.class, () -> rig.server.sendCovered(token, ProtocolState.PLAY,
+                    NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "again"), NRig.frame(NRig.CONTROL_ID, "again")));
+            SentPacket next = rig.server.send(ProtocolState.PLAY, NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "n"));
+            assertEquals(covered.sequence() + 1, next.sequence(), "the rejected token took no sequence");
+
+            MultistreamSession.UpdateToken suppressed = rig.server.registerUpdate(scope);
+            rig.server.suppressUpdate(suppressed);
+            assertThrows(IllegalArgumentException.class, () -> rig.server.sendCovered(suppressed, ProtocolState.PLAY,
+                    NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "s"), NRig.frame(NRig.CONTROL_ID, "s")),
+                    "suppressUpdate reached the driver");
+            rig.server.completeScope(scope);
+            assertThrows(IllegalArgumentException.class, () -> rig.server.registerUpdate(scope),
+                    "completeScope reached the driver");
+            assertThrows(IllegalArgumentException.class, () -> rig.server.coverScope(999, scope),
+                    "coverScope reached the driver (unknown ack)");
+            assertThrows(IllegalArgumentException.class, () -> rig.server.sealAckCoverage(999),
+                    "sealAckCoverage reached the driver (unknown ack)");
+
+            assertTrue(SessionRigSupport.await(() -> rig.clientGame.count(NRig.CONTROL_ID) >= 2, 15_000),
+                    "the covered update and the later CONTROL record arrived");
+            assertFalse(rig.clientGame.closed.isDone());
+        }
+    }
+
     @Test
     void chunkRouteWithoutPositionFailsClosed() throws Exception {
         byte[][] uncompressed = {null, {(byte) NRig.CHUNK_ID, 0, 0, 0, 1}};
