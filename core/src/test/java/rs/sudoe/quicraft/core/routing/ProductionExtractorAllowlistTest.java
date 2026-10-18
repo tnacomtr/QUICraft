@@ -50,7 +50,7 @@ class ProductionExtractorAllowlistTest {
 
     @Test void theAllowlistIsClosedAndEveryIdentifierKeepsItsDecoding() {
         assertEquals(setOf("mc775.block_position.v1", "mc775.chunk_list.v1", "mc775.chunk_xz.v1",
-                "mc775.join.v1", "mc775.section_position.v1", "mc775.varint_xz.v1"),
+                "mc775.join.v1", "mc775.section_position.v1"),
                 ExtractorRegistry.productionIds());
         for (String id : ExtractorRegistry.productionIds()) {
             assertTrue(ExtractorRegistry.isProduction(id), id);
@@ -62,6 +62,11 @@ class ProductionExtractorAllowlistTest {
             assertFalse(ExtractorRegistry.isProduction(id), id);
             assertThrows(IllegalArgumentException.class, () -> ExtractorRegistry.productionDecoder(id));
         }
+        // varint_xz has no production identifier: no captured 775 packet carried its layout, so
+        // even the production-looking name is unknown rather than silently allowed.
+        assertFalse(ExtractorRegistry.isProduction("mc775.varint_xz.v1"));
+        assertThrows(IllegalArgumentException.class, () -> ExtractorRegistry.productionDecoder("mc775.varint_xz.v1"));
+        assertThrows(IllegalArgumentException.class, () -> ExtractorRegistry.decoder("mc775.varint_xz.v1"));
         assertThrows(IllegalArgumentException.class, () -> ExtractorRegistry.productionDecoder("mc775.chunk.v1"));
         assertThrows(IllegalArgumentException.class, () -> ExtractorRegistry.decoder("mc775.chunk.v1"));
         // Same layout, same math: the two families differ only in who may name them.

@@ -13,9 +13,10 @@ import static org.junit.jupiter.api.Assertions.*;
 class ExtractorGoldenTest {
     @Test void independentPythonGoldenVectorsAndEveryTruncationAndPrefix() throws Exception {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(getClass().getResourceAsStream(
-                "extractor-vectors.txt"), StandardCharsets.UTF_8))) {
+                "oracle-vectors.txt"), StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
+                if (line.startsWith("#")) continue;
                 String[] fields = line.split("\\|", -1);
                 assertEquals(4, fields.length, line);
                 String identifier = fields[0];
@@ -23,9 +24,12 @@ class ExtractorGoldenTest {
                 int consumed = Integer.parseInt(fields[3]);
                 assertTrue(consumed > 0 && consumed <= packet.length, line);
                 // The sibling identifier names the same layout under the other family
-                // (synthetic primitive.* vs reviewed mc775.*); the same bytes must decode alike.
+                // (synthetic primitive.* vs reviewed mc775.*) when a captured packet carries it;
+                // the same bytes must decode alike. varint_xz has no production sibling.
                 ExtractorRegistry.Decoder decoder = ExtractorRegistry.decoder(identifier);
-                ExtractorRegistry.Decoder sibling = ExtractorRegistry.decoder(siblingId(identifier));
+                boolean hasSibling = identifier.startsWith("primitive.")
+                        && ExtractorRegistry.ids().contains(siblingId(identifier));
+                ExtractorRegistry.Decoder sibling = hasSibling ? ExtractorRegistry.decoder(siblingId(identifier)) : decoder;
                 assertResult(fields[2], decoder.decode(packet), line);
                 assertResult(fields[2], sibling.decode(packet), line);
                 assertThrows(UnsupportedOperationException.class, () -> decoder.decode(packet).positions.clear());

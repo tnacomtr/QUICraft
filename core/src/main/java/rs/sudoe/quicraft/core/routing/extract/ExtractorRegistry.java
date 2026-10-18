@@ -18,11 +18,13 @@ import rs.sudoe.quicraft.core.routing.Extractor;
  * noncanonical or overflowing VarInts, a negative packet id and malformed list counts or lengths are
  * rejected: a packet that cannot supply the layout's fields is malformed, not a reason to guess.
  *
- * <p>Every layout has one synthetic identifier ({@code test.*}, {@code primitive.*}) and one
- * production identifier of the form {@code mc775.<layout>.v1}. The two identifiers decode with the
- * same reviewed math; the production identifier is the one a shipped table may name, and its
- * evidence is the captured real 775 packets checked in next to the code. The production load path
- * accepts only the production allowlist: renaming a primitive is not review (13.7).
+ * <p>Every layout has one synthetic identifier ({@code test.*}, {@code primitive.*}) and, when a
+ * real packet carries it, one production identifier of the form {@code mc775.<layout>.v1}. The two
+ * identifiers decode with the same reviewed math; the production identifier is the one a shipped
+ * table may name, and its evidence is the captured real 775 packets checked in next to the code.
+ * The production load path accepts only the production allowlist: renaming a primitive is not
+ * review (13.7). {@code varint_xz} has no production identifier: no captured 775 packet carried
+ * that layout.
  */
 public final class ExtractorRegistry {
     public enum Kind { SINGLE, LIST, JOIN }
@@ -93,7 +95,13 @@ public final class ExtractorRegistry {
         for (String layout : new String[] {"chunk_xz", "block_position", "section_position",
                 "varint_xz", "chunk_list", "join"}) {
             synthetic(decoders, "primitive." + layout + ".v1", layout);
-            add(decoders, new Decoder("mc775." + layout + ".v1", layout, kind(layout), Origin.PRODUCTION));
+            // No production packet carried the varint_xz layout on the live 26.1.2 client: light
+            // changing play edits (a surface break, a stone roof, a torch, glowstone) produced no
+            // light_update, so naming it for light_update would be an assumption. It stays a
+            // synthetic layout for the oracle until a unit captures a real packet for it (13.7).
+            if (!layout.equals("varint_xz")) {
+                add(decoders, new Decoder("mc775." + layout + ".v1", layout, kind(layout), Origin.PRODUCTION));
+            }
         }
         return Collections.unmodifiableMap(decoders);
     }
