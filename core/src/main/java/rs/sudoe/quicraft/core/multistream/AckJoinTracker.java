@@ -37,6 +37,55 @@ public final class AckJoinTracker {
     public static final int MAX_SCOPES = 128;
     /** Max scopes covering one ack, bounding per-ack membership (U1, 13.19). */
     private static final int MAX_COVER_PER_ACK = 128;
+    /** Max live (unresolved) update tokens per scope; resolved tokens are dropped at once (U1, 13.19). */
+    public static final int MAX_TOKENS_PER_SCOPE = 128;
+    /** Frontier keys of a tracker that does not know its session shape (U1, 13.19). */
+    private static final int DEFAULT_MAX_FRONTIER_KEYS = LogicalStream.MAX_CHUNKS + 2;
+
+    /**
+     * A bounded causal-scope resource is exhausted (U1, 13.19). Typed so the driver can map it to a
+     * local resource close (0x12) instead of letting a bare {@link IllegalStateException} reach a
+     * production send path. It never names a peer.
+     */
+    public static final class CapacityException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+
+        /** Creates a capacity failure with a diagnostic reason, never a payload dump. */
+        public CapacityException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * A covering scope was offered after the ack's membership was sealed (U1, 13.19). Typed so a
+     * caller can reject the producer's contract violation without parsing messages.
+     */
+    public static final class SealedCoverageException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+
+        /** Creates a sealed-membership failure with a diagnostic reason. */
+        public SealedCoverageException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * A scope or token handle belongs to another tracker/session (U1, 13.19). Per-tracker ids plus
+     * the owner identity make handles unique across sessions; a foreign handle is never resolved
+     * against the local id space.
+     */
+    public static final class ForeignHandleException extends IllegalArgumentException {
+        private static final long serialVersionUID = 1L;
+
+        /** Creates a foreign-handle failure with a diagnostic reason. */
+        public ForeignHandleException(String message) {
+            super(message);
+        }
+    }
+
+    private final int maxFrontierKeys;
+    /** Owner identity carried by every handle this tracker issues; never shared statically. */
+    private final Object identity = new Object();
 
     private final Map<Long, Pending> pending = new LinkedHashMap<Long, Pending>();
     private final Map<Long, Set<Long>> waiters = new HashMap<Long, Set<Long>>();
@@ -57,6 +106,25 @@ public final class AckJoinTracker {
     private long nextScopeId = 1;
     /** Monotonic token id allocator, never reused (U1, 13.19). */
     private long nextTokenId = 1;
+
+    /** A tracker for a session whose logical stream count is unknown: the /3 maximum, N+2 = 8. */
+    public AckJoinTracker() {
+        this(DEFAULT_MAX_FRONTIER_KEYS);
+    }
+
+    /**
+     * A tracker whose frontier maps never hold keys outside the session's logical streams (U1,
+     * 13.19). The driver passes {@link SessionContext#logicalStreamCount()}; invalid stream indices
+     * are rejected rather than growing a frontier map without bound.
+     *
+     * @throws IllegalArgumentException when {@code maxFrontierKeys} is not positive
+     */
+    public AckJoinTracker(int maxFrontierKeys) {
+        if (maxFrontierKeys <= 0) {
+            throw new IllegalArgumentException("max frontier keys");
+        }
+        this.maxFrontierKeys = maxFrontierKeys;
+    }
 
     /** One ack ready for sequencing, with its dependencies in the sender's logical order (13.19). */
     public static final class Ready {
@@ -109,7 +177,8 @@ public final class AckJoinTracker {
      * ack's dependencies at once (13.19).
      */
     public synchronized void coverAssigned(long id, int stream, long sequence) {
-        if (stream < 0 || sequence <= 0) {
+        requireStream(stream);
+        if (sequence <= 0) {
             throw new IllegalArgumentException("coverage");
         }
         require(id).merge(stream, sequence);
@@ -145,7 +214,8 @@ public final class AckJoinTracker {
      * update first.
      */
     public synchronized void assignedPending(long updateToken, int stream, long sequence) {
-        if (stream < 0 || sequence <= 0) {
+        requireStream(stream);
+        if (sequence <= 0) {
             throw new IllegalArgumentException("coverage");
         }
         Set<Long> ids = waiters.remove(updateToken);
@@ -204,6 +274,11 @@ public final class AckJoinTracker {
             return null;
         }
         if (!isScopeReady(id)) {
+            if (expired(value, nowNanos)) {
+                // A past-deadline ack whose scope membership never became ready is dropped here,
+                // counted and retired before returning, so the caller never holds an orphan.
+                drop(id, value);
+            }
             return null;
         }
         if (!value.unassigned.isEmpty()) {
@@ -300,48 +375,64 @@ public final class AckJoinTracker {
     }
 
     /**
-     * Opens a new causal scope and returns its opaque id (U1, 13.19). The id is monotonic per
-     * session and never reused. Throws {@link IllegalStateException} when the cap is exceeded.
+     * Number of retained update tokens: registered and neither assigned nor suppressed yet
+     * (U1, 13.19). Resolved tokens are dropped immediately, so this is the live retention count.
      */
-    public synchronized long openScope() {
-        if (scopes.size() >= MAX_SCOPES) {
-            throw new IllegalStateException("scope cap");
-        }
-        long id = nextScopeId++;
-        scopes.put(id, new Scope(id));
-        return id;
+    public synchronized int retainedTokenCount() {
+        return tokenScope.size();
     }
 
     /**
-     * Registers one update in the live scope, returning its opaque token id (U1, 13.19). The
-     * token is resolved by {@link #assignScopeToken} or {@link #suppressScopeToken}. Throws for an
-     * unknown or completed scope.
+     * Opens a new causal scope and returns its opaque handle (U1, 13.19). The id is monotonic per
+     * tracker and never reused; the handle carries this tracker's owner identity. Throws
+     * {@link CapacityException} when the cap is exceeded.
      */
-    public synchronized long registerUpdate(long scopeId) {
-        Scope scope = scopes.get(scopeId);
-        if (scope == null) {
+    public synchronized MultistreamSession.CausalScope openScope() {
+        if (scopes.size() >= MAX_SCOPES) {
+            throw new CapacityException("scope cap");
+        }
+        long id = nextScopeId++;
+        scopes.put(id, new Scope(id));
+        return new MultistreamSession.CausalScope(identity, id);
+    }
+
+    /**
+     * Registers one update in the live scope, returning its opaque token handle (U1, 13.19). The
+     * token is resolved by {@link #assignScopeToken} or {@link #suppressScopeToken}. Throws for an
+     * unknown, foreign or completed scope, and {@link CapacityException} when the per-scope token
+     * cap is reached.
+     */
+    public synchronized MultistreamSession.UpdateToken registerUpdate(MultistreamSession.CausalScope scope) {
+        long scopeId = scopeIdOf(scope);
+        Scope value = scopes.get(scopeId);
+        if (value == null) {
             throw new IllegalArgumentException("unknown scope");
         }
-        if (scope.complete) {
+        if (value.complete) {
             throw new IllegalArgumentException("scope complete");
         }
+        if (value.unresolved.size() >= MAX_TOKENS_PER_SCOPE) {
+            throw new CapacityException("scope token cap");
+        }
         long token = nextTokenId++;
-        scope.tokens.add(token);
-        scope.unresolved.add(token);
+        value.unresolved.add(token);
         tokenScope.put(token, scopeId);
-        return token;
+        return new MultistreamSession.UpdateToken(identity, token);
     }
 
     /**
      * Resolves a scope token by assignment to {@code stream/sequence} (U1, 13.19). The token's
      * frontier is merged into its scope. Throws for an unknown, retired or already-resolved token,
-     * or for a completed scope: assigned updates can never later be suppressed.
+     * for a completed scope, or for a stream outside the session's logical streams: assigned
+     * updates can never later be suppressed.
      */
-    public synchronized void assignScopeToken(long tokenId, int stream, long sequence) {
-        if (stream < 0 || sequence <= 0) {
+    public synchronized void assignScopeToken(MultistreamSession.UpdateToken tokenId, int stream, long sequence) {
+        requireStream(stream);
+        if (sequence <= 0) {
             throw new IllegalArgumentException("coverage");
         }
-        Long scopeId = tokenScope.get(tokenId);
+        long token = tokenIdOf(tokenId);
+        Long scopeId = tokenScope.get(token);
         if (scopeId == null) {
             throw new IllegalArgumentException("unknown token");
         }
@@ -352,9 +443,11 @@ public final class AckJoinTracker {
         if (scope.complete) {
             throw new IllegalArgumentException("scope complete");
         }
-        if (!scope.unresolved.remove(tokenId)) {
+        if (!scope.unresolved.remove(token)) {
             throw new IllegalArgumentException("token already resolved");
         }
+        // The token's identity is consumed: it is not retained by the tracker any more.
+        tokenScope.remove(token);
         scope.merge(stream, sequence);
     }
 
@@ -363,8 +456,9 @@ public final class AckJoinTracker {
      * awaited (U1, 13.19). Throws for an unknown, retired or already-resolved token, or for a
      * completed scope. Suppression is valid only for genuinely unassigned tokens.
      */
-    public synchronized void suppressScopeToken(long tokenId) {
-        Long scopeId = tokenScope.get(tokenId);
+    public synchronized void suppressScopeToken(MultistreamSession.UpdateToken tokenId) {
+        long token = tokenIdOf(tokenId);
+        Long scopeId = tokenScope.get(token);
         if (scopeId == null) {
             throw new IllegalArgumentException("unknown token");
         }
@@ -375,9 +469,11 @@ public final class AckJoinTracker {
         if (scope.complete) {
             throw new IllegalArgumentException("scope complete");
         }
-        if (!scope.unresolved.remove(tokenId)) {
+        if (!scope.unresolved.remove(token)) {
             throw new IllegalArgumentException("token already resolved");
         }
+        // The token's identity is consumed: it is not retained by the tracker any more.
+        tokenScope.remove(token);
     }
 
     /**
@@ -385,8 +481,8 @@ public final class AckJoinTracker {
      * Throws if any registered token is still unresolved; afterwards neither registration nor
      * assignment is legal for that scope.
      */
-    public synchronized void completeScope(long scopeId) {
-        Scope scope = scopes.get(scopeId);
+    public synchronized void completeScope(MultistreamSession.CausalScope scopeId) {
+        Scope scope = scopes.get(scopeIdOf(scopeId));
         if (scope == null) {
             throw new IllegalArgumentException("unknown scope");
         }
@@ -401,14 +497,19 @@ public final class AckJoinTracker {
 
     /**
      * Registers a live or completed scope as covering a pending ack (U1, 13.19). The scope retains
-     * its assigned frontier. A duplicate cover is a no-op. Throws for an unknown ack or scope.
+     * its assigned frontier. A duplicate cover is a no-op. Throws for an unknown ack or scope, for
+     * a foreign scope handle, and once the ack's membership is sealed.
      */
-    public synchronized void coverScope(long ackId, long scopeId) {
+    public synchronized void coverScope(long ackId, MultistreamSession.CausalScope scopeId) {
         Pending ack = pending.get(ackId);
         if (ack == null) {
             throw new IllegalArgumentException("unknown ack");
         }
-        Scope scope = scopes.get(scopeId);
+        if (sealedAcks.contains(ackId)) {
+            throw new SealedCoverageException("ack coverage sealed");
+        }
+        long id = scopeIdOf(scopeId);
+        Scope scope = scopes.get(id);
         if (scope == null) {
             throw new IllegalArgumentException("unknown scope");
         }
@@ -418,10 +519,10 @@ public final class AckJoinTracker {
             ackScopes.put(ackId, covered);
         }
         if (covered.size() >= MAX_COVER_PER_ACK) {
-            throw new IllegalStateException("ack scope cap");
+            throw new CapacityException("ack scope cap");
         }
-        if (covered.add(scopeId)) {
-            scopeAcks.computeIfAbsent(scopeId, k -> new HashSet<Long>()).add(ackId);
+        if (covered.add(id)) {
+            scopeAcks.computeIfAbsent(id, k -> new HashSet<Long>()).add(ackId);
         }
     }
 
@@ -507,9 +608,10 @@ public final class AckJoinTracker {
                     scopeAcks.remove(scopeId);
                     Scope scope = scopes.remove(scopeId);
                     if (scope != null) {
-                        for (Long token : scope.tokens) {
+                        for (Long token : scope.unresolved) {
                             tokenScope.remove(token);
                         }
+                        scope.unresolved.clear();
                     }
                 }
             }
@@ -525,6 +627,10 @@ public final class AckJoinTracker {
                 throw new IllegalArgumentException("safe superset");
             }
             for (Record.Dependency dependency : safeSuperset) {
+                requireStream(dependency.streamIndex());
+                if (dependency.sequence() <= 0) {
+                    throw new IllegalArgumentException("coverage");
+                }
                 mergeInto(merged, dependency.streamIndex(), dependency.sequence());
             }
         }
@@ -574,6 +680,29 @@ public final class AckJoinTracker {
         return value;
     }
 
+    /** Rejects a stream index outside this session's logical streams, bounding every frontier map. */
+    private void requireStream(int stream) {
+        if (stream < 0 || stream >= maxFrontierKeys) {
+            throw new IllegalArgumentException("stream index");
+        }
+    }
+
+    /** Resolves a scope handle only when this tracker issued it; foreign handles never alias a local id. */
+    private long scopeIdOf(MultistreamSession.CausalScope scope) {
+        if (scope == null || scope.owner() != identity) {
+            throw new ForeignHandleException("foreign scope handle");
+        }
+        return scope.id();
+    }
+
+    /** Resolves a token handle only when this tracker issued it; foreign handles never alias a local id. */
+    private long tokenIdOf(MultistreamSession.UpdateToken token) {
+        if (token == null || token.owner() != identity) {
+            throw new ForeignHandleException("foreign token handle");
+        }
+        return token.id();
+    }
+
     private static boolean expired(Pending value, long nowNanos) {
         return nowNanos - value.createdNanos >= DEADLINE_NANOS;
     }
@@ -602,7 +731,6 @@ public final class AckJoinTracker {
     private static final class Scope {
         final long id;
         boolean complete;
-        final Set<Long> tokens = new HashSet<Long>();
         final Set<Long> unresolved = new HashSet<Long>();
         final TreeMap<Integer, Long> frontier = new TreeMap<Integer, Long>();
 

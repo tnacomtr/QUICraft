@@ -6,10 +6,13 @@ import java.util.TreeMap;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
+import rs.sudoe.quicraft.core.multistream.MultistreamSession.CausalScope;
+import rs.sudoe.quicraft.core.multistream.MultistreamSession.UpdateToken;
+
 /**
  * Causal-scope STATE and API CONTRACT tests for {@link AckJoinTracker} (U1, docs/protocol.md
- * 13.19). Deterministic: the tracker is exercised in isolation with opaque long ids,
- * mirroring the driver-side delegation path.
+ * 13.19). Deterministic: the tracker is exercised in isolation with its opaque handles, mirroring
+ * the driver-side delegation path.
  */
 class CausalScopeTest {
 
@@ -33,7 +36,7 @@ class CausalScopeTest {
     @Test void emptyButOpenScopeBlocksTake() {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 4, 0));
-        long scope = acks.openScope();
+        CausalScope scope = acks.openScope();
         acks.coverScope(1, scope);
         assertNull(acks.take(1, 1, 0, null), "sealed membership required");
         acks.sealAckCoverage(1);
@@ -47,8 +50,8 @@ class CausalScopeTest {
     // 2. Late registration after completion must fail.
     @Test void lateRegisterAfterCompleteFails() {
         AckJoinTracker acks = new AckJoinTracker();
-        long scope = acks.openScope();
-        long token = acks.registerUpdate(scope);
+        CausalScope scope = acks.openScope();
+        UpdateToken token = acks.registerUpdate(scope);
         acks.suppressScopeToken(token);
         acks.completeScope(scope);
         assertThrows(IllegalArgumentException.class, () -> acks.registerUpdate(scope),
@@ -59,10 +62,10 @@ class CausalScopeTest {
     @Test void multipleScopesMergedIntoAck() {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 8, 5));
-        long s1 = acks.openScope();
-        long s2 = acks.openScope();
-        long t1 = acks.registerUpdate(s1);
-        long t2 = acks.registerUpdate(s2);
+        CausalScope s1 = acks.openScope();
+        CausalScope s2 = acks.openScope();
+        UpdateToken t1 = acks.registerUpdate(s1);
+        UpdateToken t2 = acks.registerUpdate(s2);
         acks.assignScopeToken(t1, 2, 10);
         acks.assignScopeToken(t2, 3, 20);
         acks.completeScope(s1);
@@ -77,24 +80,27 @@ class CausalScopeTest {
         assertEquals(0, acks.scopeCount(), "both scopes retired after ack resolution");
     }
 
-    // 4. Duplicate / foreign / stale tokens.
+    // 4. Duplicate / foreign / stale handles.
     @Test void duplicateForeignStaleTokensRejected() {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 4, 0));
-        long scope = acks.openScope();
+        CausalScope scope = acks.openScope();
         acks.coverScope(1, scope);
         // duplicate coverScope is a no-op, not an error
         acks.coverScope(1, scope);
-        // foreign scope id
-        assertThrows(IllegalArgumentException.class, () -> acks.coverScope(1, 99_999L));
-        // foreign token id for assignment
-        assertThrows(IllegalArgumentException.class, () -> acks.assignScopeToken(99_999L, 2, 1));
-        long token = acks.registerUpdate(scope);
+        // foreign scope and token handles: another tracker's local ids start at the same values
+        AckJoinTracker other = new AckJoinTracker();
+        CausalScope foreignScope = other.openScope();
+        UpdateToken foreignToken = other.registerUpdate(foreignScope);
+        assertThrows(AckJoinTracker.ForeignHandleException.class, () -> acks.coverScope(1, foreignScope));
+        assertThrows(AckJoinTracker.ForeignHandleException.class,
+                () -> acks.assignScopeToken(foreignToken, 2, 1));
+        UpdateToken token = acks.registerUpdate(scope);
         acks.assignScopeToken(token, 2, 5);
         // stale: token already resolved
         assertThrows(IllegalArgumentException.class, () -> acks.assignScopeToken(token, 2, 6));
         // stale: token already suppressed
-        long t2 = acks.registerUpdate(scope);
+        UpdateToken t2 = acks.registerUpdate(scope);
         acks.suppressScopeToken(t2);
         assertThrows(IllegalArgumentException.class, () -> acks.suppressScopeToken(t2));
     }
@@ -103,9 +109,9 @@ class CausalScopeTest {
     @Test void suppressionRemovesFromCoverage() {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 4, 5));
-        long scope = acks.openScope();
-        long t1 = acks.registerUpdate(scope);
-        long t2 = acks.registerUpdate(scope);
+        CausalScope scope = acks.openScope();
+        UpdateToken t1 = acks.registerUpdate(scope);
+        UpdateToken t2 = acks.registerUpdate(scope);
         acks.assignScopeToken(t1, 2, 10);
         acks.suppressScopeToken(t2);
         acks.completeScope(scope);
@@ -122,8 +128,8 @@ class CausalScopeTest {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 4, 0));
         assertTrue(acks.create(2, 4, 0));
-        long scope = acks.openScope();
-        long token = acks.registerUpdate(scope);
+        CausalScope scope = acks.openScope();
+        UpdateToken token = acks.registerUpdate(scope);
         acks.assignScopeToken(token, 2, 7);
         acks.completeScope(scope);
         acks.coverScope(1, scope);
@@ -144,8 +150,8 @@ class CausalScopeTest {
     @Test void sealedVsUnsealedCoverage() {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 4, 5));
-        long scope = acks.openScope();
-        long token = acks.registerUpdate(scope);
+        CausalScope scope = acks.openScope();
+        UpdateToken token = acks.registerUpdate(scope);
         acks.assignScopeToken(token, 2, 3);
         acks.completeScope(scope);
         acks.coverScope(1, scope);
@@ -164,7 +170,7 @@ class CausalScopeTest {
         // Under the OLD code (no scope gating), take() would have returned this ack
         // immediately because pending.unassigned was empty. The scope-gating check
         // makes take() return null when coverage is not sealed and complete.
-        long scope = acks.openScope();
+        CausalScope scope = acks.openScope();
         acks.coverScope(1, scope);
         assertNull(acks.take(1, 0, 0, null),
                 "old code would have resolved on empty pending; new code must not");
@@ -176,35 +182,54 @@ class CausalScopeTest {
         assertNotNull(acks.take(1, 0, 0, null), "sealed + complete resolves");
     }
 
-    // 9. Overflow rejection: MAX_SCOPES exceeded.
+    // 9. Overflow rejection: MAX_SCOPES exceeded with a typed capacity failure (Defect 3).
     @Test void scopeCapRejects() {
         AckJoinTracker acks = new AckJoinTracker();
         for (int i = 0; i < AckJoinTracker.MAX_SCOPES; i++) {
-            acks.openScope();
+            assertNotNull(acks.openScope());
         }
-        assertThrows(IllegalStateException.class, () -> acks.openScope(),
-                "MAX_SCOPES exceeded must throw, not silently evict");
+        assertThrows(AckJoinTracker.CapacityException.class, acks::openScope,
+                "MAX_SCOPES exceeded must throw the typed capacity failure, not silently evict");
         assertEquals(AckJoinTracker.MAX_SCOPES, acks.scopeCount());
     }
 
-    // 10. Foreign-session rejection: tokens/scopes from another session are rejected.
-    @Test void foreignTokenRejected() {
-        AckJoinTracker acks = new AckJoinTracker();
-        assertThrows(IllegalArgumentException.class,
-                () -> acks.assignScopeToken(1L, 2, 1),
-                "token 1L was never registered in this session");
-        assertThrows(IllegalArgumentException.class,
-                () -> acks.suppressScopeToken(1L));
-        assertThrows(IllegalArgumentException.class,
-                () -> acks.coverScope(1L, 1L),
-                "foreign ack and foreign scope both rejected");
+    // 10. Foreign-session rejection: two trackers whose local ids both start at 1 (Defect 2).
+    @Test void foreignTrackerHandlesRejected() {
+        AckJoinTracker a = new AckJoinTracker();
+        AckJoinTracker b = new AckJoinTracker();
+        assertTrue(a.create(1, 4, 0));
+        assertTrue(b.create(1, 4, 0));
+        CausalScope scopeA = a.openScope();
+        CausalScope scopeB = b.openScope();
+        UpdateToken tokenA = a.registerUpdate(scopeA);
+        UpdateToken tokenB = b.registerUpdate(scopeB);
+        // The local id spaces collide by construction.
+        assertEquals(1, scopeA.id());
+        assertEquals(1, scopeB.id());
+        assertEquals(1, tokenA.id());
+        assertEquals(1, tokenB.id());
+        // Owner identity keeps the handles distinct and rejects cross-tracker use.
+        assertNotEquals(scopeA, scopeB, "handles from different trackers are never equal");
+        assertNotEquals(tokenA, tokenB, "tokens from different trackers are never equal");
+        assertThrows(AckJoinTracker.ForeignHandleException.class, () -> b.coverScope(1, scopeA));
+        assertThrows(AckJoinTracker.ForeignHandleException.class, () -> b.assignScopeToken(tokenA, 2, 1));
+        assertThrows(AckJoinTracker.ForeignHandleException.class, () -> b.suppressScopeToken(tokenA));
+        assertThrows(AckJoinTracker.ForeignHandleException.class, () -> b.completeScope(scopeA));
+        assertThrows(AckJoinTracker.ForeignHandleException.class, () -> a.coverScope(1, scopeB));
+        // The owning tracker still resolves its own handles normally.
+        a.assignScopeToken(tokenA, 2, 5);
+        a.completeScope(scopeA);
+        a.coverScope(1, scopeA);
+        a.sealAckCoverage(1);
+        assertNotNull(a.take(1, 1, 0, null));
+        assertEquals(0, a.scopeCount());
     }
 
     // 11. completeScope with an unresolved registered token must throw.
     @Test void completeWithUnresolvedThrows() {
         AckJoinTracker acks = new AckJoinTracker();
-        long scope = acks.openScope();
-        long t1 = acks.registerUpdate(scope); // unresolved
+        CausalScope scope = acks.openScope();
+        UpdateToken t1 = acks.registerUpdate(scope); // unresolved
         assertThrows(IllegalArgumentException.class, () -> acks.completeScope(scope),
                 "completion with unresolved tokens must throw");
         // Resolve the token, then completion succeeds
@@ -222,8 +247,8 @@ class CausalScopeTest {
     @Test void unsealedAckStaysPendingAcrossRepeatedTake() {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 4, 0));
-        long scope = acks.openScope();
-        long token = acks.registerUpdate(scope);
+        CausalScope scope = acks.openScope();
+        UpdateToken token = acks.registerUpdate(scope);
         acks.assignScopeToken(token, 2, 5);
         acks.completeScope(scope);
         acks.coverScope(1, scope);
@@ -241,7 +266,7 @@ class CausalScopeTest {
     @Test void expiredScopedAckIsDropped() {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 4, 100));
-        long scope = acks.openScope();
+        CausalScope scope = acks.openScope();
         acks.coverScope(1, scope);
         assertNull(acks.take(1, 99, 0, null));
         assertEquals(1, acks.pendingCount());
@@ -256,7 +281,7 @@ class CausalScopeTest {
     @Test void transitionDropsUnsealedAcksAndClearsScopes() {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 4, 0));
-        long scope = acks.openScope();
+        CausalScope scope = acks.openScope();
         acks.coverScope(1, scope);
         acks.sealAckCoverage(1);
         java.util.List<AckJoinTracker.Ready> settled = acks.settleForTransition(0, null);
@@ -268,8 +293,8 @@ class CausalScopeTest {
     // 15. Session lifecycle (closeScopes) invalidates all handles; new allocation works.
     @Test void closeScopesInvalidatesHandles() {
         AckJoinTracker acks = new AckJoinTracker();
-        long scope = acks.openScope();
-        long token = acks.registerUpdate(scope);
+        CausalScope scope = acks.openScope();
+        UpdateToken token = acks.registerUpdate(scope);
         acks.closeScopes();
         assertThrows(IllegalArgumentException.class, () -> acks.registerUpdate(scope),
                 "retired scope rejects registration");
@@ -278,20 +303,110 @@ class CausalScopeTest {
         assertThrows(IllegalArgumentException.class, () -> acks.completeScope(scope),
                 "retired scope rejects completion");
         // New scope after closeScopes: allocation works, IDs are monotonic (not reused)
-        long fresh = acks.openScope();
-        assertEquals(scope + 1, fresh, "IDs are monotonic, never reused");
+        CausalScope fresh = acks.openScope();
+        assertEquals(scope.id() + 1, fresh.id(), "IDs are monotonic, never reused");
     }
 
     // 16. Assigned token can never later be suppressed; completion after assignment works.
     @Test void assignedTokenCannotBeSuppressed() {
         AckJoinTracker acks = new AckJoinTracker();
-        long scope = acks.openScope();
-        long token = acks.registerUpdate(scope);
+        CausalScope scope = acks.openScope();
+        UpdateToken token = acks.registerUpdate(scope);
         acks.assignScopeToken(token, 2, 4);
         assertThrows(IllegalArgumentException.class, () -> acks.suppressScopeToken(token),
                 "assigned token cannot be suppressed");
         acks.completeScope(scope);
         assertThrows(IllegalArgumentException.class, () -> acks.registerUpdate(scope),
                 "registration after completion throws");
+    }
+
+    // 17. Sealing is final: no scope may join afterwards, while resealing is idempotent (Defect 1).
+    @Test void sealIsFinalAndDoubleSealIdempotent() {
+        AckJoinTracker acks = new AckJoinTracker();
+        assertTrue(acks.create(1, 4, 0));
+        CausalScope first = acks.openScope();
+        CausalScope late = acks.openScope();
+        acks.coverScope(1, first);
+        acks.sealAckCoverage(1);
+        acks.sealAckCoverage(1);
+        assertThrows(AckJoinTracker.SealedCoverageException.class, () -> acks.coverScope(1, late),
+                "membership is final once sealed");
+        // The sealed membership still resolves normally.
+        acks.completeScope(first);
+        assertNotNull(acks.take(1, 1, 0, null));
+        assertThrows(IllegalArgumentException.class, () -> acks.sealAckCoverage(99),
+                "sealing an unknown ack is still rejected");
+    }
+
+    // 18. Resolved and suppressed tokens release their retention immediately (Defect 3).
+    @Test void resolvedTokensAreDroppedImmediately() {
+        AckJoinTracker acks = new AckJoinTracker();
+        CausalScope scope = acks.openScope();
+        UpdateToken assigned = acks.registerUpdate(scope);
+        UpdateToken suppressed = acks.registerUpdate(scope);
+        assertEquals(2, acks.retainedTokenCount());
+        acks.assignScopeToken(assigned, 2, 5);
+        assertEquals(1, acks.retainedTokenCount(), "an assigned token is not retained");
+        acks.suppressScopeToken(suppressed);
+        assertEquals(0, acks.retainedTokenCount(), "a suppressed token is not retained");
+        // Neither token resolves a second time: its identity left the live token space.
+        assertThrows(IllegalArgumentException.class, () -> acks.assignScopeToken(assigned, 2, 6));
+        assertThrows(IllegalArgumentException.class, () -> acks.suppressScopeToken(suppressed));
+        acks.completeScope(scope);
+    }
+
+    // 19. Per-scope token cap with a typed failure; resolving frees capacity (Defect 3).
+    @Test void tokenCapRejects() {
+        AckJoinTracker acks = new AckJoinTracker();
+        CausalScope scope = acks.openScope();
+        UpdateToken first = null;
+        for (int i = 0; i < AckJoinTracker.MAX_TOKENS_PER_SCOPE; i++) {
+            UpdateToken token = acks.registerUpdate(scope);
+            if (first == null) {
+                first = token;
+            }
+        }
+        assertEquals(AckJoinTracker.MAX_TOKENS_PER_SCOPE, acks.retainedTokenCount());
+        assertThrows(AckJoinTracker.CapacityException.class, () -> acks.registerUpdate(scope),
+                "the per-scope token cap is a typed capacity failure");
+        // Releasing a token frees capacity; nothing is silently evicted.
+        acks.assignScopeToken(first, 2, 1);
+        assertNotNull(acks.registerUpdate(scope));
+        assertEquals(AckJoinTracker.MAX_TOKENS_PER_SCOPE, acks.retainedTokenCount());
+    }
+
+    // 20. Frontier keys are bounded by the session's logical stream count (Defect 3).
+    @Test void frontierKeysAreBounded() {
+        AckJoinTracker acks = new AckJoinTracker(2);
+        CausalScope scope = acks.openScope();
+        UpdateToken token = acks.registerUpdate(scope);
+        assertThrows(IllegalArgumentException.class, () -> acks.assignScopeToken(token, 2, 1),
+                "stream 2 is outside a two-stream session");
+        acks.assignScopeToken(token, 1, 1);
+        UpdateToken second = acks.registerUpdate(scope);
+        assertThrows(IllegalArgumentException.class, () -> acks.assignScopeToken(second, 8, 1),
+                "an arbitrary stream index never grows a frontier map");
+        assertTrue(acks.create(1, 4, 0));
+        assertThrows(IllegalArgumentException.class, () -> acks.coverAssigned(1, 2, 1),
+                "ack frontiers are bounded by the same stream count");
+    }
+
+    // 21. Expiry of a scope-unready ack drops, counts and retires before returning (Defect 4).
+    @Test void expiryOfScopeUnreadyAckDropsTrackerState() {
+        AckJoinTracker acks = new AckJoinTracker();
+        assertTrue(acks.create(1, 4, 100));
+        CausalScope scope = acks.openScope();
+        UpdateToken token = acks.registerUpdate(scope);
+        acks.coverScope(1, scope);
+        acks.sealAckCoverage(1);
+        long deadline = 100 + AckJoinTracker.DEADLINE_NANOS;
+        assertNull(acks.take(1, deadline, 0, null),
+                "a past-deadline ack with an incomplete scope never resolves");
+        assertEquals(0, acks.pendingCount(), "the tracker dropped the orphan");
+        assertEquals(1, acks.droppedCount(), "the drop is counted");
+        assertEquals(0, acks.scopeCount(), "the scope is retired");
+        assertEquals(0, acks.retainedTokenCount(), "the unresolved token is released");
+        assertThrows(IllegalArgumentException.class, () -> acks.assignScopeToken(token, 2, 1),
+                "a token of a retired scope is no longer usable");
     }
 }

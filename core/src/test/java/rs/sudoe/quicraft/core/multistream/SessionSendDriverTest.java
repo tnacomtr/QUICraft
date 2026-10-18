@@ -875,6 +875,94 @@ class SessionSendDriverTest {
                 InetAddress.getLoopbackAddress(), null, now::get, 86, 14, TEST_SLICE));
     }
 
+    /**
+     * A scoped ack resolves once its covering scope is complete and sealed, and the scope is retired
+     * after the ack is sequenced (U1, 13.19). Verifies the driver delegates all scope state to the tracker.
+     */
+    @Test
+    void scopedAckResolvesAndRetiresScopeAfterSeal() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(1, frame(2).frame(), 8));
+        MultistreamSession.CausalScope scope = driver.openScope();
+        assertNotNull(scope, "scope handle allocated");
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        assertNotNull(token, "token handle allocated");
+        SentPacket covered = driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        driver.assignScopeToken(token, covered.logicalStream(), covered.sequence());
+        driver.completeScope(scope);
+        driver.coverScope(1, scope);
+        driver.sealAckCoverage(1);
+        SentPacket join = driver.takeAck(1);
+        assertNotNull(join, "sealed + complete scope resolves the ack");
+        assertTrue(join.isAssigned());
+        assertEquals(0, driver.trackerScopeCount(), "scope retired after ack resolution");
+        driver.close();
+    }
+
+    /**
+     * A past-deadline scoped ack with an incomplete scope is dropped consistently by both the tracker
+     * and the driver (Defect 4): takeAck must not orphan the ack, its scope and its tokens in the
+     * tracker after the driver drops its charge.
+     */
+    @Test
+    void expiredScopedAckDropsDriverChargeAndTrackerState() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(1, frame(2).frame(), 8));
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        assertNotNull(token, "token handle allocated");
+        // Do NOT resolve the token or complete the scope: the ack is not scope-ready.
+        driver.coverScope(1, scope);
+        driver.sealAckCoverage(1);
+        int queuedBefore = driver.queuedRecords();
+        assertTrue(queuedBefore > 0, "the ack is queued from creation");
+        assertEquals(1, driver.trackerRetainedTokens(), "one live token before expiry");
+        // Advance the clock past the deadline so the ack is expired.
+        rig.now.addAndGet(AckJoinTracker.DEADLINE_NANOS + 1);
+        assertNull(driver.takeAck(1), "a past-deadline scope-unready ack never resolves");
+        // The tracker dropped the ack and retired scope state (Defect 4).
+        assertEquals(0, driver.trackerScopeCount(), "tracker retired the scope");
+        assertEquals(0, driver.trackerRetainedTokens(), "tracker dropped live tokens");
+        // The driver dropped its charge and freed the queue slot.
+        assertEquals(queuedBefore - 1, driver.queuedRecords(), "driver freed the ack's slot");
+        driver.close();
+    }
+
+    /** A scope-capacity failure is a typed tracker failure that the driver maps to a local 0x12 close. */
+    @Test
+    void scopeCapacityClosesWithResourceCode() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        for (int i = 0; i < AckJoinTracker.MAX_SCOPES; i++) {
+            assertNotNull(driver.openScope());
+        }
+        assertNull(driver.openScope(), "the cap refuses the next scope");
+        assertTrue(driver.isClosed(), "a capacity failure closes locally instead of throwing");
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertTrue(driver.closeCause() instanceof AckJoinTracker.CapacityException,
+                "the original typed cause is retained, not masked");
+        driver.close();
+    }
+
+    /** The per-scope token cap maps the same way: local 0x12, typed cause retained, no throw. */
+    @Test
+    void tokenCapacityClosesWithResourceCode() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.CausalScope scope = driver.openScope();
+        for (int i = 0; i < AckJoinTracker.MAX_TOKENS_PER_SCOPE; i++) {
+            assertNotNull(driver.registerUpdate(scope));
+        }
+        assertNull(driver.registerUpdate(scope), "the cap refuses the next token");
+        assertTrue(driver.isClosed(), "a capacity failure closes locally instead of throwing");
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertTrue(driver.closeCause() instanceof AckJoinTracker.CapacityException,
+                "the original typed cause is retained, not masked");
+        driver.close();
+    }
+
     /** Polls every selectable slice without releasing any, collecting them in write order. */
     private static void pollAll(SessionSendDriver driver, List<SessionSendDriver.Write> into) {
         SessionSendDriver.Write write;

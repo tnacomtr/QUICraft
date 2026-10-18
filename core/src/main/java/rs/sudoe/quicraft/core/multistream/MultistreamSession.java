@@ -195,13 +195,17 @@ public interface MultistreamSession {
     }
 
     /**
-     * Opaque handle for one causal scope, allocated monotonically by the session and never reused
-     * (U1, 13.19). Carries no game coordinates or prediction numbers; identity is an internal token.
+     * Opaque handle for one causal scope, allocated monotonically by the session's tracker and never
+     * reused (U1, 13.19). Carries no game coordinates or prediction numbers; identity is an internal
+     * token bound to the tracker/session that issued it. Two sessions' local ids may collide, but
+     * their handles never compare equal and a foreign handle is rejected by every operation.
      */
     final class CausalScope {
+        private final Object owner;
         private final long id;
 
-        CausalScope(long id) {
+        CausalScope(Object owner, long id) {
+            this.owner = owner;
             this.id = id;
         }
 
@@ -209,14 +213,25 @@ public interface MultistreamSession {
             return id;
         }
 
+        Object owner() {
+            return owner;
+        }
+
         @Override
         public boolean equals(Object o) {
-            return this == o || (o instanceof CausalScope && id == ((CausalScope) o).id);
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof CausalScope)) {
+                return false;
+            }
+            CausalScope other = (CausalScope) o;
+            return id == other.id && owner == other.owner;
         }
 
         @Override
         public int hashCode() {
-            return Long.hashCode(id);
+            return 31 * System.identityHashCode(owner) + Long.hashCode(id);
         }
 
         @Override
@@ -227,13 +242,16 @@ public interface MultistreamSession {
 
     /**
      * Opaque handle for one update registered inside a causal scope (U1, 13.19). Allocated
-     * monotonically per session and never reused. Once resolved by {@link #sendCovered} or
-     * {@link #suppressUpdate} it is consumed and cannot be reused or re-resolved.
+     * monotonically per session's tracker and never reused. Once resolved by {@link #sendCovered}
+     * or {@link #suppressUpdate} it is consumed and cannot be reused or re-resolved. The handle is
+     * bound to its owning tracker/session like {@link CausalScope}.
      */
     final class UpdateToken {
+        private final Object owner;
         private final long id;
 
-        UpdateToken(long id) {
+        UpdateToken(Object owner, long id) {
+            this.owner = owner;
             this.id = id;
         }
 
@@ -241,14 +259,25 @@ public interface MultistreamSession {
             return id;
         }
 
+        Object owner() {
+            return owner;
+        }
+
         @Override
         public boolean equals(Object o) {
-            return this == o || (o instanceof UpdateToken && id == ((UpdateToken) o).id);
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof UpdateToken)) {
+                return false;
+            }
+            UpdateToken other = (UpdateToken) o;
+            return id == other.id && owner == other.owner;
         }
 
         @Override
         public int hashCode() {
-            return Long.hashCode(id);
+            return 31 * System.identityHashCode(owner) + Long.hashCode(id);
         }
 
         @Override
