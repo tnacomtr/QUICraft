@@ -173,6 +173,14 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     /** Where an encoded packet goes: the lane session in production, a recorder in tests. */
     interface LaneSend {
         void send(ProtocolState state, int packetId, byte[] frame);
+
+        /**
+         * With the packet's uncompressed id and body, so a CHUNK route can extract its position (13.8).
+         * The default drops them (a recorder needs no position); production overrides it.
+         */
+        default void send(ProtocolState state, int packetId, byte[] frame, byte[] uncompressed) {
+            send(state, packetId, frame);
+        }
     }
 
     /** Tests: replaces the lane session as the destination of encoded packets. */
@@ -402,6 +410,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             }
             encodedFramesObserved++;
             int packetId = VarInt.read(body.duplicate());
+            byte[] uncompressed = ByteBufUtil.getBytes(body);
             byte[] frame = LaneCodec.frame(channel, body);
             framedFramesObserved++;
             GameLanes current = lanes;
@@ -412,10 +421,10 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                     failActive("send queue overflow", NStreamSession.CLOSE_ORDERING);
                     return;
                 }
-                backlog.add(new QueuedFrame(sendState, packetId, frame, promise));
+                backlog.add(new QueuedFrame(sendState, packetId, frame, uncompressed, promise));
                 backlogBytes += frame.length;
             } else {
-                sendFrame(new QueuedFrame(sendState, packetId, frame, promise));
+                sendFrame(new QueuedFrame(sendState, packetId, frame, uncompressed, promise));
             }
         } catch (Throwable t) {
             promise.tryFailure(t);
@@ -428,7 +437,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     /** Transfers one fully encoded GAME frame to the lane session. */
     private void sendFrame(QueuedFrame queued) {
         try {
-            laneSend.send(queued.state, queued.packetId, queued.frame);
+            laneSend.send(queued.state, queued.packetId, queued.frame, queued.uncompressed);
             queued.promise.trySuccess();
         } catch (Throwable t) {
             queued.promise.tryFailure(t);
@@ -706,7 +715,17 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         GameLanes started = new GameLanes(channel, codec, v3::session, ProtocolState.CONFIGURATION,
                 DeliveryContext.of(pipeline));
         lanes = started;
-        laneSend = (state, id, frame) -> v3.session().send(state, id, frame);
+        laneSend = new LaneSend() {
+            @Override
+            public void send(ProtocolState state, int id, byte[] frame) {
+                v3.session().send(state, id, frame);
+            }
+
+            @Override
+            public void send(ProtocolState state, int id, byte[] frame, byte[] uncompressed) {
+                v3.session().send(state, id, frame, uncompressed);
+            }
+        };
         // Outbound: the game's own encoder runs (with everything in front of it); its output is taken
         // right behind it and sent as a record. Held writes wait at the tail while the lanes are full.
         String encoderName = pipeline.get("encoder") != null ? "encoder" : "outbound_config";
@@ -914,12 +933,14 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         final ProtocolState state;
         final int packetId;
         final byte[] frame;
+        final byte[] uncompressed;
         final ChannelPromise promise;
 
-        QueuedFrame(ProtocolState state, int packetId, byte[] frame, ChannelPromise promise) {
+        QueuedFrame(ProtocolState state, int packetId, byte[] frame, byte[] uncompressed, ChannelPromise promise) {
             this.state = state;
             this.packetId = packetId;
             this.frame = frame;
+            this.uncompressed = uncompressed;
             this.promise = promise;
         }
     }

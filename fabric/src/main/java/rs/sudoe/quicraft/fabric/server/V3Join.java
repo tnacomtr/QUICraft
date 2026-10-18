@@ -36,6 +36,7 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.binding.BindingDriver;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
+import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
@@ -515,7 +516,7 @@ public final class V3Join {
         @Override
         public void send(ProtocolState packetState, byte[] packet) {
             try {
-                connection.session().send(packetState, FrameCodec.packetId(packet), codec.outboundFrame(packet));
+                submitUncompressed(connection.session(), codec, packetState, packet);
             } catch (java.io.IOException e) {
                 throw new IllegalStateException(e);
             }
@@ -534,6 +535,16 @@ public final class V3Join {
                 throw new IllegalStateException(e);
             }
         }
+    }
+
+    /**
+     * Submits one encoder-written GAME packet (id and body, uncompressed) to the session with its
+     * uncompressed bytes, so a CHUNK route can extract its position (13.8). Without them the session
+     * fails the route closed (0x11). Package-private for the unit test.
+     */
+    static void submitUncompressed(MultistreamSession session, PacketLaneCodec codec, ProtocolState state,
+            byte[] packet) throws java.io.IOException {
+        session.send(state, FrameCodec.packetId(packet), codec.outboundFrame(packet), packet);
     }
 
     /** Gives every byte the join still retains back to the node's budget; safe to call more than once. */
