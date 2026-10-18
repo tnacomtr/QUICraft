@@ -68,6 +68,8 @@ final class RawV3Client {
         volatile boolean outboundCipherRetained;
         /** The inbound AES/CFB8 cipher was still in place when this attempt settled. */
         volatile boolean inboundCipherRetained;
+        /** CLIENT_PROOFs this attempt rewrote to N=1 before submitting them (wrongShardClientProof only). */
+        volatile int rewrittenProofs;
 
         @Override
         public String toString() {
@@ -76,7 +78,8 @@ final class RawV3Client {
                     + closeCause + " failure=" + failure + " negotiatedN=" + negotiatedN + " boundN=" + boundN
                     + " serverOfferN=" + serverOfferN + " clientPort=" + clientPort + " switchSent=" + switchSent
                     + " switchVerified=" + switchVerified + " outboundCipherRetained=" + outboundCipherRetained
-                    + " inboundCipherRetained=" + inboundCipherRetained + " events=" + events;
+                    + " inboundCipherRetained=" + inboundCipherRetained + " rewrittenProofs=" + rewrittenProofs
+                    + " events=" + events;
         }
     }
 
@@ -119,15 +122,24 @@ final class RawV3Client {
     private Cipher encryptOut;
     /** Test only: 0 binds the negotiated N; anything else binds that N regardless of the transport. */
     private final int bindingN;
+    /**
+     * Test only: with this set the client keeps its normal binding and rewrites the single
+     * CLIENT_PROOF it submits to N=1, keeping that proof's original tag, so the server's own N
+     * validation is what the test sees.
+     */
+    private final boolean wrongShardClientProof;
+    /** The proof is rewritten exactly once; later sends go out untouched. */
+    private boolean proofRewritten;
 
     private RawV3Client(V3Connection connection, RoutingTable table, byte[] fingerprint, int playPacketsWanted,
-            boolean online, int bindingN) {
+            boolean online, int bindingN, boolean wrongShardClientProof) {
         this.online = online;
         this.connection = connection;
         this.table = table;
         this.fingerprint = fingerprint;
         this.playPacketsWanted = playPacketsWanted;
         this.bindingN = bindingN;
+        this.wrongShardClientProof = wrongShardClientProof;
     }
 
     static final class Join implements AutoCloseable {
@@ -167,9 +179,21 @@ final class RawV3Client {
      */
     static Join start(InetSocketAddress server, Fingerprint fingerprint, RoutingTable table, int playPacketsWanted,
             boolean online, boolean lenient, int bindingN) throws Exception {
+        return start(server, fingerprint, table, playPacketsWanted, online, lenient, bindingN, false);
+    }
+
+    /**
+     * Starts a join. {@code bindingN} is a test-only override: 0 binds the transport's negotiated
+     * shard count, anything else binds that N regardless of it, to drive a peer N mismatch.
+     * {@code wrongShardClientProof} leaves that binding alone and instead submits one CLIENT_PROOF
+     * whose N field is 1 while its tag stays the one computed for the negotiated N, so the server's
+     * metadata validation runs first (the MAC is never reached).
+     */
+    static Join start(InetSocketAddress server, Fingerprint fingerprint, RoutingTable table, int playPacketsWanted,
+            boolean online, boolean lenient, int bindingN, boolean wrongShardClientProof) throws Exception {
         V3Connection connection = QuicClient.connectV3(server, fingerprint, table, null).get(15, TimeUnit.SECONDS);
         RawV3Client client = new RawV3Client(connection, table, digest(fingerprint), playPacketsWanted, online,
-                bindingN);
+                bindingN, wrongShardClientProof);
         client.result.clientPort = connection.localAddress() == null ? -1 : connection.localAddress().getPort();
         client.lenient = lenient;
         connection.setListener(client.new Listener());
@@ -270,7 +294,7 @@ final class RawV3Client {
                         new BindingDriver.Callbacks() {
                             @Override
                             public void send(byte[] payload) {
-                                RawV3Client.this.send(framed(customPayload(payload)));
+                                RawV3Client.this.send(framed(customPayload(rewriteClientProof(payload))));
                                 connection.flush();
                             }
 
@@ -356,6 +380,32 @@ final class RawV3Client {
             }
         } catch (BindingFormatException ignored) {
             // Not a decodable binding message: the machine rejects it and no N evidence is recorded.
+        }
+    }
+
+    /**
+     * Test only, drives the server's own wrong-N rejection: the client binds the negotiated N
+     * normally, and the one CLIENT_PROOF it submits carries N=1 with the tag the machine computed
+     * for the negotiated N. Only the metadata changes; the client neither recomputes the MAC nor
+     * touches any cipher. That makes this a wrong-N metadata rejection before MAC validation, not a
+     * cryptographically valid N=1 proof.
+     */
+    private byte[] rewriteClientProof(byte[] payload) {
+        if (!wrongShardClientProof || proofRewritten) {
+            return payload;
+        }
+        try {
+            BindingMessage message = BindingMessage.decode(payload);
+            if (message.kind() != BindingKind.CLIENT_PROOF) {
+                return payload;
+            }
+            proofRewritten = true;
+            result.rewrittenProofs++;
+            return BindingMessage.of(message.kind(), message.mode(), message.protocolNumber(), 1,
+                    message.fingerprint(), message.routing(), message.tag()).encode();
+        } catch (BindingFormatException e) {
+            // Not a decodable binding message: the machine rejects it; nothing is rewritten.
+            return payload;
         }
     }
 

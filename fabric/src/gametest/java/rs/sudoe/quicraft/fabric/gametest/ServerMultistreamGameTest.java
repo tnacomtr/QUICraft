@@ -81,9 +81,62 @@ public class ServerMultistreamGameTest implements FabricClientGameTest {
             check(result.boundN == result.negotiatedN, "the raw client bound the negotiated N: " + result);
             check(result.serverOfferN == result.negotiatedN,
                     "the server's OFFER carried the negotiated N: " + result);
-            // 12.7/13.2: a peer that binds a different N fails the exchange before activation. The
-            // offline profile has no cipher to retain, so this case checks the failure and the
-            // absence of activation; the online case checks the cipher retention too.
+            // 12.7/13.2/12.14: the server's own N validation runs before the proof's MAC. The raw
+            // client binds the negotiated N and accepts the OFFER; its one CLIENT_PROOF carries N=1
+            // with the tag the machine computed for the negotiated N, so the server fails the
+            // exchange on wrong-N metadata. Offline has no cipher, so this case asserts the rejection
+            // itself; the online case asserts cipher retention too. This case runs first: the
+            // client-side rejection below leaves a join pending on the server until its deadline,
+            // which must not fall inside this armed observer window.
+            ServerMultistreamOnlineGameTest.armBindingObserver();
+            try {
+                RawV3Client.Result wrongProof;
+                try (RawV3Client.Join join = RawV3Client.start(new InetSocketAddress(InetAddress.getLoopbackAddress(),
+                        ad.port()), ad.fingerprint(), table, 5, false, false, 0, true)) {
+                    for (int tick = 0; tick < 1200 && !join.done.isDone(); tick++) {
+                        context.waitTick();
+                    }
+                    wrongProof = join.result;
+                    for (int tick = 0; tick < 300
+                            && ServerMultistreamOnlineGameTest.bindingObserverEvidence() == null; tick++) {
+                        context.waitTick();
+                    }
+                }
+                QuicraftFabricTestLog.info("offline /3 wrong-proof join: " + wrongProof);
+                // The server picks its preferred 3 inside the client's 1..6 offer, so a real /3
+                // exchange negotiates N=3 here; the case is meaningless if it ever ran on N=1.
+                check(wrongProof.negotiatedN == 3, "the transport negotiated N=3: " + wrongProof);
+                check(wrongProof.boundN == 3, "the client bound the negotiated N=3: " + wrongProof);
+                check(wrongProof.serverOfferN == 3, "the server's OFFER carried N=3: " + wrongProof);
+                check(wrongProof.rewrittenProofs == 1,
+                        "exactly one CLIENT_PROOF was rewritten and submitted, got " + wrongProof.rewrittenProofs);
+                check(!wrongProof.activated, "no activation on the client: " + wrongProof);
+                check(!wrongProof.switchSent && !wrongProof.switchVerified, "no switch ran: " + wrongProof);
+
+                check(ServerMultistreamOnlineGameTest.bindingObserverInvocations() == 1,
+                        "the server's V3Join.fail ran exactly once for the armed attempt, saw "
+                                + ServerMultistreamOnlineGameTest.bindingObserverInvocations());
+                check(!ServerMultistreamOnlineGameTest.bindingObserverDivergentChannel(),
+                        "the observed failure came from a single connection");
+                ServerMultistreamOnlineGameTest.BindingFailureEvidence observed =
+                        ServerMultistreamOnlineGameTest.bindingObserverEvidence();
+                check(observed != null, "the server-side observer captured the armed failure");
+                check(observed.reflectionError == null, "the observer's reflection ran: " + observed);
+                check(observed.onChannelEventLoop, "the failure ran on the channel's event loop: " + observed);
+                check(observed.remotePort == wrongProof.clientPort && wrongProof.clientPort > 0,
+                        "the observed failure is this attempt's connection: " + observed + " vs client port "
+                                + wrongProof.clientPort);
+                check(observed.reason != null && observed.reason.contains("WRONG_SHARD_COUNT"),
+                        "the server rejected the wrong N itself: " + observed);
+                check(observed.reason != null && !observed.reason.contains("deadline"),
+                        "the rejection is not the activation deadline: " + observed);
+                QuicraftFabricTestLog.info("offline /3 wrong-proof server evidence: " + observed);
+            } finally {
+                ServerMultistreamOnlineGameTest.clearBindingObserver();
+            }
+            // The reciprocal direction, last: here the client rejects the server's OFFER locally and
+            // no proof ever reaches the server. Offline there is no cipher to retain, so this case
+            // checks only that the exchange failed and nothing activated.
             RawV3Client.Result mismatch;
             try (RawV3Client.Join join = RawV3Client.start(new InetSocketAddress(InetAddress.getLoopbackAddress(),
                     ad.port()), ad.fingerprint(), table, 5, false, false, 1)) {
