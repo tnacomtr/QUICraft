@@ -1108,6 +1108,37 @@ class SessionSendDriverTest {
         assertEquals(0.0, timestamped.score(owner, now.get()), "no registration was acquired");
     }
 
+    /**
+     * A duplicate construction under an owner key already in use must not touch that owner's ledger. The existing
+     * driver keeps its slice charge and its queued request; only the failed constructor's own acquisition may be
+     * unwound (Sol rollback finding).
+     */
+    @Test
+    void duplicateConstructionPreservesTheExistingDriversLedger() throws Exception {
+        final AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 4096, ranking.view(now::get));
+        Object owner = new Object();
+        InetAddress ip = InetAddress.getLoopbackAddress();
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1024, 1L << 40, 4, 4, 4);
+        SessionSendDriver existing = new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner, ip,
+                null, now::get, 64, 64, 2048);
+        assertEquals(2048, pool.reserved(owner), "the existing driver holds its slice");
+        // A record beyond the owner's free bytes waits, so the existing driver also owns a queued request.
+        assertTrue(existing.submit(frame(3000), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertEquals(1, pool.waitingCount(), "the existing driver's record waits");
+
+        // The same owner key cannot register twice; the failed construction owns neither the slice nor a request.
+        assertThrows(IllegalStateException.class, () -> new SessionSendDriver(SessionContext.of(2), profile, pool,
+                ranking, owner, ip, null, now::get, 64, 64, 32));
+        assertEquals(2048, pool.reserved(owner), "the existing driver's slice stays charged");
+        assertEquals(1, pool.waitingCount(), "the existing driver's queued request keeps its place");
+        existing.close();
+        assertEquals(0, pool.reserved(owner), "the owner's own close ends its ledger");
+        assertEquals(0, pool.waitingCount());
+    }
+
     /** A constructor failure after its connect unwinds the registration and every charge the driver took. */
     @Test
     void driverConstructorRollsBackAfterASuccessfulConnect() throws Exception {
@@ -1127,7 +1158,10 @@ class SessionSendDriverTest {
                 new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner, ip, null, () -> 0,
                         64, 64, 32, false, SessionResources.Accounting.CUMULATIVE));
         assertEquals(0, failure.getSuppressed().length, "the cleanup succeeded and masked nothing");
-        assertEquals(0, pool.reserved(owner), "the pool, the realtime slice and the waiting request are all unwound");
+        // This reservation predates the failed constructor. It belongs to an existing holder of the same owner
+        // key, so the rollback must leave it charged; releasing all owner bytes here erased another driver's
+        // ledger (Sol rollback finding). Only the slice this constructor was granted is ever returned.
+        assertEquals(4096, pool.reserved(owner), "the reservation that predates this constructor is untouched");
         // The registration is gone: a fresh cumulative connect succeeds from the cleanup's committed reading.
         scripted.reading(20_000_000_000L, 5_000_000_000L, true);
         scripted.reading(30_000_000_000L, 5_000_000_000L, true);
@@ -1155,7 +1189,8 @@ class SessionSendDriverTest {
                         64, 64, 32, false, SessionResources.Accounting.CUMULATIVE));
         assertEquals(1, failure.getSuppressed().length, "the cleanup failure is attached, not substituted");
         assertTrue(failure.getSuppressed()[0] instanceof StallClock.UnavailableException);
-        assertEquals(0, pool.reserved(owner), "the pool release ran before the failing cleanup disconnect");
+        assertEquals(4096, pool.reserved(owner),
+                "the pre-existing reservation is untouched even when the cleanup itself fails");
         // The malformed cleanup released nothing: a coherent reading still unregisters the connection.
         scripted.reading(10_000_000_000L, 5_000_000_000L, true);
         ranking.disconnect(owner);

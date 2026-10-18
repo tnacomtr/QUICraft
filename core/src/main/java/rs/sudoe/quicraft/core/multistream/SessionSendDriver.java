@@ -355,10 +355,13 @@ public final class SessionSendDriver {
             // The slice is the first ticket of this owner, requested before any record (13.12).
             request(slice);
         } catch (RuntimeException | Error failure) {
-            // Unwind exactly what was acquired: the ranking registration and any charge the slice request took.
             final boolean connected = registered;
+            // Unwind only what this constructor itself acquired: its ranking registration and its slice charge.
+            // Never OutboundPool.cancel(owner): a duplicate construction under an owner key that is already in
+            // use reaches this handler while an existing driver holds reservations and queued requests there,
+            // and cancel would release and drop all of them.
             try {
-                ReceiveCleanup.run(() -> pool.cancel(owner), () -> {
+                ReceiveCleanup.run(this::releaseSliceAcquisition, () -> {
                     if (connected) {
                         disconnectRanking();
                     }
@@ -368,6 +371,23 @@ public final class SessionSendDriver {
             }
             throw failure;
         }
+    }
+
+    /**
+     * Returns exactly the REALTIME slice this constructor acquired, if any: the charge it took, or a grant that
+     * landed after its refused request. It touches nothing else of the owner's ledger, so a failed construction
+     * never erases reservations that predate it. A refused slice that was never granted holds no bytes and keeps
+     * its FIFO place; the owner's own close drops that wait with the rest of the owner's ledger.
+     */
+    private void releaseSliceAcquisition() {
+        if (!slice.requested) {
+            return;
+        }
+        if (!slice.granted && !pool.takeGrant(slice.ticket)) {
+            return;
+        }
+        slice.granted = false;
+        pool.release(owner, slice.bytes);
     }
 
     /** Registers this connection with the ranking, timestamped in LEGACY and cumulative otherwise. */
