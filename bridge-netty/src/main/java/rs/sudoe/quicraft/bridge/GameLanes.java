@@ -260,6 +260,43 @@ public final class GameLanes implements LaneGame {
         default SentPacket finishBatch(long batchId, OutboundPacket join) {
             throw new UnsupportedOperationException("finishBatch");
         }
+
+        // Additive causal-scope passthroughs (U1/U2, 13.19), mirroring MultistreamSession. The
+        // defaults fail closed, so a session that cannot track causality never accepts a scope.
+
+        default MultistreamSession.CausalScope openScope() {
+            throw new UnsupportedOperationException("openScope");
+        }
+
+        default MultistreamSession.UpdateToken registerUpdate(MultistreamSession.CausalScope scope) {
+            throw new UnsupportedOperationException("registerUpdate");
+        }
+
+        default SentPacket sendCovered(MultistreamSession.UpdateToken token, ProtocolState state,
+                int packetId, byte[] frame, byte[] uncompressedPacket) {
+            throw new UnsupportedOperationException("sendCovered");
+        }
+
+        default List<SentPacket> sendCoveredBundle(OutboundPacket open, List<OutboundPacket> members,
+                OutboundPacket close, List<List<MultistreamSession.UpdateToken>> memberCoverage) {
+            throw new UnsupportedOperationException("sendCoveredBundle");
+        }
+
+        default void suppressUpdate(MultistreamSession.UpdateToken token) {
+            throw new UnsupportedOperationException("suppressUpdate");
+        }
+
+        default void completeScope(MultistreamSession.CausalScope scope) {
+            throw new UnsupportedOperationException("completeScope");
+        }
+
+        default void coverScope(long ackId, MultistreamSession.CausalScope scope) {
+            throw new UnsupportedOperationException("coverScope");
+        }
+
+        default void sealAckCoverage(long ackId) {
+            throw new UnsupportedOperationException("sealAckCoverage");
+        }
     }
 
     private final Channel game;
@@ -485,6 +522,88 @@ public final class GameLanes implements LaneGame {
             throw new IllegalArgumentException("lane");
         }
         session().applied(lane, sequence);
+    }
+
+    // --- Causal scopes (U1/U2, 13.19).
+    // Additive passthroughs to the session activation created. This object owns no tracker and
+    // allocates no scope identity, so every handle stays bound to the connection's own tracker and
+    // a handle from another connection is rejected there. Call them on the session's submission
+    // thread, in the same order as the packets they cover, like every other send operation.
+
+    /**
+     * Opens a causal scope on this connection's existing session (U1, 13.19) and returns its
+     * opaque handle, or null when the session is closed or refused it with a local 0x12 close.
+     */
+    public MultistreamSession.CausalScope openScope() {
+        return session().openScope();
+    }
+
+    /**
+     * Registers one update inside a scope this connection opened (U1, 13.19) and returns its
+     * opaque token, or null when the session is closed. The token resolves exactly once, by
+     * {@link #sendCovered} or {@link #suppressUpdate}; a scope handle from another connection is
+     * rejected by the session before anything is allocated.
+     */
+    public MultistreamSession.UpdateToken registerUpdate(MultistreamSession.CausalScope scope) {
+        return session().registerUpdate(scope);
+    }
+
+    /**
+     * Submits one packet whose assignment resolves {@code token} (U1/U2, 13.19). A foreign,
+     * resolved, suppressed or retired token throws {@link IllegalArgumentException} before any
+     * sequence is assigned and leaves the token untouched. A route the session cannot resolve
+     * fails the connection closed, as every other submission does.
+     */
+    public SentPacket sendCovered(MultistreamSession.UpdateToken token, ProtocolState state,
+            int packetId, byte[] frame, byte[] uncompressedPacket) {
+        return session().sendCovered(token, state, packetId, frame, uncompressedPacket);
+    }
+
+    /**
+     * Submits one covered bundle as the session's single atomic transaction (U2b, 13.19). A
+     * rejected call assigns nothing: caller errors (a malformed frame, an invalid coverage shape,
+     * or a foreign, resolved, suppressed or retired token) throw before any sequence is assigned
+     * and leave every token live, while a terminal local resource refusal closes the connection
+     * with 0x12 and writes nothing. A token covering several members is consumed once, at its
+     * highest covered member, or at the closer when the strongest member promotes the run to
+     * GLOBAL (13.15). Never send a bundle's children separately.
+     */
+    public List<SentPacket> sendCoveredBundle(OutboundPacket open, List<OutboundPacket> members,
+            OutboundPacket close, List<List<MultistreamSession.UpdateToken>> memberCoverage) {
+        return session().sendCoveredBundle(open, members, close, memberCoverage);
+    }
+
+    /**
+     * Removes a registered update from coverage (U1, 13.19): it has no wire frontier and is never
+     * awaited. Valid only for a token that was never assigned.
+     */
+    public void suppressUpdate(MultistreamSession.UpdateToken token) {
+        session().suppressUpdate(token);
+    }
+
+    /**
+     * Marks a scope complete, the explicit producer-completeness event (U1, 13.19). Accepted only
+     * once every token the scope registered has resolved; afterwards it takes no new registration
+     * and no assignment.
+     */
+    public void completeScope(MultistreamSession.CausalScope scope) {
+        session().completeScope(scope);
+    }
+
+    /**
+     * Registers a live or completed scope as covering an ack id (U1, 13.19). Register every
+     * covering scope before {@link #sealAckCoverage} and before the ack is resolved.
+     */
+    public void coverScope(long ackId, MultistreamSession.CausalScope scope) {
+        session().coverScope(ackId, scope);
+    }
+
+    /**
+     * Seals an ack's coverage membership: the producer declares no further covering scope will
+     * arise (U1, 13.19). Idempotent, and a later {@link #coverScope} for that ack is rejected.
+     */
+    public void sealAckCoverage(long ackId) {
+        session().sealAckCoverage(ackId);
     }
 
     // --- LaneGame, backpressure and close.
@@ -736,6 +855,48 @@ public final class GameLanes implements LaneGame {
         @Override
         public SentPacket finishBatch(long batchId, OutboundPacket join) {
             return session.finishBatch(batchId, join);
+        }
+
+        @Override
+        public MultistreamSession.CausalScope openScope() {
+            return session.openScope();
+        }
+
+        @Override
+        public MultistreamSession.UpdateToken registerUpdate(MultistreamSession.CausalScope scope) {
+            return session.registerUpdate(scope);
+        }
+
+        @Override
+        public SentPacket sendCovered(MultistreamSession.UpdateToken token, ProtocolState state,
+                int packetId, byte[] frame, byte[] uncompressedPacket) {
+            return session.sendCovered(token, state, packetId, frame, uncompressedPacket);
+        }
+
+        @Override
+        public List<SentPacket> sendCoveredBundle(OutboundPacket open, List<OutboundPacket> members,
+                OutboundPacket close, List<List<MultistreamSession.UpdateToken>> memberCoverage) {
+            return session.sendCoveredBundle(open, members, close, memberCoverage);
+        }
+
+        @Override
+        public void suppressUpdate(MultistreamSession.UpdateToken token) {
+            session.suppressUpdate(token);
+        }
+
+        @Override
+        public void completeScope(MultistreamSession.CausalScope scope) {
+            session.completeScope(scope);
+        }
+
+        @Override
+        public void coverScope(long ackId, MultistreamSession.CausalScope scope) {
+            session.coverScope(ackId, scope);
+        }
+
+        @Override
+        public void sealAckCoverage(long ackId) {
+            session.sealAckCoverage(ackId);
         }
     }
 }

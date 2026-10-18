@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -21,17 +22,23 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.multistream.AckJoinTracker;
 import rs.sudoe.quicraft.core.multistream.Envelope;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
+import rs.sudoe.quicraft.core.multistream.LogicalStream;
+import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
+import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.SentPacket;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
@@ -336,6 +343,199 @@ class GameLanesTest {
         channel.close().sync();
     }
 
+    @Test
+    void theCausalFacadeDelegatesToTheConnectionSession() {
+        CausalSession session = new CausalSession();
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), session,
+                ProtocolState.PLAY, null);
+
+        MultistreamSession.CausalScope scope = lanes.openScope();
+        assertNotNull(scope);
+        assertEquals(1, session.openScopes, "the scope comes from the session, never from a new tracker");
+        MultistreamSession.UpdateToken token = lanes.registerUpdate(scope);
+        assertTrue(session.tracker.validateScopeToken(token), "a live token of the session's own tracker");
+
+        byte[] frame = new byte[] {1, 2, 3};
+        assertNull(lanes.sendCovered(token, ProtocolState.PLAY, 8, frame, frame),
+                "the session's own answer is what the facade returns");
+        assertEquals(Collections.singletonList(ProtocolState.PLAY + ":8"), session.covered);
+        assertArrayEquals(frame, session.coveredFrames.get(0), "the frame reaches the session unchanged");
+        assertArrayEquals(frame, session.coveredUncompressed.get(0),
+                "the uncompressed bytes reach the session unchanged");
+        lanes.completeScope(scope);
+
+        MultistreamSession.CausalScope second = lanes.openScope();
+        MultistreamSession.UpdateToken suppressed = lanes.registerUpdate(second);
+        lanes.suppressUpdate(suppressed);
+        lanes.completeScope(second);
+        assertEquals(2, session.openScopes, "each facade call reached the one session");
+    }
+
+    @Test
+    void causalHandlesAreBoundToTheSessionThatIssuedThem() {
+        CausalSession first = new CausalSession();
+        CausalSession second = new CausalSession();
+        GameLanes firstLanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), first,
+                ProtocolState.PLAY, null);
+        GameLanes secondLanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), second,
+                ProtocolState.PLAY, null);
+
+        MultistreamSession.CausalScope scope = firstLanes.openScope();
+        assertThrows(AckJoinTracker.ForeignHandleException.class,
+                () -> secondLanes.registerUpdate(scope), "a scope handle from another connection");
+        MultistreamSession.UpdateToken token = firstLanes.registerUpdate(scope);
+        assertThrows(AckJoinTracker.ForeignHandleException.class,
+                () -> secondLanes.sendCovered(token, ProtocolState.PLAY, 8, new byte[] {1}, null),
+                "a token handle from another connection");
+        assertThrows(AckJoinTracker.ForeignHandleException.class,
+                () -> secondLanes.completeScope(scope));
+        long ack = second.createAckForTest();
+        assertThrows(AckJoinTracker.ForeignHandleException.class,
+                () -> secondLanes.coverScope(ack, scope));
+
+        assertTrue(first.tracker.validateScopeToken(token), "the rejected calls left the token live");
+        assertTrue(second.coveredFrames.isEmpty(), "nothing reached the other session's send path");
+    }
+
+    @Test
+    void aResolvedOrSuppressedUpdateCannotResolveAgain() {
+        CausalSession session = new CausalSession();
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), session,
+                ProtocolState.PLAY, null);
+        MultistreamSession.CausalScope scope = lanes.openScope();
+
+        MultistreamSession.UpdateToken assigned = lanes.registerUpdate(scope);
+        lanes.sendCovered(assigned, ProtocolState.PLAY, 8, new byte[] {1}, null);
+        assertThrows(IllegalArgumentException.class,
+                () -> lanes.sendCovered(assigned, ProtocolState.PLAY, 8, new byte[] {1}, null),
+                "an assigned token is consumed");
+        assertThrows(IllegalArgumentException.class, () -> lanes.suppressUpdate(assigned),
+                "an assigned token can never be suppressed afterwards");
+
+        MultistreamSession.UpdateToken suppressed = lanes.registerUpdate(scope);
+        lanes.suppressUpdate(suppressed);
+        assertThrows(IllegalArgumentException.class, () -> lanes.suppressUpdate(suppressed),
+                "suppression is final");
+        assertThrows(IllegalArgumentException.class,
+                () -> lanes.sendCovered(suppressed, ProtocolState.PLAY, 8, new byte[] {1}, null),
+                "a suppressed token has no assignment");
+        assertEquals(1, session.covered.size(), "only the one covered send reached the session");
+    }
+
+    @Test
+    void aScopeWithUnresolvedUpdatesCannotComplete() {
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(),
+                new CausalSession(), ProtocolState.PLAY, null);
+        MultistreamSession.CausalScope scope = lanes.openScope();
+        MultistreamSession.UpdateToken first = lanes.registerUpdate(scope);
+        MultistreamSession.UpdateToken second = lanes.registerUpdate(scope);
+
+        assertThrows(IllegalArgumentException.class, () -> lanes.completeScope(scope),
+                "the first token is still unresolved");
+        lanes.suppressUpdate(first);
+        assertThrows(IllegalArgumentException.class, () -> lanes.completeScope(scope),
+                "the second token is still unresolved");
+        lanes.suppressUpdate(second);
+        lanes.completeScope(scope);
+        assertThrows(IllegalArgumentException.class, () -> lanes.registerUpdate(scope),
+                "a completed scope takes no new update");
+    }
+
+    @Test
+    void sealingCoverageRejectsLaterScopesAndStaysSealed() {
+        CausalSession session = new CausalSession();
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), session,
+                ProtocolState.PLAY, null);
+        long ack = session.createAckForTest();
+        MultistreamSession.CausalScope scope = lanes.openScope();
+
+        lanes.coverScope(ack, scope);
+        lanes.sealAckCoverage(ack);
+        lanes.sealAckCoverage(ack);
+        MultistreamSession.CausalScope late = lanes.openScope();
+        assertThrows(AckJoinTracker.SealedCoverageException.class, () -> lanes.coverScope(ack, late),
+                "a sealed membership takes no later covering scope");
+    }
+
+    @Test
+    void aCoveredBundleIsOneAtomicSessionTransaction() {
+        CausalSession session = new CausalSession();
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), session,
+                ProtocolState.PLAY, null);
+        MultistreamSession.CausalScope coveredScope = lanes.openScope();
+        MultistreamSession.UpdateToken covered = lanes.registerUpdate(coveredScope);
+        MultistreamSession.CausalScope siblingScope = lanes.openScope();
+        MultistreamSession.UpdateToken sibling = lanes.registerUpdate(siblingScope);
+        MultistreamSession.CausalScope droppedScope = lanes.openScope();
+        MultistreamSession.UpdateToken suppressed = lanes.registerUpdate(droppedScope);
+        lanes.suppressUpdate(suppressed);
+
+        List<OutboundPacket> members = Arrays.asList(
+                new OutboundPacket(new byte[] {2}), new OutboundPacket(new byte[] {3}));
+        List<List<MultistreamSession.UpdateToken>> rejected =
+                new ArrayList<List<MultistreamSession.UpdateToken>>();
+        rejected.add(Collections.singletonList(covered));
+        rejected.add(Collections.singletonList(suppressed));
+        assertThrows(IllegalArgumentException.class,
+                () -> lanes.sendCoveredBundle(new OutboundPacket(new byte[] {1}), members,
+                        new OutboundPacket(new byte[] {4}), rejected));
+        assertTrue(session.bundles.isEmpty(), "a rejected bundle never reaches the session");
+        assertTrue(session.tracker.validateScopeToken(covered),
+                "the first token survived the rejection, so the call was all or nothing");
+        assertTrue(session.tracker.validateScopeToken(sibling));
+
+        List<List<MultistreamSession.UpdateToken>> accepted =
+                new ArrayList<List<MultistreamSession.UpdateToken>>();
+        accepted.add(Collections.singletonList(covered));
+        accepted.add(Collections.singletonList(sibling));
+        assertSame(session.bundleResult, lanes.sendCoveredBundle(new OutboundPacket(new byte[] {1}),
+                members, new OutboundPacket(new byte[] {4}), accepted),
+                "the session's own result is what the facade returns");
+        assertEquals(1, session.bundles.size(), "one atomic session call, never per-child sends");
+        assertEquals(Arrays.asList("1", "1"), session.bundles.get(0),
+                "the whole coverage shape reached the one call");
+        assertFalse(session.tracker.validateScopeToken(covered), "the bundle consumed its token");
+        assertFalse(session.tracker.validateScopeToken(sibling));
+    }
+
+    /**
+     * The additive causal methods fail closed on a session that does not implement them, so a
+     * producer can never believe a scope was tracked by a session that cannot track one.
+     */
+    @Test
+    void theLegacySessionFailsClosedOnEveryCausalScopeMethod() {
+        GameLanes.Session session = new FakeSession();
+        ProtocolState state = ProtocolState.PLAY;
+        assertThrows(UnsupportedOperationException.class, session::openScope);
+        assertThrows(UnsupportedOperationException.class, () -> session.registerUpdate(null));
+        assertThrows(UnsupportedOperationException.class,
+                () -> session.sendCovered(null, state, 7, new byte[] {1}, null));
+        assertThrows(UnsupportedOperationException.class,
+                () -> session.sendCoveredBundle(null, null, null, null));
+        assertThrows(UnsupportedOperationException.class, () -> session.suppressUpdate(null));
+        assertThrows(UnsupportedOperationException.class, () -> session.completeScope(null));
+        assertThrows(UnsupportedOperationException.class, () -> session.coverScope(1L, null));
+        assertThrows(UnsupportedOperationException.class, () -> session.sealAckCoverage(1L));
+        assertTrue(((FakeSession) session).sent.isEmpty(), "nothing reached the legacy send path");
+    }
+
+    @Test
+    void theFacadeOfALegacySessionFailsClosedOnEveryCausalScopeMethod() {
+        GameLanes lanes = GameLanes.forTest(new EmbeddedChannel(), new FakeCodec(), new FakeSession(),
+                ProtocolState.PLAY, null);
+        ProtocolState state = ProtocolState.PLAY;
+        assertThrows(UnsupportedOperationException.class, lanes::openScope);
+        assertThrows(UnsupportedOperationException.class, () -> lanes.registerUpdate(null));
+        assertThrows(UnsupportedOperationException.class,
+                () -> lanes.sendCovered(null, state, 7, new byte[] {1}, null));
+        assertThrows(UnsupportedOperationException.class,
+                () -> lanes.sendCoveredBundle(null, null, null, null));
+        assertThrows(UnsupportedOperationException.class, () -> lanes.suppressUpdate(null));
+        assertThrows(UnsupportedOperationException.class, () -> lanes.completeScope(null));
+        assertThrows(UnsupportedOperationException.class, () -> lanes.coverScope(1L, null));
+        assertThrows(UnsupportedOperationException.class, () -> lanes.sealAckCoverage(1L));
+    }
+
     /** A codec the test drives: what a frame decodes to and how a packet routes are the test's. */
     static final class FakeCodec implements GameLanes.Codec {
         final Map<Object, GameLanes.Route> routes = new HashMap<>();
@@ -407,6 +607,130 @@ class GameLanesTest {
         @Override
         public void abort(int code) {
             aborted.add(Integer.valueOf(code));
+        }
+    }
+
+    /**
+     * A {@link GameLanes.Session} whose causal operations delegate to a real {@link AckJoinTracker}:
+     * the handles are the production handle type and carry the tracker's own owner identity, so the
+     * ownership and resolution rules exercised here are the real ones. Its single-send path is not
+     * used. The production session's atomic bundle transaction and effective GLOBAL promotion are
+     * exercised end to end in {@link GameLanesV3LoopbackTest}.
+     */
+    static final class CausalSession implements GameLanes.Session {
+        final AckJoinTracker tracker = new AckJoinTracker(LogicalStream.MAX_CHUNKS + 2);
+        final List<String> covered = new ArrayList<>();
+        final List<byte[]> coveredFrames = new ArrayList<>();
+        final List<byte[]> coveredUncompressed = new ArrayList<>();
+        /** The coverage shape of every bundle call that reached this session, in order. */
+        final List<List<String>> bundles = new ArrayList<>();
+        final List<SentPacket> bundleResult = new ArrayList<>();
+        int openScopes;
+        long sequences;
+        private long nextAck = 1;
+
+        long createAckForTest() {
+            long id = nextAck++;
+            assertTrue(tracker.create(id, 1, System.nanoTime()));
+            return id;
+        }
+
+        @Override
+        public Lane outboundLane(ProtocolState state, int packetId) {
+            return Lane.CONTROL;
+        }
+
+        @Override
+        public Lane send(ProtocolState state, int packetId, byte[] frame) {
+            throw new UnsupportedOperationException("single send is not part of the causal wiring test");
+        }
+
+        @Override
+        public void applied(Lane lane, long sequence) {
+            throw new UnsupportedOperationException("applied is not part of the causal wiring test");
+        }
+
+        @Override
+        public void abort(int code) {
+            throw new UnsupportedOperationException("abort is not part of the causal wiring test");
+        }
+
+        @Override
+        public MultistreamSession.CausalScope openScope() {
+            openScopes++;
+            return tracker.openScope();
+        }
+
+        @Override
+        public MultistreamSession.UpdateToken registerUpdate(MultistreamSession.CausalScope scope) {
+            return tracker.registerUpdate(scope);
+        }
+
+        @Override
+        public SentPacket sendCovered(MultistreamSession.UpdateToken token, ProtocolState state,
+                int packetId, byte[] frame, byte[] uncompressedPacket) {
+            if (!tracker.validateScopeToken(token)) {
+                throw new IllegalArgumentException(
+                        "unknown, resolved, suppressed or retired update token");
+            }
+            covered.add(state + ":" + packetId);
+            coveredFrames.add(frame == null ? null : frame.clone());
+            coveredUncompressed.add(uncompressedPacket == null ? null : uncompressedPacket.clone());
+            tracker.assignScopeToken(token, LogicalStream.CONTROL, ++sequences);
+            return null;
+        }
+
+        @Override
+        public List<SentPacket> sendCoveredBundle(OutboundPacket open, List<OutboundPacket> members,
+                OutboundPacket close, List<List<MultistreamSession.UpdateToken>> memberCoverage) {
+            if (open == null || members == null || close == null || memberCoverage == null
+                    || memberCoverage.size() != members.size()) {
+                throw new IllegalArgumentException("bundle coverage");
+            }
+            // Validate every token before consuming any: one bad token rejects the whole call (U2b).
+            for (List<MultistreamSession.UpdateToken> tokens : memberCoverage) {
+                if (tokens == null) {
+                    throw new IllegalArgumentException("bundle coverage");
+                }
+                for (MultistreamSession.UpdateToken token : tokens) {
+                    if (token == null || !tracker.validateScopeToken(token)) {
+                        throw new IllegalArgumentException(
+                                "unknown, resolved, suppressed or retired update token");
+                    }
+                }
+            }
+            List<String> shape = new ArrayList<>();
+            Set<MultistreamSession.UpdateToken> distinct =
+                    new LinkedHashSet<MultistreamSession.UpdateToken>();
+            for (List<MultistreamSession.UpdateToken> tokens : memberCoverage) {
+                shape.add(String.valueOf(tokens.size()));
+                distinct.addAll(tokens);
+            }
+            bundles.add(shape);
+            for (MultistreamSession.UpdateToken token : distinct) {
+                tracker.assignScopeToken(token, LogicalStream.CONTROL, ++sequences);
+            }
+            return bundleResult;
+        }
+
+        @Override
+        public void suppressUpdate(MultistreamSession.UpdateToken token) {
+            tracker.suppressScopeToken(token);
+        }
+
+        @Override
+        public void completeScope(MultistreamSession.CausalScope scope) {
+            tracker.completeScope(scope);
+        }
+
+        @Override
+        public void coverScope(long ackId, MultistreamSession.CausalScope scope) {
+            tracker.coverScope(ackId, scope);
+        }
+
+        @Override
+        public void sealAckCoverage(long ackId) {
+            tracker.sealAckCoverage(ackId);
         }
     }
 

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -31,10 +32,15 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.multistream.AckJoinTracker;
 import rs.sudoe.quicraft.core.multistream.Envelope;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
+import rs.sudoe.quicraft.core.multistream.LogicalStream;
+import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
+import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.RecordCodec;
+import rs.sudoe.quicraft.core.multistream.SentPacket;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
@@ -56,7 +62,11 @@ import rs.sudoe.quicraft.core.transport.V3Listener;
  * tests.
  */
 class GameLanesV3LoopbackTest {
-    /** Everything defaults to CONTROL, which is what a one-record check needs (13.6). */
+    /**
+     * Everything else defaults to global, which is what a one-record check needs (13.6). Packet 8 is
+     * an explicit CONTROL route and packet 9 a REALTIME one, so covered-bundle members have two
+     * different scopes to combine (13.15).
+     */
     static final RoutingTable TABLE = RoutingTableLoader.parse(tableJson());
 
     private static String tableJson() {
@@ -69,8 +79,21 @@ class GameLanesV3LoopbackTest {
             limits.append('"').append(state).append("\":").append(limit);
         }
         return "{\"schema\":2,\"protocol\":4242,\"default\":\"global\",\"extractors\":{},"
-                + "\"serverboundLimits\":{" + limits + "},\"routes\":[]}";
+                + "\"serverboundLimits\":{" + limits + "},\"routes\":["
+                + clientboundRoute(8, "control", "control") + ","
+                + clientboundRoute(9, "realtime", "lane") + "]}";
     }
+
+    /**
+     * One clientbound schema-2 route (13.7). The two routes give the covered-bundle test a CONTROL
+     * member and a REALTIME member, so the strongest-member rule has something to promote (13.15).
+     */
+    private static String clientboundRoute(int packetId, String lane, String dependency) {
+        return "{\"state\":\"play\",\"direction\":\"clientbound\",\"packet_id\":" + packetId
+                + ",\"lane\":\"" + lane + "\",\"dependency\":\"" + dependency
+                + "\",\"position\":null,\"epoch_change\":false}";
+    }
+
     static final int PROTOCOL = 4242;
     /** The application had nothing buffered past the switch packet. */
     static final ByteBuffer NO_LEFTOVER = null;
@@ -197,6 +220,189 @@ class GameLanesV3LoopbackTest {
         }
     }
 
+    /**
+     * The causal facade over the production session: a scope and its update are the session's own
+     * handles, an unresolved scope cannot complete, another connection's handles are rejected, and
+     * an update resolves exactly once (U1/U2, 13.19).
+     */
+    @Test
+    void theCausalScopeFacadeTracksOwnershipAndResolutionThroughTheProductionSession()
+            throws Exception {
+        try (Rig rig = new Rig()) {
+            rig.activateServer(NO_LEFTOVER);
+            rig.activateClient(NO_LEFTOVER);
+
+            MultistreamSession.CausalScope scope = rig.clientLanes.openScope();
+            assertNotNull(scope, "the session allocated the scope");
+            MultistreamSession.UpdateToken token = rig.clientLanes.registerUpdate(scope);
+            assertThrows(IllegalArgumentException.class, () -> rig.clientLanes.completeScope(scope),
+                    "13.19: a scope with an unresolved update cannot complete");
+
+            assertThrows(AckJoinTracker.ForeignHandleException.class,
+                    () -> rig.serverLanes.registerUpdate(scope),
+                    "13.19: a scope handle belongs to the session that issued it");
+            assertThrows(AckJoinTracker.ForeignHandleException.class,
+                    () -> rig.serverLanes.sendCovered(token, ProtocolState.PLAY, 8,
+                            frame(8, "foreign"), null),
+                    "13.19: a token handle belongs to the session that issued it");
+
+            byte[] frame = frame(8, "covered");
+            SentPacket handle = rig.clientLanes.sendCovered(token, ProtocolState.PLAY, 8, frame, null);
+            assertTrue(handle.isAssigned(), "the covered packet took a sequence");
+            assertEquals(Lane.CONTROL, handle.lane(), "the default route is a CONTROL fence");
+            rig.clientLanes.completeScope(scope);
+
+            List<Object> received = rig.serverGame.await(2);
+            assertEquals(2, received.size(), "the covered packet and its acknowledgement: " + received);
+            assertArrayEquals(frame, ((Packet) received.get(0)).frame,
+                    "the covered packet reached the peer");
+            assertEquals(Lane.CONTROL, ((GameLanes.Ack) received.get(1)).lane());
+
+            assertThrows(IllegalArgumentException.class,
+                    () -> rig.clientLanes.sendCovered(token, ProtocolState.PLAY, 8, frame, null),
+                    "13.19: an assigned token is consumed and cannot resolve again");
+
+            MultistreamSession.CausalScope other = rig.clientLanes.openScope();
+            MultistreamSession.UpdateToken suppressed = rig.clientLanes.registerUpdate(other);
+            rig.clientLanes.suppressUpdate(suppressed);
+            assertThrows(IllegalArgumentException.class,
+                    () -> rig.clientLanes.sendCovered(suppressed, ProtocolState.PLAY, 8, frame, null),
+                    "13.19: a suppressed update has no assignment");
+            rig.clientLanes.completeScope(other);
+        }
+    }
+
+    /**
+     * A covered bundle from the production facade is one atomic session transaction (U2b, 13.19).
+     * Its members are a CONTROL route and a REALTIME route; the strongest-member rule promotes the
+     * run to GLOBAL, so the LANE member never rides its own stream and the peer receives the whole
+     * run as one delivery whose acknowledgement names the closer (13.15).
+     */
+    @Test
+    void aCoveredBundleIsOneAtomicPromotedDeliveryThroughTheProductionFacade() throws Exception {
+        try (Rig rig = new Rig()) {
+            rig.activateServer(NO_LEFTOVER);
+            rig.activateClient(NO_LEFTOVER);
+            // The client's codec is the platform's receiver: a delimiter packet opens and closes a
+            // bundle, and ordinary packets between them are members (13.15).
+            rig.clientCodec.bundleOpenId = 70;
+            rig.clientCodec.bundleCloseId = 72;
+
+            MultistreamSession.CausalScope controlScope = rig.serverLanes.openScope();
+            MultistreamSession.UpdateToken controlToken = rig.serverLanes.registerUpdate(controlScope);
+            MultistreamSession.CausalScope realtimeScope = rig.serverLanes.openScope();
+            MultistreamSession.UpdateToken realtimeToken = rig.serverLanes.registerUpdate(realtimeScope);
+
+            List<OutboundPacket> members = new ArrayList<OutboundPacket>();
+            members.add(new OutboundPacket(frame(8, "control member")));
+            members.add(new OutboundPacket(frame(9, "realtime member")));
+            List<List<MultistreamSession.UpdateToken>> coverage =
+                    new ArrayList<List<MultistreamSession.UpdateToken>>();
+            coverage.add(Collections.singletonList(controlToken));
+            coverage.add(Collections.singletonList(realtimeToken));
+
+            List<SentPacket> handles = rig.serverLanes.sendCoveredBundle(
+                    new OutboundPacket(frame(70, "")), members,
+                    new OutboundPacket(frame(72, "")), coverage);
+
+            assertEquals(4, handles.size(), "opener, both members and the closer");
+            for (SentPacket handle : handles) {
+                assertTrue(handle.isAssigned(), "every record of the run took a sequence");
+                assertEquals(LogicalStream.CONTROL, handle.logicalStream(),
+                        "13.15: the REALTIME member promotes the whole bundle to GLOBAL on CONTROL");
+            }
+            rig.serverLanes.completeScope(controlScope);
+            rig.serverLanes.completeScope(realtimeScope);
+
+            List<Object> received = rig.clientGame.await(5);
+            assertEquals(5, received.size(),
+                    "the opener, both members, the closer and one bundle acknowledgement: " + received);
+            assertArrayEquals(frame(70, ""), ((Packet) received.get(0)).frame);
+            assertArrayEquals(frame(8, "control member"), ((Packet) received.get(1)).frame);
+            assertArrayEquals(frame(9, "realtime member"), ((Packet) received.get(2)).frame);
+            assertArrayEquals(frame(72, ""), ((Packet) received.get(3)).frame);
+            GameLanes.Ack ack = (GameLanes.Ack) received.get(4);
+            assertTrue(ack.bundle(), "13.15: the run is one delivery, never per-child packets");
+            assertEquals(handles.get(3).sequence(), ack.sequence(),
+                    "the acknowledged frontier is the closer");
+        }
+    }
+
+    /**
+     * A rejected covered bundle assigns and writes nothing through the production session: the
+     * foreign token on the second member rejects the call, the live token on the first member
+     * survives, and only a later valid covered send reaches the peer (U2b, 13.19).
+     */
+    @Test
+    void aRejectedCoveredBundleThroughTheProductionFacadeWritesNothing() throws Exception {
+        try (Rig rig = new Rig()) {
+            rig.activateServer(NO_LEFTOVER);
+            rig.activateClient(NO_LEFTOVER);
+
+            MultistreamSession.CausalScope localScope = rig.serverLanes.openScope();
+            MultistreamSession.UpdateToken live = rig.serverLanes.registerUpdate(localScope);
+            MultistreamSession.CausalScope foreignScope = rig.clientLanes.openScope();
+            MultistreamSession.UpdateToken foreign = rig.clientLanes.registerUpdate(foreignScope);
+
+            List<OutboundPacket> members = new ArrayList<OutboundPacket>();
+            members.add(new OutboundPacket(frame(8, "first member")));
+            members.add(new OutboundPacket(frame(9, "second member")));
+            List<List<MultistreamSession.UpdateToken>> coverage =
+                    new ArrayList<List<MultistreamSession.UpdateToken>>();
+            coverage.add(Collections.singletonList(live));
+            coverage.add(Collections.singletonList(foreign));
+
+            assertThrows(AckJoinTracker.ForeignHandleException.class,
+                    () -> rig.serverLanes.sendCoveredBundle(new OutboundPacket(frame(70, "")),
+                            members, new OutboundPacket(frame(72, "")), coverage),
+                    "13.19: one foreign token rejects the whole atomic run");
+
+            byte[] later = frame(8, "later");
+            assertTrue(rig.serverLanes.sendCovered(live, ProtocolState.PLAY, 8, later, null).isAssigned(),
+                    "13.19: the live token survived the rejected bundle untouched");
+            List<Object> received = rig.clientGame.await(2);
+            assertEquals(2, received.size(),
+                    "only the later covered packet and its acknowledgement: " + received);
+            assertArrayEquals(later, ((Packet) received.get(0)).frame,
+                    "nothing from the rejected bundle reached the wire");
+            assertEquals(Lane.CONTROL, ((GameLanes.Ack) received.get(1)).lane());
+        }
+    }
+
+    /**
+     * Coverage sealing over the production session: the pending ack is created through the existing
+     * ACK_JOIN passthrough, the facade registers and seals the covering scope, and a later scope is
+     * refused (U1, 13.19).
+     */
+    @Test
+    void sealingCoverageThroughTheProductionFacadeRejectsALaterScope() throws Exception {
+        try (Rig rig = new Rig()) {
+            rig.activateServer(NO_LEFTOVER);
+            rig.activateClient(NO_LEFTOVER);
+
+            Method session = GameLanes.class.getDeclaredMethod("session");
+            session.setAccessible(true);
+            GameLanes.Session sink = (GameLanes.Session) session.invoke(rig.clientLanes);
+            assertTrue(sink.createAck(1L, new byte[] {1, 2, 3}, 3),
+                    "the session took the pending ack");
+
+            MultistreamSession.CausalScope scope = rig.clientLanes.openScope();
+            MultistreamSession.UpdateToken token = rig.clientLanes.registerUpdate(scope);
+            rig.clientLanes.sendCovered(token, ProtocolState.PLAY, 8, frame(8, "covered"), null);
+            rig.clientLanes.completeScope(scope);
+            rig.clientLanes.coverScope(1L, scope);
+            rig.clientLanes.sealAckCoverage(1L);
+            rig.clientLanes.sealAckCoverage(1L);
+
+            MultistreamSession.CausalScope late = rig.clientLanes.openScope();
+            rig.clientLanes.completeScope(late);
+            IllegalArgumentException sealed = assertThrows(IllegalArgumentException.class,
+                    () -> rig.clientLanes.coverScope(1L, late),
+                    "13.19: sealed membership takes no later covering scope");
+            assertEquals("ack coverage sealed", sealed.getMessage());
+        }
+    }
+
     /** One listener, one dial and one {@link GameLanes} per side, all through the production API. */
     static final class Rig implements AutoCloseable {
         final QuicServer server;
@@ -282,10 +488,17 @@ class GameLanesV3LoopbackTest {
         }
     }
 
-    /** A platform codec: the test's packet codec, with the knobs the three tests need. */
+    /** A platform codec: the test's packet codec, with the knobs the tests need. */
     static final class Codec implements GameLanes.Codec {
         final Map<Object, GameLanes.Route> routes = new HashMap<>();
         volatile boolean chargeBeyondBudget;
+        /**
+         * The packet ids that act as bundle delimiters, or -1 when this codec marks none. A real
+         * platform codec knows its delimiter packet types; between them every packet is a member.
+         */
+        volatile int bundleOpenId = -1;
+        volatile int bundleCloseId = -1;
+        private boolean insideBundle;
         final AtomicBoolean allocated = new AtomicBoolean();
         final AtomicReference<Throwable> rejected = new AtomicReference<>();
 
@@ -307,8 +520,45 @@ class GameLanesV3LoopbackTest {
             allocated.set(true);
             byte[] body = new byte[frame.readableBytes()];
             frame.getBytes(frame.readerIndex(), body);
-            return new LaneGame.Decoded(new Packet(body), ProtocolState.PLAY, 0, Envelope.Bundle.NONE,
-                    false);
+            int id = packetId(body);
+            Envelope.Bundle bundle = Envelope.Bundle.NONE;
+            if (bundleOpenId >= 0) {
+                if (id == bundleOpenId) {
+                    insideBundle = true;
+                    bundle = Envelope.Bundle.OPEN;
+                } else if (id == bundleCloseId) {
+                    insideBundle = false;
+                    bundle = Envelope.Bundle.CLOSE;
+                } else if (insideBundle) {
+                    bundle = Envelope.Bundle.MEMBER;
+                }
+            }
+            return new LaneGame.Decoded(new Packet(body), ProtocolState.PLAY, id, bundle, false);
+        }
+
+        /** The packet id of one complete GAME frame this codec built: length VarInt, then id VarInt. */
+        private static int packetId(byte[] body) {
+            int[] at = {0};
+            if (varInt(body, at) < 0) {
+                return 0;
+            }
+            int id = varInt(body, at);
+            return id < 0 ? 0 : id;
+        }
+
+        private static int varInt(byte[] bytes, int[] at) {
+            int value = 0;
+            for (int shift = 0; shift < 35; shift += 7) {
+                if (at[0] >= bytes.length) {
+                    return -1;
+                }
+                int read = bytes[at[0]++] & 0xff;
+                value |= (read & 0x7f) << shift;
+                if ((read & 0x80) == 0) {
+                    return value;
+                }
+            }
+            return -1;
         }
 
         @Override
