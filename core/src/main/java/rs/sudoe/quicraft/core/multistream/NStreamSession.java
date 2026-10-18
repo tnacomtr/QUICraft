@@ -385,14 +385,18 @@ public final class NStreamSession implements MultistreamSession {
     private boolean streamCapacityLookedUp;
 
     /**
-     * A production session for the negotiated context, uncompressed, with production timing.
+     * A production session for the negotiated context with production timing.
      *
+     * @param compressed the game's stream compression state at activation (13.4), read once by the
+     *     platform: it decides whether a GAME frame carries a Data Length VarInt and how bundle
+     *     member ids are read. Vanilla sets the threshold during login and never changes it.
      * @throws IllegalArgumentException when the table is not schema 2 or lacks the PLAY serverbound limits a
      *     server needs, or when the resources' smallest outbound cap cannot hold the driver's headroom
      */
     public NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control,
-            RoutingTable table, LaneGame game, SessionContext context, SessionResources resources) {
-        this(connection, role, control, table, game, context, resources, Timing.DEFAULT, false);
+            RoutingTable table, LaneGame game, SessionContext context, SessionResources resources,
+            boolean compressed) {
+        this(connection, role, control, table, game, context, resources, Timing.DEFAULT, compressed);
     }
 
     NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,

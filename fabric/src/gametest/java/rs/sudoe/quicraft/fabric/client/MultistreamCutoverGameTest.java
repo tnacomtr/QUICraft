@@ -1326,6 +1326,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         final byte[] exporter = new byte[32];
         volatile Listener listener;
         volatile boolean activated;
+        volatile boolean compressed;
         volatile byte[] activationLeftover;
         volatile int abortCode = -1;
         volatile boolean open = true;
@@ -1383,8 +1384,9 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         }
 
         @Override
-        public void activate(LaneGame game, ByteBuffer controlLeftover) {
+        public void activate(LaneGame game, boolean compressed, ByteBuffer controlLeftover) {
             activated = true;
+            this.compressed = compressed;
             // Core hands the session the application's leftover followed by what it kept since the detach.
             ByteArrayOutputStream all = new ByteArrayOutputStream();
             if (controlLeftover != null) {
@@ -1398,8 +1400,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         }
 
         @Override
-        public void activate(LaneGame game, int protocolNumber, ByteBuffer controlLeftover) {
-            activate(game, controlLeftover);
+        public void activate(LaneGame game, int protocolNumber, boolean compressed, ByteBuffer controlLeftover) {
+            activate(game, compressed, controlLeftover);
         }
 
         @Override

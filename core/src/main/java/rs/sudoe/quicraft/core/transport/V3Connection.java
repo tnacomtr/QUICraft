@@ -65,9 +65,15 @@ public interface V3Connection extends QuicByteStream {
      * over stream 0 with the game side {@code game}. {@code controlLeftover} is what the
      * application read past the switch (null when none): the start of the 13.4 record stream.
      *
+     * <p>{@code compressed} is whether the game's stream compression is enabled at activation
+     * (13.4): it decides whether a GAME frame starts with a Data Length VarInt and how bundle
+     * member ids are read. The platform reads its live pipeline once, at activation, and passes
+     * the answer down; the session never re-reads game state. Vanilla sets the threshold during
+     * login and never changes it for the connection, so one value is exact.
+     *
      * <p>On a server this needs the negotiated protocol number, so use
-     * {@link #activate(LaneGame, int, ByteBuffer)}; this form is the client's, whose routing table
-     * came from the dial.
+     * {@link #activate(LaneGame, int, boolean, ByteBuffer)}; this form is the client's, whose
+     * routing table came from the dial.
      *
      * <p>Runs on the connection's event loop, inline when called there, so a server can activate
      * before, or in the same task as, the flush that sends SERVER_SWITCH (13.3).
@@ -77,15 +83,15 @@ public interface V3Connection extends QuicByteStream {
      * {@code 0x10} rather than starting a session, so a caller cannot skip the check by accident;
      * the client role has no such guard.
      */
-    void activate(LaneGame game, ByteBuffer controlLeftover);
+    void activate(LaneGame game, boolean compressed, ByteBuffer controlLeftover);
 
     /**
-     * As {@link #activate(LaneGame, ByteBuffer)}, for a server, resolving its routing table from
-     * the listener's {@link V3Listener#tableFor(int)}. A listener without a table for
+     * As {@link #activate(LaneGame, boolean, ByteBuffer)}, for a server, resolving its routing
+     * table from the listener's {@link V3Listener#tableFor(int)}. A listener without a table for
      * {@code protocolNumber} closes the connection with {@code 0x10} (12.3, 12.14): a {@code /3}
      * listener never falls back to {@code /2} or to a guessed table.
      */
-    void activate(LaneGame game, int protocolNumber, ByteBuffer controlLeftover);
+    void activate(LaneGame game, int protocolNumber, boolean compressed, ByteBuffer controlLeftover);
 
     /**
      * The activated session, or null before {@link #activate} has run on the event loop. The game

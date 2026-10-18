@@ -100,6 +100,28 @@ class V3ConnectionTest {
 
     // --- The tests.
 
+    /**
+     * 13.4/13.12: the platform's compression state reaches the session, so a serverbound GAME
+     * record whose frame starts with the stored Data Length is decoded from the packet, not from
+     * that zero byte. Before activation carried the flag, the server read the zero as the packet id
+     * (0: client_information) and disconnected the join.
+     */
+    @Test
+    void aStoredCompressionServerboundRecordArrivesWithoutItsHeader() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            activate(pair.serverSide, pair.serverGame, 4242, true);
+            activate(pair.client, pair.clientGame, -1, true);
+
+            pair.client.session().send(ProtocolState.PLAY, 42, storedFrame(42, "hi"));
+
+            assertTrue(await(() -> !pair.serverGame.delivered.isEmpty(), 5_000), "the serverbound record");
+            Packet packet = (Packet) pair.serverGame.delivered.get(0);
+            assertEquals(42, packet.id, "the stored Data Length must not become the packet id");
+        }
+    }
+
     @Test
     void productionClientAcceptsAllNegotiatedChunkStreams() throws Exception {
         requireV3();
@@ -554,7 +576,7 @@ class V3ConnectionTest {
             }
             early.compareAndSet(null, connection);
             connection.detachForActivation(leftover -> { });
-            connection.activate(new Game(), 4242, null); // too early on this 0-RTT connection (12.7)
+            connection.activate(new Game(), 4242, false, null); // too early on this 0-RTT connection (12.7)
         }); DelayRelay relay = new DelayRelay(server.localAddress(), 30)) {
             primeV3Join(relay.address());
             EarlyFlight earlyFlight = new EarlyFlight("inputs");
@@ -638,11 +660,16 @@ class V3ConnectionTest {
 
     /** Activation on the connection's loop, then the game's session reference. */
     static void activate(V3Connection connection, Game game, int protocol) throws Exception {
+        activate(connection, game, protocol, false);
+    }
+
+    /** As above, with the platform's compression state at activation (13.4). */
+    static void activate(V3Connection connection, Game game, int protocol, boolean compressed) throws Exception {
         connection.detachForActivation(leftover -> { });
         if (protocol >= 0) {
-            connection.activate(game, protocol, null);
+            connection.activate(game, protocol, compressed, null);
         } else {
-            connection.activate(game, null);
+            connection.activate(game, compressed, null);
         }
         assertTrue(await(() -> connection.session() != null, 5_000), "activation");
         CountDownLatch onLoop = new CountDownLatch(1);
@@ -729,6 +756,23 @@ class V3ConnectionTest {
             value >>>= 7;
         }
         out.write(value);
+        out.write(packetId);
+        out.write(bytes, 0, bytes.length);
+        return out.toByteArray();
+    }
+
+    /** A stored-compression frame (13.4): {@code VarInt(inner length) || VarInt(0) || id || body}. */
+    static byte[] storedFrame(int packetId, String payload) {
+        byte[] bytes = payload.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int inner = 2 + bytes.length; // the stored Data Length VarInt, the id and the body
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int value = inner;
+        while ((value & ~0x7F) != 0) {
+            out.write((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+        out.write(value);
+        out.write(0); // Data Length 0: stored, not deflated
         out.write(packetId);
         out.write(bytes, 0, bytes.length);
         return out.toByteArray();

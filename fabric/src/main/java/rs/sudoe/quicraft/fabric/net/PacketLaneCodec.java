@@ -187,6 +187,15 @@ public final class PacketLaneCodec implements GameLanes.Codec {
         return pipeline.get(INBOUND_CONFIG) != null;
     }
 
+    /**
+     * Whether the game's inbound stream compression is enabled on this pipeline (13.4), the value
+     * activation carries into the {@code /3} session. Read it once, at activation: vanilla sets the
+     * threshold during login and never changes it for the connection.
+     */
+    public static boolean compressionEnabled(ChannelPipeline pipeline) {
+        return pipeline.get(DECOMPRESS) instanceof CompressionDecoder;
+    }
+
     /** The routing state of a game protocol. */
     public static ProtocolState stateOf(ConnectionProtocol protocol) {
         switch (protocol) {

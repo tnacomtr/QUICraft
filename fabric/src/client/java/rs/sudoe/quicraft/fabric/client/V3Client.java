@@ -45,6 +45,7 @@ import rs.sudoe.quicraft.core.transport.V3Connection;
 import rs.sudoe.quicraft.core.transport.V3ConnectionImpl;
 import rs.sudoe.quicraft.fabric.QuicraftFabric;
 import rs.sudoe.quicraft.fabric.net.BindingPayload;
+import rs.sudoe.quicraft.fabric.net.PacketLaneCodec;
 
 /**
  * One {@code quicraft/3} join on the client (docs/protocol.md 12 and 13): from the QUIC handshake
@@ -716,7 +717,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             pipeline.remove("timeout");
         }
         handler.startSilenceWatch(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readTimeoutMillis));
-        v3.activate(started, leftover);
+        // 13.4: the platform reads the live compression state once, here, and the session keeps it.
+        v3.activate(started, PacketLaneCodec.compressionEnabled(pipeline), leftover);
         state = State.ACTIVE;
         QuicraftFabric.LOG.info("QUICraft: multi-stream active to {}", v3.remoteAddress());
         // The packets the exchange held, in order, now as records.

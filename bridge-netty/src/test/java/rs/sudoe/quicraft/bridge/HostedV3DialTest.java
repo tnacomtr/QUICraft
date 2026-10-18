@@ -162,8 +162,8 @@ class HostedV3DialTest {
             await(() -> negotiated(client), 10_000);
             StubGame clientGame = new StubGame();
             StubGame serverGame = new StubGame();
-            client.activate(clientGame, null);
-            serverSide.activate(serverGame, PROTOCOL, null);
+            client.activate(clientGame, false, null);
+            serverSide.activate(serverGame, PROTOCOL, false, null);
             await(() -> client.session() != null && serverSide.session() != null, 5_000);
             // Several ticks of the session's periodic task: it used to throw here and close 0x2.
             Thread.sleep(300);

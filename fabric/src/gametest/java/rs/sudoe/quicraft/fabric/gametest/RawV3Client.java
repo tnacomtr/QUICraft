@@ -321,7 +321,7 @@ final class RawV3Client {
         }
         result.activated = true;
         result.events.add("lanes activated, leftover " + length + " bytes");
-        connection.activate(new Game(), leftover);
+        connection.activate(new Game(), threshold >= 0, leftover);
     }
 
     // --- The lanes.

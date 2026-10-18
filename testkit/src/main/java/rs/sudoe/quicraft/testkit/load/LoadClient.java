@@ -271,7 +271,7 @@ public final class LoadClient {
                             String key = closeKey(code, byPeer, cause);
                             closeCauses.computeIfAbsent(key, k -> new AtomicLong()).incrementAndGet();
                         }
-                    }), suffix);
+                    }), false, suffix);
                     activationRequested.incrementAndGet();
                 } catch (Throwable t) {
                     lanesFailed.incrementAndGet();

@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -258,5 +259,30 @@ class SessionContractTest {
     private static void assertDefaultMethod(Class<?> type, String name, Class<?>... params) throws Exception {
         Method method = type.getMethod(name, params);
         assertTrue(method.isDefault(), name + " must be an additive default method");
+    }
+
+    /**
+     * 13.4: with compression on, a GAME frame starts with a Data Length VarInt. Reading a bundle
+     * member's id must skip it; without the session's compression flag the stored length (0) would
+     * be taken for the id.
+     */
+    @Test
+    void aStoredCompressionFrameReadsItsBundleMemberId() {
+        byte[] stored = storedFrame(42);
+        assertEquals(42, NStreamSession.packetIdOf(stored, true));
+        assertEquals(0, NStreamSession.packetIdOf(stored, false),
+                "without compression the stored Data Length is read as the packet id");
+    }
+
+    /** {@code VarInt(inner length) || VarInt(0) || id || body} (13.4, stored). */
+    private static byte[] storedFrame(int packetId) {
+        ByteArrayOutputStream packet = new ByteArrayOutputStream();
+        VarInt.write(packet, packetId);
+        packet.write('x');
+        ByteArrayOutputStream frame = new ByteArrayOutputStream();
+        VarInt.write(frame, packet.size() + 1);
+        VarInt.write(frame, 0);
+        frame.write(packet.toByteArray(), 0, packet.size());
+        return frame.toByteArray();
     }
 }

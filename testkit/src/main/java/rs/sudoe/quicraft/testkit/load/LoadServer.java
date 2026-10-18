@@ -207,7 +207,7 @@ public final class LoadServer {
             connection.detachForActivation(leftover -> { });
             connection.activate(new IdleLaneGame((code, byPeer, cause) -> LANE_CLOSES
                     .computeIfAbsent(LoadClient.closeKey(code, byPeer, cause), k -> new AtomicLong())
-                    .incrementAndGet()), PROTOCOL, null);
+                    .incrementAndGet()), PROTOCOL, false, null);
             lanesActive.incrementAndGet();
         } catch (Throwable t) {
             lanesFailed.incrementAndGet();

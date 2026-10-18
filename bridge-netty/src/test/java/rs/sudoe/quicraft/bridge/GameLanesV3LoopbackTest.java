@@ -247,13 +247,13 @@ class GameLanesV3LoopbackTest {
             }
             assertTrue(serverSide.handshakeComplete(), "12.7: the server must see its own handshake");
             serverSide.detachForActivation(ignored -> { });
-            serverSide.activate(serverLanes, PROTOCOL, leftover);
+            serverSide.activate(serverLanes, PROTOCOL, false, leftover);
             awaitSession(serverSide);
         }
 
         void activateClient(ByteBuffer leftover) throws Exception {
             client.detachForActivation(ignored -> { });
-            client.activate(clientLanes, leftover);
+            client.activate(clientLanes, false, leftover);
             awaitSession(client);
         }
 
