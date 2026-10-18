@@ -95,6 +95,11 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
     providers.gradleProperty("quicraft.emitExtractorVectors").orNull?.let {
         property("quicraft.gametest.emitExtractorVectors", it)
     }
+    // Whether this module is built for its own game version (no -P<module>.minecraft override).
+    // RoutingTableGameTest then treats a protocol change as a stale fixture and fails; matrix rows
+    // that test the same jar on another release skip visibly.
+    val minecraftOverridden = providers.gradleProperty("${project.name}.minecraft").isPresent
+    property("quicraft.gametest.pinnedVersion", (!minecraftOverridden).toString())
     // Opt-in: the real client against an outside server (ExternalServerGameTest), e.g. the
     // testkit's Velocity through testkit/run-real-client.sh: -Pquicraft.externalServer=host:port
     providers.gradleProperty("quicraft.externalServer").orNull?.let {
@@ -120,6 +125,10 @@ sourceSets.named("gametest") {
     resources.setSrcDirs(listOf(shared.dir("gametest/resources")))
     compileClasspath += sourceSets.main.get().output + sourceSets.getByName("client").output
     runtimeClasspath += sourceSets.main.get().output + sourceSets.getByName("client").output
+    // RoutingTableGameTest compares the live protocol against the checked-in play-ids-775.txt, which
+    // lives with core's routing tests. Added as a directory (not copied), so a refresh run sees the
+    // edited file.
+    runtimeClasspath += files(rootProject.layout.projectDirectory.dir("core/src/test/resources"))
 }
 
 // What the mod jar carries besides its own classes: the shaded core (Netty relocated, natives
