@@ -138,6 +138,10 @@ xvfb-run -a ./gradlew :fabric-26x:runClientGameTest -Pfabric-26x.minecraft=26.3 
 # regenerate core's captured extractor vectors (protocol 775; runs the whole client suite):
 xvfb-run -a ./gradlew :fabric-26x:runClientGameTest \
   -Pquicraft.emitExtractorVectors=core/src/test/resources/rs/sudoe/quicraft/core/routing/captured-775-vectors.txt
+# a regeneration captures the same layouts at both coordinate signs; the exact frames and the
+# sample selection differ per run, so compare layouts and expectations, not bytes
+# if that crashes with "X11: Failed to open display", Gradle's configuration cache reused the
+# DISPLAY of an earlier run: add --no-configuration-cache
 ```
 
 Results (2026-10-11, commit after 5026691): all pass on 26.1, 26.1.1, 26.1.2, 26.2, 26.3 and
