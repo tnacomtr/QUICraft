@@ -4,6 +4,7 @@
   "package": "rs.sudoe.quicraft.fabric.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": [
+    "CausalConnectionMixin",
     "CipherBaseAccessor",
     "CipherDecoderAccessor",
     "CompressionDecoderAccessor",
