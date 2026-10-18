@@ -1829,6 +1829,114 @@ class SessionSendDriverTest {
         }
     }
 
+    /**
+     * A frame that is not one complete GAME body (13.4) fails RecordCodec's own rule. Each malformed opener,
+     * member or closer is refused before any sequence, queue slot, charge or token is touched, so the session
+     * stays open and the live token still resolves afterwards. Covers an inner length of zero and an inner
+     * length longer than the carried bytes.
+     */
+    @Test
+    void coveredBundleRejectsMalformedGameFramesInPlaceAtEveryPosition() throws Exception {
+        StreamSequencer.Fence ordinary = StreamSequencer.Fence.ORDINARY_CONTROL;
+        OutboundPacket[] malformed = {
+            new OutboundPacket(new byte[] {0}),
+            new OutboundPacket(new byte[] {2, 7}),
+        };
+        for (OutboundPacket bad : malformed) {
+            Rig rig = new Rig(2, 1000);
+            SessionSendDriver driver = rig.driver;
+            MultistreamSession.UpdateToken live = driver.registerUpdate(driver.openScope());
+
+            assertRejectedInPlace(rig, live, "malformed opener", () -> driver.submitCoveredBundle(bad, packets(2),
+                    new StreamSequencer.Fence[] {ordinary}, frame(1), emptyCoverage(1)));
+            assertRejectedInPlace(rig, live, "malformed closer", () -> driver.submitCoveredBundle(frame(1),
+                    packets(2), new StreamSequencer.Fence[] {ordinary}, bad, emptyCoverage(1)));
+            for (int position = 0; position < 3; position++) {
+                List<OutboundPacket> members = packets(2, 2, 2);
+                members.set(position, bad);
+                assertRejectedInPlace(rig, live, "malformed member " + position,
+                        () -> driver.submitCoveredBundle(frame(1), members,
+                                new StreamSequencer.Fence[] {ordinary, ordinary, ordinary}, frame(1),
+                                emptyCoverage(3)));
+            }
+            assertTrue(driver.submitCovered(live, frame(2), ordinary, false, 0, 0).isAssigned(),
+                    "the live token still resolves after every malformed refusal");
+            driver.close();
+        }
+    }
+
+    /**
+     * Every member scope is inspected, not only the ones before the first CHUNK or GLOBAL. An invalid later scope
+     * (REALTIME or null) refuses the whole bundle in place, and the sequencer rule agrees with the driver.
+     */
+    @Test
+    void coveredBundleRejectsAnInvalidScopeAnywhereInTheRunInPlace() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.UpdateToken live = driver.registerUpdate(driver.openScope());
+        StreamSequencer.Fence chunk = StreamSequencer.Fence.CHUNK;
+        StreamSequencer.Fence global = StreamSequencer.Fence.GLOBAL;
+
+        assertRejectedInPlace(rig, live, "CHUNK then REALTIME", () -> driver.submitCoveredBundle(frame(1),
+                packets(2, 2), new StreamSequencer.Fence[] {chunk, StreamSequencer.Fence.REALTIME}, frame(1),
+                emptyCoverage(2)));
+        assertRejectedInPlace(rig, live, "GLOBAL then null", () -> driver.submitCoveredBundle(frame(1),
+                packets(2, 2), new StreamSequencer.Fence[] {global, null}, frame(1), emptyCoverage(2)));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> StreamSequencer.bundleScope(chunk, StreamSequencer.Fence.REALTIME));
+        assertThrows(IllegalArgumentException.class, () -> StreamSequencer.bundleScope(global, null));
+        assertEquals(StreamSequencer.Fence.GLOBAL, StreamSequencer.bundleScope(StreamSequencer.Fence.VIEW, chunk));
+        assertEquals(StreamSequencer.Fence.VIEW,
+                StreamSequencer.bundleScope(StreamSequencer.Fence.ORDINARY_CONTROL, StreamSequencer.Fence.VIEW));
+        assertEquals(StreamSequencer.Fence.CONTROL_FENCE,
+                StreamSequencer.bundleScope(StreamSequencer.Fence.ORDINARY_CONTROL));
+        driver.close();
+    }
+
+    /**
+     * A clock failure on the one reading taken inside enqueue (the pump's ranking update) is a local defect after
+     * assignment. The call returns no handle, the driver closes with 0x12 and the original cause, every charge
+     * including the run's is released, the queue is empty and nothing is written. Only the reachable terminal
+     * cleanup is claimed here, not the post-assignment admission refusal.
+     */
+    @Test
+    void coveredBundleClockFailureDuringEnqueueReleasesChargesQueueAndWritesNothing() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        AtomicBoolean armed = new AtomicBoolean(false);
+        LongSupplier clock = () -> {
+            if (armed.getAndSet(false)) {
+                throw new IllegalStateException("injected clock failure");
+            }
+            return now.get();
+        };
+        PressureRanking ranking = new PressureRanking();
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 1L << 40, ranking.view(now::get));
+        Object owner = new Object();
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
+        // LEGACY reads the clock in pump(); CUMULATIVE would not, so the injected failure needs LEGACY.
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner,
+                InetAddress.getLoopbackAddress(), null, clock, false, SessionResources.Accounting.LEGACY);
+        MultistreamSession.UpdateToken token = driver.registerUpdate(driver.openScope());
+        assertTrue(pool.reserved(owner) > 0, "the REALTIME slice is charged before the call");
+
+        armed.set(true);
+        List<SentPacket> handles = driver.submitCoveredBundle(frame(1), packets(2, 2),
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL,
+                    StreamSequencer.Fence.ORDINARY_CONTROL}, frame(1),
+                coverage(tokens(token), new ArrayList<MultistreamSession.UpdateToken>()));
+
+        assertFalse(armed.get(), "the injected failure was reached inside enqueue, not before it");
+        assertTrue(handles.isEmpty(), "a locally failed call returns no handle");
+        assertTrue(driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertEquals(0, pool.reserved(owner), "terminal cleanup released the run charge and the slice");
+        assertEquals(0, driver.queuedRecords(), "terminal cleanup emptied the queue");
+        assertFalse(driver.validateScopeToken(token), "the token is gone with the closed driver");
+        assertNull(driver.poll(stream -> true), "nothing is written after the local close");
+    }
+
     private static Map<Integer, Long> dependencies(Record.Dependency[] dependencies) {
         Map<Integer, Long> out = new java.util.TreeMap<Integer, Long>();
         for (Record.Dependency dependency : dependencies) {

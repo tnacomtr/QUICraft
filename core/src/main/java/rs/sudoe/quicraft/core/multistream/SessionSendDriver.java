@@ -1056,18 +1056,26 @@ public final class SessionSendDriver {
                 || memberCoverage == null) {
             throw new IllegalArgumentException("bundle");
         }
+        // Snapshot every input before validating: later caller mutations cannot change what this
+        // atomic assignment writes or which sequences its tokens resolve to. The scopes are copied
+        // once here and that exact copy serves validation and assignment alike.
+        StreamSequencer.Fence[] scopes = memberScopes.clone();
         int count = members.size();
-        if (memberScopes.length != count || memberCoverage.size() != count) {
+        if (scopes.length != count || memberCoverage.size() != count) {
             throw new IllegalArgumentException("bundle coverage");
         }
-        // Snapshot every input before validating: later caller mutations cannot change what this
-        // atomic assignment writes or which sequences its tokens resolve to.
         byte[] openingFrame = snapshotFrame(opening, "bundle opener");
         byte[] closingFrame = snapshotFrame(closing, "bundle closer");
         List<byte[]> frames = new ArrayList<byte[]>(count);
         long rawBytes = openingFrame.length + closingFrame.length;
+        // Complete GAME framing (13.4) of the opener, every member and the closer is checked here, before any
+        // sequence is taken. RecordCodec would reject the same bytes only after assignment, which would close the
+        // session instead of refusing the call.
+        validateGameFrame(openingFrame, "bundle opener");
+        validateGameFrame(closingFrame, "bundle closer");
         for (int i = 0; i < count; i++) {
             byte[] frame = snapshotFrame(members.get(i), "bundle member");
+            validateGameFrame(frame, "bundle member");
             frames.add(frame);
             rawBytes += frame.length;
         }
@@ -1097,8 +1105,8 @@ public final class SessionSendDriver {
             }
         }
         // Run shape, scopes, dependencies and encoded aggregate are all checked before assignment.
-        StreamSequencer.Fence bundleFence = StreamSequencer.bundleScope(memberScopes);
-        long unitBytes = sequencer.bundleWireBytes(openingFrame, frames, memberScopes, closingFrame);
+        StreamSequencer.Fence bundleFence = StreamSequencer.bundleScope(scopes);
+        long unitBytes = sequencer.bundleWireBytes(openingFrame, frames, scopes, closingFrame);
         if (sequencer.assigned()[CONTROL] + (long) count + 2 > StreamSequencer.MAX_SEQUENCE) {
             throw new IllegalArgumentException("sequence exhausted");
         }
@@ -1113,7 +1121,14 @@ public final class SessionSendDriver {
         if (unitBytes > maxRecordBytes) {
             throw new IllegalArgumentException("bundle run larger than maxRecordBytes");
         }
-        List<Record> records = sequencer.assignBundle(openingFrame, frames, memberScopes, closingFrame);
+        // Assignment is the one point of no return inside this call. From here on, sequences are consumed
+        // internally (the CONTROL sequence and the scope frontiers move) and the caller still gets no handle
+        // for a failed call. That internal consumption is deliberate terminal cleanup, not a partial write:
+        // every failure below closes the driver locally, which releases the run's single charge, drops the
+        // queue, clears the causal-scope and token state (AckJoinTracker.closeScopes) and writes nothing.
+        // Encoding cannot fail for a validated run: every frame passed RecordCodec.validateBody above, and the
+        // record header and length bounds are fixed by the 13.4 constants. The catch is a defensive net only.
+        List<Record> records = sequencer.assignBundle(openingFrame, frames, scopes, closingFrame);
         List<byte[]> encodings = new ArrayList<byte[]>(records.size());
         long runBytes = 0;
         try {
@@ -1122,6 +1137,9 @@ public final class SessionSendDriver {
                 runBytes += encoded.length;
                 encodings.add(encoded);
             }
+            // runBytes equals unitBytes exactly (same compact size formulas). Its check repeats the one above, and
+            // the owner, IP and account caps are fixed at construction, so this refusal is not reached while the
+            // node limit holds still. It is kept as a defensive 0x12 close and no test claims to cover it.
             if (!pool.admissible(account, runBytes)) {
                 closeCause = new IllegalStateException("covered bundle exceeds every applicable cap");
                 closeWith(CLOSE_RESOURCE);
@@ -1129,8 +1147,9 @@ public final class SessionSendDriver {
             }
             enqueueRun(records, encodings);
         } catch (RuntimeException failure) {
-            // Encoding, enqueue or pump failed after the run took sequences. The run cannot be
-            // completed consistently: close locally with the original cause; no token is consumed.
+            // Encoding, enqueue or pump (including its clock reading) failed after the run took sequences.
+            // The run cannot be completed consistently: close locally with the original cause. No token was
+            // consumed yet and the caller receives no handles.
             closeCause = failure;
             closeWith(CLOSE_RESOURCE);
             return result;
@@ -1170,6 +1189,21 @@ public final class SessionSendDriver {
             throw new IllegalArgumentException(what);
         }
         return frame.clone();
+    }
+
+    /**
+     * Checks that a snapshotted frame is one complete GAME body (13.4): a VarInt inner length of 1 to
+     * {@link RecordCodec#MAX_INNER_CONTENT} followed by exactly that many bytes. It applies RecordCodec's own rule
+     * unchanged, so a frame it would refuse after assignment is refused here before any sequence is taken.
+     *
+     * @throws IllegalArgumentException when the frame is not one complete GAME body
+     */
+    private static void validateGameFrame(byte[] frame, String what) {
+        try {
+            RecordCodec.validateBody(RecordCodec.KIND_GAME, frame, 0, frame.length, true);
+        } catch (MultistreamProtocolException malformed) {
+            throw new IllegalArgumentException(what + ": " + malformed.getMessage(), malformed);
+        }
     }
 
     /**
@@ -1243,6 +1277,10 @@ public final class SessionSendDriver {
         tokens.clear();
         byRecord.clear();
         toOffer.clear();
+        // Every queued reservation was just dropped, so the admission counters must not keep charging them.
+        // poll() refuses a closed driver and released()/failed() find no token, so nothing can decrement below zero.
+        queuedRecords = 0;
+        queuedBytes = 0;
         realtimeOrder.clear();
         orphans.clear();
         pendingAcks.clear();
