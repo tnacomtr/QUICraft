@@ -540,7 +540,8 @@ public final class NStreamSession implements MultistreamSession {
         Map<String, Extractor> result = new HashMap<String, Extractor>();
         for (String identifier : table.extractors().values()) {
             ExtractorRegistry.Decoder decoder = ExtractorRegistry.decoder(identifier);
-            if (decoder.kind == ExtractorRegistry.Kind.SINGLE) {
+            if (decoder.kind == ExtractorRegistry.Kind.SINGLE
+                    || decoder.kind == ExtractorRegistry.Kind.JOIN) {
                 result.put(identifier, decoder);
             }
         }
