@@ -698,6 +698,66 @@ public final class SessionSendDriver {
         return handle;
     }
 
+    // --- Causal-scope driver operations (U1, 13.19) ---
+    // These delegate to the tracker. The matching MultistreamSession defaults throw; NStreamSession
+    // wiring (wrapping longs in CausalScope/UpdateToken) is deferred to a later phase.
+
+    /** Opens a causal scope, returning its opaque id. No send-path integration (U1). */
+    public synchronized long openScope() {
+        if (closed || sealed) {
+            return 0;
+        }
+        return acks.openScope();
+    }
+
+    /** Registers an update token in the scope, returning its opaque id. No send-path integration (U1). */
+    public synchronized long registerUpdate(long scopeId) {
+        if (closed || sealed) {
+            return 0;
+        }
+        return acks.registerUpdate(scopeId);
+    }
+
+    /** Resolves a token by assignment, merging its frontier into the covering scope(s). */
+    public synchronized void assignScopeToken(long tokenId, int stream, long sequence) {
+        if (closed || sealed) {
+            return;
+        }
+        acks.assignScopeToken(tokenId, stream, sequence);
+    }
+
+    /** Suppresses a token: never assigned, no frontier. */
+    public synchronized void suppressUpdate(long tokenId) {
+        if (closed || sealed) {
+            return;
+        }
+        acks.suppressScopeToken(tokenId);
+    }
+
+    /** Completes a scope: the producer's explicit completeness event. */
+    public synchronized void completeScope(long scopeId) {
+        if (closed || sealed) {
+            return;
+        }
+        acks.completeScope(scopeId);
+    }
+
+    /** Registers a scope as covering an ack. */
+    public synchronized void coverScope(long ackId, long scopeId) {
+        if (closed || sealed) {
+            return;
+        }
+        acks.coverScope(ackId, scopeId);
+    }
+
+    /** Seals an ack's coverage membership: no more covering scopes will arise. */
+    public synchronized void sealAckCoverage(long ackId) {
+        if (closed || sealed) {
+            return;
+        }
+        acks.sealAckCoverage(ackId);
+    }
+
     /**
      * Assigns one bundle as one CONTROL run (13.15): the opening delimiter as a kind 4 record, every
      * member, then the closing delimiter. A bundle over 126 members or over B closes 0x11 locally and
@@ -840,6 +900,7 @@ public final class SessionSendDriver {
         realtimeOrder.clear();
         orphans.clear();
         pendingAcks.clear();
+        acks.closeScopes();
         disconnectRanking();
     }
 

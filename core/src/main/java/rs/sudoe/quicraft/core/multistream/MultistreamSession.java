@@ -24,6 +24,7 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
  * closed: the default throws {@link UnsupportedOperationException}.
  */
 public interface MultistreamSession {
+
     /** Attaches the game side, at most once, before or after {@link #activate}. */
     void bindGame(LaneGame game);
 
@@ -131,5 +132,128 @@ public interface MultistreamSession {
 
     default SentPacket finishBatch(long batchId, OutboundPacket join) {
         throw new UnsupportedOperationException("finishBatch");
+    }
+
+    // --- Causal scope API (U1, 13.19) ---
+
+    /**
+     * Opens a new causal scope and returns its opaque handle (U1, 13.19). The session allocates
+     * scope identities monotonically and never reuses them.
+     */
+    default CausalScope openScope() {
+        throw new UnsupportedOperationException("openScope");
+    }
+
+    /**
+     * Registers one update inside the live scope, returning an opaque token (U1, 13.19). The token
+     * is resolved by {@link #sendCovered} (assignment) or {@link #suppressUpdate} (suppression).
+     */
+    default UpdateToken registerUpdate(CausalScope scope) {
+        throw new UnsupportedOperationException("registerUpdate");
+    }
+
+    /**
+     * Submits one GAME packet covered by the registered update, resolving the token by assignment
+     * (U1, 13.19). The token is consumed: it can never later be suppressed or re-resolved.
+     */
+    default SentPacket sendCovered(UpdateToken token, ProtocolState state, int packetId, byte[] frame,
+            byte[] uncompressedPacket) {
+        throw new UnsupportedOperationException("sendCovered");
+    }
+
+    /**
+     * Removes the registered update from coverage: it has no wire frontier and is never awaited
+     * (U1, 13.19). Valid only for tokens that were never assigned.
+     */
+    default void suppressUpdate(UpdateToken token) {
+        throw new UnsupportedOperationException("suppressUpdate");
+    }
+
+    /**
+     * Marks a scope as complete, the explicit producer-completeness event (U1, 13.19). Accepted
+     * only after all registered tokens resolve; afterwards neither registration nor assignment is legal.
+     */
+    default void completeScope(CausalScope scope) {
+        throw new UnsupportedOperationException("completeScope");
+    }
+
+    /**
+     * Registers a live or completed scope as covering {@code ackId} (U1, 13.19). Callers must
+     * register every covering scope before ACK resolution.
+     */
+    default void coverScope(long ackId, CausalScope scope) {
+        throw new UnsupportedOperationException("coverScope");
+    }
+
+    /**
+     * Seals an ack's coverage membership: the producer declares no additional covering scopes will
+     * arise (U1, 13.19). Idempotent. {@code takeAck} resolution requires a sealed set plus all
+     * covering scopes complete; empty coverage alone never establishes readiness.
+     */
+    default void sealAckCoverage(long ackId) {
+        throw new UnsupportedOperationException("sealAckCoverage");
+    }
+
+    /**
+     * Opaque handle for one causal scope, allocated monotonically by the session and never reused
+     * (U1, 13.19). Carries no game coordinates or prediction numbers; identity is an internal token.
+     */
+    final class CausalScope {
+        private final long id;
+
+        CausalScope(long id) {
+            this.id = id;
+        }
+
+        long id() {
+            return id;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return this == o || (o instanceof CausalScope && id == ((CausalScope) o).id);
+        }
+
+        @Override
+        public int hashCode() {
+            return Long.hashCode(id);
+        }
+
+        @Override
+        public String toString() {
+            return "CausalScope{" + id + "}";
+        }
+    }
+
+    /**
+     * Opaque handle for one update registered inside a causal scope (U1, 13.19). Allocated
+     * monotonically per session and never reused. Once resolved by {@link #sendCovered} or
+     * {@link #suppressUpdate} it is consumed and cannot be reused or re-resolved.
+     */
+    final class UpdateToken {
+        private final long id;
+
+        UpdateToken(long id) {
+            this.id = id;
+        }
+
+        long id() {
+            return id;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return this == o || (o instanceof UpdateToken && id == ((UpdateToken) o).id);
+        }
+
+        @Override
+        public int hashCode() {
+            return Long.hashCode(id);
+        }
+
+        @Override
+        public String toString() {
+            return "UpdateToken{" + id + "}";
+        }
     }
 }

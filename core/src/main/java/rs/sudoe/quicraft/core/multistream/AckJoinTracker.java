@@ -33,11 +33,30 @@ public final class AckJoinTracker {
     public static final int MAX_BYTES = 64 * 1024;
     /** Pending deadline measured from creation on the monotonic transport clock (13.19). */
     public static final long DEADLINE_NANOS = 10_000_000_000L;
+    /** Max live (open or completed, not retired) causal scopes per connection (U1, 13.19). */
+    public static final int MAX_SCOPES = 128;
+    /** Max scopes covering one ack, bounding per-ack membership (U1, 13.19). */
+    private static final int MAX_COVER_PER_ACK = 128;
 
     private final Map<Long, Pending> pending = new LinkedHashMap<Long, Pending>();
     private final Map<Long, Set<Long>> waiters = new HashMap<Long, Set<Long>>();
     private int bytes;
     private long droppedCount;
+
+    /** Live causal scopes by monotonic id (U1, 13.19). */
+    private final Map<Long, Scope> scopes = new HashMap<Long, Scope>();
+    /** Token id to owning scope id (U1, 13.19). */
+    private final Map<Long, Long> tokenScope = new HashMap<Long, Long>();
+    /** Ack id to set of covering scope ids (U1, 13.19). */
+    private final Map<Long, Set<Long>> ackScopes = new HashMap<Long, Set<Long>>();
+    /** Scope id to set of ack ids that cover it, for retirement (U1, 13.19). */
+    private final Map<Long, Set<Long>> scopeAcks = new HashMap<Long, Set<Long>>();
+    /** Ack ids whose coverage membership is sealed (U1, 13.19). */
+    private final Set<Long> sealedAcks = new HashSet<Long>();
+    /** Monotonic scope id allocator, never reused (U1, 13.19). */
+    private long nextScopeId = 1;
+    /** Monotonic token id allocator, never reused (U1, 13.19). */
+    private long nextTokenId = 1;
 
     /** One ack ready for sequencing, with its dependencies in the sender's logical order (13.19). */
     public static final class Ready {
@@ -174,11 +193,17 @@ public final class AckJoinTracker {
      * carries the ack's frontier plus the CONTROL frontier snapshot at the logical point, which 13.19
      * takes conservatively. An inexact ack uses {@code safeSuperset} (see
      * {@link StreamSequencer#safeSupersetDependencies()}).
+     *
+     * <p>Scope coverage gates resolution (U1, 13.19): if any scopes cover this ack, coverage must be
+     * sealed and every covering scope complete. Empty scope membership alone never establishes readiness.
      */
     public synchronized Ready take(long id, long nowNanos, long controlFrontier,
             Record.Dependency[] safeSuperset) {
         Pending value = pending.get(id);
         if (value == null) {
+            return null;
+        }
+        if (!isScopeReady(id)) {
             return null;
         }
         if (!value.unassigned.isEmpty()) {
@@ -187,10 +212,12 @@ public final class AckJoinTracker {
             }
             return null;
         }
+        mergeScopeFrontiers(id, value);
         Record.Dependency[] result = resolve(value, controlFrontier, safeSuperset);
         forgetWaiters(id, value);
         pending.remove(id);
         bytes -= value.size;
+        retireScopes(id);
         return new Ready(id, result);
     }
 
@@ -199,13 +226,18 @@ public final class AckJoinTracker {
      * whose coverage is complete are returned as ready so the caller can sequence them in the old
      * state and epoch. The others are dropped and counted. Every entry is removed; nothing carries
      * across the transition.
+     *
+     * <p>Scope coverage is checked at the same gate (U1, 13.19): only acks whose covering scopes are
+     * sealed and complete resolve; others are dropped. All scope state is cleared here.
      */
     public synchronized List<Ready> settleForTransition(long controlFrontier, Record.Dependency[] safeSuperset) {
         List<Ready> ready = new ArrayList<Ready>();
         for (Map.Entry<Long, Pending> entry : new ArrayList<Map.Entry<Long, Pending>>(pending.entrySet())) {
+            long id = entry.getKey();
             Pending value = entry.getValue();
-            if (value.unassigned.isEmpty()) {
-                ready.add(new Ready(entry.getKey(), resolve(value, controlFrontier, safeSuperset)));
+            if (value.unassigned.isEmpty() && isScopeReady(id)) {
+                mergeScopeFrontiers(id, value);
+                ready.add(new Ready(id, resolve(value, controlFrontier, safeSuperset)));
             } else {
                 droppedCount++;
             }
@@ -213,6 +245,7 @@ public final class AckJoinTracker {
         pending.clear();
         waiters.clear();
         bytes = 0;
+        closeScopes();
         return ready;
     }
 
@@ -225,18 +258,21 @@ public final class AckJoinTracker {
         List<Ready> ready = new ArrayList<Ready>();
         for (Iterator<Map.Entry<Long, Pending>> it = pending.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<Long, Pending> entry = it.next();
+            long id = entry.getKey();
             Pending value = entry.getValue();
             if (!expired(value, nowNanos)) {
                 continue;
             }
-            if (value.unassigned.isEmpty()) {
-                ready.add(new Ready(entry.getKey(), resolve(value, controlFrontier, safeSuperset)));
+            if (value.unassigned.isEmpty() && isScopeReady(id)) {
+                mergeScopeFrontiers(id, value);
+                ready.add(new Ready(id, resolve(value, controlFrontier, safeSuperset)));
             } else {
                 droppedCount++;
             }
-            forgetWaiters(entry.getKey(), value);
+            forgetWaiters(id, value);
             bytes -= value.size;
             it.remove();
+            retireScopes(id);
         }
         return ready;
     }
@@ -254,6 +290,230 @@ public final class AckJoinTracker {
     /** Number of acks dropped by deadline or transition, a counter without packet contents (13.19). */
     public synchronized long droppedCount() {
         return droppedCount;
+    }
+
+    // --- Causal scope tracking (U1, 13.19) ---
+
+    /** Number of live (open or completed, not retired) scopes. */
+    public synchronized int scopeCount() {
+        return scopes.size();
+    }
+
+    /**
+     * Opens a new causal scope and returns its opaque id (U1, 13.19). The id is monotonic per
+     * session and never reused. Throws {@link IllegalStateException} when the cap is exceeded.
+     */
+    public synchronized long openScope() {
+        if (scopes.size() >= MAX_SCOPES) {
+            throw new IllegalStateException("scope cap");
+        }
+        long id = nextScopeId++;
+        scopes.put(id, new Scope(id));
+        return id;
+    }
+
+    /**
+     * Registers one update in the live scope, returning its opaque token id (U1, 13.19). The
+     * token is resolved by {@link #assignScopeToken} or {@link #suppressScopeToken}. Throws for an
+     * unknown or completed scope.
+     */
+    public synchronized long registerUpdate(long scopeId) {
+        Scope scope = scopes.get(scopeId);
+        if (scope == null) {
+            throw new IllegalArgumentException("unknown scope");
+        }
+        if (scope.complete) {
+            throw new IllegalArgumentException("scope complete");
+        }
+        long token = nextTokenId++;
+        scope.tokens.add(token);
+        scope.unresolved.add(token);
+        tokenScope.put(token, scopeId);
+        return token;
+    }
+
+    /**
+     * Resolves a scope token by assignment to {@code stream/sequence} (U1, 13.19). The token's
+     * frontier is merged into its scope. Throws for an unknown, retired or already-resolved token,
+     * or for a completed scope: assigned updates can never later be suppressed.
+     */
+    public synchronized void assignScopeToken(long tokenId, int stream, long sequence) {
+        if (stream < 0 || sequence <= 0) {
+            throw new IllegalArgumentException("coverage");
+        }
+        Long scopeId = tokenScope.get(tokenId);
+        if (scopeId == null) {
+            throw new IllegalArgumentException("unknown token");
+        }
+        Scope scope = scopes.get(scopeId);
+        if (scope == null) {
+            throw new IllegalArgumentException("scope retired");
+        }
+        if (scope.complete) {
+            throw new IllegalArgumentException("scope complete");
+        }
+        if (!scope.unresolved.remove(tokenId)) {
+            throw new IllegalArgumentException("token already resolved");
+        }
+        scope.merge(stream, sequence);
+    }
+
+    /**
+     * Removes a suppression-only token from its scope: it has no wire frontier and is never
+     * awaited (U1, 13.19). Throws for an unknown, retired or already-resolved token, or for a
+     * completed scope. Suppression is valid only for genuinely unassigned tokens.
+     */
+    public synchronized void suppressScopeToken(long tokenId) {
+        Long scopeId = tokenScope.get(tokenId);
+        if (scopeId == null) {
+            throw new IllegalArgumentException("unknown token");
+        }
+        Scope scope = scopes.get(scopeId);
+        if (scope == null) {
+            throw new IllegalArgumentException("scope retired");
+        }
+        if (scope.complete) {
+            throw new IllegalArgumentException("scope complete");
+        }
+        if (!scope.unresolved.remove(tokenId)) {
+            throw new IllegalArgumentException("token already resolved");
+        }
+    }
+
+    /**
+     * Marks a live scope as complete, the explicit producer-completeness event (U1, 13.19).
+     * Throws if any registered token is still unresolved; afterwards neither registration nor
+     * assignment is legal for that scope.
+     */
+    public synchronized void completeScope(long scopeId) {
+        Scope scope = scopes.get(scopeId);
+        if (scope == null) {
+            throw new IllegalArgumentException("unknown scope");
+        }
+        if (scope.complete) {
+            throw new IllegalArgumentException("scope complete");
+        }
+        if (!scope.unresolved.isEmpty()) {
+            throw new IllegalArgumentException("unresolved tokens");
+        }
+        scope.complete = true;
+    }
+
+    /**
+     * Registers a live or completed scope as covering a pending ack (U1, 13.19). The scope retains
+     * its assigned frontier. A duplicate cover is a no-op. Throws for an unknown ack or scope.
+     */
+    public synchronized void coverScope(long ackId, long scopeId) {
+        Pending ack = pending.get(ackId);
+        if (ack == null) {
+            throw new IllegalArgumentException("unknown ack");
+        }
+        Scope scope = scopes.get(scopeId);
+        if (scope == null) {
+            throw new IllegalArgumentException("unknown scope");
+        }
+        Set<Long> covered = ackScopes.get(ackId);
+        if (covered == null) {
+            covered = new HashSet<Long>();
+            ackScopes.put(ackId, covered);
+        }
+        if (covered.size() >= MAX_COVER_PER_ACK) {
+            throw new IllegalStateException("ack scope cap");
+        }
+        if (covered.add(scopeId)) {
+            scopeAcks.computeIfAbsent(scopeId, k -> new HashSet<Long>()).add(ackId);
+        }
+    }
+
+    /**
+     * Seals an ack's coverage membership: the producer declares no additional covering scopes will
+     * arise (U1, 13.19). Idempotent. Throws for an unknown ack.
+     */
+    public synchronized void sealAckCoverage(long ackId) {
+        Pending ack = pending.get(ackId);
+        if (ack == null) {
+            throw new IllegalArgumentException("unknown ack");
+        }
+        sealedAcks.add(ackId);
+    }
+
+    /**
+     * Drops all causal-scope state (U1, 13.19). Called by the driver on session close. IDs are
+     * not reset: monotonicity is per-session, not per-state.
+     */
+    public synchronized void closeScopes() {
+        scopes.clear();
+        tokenScope.clear();
+        ackScopes.clear();
+        scopeAcks.clear();
+        sealedAcks.clear();
+    }
+
+    /**
+     * True when an ack's scope coverage, if any, is ready: sealed and every covering scope
+     * complete (U1, 13.19). No-scope acks are always ready at this check.
+     */
+    private boolean isScopeReady(long ackId) {
+        Set<Long> scopeIds = ackScopes.get(ackId);
+        if (scopeIds == null || scopeIds.isEmpty()) {
+            return true;
+        }
+        if (!sealedAcks.contains(ackId)) {
+            return false;
+        }
+        for (Long scopeId : scopeIds) {
+            Scope scope = scopes.get(scopeId);
+            if (scope == null || !scope.complete) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Merges every covering scope's assigned frontier into the ack's pending frontier (U1, 13.19).
+     * Idempotent: scopes are immutable once complete, so repeated merges take the max.
+     */
+    private void mergeScopeFrontiers(long ackId, Pending value) {
+        Set<Long> scopeIds = ackScopes.get(ackId);
+        if (scopeIds == null) {
+            return;
+        }
+        for (Long scopeId : scopeIds) {
+            Scope scope = scopes.get(scopeId);
+            if (scope != null) {
+                for (Map.Entry<Integer, Long> entry : scope.frontier.entrySet()) {
+                    value.merge(entry.getKey(), entry.getValue());
+                }
+            }
+        }
+    }
+
+    /**
+     * Retires an ack's covering scopes after the ack is resolved or dropped (U1, 13.19). A scope
+     * whose last covering ack has cleared is removed entirely, and its tokens become foreign (rejected).
+     */
+    private void retireScopes(long ackId) {
+        Set<Long> scopeIds = ackScopes.remove(ackId);
+        sealedAcks.remove(ackId);
+        if (scopeIds == null) {
+            return;
+        }
+        for (Long scopeId : scopeIds) {
+            Set<Long> ackSet = scopeAcks.get(scopeId);
+            if (ackSet != null) {
+                ackSet.remove(ackId);
+                if (ackSet.isEmpty()) {
+                    scopeAcks.remove(scopeId);
+                    Scope scope = scopes.remove(scopeId);
+                    if (scope != null) {
+                        for (Long token : scope.tokens) {
+                            tokenScope.remove(token);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private Record.Dependency[] resolve(Pending value, long controlFrontier, Record.Dependency[] safeSuperset) {
@@ -291,6 +551,7 @@ public final class AckJoinTracker {
         pending.remove(id);
         bytes -= value.size;
         droppedCount++;
+        retireScopes(id);
     }
 
     private void forgetWaiters(long id, Pending value) {
@@ -327,6 +588,26 @@ public final class AckJoinTracker {
         Pending(int size, long createdNanos) {
             this.size = size;
             this.createdNanos = createdNanos;
+        }
+
+        void merge(int stream, long sequence) {
+            mergeInto(frontier, stream, sequence);
+        }
+    }
+
+    /**
+     * One causal scope: a monotonic id, its registered tokens, those still unresolved, and the
+     * frontier merged from assigned tokens (U1, 13.19). Suppressed tokens contribute no frontier.
+     */
+    private static final class Scope {
+        final long id;
+        boolean complete;
+        final Set<Long> tokens = new HashSet<Long>();
+        final Set<Long> unresolved = new HashSet<Long>();
+        final TreeMap<Integer, Long> frontier = new TreeMap<Integer, Long>();
+
+        Scope(long id) {
+            this.id = id;
         }
 
         void merge(int stream, long sequence) {
