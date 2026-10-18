@@ -28,12 +28,28 @@ import rs.sudoe.quicraft.testkit.Args;
  * rejected or missing {@code /3} arm is printed without a median. The process exit status is 0 only
  * when every requested profile has a verified TCP, {@code /2} and {@code /3} cell and every
  * measured run is usable evidence; 1 if any measured run is incompatible, malformed, failed or
- * disconnected, or if {@code /3} evidence is present but invalid; 2 while {@code /3} evidence is
- * absent, which is the expected state before U3.
+ * disconnected, if a successful run carries an impossible metric value, if an artifact carries no
+ * usable netem profile, or if {@code /3} evidence is present but invalid; 2 while {@code /3}
+ * evidence is absent, which is the expected state before U3.
+ *
+ * <p>An artifact that cannot be attributed to a netem profile is never dropped silently: the rest of
+ * the directory would then pass with part of its evidence missing. Only a known profile that the
+ * caller did not request is ignored. A successful run that took no ping sample keeps the bench's
+ * {@code rttMedianMs=-1}; that is unavailable RTT evidence, so its cell is reported as not run and
+ * never as a median.
  */
 public final class MatrixSummarize {
     /** The six profiles defined by testkit/netem/profiles.sh. */
     public static final String DEFAULT_PROFILES = "clean loss delay delayloss reorder jitter";
+
+    /**
+     * Profiles this command can compare. An artifact outside this set is only usable when the
+     * caller requested its profile explicitly; otherwise it is unclassifiable evidence.
+     */
+    private static final Set<String> KNOWN_PROFILES = Set.of(DEFAULT_PROFILES.split(" "));
+
+    /** The bench writes this {@code rttMedianMs} for a successful run that took no ping sample. */
+    private static final double RTT_UNAVAILABLE = -1;
 
     private static final Gson GSON = new Gson();
 
@@ -43,12 +59,24 @@ public final class MatrixSummarize {
     /** Flags that classify and gate a run; Gson would otherwise default a missing one to false. */
     private static final List<String> REQUIRED_FLAGS = List.of("warmup", "ok", "disconnected");
 
-    private record Metric(String label, ToDoubleFunction<RunResult> value) {}
+    /**
+     * One metric column. {@code unavailableWhenNegative} is true only for play RTT: the bench writes
+     * {@code -1} when a successful run took no ping sample, while a completed join and chunk load can
+     * never be negative.
+     */
+    private record Metric(String label, ToDoubleFunction<RunResult> value, boolean unavailableWhenNegative) {
+        /** Why a cell with successful runs has no sample for this metric. */
+        String absentDetail() {
+            return unavailableWhenNegative
+                    ? "RTT unavailable in every successful run (rttMedianMs=" + (int) RTT_UNAVAILABLE + ")"
+                    : "no usable " + label + " values";
+        }
+    }
 
     private static final List<Metric> METRICS = List.of(
-            new Metric("join (ms)", RunResult::joinMs),
-            new Metric("chunk load (ms)", RunResult::chunkLoadMs),
-            new Metric("play RTT (ms)", RunResult::rttMedianMs));
+            new Metric("join (ms)", RunResult::joinMs, false),
+            new Metric("chunk load (ms)", RunResult::chunkLoadMs, false),
+            new Metric("play RTT (ms)", RunResult::rttMedianMs, true));
 
     private MatrixSummarize() {}
 
@@ -67,7 +95,9 @@ public final class MatrixSummarize {
         }
         int incompatibleRuns = 0;
         int malformedRuns = 0;
+        int invalidMetricRuns = 0;
         int invalidFiles = 0;
+        int unclassifiedFiles = 0;
         List<RunResult> all = new ArrayList<>();
 
         try (Stream<Path> files = Files.walk(dir)) {
@@ -84,7 +114,15 @@ public final class MatrixSummarize {
                     continue;
                 }
                 String profile = profileOf(doc);
-                if (profile == null || !wanted.contains(profile)) {
+                if (profile == null || profile.isBlank()
+                        || (!wanted.contains(profile) && !KNOWN_PROFILES.contains(profile))) {
+                    // An artifact whose profile cannot be attributed cannot be compared, and
+                    // dropping it would let the rest of the directory pass with evidence missing.
+                    unclassifiedFiles++;
+                    continue;
+                }
+                if (!wanted.contains(profile)) {
+                    // A known profile the caller did not request makes no claim here.
                     continue;
                 }
                 for (JsonElement element : doc.getAsJsonArray("runs")) {
@@ -105,13 +143,27 @@ public final class MatrixSummarize {
                         incompatibleRuns++;
                         continue;
                     }
+                    if (run.ok() && !run.disconnected() && !hasUsableMetrics(run)) {
+                        // A successful join cannot have a negative duration, and the only negative
+                        // RTT the bench records is its "no ping sample" sentinel. Dropping the run
+                        // would shrink a sample while the rest of the matrix still looked valid.
+                        invalidMetricRuns++;
+                        continue;
+                    }
                     byProfile.get(profile).add(run);
                     all.add(run);
                 }
             }
         }
         if (all.isEmpty()) {
-            System.err.println("no classified measured runs under " + dir);
+            System.err.println("no usable measured runs under " + dir);
+            if (incompatibleRuns + malformedRuns + invalidMetricRuns + invalidFiles
+                    + unclassifiedFiles > 0) {
+                System.err.println("rejected evidence: incompatible=" + incompatibleRuns
+                        + " malformed=" + malformedRuns + " invalidMetrics=" + invalidMetricRuns
+                        + " unreadableArtifacts=" + invalidFiles
+                        + " unclassifiedArtifacts=" + unclassifiedFiles);
+            }
             return 1;
         }
 
@@ -128,14 +180,14 @@ public final class MatrixSummarize {
 
         boolean anyFailClosed = rows.stream()
                 .anyMatch(row -> row.quic3().status() == ComparisonRow.Status.FAIL_CLOSED);
-        boolean artifactsValid = invalidFiles == 0;
+        boolean artifactsValid = invalidFiles == 0 && unclassifiedFiles == 0;
         long failedRuns = all.stream().filter(run -> !run.ok()).count();
         long disconnects = all.stream().filter(RunResult::disconnected).count();
         long inconsistent = all.stream().filter(run -> run.ok() && run.disconnected()).count();
         // A disconnect means the join did not survive the bench window, so an ok flag alongside it
         // is contradictory evidence. Either way the matrix may not pass.
         boolean rejected = !artifactsValid || incompatibleRuns > 0 || malformedRuns > 0
-                || failedRuns > 0 || disconnects > 0;
+                || invalidMetricRuns > 0 || failedRuns > 0 || disconnects > 0;
         boolean complete = rows.stream().allMatch(row -> row.tcp().status() == ComparisonRow.Status.VERIFIED
                 && row.quic2().status() == ComparisonRow.Status.VERIFIED
                 && row.quic3().status() == ComparisonRow.Status.VERIFIED);
@@ -157,12 +209,17 @@ public final class MatrixSummarize {
         if (invalidFiles > 0) {
             md.append("Unreadable JSON files skipped: ").append(invalidFiles).append('\n');
         }
-        if (incompatibleRuns > 0 || malformedRuns > 0 || inconsistent > 0) {
+        if (unclassifiedFiles > 0) {
+            md.append("Unclassifiable artifacts: ").append(unclassifiedFiles)
+                    .append(" (no usable netem profile)\n");
+        }
+        if (incompatibleRuns > 0 || malformedRuns > 0 || inconsistent > 0 || invalidMetricRuns > 0) {
             md.append("Rejected measured runs: ")
-                    .append(incompatibleRuns + malformedRuns + inconsistent)
+                    .append(incompatibleRuns + malformedRuns + inconsistent + invalidMetricRuns)
                     .append(" (incompatible schema or transport: ").append(incompatibleRuns)
                     .append(", missing required fields: ").append(malformedRuns)
                     .append(", success reported after a disconnect: ").append(inconsistent)
+                    .append(", impossible metric values: ").append(invalidMetricRuns)
                     .append(")\n");
         }
         md.append("Failed measured runs: ").append(failedRuns)
@@ -235,18 +292,35 @@ public final class MatrixSummarize {
         return label;
     }
 
+    /**
+     * True when a successful run carries plausible metrics. A completed join and chunk load cannot
+     * be negative, and the only negative RTT the bench writes is {@link #RTT_UNAVAILABLE} for a run
+     * that took no ping sample.
+     */
+    private static boolean hasUsableMetrics(RunResult run) {
+        return run.joinMs() >= 0 && run.chunkLoadMs() >= 0
+                && (run.rttMedianMs() >= 0 || run.rttMedianMs() == RTT_UNAVAILABLE);
+    }
+
     private static ComparisonRow.Cell measured(List<RunResult> runs, TransportVersion version, Metric metric) {
         List<RunResult> matching = runs.stream().filter(run -> run.transportVersion() == version).toList();
         if (matching.isEmpty()) {
             return ComparisonRow.Cell.notRun(version, "no measured runs");
         }
-        double[] values = matching.stream()
+        List<RunResult> successful = matching.stream()
                 .filter(run -> run.ok() && !run.disconnected())
+                .toList();
+        if (successful.isEmpty()) {
+            return ComparisonRow.Cell.notRun(version, "no successful runs");
+        }
+        double[] values = successful.stream()
                 .mapToDouble(metric.value())
                 .filter(value -> value >= 0)
                 .toArray();
         if (values.length == 0) {
-            return ComparisonRow.Cell.notRun(version, "no successful runs");
+            // No median here: -1 RTT means the run took no sample, and a negative time would
+            // otherwise have been rejected as invalid evidence before reaching this point.
+            return ComparisonRow.Cell.notRun(version, metric.absentDetail());
         }
         return ComparisonRow.Cell.verified(version, BenchClient.median(values), values.length,
                 "median of successful runs");
@@ -292,14 +366,21 @@ public final class MatrixSummarize {
             }
         }
 
-        double[] values = matching.stream()
+        List<RunResult> successful = matching.stream()
                 .filter(run -> run.ok() && !run.disconnected())
+                .toList();
+        double[] values = successful.stream()
                 .mapToDouble(metric.value())
                 .filter(value -> value >= 0)
                 .toArray();
         if (values.length == 0) {
-            return ComparisonRow.Cell.failClosed(TransportVersion.QUIC_3,
-                    "no successful /3 values for this metric");
+            // A /3 run with no RTT sample is verified evidence with that metric unavailable, not
+            // invalid evidence; join and chunk load cannot be negative, so their absence stays
+            // fail-closed.
+            return metric.unavailableWhenNegative()
+                    ? ComparisonRow.Cell.notRun(TransportVersion.QUIC_3, metric.absentDetail())
+                    : ComparisonRow.Cell.failClosed(TransportVersion.QUIC_3,
+                            "no successful /3 values for this metric");
         }
         return ComparisonRow.Cell.verified(TransportVersion.QUIC_3, BenchClient.median(values), values.length,
                 "R=" + digest.substring(0, 12) + " schema=" + routingSchema + " streams=" + streams

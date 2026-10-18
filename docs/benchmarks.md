@@ -922,6 +922,13 @@ with one cell for each transport: TCP, QUIC `/2`, QUIC `/3`. A cell is `verified
 at least one successful measured value. A missing or rejected arm is printed as `not run` or
 `fail-closed` and carries no number.
 
+A measured run that cannot be attributed to one of the six profiles is unclassifiable evidence and
+fails the gate; only a known profile the caller did not request is ignored. A successful run that
+reports a negative `joinMs` or `chunkLoadMs` is rejected as impossible evidence instead of being
+dropped from the sample, so the matrix fails closed. `rttMedianMs` is different: `-1` records a
+successful run that took no ping sample, so a cell with no valid RTT sample is printed as `not run`
+and never as a median, and a verified RTT cell reports the number of valid samples it used.
+
 The `/3` cell is fail-closed. It may be `verified` only when every contributing `/3` run satisfies
 all of these:
 
@@ -959,6 +966,6 @@ the Phase 0 parameters and delegates measurement and container cleanup to
 `matrix-summarize` exits `0` only when every requested profile has verified TCP, `/2` and `/3`
 cells and every measured run is usable evidence. It exits `1` when `/3` evidence is rejected, a
 measured run failed or disconnected, a measured run comes from a different schema, a required
-metric field is missing, or an artifact could not be read. It exits `2` while `/3` evidence is
-absent, which is the expected state before U3. The presence of `/2` results never turns that `2`
-into a pass.
+metric field is missing, a successful run reports an impossible metric value, or an artifact could
+not be read or carries no usable netem profile. It exits `2` while `/3` evidence is absent, which
+is the expected state before U3. The presence of `/2` results never turns that `2` into a pass.

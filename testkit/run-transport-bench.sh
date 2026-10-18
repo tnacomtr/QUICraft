@@ -11,6 +11,8 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
+# shellcheck source=lib/git-state.sh
+. "$here/lib/git-state.sh"
 
 RUNS="${RUNS:-20}"
 WARMUP="${WARMUP:-1}"
@@ -36,7 +38,7 @@ for _ in $(seq 1 60); do [[ -s "$here/results/transport-fp.txt" ]] && break; sle
 {
     echo "started: $stamp"
     echo "runs=$RUNS warmup=$WARMUP profiles=[$PROFILES] play_ms=$PLAY_MS"
-    echo "git: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo none)$(git -C "$root" diff --quiet 2>/dev/null || echo ' (dirty)')"
+    echo "git: $(git_state "$root")"
     echo "kernel: $(uname -r)"
     echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
 } > "$results/environment.txt"

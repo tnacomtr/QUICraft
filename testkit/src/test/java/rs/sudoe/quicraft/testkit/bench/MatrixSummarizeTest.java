@@ -229,6 +229,118 @@ class MatrixSummarizeTest {
     }
 
     @Test
+    void anArtifactWithNoUsableProfileFailsClosedEvenWithCompleteCells() throws IOException {
+        completeCleanCells();
+        // Valid cells alone would pass; an artifact the summarizer cannot attribute must not
+        // disappear, or the directory would pass with part of its evidence missing.
+        writeUnprofiled("orphan.json", RunFixtures.tcp(11, 110, 1));
+        write("mystery.json", "mystery-tcp", "mystery", RunFixtures.tcp(12, 120, 1));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("Unclassifiable artifacts: 2 (no usable netem profile)"), text);
+        assertTrue(text.contains("Matrix /3 gate: FAIL-CLOSED"), text);
+        assertFalse(text.contains("Matrix /3 gate: PASS"), text);
+    }
+
+    @Test
+    void aKnownProfileTheCallerDidNotRequestIsStillIgnored() throws IOException {
+        completeCleanCells();
+        write("loss.json", "loss-tcp", "loss",
+                RunFixtures.tcp(11, 110, 1),
+                RunFixtures.tcp(12, 120, 2));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(0, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("Matrix /3 gate: PASS"), text);
+        assertFalse(text.contains("Unclassifiable artifacts"), text);
+    }
+
+    @Test
+    void aSuccessfulRunWithANegativeTimeFailsClosedInsteadOfShrinkingTheSample() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, 1),
+                RunFixtures.tcp(-5, 200, 2));
+        write("clean-quic.json", "clean-quic", "clean",
+                RunFixtures.quic2(30, -1, 3));
+        write("clean-quic3.json", "clean-quic3", "clean",
+                RunFixtures.quic3(50, 500, 5));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("impossible metric values: 2"), text);
+        assertTrue(text.contains("Matrix /3 gate: FAIL-CLOSED"), text);
+        assertFalse(text.contains("Matrix /3 gate: PASS"), text);
+        String join = line(text, "| clean | join (ms) |");
+        assertTrue(join.contains("10.0 (n=1)"), join);
+        assertFalse(join.contains("-5.0"), join);
+        String chunk = line(text, "| clean | chunk load (ms) |");
+        assertTrue(chunk.contains("100.0 (n=1)"), chunk);
+        assertFalse(chunk.contains("-1.0"), chunk);
+    }
+
+    @Test
+    void anRttBelowTheUnavailableSentinelIsInvalidEvidence() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, -2));
+        write("clean-quic.json", "clean-quic", "clean", RunFixtures.quic2(30, 300, 3));
+        write("clean-quic3.json", "clean-quic3", "clean", RunFixtures.quic3(50, 500, 5));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("impossible metric values: 1"), text);
+        assertTrue(text.contains("Matrix /3 gate: FAIL-CLOSED"), text);
+    }
+
+    @Test
+    void anRttOnlyMinusOneCellIsUnavailableAndNeverAVerifiedMedian() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, -1));
+        write("clean-quic.json", "clean-quic", "clean", RunFixtures.quic2(30, 300, -1));
+        write("clean-quic3.json", "clean-quic3", "clean", RunFixtures.quic3(50, 500, -1));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        // Join and chunk load verify; RTT has no sample, so the matrix stays incomplete.
+        assertEquals(2, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        String rtt = line(text, "| clean | play RTT (ms) |");
+        assertTrue(rtt.contains("not run (RTT unavailable in every successful run (rttMedianMs=-1))"), rtt);
+        assertFalse(rtt.contains("(n="), rtt);
+        assertTrue(text.contains("Matrix /3 gate: INCOMPLETE"), text);
+        assertFalse(text.contains("Matrix /3 gate: PASS"), text);
+    }
+
+    @Test
+    void anRttMedianWithOneValidSampleReportsThatSampleCount() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, -1),
+                RunFixtures.tcp(20, 200, 40));
+        write("clean-quic.json", "clean-quic", "clean", RunFixtures.quic2(30, 300, 30));
+        write("clean-quic3.json", "clean-quic3", "clean", RunFixtures.quic3(50, 500, 50));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(0, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        String rtt = line(text, "| clean | play RTT (ms) |");
+        assertTrue(rtt.contains("40.0 (n=1)"), rtt);
+        assertTrue(text.contains("Matrix /3 gate: PASS"), text);
+    }
+
+    @Test
     void profileOfPrefersTheBaseNetemProfileAndFallsBackForLegacyFiles() {
         JsonObject current = new JsonObject();
         current.addProperty("profile", "clean-tcp");
@@ -248,10 +360,24 @@ class MatrixSummarizeTest {
         assertEquals("delayloss", MatrixSummarize.baseProfile("delayloss"));
     }
 
+    /** One verified run per transport, enough for a complete and passing {@code clean} matrix. */
+    private void completeCleanCells() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, 1));
+        write("clean-quic.json", "clean-quic", "clean", RunFixtures.quic2(30, 300, 3));
+        write("clean-quic3.json", "clean-quic3", "clean", RunFixtures.quic3(50, 500, 5));
+    }
+
     private void write(String file, String profile, String netemProfile, RunResult... runs) throws IOException {
         JsonObject doc = new JsonObject();
         doc.addProperty("profile", profile);
         doc.addProperty("netemProfile", netemProfile);
+        doc.add("runs", GSON.toJsonTree(runs));
+        Files.writeString(dir.resolve(file), GSON.toJson(doc), StandardCharsets.UTF_8);
+    }
+
+    /** Writes a result file with no profile fields, like a truncated or hand-edited artifact. */
+    private void writeUnprofiled(String file, RunResult... runs) throws IOException {
+        JsonObject doc = new JsonObject();
         doc.add("runs", GSON.toJsonTree(runs));
         Files.writeString(dir.resolve(file), GSON.toJson(doc), StandardCharsets.UTF_8);
     }
