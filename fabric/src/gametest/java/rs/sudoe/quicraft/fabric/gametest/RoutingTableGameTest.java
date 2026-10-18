@@ -46,6 +46,11 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * a module version bump to another protocol fails loudly too. Rows that test the same jar on another
  * release through a {@code -P<module>.minecraft} override skip visibly instead.
  *
+ * <p>A refresh run ({@code -Pquicraft.emitPlayIds}) emits even when the live protocol differs from
+ * {@link #PROTOCOL}, so a protocol bump can be captured before the constant, the routing resource
+ * and core's expected inventory are updated; it writes {@code play-ids-<live>.txt} in that case.
+ * The pins (shipped table and checked-in inventory) are skipped in a refresh run.
+ *
  * <p>With {@code -Pquicraft.emitPlayIds} (system property {@code quicraft.gametest.emitPlayIds}, see
  * docs/platforms/fabric.md) it writes and prints the full inventory of both directions, one
  * {@code <direction> <id> <name>} line per packet sorted by id. That is how the fixture is
@@ -59,8 +64,8 @@ public class RoutingTableGameTest implements FabricClientGameTest {
     private static final String INVENTORY_RESOURCE =
             "rs/sudoe/quicraft/core/routing/play-ids-" + PROTOCOL + ".txt";
 
-    /** The same file from the repository root, for the refresh command. */
-    private static final String FIXTURE_PATH = "core/src/test/resources/" + INVENTORY_RESOURCE;
+    /** Where a refresh run writes an inventory, from the repository root. */
+    private static final String INVENTORY_DIR = "core/src/test/resources/rs/sudoe/quicraft/core/routing";
 
     /** Makes the test emit the inventory: -Pquicraft.emitPlayIds=true (default path) or a file path. */
     private static final String EMIT_PROPERTY = "quicraft.gametest.emitPlayIds";
@@ -70,9 +75,6 @@ public class RoutingTableGameTest implements FabricClientGameTest {
      * {@code -P<module>.minecraft} override. True means a protocol change is a stale fixture.
      */
     private static final String PINNED_PROPERTY = "quicraft.gametest.pinnedVersion";
-
-    /** Marks the emitted inventory on stdout. */
-    private static final String BLOCK = "QUICraft play packet inventory, protocol " + PROTOCOL;
 
     /**
      * Every non-CONTROL route, as {@code direction lane live-id name}. Anything not listed is CONTROL
@@ -114,24 +116,34 @@ public class RoutingTableGameTest implements FabricClientGameTest {
             return;
         }
         int liveProtocol = SharedConstants.getProtocolVersion();
-        if (liveProtocol != PROTOCOL) {
-            String message = "the live game is PLAY protocol " + liveProtocol
-                    + ", but the checked-in inventory pins " + PROTOCOL + " (" + INVENTORY_RESOURCE + ")";
-            if (Boolean.parseBoolean(System.getProperty(PINNED_PROPERTY, "true"))) {
-                throw new AssertionError(message + ". Refresh the fixture: " + refreshCommand());
-            }
-            System.out.println("[QUICraft] " + message + "; this row tests another release"
-                    + " (a -P<module>.minecraft override), skipping");
-            return;
-        }
+        boolean refresh = System.getProperty(EMIT_PROPERTY) != null;
         try {
             Map<String, Integer> clientbound = liveIds("CLIENTBOUND_TEMPLATE");
             Map<String, Integer> serverbound = liveIds("SERVERBOUND_TEMPLATE");
-            pin(clientbound, serverbound);
-            if (emit(clientbound, serverbound)) {
-                System.out.println("[QUICraft] refresh run: the checked-in inventory comparison is skipped");
+            if (liveProtocol != PROTOCOL) {
+                if (refresh) {
+                    emit(liveProtocol, clientbound, serverbound);
+                    System.out.println("[QUICraft] captured protocol " + liveProtocol + "; update PROTOCOL,"
+                            + " protocol-" + liveProtocol + ".json and its pins, and core's"
+                            + " PlayIdInventoryTest, then re-run without -Pquicraft.emitPlayIds");
+                    return;
+                }
+                String message = "the live game is PLAY protocol " + liveProtocol
+                        + ", but the checked-in inventory pins " + PROTOCOL + " (" + INVENTORY_RESOURCE + ")";
+                if (Boolean.parseBoolean(System.getProperty(PINNED_PROPERTY, "true"))) {
+                    throw new AssertionError(message + ". Refresh the fixture: " + refreshCommand(liveProtocol));
+                }
+                System.out.println("[QUICraft] " + message + "; this row tests another release"
+                        + " (a -P<module>.minecraft override), skipping");
                 return;
             }
+            if (refresh) {
+                emit(PROTOCOL, clientbound, serverbound);
+                System.out.println("[QUICraft] refresh run: the shipped-table pins and the checked-in"
+                        + " inventory comparison are skipped");
+                return;
+            }
+            pin(clientbound, serverbound);
             compareInventory(clientbound, serverbound);
         } catch (AssertionError e) {
             throw e;
@@ -175,33 +187,32 @@ public class RoutingTableGameTest implements FabricClientGameTest {
     }
 
     /**
-     * With {@link #EMIT_PROPERTY} set, writes the full inventory to a file and prints it between
-     * BEGIN/END markers so either capture path works, then returns true. Emission happens after the
-     * pins pass, so a version whose ids don't match the shipped table emits nothing.
+     * Writes the full inventory of protocol {@code protocolNumber} to the file named by
+     * {@link #EMIT_PROPERTY} (or {@code play-ids-<protocol>.txt}) and prints it between BEGIN/END
+     * markers, so either capture path works. Called for a refresh, which is why it runs even when
+     * the live protocol differs from {@link #PROTOCOL}; the pins are skipped there.
      */
-    private static boolean emit(Map<String, Integer> clientbound, Map<String, Integer> serverbound)
-            throws IOException {
+    private static void emit(int protocolNumber, Map<String, Integer> clientbound,
+            Map<String, Integer> serverbound) throws IOException {
         String target = System.getProperty(EMIT_PROPERTY);
-        if (target == null) {
-            return false;
-        }
+        String label = "QUICraft play packet inventory, protocol " + protocolNumber;
         List<String> lines = inventory(clientbound, serverbound);
-        StringBuilder block = new StringBuilder(BLOCK).append(" BEGIN\n");
+        StringBuilder block = new StringBuilder(label).append(" BEGIN\n");
         for (String line : lines) {
             block.append(line).append('\n');
         }
-        block.append(BLOCK).append(" END");
+        block.append(label).append(" END");
         System.out.println(block);
 
         Path path = Paths.get(target.isEmpty() || target.equals("true")
-                ? "play-ids-" + PROTOCOL + ".txt"
+                ? "play-ids-" + protocolNumber + ".txt"
                 : target);
         Path parent = path.toAbsolutePath().getParent();
         if (parent != null) {
             Files.createDirectories(parent);
         }
         StringBuilder file = new StringBuilder();
-        file.append("# QUICraft PLAY packet inventory, protocol ").append(PROTOCOL)
+        file.append("# QUICraft PLAY packet inventory, protocol ").append(protocolNumber)
                 .append(", live game, both directions.\n");
         file.append("# <direction> <id> <name>, one line per packet;")
                 .append(" ids ascending per direction, clientbound first.\n");
@@ -214,7 +225,6 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         }
         Files.write(path, file.toString().getBytes(StandardCharsets.UTF_8));
         System.out.println("[QUICraft] play packet inventory written to " + path.toAbsolutePath());
-        return true;
     }
 
     /**
@@ -234,7 +244,7 @@ public class RoutingTableGameTest implements FabricClientGameTest {
             Map<Integer, String> actual = live.get(direction);
             check(expected.equals(actual), "the checked-in " + direction.wireName()
                     + " PLAY protocol does not match the live game (" + differences(expected, actual)
-                    + "). The fixture is stale: refresh it with " + refreshCommand());
+                    + "). The fixture is stale: refresh it with " + refreshCommand(PROTOCOL));
         }
     }
 
@@ -301,11 +311,16 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         return shown + 1;
     }
 
-    /** The refresh command, run from the repository root (docs/platforms/fabric.md has the caveat). */
-    private static String refreshCommand() {
+    /**
+     * The refresh command, run from the repository root (docs/platforms/fabric.md has the caveat).
+     * It emits even when the live protocol differs from {@link #PROTOCOL}, writing the inventory
+     * under the live protocol's name, so it is the command a protocol-bump failure recommends.
+     */
+    private static String refreshCommand(int protocolNumber) {
         return "xvfb-run -a -s \"-screen 0 1280x720x24\" ./gradlew :fabric-26x:runClientGameTest"
-                + " -Pquicraft.emitPlayIds=" + FIXTURE_PATH
-                + ", then update PROTOCOL and core's PlayIdInventoryTest and check all three in";
+                + " -Pquicraft.emitPlayIds=" + INVENTORY_DIR + "/play-ids-" + protocolNumber + ".txt"
+                + " (it emits even on a protocol mismatch), then update PROTOCOL, protocol-"
+                + protocolNumber + ".json and its pins, and core's PlayIdInventoryTest, and re-run";
     }
 
     /** Whether the game's play protocol can be read by name (false on 1.21.11, where it is obfuscated). */
