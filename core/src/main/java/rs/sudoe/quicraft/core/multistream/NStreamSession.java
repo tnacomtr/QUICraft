@@ -751,6 +751,66 @@ public final class NStreamSession implements MultistreamSession {
     }
 
     /**
+     * One covered bundle (U2b, 13.19): resolves each member's route exactly as {@link #sendBundle}
+     * does, then hands the snapshotted shape and coverage to the send driver's one-monitor
+     * transaction. Caller errors (an invalid token, frame, coverage shape or run constraint) throw
+     * before the session is touched; an unresolvable member route fails closed 0x11 like every
+     * other unresolved outbound packet.
+     */
+    @Override
+    public List<SentPacket> sendCoveredBundle(OutboundPacket open, List<OutboundPacket> members,
+            OutboundPacket close, List<List<UpdateToken>> memberCoverage) {
+        if (open == null || members == null || close == null || memberCoverage == null) {
+            throw new IllegalArgumentException("bundle coverage");
+        }
+        if (refused || closed) {
+            return new ArrayList<SentPacket>();
+        }
+        List<OutboundPacket> copy = new ArrayList<OutboundPacket>(members);
+        if (memberCoverage.size() != copy.size()) {
+            throw new IllegalArgumentException("bundle coverage");
+        }
+        for (List<UpdateToken> coverage : memberCoverage) {
+            if (coverage == null) {
+                throw new IllegalArgumentException("bundle coverage");
+            }
+        }
+        int[] ids = new int[copy.size()];
+        for (int i = 0; i < ids.length; i++) {
+            OutboundPacket member = copy.get(i);
+            if (member == null) {
+                throw new IllegalArgumentException("bundle member");
+            }
+            ids[i] = packetIdOf(member.frame(), compressed);
+            if (ids[i] < 0) {
+                refuse("covered bundle member " + i + " has no readable packet id (13.15)");
+                return new ArrayList<SentPacket>();
+            }
+        }
+        SendRouteResolver.BundleScopes resolved = SendRouteResolver.bundleScopes(routes, protocolNumber,
+                sendDirection, ProtocolState.PLAY, ids);
+        if (resolved.failed()) {
+            refuse(resolved.failure());
+            return new ArrayList<SentPacket>();
+        }
+        List<SentPacket> handles;
+        try {
+            handles = sendDriver.submitCoveredBundle(open, copy, resolved.scopes(), close, memberCoverage);
+        } catch (IllegalArgumentException misuse) {
+            // A token, frame or run-shape contract violation before assignment: caller error, not a wire refusal.
+            throw misuse;
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return new ArrayList<SentPacket>();
+        } catch (RuntimeException e) {
+            refuse("covered bundle refused: " + e.getMessage());
+            return new ArrayList<SentPacket>();
+        }
+        afterSubmit();
+        return handles;
+    }
+
+    /**
      * Assigns END at once on the caller's thread, like every other submission, so its place is the call order and
      * the driver refuses every later submission from then on (13.14). The loop then drains up to END.
      */

@@ -10,20 +10,29 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Field;
 import java.net.InetAddress;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 
+import io.netty.handler.codec.quic.QuicStreamChannel;
 import org.junit.jupiter.api.Test;
 
 import rs.sudoe.quicraft.core.profile.ServerProfile;
 import rs.sudoe.quicraft.core.resource.NodePools;
 import rs.sudoe.quicraft.core.resource.OutboundPool;
 import rs.sudoe.quicraft.core.resource.PressureRanking;
+import rs.sudoe.quicraft.core.routing.Lane;
+import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.time.StallClock;
 
 class SessionSendDriverTest {
@@ -1585,6 +1594,803 @@ class SessionSendDriverTest {
         ranking.connect(owner, ip, null);
         ranking.disconnect(owner);
         assertEquals(5, scripted.taken());
+    }
+
+    /** Every complete record of one stream in one drained write sequence. */
+    private static List<Record> recordsOf(Drain drain, int stream) throws Exception {
+        byte[] all = drain.stream(stream);
+        List<Record> out = new ArrayList<Record>();
+        int at = 0;
+        while (at < all.length) {
+            int length = firstRecordLength(Arrays.copyOfRange(all, at, all.length));
+            out.add(RecordCodec.decodeRecord(Arrays.copyOfRange(all, at, at + length), stream));
+            at += length;
+        }
+        return out;
+    }
+
+    private interface BundleCall {
+        List<SentPacket> call();
+    }
+
+    @SafeVarargs
+    private static List<List<MultistreamSession.UpdateToken>> coverage(
+            List<MultistreamSession.UpdateToken>... entries) {
+        return Arrays.asList(entries);
+    }
+
+    private static List<MultistreamSession.UpdateToken> tokens(MultistreamSession.UpdateToken... entries) {
+        return Arrays.asList(entries);
+    }
+
+    private static List<OutboundPacket> packets(int... sizes) {
+        List<OutboundPacket> out = new ArrayList<OutboundPacket>();
+        for (int size : sizes) {
+            out.add(frame(size));
+        }
+        return out;
+    }
+
+    /**
+     * The CONTROL frontier a covering scope holds after a covered submission, read from the tracker
+     * for the GLOBAL-vs-CONTROL resolution assertion.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<Integer, Long> scopeFrontier(SessionSendDriver driver, MultistreamSession.CausalScope scope)
+            throws Exception {
+        Field acksField = SessionSendDriver.class.getDeclaredField("acks");
+        acksField.setAccessible(true);
+        Object tracker = acksField.get(driver);
+        Field scopesField = AckJoinTracker.class.getDeclaredField("scopes");
+        scopesField.setAccessible(true);
+        Object scopeObject = ((Map<Long, Object>) scopesField.get(tracker)).get(scope.id());
+        assertNotNull(scopeObject, "the scope is still retained");
+        Field frontierField = scopeObject.getClass().getDeclaredField("frontier");
+        frontierField.setAccessible(true);
+        return (Map<Integer, Long>) frontierField.get(scopeObject);
+    }
+
+    /** A session that implements only the contract's abstract methods, so its defaults are observable. */
+    private static final class AbstractOnlySession implements MultistreamSession {
+        @Override public void bindGame(LaneGame game) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public void activate(ByteBuffer controlLeftover) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public void acceptStream(QuicStreamChannel stream) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public SentPacket send(ProtocolState state, int packetId, byte[] frame, SentPacket... after) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public SentPacket send(ProtocolState state, int packetId, byte[] frame, int uncompressedBytes,
+                SentPacket... after) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public List<SentPacket> sendBundle(OutboundPacket open, List<OutboundPacket> members,
+                OutboundPacket close) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public void end() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public void abort(int code) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public void applied(Lane lane, long sequence) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override public SessionContext context() {
+            return SessionContext.of(1);
+        }
+
+        @Override public Lane outboundLane(ProtocolState state, int packetId) {
+            return Lane.CONTROL;
+        }
+
+        @Override public boolean isWritable() {
+            return true;
+        }
+    }
+
+    @Test
+    void coveredBundleDefaultFailsClosed() {
+        AbstractOnlySession session = new AbstractOnlySession();
+        assertThrows(UnsupportedOperationException.class, () -> session.sendCoveredBundle(frame(1),
+                new ArrayList<OutboundPacket>(), frame(1), new ArrayList<List<MultistreamSession.UpdateToken>>()));
+    }
+
+    /**
+     * Empty, multiple and repeated coverage in one atomic run: every member is assigned on CONTROL
+     * in order, a token listed twice is consumed once at its highest member, an uncovered member is
+     * legal, and each covering scope keeps exactly the frontier its members resolved to.
+     */
+    @Test
+    void coveredBundleResolvesEmptyMultipleAndRepeatedCoverageOnce() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.CausalScope first = driver.openScope();
+        MultistreamSession.CausalScope second = driver.openScope();
+        MultistreamSession.CausalScope third = driver.openScope();
+        MultistreamSession.UpdateToken repeated = driver.registerUpdate(first);
+        MultistreamSession.UpdateToken middle = driver.registerUpdate(second);
+        MultistreamSession.UpdateToken alsoMiddle = driver.registerUpdate(third);
+        List<OutboundPacket> members = packets(5, 6, 7);
+
+        List<SentPacket> handles = driver.submitCoveredBundle(frame(1), members,
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL,
+                    StreamSequencer.Fence.ORDINARY_CONTROL, StreamSequencer.Fence.ORDINARY_CONTROL},
+                frame(1), coverage(tokens(repeated), tokens(middle, alsoMiddle), tokens(repeated)));
+
+        assertEquals(5, handles.size(), "opener, three members and closer");
+        for (int i = 0; i < handles.size(); i++) {
+            assertEquals(LogicalStream.CONTROL, handles.get(i).logicalStream());
+            assertEquals(i + 1, handles.get(i).sequence(), "the run is consecutive in wire order");
+        }
+        assertEquals(0, driver.trackerRetainedTokens(), "every distinct token is consumed exactly once");
+        assertEquals(4L, (long) scopeFrontier(driver, first).get(LogicalStream.CONTROL),
+                "the repeated token resolves at member 2, its highest covered member");
+        assertEquals(3L, (long) scopeFrontier(driver, second).get(LogicalStream.CONTROL));
+        assertEquals(3L, (long) scopeFrontier(driver, third).get(LogicalStream.CONTROL));
+        driver.completeScope(first);
+        driver.completeScope(second);
+        driver.completeScope(third);
+
+        Drain drain = drainAndRelease(driver);
+        List<Record> records = recordsOf(drain, LogicalStream.CONTROL);
+        assertEquals(5, records.size(), "one uninterrupted CONTROL run");
+        assertEquals(RecordCodec.KIND_BUNDLE_OPEN, records.get(0).kind());
+        for (int i = 0; i < 3; i++) {
+            assertArrayEquals(members.get(i).frame(), records.get(i + 1).payload(), "member " + i + " in order");
+        }
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "the aggregate run charge is released");
+        driver.close();
+    }
+
+    /**
+     * Strongest-member routing promotes a bundle to GLOBAL: every participating scope resolves to
+     * the closing delimiter, even a token that only covered an earlier member, so each scope covers
+     * the entire atomic run.
+     */
+    @Test
+    void coveredBundleGlobalPromotionResolvesEveryTokenAtTheClosingDelimiter() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.CausalScope first = driver.openScope();
+        MultistreamSession.CausalScope second = driver.openScope();
+        MultistreamSession.UpdateToken onFirst = driver.registerUpdate(first);
+        MultistreamSession.UpdateToken onSecond = driver.registerUpdate(second);
+        MultistreamSession.UpdateToken repeated = driver.registerUpdate(second);
+
+        List<SentPacket> handles = driver.submitCoveredBundle(frame(1), packets(4, 5),
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.CONTROL_FENCE, StreamSequencer.Fence.CHUNK},
+                frame(1), coverage(tokens(onFirst, repeated), tokens(onSecond, repeated)));
+
+        assertEquals(4, handles.size());
+        long closing = handles.get(3).sequence();
+        assertEquals(4L, closing);
+        assertEquals(closing, (long) scopeFrontier(driver, first).get(LogicalStream.CONTROL),
+                "a GLOBAL bundle resolves even a first-member token at the closer");
+        assertEquals(closing, (long) scopeFrontier(driver, second).get(LogicalStream.CONTROL));
+        assertEquals(0, driver.trackerRetainedTokens());
+        driver.completeScope(first);
+        driver.completeScope(second);
+        driver.close();
+    }
+
+    /** Caller-triggered rejection leaves the driver open pending; the caller closes it explicitly. */
+    @Test
+    void coveredBundleRejectsBadTokenAtFirstMiddleOrLastMemberWithoutConsumingAnyToken() throws Exception {
+        for (int position = 0; position < 3; position++) {
+            Rig rig = new Rig(2, 1000);
+            SessionSendDriver driver = rig.driver;
+            MultistreamSession.CausalScope liveScope = driver.openScope();
+            MultistreamSession.UpdateToken live = driver.registerUpdate(liveScope);
+            MultistreamSession.UpdateToken suppressed = driver.registerUpdate(driver.openScope());
+            driver.suppressUpdate(suppressed);
+            List<List<MultistreamSession.UpdateToken>> lists =
+                    new ArrayList<List<MultistreamSession.UpdateToken>>();
+            for (int i = 0; i < 3; i++) {
+                lists.add(new ArrayList<MultistreamSession.UpdateToken>());
+            }
+            lists.get(position).add(suppressed);
+            lists.get((position + 1) % 3).add(live);
+            long assignedBefore = driver.assignedSequence(LogicalStream.CONTROL);
+            int queuedBefore = driver.queuedRecords();
+            long chargedBefore = rig.pool.reserved(rig.owner);
+
+            assertThrows(IllegalArgumentException.class,
+                    () -> driver.submitCoveredBundle(frame(1), packets(2, 2, 2),
+                            new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL,
+                                StreamSequencer.Fence.ORDINARY_CONTROL, StreamSequencer.Fence.ORDINARY_CONTROL},
+                            frame(1), lists),
+                    "suppressed token at member " + position);
+
+            assertEquals(assignedBefore, driver.assignedSequence(LogicalStream.CONTROL),
+                    "position " + position + " assigned no sequence");
+            assertEquals(queuedBefore, driver.queuedRecords(), "position " + position + " queued nothing");
+            assertEquals(chargedBefore, rig.pool.reserved(rig.owner), "position " + position + " took no charge");
+            assertEquals(1, driver.trackerRetainedTokens(), "the live token survived the rejection");
+            assertTrue(driver.validateScopeToken(live), "the live token is still assignable");
+            assertFalse(driver.isClosed(), "a bad token is caller misuse, not a wire refusal");
+            assertTrue(driver.submitCovered(live, frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, false, 0, 0)
+                    .isAssigned(), "the surviving token still resolves later");
+            driver.close();
+        }
+    }
+
+    private static Map<Integer, Long> dependencies(Record.Dependency[] dependencies) {
+        Map<Integer, Long> out = new java.util.TreeMap<Integer, Long>();
+        for (Record.Dependency dependency : dependencies) {
+            out.put(dependency.streamIndex(), dependency.sequence());
+        }
+        return out;
+    }
+
+    private static Map<Integer, Long> dependencies(List<Record.Dependency> dependencies) {
+        return dependencies(dependencies.toArray(new Record.Dependency[dependencies.size()]));
+    }
+
+    private static int xForShard(int shards, int shard) {
+        int x = 0;
+        while (ShardHash.shardOf(x, 0, 0, shards) != shard) {
+            x++;
+        }
+        return x;
+    }
+
+    private static List<List<MultistreamSession.UpdateToken>> emptyCoverage(int members) {
+        List<List<MultistreamSession.UpdateToken>> out =
+                new ArrayList<List<MultistreamSession.UpdateToken>>();
+        for (int i = 0; i < members; i++) {
+            out.add(new ArrayList<MultistreamSession.UpdateToken>());
+        }
+        return out;
+    }
+
+    private static void assertRejectedInPlace(Rig rig, MultistreamSession.UpdateToken live, String why,
+            BundleCall call) throws Exception {
+        SessionSendDriver driver = rig.driver;
+        long assigned = driver.assignedSequence(LogicalStream.CONTROL);
+        int queued = driver.queuedRecords();
+        long charged = rig.pool.reserved(rig.owner);
+        assertThrows(IllegalArgumentException.class, call::call, why);
+        assertEquals(assigned, driver.assignedSequence(LogicalStream.CONTROL), why + ": no sequence");
+        assertEquals(queued, driver.queuedRecords(), why + ": no queue entry");
+        assertEquals(charged, rig.pool.reserved(rig.owner), why + ": no charge");
+        assertEquals(1, driver.trackerRetainedTokens(), why + ": the live token stays live");
+        assertTrue(driver.validateScopeToken(live), why + ": still assignable");
+        assertFalse(driver.isClosed(), why + ": caller misuse keeps the driver open");
+    }
+
+    /**
+     * Nulls, malformed frames, mismatched coverage shapes, invalid scopes and run-size overflow are
+     * all ordinary validation failures: they throw before any sequence, queue slot, charge or token
+     * is consumed, and the live token can still be assigned afterwards.
+     */
+    @Test
+    void coveredBundleRejectsNullsShapeAndMalformedFramesInPlace() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.UpdateToken live = driver.registerUpdate(driver.openScope());
+        StreamSequencer.Fence ordinary = StreamSequencer.Fence.ORDINARY_CONTROL;
+        List<MultistreamSession.UpdateToken> liveList = tokens(live);
+        List<List<MultistreamSession.UpdateToken>> oneCoverage = coverage(liveList);
+
+        assertRejectedInPlace(rig, live, "null opener", () -> driver.submitCoveredBundle(null, packets(2),
+                new StreamSequencer.Fence[] {ordinary}, frame(1), emptyCoverage(1)));
+        assertRejectedInPlace(rig, live, "null closer", () -> driver.submitCoveredBundle(frame(1), packets(2),
+                new StreamSequencer.Fence[] {ordinary}, null, emptyCoverage(1)));
+        assertRejectedInPlace(rig, live, "null members", () -> driver.submitCoveredBundle(frame(1), null,
+                new StreamSequencer.Fence[] {ordinary}, frame(1), emptyCoverage(1)));
+        assertRejectedInPlace(rig, live, "null scopes", () -> driver.submitCoveredBundle(frame(1), packets(2),
+                null, frame(1), emptyCoverage(1)));
+        assertRejectedInPlace(rig, live, "null coverage", () -> driver.submitCoveredBundle(frame(1), packets(2),
+                new StreamSequencer.Fence[] {ordinary}, frame(1), null));
+        assertRejectedInPlace(rig, live, "outer coverage size", () -> driver.submitCoveredBundle(frame(1),
+                packets(2), new StreamSequencer.Fence[] {ordinary}, frame(1),
+                emptyCoverage(2)));
+        assertRejectedInPlace(rig, live, "scope count", () -> driver.submitCoveredBundle(frame(1), packets(2),
+                new StreamSequencer.Fence[] {ordinary, ordinary}, frame(1), emptyCoverage(2)));
+        assertRejectedInPlace(rig, live, "null inner coverage", () -> driver.submitCoveredBundle(frame(1),
+                packets(2), new StreamSequencer.Fence[] {ordinary}, frame(1),
+                Arrays.asList((List<MultistreamSession.UpdateToken>) null)));
+        assertRejectedInPlace(rig, live, "null token", () -> driver.submitCoveredBundle(frame(1),
+                packets(2), new StreamSequencer.Fence[] {ordinary}, frame(1),
+                Arrays.asList(Arrays.asList((MultistreamSession.UpdateToken) null))));
+        for (int position = 0; position < 3; position++) {
+            List<OutboundPacket> members = packets(2, 2, 2);
+            members.set(position, null);
+            assertRejectedInPlace(rig, live, "null member " + position, () -> driver.submitCoveredBundle(frame(1),
+                    members, new StreamSequencer.Fence[] {ordinary, ordinary, ordinary}, frame(1),
+                    emptyCoverage(3)));
+        }
+        assertRejectedInPlace(rig, live, "empty opener", () -> driver.submitCoveredBundle(new OutboundPacket(new byte[0]),
+                packets(2), new StreamSequencer.Fence[] {ordinary}, frame(1), emptyCoverage(1)));
+        assertRejectedInPlace(rig, live, "empty closer", () -> driver.submitCoveredBundle(frame(1), packets(2),
+                new StreamSequencer.Fence[] {ordinary}, new OutboundPacket(new byte[0]), emptyCoverage(1)));
+        assertRejectedInPlace(rig, live, "null scope", () -> driver.submitCoveredBundle(frame(1), packets(2),
+                new StreamSequencer.Fence[] {null}, frame(1), emptyCoverage(1)));
+        assertRejectedInPlace(rig, live, "realtime scope", () -> driver.submitCoveredBundle(frame(1), packets(2),
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.REALTIME}, frame(1), emptyCoverage(1)));
+        List<OutboundPacket> many = packets(new int[StreamSequencer.MAX_BUNDLE_MEMBERS + 1]);
+        StreamSequencer.Fence[] manyScopes = new StreamSequencer.Fence[StreamSequencer.MAX_BUNDLE_MEMBERS + 1];
+        Arrays.fill(manyScopes, ordinary);
+        assertRejectedInPlace(rig, live, "member cap", () -> driver.submitCoveredBundle(frame(1), many,
+                manyScopes, frame(1), emptyCoverage(StreamSequencer.MAX_BUNDLE_MEMBERS + 1)));
+
+        assertTrue(driver.submitCovered(live, frame(2), ordinary, false, 0, 0).isAssigned(),
+                "the untouched token resolves after every rejection");
+        driver.close();
+    }
+
+    /**
+     * Foreign, retired and already assigned tokens anywhere in the coverage reject the whole call;
+     * an unrelated live token in the same call is not consumed as collateral.
+     */
+    @Test
+    void coveredBundleRejectsForeignRetiredAndAssignedTokensWithoutConsumingLiveOnes() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        Rig other = new Rig(2, 1000);
+        MultistreamSession.UpdateToken foreign = other.driver.registerUpdate(other.driver.openScope());
+        MultistreamSession.UpdateToken live = driver.registerUpdate(driver.openScope());
+        long before = driver.assignedSequence(LogicalStream.CONTROL);
+        StreamSequencer.Fence ordinary = StreamSequencer.Fence.ORDINARY_CONTROL;
+
+        assertThrows(AckJoinTracker.ForeignHandleException.class, () -> driver.submitCoveredBundle(frame(1),
+                packets(2, 2), new StreamSequencer.Fence[] {ordinary, ordinary}, frame(1),
+                coverage(tokens(foreign), tokens(live))));
+        assertEquals(before, driver.assignedSequence(LogicalStream.CONTROL));
+        assertEquals(1, driver.trackerRetainedTokens(), "the live token survived the foreign token");
+        assertTrue(driver.validateScopeToken(live));
+
+        MultistreamSession.UpdateToken assigned = driver.registerUpdate(driver.openScope());
+        driver.assignScopeToken(assigned, LogicalStream.CONTROL, 7);
+        long afterAssign = driver.assignedSequence(LogicalStream.CONTROL);
+        assertThrows(IllegalArgumentException.class, () -> driver.submitCoveredBundle(frame(1), packets(2, 2),
+                new StreamSequencer.Fence[] {ordinary, ordinary}, frame(1), coverage(tokens(assigned), tokens(live))));
+        assertEquals(afterAssign, driver.assignedSequence(LogicalStream.CONTROL));
+        assertEquals(1, driver.trackerRetainedTokens());
+
+        assertTrue(driver.createAck(9, frame(2).frame(), 8));
+        MultistreamSession.CausalScope retiredScope = driver.openScope();
+        MultistreamSession.UpdateToken retired = driver.registerUpdate(retiredScope);
+        driver.coverScope(9, retiredScope);
+        driver.sealAckCoverage(9);
+        rig.now.addAndGet(AckJoinTracker.DEADLINE_NANOS + 1);
+        assertNull(driver.takeAck(9));
+        assertFalse(driver.validateScopeToken(retired), "the retired token is gone");
+        assertThrows(IllegalArgumentException.class, () -> driver.submitCoveredBundle(frame(1), packets(2, 2),
+                new StreamSequencer.Fence[] {ordinary, ordinary}, frame(1), coverage(tokens(retired), tokens(live))));
+        assertEquals(afterAssign, driver.assignedSequence(LogicalStream.CONTROL));
+        assertEquals(1, driver.trackerRetainedTokens());
+        assertTrue(driver.validateScopeToken(live), "the live token is still assignable");
+        driver.close();
+        other.driver.close();
+    }
+
+    /**
+     * A run larger than maxRecordBytes is refused before assignment; a cap the run can never be
+     * admitted by and a queue overflow are terminal resource refusals that assign no member and
+     * acquire no run charge. All leave the sequences and live tokens of an ordinary rejection alone.
+     */
+    @Test
+    void coveredBundleOversizeCapAndQueueRefusalsAssignNothing() throws Exception {
+        StreamSequencer.Fence ordinary = StreamSequencer.Fence.ORDINARY_CONTROL;
+
+        HeadroomRig oversized = new HeadroomRig(1000, 200, 50);
+        MultistreamSession.UpdateToken token = oversized.driver.registerUpdate(oversized.driver.openScope());
+        assertThrows(IllegalArgumentException.class, () -> oversized.driver.submitCoveredBundle(frame(1),
+                packets(100, 100), new StreamSequencer.Fence[] {ordinary, ordinary}, frame(1),
+                coverage(tokens(token), new ArrayList<MultistreamSession.UpdateToken>())));
+        assertEquals(0, oversized.driver.assignedSequence(LogicalStream.CONTROL), "no sequence taken");
+        assertEquals(0, oversized.driver.queuedRecords(), "nothing queued");
+        assertEquals(oversized.slice, oversized.pool.reserved(oversized.owner), "no run charge");
+        assertTrue(oversized.driver.validateScopeToken(token), "the token stays live");
+        assertFalse(oversized.driver.isClosed(), "maxRecordBytes is an ordinary refusal");
+
+        Rig capped = new Rig(2, 1000, 100);
+        MultistreamSession.UpdateToken cappedToken = capped.driver.registerUpdate(capped.driver.openScope());
+        assertTrue(capped.driver.submitCoveredBundle(frame(1), packets(200),
+                new StreamSequencer.Fence[] {ordinary}, frame(1), coverage(tokens(cappedToken))).isEmpty());
+        assertTrue(capped.driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, capped.driver.closeCode());
+        assertEquals(0, capped.driver.assignedSequence(LogicalStream.CONTROL), "the refused run assigned nothing");
+        assertEquals(0, capped.driver.queuedRecords());
+        assertEquals(0, capped.pool.reserved(capped.owner), "the terminal close released every charge");
+
+        Rig queued = new Rig(2, 1);
+        assertTrue(queued.driver.submit(frame(2), ordinary, 0, 0).isAssigned(), "fill the one queue slot");
+        MultistreamSession.UpdateToken queuedToken = queued.driver.registerUpdate(queued.driver.openScope());
+        long queuedBefore = queued.driver.assignedSequence(LogicalStream.CONTROL);
+        assertTrue(queued.driver.submitCoveredBundle(frame(1), packets(2, 2),
+                new StreamSequencer.Fence[] {ordinary, ordinary}, frame(1),
+                coverage(tokens(queuedToken), new ArrayList<MultistreamSession.UpdateToken>())).isEmpty());
+        assertTrue(queued.driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, queued.driver.closeCode());
+        assertEquals(queuedBefore, queued.driver.assignedSequence(LogicalStream.CONTROL),
+                "the overflowing run assigned no member");
+        assertEquals(0, queued.pool.reserved(queued.owner), "the terminal close released every charge");
+
+        Rig deferred = new Rig(2, 1000, 100);
+        deferred.driver.releaseOnOwnerClose();
+        MultistreamSession.UpdateToken deferredToken =
+                deferred.driver.registerUpdate(deferred.driver.openScope());
+        assertTrue(deferred.driver.submitCoveredBundle(frame(1), packets(200),
+                new StreamSequencer.Fence[] {ordinary}, frame(1), coverage(tokens(deferredToken))).isEmpty());
+        assertTrue(deferred.driver.isClosed(), "the driver stops at once");
+        assertEquals(0, deferred.driver.assignedSequence(LogicalStream.CONTROL));
+        assertEquals(1, deferred.driver.trackerRetainedTokens(),
+                "the stopped driver has not consumed the token; the owner close still cleans up");
+        deferred.driver.close();
+        assertEquals(0, deferred.pool.reserved(deferred.owner));
+    }
+
+    /**
+     * Suppression and a covered bundle race on the same monitor: either suppression wins and the
+     * whole call rejects with no sequence, or the bundle wins and the later suppression rejects.
+     */
+    @Test
+    void coveredBundleAndSuppressionSerializeUnderOneMonitor() throws Exception {
+        for (int round = 0; round < 30; round++) {
+            Rig rig = new Rig(1, 1000);
+            SessionSendDriver driver = rig.driver;
+            MultistreamSession.UpdateToken token = driver.registerUpdate(driver.openScope());
+            AtomicReference<List<SentPacket>> handles = new AtomicReference<List<SentPacket>>();
+            AtomicReference<Throwable> submitFailure = new AtomicReference<Throwable>();
+            AtomicReference<Throwable> suppressFailure = new AtomicReference<Throwable>();
+            CountDownLatch go = new CountDownLatch(1);
+            Thread submit = new Thread(() -> {
+                try {
+                    go.await();
+                    handles.set(driver.submitCoveredBundle(frame(1), packets(2),
+                            new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL}, frame(1),
+                            coverage(tokens(token))));
+                } catch (Throwable failure) {
+                    submitFailure.set(failure);
+                }
+            });
+            Thread suppress = new Thread(() -> {
+                try {
+                    go.await();
+                    driver.suppressUpdate(token);
+                } catch (Throwable failure) {
+                    suppressFailure.set(failure);
+                }
+            });
+            submit.start();
+            suppress.start();
+            go.countDown();
+            submit.join(10_000);
+            suppress.join(10_000);
+            boolean accepted = handles.get() != null && !handles.get().isEmpty();
+            if (accepted) {
+                assertNull(submitFailure.get(), "round " + round);
+                assertTrue(suppressFailure.get() instanceof IllegalArgumentException,
+                        "round " + round + ": the bundle won, suppression must reject");
+                assertEquals(3, driver.assignedSequence(LogicalStream.CONTROL),
+                        "round " + round + ": opener, member and closer");
+            } else {
+                assertTrue(submitFailure.get() instanceof IllegalArgumentException,
+                        "round " + round + ": suppression won, the bundle must reject");
+                assertNull(suppressFailure.get(), "round " + round + ": suppression succeeded");
+                assertEquals(0, driver.assignedSequence(LogicalStream.CONTROL), "round " + round);
+            }
+            assertEquals(0, driver.trackerRetainedTokens(), "round " + round + ": the token is consumed once");
+            assertFalse(driver.isClosed());
+            driver.close();
+        }
+    }
+
+    /**
+     * One CONTROL run, one aggregate charge: members appear in order between the delimiters, the
+     * run's bytes stay charged until the last member's last slice completes, and duplicate or late
+     * releases (and a write failure) release exactly once.
+     */
+    @Test
+    void coveredBundleOwnsOneAggregateChargeUntilEveryMemberAndSliceFinishes() throws Exception {
+        Rig rig = new Rig(1, 1000);
+        SessionSendDriver driver = rig.driver;
+        List<OutboundPacket> members = packets(5, 6, 7);
+        List<SentPacket> handles = driver.submitCoveredBundle(frame(1), members,
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL,
+                    StreamSequencer.Fence.ORDINARY_CONTROL, StreamSequencer.Fence.ORDINARY_CONTROL},
+                frame(1), emptyCoverage(3));
+        assertEquals(5, handles.size());
+        long runCharge = rig.pool.reserved(rig.owner) - rig.slice;
+        assertTrue(runCharge > 0, "the opener owns the whole run's bytes as one charge");
+
+        List<SessionSendDriver.Write> writes = new ArrayList<SessionSendDriver.Write>();
+        pollAll(driver, writes);
+        assertEquals(5, writes.size(), "every record is one slice");
+        assertEquals(RecordCodec.KIND_BUNDLE_OPEN,
+                RecordCodec.decodeRecord(writes.get(0).bytes(), LogicalStream.CONTROL).kind());
+        for (int i = 0; i < 3; i++) {
+            Record member = RecordCodec.decodeRecord(writes.get(i + 1).bytes(), LogicalStream.CONTROL);
+            assertArrayEquals(members.get(i).frame(), member.payload(), "member " + i + " wire order");
+        }
+        assertEquals(0,
+                RecordCodec.decodeRecord(writes.get(4).bytes(), LogicalStream.CONTROL).kind());
+
+        for (int i = 0; i < 4; i++) {
+            driver.released(writes.get(i).token());
+        }
+        assertEquals(rig.slice + runCharge, rig.pool.reserved(rig.owner),
+                "the run stays charged while the closer is outstanding");
+        long closingToken = writes.get(4).token();
+        driver.failed(closingToken);
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "a write failure releases the run once");
+        driver.failed(closingToken);
+        driver.released(closingToken);
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "late and duplicate outcomes release nothing again");
+        driver.close();
+        assertEquals(0, rig.pool.reserved(rig.owner));
+    }
+
+    /** A covered bundle neither completes a scope nor seals an ack: the caller still owns both. */
+    @Test
+    void coveredBundleLeavesScopeCompletionAndAckSealingToTheCaller() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(1, frame(2).frame(), 16));
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        driver.coverScope(1, scope);
+        assertNull(driver.takeAck(1), "an unsealed, incomplete scope never resolves");
+
+        assertTrue(driver.submitCoveredBundle(frame(1), packets(3),
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL}, frame(1),
+                coverage(tokens(token))).size() == 3);
+        assertNull(driver.takeAck(1), "the bundle did not complete the scope");
+        driver.completeScope(scope);
+        assertNull(driver.takeAck(1), "the bundle did not seal the ack");
+        driver.sealAckCoverage(1);
+        assertNotNull(driver.takeAck(1), "the caller's completion and seal resolve the ack");
+        driver.close();
+    }
+
+    /** Batch prevalidation is non-mutating, and nested, unmatched or invalid markers assign nothing. */
+    @Test
+    void batchPrevalidationIsNonMutatingAndInvalidMarkersAssignNothing() throws Exception {
+        BatchJoinTracker tracker = new BatchJoinTracker();
+        tracker.begin(1, 5, 7);
+        tracker.chunk(1, 2, 6, 7);
+        tracker.chunk(1, 3, 8, 7);
+        assertThrows(IllegalArgumentException.class, () -> tracker.validateBegin(2, 7), "nested begin");
+        assertEquals(5, dependencies(tracker.previewFinish(1, 7)).get(LogicalStream.CONTROL),
+                "the active batch survived the nested begin");
+        assertTrue(tracker.active());
+        tracker.validateInstall(1, 2, 7, 4);
+        assertTrue(tracker.active(), "valid install prevalidation mutates nothing");
+        assertThrows(IllegalArgumentException.class, () -> tracker.validateInstall(1, 1, 7, 4), "CONTROL");
+        assertThrows(IllegalArgumentException.class, () -> tracker.validateInstall(1, 9, 7, 4), "above the streams");
+        assertThrows(IllegalArgumentException.class, () -> tracker.validateInstall(9, 2, 7, 4), "wrong id");
+        assertThrows(IllegalArgumentException.class, () -> tracker.validateInstall(1, 2, 8, 4), "wrong epoch");
+        assertTrue(tracker.active(), "rejected install prevalidation mutates nothing");
+        assertThrows(IllegalArgumentException.class, () -> tracker.previewFinish(9, 7), "wrong id");
+        assertTrue(tracker.active());
+        Record.Dependency[] preview = tracker.previewFinish(1, 7);
+        assertEquals(5, dependencies(preview).get(LogicalStream.CONTROL));
+        assertEquals(6, dependencies(preview).get(2));
+        assertEquals(8, dependencies(preview).get(3));
+        assertTrue(tracker.active(), "a valid finish preview does not clear the batch");
+        assertThrows(IllegalArgumentException.class, () -> tracker.previewFinish(1, 8), "epoch mismatch");
+        assertFalse(tracker.active(), "the epoch mismatch discards stale installs");
+        tracker.begin(2, 20, 0);
+        assertEquals(20, dependencies(tracker.previewFinish(2, 0)).get(LogicalStream.CONTROL));
+
+        Rig rig = new Rig(3, 1000);
+        SessionSendDriver driver = rig.driver;
+        SentPacket start = driver.beginBatch(1, frame(2));
+        assertTrue(start.isAssigned());
+        long afterStart = driver.assignedSequence(LogicalStream.CONTROL);
+        assertThrows(IllegalArgumentException.class, () -> driver.beginBatch(1, frame(2)), "nested");
+        assertEquals(afterStart, driver.assignedSequence(LogicalStream.CONTROL),
+                "the nested begin assigned no start record");
+        assertThrows(IllegalArgumentException.class, () -> driver.batchInstall(9, frame(2), 0, 0), "unmatched install");
+        assertEquals(afterStart, driver.assignedSequence(LogicalStream.CONTROL));
+        long chunkBefore = driver.assignedSequence(2);
+        assertThrows(IllegalArgumentException.class, () -> driver.finishBatch(9, frame(2)), "unmatched finish");
+        assertEquals(chunkBefore, driver.assignedSequence(2),
+                "the unmatched finish assigned no join");
+        assertThrows(IllegalArgumentException.class, () -> driver.beginBatch(0, frame(2)), "invalid id");
+        driver.close();
+    }
+
+    /**
+     * A finish waits for the start and the per-stream maximum of every install, even across several
+     * shards, and the next start keeps the previous successfully sequenced JOIN dependency.
+     */
+    @Test
+    void batchFinishWaitsForStartAndPerStreamInstallMaximaAndNextStartKeepsTheJoin() throws Exception {
+        Rig rig = new Rig(3, 1000);
+        SessionSendDriver driver = rig.driver;
+        SentPacket start = driver.beginBatch(1, frame(2));
+        int x1 = xForShard(3, 1);
+        int x2 = xForShard(3, 2);
+        SentPacket first = driver.batchInstall(1, frame(3), x1, 0);
+        SentPacket second = driver.batchInstall(1, frame(4), x2, 0);
+        SentPacket again = driver.batchInstall(1, frame(5), x1, 0);
+        SentPacket join = driver.finishBatch(1, frame(2));
+        assertTrue(join.isAssigned());
+        assertEquals(2, join.logicalStream());
+
+        Drain drain = drainAndRelease(driver);
+        Map<Integer, Long> finish = dependencies(recordOf(drain, join).dependencies());
+        assertEquals(start.sequence(), (long) finish.get(LogicalStream.CONTROL), "finish waits for the start");
+        assertEquals(again.sequence(), (long) finish.get(first.logicalStream()), "the install maximum on shard 1");
+        assertEquals(second.sequence(), (long) finish.get(second.logicalStream()), "the install maximum on shard 2");
+
+        SentPacket secondStart = driver.beginBatch(2, frame(2));
+        SentPacket emptyJoin = driver.finishBatch(2, frame(2));
+        Drain secondDrain = drainAndRelease(driver);
+        Map<Integer, Long> next = dependencies(recordOf(secondDrain, secondStart).dependencies());
+        assertEquals(join.sequence(), (long) next.get(2),
+                "the next start keeps the previous JOIN even across an empty batch");
+        assertEquals(emptyJoin.sequence(), (long) dependencies(recordOf(secondDrain, emptyJoin).dependencies())
+                .get(LogicalStream.CONTROL));
+        driver.close();
+    }
+
+    /** Transitions abort active installs before the next batch observes them, but keep the JOIN chain. */
+    @Test
+    void batchTransitionDiscardsActiveInstallsButKeepsThePreviousJoin() throws Exception {
+        Rig rig = new Rig(3, 1000);
+        SessionSendDriver driver = rig.driver;
+        SentPacket start = driver.beginBatch(1, frame(2));
+        SentPacket join = driver.finishBatch(1, frame(2));
+        assertTrue(join.isAssigned());
+        SentPacket start2 = driver.beginBatch(2, frame(2));
+        assertTrue(start2.isAssigned());
+        SentPacket stale = driver.batchInstall(2, frame(3), 0, 0);
+        assertTrue(stale.isAssigned(), "a batch 2 install is active before the transition");
+        driver.submitEpochTransition(frame(2));
+        SentPacket start3 = driver.beginBatch(3, frame(2));
+        assertTrue(start3.isAssigned(), "the aborted batch 2 no longer blocks a new one");
+        SentPacket join3 = driver.finishBatch(3, frame(2));
+
+        Drain drain = drainAndRelease(driver);
+        Map<Integer, Long> deps = dependencies(recordOf(drain, join3).dependencies());
+        assertEquals(1, deps.size(), "only the new start remains; the aborted install is gone");
+        assertEquals(start3.sequence(), (long) deps.get(LogicalStream.CONTROL));
+        Map<Integer, Long> startDeps = dependencies(recordOf(drain, start3).dependencies());
+        assertEquals(stale.sequence(), (long) startDeps.get(2),
+                "the view gate still waits for the aborted install's wire record");
+        assertTrue(join.sequence() < stale.sequence(), "the stale install sequenced after the previous JOIN");
+        driver.close();
+
+        // With no install after the JOIN, the next start carries that JOIN explicitly across a transition.
+        Rig retained = new Rig(3, 1000);
+        assertTrue(retained.driver.beginBatch(1, frame(2)).isAssigned());
+        SentPacket retainedJoin = retained.driver.finishBatch(1, frame(2));
+        assertTrue(retainedJoin.isAssigned());
+        assertTrue(retained.driver.beginBatch(2, frame(2)).isAssigned());
+        retained.driver.submitEpochTransition(frame(2));
+        SentPacket after = retained.driver.beginBatch(3, frame(2));
+        Drain retainedDrain = drainAndRelease(retained.driver);
+        assertEquals(retainedJoin.sequence(),
+                (long) dependencies(recordOf(retainedDrain, after).dependencies()).get(2),
+                "the previous JOIN chain survives the transition");
+        retained.driver.close();
+    }
+
+    /** Begin/install/finish commit no batch state when their record cannot be enqueued. */
+    @Test
+    void batchStateCommitsOnlyAfterSuccessfulEnqueue() throws Exception {
+        Rig fullStart = new Rig(2, 1);
+        assertTrue(fullStart.driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        long controlBefore = fullStart.driver.assignedSequence(LogicalStream.CONTROL);
+        SentPacket refusedStart = fullStart.driver.beginBatch(1, frame(2));
+        assertFalse(refusedStart.isAssigned());
+        assertTrue(fullStart.driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, fullStart.driver.closeCode());
+        assertEquals(controlBefore, fullStart.driver.assignedSequence(LogicalStream.CONTROL),
+                "the overflowing start assigned nothing");
+
+        Rig fullInstall = new Rig(2, 1);
+        SentPacket start = fullInstall.driver.beginBatch(1, frame(2));
+        assertTrue(start.isAssigned());
+        long chunkBefore = fullInstall.driver.assignedSequence(2);
+        SentPacket refusedInstall = fullInstall.driver.batchInstall(1, frame(2), 0, 0);
+        assertFalse(refusedInstall.isAssigned());
+        assertTrue(fullInstall.driver.isClosed());
+        assertEquals(chunkBefore, fullInstall.driver.assignedSequence(2),
+                "the overflowing install assigned no chunk record");
+
+        Rig fullFinish = new Rig(2, 2);
+        assertTrue(fullFinish.driver.beginBatch(1, frame(2)).isAssigned());
+        assertTrue(fullFinish.driver.batchInstall(1, frame(2), 0, 0).isAssigned());
+        long joinBefore = fullFinish.driver.assignedSequence(2);
+        SentPacket refusedJoin = fullFinish.driver.finishBatch(1, frame(2));
+        assertFalse(refusedJoin.isAssigned());
+        assertTrue(fullFinish.driver.isClosed());
+        assertEquals(joinBefore, fullFinish.driver.assignedSequence(2),
+                "the overflowing join assigned no BATCH_JOIN");
+    }
+
+    /** Inputs are snapshotted: mutating the caller's lists after the call changes nothing. */
+    @Test
+    void coveredBundleSnapshotsItsInputs() throws Exception {
+        Rig rig = new Rig(1, 1000);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.UpdateToken token = driver.registerUpdate(driver.openScope());
+        List<OutboundPacket> members = new ArrayList<OutboundPacket>(packets(3));
+        List<List<MultistreamSession.UpdateToken>> coverage = new ArrayList<List<MultistreamSession.UpdateToken>>();
+        coverage.add(new ArrayList<MultistreamSession.UpdateToken>(Arrays.asList(token)));
+        List<SentPacket> handles = driver.submitCoveredBundle(frame(1), members,
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL}, frame(1), coverage);
+
+        assertEquals(3, handles.size());
+        members.clear();
+        coverage.clear();
+        handles.clear();
+        assertEquals(1, driver.queuedRecords(), "the driver kept its own run, not the caller's list");
+        assertEquals(0, driver.trackerRetainedTokens(), "the token was consumed at submission");
+        Drain drain = drainAndRelease(driver);
+        assertEquals(3, recordsOf(drain, LogicalStream.CONTROL).size(), "the run is still whole");
+        driver.close();
+    }
+
+    /**
+     * A covered bundle never overtakes an earlier record: its single aggregate charge is requested
+     * and offered only in assignment order, so the earlier record stays writable.
+     */
+    @Test
+    void coveredBundleWaitsBehindAnEarlierRecordAndNeverStallsIt() throws Exception {
+        HeadroomRig rig = new HeadroomRig(100, 86, 14);
+        SessionSendDriver driver = rig.driver;
+        SentPacket early = driver.submit(frame(40), StreamSequencer.Fence.CHUNK, 0, 0);
+        assertTrue(early.isAssigned());
+        List<SentPacket> unit = driver.submitCoveredBundle(frame(1), packets(20),
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL}, frame(1),
+                emptyCoverage(1));
+        assertEquals(3, unit.size());
+        SessionSendDriver.Write first = driver.poll(stream -> stream == early.logicalStream());
+        assertNotNull(first, "the earlier chunk is offered first");
+        assertEquals(early.sequence(), RecordCodec.decodeRecord(first.bytes(), first.stream()).sequence());
+        assertNull(driver.poll(stream -> true), "the covered run waits behind the earlier granted record");
+        driver.released(first.token());
+        Drain rest = drainAndRelease(driver);
+        assertEquals(3, rest.writes.size(), "the whole covered run follows once the earlier record releases");
+        assertEquals(RecordCodec.KIND_BUNDLE_OPEN,
+                RecordCodec.decodeRecord(rest.writes.get(0).bytes(), LogicalStream.CONTROL).kind());
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner));
+        driver.close();
+    }
+
+    /** ACK headroom stays outside the ordinary FIFO: a pending ACK never blocks a covered bundle. */
+    @Test
+    void coveredBundleIsAdmittedUnderPendingAckHeadroom() throws Exception {
+        HeadroomRig rig = new HeadroomRig(102, 86, 16);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(1, frame(2).frame(), 16));
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        driver.coverScope(1, scope);
+
+        List<SentPacket> handles = driver.submitCoveredBundle(frame(1), packets(10),
+                new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL}, frame(1),
+                coverage(tokens(token)));
+        assertEquals(3, handles.size(), "the bundle fits beside the ACK's precharged bytes");
+        assertNull(driver.takeAck(1), "the ACK is still pending");
+        driver.completeScope(scope);
+        driver.sealAckCoverage(1);
+        assertNotNull(driver.takeAck(1), "the ACK resolves after its covering scope completes");
+        Drain drain = drainAndRelease(driver);
+        assertTrue(drain.writes.size() >= 4, "the bundle and the ACK join were written");
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner));
+        driver.close();
     }
 
     /** If the rollback's own disconnect fails, the original constructor failure is still the one reported. */
