@@ -170,6 +170,26 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         this.codec = new LaneCodec(channel, table, decodedBytes::addAndGet);
     }
 
+    /**
+     * The 13.12 account key of this client's own login (ADJUST 3: the same rule as the server). Authenticated
+     * sessions use the profile UUID, legacy (offline) sessions the player name. Null only without a session user.
+     */
+    static String ownAccountKey() {
+        net.minecraft.client.User user = Minecraft.getInstance().getUser();
+        if (user == null) {
+            return null;
+        }
+        return accountKey(user.getName(), user.getProfileId(), !"0".equals(user.getAccessToken()));
+    }
+
+    /** The account key rule, given the user's parts: the UUID when authenticated, else the name (never empty). */
+    static String accountKey(String name, java.util.UUID profileId, boolean authenticated) {
+        if (authenticated && profileId != null) {
+            return profileId.toString();
+        }
+        return name == null || name.isEmpty() ? null : name;
+    }
+
     /** Where an encoded packet goes: the lane session in production, a recorder in tests. */
     interface LaneSend {
         void send(ProtocolState state, int packetId, byte[] frame);
@@ -737,7 +757,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         }
         handler.startSilenceWatch(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readTimeoutMillis));
         // 13.4: the platform reads the live compression state once, here, and the session keeps it.
-        v3.activate(started, PacketLaneCodec.compressionEnabled(pipeline), leftover);
+        v3.activate(started, PacketLaneCodec.compressionEnabled(pipeline), ownAccountKey(), leftover);
         state = State.ACTIVE;
         QuicraftFabric.LOG.info("QUICraft: multi-stream active to {}", v3.remoteAddress());
         // The packets the exchange held, in order, now as records.

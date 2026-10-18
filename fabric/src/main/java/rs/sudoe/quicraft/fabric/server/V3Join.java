@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.server;
 
+import com.mojang.authlib.GameProfile;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.channel.ChannelDuplexHandler;
@@ -96,6 +97,10 @@ public final class V3Join {
     private final SecretHolder secrets = new SecretHolder();
 
     private BindingPayloads payloads;
+    /** The login profile the configuration listener holds, captured at begin (13.12 account key). */
+    private GameProfile profile;
+    /** The 13.12 account key for this join's pool and ranking charges, or null (set at start). */
+    private String account;
     private CipherCutover cutover;
     private RoutingTable table;
     private int protocol;
@@ -168,7 +173,8 @@ public final class V3Join {
      * Hook (start of the configuration stage): starts the binding exchange and returns the
      * configuration task that holds Finish Configuration until it is over (12.4).
      */
-    public ConfigurationTask begin() {
+    public ConfigurationTask begin(GameProfile player) {
+        this.profile = player;
         try {
             Hooks.enter("binding start");
             if (!channel.eventLoop().inEventLoop()) {
@@ -246,7 +252,9 @@ public final class V3Join {
                     throw new IllegalStateException("online mode without Minecraft's shared secret");
                 }
                 mode = BindingStateMachine.MODE_ONLINE;
+                account = accountKey(profile, true);
             } else {
+                account = accountKey(profile, false);
                 if (shared != null) {
                     // 12.19: encrypted but unauthenticated never takes mode 0.
                     throw new IllegalStateException("encrypted but unauthenticated login");
@@ -488,7 +496,7 @@ public final class V3Join {
         backlog = new AckBacklog((lane, sequence) -> lanes.applied(lane, sequence), this::offerBehindHandlers, node,
                 AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
         // 13.4: the platform reads the live compression state once, here, and the session keeps it.
-        connection.activate(lanes, protocol, PacketLaneCodec.compressionEnabled(pipeline), control);
+        connection.activate(lanes, protocol, PacketLaneCodec.compressionEnabled(pipeline), account, control);
         sinkActive = true;
         // 12.13: what was queued during the exchange goes out as records, whole units in order. A
         // submission that fails takes every unit it did not hand over with it and gives their node
@@ -545,6 +553,23 @@ public final class V3Join {
     static void submitUncompressed(MultistreamSession session, PacketLaneCodec codec, ProtocolState state,
             byte[] packet) throws java.io.IOException {
         session.send(state, FrameCodec.packetId(packet), codec.outboundFrame(packet), packet);
+    }
+
+    /**
+     * The 13.12 account key of one login: the authenticated profile UUID when the login was
+     * authenticated, otherwise the player name (docs/protocol.md 13.12: offline accounts are
+     * unauthenticated names, so the key is spoofable there by design of the spec). Null only when
+     * the profile is absent or has no usable identity. Package-private for the unit test.
+     */
+    static String accountKey(GameProfile profile, boolean authenticated) {
+        if (profile == null) {
+            return null;
+        }
+        if (authenticated && profile.id() != null) {
+            return profile.id().toString();
+        }
+        String name = profile.name();
+        return name == null || name.isEmpty() ? null : name;
     }
 
     /** Gives every byte the join still retains back to the node's budget; safe to call more than once. */
