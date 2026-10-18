@@ -37,6 +37,22 @@ class ProductionExtractorAllowlistTest {
         assertTrue(e.getMessage().contains("primitive."), e.getMessage());
     }
 
+    /**
+     * 13.7: the footprint policy follows the extractor rule. Protocol 9004 is 9002 with the primitive
+     * accounting id; the production path rejects it, the test path accepts it, and the production
+     * footprint id is the one 9002 names.
+     */
+    @Test void productionLoadRejectsSyntheticFootprintIdentifiers() throws IOException {
+        RoutingTableException e = assertThrows(RoutingTableException.class,
+                () -> RoutingTableLoader.loadResource(9004));
+        assertTrue(e.getMessage().contains("decodeFootprintBound is not production-approved"), e.getMessage());
+        assertTrue(e.getMessage().contains("primitive.raw_copies.v1"), e.getMessage());
+        assertEquals(2, RoutingTableLoader.parse(bytes("protocol-9004.json")).schema());
+        assertEquals("mc775.raw_copies.v1",
+                RoutingTableLoader.loadResource(9002).serverboundLimits()
+                        .get(rs.sudoe.quicraft.core.routing.ProtocolState.PLAY).decodeFootprintBound);
+    }
+
     @Test void theTestParsePathAcceptsBothFixturesAndSyntheticIdentifiers() throws IOException {
         RoutingTable synthetic = RoutingTableLoader.parse(bytes(SYNTHETIC));
         assertEquals(2, synthetic.schema());

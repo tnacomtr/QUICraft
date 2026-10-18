@@ -115,6 +115,25 @@ class ExtractorGoldenTest {
     }
 
     /**
+     * The production footprint id is the same closed-form bound, with its own boundary vectors: it
+     * gets the same numbers as the primitive, and only the production load path accepts it (13.7).
+     */
+    @Test void productionFootprintIdentifierKeepsTheSameBoundaryVectors() {
+        String production = "mc775.raw_copies.v1";
+        assertEquals(160, FootprintRegistry.bound(production, 0, 0, false));
+        assertEquals(5619, FootprintRegistry.bound(production, 2000, 1459, false));
+        assertEquals(5620, FootprintRegistry.bound(production, 2000, 1460, false));
+        assertEquals(160L + 3L * Integer.MAX_VALUE,
+                FootprintRegistry.bound(production, Integer.MAX_VALUE, Integer.MAX_VALUE, false));
+        assertThrows(IllegalArgumentException.class, () -> FootprintRegistry.bound(production, 10, 100, true));
+        assertThrows(IllegalArgumentException.class, () -> FootprintRegistry.bound(production, -1, 0, false));
+        FootprintRegistry.requireProduction(production);
+        IllegalArgumentException synthetic = assertThrows(IllegalArgumentException.class,
+                () -> FootprintRegistry.requireProduction("primitive.raw_copies.v1"));
+        assertTrue(synthetic.getMessage().contains("not production-approved"), synthetic.getMessage());
+    }
+
+    /**
      * Every identifier whose decode math a malformed case must exercise: the synthetic one always,
      * plus the production identifier where a captured packet gave the layout one (13.7).
      */

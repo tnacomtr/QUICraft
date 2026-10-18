@@ -312,7 +312,10 @@ public final class RoutingTableLoader {
             if (allowance < 160) throw new RoutingTableException("13.7: prefix staging does not fit");
             Object accounting = value.get("decodeFootprintBound");
             if (!(accounting instanceof String)) throw new RoutingTableException("13.7: accounting must be a string");
-            try { FootprintRegistry.require((String) accounting); }
+            try {
+                if (policy == Policy.PRODUCTION) FootprintRegistry.requireProduction((String) accounting);
+                else FootprintRegistry.require((String) accounting);
+            }
             catch (IllegalArgumentException e) { throw new RoutingTableException(e.getMessage()); }
             limits.put(state, new RouteV2.ServerboundLimits(control, realtime, decoded, allowance, (String) accounting));
         }
