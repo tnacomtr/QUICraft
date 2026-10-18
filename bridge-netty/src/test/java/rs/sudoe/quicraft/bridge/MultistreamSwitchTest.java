@@ -64,28 +64,24 @@ class MultistreamSwitchTest {
     }
 
     @Test
-    void theShippedRoutingResourceIsWhatTheAdvertisementOffers() {
-        // 13.7: a schema-1 resource loads, but it cannot drive /3 and must not be advertised.
-        assertEquals(1, RoutingRegistry.forProtocol(775).get().schema(),
-                "this tree ships schema 1 until U9a-2b lands the reviewed schema-2 table");
-        assertEquals(MultistreamSwitch.Reason.NO_ROUTING_SCHEMA, MultistreamSwitch.probe(true, () -> true, () -> true),
-                "13.7: the advertisement names only a reviewed schema-2 resource");
-        // The public probe short-circuits on a native without the exporter, so guard that assertion.
-        assertEquals(QuicSupport.hasKeyingMaterialExport() ? MultistreamSwitch.Reason.NO_ROUTING_SCHEMA
-                        : MultistreamSwitch.Reason.NO_EXPORTER,
-                MultistreamSwitch.probe(true));
-        assertTrue(MultistreamSwitch.Reason.NO_ROUTING_SCHEMA.message().contains("13.7"));
-        assertTrue(MultistreamSwitch.advertisedRouting().isEmpty(),
-                "a schema-1 digest must never reach the advertisement: "
-                        + MultistreamSwitch.advertisedRouting());
-        assertFalse(MultistreamSwitch.servesProtocol(775));
+    void theShippedRoutingResourceIsTheReviewedSchemaTwoTableAndIsWhatTheAdvertisementOffers() {
+        // 13.7: the reviewed schema-2 resource drives /3, and its digest is the one advertised.
+        RoutingTable shipped = RoutingRegistry.forProtocol(775).get();
+        assertEquals(2, shipped.schema(), "the reviewed schema-2 table ships (CP2)");
+        assertTrue(MultistreamSwitch.servesProtocol(775), "the shipped 775 table drives /3");
+        assertEquals(MultistreamSwitch.Reason.ENABLED, MultistreamSwitch.probe(true, () -> true, () -> true),
+                "13.7: with the reviewed table, every probe passes");
+        assertEquals(MultistreamSwitch.Reason.NO_WINDOW_CAPS, MultistreamSwitch.probe(true, () -> true, () -> false),
+                "13.1/13.13: the window probe still gates the advertisement after routing");
+        assertEquals("sha256:" + shipped.digestHex(), MultistreamSwitch.advertisedRouting().get(775),
+                "the advertised digest is the shipped table's exact-byte digest");
     }
 
     @Test
     void aSchemaTwoTableIsServedAdvertisedAndTheDialPathIsUnaffected() {
         RoutingTable schemaTwo = RoutingTableLoader.parse(tableV2Json());
         assertTrue(MultistreamSwitch.serves(schemaTwo), "schema 2 is the reviewed resource");
-        assertFalse(MultistreamSwitch.serves(RoutingRegistry.forProtocol(775).get()));
+        assertTrue(MultistreamSwitch.serves(RoutingRegistry.forProtocol(775).get()));
 
         Map<Integer, String> routing = MultistreamSwitch.advertisedRouting(
                 protocol -> protocol == 775 ? schemaTwo : null);
@@ -99,7 +95,7 @@ class MultistreamSwitchTest {
 
     @Test
     void theSkipGuardOnlyAcceptsSchemaTwo() {
-        assertFalse(MultistreamSwitch.servesProtocol(775), "a shipped schema-1 table cannot drive /3");
+        assertTrue(MultistreamSwitch.servesProtocol(775), "the reviewed schema-2 table drives /3 (CP2)");
         assertFalse(MultistreamSwitch.servesProtocol(1234), "a protocol without a resource cannot drive /3");
         assertTrue(MultistreamSwitch.serves(RoutingTableLoader.parse(tableV2Json())));
     }
@@ -107,8 +103,8 @@ class MultistreamSwitchTest {
     /**
      * 12.1/12.3: the probes stay lazy and ordered (flag, exporter, routing/schema, window). The
      * suppliers record invocations, so an eagerly evaluated window probe, or a flag-off that
-     * touches native state, fails here. The routing rejection assumes the schema-1 table this tree
-     * ships until U9a-2b.
+     * touches native state, fails here. The routing check runs before the window probe, so a
+     * shipped table that passes it lets the window probe run next.
      */
     @Test
     void theProbeShortCircuitsWithoutTouchingLaterCapabilities() {
@@ -134,12 +130,9 @@ class MultistreamSwitchTest {
 
         exporterCalls.set(0);
         windowCalls.set(0);
-        assertEquals(MultistreamSwitch.Reason.NO_ROUTING_SCHEMA,
-                MultistreamSwitch.probe(true, exporter, windows));
+        assertEquals(MultistreamSwitch.Reason.ENABLED, MultistreamSwitch.probe(true, exporter, windows));
         assertEquals(1, exporterCalls.get(), "the exporter is probed exactly once");
-        assertEquals(0, windowCalls.get(), "the window probe must not run before the routing rejection");
-        // The window rejection itself needs a schema-2 resource to get past routing, so
-        // decide(true, true, true, false) covers it; here the ordering is the subject.
+        assertEquals(1, windowCalls.get(), "the window probe runs once the routing check has passed");
     }
 
     @Test
