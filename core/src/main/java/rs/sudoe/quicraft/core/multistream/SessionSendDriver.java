@@ -197,6 +197,7 @@ public final class SessionSendDriver {
     private final Object ip;
     private final Object account;
     private final LongSupplier clock;
+    private final SessionResources.Accounting accounting;
     private final StreamSequencer sequencer;
     private final SendScheduler scheduler;
     private final AckJoinTracker acks = new AckJoinTracker();
@@ -289,19 +290,42 @@ public final class SessionSendDriver {
     /**
      * The production sender for either direction. A serverbound sender (the client's) accepts the interaction
      * flag and refuses chunk routes and epoch transitions (13.9, 13.18); a clientbound one is the server's.
+     * Legacy timestamped ranking calls.
+     *
+     * @see #SessionSendDriver(SessionContext, ServerProfile, OutboundPool, PressureRanking, Object, InetAddress,
+     *     String, LongSupplier, boolean, SessionResources.Accounting)
      */
     public SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
             PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
             boolean serverbound) {
+        this(context, profile, pool, ranking, owner, ip, account, clock, serverbound,
+                SessionResources.Accounting.LEGACY);
+    }
+
+    /**
+     * The production sender for either direction with an explicit ranking mode: LEGACY makes the timestamped
+     * ranking calls, CUMULATIVE the no-time calls from the ranking's shared stall source.
+     */
+    public SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
+            PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
+            boolean serverbound, SessionResources.Accounting accounting) {
         this(context, profile, pool, ranking, owner, ip, account, clock, ReceiveSlots.BYTES_PER_STREAM,
-                AckJoinTracker.MAX_BYTES, DEFAULT_REALTIME_SLICE_BYTES, serverbound);
+                AckJoinTracker.MAX_BYTES, DEFAULT_REALTIME_SLICE_BYTES, serverbound, accounting);
     }
 
     SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
             PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
             long maxRecordBytes, long ackByteLimit, long realtimeSliceBytes, boolean serverbound) {
+        this(context, profile, pool, ranking, owner, ip, account, clock, maxRecordBytes, ackByteLimit,
+                realtimeSliceBytes, serverbound, SessionResources.Accounting.LEGACY);
+    }
+
+    SessionSendDriver(SessionContext context, ServerProfile profile, OutboundPool pool,
+            PressureRanking ranking, Object owner, InetAddress ip, String account, LongSupplier clock,
+            long maxRecordBytes, long ackByteLimit, long realtimeSliceBytes, boolean serverbound,
+            SessionResources.Accounting accounting) {
         if (context == null || profile == null || pool == null || ranking == null || owner == null
-                || clock == null) {
+                || clock == null || accounting == null) {
             throw new IllegalArgumentException("send driver");
         }
         // The headroom must fit under the smallest cap that applies to this connection: owner, IP, account or node.
@@ -321,11 +345,67 @@ public final class SessionSendDriver {
         this.ip = ip;
         this.account = account;
         this.clock = clock;
+        this.accounting = accounting;
         this.sequencer = new StreamSequencer(context.shardCount(), serverbound);
         this.scheduler = new SendScheduler(profile);
-        ranking.connect(owner, ip, account, clock.getAsLong());
-        // The slice is the first ticket of this owner, requested before any record (13.12).
-        request(slice);
+        boolean registered = false;
+        try {
+            connectRanking();
+            registered = true;
+            // The slice is the first ticket of this owner, requested before any record (13.12).
+            request(slice);
+        } catch (RuntimeException | Error failure) {
+            final boolean connected = registered;
+            // Unwind only what this constructor itself acquired: its ranking registration and its slice charge.
+            // Never OutboundPool.cancel(owner): a duplicate construction under an owner key that is already in
+            // use reaches this handler while an existing driver holds reservations and queued requests there,
+            // and cancel would release and drop all of them.
+            try {
+                ReceiveCleanup.run(this::releaseSliceAcquisition, () -> {
+                    if (connected) {
+                        disconnectRanking();
+                    }
+                });
+            } catch (RuntimeException | Error cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            throw failure;
+        }
+    }
+
+    /**
+     * Returns exactly the REALTIME slice this constructor acquired, if any: the charge it took, or a grant that
+     * landed after its refused request. It touches nothing else of the owner's ledger, so a failed construction
+     * never erases reservations that predate it. A refused slice that was never granted holds no bytes and keeps
+     * its FIFO place; the owner's own close drops that wait with the rest of the owner's ledger.
+     */
+    private void releaseSliceAcquisition() {
+        if (!slice.requested) {
+            return;
+        }
+        if (!slice.granted && !pool.takeGrant(slice.ticket)) {
+            return;
+        }
+        slice.granted = false;
+        pool.release(owner, slice.bytes);
+    }
+
+    /** Registers this connection with the ranking, timestamped in LEGACY and cumulative otherwise. */
+    private void connectRanking() {
+        if (accounting == SessionResources.Accounting.CUMULATIVE) {
+            ranking.connect(owner, (InetAddress) ip, (String) account);
+        } else {
+            ranking.connect(owner, (InetAddress) ip, (String) account, clock.getAsLong());
+        }
+    }
+
+    /** Unregisters this connection from the ranking, timestamped in LEGACY and cumulative otherwise. */
+    private void disconnectRanking() {
+        if (accounting == SessionResources.Accounting.CUMULATIVE) {
+            ranking.disconnect(owner);
+        } else {
+            ranking.disconnect(owner, clock.getAsLong());
+        }
     }
 
     /** The negotiated session shape. */
@@ -760,7 +840,7 @@ public final class SessionSendDriver {
         realtimeOrder.clear();
         orphans.clear();
         pendingAcks.clear();
-        ranking.disconnect(owner, clock.getAsLong());
+        disconnectRanking();
     }
 
     private void closeWith(int code) {
@@ -788,9 +868,15 @@ public final class SessionSendDriver {
         }
         charge.released = true;
         releaseCharge(charge);
-        long now = clock.getAsLong();
-        ranking.progress(owner, charge.progress, now);
-        ranking.setRetained(owner, pool.reserved(owner), now);
+        if (accounting == SessionResources.Accounting.CUMULATIVE) {
+            ranking.progress(owner, charge.progress);
+            ranking.setRetained(owner, pool.reserved(owner));
+        } else {
+            // One legacy clock reading serves both timestamped calls.
+            long now = clock.getAsLong();
+            ranking.progress(owner, charge.progress, now);
+            ranking.setRetained(owner, pool.reserved(owner), now);
+        }
         if (!closed) {
             // A stopped driver awaiting its owner's close requests nothing new.
             pump();
@@ -894,7 +980,11 @@ public final class SessionSendDriver {
             return;
         }
         if (pendingGrants == 0) {
-            ranking.beginRefusedWait(owner, clock.getAsLong());
+            if (accounting == SessionResources.Accounting.CUMULATIVE) {
+                ranking.beginRefusedWait(owner);
+            } else {
+                ranking.beginRefusedWait(owner, clock.getAsLong());
+            }
         }
         pendingGrants++;
     }
@@ -935,7 +1025,11 @@ public final class SessionSendDriver {
             pumpMain();
             pumpRealtime();
         }
-        ranking.setRetained(owner, pool.reserved(owner), clock.getAsLong());
+        if (accounting == SessionResources.Accounting.CUMULATIVE) {
+            ranking.setRetained(owner, pool.reserved(owner));
+        } else {
+            ranking.setRetained(owner, pool.reserved(owner), clock.getAsLong());
+        }
     }
 
     /**

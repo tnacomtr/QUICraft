@@ -69,6 +69,24 @@ public interface MultistreamSession {
     /** True while the unsent queue is below its backpressure mark. */
     boolean isWritable();
 
+    /**
+     * The game executor stalled from {@code atNanos} (13.10). Additive: the default throws, so a session never
+     * silently counts executor time toward its close clocks from a report it cannot trust. A cumulative session
+     * derives its exclusion from the listener-owned accounting source; explicit reports remain unsupported and
+     * the default keeps throwing.
+     */
+    default void stallStarted(long atNanos) {
+        throw new UnsupportedOperationException("executor stall reporting");
+    }
+
+    /**
+     * The executor stall that began with {@link #stallStarted(long)} ended at {@code atNanos} (13.10). Additive:
+     * the default throws, as for {@link #stallStarted(long)}; a cumulative session takes no explicit report.
+     */
+    default void stallEnded(long atNanos) {
+        throw new UnsupportedOperationException("executor stall reporting");
+    }
+
     // Additive ACK_JOIN and BATCH_JOIN passthroughs (13.19), mirroring SessionSendDriver.
 
     default boolean createAck(long id, byte[] payload, int chargedBytes) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.mixin;
 
+import com.mojang.authlib.GameProfile;
 import net.minecraft.network.Connection;
 import net.minecraft.server.network.ConfigurationTask;
 import net.minecraft.server.network.ServerConfigurationPacketListenerImpl;
@@ -33,7 +34,8 @@ abstract class ServerConfigurationPacketListenerImplMixin {
             V3Join join = V3Join.of(game);
             if (join != null) {
                 // First in the queue: nothing else of the stage starts before activation.
-                ConfigurationTask hold = join.begin();
+                GameProfile profile = ((ServerConfigurationPacketListenerImpl) (Object) this).getOwner();
+                ConfigurationTask hold = join.begin(profile);
                 ((ServerConfigurationPacketListenerImplAccessor) (Object) this).quicraft$configurationTasks().add(hold);
             }
         } catch (Throwable t) {

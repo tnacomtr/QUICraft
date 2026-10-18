@@ -22,6 +22,7 @@ import rs.sudoe.quicraft.core.profile.ServerProfile;
 import rs.sudoe.quicraft.core.resource.NodePools;
 import rs.sudoe.quicraft.core.resource.OutboundPool;
 import rs.sudoe.quicraft.core.resource.PressureRanking;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 class SessionSendDriverTest {
     private static final long MB = 1L << 20;
@@ -1058,5 +1059,141 @@ class SessionSendDriverTest {
             reader.feed(bytes[at++] & 255);
         }
         return (int) (at + reader.value());
+    }
+
+    /** A cumulative driver reads its ranking source once per connect and cleanup, never a timestamp. */
+    @Test
+    void cumulativeDriverConnectsClosesAndReportsFromTheSharedSource() throws Exception {
+        final AtomicLong now = new AtomicLong(1_000_000_000L);
+        final AtomicLong reads = new AtomicLong();
+        java.util.function.LongSupplier clock = () -> {
+            reads.incrementAndGet();
+            return now.get();
+        };
+        PressureRanking ranking = new PressureRanking(new ExecutorProgressWatch(clock));
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 1L << 40, ranking.view());
+        Object owner = new Object();
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 100, 1L << 40, 4, 4, 4);
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner,
+                InetAddress.getLoopbackAddress(), null, clock, false, SessionResources.Accounting.CUMULATIVE);
+        assertEquals(1, reads.get(), "one cumulative connect reading, no timestamped call");
+        assertTrue(pool.reserved(owner) > 0, "the slice is charged");
+        now.set(2_000_000_000L);
+        driver.close();
+        assertEquals(2, reads.get(), "one cumulative cleanup reading");
+        assertEquals(0, pool.reserved(owner), "close returned every charge");
+        ranking.connect(owner, InetAddress.getLoopbackAddress(), null);
+        assertEquals(3, reads.get(), "the registration was released for a fresh connect");
+        ranking.disconnect(owner);
+    }
+
+    /** A null mode and a ranking of the wrong mode are rejected without acquiring any charge. */
+    @Test
+    void driverRejectsANullModeAndAWrongModeRanking() throws Exception {
+        AtomicLong now = new AtomicLong();
+        PressureRanking timestamped = new PressureRanking();
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 1L << 40, timestamped.view(now::get));
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 100, 1L << 40, 4, 4, 4);
+        Object owner = new Object();
+        InetAddress ip = InetAddress.getLoopbackAddress();
+        assertThrows(IllegalArgumentException.class, () -> new SessionSendDriver(SessionContext.of(2), profile,
+                pool, timestamped, owner, ip, null, now::get, false, null), "a null mode is rejected");
+        assertEquals(0, pool.reserved(owner));
+        // A timestamped ranking cannot serve a cumulative driver: the connect rejects it before any charge.
+        assertThrows(IllegalStateException.class, () -> new SessionSendDriver(SessionContext.of(2), profile, pool,
+                timestamped, owner, ip, null, now::get, false, SessionResources.Accounting.CUMULATIVE));
+        assertEquals(0, pool.reserved(owner));
+        assertEquals(0.0, timestamped.score(owner, now.get()), "no registration was acquired");
+    }
+
+    /**
+     * A duplicate construction under an owner key already in use must not touch that owner's ledger. The existing
+     * driver keeps its slice charge and its queued request; only the failed constructor's own acquisition may be
+     * unwound (Sol rollback finding).
+     */
+    @Test
+    void duplicateConstructionPreservesTheExistingDriversLedger() throws Exception {
+        final AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 4096, ranking.view(now::get));
+        Object owner = new Object();
+        InetAddress ip = InetAddress.getLoopbackAddress();
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1024, 1L << 40, 4, 4, 4);
+        SessionSendDriver existing = new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner, ip,
+                null, now::get, 64, 64, 2048);
+        assertEquals(2048, pool.reserved(owner), "the existing driver holds its slice");
+        // A record beyond the owner's free bytes waits, so the existing driver also owns a queued request.
+        assertTrue(existing.submit(frame(3000), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertEquals(1, pool.waitingCount(), "the existing driver's record waits");
+
+        // The same owner key cannot register twice; the failed construction owns neither the slice nor a request.
+        assertThrows(IllegalStateException.class, () -> new SessionSendDriver(SessionContext.of(2), profile, pool,
+                ranking, owner, ip, null, now::get, 64, 64, 32));
+        assertEquals(2048, pool.reserved(owner), "the existing driver's slice stays charged");
+        assertEquals(1, pool.waitingCount(), "the existing driver's queued request keeps its place");
+        existing.close();
+        assertEquals(0, pool.reserved(owner), "the owner's own close ends its ledger");
+        assertEquals(0, pool.waitingCount());
+    }
+
+    /** A constructor failure after its connect unwinds the registration and every charge the driver took. */
+    @Test
+    void driverConstructorRollsBackAfterASuccessfulConnect() throws Exception {
+        SessionResourcesTest.Scripted scripted = new SessionResourcesTest.Scripted();
+        scripted.reading(0, 0, true);
+        scripted.reading(0, 5, true);
+        scripted.reading(10_000_000_000L, 5_000_000_000L, true);
+        PressureRanking ranking = new PressureRanking(scripted);
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 4096, ranking.view());
+        Object owner = new Object();
+        InetAddress ip = InetAddress.getLoopbackAddress();
+        // The connection's byte budget is already spent, so the slice waits and its refused wait samples.
+        assertTrue(pool.takeGrant(pool.reserveTicket(owner, ip, null, 4096)));
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 100, 1L << 40, 4, 4, 4);
+        StallClock.UnavailableException failure = assertThrows(StallClock.UnavailableException.class, () ->
+                new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner, ip, null, () -> 0,
+                        64, 64, 32, false, SessionResources.Accounting.CUMULATIVE));
+        assertEquals(0, failure.getSuppressed().length, "the cleanup succeeded and masked nothing");
+        // This reservation predates the failed constructor. It belongs to an existing holder of the same owner
+        // key, so the rollback must leave it charged; releasing all owner bytes here erased another driver's
+        // ledger (Sol rollback finding). Only the slice this constructor was granted is ever returned.
+        assertEquals(4096, pool.reserved(owner), "the reservation that predates this constructor is untouched");
+        // The registration is gone: a fresh cumulative connect succeeds from the cleanup's committed reading.
+        scripted.reading(20_000_000_000L, 5_000_000_000L, true);
+        scripted.reading(30_000_000_000L, 5_000_000_000L, true);
+        ranking.connect(owner, ip, null);
+        ranking.disconnect(owner);
+        assertEquals(5, scripted.taken());
+    }
+
+    /** If the rollback's own disconnect fails, the original constructor failure is still the one reported. */
+    @Test
+    void driverConstructorCleanupFailureDoesNotMaskTheOriginal() throws Exception {
+        SessionResourcesTest.Scripted scripted = new SessionResourcesTest.Scripted();
+        scripted.reading(0, 0, true);
+        scripted.reading(0, 5, true);
+        scripted.reading(5_000_000_000L, 50_000_000_000L, true);
+        PressureRanking ranking = new PressureRanking(scripted);
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 4096, ranking.view());
+        Object owner = new Object();
+        InetAddress ip = InetAddress.getLoopbackAddress();
+        assertTrue(pool.takeGrant(pool.reserveTicket(owner, ip, null, 4096)));
+        ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 100, 1L << 40, 4, 4, 4);
+        StallClock.UnavailableException failure = assertThrows(StallClock.UnavailableException.class, () ->
+                new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner, ip, null, () -> 0,
+                        64, 64, 32, false, SessionResources.Accounting.CUMULATIVE));
+        assertEquals(1, failure.getSuppressed().length, "the cleanup failure is attached, not substituted");
+        assertTrue(failure.getSuppressed()[0] instanceof StallClock.UnavailableException);
+        assertEquals(4096, pool.reserved(owner),
+                "the pre-existing reservation is untouched even when the cleanup itself fails");
+        // The malformed cleanup released nothing: a coherent reading still unregisters the connection.
+        scripted.reading(10_000_000_000L, 5_000_000_000L, true);
+        ranking.disconnect(owner);
+        assertEquals(4, scripted.taken(), "the connection was still registered after the failed cleanup");
     }
 }

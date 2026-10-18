@@ -12,6 +12,7 @@ import rs.sudoe.quicraft.core.routing.Direction;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.RouteKey;
 import rs.sudoe.quicraft.core.routing.RouteV2;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
  * Serial delivery driver for serverbound receive (protocol.md 13.10, 13.12, 13.18), the sibling of
@@ -71,6 +72,9 @@ public final class ServerReceiveDriver {
     private boolean closed;
 
     /**
+     * Legacy boundary mode: the blocked-head timer is driven by {@link #stallStarted(long)} and
+     * {@link #stallEnded(long)} notifications on {@code clock}.
+     *
      * @param chunks negotiated chunk count N, 1..6; the receiver keeps the N+2 stream indices
      * @param pump the serverbound read pump for the same session
      * @param validator injected shard, fence and join checks
@@ -95,6 +99,38 @@ public final class ServerReceiveDriver {
         this.held = new Entry[chunks + 2];
     }
 
+    /**
+     * Cumulative mode: the receiver's blocked-head timer reads {@code source} (13.10), so a late
+     * observation excludes exactly what a timely one would have. {@code clock} stays the session's
+     * non-excluding transport clock, kept for deadlines outside stall accounting; it must not be null.
+     * Boundary stall notifications forwarded through this driver throw in this mode.
+     *
+     * @param chunks negotiated chunk count N, 1..6; the receiver keeps the N+2 stream indices
+     * @param pump the serverbound read pump for the same session
+     * @param validator injected shard, fence and join checks
+     * @param routes route lookup for the connection's protocol
+     * @param protocolNumber the negotiated protocol number, for route keys
+     * @param game the game side: decode, deliver, acknowledgements
+     * @param clock the non-excluding transport clock
+     * @param sink receives the one close
+     * @param source the stall accounting source of the executor incarnation, never replaced; not null
+     */
+    public ServerReceiveDriver(int chunks, SessionReadPump pump, StreamReceiver.Validator validator,
+                               SessionReceiveDriver.RouteSource routes, int protocolNumber, LaneGame game,
+                               LongSupplier clock, SessionReceiveDriver.CloseSink sink, StallClock source) {
+        if (pump == null || validator == null || routes == null || game == null || clock == null || sink == null
+                || source == null) {
+            throw new IllegalArgumentException("driver arguments and the stall source are required");
+        }
+        this.pump = pump;
+        this.receiver = new StreamReceiver(chunks, Direction.SERVERBOUND, validator, source);
+        this.routes = routes;
+        this.protocolNumber = protocolNumber;
+        this.game = game;
+        this.sink = sink;
+        this.held = new Entry[chunks + 2];
+    }
+
     /** Returns true once the driver has closed the connection. */
     public boolean closed() {
         return closed;
@@ -103,6 +139,16 @@ public final class ServerReceiveDriver {
     /** Returns the receiver, for the integration and for tests. */
     public StreamReceiver receiver() {
         return receiver;
+    }
+
+    /** Forwards the start of a game-executor tick stall, timestamped at {@code atNanos} (13.10). */
+    public void stallStarted(long atNanos) {
+        receiver.stallStarted(atNanos);
+    }
+
+    /** Forwards the end of a game-executor tick stall, timestamped at {@code atNanos} (13.10). */
+    public void stallEnded(long atNanos) {
+        receiver.stallEnded(atNanos);
     }
 
     /**
@@ -226,6 +272,8 @@ public final class ServerReceiveDriver {
         } catch (RetryLater e) {
             fail(ReceiveClose.resourceWait("execution workspace"));
             return false;
+        } catch (StallClock.UnavailableException e) {
+            throw e;
         } catch (Exception e) {
             fail(ReceiveClose.peerViolation("decode failed: " + e));
             return false;

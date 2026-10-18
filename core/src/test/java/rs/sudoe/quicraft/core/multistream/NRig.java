@@ -16,6 +16,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import rs.sudoe.quicraft.core.resource.NodePools;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
@@ -77,15 +78,23 @@ final class NRig implements AutoCloseable {
 
     static final long OUTBOUND_BYTES = 4L << 20;
 
-    /** Small test pools: a 4 MiB outbound node, IP, account and connection cap. */
+    /** One stored system clock: the no-arg resources and timing helpers must share this exact supplier. */
+    static final LongSupplier SYSTEM_CLOCK = System::nanoTime;
+
+    /** Small test pools: a 4 MiB outbound node, IP, account and connection cap, cumulative accounting. */
     static SessionResources resources() {
+        return resources(SYSTEM_CLOCK);
+    }
+
+    /** Small cumulative test resources on {@code clock}; a fake clock must also build the matching timing. */
+    static SessionResources resources(LongSupplier clock) {
         NodePools node = new NodePools(64L << 20, 64L << 20, OUTBOUND_BYTES, 10, false, NodePools.MIN_EXCESS);
         return new SessionResources(node, OUTBOUND_BYTES, OUTBOUND_BYTES, OUTBOUND_BYTES, 16L << 20, 16L << 20,
-                SessionResources.defaultProfile(), System::nanoTime);
+                SessionResources.defaultProfile(), clock, SessionResources.Accounting.CUMULATIVE);
     }
 
     static NStreamSession.Timing timing(long tickMillis, long openTimeoutMillis) {
-        return new NStreamSession.Timing(System::nanoTime, TimeUnit.MILLISECONDS.toNanos(openTimeoutMillis),
+        return new NStreamSession.Timing(SYSTEM_CLOCK, TimeUnit.MILLISECONDS.toNanos(openTimeoutMillis),
                 TimeUnit.SECONDS.toNanos(10), TimeUnit.MILLISECONDS.toNanos(tickMillis));
     }
 
@@ -154,6 +163,8 @@ final class NRig implements AutoCloseable {
         volatile NStreamSession session;
         volatile long decodeReserveBytes;
         volatile boolean autoApply = true;
+        /** Fault injection: a decode call throws this instead of returning (session stall-accounting tests). */
+        volatile RuntimeException decodeFailure;
         private volatile int lastStream = -1;
 
         @Override
@@ -163,6 +174,9 @@ final class NRig implements AutoCloseable {
 
         @Override
         public Decoded decode(Lane lane, long sequence, byte[] frame, boolean insideBundle, Reservation reservation) {
+            if (decodeFailure != null) {
+                throw decodeFailure;
+            }
             int prefix = 0;
             while ((frame[prefix] & 0x80) != 0) {
                 prefix++;
@@ -176,6 +190,9 @@ final class NRig implements AutoCloseable {
         @Override
         public Decoded decodeInflated(Lane lane, long sequence, byte[] content, boolean insideBundle,
                 Reservation reservation) {
+            if (decodeFailure != null) {
+                throw decodeFailure;
+            }
             return decodeContent(content, insideBundle, reservation);
         }
 
@@ -255,6 +272,8 @@ final class NRig implements AutoCloseable {
         SessionResources serverResources = resources();
         SessionResources clientResources = resources();
         RoutingTable table = TABLE;
+        /** The 13.12 account key of the server session's charges, or null (see NStreamSession). */
+        String serverAccount;
     }
 
     final Config config;
@@ -334,7 +353,8 @@ final class NRig implements AutoCloseable {
             if (config.serverSession) {
                 serverConnection.eventLoop().submit(() -> {
                     server = new NStreamSession(serverConnection, NStreamSession.Role.SERVER, serverControl, config.table,
-                            serverGame, context, config.serverResources, config.serverTiming, config.compressed);
+                            serverGame, context, config.serverResources, config.serverTiming, config.compressed,
+                            config.serverAccount);
                     serverGame.session = server;
                     serverRef = server;
                     for (QuicStreamChannel s : serverEarly) {

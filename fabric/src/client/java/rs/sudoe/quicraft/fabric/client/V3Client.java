@@ -41,6 +41,7 @@ import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
+import rs.sudoe.quicraft.core.time.StallClock;
 import rs.sudoe.quicraft.core.transport.V3Connection;
 import rs.sudoe.quicraft.core.transport.V3ConnectionImpl;
 import rs.sudoe.quicraft.fabric.QuicraftFabric;
@@ -57,7 +58,9 @@ import rs.sudoe.quicraft.fabric.net.PacketLaneCodec;
  * <p><b>Fail safe.</b> Any failure before the lanes are active ends in {@link #fail}: the QUIC
  * connection closes with {@code 0x10}, {@link V3Plan#failed} records it, and (unless the player
  * chose {@code quic-only}) the same join starts again over fresh TCP with a line in the log and in
- * the chat. After activation a failure disconnects and the next join uses TCP.</p>
+ * the chat. A {@link rs.sudoe.quicraft.core.time.StallClock.UnavailableException} close instead
+ * classifies as a local resource abort ({@code 0x12}, {@link V3Plan#closed}), which writes no
+ * failure-cache entry. After activation a failure disconnects and the next join uses TCP.</p>
  *
  * <p>Threading: everything runs on the connection's event loop (the game's, for the hosted
  * transport) except the login hooks that vanilla runs elsewhere (volatile fields) and
@@ -170,9 +173,37 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         this.codec = new LaneCodec(channel, table, decodedBytes::addAndGet);
     }
 
+    /**
+     * The 13.12 account key of this client's own login (ADJUST 3: the same rule as the server). Authenticated
+     * sessions use the profile UUID, legacy (offline) sessions the player name. Null only without a session user.
+     */
+    static String ownAccountKey() {
+        net.minecraft.client.User user = Minecraft.getInstance().getUser();
+        if (user == null) {
+            return null;
+        }
+        return accountKey(user.getName(), user.getProfileId(), !"0".equals(user.getAccessToken()));
+    }
+
+    /** The account key rule, given the user's parts: the UUID when authenticated, else the name (never empty). */
+    static String accountKey(String name, java.util.UUID profileId, boolean authenticated) {
+        if (authenticated && profileId != null) {
+            return profileId.toString();
+        }
+        return name == null || name.isEmpty() ? null : name;
+    }
+
     /** Where an encoded packet goes: the lane session in production, a recorder in tests. */
     interface LaneSend {
         void send(ProtocolState state, int packetId, byte[] frame);
+
+        /**
+         * With the packet's uncompressed id and body, so a CHUNK route can extract its position (13.8).
+         * The default drops them (a recorder needs no position); production overrides it.
+         */
+        default void send(ProtocolState state, int packetId, byte[] frame, byte[] uncompressed) {
+            send(state, packetId, frame);
+        }
     }
 
     /** Tests: replaces the lane session as the destination of encoded packets. */
@@ -406,6 +437,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             }
             encodedFramesObserved++;
             int packetId = VarInt.read(body.duplicate());
+            byte[] uncompressed = ByteBufUtil.getBytes(body);
             byte[] frame = LaneCodec.frame(channel, body);
             framedFramesObserved++;
             GameLanes current = lanes;
@@ -416,10 +448,10 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                     failActive("send queue overflow", NStreamSession.CLOSE_ORDERING);
                     return;
                 }
-                backlog.add(new QueuedFrame(sendState, packetId, frame, promise));
+                backlog.add(new QueuedFrame(sendState, packetId, frame, uncompressed, promise));
                 backlogBytes += frame.length;
             } else {
-                sendFrame(new QueuedFrame(sendState, packetId, frame, promise));
+                sendFrame(new QueuedFrame(sendState, packetId, frame, uncompressed, promise));
             }
         } catch (Throwable t) {
             promise.tryFailure(t);
@@ -432,7 +464,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     /** Transfers one fully encoded GAME frame to the lane session. */
     private void sendFrame(QueuedFrame queued) {
         try {
-            laneSend.send(queued.state, queued.packetId, queued.frame);
+            laneSend.send(queued.state, queued.packetId, queued.frame, queued.uncompressed);
             queued.promise.trySuccess();
         } catch (Throwable t) {
             queued.promise.tryFailure(t);
@@ -474,12 +506,35 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     }
 
     void laneClosed(GameLanes.LaneClosedException e) {
+        boolean localResource = e.code() == Protocol.CLOSE_RESOURCE
+                && e.getCause() instanceof StallClock.UnavailableException;
         if (state == State.ACTIVE) {
             state = State.FAILED;
             failureText = "QUIC multi-stream failed (" + e.getMessage() + ")";
             Transports.v3Failure(connection, failureText);
             QuicraftFabric.LOG.warn("QUICraft: {}; the next join uses TCP", failureText);
-            plan.failed(V3Plan.Phase.PLAY, e.getMessage());
+            try {
+                if (localResource) {
+                    // 13.10/13.12: the stall source is gone. This is a local resource abort after
+                    // activation: no failure-cache entry, only 12.14's fixed resource window.
+                    plan.closed(V3Plan.Phase.PLAY, V3Plan.CloseEvent.localResourceAbort(0), e.getMessage());
+                } else {
+                    plan.failed(V3Plan.Phase.PLAY, e.getMessage());
+                }
+            } catch (Throwable ignored) {
+                // The bookkeeping fails closed; the connection still has to end.
+            }
+            // The session already closed the QUIC connection before calling the game; abort the
+            // bridge connection so the game sees the close. The session's code is authoritative.
+            // A -1 code is no application close at all, so there is nothing valid to send.
+            if (e.code() >= 0) {
+                v3.abort(e.code());
+            }
+        } else if (state != State.FAILED) {
+            // Pre-activation the game has not seen: a lane closed before the session was active.
+            // A stall-source invalidation (UnavailableException cause) is a local resource abort,
+            // closed with 0x12 and classified LOCAL_RESOURCE; any other cause is a normal 0x10 failure.
+            fail(localResource ? e.getCause() : null, e.getMessage());
         }
     }
 
@@ -710,7 +765,17 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         GameLanes started = new GameLanes(channel, codec, v3::session, ProtocolState.CONFIGURATION,
                 DeliveryContext.of(pipeline));
         lanes = started;
-        laneSend = (state, id, frame) -> v3.session().send(state, id, frame);
+        laneSend = new LaneSend() {
+            @Override
+            public void send(ProtocolState state, int id, byte[] frame) {
+                v3.session().send(state, id, frame);
+            }
+
+            @Override
+            public void send(ProtocolState state, int id, byte[] frame, byte[] uncompressed) {
+                v3.session().send(state, id, frame, uncompressed);
+            }
+        };
         // Outbound: the game's own encoder runs (with everything in front of it); its output is taken
         // right behind it and sent as a record. Held writes wait at the tail while the lanes are full.
         String encoderName = pipeline.get("encoder") != null ? "encoder" : "outbound_config";
@@ -722,7 +787,12 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         }
         handler.startSilenceWatch(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readTimeoutMillis));
         // 13.4: the platform reads the live compression state once, here, and the session keeps it.
-        v3.activate(started, PacketLaneCodec.compressionEnabled(pipeline), leftover);
+        v3.activate(started, PacketLaneCodec.compressionEnabled(pipeline), ownAccountKey(), leftover);
+        if (exchangeEnded || state == State.FAILED) {
+            // A local-resource abort during activation already notified the game synchronously and
+            // ended this attempt. Never overwrite FAILED with ACTIVE or release what was held.
+            return;
+        }
         state = State.ACTIVE;
         QuicraftFabric.LOG.info("QUICraft: multi-stream active to {}", v3.remoteAddress());
         // The packets the exchange held, in order, now as records.
@@ -781,17 +851,26 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     void fail(Throwable cause) {
         QuicraftFabric.LOG.warn("QUICraft: multi-stream hook failed", cause);
-        fail(V3Plan.INTERNAL_ERROR);
+        fail(cause, V3Plan.INTERNAL_ERROR);
     }
 
     /**
-     * The {@code /3} attempt failed before the lanes were active (12.14): close QUIC with {@code 0x10},
-     * record it, and start the same join over TCP unless the player asked for {@code quic-only}.
-     * The first failure wins.
+     * The {@code /3} attempt failed before the lanes were active (12.14): close QUIC with {@code 0x10}
+     * (or {@code 0x12} for a local resource abort), record it, and start the same join over TCP unless
+     * the player asked for {@code quic-only}. The first failure wins.
+     *
+     * <p>When {@code cause} is a {@link StallClock.UnavailableException} the close is classified as a
+     * local resource abort (12.14, 13.12): {@link V3Plan#closed} writes no failure-cache entry and the
+     * connection closes with {@link Protocol#CLOSE_RESOURCE} ({@code 0x12}) instead of
+     * {@link Protocol#CLOSE_BINDING_FAILURE} ({@code 0x10}).
      */
     void fail(String reason) {
+        fail(null, reason);
+    }
+
+    private void fail(@Nullable Throwable cause, String reason) {
         if (!loop.inEventLoop()) {
-            loop.execute(() -> fail(reason));
+            loop.execute(() -> fail(cause, reason));
             return;
         }
         if (state == State.ACTIVE) {
@@ -810,10 +889,23 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         }
         state = State.FAILED;
         boolean retry;
-        try {
-            retry = plan.failed(V3Plan.Phase.JOINING, reason);
-        } catch (Throwable t) {
-            retry = !quicOnly;
+        int closeCode;
+        if (cause instanceof StallClock.UnavailableException) {
+            // A stall-source invalidation is a local resource close (0x12), never an ordering failure:
+            // it writes no failure-cache entry and the bookkeeping treats it as LOCAL_RESOURCE.
+            try {
+                retry = plan.closed(V3Plan.Phase.JOINING, V3Plan.CloseEvent.localResourceAbort(0), reason);
+            } catch (Throwable t) {
+                retry = !quicOnly;
+            }
+            closeCode = Protocol.CLOSE_RESOURCE;
+        } else {
+            try {
+                retry = plan.failed(V3Plan.Phase.JOINING, reason);
+            } catch (Throwable t) {
+                retry = !quicOnly;
+            }
+            closeCode = Protocol.CLOSE_BINDING_FAILURE;
         }
         if (retry) {
             String message = V3Notices.fellBack(reason);
@@ -825,7 +917,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             QuicraftFabric.LOG.warn("QUICraft: {}; quic-only never falls back to TCP", failureText);
         }
         cleanUp();
-        v3.abort(Protocol.CLOSE_BINDING_FAILURE);
+        v3.abort(closeCode);
     }
 
     /**
@@ -918,12 +1010,14 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         final ProtocolState state;
         final int packetId;
         final byte[] frame;
+        final byte[] uncompressed;
         final ChannelPromise promise;
 
-        QueuedFrame(ProtocolState state, int packetId, byte[] frame, ChannelPromise promise) {
+        QueuedFrame(ProtocolState state, int packetId, byte[] frame, byte[] uncompressed, ChannelPromise promise) {
             this.state = state;
             this.packetId = packetId;
             this.frame = frame;
+            this.uncompressed = uncompressed;
             this.promise = promise;
         }
     }
