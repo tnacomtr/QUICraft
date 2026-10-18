@@ -53,19 +53,21 @@ class ExtractorGoldenTest {
     }
 
     @Test void malformedIdsCoordinatesAndListBounds() {
-        String[] families = {"primitive.", "mc775."};
-        for (String family : families) {
-            for (String bad : new String[] {"80", "808080808000", "ffffffff1f", "8100", "ffffffff0f"})
-                assertThrows(IllegalArgumentException.class,
-                        () -> ExtractorRegistry.decoder(family + "join.v1").decode(hex(bad)));
-            for (String bad : new String[] {"01ffffffff1f00", "01800000", "0180808080800000"})
-                assertThrows(IllegalArgumentException.class,
-                        () -> ExtractorRegistry.decoder(family + "varint_xz.v1").decode(hex(bad)));
-            // A chunk list entry is a packed ChunkPos, a VarInt payload length and that payload.
-            for (String bad : new String[] {"018108", "018000", "010100", "01010000000000000000",
-                    "0101000000000000000080", "010100000000000000000501"})
-                assertThrows(IllegalArgumentException.class,
-                        () -> ExtractorRegistry.decoder(family + "chunk_list.v1").decode(hex(bad)));
+        // Every malformed case runs against the synthetic identifier of its layout and, where a
+        // captured packet gave the layout a production identifier, against that one too: the two
+        // families share the decode math, so malformed bytes must fail in both. The production id
+        // of a dropped layout does not exist (13.7), so it is asserted separately below, as an
+        // unknown-identifier case rather than as a malformed-packet case.
+        for (String layout : new String[] {"join", "varint_xz", "chunk_list"}) {
+            for (String identifier : identifiers(layout)) {
+                for (String bad : malformed(layout)) {
+                    IllegalArgumentException rejected = assertThrows(IllegalArgumentException.class,
+                            () -> ExtractorRegistry.decoder(identifier).decode(hex(bad)),
+                            identifier + " accepted malformed bytes " + bad);
+                    assertFalse(rejected.getMessage().contains("unknown extractor identifier"),
+                            identifier + " was rejected as unknown, not as malformed: " + bad);
+                }
+            }
         }
         // A zero-length payload followed by bytes this layout does not read is a legal prefix.
         ExtractorRegistry.Result trailing = ExtractorRegistry.decoder("mc775.chunk_list.v1")
@@ -76,9 +78,9 @@ class ExtractorGoldenTest {
         // for the count, not for a body that was never going to be large enough.
         for (int count : new int[] {ExtractorRegistry.MAX_LIST_ENTRIES + 1, Integer.MAX_VALUE}) {
             byte[] declared = concat(new byte[] {1}, varint(count));
-            for (String family : families) {
+            for (String identifier : identifiers("chunk_list")) {
                 IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-                        () -> ExtractorRegistry.decoder(family + "chunk_list.v1").decode(declared));
+                        () -> ExtractorRegistry.decoder(identifier).decode(declared));
                 assertTrue(e.getMessage().contains("chunk list count"), e.getMessage());
             }
         }
@@ -90,6 +92,12 @@ class ExtractorGoldenTest {
         list[2] = 0x20;
         assertEquals(count, ExtractorRegistry.decoder("mc775.chunk_list.v1").decode(list).positions.size());
         assertEquals(count, ExtractorRegistry.decoder("primitive.chunk_list.v1").decode(list).positions.size());
+        // A production-looking name that no captured packet justified is unknown, and that is a
+        // different behavior from a malformed packet: this assertion covers it for the reason it
+        // claims, with the identifier the malformed cases must never reach.
+        IllegalArgumentException dropped = assertThrows(IllegalArgumentException.class,
+                () -> ExtractorRegistry.decoder("mc775.varint_xz.v1"));
+        assertTrue(dropped.getMessage().contains("unknown extractor identifier"), dropped.getMessage());
         assertThrows(IllegalArgumentException.class, () -> ExtractorRegistry.decoder("unknown.v1"));
         assertThrows(IllegalArgumentException.class, () -> ExtractorRegistry.decoder("mc775.unknown.v1"));
     }
@@ -104,6 +112,34 @@ class ExtractorGoldenTest {
         assertThrows(IllegalArgumentException.class, () -> FootprintRegistry.bound(id, -1, 0, false));
         assertThrows(IllegalArgumentException.class, () -> FootprintRegistry.bound(id, 0, -1, false));
         assertThrows(IllegalArgumentException.class, () -> FootprintRegistry.require("unknown.v1"));
+    }
+
+    /**
+     * Every identifier whose decode math a malformed case must exercise: the synthetic one always,
+     * plus the production identifier where a captured packet gave the layout one (13.7).
+     */
+    private static java.util.List<String> identifiers(String layout) {
+        java.util.List<String> identifiers = new java.util.ArrayList<String>();
+        identifiers.add("primitive." + layout + ".v1");
+        if (ExtractorRegistry.isProduction("mc775." + layout + ".v1")) {
+            identifiers.add("mc775." + layout + ".v1");
+        }
+        return identifiers;
+    }
+
+    /** Malformed byte sequences for one layout: a bad packet id, then bad fields of that layout. */
+    private static String[] malformed(String layout) {
+        switch (layout) {
+            case "join":
+                // Only the id is layout for a join, so every case here is a malformed id.
+                return new String[] {"80", "808080808000", "ffffffff1f", "8100", "ffffffff0f"};
+            case "varint_xz":
+                return new String[] {"01ffffffff1f00", "01800000", "0180808080800000"};
+            default:
+                // A chunk list entry is a packed ChunkPos, a VarInt payload length and that payload.
+                return new String[] {"018108", "018000", "010100", "01010000000000000000",
+                        "0101000000000000000080", "010100000000000000000501"};
+        }
     }
 
     private static void assertResult(String expected, ExtractorRegistry.Result result, String context) {
