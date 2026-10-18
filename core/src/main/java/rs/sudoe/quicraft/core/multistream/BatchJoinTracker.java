@@ -87,15 +87,12 @@ public final class BatchJoinTracker {
      * without changing batch state for a valid marker (U2b, 13.19). The caller invokes this before
      * assigning the join, then commits with {@link #finish} only after that record was enqueued.
      *
-     * <p>An epoch mismatch on the active batch clears that batch before it throws, as
-     * {@link #finish} does, so stale installs are never observed by a later {@link #begin}.
+     * <p>Non-mutating even on a refused marker: an epoch mismatch throws and leaves the batch
+     * active. Only {@link #finish} or {@link #abort} discard it.
      *
      * @throws IllegalArgumentException for an unmatched marker or an epoch mismatch
      */
     public synchronized Record.Dependency[] previewFinish(long id, long epoch) {
-        if (active && activeId == id && epoch != batchEpoch) {
-            clearActive();
-        }
         require(id, epoch);
         return dependencies();
     }

@@ -792,7 +792,15 @@ public final class SessionSendDriver {
         return handle;
     }
 
-    /** Ends the active batch with its BATCH_JOIN on CHUNK[0] (13.19). */
+    /**
+     * Ends the active batch with its BATCH_JOIN on CHUNK[0] (13.19).
+     *
+     * <p>The join is assigned before it is enqueued, so {@code assignJoin} can consume a CHUNK[0]
+     * sequence that is never written. That is not a leak and not a gap on the wire: a refused
+     * enqueue (a record no applicable cap can admit) closes the driver with 0x12 first, and a closed
+     * driver writes nothing further, so the consumed sequence is never visible to the peer. The
+     * batch and the previous-JOIN chain are committed only after the enqueue succeeds.
+     */
     public synchronized SentPacket finishBatch(long batchId, OutboundPacket join) {
         SentPacket handle = new SentPacket();
         if (closed || sealed) {
@@ -1127,6 +1135,10 @@ public final class SessionSendDriver {
             closeWith(CLOSE_RESOURCE);
             return result;
         }
+        // Token resolution runs after the run is enqueued (U2b). Every token was validated above under this
+        // monitor, so a failure here is a local defect. Partial consumption before the failure is not a leak:
+        // the close below drops every causal-scope and token entry (AckJoinTracker.closeScopes) and releases the
+        // run's single charge with the queue, and the caller receives no handles.
         try {
             int closingIndex = records.size() - 1;
             for (Map.Entry<MultistreamSession.UpdateToken, Integer> entry : tokenMember.entrySet()) {
@@ -1137,7 +1149,7 @@ public final class SessionSendDriver {
             }
         } catch (RuntimeException failure) {
             // The tokens were validated under this same monitor; a failure here is a local defect
-            // and the queued run cannot be completed consistently. Close with the cause.
+            // and the queued run cannot be completed consistently. Close with the cause (terminal cleanup).
             closeCause = failure;
             closeWith(CLOSE_RESOURCE);
             return new ArrayList<SentPacket>();

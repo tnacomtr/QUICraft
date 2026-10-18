@@ -2186,7 +2186,9 @@ class SessionSendDriverTest {
         assertEquals(8, dependencies(preview).get(3));
         assertTrue(tracker.active(), "a valid finish preview does not clear the batch");
         assertThrows(IllegalArgumentException.class, () -> tracker.previewFinish(1, 8), "epoch mismatch");
-        assertFalse(tracker.active(), "the epoch mismatch discards stale installs");
+        assertTrue(tracker.active(), "a refused finish preview mutates nothing");
+        assertThrows(IllegalArgumentException.class, () -> tracker.finish(1, 8), "epoch mismatch");
+        assertFalse(tracker.active(), "the epoch mismatch on finish discards stale installs");
         tracker.begin(2, 20, 0);
         assertEquals(20, dependencies(tracker.previewFinish(2, 0)).get(LogicalStream.CONTROL));
 
@@ -2319,6 +2321,26 @@ class SessionSendDriverTest {
                 "the overflowing join assigned no BATCH_JOIN");
     }
 
+    /**
+     * A join that passes the queue precheck but that no applicable cap can admit is refused inside
+     * enqueue, after assignJoin has taken its CHUNK[0] sequence. The refusal closes the driver with
+     * 0x12, so the consumed sequence and the queued start are never written and the batch is not
+     * committed (finding: finishBatch assigns before enqueue; the consumed sequence is unobservable).
+     */
+    @Test
+    void refusedBatchJoinAfterAssignmentClosesAndWritesNothing() throws Exception {
+        Rig rig = new Rig(2, 1000, 100);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.beginBatch(1, frame(2)).isAssigned());
+        SentPacket join = driver.finishBatch(1, frame(200));
+        assertFalse(join.isAssigned(), "the join no cap can admit is not assigned to the caller");
+        assertTrue(driver.isClosed(), "a refused enqueue after assignment is a terminal 0x12 close");
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        Drain drain = drainAndRelease(driver);
+        assertEquals(0, drain.writes.size(), "nothing queued before or by the join is written after the close");
+        assertEquals(0, rig.pool.reserved(rig.owner), "the terminal close released every charge");
+    }
+
     /** Inputs are snapshotted: mutating the caller's lists after the call changes nothing. */
     @Test
     void coveredBundleSnapshotsItsInputs() throws Exception {
@@ -2335,7 +2357,7 @@ class SessionSendDriverTest {
         members.clear();
         coverage.clear();
         handles.clear();
-        assertEquals(1, driver.queuedRecords(), "the driver kept its own run, not the caller's list");
+        assertEquals(3, driver.queuedRecords(), "the driver kept its own run (opener, member, closer), not the caller's list");
         assertEquals(0, driver.trackerRetainedTokens(), "the token was consumed at submission");
         Drain drain = drainAndRelease(driver);
         assertEquals(3, recordsOf(drain, LogicalStream.CONTROL).size(), "the run is still whole");
@@ -2350,7 +2372,8 @@ class SessionSendDriverTest {
     void coveredBundleWaitsBehindAnEarlierRecordAndNeverStallsIt() throws Exception {
         HeadroomRig rig = new HeadroomRig(100, 86, 14);
         SessionSendDriver driver = rig.driver;
-        SentPacket early = driver.submit(frame(40), StreamSequencer.Fence.CHUNK, 0, 0);
+        // Large enough that the early record keeps its charge, so the run's aggregate cannot fit beside it.
+        SentPacket early = driver.submit(frame(70), StreamSequencer.Fence.CHUNK, 0, 0);
         assertTrue(early.isAssigned());
         List<SentPacket> unit = driver.submitCoveredBundle(frame(1), packets(20),
                 new StreamSequencer.Fence[] {StreamSequencer.Fence.ORDINARY_CONTROL}, frame(1),
