@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Map;
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
@@ -65,8 +66,12 @@ class MultistreamSwitchTest {
         // 13.7: a schema-1 resource loads, but it cannot drive /3 and must not be advertised.
         assertEquals(1, RoutingRegistry.forProtocol(775).get().schema(),
                 "this tree ships schema 1 until U9a-2b lands the reviewed schema-2 table");
-        assertEquals(MultistreamSwitch.Reason.NO_ROUTING_SCHEMA, MultistreamSwitch.probe(true),
+        assertEquals(MultistreamSwitch.Reason.NO_ROUTING_SCHEMA, MultistreamSwitch.probe(true, true, true),
                 "13.7: the advertisement names only a reviewed schema-2 resource");
+        // The public probe short-circuits on a native without the exporter, so guard that assertion.
+        assertEquals(QuicSupport.hasKeyingMaterialExport() ? MultistreamSwitch.Reason.NO_ROUTING_SCHEMA
+                        : MultistreamSwitch.Reason.NO_EXPORTER,
+                MultistreamSwitch.probe(true));
         assertTrue(MultistreamSwitch.Reason.NO_ROUTING_SCHEMA.message().contains("13.7"));
         assertTrue(MultistreamSwitch.advertisedRouting().isEmpty(),
                 "a schema-1 digest must never reach the advertisement: "

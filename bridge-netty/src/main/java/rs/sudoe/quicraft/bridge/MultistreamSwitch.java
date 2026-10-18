@@ -115,10 +115,19 @@ public final class MultistreamSwitch {
      * the advertisement.
      */
     public static Reason probe(boolean flag) {
+        return probe(flag, QuicSupport.hasKeyingMaterialExport(), QuicSupport.hasMaxFlowControlWindows());
+    }
+
+    /**
+     * {@link #probe(boolean)} with the two native probes injected, so the routing/schema decision
+     * is testable on any host (a native without the exporter or the window caps would otherwise
+     * short-circuit before the routing check).
+     */
+    static Reason probe(boolean flag, boolean exporterCapable, boolean windowsCappable) {
         if (!flag) {
             return Reason.FLAG_OFF;
         }
-        if (!QuicSupport.hasKeyingMaterialExport()) {
+        if (!exporterCapable) {
             return Reason.NO_EXPORTER;
         }
         boolean loaded = false;
@@ -134,7 +143,7 @@ public final class MultistreamSwitch {
         if (advertisedRouting().isEmpty()) {
             return Reason.NO_ROUTING_SCHEMA;
         }
-        if (!QuicSupport.hasMaxFlowControlWindows()) {
+        if (!windowsCappable) {
             return Reason.NO_WINDOW_CAPS;
         }
         return Reason.ENABLED;
