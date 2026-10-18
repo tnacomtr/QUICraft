@@ -9,6 +9,7 @@ import java.util.Map;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
+import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
 
 /**
  * The server-side switch that turns {@code /3} on (docs/protocol.md 12.1, 12.3, 13.1, 13.13): the
@@ -59,6 +60,8 @@ public final class MultistreamSwitch {
                 + " quicraft/2"),
         /** No routing table for any shipped protocol number: 13.1 cannot select {@code /3} without one. */
         NO_ROUTING("no routing resource loaded (13.7); staying on quicraft/2"),
+        /** A table loads but none is the reviewed schema 2 that 13.7 requires for {@code /3}. */
+        NO_ROUTING_SCHEMA("no reviewed schema-2 routing resource loaded (13.7); staying on quicraft/2"),
         /** The native cannot cap quiche's flow-control windows, which 13.13 requires for {@code /3}. */
         NO_WINDOW_CAPS("the QUIC native cannot cap quiche's flow-control windows (13.13); staying on"
                 + " quicraft/2");
@@ -83,9 +86,11 @@ public final class MultistreamSwitch {
     private MultistreamSwitch() {}
 
     /**
-     * The decision of 12.3 and 13.1 over four probe results, in the order the reasons are checked.
+     * The decision of 12.3, 13.1 and 13.7 over four probe results, in the order the reasons are
+     * checked. {@code routingResourceUsable} means a reviewed schema-2 resource is available (13.7);
+     * a loaded table of any other schema counts as unusable and stays on {@code quicraft/2}.
      */
-    public static Reason decide(boolean flag, boolean exporterCapable, boolean routingResourceLoaded,
+    public static Reason decide(boolean flag, boolean exporterCapable, boolean routingResourceUsable,
             boolean flowControlWindowsCappable) {
         if (!flag) {
             return Reason.FLAG_OFF;
@@ -93,7 +98,7 @@ public final class MultistreamSwitch {
         if (!exporterCapable) {
             return Reason.NO_EXPORTER;
         }
-        if (!routingResourceLoaded) {
+        if (!routingResourceUsable) {
             return Reason.NO_ROUTING;
         }
         if (!flowControlWindowsCappable) {
@@ -104,30 +109,70 @@ public final class MultistreamSwitch {
 
     /**
      * {@link #decide} over the real probes on this machine. A flag that is off short-circuits before
-     * any probe runs, so the default configuration never touches the native capability checks.
+     * any probe runs, so the default configuration never touches the native capability checks. A
+     * loaded table that is not the reviewed schema 2 (13.7) is {@link Reason#NO_ROUTING_SCHEMA}:
+     * the N+2 session refuses it, so advertising {@code /3} would break every client that trusted
+     * the advertisement.
      */
     public static Reason probe(boolean flag) {
         if (!flag) {
             return Reason.FLAG_OFF;
         }
-        return decide(true, QuicSupport.hasKeyingMaterialExport(), !advertisedRouting().isEmpty(),
-                QuicSupport.hasMaxFlowControlWindows());
+        if (!QuicSupport.hasKeyingMaterialExport()) {
+            return Reason.NO_EXPORTER;
+        }
+        boolean loaded = false;
+        for (Integer protocol : SHIPPED_PROTOCOLS) {
+            if (tableFor(protocol.intValue()) != null) {
+                loaded = true;
+                break;
+            }
+        }
+        if (!loaded) {
+            return Reason.NO_ROUTING;
+        }
+        if (advertisedRouting().isEmpty()) {
+            return Reason.NO_ROUTING_SCHEMA;
+        }
+        if (!QuicSupport.hasMaxFlowControlWindows()) {
+            return Reason.NO_WINDOW_CAPS;
+        }
+        return Reason.ENABLED;
     }
 
     /**
-     * The advertisement's {@code routing} member (13.1): every shipped protocol number whose routing
-     * resource loads, mapped to {@code sha256:<digest of its exact bytes>}. Empty when none loads,
-     * which is exactly the {@link Reason#NO_ROUTING} case. Ascending by protocol number.
+     * The advertisement's {@code routing} member (13.1): every shipped protocol number whose
+     * routing resource loads <em>and is the reviewed schema 2</em> (13.7), mapped to
+     * {@code sha256:<digest of its exact bytes>}. Empty when none does, which is exactly the
+     * {@link Reason#NO_ROUTING_SCHEMA} case. Ascending by protocol number.
      */
     public static Map<Integer, String> advertisedRouting() {
+        return advertisedRouting(MultistreamSwitch::tableFor);
+    }
+
+    /** {@link #advertisedRouting()} over an injectable table source, so tests can prove both schemas. */
+    static Map<Integer, String> advertisedRouting(java.util.function.IntFunction<RoutingTable> tables) {
         Map<Integer, String> routing = new LinkedHashMap<Integer, String>();
         for (Integer protocol : SHIPPED_PROTOCOLS) {
-            RoutingTable table = tableFor(protocol.intValue());
-            if (table != null) {
+            RoutingTable table = tables.apply(protocol.intValue());
+            if (serves(table)) {
                 routing.put(protocol, "sha256:" + table.digestHex());
             }
         }
         return Collections.unmodifiableMap(routing);
+    }
+
+    /**
+     * 13.7: only a reviewed schema-2 resource may drive a {@code /3} join. The N+2 session refuses
+     * anything else at activation, so neither the advertisement nor a client's dial may accept it.
+     */
+    public static boolean serves(RoutingTable table) {
+        return table != null && table.schema() == RoutingTableLoader.SCHEMA_VERSION_V2;
+    }
+
+    /** Whether the shipped table for this protocol number may drive {@code /3} (13.1, 13.7). */
+    public static boolean servesProtocol(int protocolNumber) {
+        return serves(tableFor(protocolNumber));
     }
 
     /** The protocol numbers a routing resource ships for, the ones an advertisement can name. */

@@ -27,6 +27,7 @@ import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.server.network.EventLoopGroupHolder;
 import rs.sudoe.quicraft.bridge.GameHost;
+import rs.sudoe.quicraft.bridge.MultistreamSwitch;
 import rs.sudoe.quicraft.bridge.QuicBridgeChannel;
 import rs.sudoe.quicraft.bridge.status.StatusQuery;
 import rs.sudoe.quicraft.core.connect.ClientConnector;
@@ -416,6 +417,11 @@ public final class ClientConnect {
                 int protocol = currentProtocolNumber();
                 RoutingTable table = RoutingRegistry.forProtocol(protocol).orElseThrow(
                         () -> new IllegalStateException("no routing table for protocol " + protocol));
+                if (!MultistreamSwitch.serves(table)) {
+                    // 13.7: a schema-1 resource cannot drive /3, so never offer the dial at all.
+                    throw new IllegalStateException("no reviewed schema-2 routing table for protocol "
+                            + protocol + " (13.7)");
+                }
                 CompletableFuture<V3Connection> dial = GameHost.connectV3(loop,
                         GameHost.datagramChannelsLike(holder.channelCls()), target, fingerprint, table,
                         TransportConfig.DEFAULT, early, bypassResumption);

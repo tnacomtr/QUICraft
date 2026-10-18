@@ -15,6 +15,7 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.SharedConstants;
 import rs.sudoe.quicraft.bridge.MultistreamSwitch;
 import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.server.ServerQuic;
@@ -29,14 +30,21 @@ import rs.sudoe.quicraft.fabric.server.ServerQuic;
 public class ServerMultistreamGameTest implements FabricClientGameTest {
     @Override
     public void runTest(ClientGameTestContext context) {
-        if (!QuicSupport.hasKeyingMaterialExport() || !QuicSupport.hasMaxFlowControlWindows()
-                || MultistreamSwitch.tableFor(SharedConstants.getProtocolVersion()) == null) {
-            // No /3 on this native, or no routing resource for this game version (13.1): TCP only.
+        RoutingTable table = MultistreamSwitch.tableFor(SharedConstants.getProtocolVersion());
+        if (!QuicSupport.hasKeyingMaterialExport() || !QuicSupport.hasMaxFlowControlWindows()) {
+            // 12.2/12.3/13.13: this native cannot do /3, so the server stays on quicraft/2.
+            QuicraftFabricTestLog.info("skipping the offline /3 join: this native cannot do /3 (12.2, 12.3, 13.13)");
+            return;
+        }
+        if (!MultistreamSwitch.serves(table)) {
+            // 13.7: a schema-1 resource cannot drive /3; U9a-2b lands the reviewed table.
+            QuicraftFabricTestLog.info("skipping the offline /3 join: no reviewed schema-2 routing table for protocol "
+                    + SharedConstants.getProtocolVersion() + " (13.7); the server stays on quicraft/2");
             return;
         }
         Hooks.setFaultInjection(false);
         try {
-            run(context);
+            run(context, table);
         } catch (java.io.IOException e) {
             throw new AssertionError(e);
         } catch (Exception e) {
@@ -44,7 +52,7 @@ public class ServerMultistreamGameTest implements FabricClientGameTest {
         }
     }
 
-    private static void run(ClientGameTestContext context) throws Exception {
+    private static void run(ClientGameTestContext context, RoutingTable table) throws Exception {
         Path settings = FabricLoader.getInstance().getConfigDir().resolve("quicraft").resolve("server.properties");
         byte[] before = Files.exists(settings) ? Files.readAllBytes(settings) : null;
         Files.createDirectories(settings.getParent());
@@ -55,7 +63,7 @@ public class ServerMultistreamGameTest implements FabricClientGameTest {
             check(ad != null && "quicraft/3".equals(ad.alpn()), "the server advertises quicraft/3: " + ad);
             RawV3Client.Result result;
             try (RawV3Client.Join join = RawV3Client.start(new InetSocketAddress(InetAddress.getLoopbackAddress(),
-                    ad.port()), ad.fingerprint(), MultistreamSwitch.tableFor(SharedConstants.getProtocolVersion()), 5, false)) {
+                    ad.port()), ad.fingerprint(), table, 5, false)) {
                 // The harness steps the game's ticks only while the test waits for them.
                 for (int tick = 0; tick < 1200 && !join.done.isDone(); tick++) {
                     context.waitTick();
