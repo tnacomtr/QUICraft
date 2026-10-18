@@ -14,6 +14,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -154,6 +155,76 @@ class HostedEventLoopTest {
         assertThrows(IllegalArgumentException.class,
                 () -> loop.scheduleWithFixedDelay(() -> ran.set(true), 0, 0, TimeUnit.MILLISECONDS));
         assertFalse(ran.get(), "a refused schedule runs nothing");
+    }
+
+    /**
+     * A cancel that lands between a periodic run's last cancellation check and the publication of
+     * its next handle must still release the newly armed task; the guard alone would let the host
+     * retain it until its deadline.
+     */
+    @Test
+    void aCancelThatRacesAnArmingReleasesTheNewlyArmedTask() throws Exception {
+        RaceHost race = new RaceHost();
+        HostedEventLoop hosted = new HostedEventLoop(race);
+        try {
+            ScheduledFuture<?> future = hosted.scheduleAtFixedRate(() -> race.armAtNextSchedule = true,
+                    0, 20, TimeUnit.MILLISECONDS);
+            race.future.set(future);
+            assertTrue(race.newlyArmedCancelled.await(5, TimeUnit.SECONDS),
+                    "the task armed during the cancel was not released");
+            assertTrue(future.isCancelled());
+        } finally {
+            race.shutdown();
+        }
+    }
+
+    /** A host that cancels the future exactly while its next task is being scheduled. */
+    private static final class RaceHost implements HostLoop {
+        private final TestHost.Loop delegate = new TestHost.Loop("hosted-race-test");
+        final AtomicReference<ScheduledFuture<?>> future = new AtomicReference<ScheduledFuture<?>>();
+        final CountDownLatch newlyArmedCancelled = new CountDownLatch(1);
+        volatile boolean armAtNextSchedule;
+        private volatile boolean cancellingDuringSchedule;
+
+        @Override
+        public boolean inEventLoop(Thread thread) {
+            return delegate.inEventLoop(thread);
+        }
+
+        @Override
+        public void execute(Runnable task) {
+            delegate.execute(task);
+        }
+
+        @Override
+        public Cancellable schedule(Runnable task, long delay, TimeUnit unit) {
+            Cancellable real = delegate.schedule(task, delay, unit);
+            if (armAtNextSchedule) {
+                ScheduledFuture<?> armed = future.get();
+                if (armed != null) {
+                    cancellingDuringSchedule = true;
+                    try {
+                        armed.cancel(false); // the race: commit the cancel before the handle returns
+                    } finally {
+                        cancellingDuringSchedule = false;
+                    }
+                }
+            }
+            return new Cancellable() {
+                @Override
+                public boolean cancel() {
+                    boolean cancelled = real.cancel();
+                    if (cancelled && !cancellingDuringSchedule) {
+                        newlyArmedCancelled.countDown();
+                    }
+                    return cancelled;
+                }
+            };
+        }
+
+        void shutdown() {
+            delegate.shutdown();
+        }
     }
 
     private static void sleep(long millis) {

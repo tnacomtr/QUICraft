@@ -172,7 +172,15 @@ final class HostedEventLoop extends AbstractEventLoop {
         /** Schedules the next run at {@code deadlineNanos}; a deadline already past runs at once. */
         final void armAt(long deadlineNanos) {
             this.deadlineNanos = deadlineNanos;
-            handle = loop.host.schedule(this, Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+            HostLoop.Cancellable scheduled = loop.host.schedule(this,
+                    Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+            handle = scheduled;
+            if (isDone()) {
+                // cancel() can land between the caller's last cancellation check and this
+                // publication. Publish first, then stop the task: the guard alone would leave it
+                // retained on the host until its deadline.
+                scheduled.cancel();
+            }
         }
 
         @Override
