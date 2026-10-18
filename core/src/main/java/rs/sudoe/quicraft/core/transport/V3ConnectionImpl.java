@@ -29,6 +29,7 @@ import rs.sudoe.quicraft.core.multistream.LogicalStream;
 import rs.sudoe.quicraft.core.multistream.PreambleV2;
 import rs.sudoe.quicraft.core.multistream.SessionContext;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
  * {@link V3Connection} over one Netty QUIC connection, its stream 0 and one {@link NStreamSession}.
@@ -123,10 +124,15 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
 
     /**
      * The server's side: the routing table is resolved at activation from {@code listener}, and
-     * {@code resources} are its N+2 session resources (13.12); null builds them on first activation.
+     * {@code resources} is the listener's shared N+2 resource set (13.12). That set is owned by the
+     * listener: a null is a programming-contract error and is rejected here, before anything is
+     * allocated or any per-admission pools could be created.
      */
     static V3ConnectionImpl server(QuicChannel connection, QuicStreamChannel control, NettyQuicByteStream raw,
             V3Listener listener, PreambleHandler handler, boolean handshakeComplete, SessionResources resources) {
+        if (resources == null) {
+            throw new IllegalArgumentException("server resources");
+        }
         V3ConnectionImpl impl = new V3ConnectionImpl(connection, control, raw, NStreamSession.Role.SERVER, null, null,
                 null, null, null, listener, handler, handshakeComplete);
         impl.resources = resources;
@@ -841,6 +847,20 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         MultistreamSession started;
         try {
             started = newSession(resolved, game, negotiated, compressed, account);
+        } catch (StallClock.UnavailableException e) {
+            // 13.10: the stall accounting source is gone, so the session cannot be built in good faith.
+            // Close 0x12 and tell the game with the cause so it classifies this as a local resource
+            // close, which is the same classification the session would use mid-connection.
+            LOG.log(Level.FINE, "activating /3 with no stall source: closing 0x12", e);
+            Codecs.closeLater(connection, true, Protocol.CLOSE_RESOURCE);
+            try {
+                game.onClosed(Protocol.CLOSE_RESOURCE, false, e);
+            } catch (Throwable gameFailure) {
+                // The 0x12 close is already queued and this is the one notification. A LaneGame that
+                // throws must not reach guarded(), which would queue a competing 0x10 close.
+                LOG.log(Level.FINE, "the game failed while being told about the resource close", gameFailure);
+            }
+            return;
         } catch (RuntimeException e) {
             failActivation("the session cannot start: " + e.getMessage());
             return;
@@ -862,7 +882,12 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
             boolean compressed, String account) {
         SessionResources shared = resources;
         if (shared == null) {
-            shared = role == NStreamSession.Role.CLIENT ? SessionResources.client() : SessionResources.production(null);
+            if (role != NStreamSession.Role.CLIENT) {
+                // The server's set belongs to its listener; allocating one here would give this
+                // admission its own node pools. The factory already rejects this programming error.
+                throw new IllegalArgumentException("server resources");
+            }
+            shared = SessionResources.client();
             resources = shared;
         }
         return new NStreamSession(connection, role, control, resolved, game, negotiated, shared, compressed, account);

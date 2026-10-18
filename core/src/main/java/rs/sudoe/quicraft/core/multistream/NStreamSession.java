@@ -364,7 +364,7 @@ public final class NStreamSession implements MultistreamSession {
     private final Direction sendDirection;
     private final Map<String, Extractor> extractors;
     private final SessionReceiveDriver.RouteSource routes;
-    private final SessionSendDriver sendDriver;
+    private SessionSendDriver sendDriver;
     private final QuicStreamWriteSink sink;
     private final QuicStreamByteSource source;
     private final PreambleFilter preambles;
@@ -488,13 +488,16 @@ public final class NStreamSession implements MultistreamSession {
         }
         this.source = new QuicStreamByteSource(streams);
         this.preambles = new PreambleFilter();
-        this.sendDriver = new SessionSendDriver(context, resources.profile(), resources.outbound(),
-                resources.outboundRanking(), this, ip, account, resources.clock(), role == Role.CLIENT,
-                SessionResources.Accounting.CUMULATIVE);
-        // Submissions run on callers' threads; a close they trigger only stops the driver, and its charges are
-        // returned by release() on the loop, serialized with polling and writes (13.12).
-        sendDriver.releaseOnOwnerClose();
         try {
+            // The send driver's constructor registers with the ranking and charges the slice; if it
+            // throws (e.g. the stall source is invalid), the driver is null and must not be closed
+            // again here. A failure inside the block below closes it via the null-check.
+            this.sendDriver = new SessionSendDriver(context, resources.profile(), resources.outbound(),
+                    resources.outboundRanking(), this, ip, account, resources.clock(), role == Role.CLIENT,
+                    SessionResources.Accounting.CUMULATIVE);
+            // Submissions run on callers' threads; a close they trigger only stops the driver, and its charges are
+            // returned by release() on the loop, serialized with polling and writes (13.12).
+            sendDriver.releaseOnOwnerClose();
             this.sink = new QuicStreamWriteSink(sendDriver, streams, this::writeAllowed, this::onSettled);
             StreamReceiver.Validator validator = new ShardValidator(shards,
                     role == Role.SERVER ? Direction.SERVERBOUND : Direction.CLIENTBOUND);
@@ -512,9 +515,20 @@ public final class NStreamSession implements MultistreamSession {
                         extractors, proxy, resources.clock(), closeSink, resources.stallClock());
             }
         } catch (RuntimeException e) {
-            sendDriver.close();
+            // The construction failure is the cause the caller classifies; cleanup must never replace it.
+            if (sendDriver != null) {
+                try {
+                    sendDriver.close();
+                } catch (RuntimeException | Error cleanup) {
+                    e.addSuppressed(cleanup);
+                }
+            }
             if (serverPump != null) {
-                serverPump.cancel(); // returns the inflater charge and leaves the inbound ranking
+                try {
+                    serverPump.cancel(); // returns the inflater charge and leaves the inbound ranking
+                } catch (RuntimeException | Error cleanup) {
+                    e.addSuppressed(cleanup);
+                }
             }
             throw e;
         }

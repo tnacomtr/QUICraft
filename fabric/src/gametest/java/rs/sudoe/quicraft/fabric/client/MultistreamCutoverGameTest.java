@@ -65,6 +65,7 @@ import rs.sudoe.quicraft.core.multistream.RecordCodec;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingRegistry;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
+import rs.sudoe.quicraft.core.time.StallClock;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 import rs.sudoe.quicraft.core.transport.EarlyFlight;
@@ -114,6 +115,10 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             encryptionWithoutAuthenticationFallsBack(protocol, table.get());
             quicOnlyShowsTheFailureInsteadOfFallingBack(protocol, table.get());
             aClosedConnectionBeforeActivationFallsBack(protocol, table.get());
+            aLocalResourceAbortBeforeActivationFallsBackToTcp(protocol, table.get());
+            aLocalResourceAbortDuringActivationDoesNotPublishActive(protocol, table.get());
+            aLocalResourceAbortAfterActivationDoesNotWriteTheFailureCache(protocol, table.get());
+            aLocalResourceAbortInQuicOnlyDoesNotFallBack(protocol, table.get());
             aServerDisconnectIsNotAMultistreamFailure(protocol, table.get());
             heldPacketsStayHeldUntilActivation(protocol, table.get());
             aProtocolErrorBeforeActivationFallsBackToTcp(protocol, table.get(), false);
@@ -266,6 +271,142 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
             rig.expectFallback("connection closed before multi-stream was active");
         }
+    }
+
+    /**
+     * 13.10/13.12: a stalled stall source invalidated before /3 is active closes the join with {@code 0x12},
+     * classified LOCAL_RESOURCE (no pin, no failure-cache entry), and the next join uses TCP.
+     */
+    private static void aLocalResourceAbortBeforeActivationFallsBackToTcp(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+
+            // Simulate the session telling the game it lost its stall source: a 0x12 close whose
+            // cause is a StallClock.UnavailableException. The Fake has no real session, so the close
+            // is faked through the same lane-closed event the bridge would fire.
+            fireLaneClosed(rig, Protocol.CLOSE_RESOURCE,
+                    new StallClock.UnavailableException("stall accounting is unavailable"));
+
+            check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
+            check(rig.awaitCondition(() -> rig.fake.abortCode == Protocol.CLOSE_RESOURCE),
+                    "QUIC closed with 0x12: " + rig.fake.abortCode);
+            check(Transports.takeRetryOverTcp(rig.connection), "a fresh TCP join is requested");
+            check(rig.plan.isFailed(), "the plan recorded the failure");
+            check(rig.plan.closeClass() == V3Plan.CloseClass.LOCAL_RESOURCE,
+                    "the close is LOCAL_RESOURCE, not NON_RESOURCE: " + rig.plan.closeClass());
+            check(rig.client.failureText() == null, "no quic-only failure text");
+            List<V3Notices.Notice> notices = V3Notices.drain();
+            check(notices.size() == 1
+                            && "QUIC multi-stream failed (the multi-stream connection closed with 0x12), fell back to TCP"
+                                    .equals(notices.get(0).literal()),
+                    "the player is told in the user's wording: " + notices);
+            check(rig.awaitCondition(() -> rig.files.pins().pin(HOST, PORT, Collections.emptySet())
+                            .map(p -> p.fingerprint().equals(rig.pinned)).orElse(rig.pinned == null)),
+                    "a resource close writes no pin and keeps the old one");
+            rig.expectNextJoinUsesTcp();
+            check(rig.noFailureCache(), "a local resource abort writes no failure-cache entry");
+        }
+    }
+
+    /**
+     * The synchronous shape of core's activation boundary: {@code activate()} tells the game with a
+     * 0x12 and returns without a session. V3Client must stay FAILED (never publish ACTIVE), retry over
+     * fresh TCP, classify LOCAL_RESOURCE, and write no failure-cache entry.
+     */
+    private static void aLocalResourceAbortDuringActivationDoesNotPublishActive(int protocol, RoutingTable table)
+            throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.fake.activationFailure =
+                    new StallClock.UnavailableException("stall accounting is unavailable");
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+
+            check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
+            // The notification runs synchronously inside activate(); a task queued behind that same
+            // loop task runs only after startLanes returns, proving it did not overwrite FAILED.
+            rig.loop.submit(() -> { }).sync();
+            check(rig.client.state() == V3Client.State.FAILED,
+                    "never published ACTIVE after the activation abort: " + rig.client.state());
+            check(!rig.fake.activated, "the fake activation did not succeed");
+            check(rig.awaitCondition(() -> rig.fake.abortCode == Protocol.CLOSE_RESOURCE),
+                    "QUIC closed with 0x12: " + rig.fake.abortCode);
+            check(Transports.takeRetryOverTcp(rig.connection), "a fresh TCP join is requested");
+            check(rig.plan.isFailed(), "the plan recorded the failure");
+            check(rig.plan.closeClass() == V3Plan.CloseClass.LOCAL_RESOURCE,
+                    "the close is LOCAL_RESOURCE: " + rig.plan.closeClass());
+            check(rig.client.failureText() == null, "no quic-only failure text");
+            List<V3Notices.Notice> notices = V3Notices.drain();
+            check(notices.size() == 1, "one fallback line: " + notices);
+            rig.expectNextJoinUsesTcp();
+            check(rig.noFailureCache(), "a local resource abort writes no failure-cache entry");
+        }
+    }
+
+    /**
+     * After activation the same 0x12 + UnavailableException must be classified through
+     * {@code V3Plan.closed(PLAY, localResourceAbort)}: no retry, no failure-cache entry, only the fixed
+     * 60-second resource window.
+     */
+    private static void aLocalResourceAbortAfterActivationDoesNotWriteTheFailureCache(int protocol,
+            RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, false, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+            rig.server.start();
+            rig.run(Integer.MAX_VALUE);
+            check(rig.awaitState(V3Client.State.ACTIVE), "active, state " + rig.client.state());
+
+            fireLaneClosed(rig, Protocol.CLOSE_RESOURCE,
+                    new StallClock.UnavailableException("stall accounting is unavailable"));
+
+            check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
+            check(rig.awaitCondition(() -> rig.fake.abortCode == Protocol.CLOSE_RESOURCE),
+                    "QUIC closed with 0x12: " + rig.fake.abortCode);
+            check(!Transports.takeRetryOverTcp(rig.connection), "no retry after activation");
+            check(rig.plan.closeClass() == V3Plan.CloseClass.LOCAL_RESOURCE,
+                    "the close is LOCAL_RESOURCE, not NON_RESOURCE: " + rig.plan.closeClass());
+            check(rig.client.failureText() != null, "the disconnect screen says why");
+            check(V3Notices.isEmpty(), "no fallback line: the join was already in play");
+            rig.expectNextJoinUsesTcp();
+            check(rig.noFailureCache(), "a local resource abort writes no failure-cache entry");
+        }
+    }
+
+    /** QUIC_ONLY has no automatic TCP fallback, but the local-resource close still writes no cache. */
+    private static void aLocalResourceAbortInQuicOnlyDoesNotFallBack(int protocol, RoutingTable table) throws Exception {
+        try (Rig rig = new Rig(protocol, table, true, false)) {
+            rig.login(true, true);
+            rig.client.onConfigurationStarted();
+            rig.awaitState(V3Client.State.BINDING);
+
+            fireLaneClosed(rig, Protocol.CLOSE_RESOURCE,
+                    new StallClock.UnavailableException("stall accounting is unavailable"));
+
+            check(rig.awaitState(V3Client.State.FAILED), "failed, state " + rig.client.state());
+            check(rig.awaitCondition(() -> rig.fake.abortCode == Protocol.CLOSE_RESOURCE),
+                    "QUIC closed with 0x12: " + rig.fake.abortCode);
+            check(!Transports.takeRetryOverTcp(rig.connection), "quic-only never retries over TCP");
+            check(rig.plan.closeClass() == V3Plan.CloseClass.LOCAL_RESOURCE,
+                    "the close is LOCAL_RESOURCE: " + rig.plan.closeClass());
+            check(rig.client.failureText() != null, "the disconnect screen says why");
+            check(V3Notices.isEmpty(), "no fallback line in quic-only");
+            check(rig.noFailureCache(), "a local resource abort writes no failure-cache entry");
+        }
+    }
+
+    /** Fires the same lane-closed event the bridge produces for a session close. */
+    private static void fireLaneClosed(Rig rig, int code, Throwable cause) throws Exception {
+        java.lang.reflect.Constructor<rs.sudoe.quicraft.bridge.GameLanes.LaneClosedException> ctor =
+                rs.sudoe.quicraft.bridge.GameLanes.LaneClosedException.class.getDeclaredConstructor(
+                        int.class, boolean.class, Throwable.class);
+        ctor.setAccessible(true);
+        rig.channel.pipeline().fireExceptionCaught(ctor.newInstance(code, false, cause));
     }
 
     /** A server that kicks the player (a disconnect packet, then close) is not a /3 failure. */
@@ -990,6 +1131,7 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         final EventLoop loop = group.next();
         final Path dir;
         final ClientV3State files;
+        final FailureCache failures;
         final Fake fake = new Fake(loop);
         final Connection connection = new Connection(PacketFlow.CLIENTBOUND);
         final ServerIdentity identity;
@@ -1028,7 +1170,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             Advertisement ad = Advertisement.of(Protocol.ALPN_V3, 25570, identity.fingerprint(),
                     Map.of(protocol, "sha256:" + table.digestHex()));
             ads.record(ClientConnector.key(server), Optional.of(ad));
-            connector = new ClientConnector(ads, FailureCache.load(dir.resolve("failures.properties")),
+            failures = FailureCache.load(dir.resolve("failures.properties"));
+            connector = new ClientConnector(ads, failures,
                     new ClientConnector.V3Support(files.pins(), files.rebinds(), files.worker(),
                             System::currentTimeMillis, protocol, true, true));
             ClientConnector.Outcome<Object> outcome = connector.connect(server, HOST, PORT,
@@ -1112,6 +1255,15 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
                     new InetSocketAddress(InetAddress.getLoopbackAddress(), PORT), HOST, PORT, Mode.AUTO, null, tcp)
                     .get(10, TimeUnit.SECONDS);
             check(next.tcp() != null && next.quic() == null, "the next join uses TCP");
+        }
+
+        /** True when neither the §6 cache nor 12.14's activation cache blocks QUIC for this server. */
+        boolean noFailureCache() throws Exception {
+            files.worker().submit(() -> { }).get(10, TimeUnit.SECONDS);
+            InetSocketAddress quic = new InetSocketAddress(InetAddress.getLoopbackAddress(), 25570);
+            return failures.allows(quic.getAddress(), quic.getPort(), plan.fingerprint())
+                    && !failures.isActivationBlocked(quic.getAddress(), quic.getPort(),
+                            plan.fingerprint(), System.currentTimeMillis());
         }
 
         /** One delivery as the lanes fire it: a game packet, then the acknowledgement marker (on the loop). */
@@ -1328,6 +1480,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
         volatile boolean activated;
         volatile boolean compressed;
         volatile byte[] activationLeftover;
+        /** Non-null makes activate() take core's activation-unavailable shape: notify 0x12, no session. */
+        volatile Throwable activationFailure;
         volatile int abortCode = -1;
         volatile boolean open = true;
         /** Like core's connection after detachForActivation: later stream data is kept for activate(). */
@@ -1385,6 +1539,13 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
 
         @Override
         public void activate(LaneGame game, boolean compressed, ByteBuffer controlLeftover) {
+            Throwable failure = activationFailure;
+            if (failure != null) {
+                // Same shape as core's doActivate catch: notify the supplied game synchronously with
+                // 0x12 and the original cause, then return without publishing a session.
+                game.onClosed(Protocol.CLOSE_RESOURCE, false, failure);
+                return;
+            }
             activated = true;
             this.compressed = compressed;
             // Core hands the session the application's leftover followed by what it kept since the detach.
@@ -1401,6 +1562,17 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
 
         @Override
         public void activate(LaneGame game, int protocolNumber, boolean compressed, ByteBuffer controlLeftover) {
+            activate(game, compressed, controlLeftover);
+        }
+
+        @Override
+        public void activate(LaneGame game, boolean compressed, String account, ByteBuffer controlLeftover) {
+            activate(game, compressed, controlLeftover);
+        }
+
+        @Override
+        public void activate(LaneGame game, int protocolNumber, boolean compressed, String account,
+                ByteBuffer controlLeftover) {
             activate(game, compressed, controlLeftover);
         }
 

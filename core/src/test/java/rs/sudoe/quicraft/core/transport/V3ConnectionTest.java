@@ -48,6 +48,8 @@ import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
+import rs.sudoe.quicraft.core.multistream.SessionResources;
+import rs.sudoe.quicraft.core.time.StallClock;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 /**
@@ -91,6 +93,16 @@ class V3ConnectionTest {
         QuicClient.setGraceFloorForTests(0);
         QuicClient.setBeforeConnectCompletionForTests(null);
         QuicClient.forgetSessions();
+        // A test may invalidate the process-wide client stall source; reset it so the next test
+        // gets a fresh one. Reflection avoids polluting the production API.
+        try {
+            java.lang.reflect.Field clientField = SessionResources.class.getDeclaredField("client");
+            clientField.setAccessible(true);
+            clientField.set(null, null);
+        } catch (Exception e) {
+            // If the field layout changed, fail fast in the next test that needs it.
+            throw new AssertionError(e);
+        }
     }
 
     private static void requireV3() {
@@ -600,6 +612,109 @@ class V3ConnectionTest {
         assertTrue(warned, "the refusal is the 12.7 handshake guard, which fails closed with 0x10");
     }
 
+    // --- The stall-source invalidation tests.
+
+    /**
+     * 13.10/13.12: when the client's stall accounting source is invalid by the time {@code activate}
+     * runs, the {@link NStreamSession} constructor throws {@link
+     * StallClock.UnavailableException}, caught in {@code doActivate} as a local resource close ({@code
+     * 0x12}) that notifies the game with the cause.
+     */
+    @Test
+    void aClientThatLosesItsStallSourceBeforeActivationCloses0x12() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            assertTrue(await(() -> negotiated(pair.client) != null, 5_000), "the client's selection");
+            SessionResources.client().progressWatch().invalidate();
+
+            CompletableFuture<SeenClose> close = watchCloseEvent(channelOf(pair.serverSide));
+            pair.client.detachForActivation(leftover -> { });
+            pair.client.activate(pair.clientGame, -1, false, ByteBuffer.wrap(LOGIN_FLIGHT));
+
+            SeenClose seen = close.get(10, TimeUnit.SECONDS);
+            assertEquals(Protocol.CLOSE_RESOURCE, seen.code, "the peer sees 0x12");
+            assertEquals(0, seen.reason.length, "0x12 is sent with an empty wire reason");
+            assertNull(pair.client.session(), "no session is created");
+            assertSingleLocalClose(pair.clientGame, "client");
+        }
+    }
+
+    /**
+     * As above, on the server side: when the server's stall source is invalid before it activates,
+     * the connection closes with {@code 0x12} and the game receives the cause.
+     */
+    @Test
+    void aServerThatLosesItsStallSourceBeforeActivationCloses0x12() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            assertTrue(await(pair.client::handshakeComplete, 5_000), "the client's handshake");
+            assertTrue(await(() -> negotiated(pair.serverSide) != null, 5_000), "the server's selection");
+            assertTrue(await(() -> negotiated(pair.client) != null, 5_000), "the client's selection");
+            SessionResources serverResources = serverResources(pair.serverSide);
+            assertNotNull(serverResources, "the server has resources");
+            serverResources.progressWatch().invalidate();
+
+            CompletableFuture<SeenClose> close = watchCloseEvent(channelOf(pair.client));
+            pair.serverSide.detachForActivation(leftover -> { });
+            pair.serverSide.activate(pair.serverGame, 4242, false, ByteBuffer.wrap(LOGIN_FLIGHT));
+
+            SeenClose seen = close.get(10, TimeUnit.SECONDS);
+            assertEquals(Protocol.CLOSE_RESOURCE, seen.code, "the peer sees 0x12");
+            assertEquals(0, seen.reason.length, "0x12 is sent with an empty wire reason");
+            assertNull(pair.serverSide.session(), "no session is created");
+            assertSingleLocalClose(pair.serverGame, "server");
+        }
+    }
+
+    /**
+     * Constructor-failure variant: the {@link NStreamSession} catch block must not NPE when
+     * {@code sendDriver} is null (the driver constructor threw). If the null-check were absent, the
+     * re-throw would be an NPE caught as a {@code 0x10} binding failure instead of the {@code 0x12}
+     * resource close.
+     */
+    @Test
+    void aStallSourceInvalidationBeforeActivationPropagatesTheCause() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            assertTrue(await(() -> negotiated(pair.serverSide) != null, 5_000), "the server's selection");
+            assertTrue(await(() -> negotiated(pair.client) != null, 5_000), "the client's selection");
+            // Invalidate the server side so the server's own construction fails first.
+            serverResources(pair.serverSide).progressWatch().invalidate();
+
+            CompletableFuture<SeenClose> close = watchCloseEvent(channelOf(pair.client));
+            pair.serverSide.detachForActivation(leftover -> { });
+            pair.serverSide.activate(pair.serverGame, 4242, false, ByteBuffer.wrap(LOGIN_FLIGHT));
+
+            // The client sees 0x12 (UnavailableException), not 0x10 (NPE from the null sendDriver).
+            SeenClose seen = close.get(10, TimeUnit.SECONDS);
+            assertEquals(Protocol.CLOSE_RESOURCE, seen.code, "the peer sees 0x12, not a constructor NPE");
+            assertEquals(0, seen.reason.length, "0x12 is sent with an empty wire reason");
+            assertNull(pair.serverSide.session(), "no session is created on either side");
+            assertSingleLocalClose(pair.serverGame, "server");
+        }
+    }
+
+    /**
+     * Contract C: the server's resources belong to the listener. The server factory rejects a null
+     * set before constructing anything; this is an ownership/programming-contract error, not a wire
+     * close. The production caller ({@code QuicServer.Connection.offerV3}) does not catch it.
+     */
+    @Test
+    void aServerFactoryRejectsNullResourcesBeforeBuildingAnything() throws Exception {
+        requireV3();
+        try (Pair pair = new Pair(connection -> { })) {
+            assertTrue(await(pair.serverSide::handshakeComplete, 5_000), "the server's handshake");
+            V3ConnectionImpl server = (V3ConnectionImpl) pair.serverSide;
+            IllegalArgumentException rejected = assertThrows(IllegalArgumentException.class,
+                    () -> V3ConnectionImpl.server(channelOf(pair.serverSide), controlOf(pair.serverSide),
+                            server.rawStream(), null, null, true, null));
+            assertEquals("server resources", rejected.getMessage());
+        }
+    }
+
     // --- Helpers.
 
     /** A /3 listener with the test callback, on a fresh loopback port. */
@@ -631,6 +746,30 @@ class V3ConnectionTest {
             V3Connection connection = (V3Connection) stream;
             onAccepted.accept(connection);
         }, protocol -> TABLE);
+    }
+
+    /** Reads the server-side SessionResources field, set by the listener when it accepts the /3 stream. */
+    static SessionResources serverResources(V3Connection server) throws Exception {
+        java.lang.reflect.Field resourcesField = V3ConnectionImpl.class.getDeclaredField("resources");
+        resourcesField.setAccessible(true);
+        return (SessionResources) resourcesField.get(server);
+    }
+
+    /** Reads the server connection's CONTROL stream, for the factory's null-resources contract. */
+    static QuicStreamChannel controlOf(V3Connection server) throws Exception {
+        java.lang.reflect.Field controlField = V3ConnectionImpl.class.getDeclaredField("control");
+        controlField.setAccessible(true);
+        return (QuicStreamChannel) controlField.get(server);
+    }
+
+    /** A local resource close notifies the game once, locally, with the original cause, and delivers nothing. */
+    private static void assertSingleLocalClose(Game game, String side) throws Exception {
+        assertTrue(await(() -> game.closeCause.isDone(), 5_000), side + ": the game is notified of the close");
+        assertTrue(game.closeCause.get() instanceof StallClock.UnavailableException,
+                side + ": the cause is the stall-source invalidation");
+        assertEquals(1, game.closedCount.get(), side + ": the game is notified exactly once");
+        assertFalse(game.closeByPeer, side + ": the close is local");
+        assertTrue(game.delivered.isEmpty(), side + ": no leftover was delivered");
     }
 
     /** One /3 listener and one /3 dial to it, both sides already accepted. */
@@ -682,6 +821,10 @@ class V3ConnectionTest {
     static final class Game implements LaneGame {
         final List<Object> delivered = Collections.synchronizedList(new ArrayList<Object>());
         final CompletableFuture<Integer> closed = new CompletableFuture<Integer>();
+        final CompletableFuture<Throwable> closeCause = new CompletableFuture<Throwable>();
+        final java.util.concurrent.atomic.AtomicInteger closedCount =
+                new java.util.concurrent.atomic.AtomicInteger();
+        volatile boolean closeByPeer;
         volatile rs.sudoe.quicraft.core.multistream.MultistreamSession session;
         volatile boolean echo;
 
@@ -725,6 +868,9 @@ class V3ConnectionTest {
 
         @Override
         public void onClosed(int code, boolean byPeer, Throwable cause) {
+            closedCount.incrementAndGet();
+            closeByPeer = byPeer;
+            closeCause.complete(cause);
             closed.complete(code);
         }
 
@@ -803,6 +949,39 @@ class V3ConnectionTest {
                 if (evt instanceof QuicConnectionCloseEvent) {
                     QuicConnectionCloseEvent event = (QuicConnectionCloseEvent) evt;
                     close.complete(event.isApplicationClose() ? event.error() : -1);
+                }
+                ctx.fireUserEventTriggered(evt);
+            }
+        });
+        return close;
+    }
+
+    /** A received peer close: its application code and its wire reason phrase. */
+    static final class SeenClose {
+        final int code;
+        final byte[] reason;
+
+        SeenClose(int code, byte[] reason) {
+            this.code = code;
+            this.reason = reason;
+        }
+    }
+
+    static CompletableFuture<SeenClose> watchCloseEvent(QuicChannel channel) {
+        CompletableFuture<SeenClose> close = new CompletableFuture<SeenClose>();
+        channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+            @Override
+            public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+                if (evt instanceof QuicConnectionCloseEvent) {
+                    QuicConnectionCloseEvent event = (QuicConnectionCloseEvent) evt;
+                    byte[] phrase;
+                    try {
+                        phrase = event.reason();
+                    } catch (NullPointerException none) {
+                        phrase = null;
+                    }
+                    close.complete(new SeenClose(event.isApplicationClose() ? event.error() : -1,
+                            phrase == null ? new byte[0] : phrase.clone()));
                 }
                 ctx.fireUserEventTriggered(evt);
             }
