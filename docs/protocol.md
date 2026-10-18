@@ -1321,11 +1321,75 @@ before this revision can run.
    ]}
    ```
 
-   The currently shipped 26.1.2 table (`protocol-775.json`, protocol 775) is clientbound-only
-   today: it routes clientbound play entities to REALTIME and block/light/block-entity/biome
-   updates to WORLD. It does not implement the proposed serverbound routes above. Its packet
-   ids are pinned to the live game by `RoutingTableGameTest`, and route ordering by
-   `ShippedRoutingOrderingTest`.
+   The shipped 26.1.2 table (`protocol-775.json`, protocol 775) is the reviewed schema-2 table
+    (CP2): one explicit route per live play id, 141 clientbound and 69 serverbound, checked
+    against `play-ids-775.txt` by `ShippedRoutingCoverageTest`. Its serverbound half is entirely
+    CONTROL/global with `ordinarySmall:false`, because the serverbound dual-lane routes above are
+    still "Proposed". Its packet ids are pinned to the live game by `RoutingTableGameTest`.
+    It has no CHUNK route; the ordering argument and the deferrals are below.
+   Shipped routing, ordering argument (CP2, design review). The shipped table routes no packet to
+   CHUNK. Chunk installs (45), block, section and block-entity updates (8, 84, 6) and the
+   block_changed_ack join (4) therefore stay CONTROL/global. The reason is 13.19: a covered update
+   must be ordered before its acknowledgement even when the game emits the acknowledgement first.
+   The causal machinery exists in core (`AckJoinTracker`, `SessionSendDriver.coverAssigned` and
+   `assignedPending`), but no production adapter calls the coverage hooks (only bridge passthroughs
+   and tests), and the route resolver fails closed on ACK_JOIN and BATCH_JOIN. A global ACK route alone
+   does not make that order safe, so the CHUNK routes wait for that wiring. With no CHUNK route,
+   every relaxation the table makes is ordered against every global record: REALTIME waits for the
+   latest CONTROL fence and the view gate is a fence for later REALTIME. The shipped order therefore
+   matches TCP's game order. `ShippedRoutingTableTest` pins this.
+
+   Deferrals, all CONTROL/global, with the reason for each:
+   - `block_changed_ack` (4) and `chunk_batch_finished` (11): the join routes need the coverage
+     wiring above. The reviewed `mc775.join.v1` layout is unbound for the same reason.
+   - `login` (49) and `respawn` (82): `epoch_change` is `false`. RELEASE BLOCKER: 13.18 requires
+     level replacement to advance the epoch and clear epoch-keyed frontiers, and `epoch_change:false`
+     breaks that invariant. The send path fails closed on epoch routes until `submitEpochTransition`
+     is wired into the production path (adapters unit). The flip to `epoch_change:true` lands after
+     that wiring merges, with its test. Until then the epoch path is unexercised by the shipped
+     table, and a release must not ship with it.
+   - `forget_level_chunk` (37): no reviewed layout (see the list below).
+   - `light_update` (48): the `varint_xz` layout was dropped (addendum A4). Every light-changing play
+     edit tried on the live 26.1.2 client produced no light update, so naming `varint_xz` would be an
+     assumption.
+   - `explode` (36) and `level_event` (46): kept global. 13.8 says they need no chunk ordering, so
+     REALTIME would also be safe; global is the safe superset until a reviewed route is wanted.
+   - Control-fence entity classes (spawn, remove, teleport relations; 13.5): global, a safe superset.
+   - Serverbound dual-lane (13.8 "Proposed"): every serverbound id is CONTROL/global.
+   - `chunks_biomes` (13): CONTROL/global with its reviewed `mc775.chunk_list.v1` extractor, as 13.8 says.
+
+   Mandatory CONTROL set (`protocol-775-mandatory-control.json`, 13.5): clientbound `disconnect` (32),
+   `login` (49), `respawn` (82), `start_configuration` (118) and `transfer` (129), and serverbound
+   `configuration_acknowledged` (16). Listing `transfer` is this table's own classification, since 13.5
+   names disconnect and does not name transfer; it ends the connection the same way. Each listed key
+   is global CONTROL, and `MandatoryControlEnforcementTest` proves that routing one off CONTROL is
+   rejected by the loader.
+
+   Provenance of the reviewed layouts (id -> layout -> packet -> route -> capture -> vector):
+
+   | Identifier | Packet(s) | Route in the shipped table | Capture and vector |
+   | --- | --- | --- | --- |
+   | `mc775.chunk_list.v1` | `chunks_biomes` (13) | CONTROL/global, list extractor | `captured-775-vectors.txt` |
+   | `mc775.chunk_xz.v1` | `level_chunk_with_light` (45) | none: CHUNK deferred (above) | `captured-775-vectors.txt` |
+   | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | none: CHUNK deferred | `captured-775-vectors.txt` |
+   | `mc775.section_position.v1` | `section_blocks_update` (84) | none: CHUNK deferred | `captured-775-vectors.txt` |
+   | `mc775.join.v1` | `block_changed_ack` (4), `chunk_batch_finished` (11) | none: joins deferred | `captured-775-vectors.txt` |
+   | `mc775.raw_copies.v1` | footprint accounting for every state's serverbound limits | `decodeFootprintBound` | 13.12 boundary vectors in `ExtractorGoldenTest` |
+
+   The captured-pair rule of 13.7 applies to packet layouts. `mc775.raw_copies.v1` is the
+   footprint-bound algorithm, so it has no captured packet pair. Its evidence is the closed-form
+   13.12 bound and its boundary vectors, and the production load path rejects the synthetic
+   `primitive.raw_copies.v1`, so no primitive is silently reused as production evidence.
+
+   REALTIME routes, with their 13.8 basis: the shipped entity and animation set `animate` (2),
+   `hurt_animation` (42), `level_particles` (47), `move_entity_pos` (53), `move_entity_pos_rot` (54),
+   `move_minecart_along_track` (55), `move_entity_rot` (56), `rotate_head` (83), `set_entity_data` (99),
+   `set_entity_motion` (101), `set_equipment` (102), `sound_entity` (116) and `update_attributes` (131),
+   which the msv scratch run exercised live. `block_destruction` (5) and `block_event` (7) are the
+   no-chunk-ordering class 13.8 names: "block_event, level_event, explode and block_destruction need no
+   chunk ordering; reviewed routes may use REALTIME/lane without a chunk dependency". `level_particles`
+   (47) is kept from the shipped table; 13.8 does not name it, so it is the one REALTIME route resting on
+   the shipped classification rather than on the spec text.
 
    Reviewed extractor identifiers and the real 26.1.2 packets each one serves. The layout is
    read from the id plus body bytes of an uncompressed packet, in the order named. The samples
@@ -1358,7 +1422,8 @@ before this revision can run.
      the synthetic `primitive.varint_xz.v1` for the oracle. `set_chunk_cache_center` is the one
      packet observed with leading VarInt x/z, but it is a view packet, not a CHUNK-lane one, so
      it does not justify a production identifier for that layout.
-   Every other 13.8 CHUNK-set packet is in the table above.
+   Every other 13.8 CHUNK-set packet has a reviewed layout in the provenance table above, but no CHUNK
+   route ships yet (CP2), so all of them stay CONTROL/global until the ACK wiring lands.
 
    Regenerate the checked-in vectors with (runs the whole client gametest suite, protocol 775):
 
