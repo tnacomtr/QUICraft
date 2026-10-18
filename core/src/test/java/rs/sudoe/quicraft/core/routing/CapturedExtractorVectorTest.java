@@ -28,7 +28,8 @@ import static org.junit.jupiter.api.Assertions.*;
  * expectation; cutting the frame below the length its layout needs must reject it, and every longer
  * prefix must still decode to the same expectation, because bytes after the layout belong to the
  * rest of the real packet (13.7). Every row of the reviewed mapping must have a sample, and every
- * position layout must have seen a negative coordinate.
+ * position layout must have seen both a negative and a nonnegative coordinate (the capture's near
+ * phase exists for the latter).
  */
 class CapturedExtractorVectorTest {
     private static final String FILE = "captured-775-vectors.txt";
@@ -95,16 +96,22 @@ class CapturedExtractorVectorTest {
     @Test void theCaptureCoversEveryReviewedPacketAndBothCoordinateSigns() throws Exception {
         Set<String> covered = new LinkedHashSet<String>();
         Set<String> negative = new LinkedHashSet<String>();
+        Set<String> nonnegative = new LinkedHashSet<String>();
         for (String line : lines()) {
             if (line.startsWith("#")) continue;
             String[] fields = line.split("\\|", -1);
             covered.add(fields[0] + " " + fields[3]);
+            boolean any = false;
+            boolean anyNegative = false;
             for (String pair : fields[2].split(";")) {
-                if (pair.equals("JOIN")) continue;
+                if (pair.isEmpty() || pair.equals("JOIN")) continue;
                 for (String value : pair.split(",")) {
-                    if (Long.parseLong(value) < 0) negative.add(fields[0]);
+                    any = true;
+                    if (Long.parseLong(value) < 0) anyNegative = true;
                 }
             }
+            if (anyNegative) negative.add(fields[0]);
+            if (any && !anyNegative) nonnegative.add(fields[0]);
         }
         for (Map.Entry<String, Set<String>> entry : REVIEWED.entrySet()) {
             for (String packet : entry.getValue()) {
@@ -114,6 +121,8 @@ class CapturedExtractorVectorTest {
             if (!entry.getKey().equals("mc775.join.v1")) {
                 assertTrue(negative.contains(entry.getKey()),
                         "no negative-coordinate sample for " + entry.getKey());
+                assertTrue(nonnegative.contains(entry.getKey()),
+                        "no nonnegative-coordinate sample for " + entry.getKey());
             }
         }
     }

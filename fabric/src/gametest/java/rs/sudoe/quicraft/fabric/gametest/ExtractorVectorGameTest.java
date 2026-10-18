@@ -21,10 +21,13 @@ import rs.sudoe.quicraft.fabric.client.QuicraftClient;
  * because it exists to regenerate a checked-in file:
  * {@code -Pquicraft.emitExtractorVectors=<file>} (see docs/platforms/fabric.md).
  *
- * <p>The capture runs in two phases, so every layout sees both coordinate signs: at spawn, and
- * after a far teleport into freshly generated chunks around x=-800, z=-1200.
+ * <p>The capture runs in three phases so every position layout sees both coordinate signs: at
+ * spawn, after a far teleport into freshly generated chunks around x=-800, z=-1200, and after a
+ * teleport back to another fresh area around x=+800, z=+1200. A phase is positive at spawn, but
+ * chunk installs only exist after a teleport, hence the third one.
  * {@link ExtractorVectorCapture#assertCoverage} fails the run if any claimed packet produced no
- * sample, so a layout whose mapping cannot be captured never ships as an assumption.
+ * sample, or if a position layout produced no negative or no nonnegative sample, so a layout
+ * whose mapping cannot be captured never ships as an assumption.
  *
  * <p>The live packet inventory is read by reflection (as RoutingTableGameTest does): this source
  * set is shared with the 1.21.11 jar, where the capture has nothing to do, and the test returns
@@ -43,6 +46,14 @@ public class ExtractorVectorGameTest implements FabricClientGameTest {
     /** Where the far phase lands: negative chunk coordinates, chunks generated on the spot. */
     private static final int FAR_X = -800;
     private static final int FAR_Z = -1200;
+
+    /**
+     * Where the near phase lands: positive chunk coordinates in another fresh area. The spawn
+     * chunks were loaded before the capture was installed, so their chunk installs are invisible;
+     * a teleport is what gives chunk_xz a nonnegative sample.
+     */
+    private static final int NEAR_X = 800;
+    private static final int NEAR_Z = 1200;
 
     @Override
     public void runTest(ClientGameTestContext context) {
@@ -75,10 +86,21 @@ public class ExtractorVectorGameTest implements FabricClientGameTest {
                 ExtractorVectorCapture.emit(path, PROTOCOL, false);
 
                 int y = context.computeOnClient(c -> c.player.blockPosition().getY());
+                // The phase label follows where the client is going, so packets that arrive while
+                // the new chunks stream in are labelled with the phase that caused them.
+                ExtractorVectorCapture.phase("far");
                 server.runCommand("tp @a " + FAR_X + " " + y + " " + FAR_Z);
                 context.waitTicks(20);
                 GameTests.waitForChunks(connection);
-                ExtractorVectorCapture.phase("far");
+                trigger(context, server, context.computeOnClient(c -> c.player.blockPosition()));
+                ExtractorVectorCapture.emit(path, PROTOCOL, false);
+
+                // Back at positive coordinates in another fresh area: the chunk installs it forces
+                // give chunk_xz its nonnegative sample, and the edits repeat the other layouts.
+                ExtractorVectorCapture.phase("near");
+                server.runCommand("tp @a " + NEAR_X + " " + y + " " + NEAR_Z);
+                context.waitTicks(20);
+                GameTests.waitForChunks(connection);
                 trigger(context, server, context.computeOnClient(c -> c.player.blockPosition()));
                 ExtractorVectorCapture.emit(path, PROTOCOL, false);
 

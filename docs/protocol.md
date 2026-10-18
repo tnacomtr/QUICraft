@@ -1335,8 +1335,9 @@ before this revision can run.
    game itself reported for exactly those bytes. `CapturedExtractorVectorTest` re-derives every
    one of those rows from the checked-in file. The capture ran on the live client, between
    decompression and the game's packet decoder, over TCP so the frames are the vanilla
-   pipeline's, at both coordinate signs (spawn and a far teleport into chunks around x=-800,
-   z=-1200); the regeneration command is below the table.
+   pipeline's, at both coordinate signs: at spawn, after a far teleport to x=-800, z=-1200 and
+   after a teleport back to x=+800, z=+1200, so every position layout has a negative and a
+   nonnegative sample. The regeneration command is below the table.
 
    | Identifier | Layout after the packet id | Real 775 packet(s) | Route(s) that may use it | Captured |
    | --- | --- | --- | --- | --- |

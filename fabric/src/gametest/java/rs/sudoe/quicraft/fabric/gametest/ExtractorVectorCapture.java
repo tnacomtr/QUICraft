@@ -45,7 +45,9 @@ import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
  *
  * <p>The result is a checked-in vector file for core's golden test. Every claim in
  * {@link #CLAIMS} must produce a sample before the test passes, so a mapping that cannot be
- * captured fails loudly instead of shipping as a comment.
+ * captured fails loudly instead of shipping as a comment. Every position layout must also produce
+ * a negative-coordinate sample and a nonnegative-coordinate sample, and {@link #selected} keeps
+ * both in the file.
  */
 final class ExtractorVectorCapture {
     /** How the game's own packet reports its position (or that it has none). */
@@ -89,7 +91,7 @@ final class ExtractorVectorCapture {
     };
 
     /** At most this many samples per claim are checked in; all are loggable, the file is not huge. */
-    private static final int MAX_SAMPLES_PER_CLAIM = 2;
+    private static final int MAX_SAMPLES_PER_CLAIM = 3;
 
     private static final String FRAME_HANDLER = "quicraft-capture-frame";
     private static final String PACKET_HANDLER = "quicraft-capture-packet";
@@ -109,17 +111,34 @@ final class ExtractorVectorCapture {
             this.expectation = expectation;
         }
 
+        /** True when the sample reports at least one negative coordinate (any entry counts). */
         boolean negative() {
-            for (String pair : expectation.split(";")) {
-                for (String value : pair.split(",")) {
-                    try {
-                        if (Long.parseLong(value) < 0) return true;
-                    } catch (NumberFormatException ignored) {
-                        // JOIN has no coordinates
-                    }
-                }
+            for (long coordinate : coordinates()) {
+                if (coordinate < 0) return true;
             }
             return false;
+        }
+
+        /** True when the sample reports coordinates and all of them are nonnegative. */
+        boolean nonnegative() {
+            List<Long> coordinates = coordinates();
+            if (coordinates.isEmpty()) return false;
+            for (long coordinate : coordinates) {
+                if (coordinate < 0) return false;
+            }
+            return true;
+        }
+
+        /** The sample's chunk coordinates in file order; empty for a join. */
+        private List<Long> coordinates() {
+            List<Long> coordinates = new ArrayList<Long>();
+            for (String pair : expectation.split(";")) {
+                if (pair.isEmpty() || pair.equals("JOIN")) continue;
+                for (String value : pair.split(",")) {
+                    coordinates.add(Long.parseLong(value));
+                }
+            }
+            return coordinates;
         }
     }
 
@@ -216,16 +235,23 @@ final class ExtractorVectorCapture {
         return out.toString();
     }
 
-    /** Fails unless every claim produced a sample and every position layout saw a negative one. */
+    /**
+     * Fails unless every claim produced a sample and every position layout saw both coordinate
+     * signs: a negative sample and a sample whose coordinates are all nonnegative.
+     */
     static void assertCoverage(Path path) {
         List<String> problems = new ArrayList<String>(ERRORS);
         Map<String, Integer> perRow = new LinkedHashMap<String, Integer>();
         Map<String, Boolean> negative = new LinkedHashMap<String, Boolean>();
+        Map<String, Boolean> nonnegative = new LinkedHashMap<String, Boolean>();
         for (Sample sample : SAMPLES) {
             String row = sample.layout + " " + sample.packetName;
             perRow.merge(row, 1, Integer::sum);
             if (sample.negative()) {
                 negative.put(sample.layout, Boolean.TRUE);
+            }
+            if (sample.nonnegative()) {
+                nonnegative.put(sample.layout, Boolean.TRUE);
             }
         }
         for (Claim claim : CLAIMS) {
@@ -233,8 +259,13 @@ final class ExtractorVectorCapture {
             if (!perRow.containsKey(row)) {
                 problems.add("no sample for " + row);
             }
-            if (claim.shape != Shape.JOIN && !Boolean.TRUE.equals(negative.get(claim.layout))) {
-                problems.add("no negative-coordinate sample for " + claim.layout);
+            if (claim.shape != Shape.JOIN) {
+                if (!Boolean.TRUE.equals(negative.get(claim.layout))) {
+                    problems.add("no negative-coordinate sample for " + claim.layout);
+                }
+                if (!Boolean.TRUE.equals(nonnegative.get(claim.layout))) {
+                    problems.add("no nonnegative-coordinate sample for " + claim.layout);
+                }
             }
         }
         QuicraftFabricTestLog.info("[QUICraft] extractor capture summary (" + SAMPLES.size() + " samples, "
@@ -247,8 +278,8 @@ final class ExtractorVectorCapture {
 
     /**
      * The subset that is checked in: the first sample of each claim, the first one that reports a
-     * negative coordinate (the test requires one per position layout), and, only if neither exists,
-     * the shortest. Two per claim keeps the file reviewable while every row stays proven.
+     * negative coordinate and the first one that reports only nonnegative coordinates, so every
+     * position row keeps both signs. Three per claim keeps the file reviewable.
      */
     private static List<Sample> selected() {
         Map<String, List<Sample>> byRow = new LinkedHashMap<String, List<Sample>>();
@@ -261,13 +292,13 @@ final class ExtractorVectorCapture {
             List<Sample> keep = new ArrayList<Sample>();
             keep.add(row.get(0));
             Sample negative = null;
-            Sample shortest = row.get(0);
+            Sample nonnegative = null;
             for (Sample sample : row) {
                 if (negative == null && sample.negative()) negative = sample;
-                if (sample.frame.length < shortest.frame.length) shortest = sample;
+                if (nonnegative == null && sample.nonnegative()) nonnegative = sample;
             }
             if (negative != null && !keep.contains(negative)) keep.add(negative);
-            if (keep.size() < MAX_SAMPLES_PER_CLAIM && !keep.contains(shortest)) keep.add(shortest);
+            if (nonnegative != null && !keep.contains(nonnegative)) keep.add(nonnegative);
             while (keep.size() > MAX_SAMPLES_PER_CLAIM) keep.remove(keep.size() - 1);
             selected.addAll(keep);
         }
