@@ -268,26 +268,6 @@ class PlayIdInventoryTest {
         }
     }
 
-    @Test
-    void everyPacketTheShippedTableRoutesIsInTheClientboundInventory() throws Exception {
-        Map<Integer, String> clientbound = parse(RESOURCE, fixture()).get(Direction.CLIENTBOUND);
-        RoutingTable table = RoutingTableLoader.loadResource(PROTOCOL);
-        int routed = 0;
-        for (RouteKey key : table.routes().keySet()) {
-            assertEquals(Direction.CLIENTBOUND, key.direction(), key.toString());
-            String name = clientbound.get(key.packetId());
-            assertNotNull(name, "the clientbound inventory has no id " + key.packetId()
-                    + ", which protocol-" + PROTOCOL + ".json routes");
-            String pinned = ShippedRoutingTableTest.PACKET_NAMES.get(key.packetId());
-            assertNotNull(pinned, "unexpected routed id " + key.packetId());
-            assertEquals("minecraft:" + pinned, name, "id " + key.packetId()
-                    + " is not the packet protocol-" + PROTOCOL + ".json routes");
-            routed++;
-        }
-        assertEquals(ShippedRoutingTableTest.PACKET_NAMES.size(), routed,
-                "protocol-" + PROTOCOL + ".json no longer routes every packet ShippedRoutingTableTest pins");
-    }
-
     /** What differs, compactly: missing ids, unexpected ids and ids bound to another name. */
     private static String differences(Map<Integer, String> expected, Map<Integer, String> actual) {
         StringBuilder message = new StringBuilder();

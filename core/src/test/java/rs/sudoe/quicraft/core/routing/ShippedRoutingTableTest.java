@@ -3,38 +3,88 @@ package rs.sudoe.quicraft.core.routing;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.security.MessageDigest;
-import java.util.Map;
 import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.Faults;
 
 /**
- * The routing table this build ships for Minecraft 26.1.2 (protocol 775, docs/protocol.md 13.7):
- * it parses through the production loader, its digest is SHA-256 over the exact resource bytes,
- * and every entry is a clientbound PLAY route that the ordering tests in
- * {@code ShippedRoutingOrderingTest} cover.
+ * The reviewed schema-2 routing table this build ships for Minecraft 26.1.2 (protocol 775,
+ * docs/protocol.md 13.7). It parses through the production loader, binds only the production
+ * extractor identifiers, carries the spec-derived serverbound limits, and its digest is SHA-256 over
+ * the exact resource bytes. Which id goes to which lane is pinned in {@link ShippedRoutingCoverageTest}.
  */
 class ShippedRoutingTableTest {
     private static final int PROTOCOL = 775;
     private static final String RESOURCE = RoutingTableLoader.resourcePath(PROTOCOL);
-    /** The 21 routed ids and their names, also read by {@link PlayIdInventoryTest}. */
-    static final Map<Integer, String> PACKET_NAMES = packetNames();
 
     @Test
-    void theShippedTableParsesAndIsTheRegistryAnswer() throws Exception {
+    void theShippedTableParsesAsReviewedSchemaTwoAndIsTheRegistryAnswer() throws Exception {
         Faults.set();
         Optional<RoutingTable> table = RoutingRegistry.forProtocol(PROTOCOL);
         assertTrue(table.isPresent(), "26.1.2 ships a table: " + RESOURCE);
         assertEquals(PROTOCOL, table.get().protocolNumber());
+        assertEquals(RoutingTableLoader.SCHEMA_VERSION_V2, table.get().schema());
         assertEquals(RoutingTableLoader.loadResource(PROTOCOL).digestHex(), table.get().digestHex());
+    }
+
+    @Test
+    void theOnlyBoundExtractorIsTheReviewedChunkListForTheGlobalMultiChunkPacket() throws Exception {
+        Faults.set();
+        Map<String, String> expected = new LinkedHashMap<String, String>();
+        expected.put("chunk_list", "mc775.chunk_list.v1");
+        // The CHUNK-lane layouts (chunk_xz, block_position, section_position) and mc775.join.v1 are
+        // reviewed but deliberately unbound: CHUNK routes stay out of the table (CP2, Sol), and the
+        // join routes fail closed on the send path (CP1).
+        assertEquals(expected, RoutingTableLoader.loadResource(PROTOCOL).extractors());
+    }
+
+    @Test
+    void theTableHasNoChunkLaneRouteAtAll() throws Exception {
+        Faults.set();
+        for (RouteV2 route : RoutingTableLoader.loadResource(PROTOCOL).routesV2().values()) {
+            assertTrue(route.lane != RouteV2.StreamLane.CHUNK, "CHUNK routes are out of the table (CP2)");
+        }
+    }
+
+    /**
+     * The ACK-ordering argument (CP2, Sol): covered block updates and their block_changed_ack must keep
+     * game order, so the table relaxes nothing against them. Every route is either global CONTROL (ordered
+     * against all records), the view gate, or REALTIME whose send waits for the latest CONTROL fence. The
+     * only relaxations are REALTIME against REALTIME and REALTIME against non-global control, and no
+     * CHUNK stream exists in this table, so no covered update can overtake its ack.
+     */
+    @Test
+    void everyShippedRelaxationIsRealtimeOrViewAndNoRouteLeavesGameOrderForChunks() throws Exception {
+        Faults.set();
+        for (RouteV2 route : RoutingTableLoader.loadResource(PROTOCOL).routesV2().values()) {
+            boolean global = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.GLOBAL;
+            boolean realtime = route.lane == RouteV2.StreamLane.REALTIME && route.dependency == Dependency.LANE;
+            boolean view = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.VIEW;
+            assertTrue(global || realtime || view, "unexpected relaxation: " + route.lane + "/" + route.dependency);
+        }
+    }
+
+    @Test
+    void theServerboundLimitsAreTheSpecDerivedCaps() throws Exception {
+        Faults.set();
+        RoutingTable table = RoutingTableLoader.loadResource(PROTOCOL);
+        assertEquals(5, table.serverboundLimits().size());
+        for (ProtocolState state : ProtocolState.values()) {
+            RouteV2.ServerboundLimits limits = table.serverboundLimits().get(state);
+            assertEquals(2097208, limits.maxServerboundRecord, state.wireName());
+            assertEquals(510, limits.maxServerboundRealtimeRecord, state.wireName());
+            assertEquals(8388608, limits.maxDecodedFootprint, state.wireName());
+            assertEquals(5619, limits.ordinaryReadAllowance, state.wireName());
+            assertEquals("mc775.raw_copies.v1", limits.decodeFootprintBound, state.wireName());
+        }
     }
 
     @Test
@@ -45,71 +95,6 @@ class ShippedRoutingTableTest {
         byte[] expected = sha256.digest(bytes);
         RoutingTable table = RoutingRegistry.forProtocol(PROTOCOL).get();
         assertArrayEquals(expected, table.digest(), "R is SHA-256 over the exact bytes (13.7)");
-    }
-
-    @Test
-    void everyShippedRouteIsAClientboundPlayRouteWithALaneDependency() throws Exception {
-        Faults.set();
-        RoutingTable table = RoutingRegistry.forProtocol(PROTOCOL).get();
-        assertFalse(table.routes().isEmpty(), "the 26.1.2 table routes packets off CONTROL");
-        for (Map.Entry<RouteKey, Route> entry : table.routes().entrySet()) {
-            RouteKey key = entry.getKey();
-            Route route = entry.getValue();
-            assertEquals(ProtocolState.PLAY, key.state(), key.toString());
-            assertEquals(Direction.CLIENTBOUND, key.direction(), key.toString());
-            assertFalse(route.lane().isControl(), key + " is listed only when it leaves CONTROL");
-            assertEquals(Dependency.LANE, route.dependency(), key.toString());
-        }
-    }
-
-    @Test
-    void everyShippedPacketNameHasItsPinnedLane() throws Exception {
-        Faults.set();
-        Map<String, Lane> expected = new LinkedHashMap<String, Lane>();
-        expected.put("animate", Lane.REALTIME);
-        expected.put("hurt_animation", Lane.REALTIME);
-        expected.put("level_particles", Lane.REALTIME);
-        expected.put("move_entity_pos", Lane.REALTIME);
-        expected.put("move_entity_pos_rot", Lane.REALTIME);
-        expected.put("move_minecart_along_track", Lane.REALTIME);
-        expected.put("move_entity_rot", Lane.REALTIME);
-        expected.put("rotate_head", Lane.REALTIME);
-        expected.put("set_entity_data", Lane.REALTIME);
-        expected.put("set_entity_motion", Lane.REALTIME);
-        expected.put("set_equipment", Lane.REALTIME);
-        expected.put("sound_entity", Lane.REALTIME);
-        expected.put("update_attributes", Lane.REALTIME);
-        expected.put("block_changed_ack", Lane.WORLD);
-        expected.put("block_destruction", Lane.WORLD);
-        expected.put("block_entity_data", Lane.WORLD);
-        expected.put("block_event", Lane.WORLD);
-        expected.put("block_update", Lane.WORLD);
-        expected.put("chunks_biomes", Lane.WORLD);
-        expected.put("light_update", Lane.WORLD);
-        expected.put("section_blocks_update", Lane.WORLD);
-
-        RoutingTable table = RoutingTableLoader.loadResource(PROTOCOL);
-        Map<String, Lane> actual = new LinkedHashMap<String, Lane>();
-        for (Map.Entry<RouteKey, Route> entry : table.routes().entrySet()) {
-            RouteKey key = entry.getKey();
-            String name = PACKET_NAMES.get(key.packetId());
-            assertTrue(name != null, "unexpected protocol-775 packet id " + key.packetId());
-            actual.put(name, entry.getValue().lane());
-        }
-        assertEquals(expected, actual, "shipped packet name -> lane assignments changed");
-    }
-
-    private static Map<Integer, String> packetNames() {
-        Map<Integer, String> names = new LinkedHashMap<Integer, String>();
-        names.put(2, "animate"); names.put(42, "hurt_animation"); names.put(47, "level_particles");
-        names.put(53, "move_entity_pos"); names.put(54, "move_entity_pos_rot");
-        names.put(55, "move_minecart_along_track"); names.put(56, "move_entity_rot");
-        names.put(83, "rotate_head"); names.put(99, "set_entity_data"); names.put(101, "set_entity_motion");
-        names.put(102, "set_equipment"); names.put(116, "sound_entity"); names.put(131, "update_attributes");
-        names.put(4, "block_changed_ack"); names.put(5, "block_destruction");
-        names.put(6, "block_entity_data"); names.put(7, "block_event"); names.put(8, "block_update");
-        names.put(13, "chunks_biomes"); names.put(48, "light_update"); names.put(84, "section_blocks_update");
-        return names;
     }
 
     private static byte[] readResource(String path) throws IOException {

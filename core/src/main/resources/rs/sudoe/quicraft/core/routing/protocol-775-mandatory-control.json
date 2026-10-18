@@ -1,1 +1,1 @@
-{"schema":1,"protocol":775,"mandatory_control":[]}
+{"schema":1,"protocol":775,"mandatory_control":[{"state":"play","direction":"clientbound","packet_id":32},{"state":"play","direction":"clientbound","packet_id":49},{"state":"play","direction":"clientbound","packet_id":82},{"state":"play","direction":"clientbound","packet_id":118},{"state":"play","direction":"clientbound","packet_id":129},{"state":"play","direction":"serverbound","packet_id":16}]}

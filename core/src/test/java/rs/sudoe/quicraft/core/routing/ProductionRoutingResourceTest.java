@@ -24,7 +24,7 @@ class ProductionRoutingResourceTest {
      * the table replaces this constant in the same commit.
      */
     private static final String DIGEST =
-            "2f76a4fed563ea7b1eed87fe64d4f01bb590e68b3d029dfd58205a77258862bc";
+            "ced506e3ab08c092eadb12c9ef1fa215c2eb75ecf4eab5dbfc8ddec78df94ff1";
 
     @Test
     void theShippedResourceLoadsThroughTheRegistry() {
@@ -46,34 +46,35 @@ class ProductionRoutingResourceTest {
                 "and it is stable across loads");
     }
 
+    /**
+     * Schema 2 (13.7): the table lists one explicit route per live play id, so nothing relies on the
+     * default. An id it does not list has no route, and the sender and receiver treat that as the
+     * 13.5/13.6 default, CONTROL/global, never an inferred category.
+     */
     @Test
-    void everyUnlistedLookupRoutesToControl() {
+    void everyUnlistedLookupHasNoRouteAndDefaultsToGlobalControl() {
         RoutingTable table = RoutingRegistry.forProtocol(PROTOCOL).get();
 
-        assertEquals(21, table.routes().size(), "the 26.1.2 table lists its 21 non-CONTROL routes");
-        for (ProtocolState state : ProtocolState.values()) {
-            for (Direction direction : Direction.values()) {
-                for (int packetId : new int[] {0, 1, 3, 0x7F, 0x80, 1024, Integer.MAX_VALUE}) {
-                    assertEquals(Lane.CONTROL, table.laneFor(state, direction, packetId),
-                            "13.6: a missing entry is CONTROL, never an inferred category: " + state + "/"
-                                    + direction + "/" + packetId);
-                }
-            }
-        }
+        assertEquals(210, table.routesV2().size(), "one explicit route per live play id (141 clientbound + 69 serverbound)");
         Random random = new Random(775);
         for (int i = 0; i < 1000; i++) {
             ProtocolState state = ProtocolState.values()[random.nextInt(ProtocolState.values().length)];
             Direction direction = Direction.values()[random.nextInt(Direction.values().length)];
-            int packetId = random.nextInt(Integer.MAX_VALUE);
-            if (table.routeFor(new RouteKey(PROTOCOL, state, direction, packetId)).isPresent()) {
-                continue;
-            }
-            assertEquals(Lane.CONTROL, table.laneFor(state, direction, packetId),
-                    "no unlisted packet id may route anywhere but CONTROL");
+            int packetId = 141 + random.nextInt(Integer.MAX_VALUE - 141);
+            RouteKey key = new RouteKey(PROTOCOL, state, direction, packetId);
+            assertEquals(null, table.routesV2().get(key), "no unlisted id has an explicit route: " + key);
+            RouteV2 defaulted = table.routeV2For(key);
+            assertEquals(RouteV2.StreamLane.CONTROL, defaulted.lane, key.toString());
+            assertEquals(Dependency.GLOBAL, defaulted.dependency, key.toString());
+            assertEquals(null, defaulted.position, key.toString());
+            assertEquals(false, defaulted.epochChange, key.toString());
         }
-        for (Map.Entry<RouteKey, Route> entry : table.routes().entrySet()) {
-            assertEquals(Direction.CLIENTBOUND, entry.getKey().direction(),
-                    "no serverbound packet is routed off CONTROL: " + entry.getKey());
+        for (Map.Entry<RouteKey, RouteV2> entry : table.routesV2().entrySet()) {
+            RouteV2 route = entry.getValue();
+            if (entry.getKey().direction() == Direction.SERVERBOUND) {
+                assertEquals(RouteV2.StreamLane.CONTROL, route.lane,
+                        "serverbound dual-lane is deferred (CP1): " + entry.getKey());
+            }
         }
     }
 }
