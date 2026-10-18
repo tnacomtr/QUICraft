@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.core.multistream;
 
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
  * Transport-clock timer for a dependency-blocked lane head or a refused local resource wait
@@ -15,16 +16,29 @@ import java.util.function.LongSupplier;
  * base and 60 second allowance give a retention of at most 70 seconds. Local resource waits construct the
  * timer with {@code excludeStalls=false}, so executor stalls never pause them.
  *
- * <p>Stall notifications are accepted only while the wait is running, and every reported interval is
- * clipped to that wait with wait-relative offsets: an interval that starts before the wait contributes
- * only from the wait's start, and an end reported past the current clock reading contributes only up to
- * that reading. Overlapping intervals are counted once, but only under the precondition that interval
- * pairs arrive in nondecreasing start-timestamp order (an end may overlap the next start). An earlier
- * start reported after a later one is out of order and not supported: that interval counts only the time
- * after the already covered end, not the full union. The recorded exclusion saturates at the allowance
- * before any addition, so it can neither overflow nor go negative. Late observation of a completed
- * interval yields the same exclusion as timely observation; nothing is applied retroactively to a wait
- * that already ended.
+ * <p>The timer has two modes and never mixes them. A timer constructed with a {@link LongSupplier} is
+ * boundary-driven: stall intervals are reported with {@link #stallStarted} and {@link #stallEnded} and
+ * every reported interval is clipped to the running wait with wait-relative offsets: an interval that
+ * starts before the wait contributes only from the wait's start, and an end reported past the current
+ * clock reading contributes only up to that reading. Overlapping intervals are counted once, but only
+ * under the precondition that interval pairs arrive in nondecreasing start-timestamp order (an end may
+ * overlap the next start). An earlier start reported after a later one is out of order and not supported:
+ * that interval counts only the time after the already covered end, not the full union. A timer
+ * constructed with a {@link StallClock} is cumulative: {@link #start()} captures one valid baseline
+ * reading, and every observation takes exactly one new reading of the same source from which it derives
+ * the wait-relative elapsed time and the excluded stall time as differences from that baseline. The
+ * cumulative timer has no boundary hooks: {@link #stallStarted()}, {@link #stallStarted(long)},
+ * {@link #stallEnded()} and {@link #stallEnded(long)} throw {@link IllegalStateException} in that mode,
+ * running or not. A boundary timer has no cumulative observations, so there is nothing to reject in it.
+ *
+ * <p>Cumulative readings are validated by subtraction under the half-range assumption: a backwards
+ * time, a backwards cumulative counter, an excluded delta larger than the elapsed delta, or an invalid
+ * source makes every observation throw {@link StallClock.UnavailableException}, and validation state
+ * advances only after the checks pass, so a rejected reading changes nothing. Signed clock and counter
+ * wrap are fine, a reading identical to the previous one is fine, and negative timestamps are never
+ * sentinels: an explicit initialization flag marks the captured baseline. A cumulative {@link #start()}
+ * that samples an invalid source throws and leaves the timer unstarted, so the wait can be started again
+ * later; it never rebaselines from a reading it does not trust.
  *
  * <p>All timestamps compared here are readings of the timer's clock. Offsets are differences of readings,
  * so clocks with negative origins (for example {@link System#nanoTime()}) are fine, under the assumption
@@ -40,8 +54,13 @@ public final class BlockedHeadTimer {
     /** Total recorded tick-stall time excluded per wait, 60 seconds (13.10). */
     public static final long STALL_ALLOWANCE_NANOS = TimeUnit.SECONDS.toNanos(60);
 
+    /** The boundary clock; null in cumulative mode. */
     private final LongSupplier clock;
+    /** The cumulative stall source; null in boundary mode. One source is one incarnation. */
+    private final StallClock source;
     private final boolean excludeStalls;
+
+    // Boundary mode state.
     private boolean running;
     private long startedAt;
     private long excluded;
@@ -50,7 +69,16 @@ public final class BlockedHeadTimer {
     private boolean inStall;
     private long stallBeganOffset;
 
+    // Cumulative mode state: an explicit initialization flag, never a negative sentinel.
+    private boolean initialized;
+    private long baseNowNanos;
+    private long baseExcludedNanos;
+    private long lastNowNanos;
+    private long lastExcludedNanos;
+
     /**
+     * Creates a boundary timer driven by stall notifications.
+     *
      * @param clock monotonic nanosecond transport clock, not wall time
      * @param excludeStalls true for a blocked head (stall exclusion applies), false for resource waits
      */
@@ -59,6 +87,22 @@ public final class BlockedHeadTimer {
             throw new IllegalArgumentException("clock");
         }
         this.clock = clock;
+        this.source = null;
+        this.excludeStalls = excludeStalls;
+    }
+
+    /**
+     * Creates a cumulative timer driven by one coherent stall accounting reading per observation.
+     *
+     * @param source the stall accounting source of the executor incarnation, never replaced
+     * @param excludeStalls true for a blocked head (stall exclusion applies), false for resource waits
+     */
+    public BlockedHeadTimer(StallClock source, boolean excludeStalls) {
+        if (source == null) {
+            throw new IllegalArgumentException("source");
+        }
+        this.clock = null;
+        this.source = source;
         this.excludeStalls = excludeStalls;
     }
 
@@ -67,13 +111,26 @@ public final class BlockedHeadTimer {
         if (running) {
             return;
         }
+        if (source == null) {
+            running = true;
+            startedAt = clock.getAsLong();
+            excluded = 0;
+            covered = false;
+            coveredEndOffset = 0;
+            inStall = false;
+            stallBeganOffset = 0;
+            return;
+        }
+        StallClock.Sample sample = source.sample();
+        if (!sample.valid()) {
+            throw new StallClock.UnavailableException("stall source is not valid");
+        }
+        baseNowNanos = sample.nowNanos();
+        baseExcludedNanos = sample.excludedNanos();
+        lastNowNanos = baseNowNanos;
+        lastExcludedNanos = baseExcludedNanos;
+        initialized = true;
         running = true;
-        startedAt = clock.getAsLong();
-        excluded = 0;
-        covered = false;
-        coveredEndOffset = 0;
-        inStall = false;
-        stallBeganOffset = 0;
     }
 
     /** Stops the wait, for example when the head is enqueued (Q) or released. */
@@ -89,6 +146,7 @@ public final class BlockedHeadTimer {
 
     /** Records the start of a tick stall observed by the game executor, now (LaneGame hook). */
     public void stallStarted() {
+        requireBoundaryMode();
         stallStarted(clock.getAsLong());
     }
 
@@ -97,9 +155,11 @@ public final class BlockedHeadTimer {
      * is timestamped by the executor's own completion record, not by when a watchdog noticed it). The start
      * is taken only while the wait is running and is stored as an offset from the wait's start, so an
      * interval that began before the wait contributes only from the wait's start. While an interval is
-     * open, further start notifications are ignored.
+     * open, further start notifications are ignored. A cumulative timer has no boundary notifications, so
+     * this throws there.
      */
     public void stallStarted(long atNanos) {
+        requireBoundaryMode();
         if (running && excludeStalls && !inStall) {
             inStall = true;
             stallBeganOffset = waitOffset(atNanos);
@@ -108,15 +168,18 @@ public final class BlockedHeadTimer {
 
     /** Records the end of a tick stall, now (LaneGame hook). */
     public void stallEnded() {
+        requireBoundaryMode();
         stallEnded(clock.getAsLong());
     }
 
     /**
      * Records the end of a tick stall at an explicit monotonic time; an end before the start excludes
      * nothing, and an end observed after the interval already happened excludes the same time it would
-     * have excluded when reported live.
+     * have excluded when reported live. A cumulative timer has no boundary notifications, so this throws
+     * there.
      */
     public void stallEnded(long atNanos) {
+        requireBoundaryMode();
         if (!inStall) {
             return;
         }
@@ -126,6 +189,10 @@ public final class BlockedHeadTimer {
 
     /** Returns the stall time excluded so far, capped at the 60 second allowance. */
     public long excludedNanos() {
+        if (source != null) {
+            Observation observation = observe();
+            return observation == null ? 0 : observation.exclusionNanos;
+        }
         if (!running || !excludeStalls) {
             return 0;
         }
@@ -143,6 +210,13 @@ public final class BlockedHeadTimer {
 
     /** Returns the active wait time: elapsed transport time minus the excluded stall time, never negative. */
     public long activeNanos() {
+        if (source != null) {
+            Observation observation = observe();
+            if (observation == null) {
+                return 0;
+            }
+            return Math.max(0, observation.elapsedNanos - observation.exclusionNanos);
+        }
         if (!running) {
             return 0;
         }
@@ -152,7 +226,48 @@ public final class BlockedHeadTimer {
 
     /** Reports whether the wait has reached its 10 second base. */
     public boolean expired() {
+        if (source != null) {
+            Observation observation = observe();
+            return observation != null && observation.elapsedNanos - observation.exclusionNanos >= TIMEOUT_NANOS;
+        }
         return running && activeNanos() >= TIMEOUT_NANOS;
+    }
+
+    /**
+     * One cumulative observation: exactly one sample of the source, validated against the last accepted
+     * reading and reduced to the wait-relative elapsed time and excluded stall time. Returns null while
+     * the wait is not running, so a stopped timer neither reads its source nor throws.
+     */
+    private Observation observe() {
+        if (!running || !initialized) {
+            return null;
+        }
+        StallClock.Sample sample = source.sample();
+        if (!sample.valid()) {
+            throw new StallClock.UnavailableException("stall source is not valid");
+        }
+        long now = sample.nowNanos();
+        long total = sample.excludedNanos();
+        long elapsedSince = now - lastNowNanos;
+        long excludedSince = total - lastExcludedNanos;
+        if (elapsedSince < 0 || excludedSince < 0 || excludedSince > elapsedSince) {
+            throw new StallClock.UnavailableException("stall source went backwards or excluded more time than it spent");
+        }
+        lastNowNanos = now;
+        lastExcludedNanos = total;
+        long elapsed = now - baseNowNanos;
+        long exclusion = 0;
+        if (excludeStalls) {
+            exclusion = Math.min(STALL_ALLOWANCE_NANOS, total - baseExcludedNanos);
+        }
+        return new Observation(elapsed, exclusion);
+    }
+
+    /** A rejected cumulative timer boundary notification. */
+    private void requireBoundaryMode() {
+        if (source != null) {
+            throw new IllegalStateException("a cumulative timer has no boundary stall notifications");
+        }
     }
 
     /** A clock reading relative to the wait start; a reading before the wait clips to zero. */
@@ -208,5 +323,16 @@ public final class BlockedHeadTimer {
             return STALL_ALLOWANCE_NANOS;
         }
         return total + delta;
+    }
+
+    /** One coherent cumulative observation: both fields come from the same single sample. */
+    private static final class Observation {
+        final long elapsedNanos;
+        final long exclusionNanos;
+
+        Observation(long elapsedNanos, long exclusionNanos) {
+            this.elapsedNanos = elapsedNanos;
+            this.exclusionNanos = exclusionNanos;
+        }
     }
 }

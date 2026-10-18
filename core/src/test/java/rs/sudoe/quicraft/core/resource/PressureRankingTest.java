@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import java.net.InetAddress;
 import java.util.Arrays;
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /** Pressure ranking: decay, stall exclusion, progress windows, overflow buckets, eviction and floors (13.12). */
 class PressureRankingTest {
@@ -297,6 +298,288 @@ class PressureRankingTest {
             if (r.bucketFor(candidate) == bucket && !Arrays.asList(avoid).contains(candidate)) return candidate;
         }
         throw new AssertionError("no address maps to bucket " + bucket);
+    }
+
+    @Test void cumulativeRankingIntegratesByteSecondsOverEffectiveTime() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 100, 100, SECRET, source);
+        ranking.connect("c", ip("192.0.2.200"), null);
+        ranking.setRetained("c", 100);
+        source.set(5 * S, 3 * S);
+        ranking.setRetained("c", 200);
+        source.set(10 * S, 5 * S);
+        assertEquals(800.0, ranking.score("c"), 0.01,
+                "100 B over 2 effective seconds plus 200 B over 3 effective seconds");
+    }
+
+    @Test void cumulativeRankingMatchesTheExactExponentialDecay() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(60_000, 100, 100, SECRET, source);
+        ranking.connect("c", ip("192.0.2.201"), null);
+        ranking.setRetained("c", 100);
+        source.set(5 * S, 3 * S);
+        ranking.setRetained("c", 200);
+        source.set(10 * S, 5 * S);
+        double expected = held(100, 2) * Math.pow(0.5, 3.0 / 60.0) + held(200, 3);
+        assertEquals(expected, ranking.score("c"), 1e-6);
+    }
+
+    @Test void cumulativeRankingIntegratesThePreviousQuantityWhenBytesChangeDuringAnOpenStall() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 100, 100, SECRET, source);
+        ranking.connect("c", ip("192.0.2.202"), null);
+        ranking.setRetained("c", 100);
+        source.set(10 * S, 5 * S);
+        ranking.setRetained("c", 300);
+        source.set(20 * S, 5 * S);
+        assertEquals(3500.0, ranking.score("c"), 0.05,
+                "100 B over the 5 effective seconds before the change, 300 B over the 10 after");
+    }
+
+    @Test void cumulativeRankingExcludesAStallMissedEntirelyBetweenSamples() throws Exception {
+        Source frequentSource = new Source();
+        PressureRanking frequent = new PressureRanking(1_000_000_000L, 100, 100, SECRET, frequentSource);
+        frequent.connect("c", ip("192.0.2.203"), null);
+        frequent.setRetained("c", 100);
+        frequentSource.set(10 * S, 5 * S);
+        frequent.score("c");
+        frequentSource.set(20 * S, 15 * S);
+        double frequentScore = frequent.score("c");
+
+        Source lateSource = new Source();
+        PressureRanking late = new PressureRanking(1_000_000_000L, 100, 100, SECRET, lateSource);
+        late.connect("c", ip("192.0.2.203"), null);
+        late.setRetained("c", 100);
+        lateSource.set(20 * S, 15 * S);
+        double lateScore = late.score("c");
+
+        assertEquals(500.0, lateScore, 0.01, "the whole stall happened between two samples");
+        assertEquals(lateScore, frequentScore, 1e-6, "a delayed and a frequent observer agree");
+    }
+
+    @Test void cumulativeRankingSharesOneEffectivePairAcrossTheIdentitiesOfAConnection() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 100, 100, SECRET, source);
+        ranking.connect("a", ip("192.0.2.204"), null);
+        ranking.setRetained("a", 100);
+        source.set(5 * S, 3 * S);
+        ranking.connect("b", ip("192.0.2.204"), null);
+        ranking.setRetained("b", 200);
+        source.set(10 * S, 5 * S);
+        double scoreA = ranking.score("a");
+        double scoreB = ranking.score("b");
+        assertEquals(1100.0, scoreA, 0.01, "the shared IP history is integrated with the same pair");
+        assertEquals(scoreA, scoreB, 1e-9);
+    }
+
+    @Test void cumulativeRankingViewScoresFreshlyWithoutReusingASample() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 100, 100, SECRET, source);
+        ranking.connect("c", ip("192.0.2.205"), null);
+        ranking.setRetained("c", 100);
+        int beforeView = source.samples;
+        HolderRank view = ranking.view();
+        assertEquals(beforeView, source.samples, "view() itself captures no sample");
+        source.set(11 * S, S);
+        assertEquals(1000.0, view.score("c"), 0.02);
+        source.set(21 * S, S);
+        assertEquals(2000.0, view.score("c"), 0.04, "the view never reuses an old sample");
+        assertEquals(beforeView + 2, source.samples, "each view score took exactly one fresh reading");
+    }
+
+    @Test void cumulativeRankingKeepsProgressWindowsOnTransportTime() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 100, 100, SECRET, source);
+        ranking.connect("c", ip("192.0.2.206"), null);
+        ranking.setRetained("c", 100);
+        source.set(5 * S, 4 * S);
+        ranking.progress("c", 1000);
+        source.set(10 * S, 9 * S);
+        assertEquals(100.0 / 101.0, ranking.score("c"), 1e-3,
+                "byte-seconds lose the 9 stalled seconds, the progress window keeps all 10");
+    }
+
+    @Test void cumulativeRankingScoresOverflowBucketsAndSamplesOnce() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 1, 10, SECRET, source);
+        ranking.connect("holder", ip("192.0.2.207"), null);
+        InetAddress guest = ip("192.0.2.208");
+        ranking.connect("guest", guest, null);
+        ranking.setRetained("guest", 100);
+        source.set(10 * S, 4 * S);
+        int bucket = ranking.bucketFor(guest);
+        int before = source.samples;
+        assertEquals(600.0, ranking.bucketScore(bucket), 0.01);
+        assertEquals(1, source.samples - before);
+        assertEquals(0.0, ranking.bucketScore((bucket + 1) % PrefixKey.OVERFLOW_BUCKETS), 0.0);
+    }
+
+    @Test void cumulativeRankingRefusedWaitFloorUsesTheSample() throws Exception {
+        Source plainSource = new Source();
+        PressureRanking plain = new PressureRanking(1_000_000_000L, 100, 100, SECRET, plainSource);
+        Source flooredSource = new Source();
+        PressureRanking floored = new PressureRanking(1_000_000_000L, 100, 100, SECRET, flooredSource);
+        for (PressureRanking ranking : new PressureRanking[] {plain, floored}) {
+            Source source = ranking == plain ? plainSource : flooredSource;
+            ranking.connect("w", ip("192.0.2.209"), null);
+            ranking.setRetained("w", 100);
+            source.set(5 * S, 4 * S);
+            ranking.progress("w", 1000);
+        }
+        flooredSource.set(11 * S, 4 * S);
+        floored.beginRefusedWait("w");
+        plainSource.set(15 * S, 4 * S);
+        flooredSource.set(15 * S, 4 * S);
+        double withFloor = floored.score("w");
+        double withoutFloor = plain.score("w");
+        assertEquals(1100.0, withoutFloor, 0.01, "11 effective seconds at 100 B");
+        assertEquals(withoutFloor / 101.0, withFloor, 1e-3, "the 100 B/s floor divides the score");
+        floored.endRefusedWait("w");
+    }
+
+    @Test void cumulativeRankingTakesOneReadingPerOperationInsideItsMonitor() throws Exception {
+        final Source source = new Source();
+        final PressureRanking[] holder = new PressureRanking[1];
+        StallClock guarded = new StallClock() {
+            @Override public Sample sample() {
+                PressureRanking ranking = holder[0];
+                assertTrue(ranking != null && Thread.holdsLock(ranking),
+                        "the source must be read while the ranking monitor is held");
+                return source.sample();
+            }
+        };
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 100, 100, SECRET, guarded);
+        holder[0] = ranking;
+        ranking.connect("c", ip("192.0.2.210"), null);
+        ranking.setRetained("c", 100);
+        ranking.progress("c", 10);
+        ranking.beginRefusedWait("c");
+        ranking.endRefusedWait("c");
+        source.set(10 * S, 4 * S);
+        ranking.score("c");
+        ranking.bucketScore(ranking.bucketFor(ip("192.0.2.210")));
+        ranking.disconnect("c");
+        assertEquals(7, source.samples, "connect, retain, progress, refuse, score, bucket, disconnect");
+    }
+
+    @Test void cumulativeRankingRejectsInvalidReadingsAndMutatesNothing() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(60_000, 1, 10, SECRET, source);
+        ranking.connect("holder", ip("192.0.2.211"), null);
+        int bucket = ranking.bucketFor(ip("192.0.2.212"));
+        ranking.connect("w", ip("192.0.2.212"), null);
+        ranking.setRetained("w", 100);
+        assertEquals(1, ranking.liveIdentities(bucket));
+        assertEquals(100, ranking.bucketBytes(bucket));
+
+        source.valid = false;
+        source.set(10 * S, 4 * S);
+        assertThrows(StallClock.UnavailableException.class, () -> ranking.score("w"));
+        assertThrows(StallClock.UnavailableException.class, () -> ranking.setRetained("w", 50));
+        assertThrows(StallClock.UnavailableException.class, () -> ranking.progress("w", 1000));
+        assertThrows(StallClock.UnavailableException.class, () -> ranking.connect("x", ip("192.0.2.213"), null));
+        assertEquals(1, ranking.liveIdentities(bucket), "a rejected reading never registers a connection");
+        assertEquals(100, ranking.bucketBytes(bucket), "a rejected reading never changes the charge");
+        assertEquals(1, ranking.exactIpCount());
+
+        int samples = source.samples;
+        ranking.disconnect("w");
+        assertEquals(samples + 1, source.samples, "the cleanup took exactly one reading");
+        assertEquals(0, ranking.bucketBytes(bucket), "the retained bytes are integrated to zero");
+        assertEquals(0, ranking.liveIdentities(bucket), "the live count is released");
+        ranking.disconnect("w");
+        assertEquals(samples + 1, source.samples, "a repeated cleanup is a no-op that reads nothing");
+        assertEquals(0.0, ranking.score("w"), 0.0, "the unknown owner scores zero without a reading");
+    }
+
+    @Test void cumulativeRankingCleanupCommitsItsReadingForLaterValidations() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(60_000, 10, 10, SECRET, source);
+        ranking.connect("a", ip("192.0.2.220"), null);
+        ranking.connect("b", ip("192.0.2.221"), null);
+        ranking.setRetained("a", 100);
+        ranking.setRetained("b", 100);
+        source.valid = false;
+        source.set(10 * S, 4 * S);
+        ranking.disconnect("a");
+
+        source.set(9 * S, 4 * S);
+        assertThrows(StallClock.UnavailableException.class, () -> ranking.disconnect("b"),
+                "a cleanup cannot validate behind the pair it just committed");
+        assertThrows(StallClock.UnavailableException.class, () -> ranking.score("b"),
+                "the rejected cleanup must not remove its owner");
+
+        source.set(11 * S, 4 * S);
+        ranking.disconnect("b");
+        assertEquals(0.0, ranking.score("b"), 0.0, "a forward cleanup succeeds and removes the owner");
+    }
+
+    @Test void cumulativeRankingRejectsTimestampedOperationsBeforeTheyMutate() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(60_000, 10, 10, SECRET, source);
+        InetAddress address = ip("192.0.2.230");
+        assertThrows(IllegalStateException.class, () -> ranking.connect("a", address, null, 0));
+        assertThrows(IllegalStateException.class, () -> ranking.disconnect("a", 0));
+        assertThrows(IllegalStateException.class, () -> ranking.setRetained("a", 1, 0));
+        assertThrows(IllegalStateException.class, () -> ranking.progress("a", 1, 0));
+        assertThrows(IllegalStateException.class, () -> ranking.beginRefusedWait("a", 0));
+        assertThrows(IllegalStateException.class, () -> ranking.score("a", 0));
+        assertThrows(IllegalStateException.class, () -> ranking.bucketScore(0, 0));
+        assertThrows(IllegalStateException.class, () -> ranking.view(null));
+        assertThrows(IllegalStateException.class, () -> ranking.stallStart(0));
+        assertThrows(IllegalStateException.class, () -> ranking.stallEnd(0));
+        assertEquals(0, ranking.exactIpCount(), "no rejected call registered anything");
+        assertEquals(0, source.samples, "the guards run before the source is ever read");
+    }
+
+    @Test void timestampedRankingRejectsCumulativeOnlyOverloads() throws Exception {
+        PressureRanking ranking = new PressureRanking(60_000, 10, 10, SECRET);
+        InetAddress address = ip("192.0.2.231");
+        assertThrows(IllegalStateException.class, () -> ranking.connect("a", address, null));
+        assertThrows(IllegalStateException.class, () -> ranking.disconnect("a"));
+        assertThrows(IllegalStateException.class, () -> ranking.setRetained("a", 1));
+        assertThrows(IllegalStateException.class, () -> ranking.progress("a", 1));
+        assertThrows(IllegalStateException.class, () -> ranking.beginRefusedWait("a"));
+        assertThrows(IllegalStateException.class, () -> ranking.score("a"));
+        assertThrows(IllegalStateException.class, () -> ranking.bucketScore(0));
+        assertThrows(IllegalStateException.class, () -> ranking.view());
+        assertEquals(0, ranking.exactIpCount());
+        assertEquals(0.0, ranking.score("a", 0), 0.0);
+        ranking.connect("a", address, null, 0);
+        assertEquals(1, ranking.exactIpCount(), "the timestamped operations keep working");
+        assertFalse(ranking.inRefusedWait("a"));
+        ranking.endRefusedWait("a");
+        assertEquals(0, ranking.liveIdentities(ranking.bucketFor(address)), "untimed inspection works too");
+    }
+
+    @Test void cumulativeRankingRejectsANullSource() {
+        assertThrows(IllegalArgumentException.class, () -> new PressureRanking((StallClock) null));
+        assertThrows(IllegalArgumentException.class, () -> new PressureRanking(60_000, 10, 10, SECRET, null));
+    }
+
+    /** Deterministic cumulative source: one scripted reading per {@link #sample()} call. */
+    private static final class Source implements StallClock {
+        long nowNanos;
+        long excludedNanos;
+        boolean valid = true;
+        int samples;
+
+        void set(long nowNanos, long excludedNanos) {
+            this.nowNanos = nowNanos;
+            this.excludedNanos = excludedNanos;
+        }
+
+        @Override public Sample sample() {
+            samples++;
+            final long now = nowNanos;
+            final long excluded = excludedNanos;
+            final boolean valid = this.valid;
+            return new Sample() {
+                @Override public long nowNanos() { return now; }
+                @Override public long excludedNanos() { return excluded; }
+                @Override public boolean valid() { return valid; }
+            };
+        }
     }
 
     @Test void neverSeenNewcomerTakesAnExactEntryWhileAStickyBucketExists() throws Exception {

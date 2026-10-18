@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.LongSupplier;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
  * Pressure ranking for one direction-specific pool (protocol.md 13.12 "Pressure ranking").
@@ -23,8 +24,27 @@ import java.util.function.LongSupplier;
  * bucket score (see {@link #overflowScore}). Exact entries are protected while an account recently used
  * them. This ranking never refuses admission: it only orders victims.</p>
  *
- * <p>The caller supplies monotonic nanosecond timestamps. Local executor stalls are reported with
- * {@link #stallStart} and {@link #stallEnd}; their time is excluded from byte-seconds. Thread-safe.</p>
+ * <p>The caller supplies monotonic nanosecond timestamps to the timestamped operations, and local
+ * executor stalls are reported with {@link #stallStart} and {@link #stallEnd}; their time is excluded
+ * from byte-seconds. A ranking constructed with a {@link StallClock} instead takes one coherent reading
+ * of that source per operation ({@link #connect(Object, InetAddress, String)}, {@link #disconnect(Object)},
+ * {@link #setRetained(Object, long)}, {@link #progress(Object, long)}, {@link #beginRefusedWait(Object)},
+ * {@link #score(Object)}, {@link #bucketScore(int)} and {@link #view()}), and its byte-second decay is
+ * excluded through the source's cumulative stall counter. The two modes never mix: timestamped
+ * operations, {@link #view(LongSupplier)}, {@link #stallStart(long)} and {@link #stallEnd(long)} throw
+ * {@link IllegalStateException} on a cumulative ranking, and the operations without a timestamp throw on
+ * a timestamped ranking. Untimed inspection and {@link #endRefusedWait(Object)} work in both modes.
+ * Progress windows always use transport time; only byte-second integration and decay exclude stalls.</p>
+ *
+ * <p>Every cumulative operation acquires this ranking's monitor before it samples the source, validates
+ * the reading by subtraction (backwards time, a backwards counter and an excluded delta larger than the
+ * elapsed delta are rejected; signed wrap is fine), and then uses that one pair for every history it
+ * touches. An invalid or malformed reading throws {@link StallClock.UnavailableException} and mutates
+ * nothing. The one exception is {@link #disconnect(Object)}: releasing a known connection may use a
+ * coherent invalid reading for its integrate-to-zero, live release and removal, never for scoring or
+ * selection, and it commits that reading as the last-used pair so later cleanups cannot validate behind
+ * histories that were already mutated. Lock order is always ranking then source; a source never calls a
+ * consumer. Thread-safe.</p>
  */
 public final class PressureRanking {
     private static final int OVERFLOW = PrefixKey.OVERFLOW_BUCKETS;
@@ -46,8 +66,14 @@ public final class PressureRanking {
     private final IdentityHistory[] buckets = new IdentityHistory[OVERFLOW];
     private final List<Map<Object, Integer>> bucketLive = new ArrayList<Map<Object, Integer>>(OVERFLOW);
     private final Map<Object, Connection> connections = new HashMap<Object, Connection>();
+    /** Cumulative stall source; null on a timestamped ranking. One source is one incarnation. */
+    private final StallClock source;
     private long stallTotal;
     private long stallBegan = -1;
+    /** Cumulative mode: whether a validated reading is the reference for later differences. */
+    private boolean clockInitialized;
+    private long lastNowNanos;
+    private long lastExcludedNanos;
 
     /** Creates a ranking with the 13.12 defaults: 60 s half-life, 131072 exact IPs and accounts, random secret. */
     public PressureRanking() {
@@ -55,7 +81,7 @@ public final class PressureRanking {
     }
 
     /**
-     * Creates a ranking.
+     * Creates a timestamped ranking whose stalls are reported with {@link #stallStart} and {@link #stallEnd}.
      *
      * @param halfLifeMillis byte-second half-life (13.12 provisional default 60 s)
      * @param maxTrackedIps exact IP entries kept (raised together with maxOpen at configuration)
@@ -63,12 +89,43 @@ public final class PressureRanking {
      * @param secret per-process key for the keyed overflow buckets
      */
     public PressureRanking(long halfLifeMillis, int maxTrackedIps, int maxTrackedAccounts, byte[] secret) {
+        this(halfLifeMillis, maxTrackedIps, maxTrackedAccounts, secret, null, false);
+    }
+
+    /**
+     * Creates a cumulative ranking that takes one reading of {@code source} per operation, with the
+     * 13.12 defaults.
+     *
+     * @param source the stall accounting source of the executor incarnation, never replaced
+     */
+    public PressureRanking(StallClock source) {
+        this(60_000L, 131_072, 131_072, newSecret(), source);
+    }
+
+    /**
+     * Creates a cumulative ranking.
+     *
+     * @param halfLifeMillis byte-second half-life (13.12 provisional default 60 s)
+     * @param maxTrackedIps exact IP entries kept (raised together with maxOpen at configuration)
+     * @param maxTrackedAccounts exact account entries kept
+     * @param secret per-process key for the keyed overflow buckets
+     * @param source the stall accounting source of the executor incarnation, never replaced
+     */
+    public PressureRanking(long halfLifeMillis, int maxTrackedIps, int maxTrackedAccounts, byte[] secret,
+            StallClock source) {
+        this(halfLifeMillis, maxTrackedIps, maxTrackedAccounts, secret, source, true);
+    }
+
+    private PressureRanking(long halfLifeMillis, int maxTrackedIps, int maxTrackedAccounts, byte[] secret,
+            StallClock source, boolean cumulative) {
         if (halfLifeMillis <= 0 || maxTrackedIps < 1 || maxTrackedAccounts < 1) throw new IllegalArgumentException("ranking");
         if (secret == null || secret.length == 0) throw new IllegalArgumentException("secret");
+        if (cumulative && source == null) throw new IllegalArgumentException("source");
         this.halfLifeNanos = halfLifeMillis * 1_000_000L;
         this.maxTrackedIps = maxTrackedIps;
         this.maxTrackedAccounts = maxTrackedAccounts;
         this.secret = secret.clone();
+        this.source = source;
         for (int i = 0; i < OVERFLOW; i++) bucketLive.add(new HashMap<Object, Integer>());
     }
 
@@ -84,20 +141,39 @@ public final class PressureRanking {
 
     /** Returns a {@link HolderRank} that scores holders at the time reported by {@code clock}. */
     public HolderRank view(final LongSupplier clock) {
+        requireTimestamped("view(LongSupplier)");
         return new HolderRank() {
             @Override public double score(Object owner) {
-                return PressureRanking.this.score(owner, clock.getAsLong());
+                long now = clock.getAsLong();
+                synchronized (PressureRanking.this) {
+                    return scoreInternal(owner, now, effStall(now));
+                }
+            }
+        };
+    }
+
+    /**
+     * Returns a {@link HolderRank} that takes one fresh cumulative reading per score: the returned rank
+     * never captures or reuses a sample, so every victim choice sees current accounting.
+     */
+    public HolderRank view() {
+        requireCumulative("view()");
+        return new HolderRank() {
+            @Override public double score(Object owner) {
+                return PressureRanking.this.score(owner);
             }
         };
     }
 
     /** Marks the start of a local game-executor stall; its time is excluded from byte-seconds. */
     public synchronized void stallStart(long nowNanos) {
+        requireTimestamped("stallStart(long)");
         if (stallBegan < 0) stallBegan = nowNanos;
     }
 
     /** Marks the end of the stall started with {@link #stallStart}. */
     public synchronized void stallEnd(long nowNanos) {
+        requireTimestamped("stallEnd(long)");
         if (stallBegan >= 0) {
             stallTotal += Math.max(0, nowNanos - stallBegan);
             stallBegan = -1;
@@ -106,14 +182,31 @@ public final class PressureRanking {
 
     /**
      * Starts a connection's statistics. Identity histories persist across reconnects; only the
-     * connection-local statistics restart (13.12).
+     * connection-local statistics restart (13.12). Timestamped form.
      *
      * @param account authenticated account name, or {@code null} in offline mode or before authentication
      */
     public synchronized void connect(Object connection, InetAddress ip, String account, long nowNanos) {
+        requireTimestamped("connect(Object, InetAddress, String, long)");
+        connectInternal(connection, ip, account, nowNanos, effStall(nowNanos));
+    }
+
+    /**
+     * Starts a connection's statistics from one cumulative reading of the stall source. Identity
+     * histories persist across reconnects; only the connection-local statistics restart (13.12).
+     *
+     * @param account authenticated account name, or {@code null} in offline mode or before authentication
+     */
+    public synchronized void connect(Object connection, InetAddress ip, String account) {
+        requireCumulative("connect(Object, InetAddress, String)");
+        if (connection == null || ip == null) throw new IllegalArgumentException("identity");
+        StallClock.Sample sample = takeSample();
+        connectInternal(connection, ip, account, sample.nowNanos(), sample.excludedNanos());
+    }
+
+    private void connectInternal(Object connection, InetAddress ip, String account, long nowNanos, long eff) {
         if (connection == null || ip == null) throw new IllegalArgumentException("identity");
         if (connections.containsKey(connection)) throw new IllegalStateException("connection already registered");
-        long eff = effStall(nowNanos);
         PrefixKey ipKey = PrefixKey.overflow(ip);
         int ipBucket = ipKey.bucket(secret);
         int accountBucket = account == null ? -1 : PrefixKey.accountBucket(secret, account);
@@ -172,10 +265,32 @@ public final class PressureRanking {
 
     /** Ends a connection: its retained bytes are integrated to zero and its live counts are released. */
     public synchronized void disconnect(Object connection, long nowNanos) {
+        requireTimestamped("disconnect(Object, long)");
+        disconnectInternal(connection, nowNanos, effStall(nowNanos));
+    }
+
+    /**
+     * Ends a connection from one cumulative reading. The reading is taken once, inside this ranking's
+     * monitor. A known connection is released even from a coherent invalid reading, because releasing
+     * already-mutated state must stay possible; that reading is then committed as the last-used pair so
+     * later cleanups cannot validate behind the histories just mutated. A malformed reading releases
+     * nothing, and an unknown connection is a no-op that takes no reading.
+     */
+    public synchronized void disconnect(Object connection) {
+        requireCumulative("disconnect(Object)");
+        if (!connections.containsKey(connection)) {
+            return;
+        }
+        StallClock.Sample sample = readSample(true);
+        disconnectInternal(connection, sample.nowNanos(), sample.excludedNanos());
+        commitSample(sample);
+    }
+
+    private void disconnectInternal(Object connection, long nowNanos, long eff) {
         Connection c = connections.remove(connection);
         if (c == null) return;
         refusedWaiters.remove(c);
-        if (c.bytes != 0) setBytesInternal(c, 0, nowNanos, effStall(nowNanos));
+        if (c.bytes != 0) setBytesInternal(c, 0, nowNanos, eff);
         touchContinuity(c, nowNanos);
         if (c.ipRecord != null) c.ipRecord.live--;
         if (c.acctRecord != null) c.acctRecord.live--;
@@ -190,24 +305,65 @@ public final class PressureRanking {
 
     /** Sets the connection's absolute retained bytes at {@code nowNanos}; the previous amount is integrated first. */
     public synchronized void setRetained(Object connection, long bytes, long nowNanos) {
+        requireTimestamped("setRetained(Object, long, long)");
         if (bytes < 0) throw new IllegalArgumentException("bytes");
         setBytesInternal(require(connection), bytes, nowNanos, effStall(nowNanos));
     }
 
-    /** Records newly received or acknowledged progress bytes, counted once per connection and identity. */
-    public synchronized void progress(Object connection, long bytes, long nowNanos) {
+    /**
+     * Sets the connection's absolute retained bytes from one cumulative reading: the previous amount is
+     * integrated through that reading's pair before the new amount is installed.
+     */
+    public synchronized void setRetained(Object connection, long bytes) {
+        requireCumulative("setRetained(Object, long)");
         if (bytes < 0) throw new IllegalArgumentException("bytes");
         Connection c = require(connection);
+        StallClock.Sample sample = takeSample();
+        setBytesInternal(c, bytes, sample.nowNanos(), sample.excludedNanos());
+    }
+
+    /** Records newly received or acknowledged progress bytes, counted once per connection and identity. */
+    public synchronized void progress(Object connection, long bytes, long nowNanos) {
+        requireTimestamped("progress(Object, long, long)");
+        if (bytes < 0) throw new IllegalArgumentException("bytes");
+        progressInternal(require(connection), bytes, nowNanos);
+    }
+
+    /**
+     * Records newly received or acknowledged progress bytes from one cumulative reading. Progress
+     * windows stay on transport time: they are not stall-excluded.
+     */
+    public synchronized void progress(Object connection, long bytes) {
+        requireCumulative("progress(Object, long)");
+        if (bytes < 0) throw new IllegalArgumentException("bytes");
+        Connection c = require(connection);
+        StallClock.Sample sample = takeSample();
+        progressInternal(c, bytes, sample.nowNanos());
+    }
+
+    private void progressInternal(Connection c, long bytes, long nowNanos) {
         c.local.progress(bytes, nowNanos);
         for (IdentityHistory target : c.charged) target.progress(bytes, nowNanos);
     }
 
     /**
      * Starts a refused wait for an inbound requester's own incomplete record (13.12): the connection-local
-     * progress rate is floored at the rate over the 10 seconds before this first refusal.
+     * progress rate is floored at the rate over the 10 seconds before this first refusal. Timestamped form.
      */
     public synchronized void beginRefusedWait(Object connection, long nowNanos) {
+        requireTimestamped("beginRefusedWait(Object, long)");
+        beginRefusedWaitInternal(require(connection), nowNanos);
+    }
+
+    /** Starts a refused wait from one cumulative reading of the stall source. */
+    public synchronized void beginRefusedWait(Object connection) {
+        requireCumulative("beginRefusedWait(Object)");
         Connection c = require(connection);
+        StallClock.Sample sample = takeSample();
+        beginRefusedWaitInternal(c, sample.nowNanos());
+    }
+
+    private void beginRefusedWaitInternal(Connection c, long nowNanos) {
         if (!c.refusedWait) {
             c.refusedWait = true;
             // A connection younger than the window at its first refusal uses the live rate: no floor.
@@ -217,7 +373,7 @@ public final class PressureRanking {
         }
     }
 
-    /** Ends a refused wait and drops its progress floor. */
+    /** Ends a refused wait and drops its progress floor. Works in both modes: it needs no timestamp. */
     public synchronized void endRefusedWait(Object connection) {
         Connection c = require(connection);
         c.refusedWait = false;
@@ -233,9 +389,25 @@ public final class PressureRanking {
 
     /** Worst-of pressure score of a connection at {@code nowNanos} (13.12); 0 for an unknown connection. */
     public synchronized double score(Object connection, long nowNanos) {
+        requireTimestamped("score(Object, long)");
+        return scoreInternal(connection, nowNanos, effStall(nowNanos));
+    }
+
+    /**
+     * Worst-of pressure score of a connection from one cumulative reading (13.12); 0 for an unknown
+     * connection, which takes no reading at all.
+     */
+    public synchronized double score(Object connection) {
+        requireCumulative("score(Object)");
         Connection c = connections.get(connection);
         if (c == null) return 0;
-        long eff = effStall(nowNanos);
+        StallClock.Sample sample = takeSample();
+        return scoreInternal(connection, sample.nowNanos(), sample.excludedNanos());
+    }
+
+    private double scoreInternal(Object connection, long nowNanos, long eff) {
+        Connection c = connections.get(connection);
+        if (c == null) return 0;
         // Refused-wait floor (13.12): this connection's rate is at least its pre-wait rate. The shortfall of
         // every refused waiter charged to an identity lifts that identity's progress, so siblings sharing it
         // cannot hide a stalled holder behind cheap records.
@@ -287,7 +459,76 @@ public final class PressureRanking {
 
     /** Decayed score of an overflow bucket at {@code nowNanos}. */
     public synchronized double bucketScore(int bucket, long nowNanos) {
-        return buckets[bucket] == null ? 0 : buckets[bucket].score(nowNanos, effStall(nowNanos), 0);
+        requireTimestamped("bucketScore(int, long)");
+        return bucketScoreInternal(bucket, nowNanos, effStall(nowNanos));
+    }
+
+    /** Decayed score of an overflow bucket from one cumulative reading. */
+    public synchronized double bucketScore(int bucket) {
+        requireCumulative("bucketScore(int)");
+        StallClock.Sample sample = takeSample();
+        return bucketScoreInternal(bucket, sample.nowNanos(), sample.excludedNanos());
+    }
+
+    private double bucketScoreInternal(int bucket, long nowNanos, long eff) {
+        return buckets[bucket] == null ? 0 : buckets[bucket].score(nowNanos, eff, 0);
+    }
+
+    /**
+     * Reads one sample of the cumulative source and validates it against the last accepted reading.
+     * Differences are plain subtractions, so signed clock and counter wrap are accepted and only
+     * backwards or self-contradicting readings are rejected. Nothing is committed here: the caller
+     * commits after its own preconditions passed.
+     *
+     * @param cleanup true only for release of a known connection: a coherent invalid reading is then
+     *        usable, while a malformed one still throws
+     */
+    private StallClock.Sample readSample(boolean cleanup) {
+        StallClock.Sample sample = source.sample();
+        if (!sample.valid() && !cleanup) {
+            throw new StallClock.UnavailableException("stall source is not valid");
+        }
+        long now = sample.nowNanos();
+        long excluded = sample.excludedNanos();
+        if (clockInitialized) {
+            long elapsed = now - lastNowNanos;
+            long delta = excluded - lastExcludedNanos;
+            if (elapsed < 0 || delta < 0 || delta > elapsed) {
+                throw new StallClock.UnavailableException("stall source went backwards or excluded more time than it spent");
+            }
+        }
+        return sample;
+    }
+
+    /** One valid, validated cumulative reading, committed as the last-used pair before it is used. */
+    private StallClock.Sample takeSample() {
+        StallClock.Sample sample = readSample(false);
+        commitSample(sample);
+        return sample;
+    }
+
+    /**
+     * Makes a reading the reference for later differences. Cleanup commits the same pair as its
+     * mutation, so a later validation can never reach behind already-mutated histories.
+     */
+    private void commitSample(StallClock.Sample sample) {
+        clockInitialized = true;
+        lastNowNanos = sample.nowNanos();
+        lastExcludedNanos = sample.excludedNanos();
+    }
+
+    /** Rejects a timestamped operation on a cumulative ranking before anything can be mutated. */
+    private void requireTimestamped(String operation) {
+        if (source != null) {
+            throw new IllegalStateException(operation + " is timestamped; this ranking samples its stall source");
+        }
+    }
+
+    /** Rejects a cumulative operation on a timestamped ranking before anything can be mutated. */
+    private void requireCumulative(String operation) {
+        if (source == null) {
+            throw new IllegalStateException(operation + " needs a ranking constructed with a stall source");
+        }
     }
 
     private double readScore(Read read, double local, long now, long eff, double extra) {

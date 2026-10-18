@@ -3,8 +3,11 @@ package rs.sudoe.quicraft.core.multistream;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import java.net.InetAddress;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.resource.PressureRanking;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 class ExecutorProgressWatchTest {
     private static final long SEC = 1_000_000_000L;
@@ -235,5 +238,60 @@ class ExecutorProgressWatchTest {
         assertEquals(8 * SEC, snapshot.excludedTotalNanos, "[1 s, 4 s] plus the open [5 s, 10 s]");
         assertFalse(snapshot.valid);
         assertFalse(snapshot.proven, "invalidation came before the probe completed");
+    }
+
+    @Test void watchIsAStallClockAndSnapshotsAreItsSamples() {
+        AtomicLong now = new AtomicLong();
+        ExecutorProgressWatch watch = new ExecutorProgressWatch(now::get);
+        StallClock clock = watch;
+        long token = watch.probeSubmitted();
+        now.set(6 * SEC);
+        StallClock.Sample sample = clock.sample();
+        ExecutorProgressWatch.Snapshot snapshot = watch.sample();
+        assertTrue(sample instanceof ExecutorProgressWatch.Snapshot);
+        assertEquals(snapshot.sampledAtNanos, sample.nowNanos());
+        assertEquals(snapshot.excludedTotalNanos, sample.excludedNanos());
+        assertEquals(snapshot.valid, sample.valid());
+        assertEquals(6 * SEC, sample.nowNanos());
+        assertEquals(5 * SEC, sample.excludedNanos(), "[1 s, 6 s] is open and included");
+        assertTrue(sample.valid());
+        now.set(12 * SEC);
+        watch.probeCompleted(token);
+        assertEquals(11 * SEC, clock.sample().excludedNanos());
+        assertTrue(clock.sample().valid());
+    }
+
+    @Test void invalidatedWindowSamplesStayCoherentForCleanupDifferences() {
+        AtomicLong now = new AtomicLong();
+        ExecutorProgressWatch watch = new ExecutorProgressWatch(now::get);
+        watch.probeSubmitted();
+        now.set(5 * SEC);
+        watch.invalidate();
+        StallClock.Sample first = watch.sample();
+        assertFalse(first.valid());
+        assertEquals(4 * SEC, first.excludedNanos(), "the open interval excludes its time past the 1 s threshold");
+        now.set(9 * SEC);
+        StallClock.Sample later = watch.sample();
+        assertFalse(later.valid());
+        assertEquals(4 * SEC, later.excludedNanos(), "the exclusion is frozen after invalidation");
+        assertEquals(4 * SEC, later.nowNanos() - first.nowNanos(), "time keeps advancing for cleanup differences");
+    }
+
+    @Test void watchDrivesATimerAndARankingFromItsProbeInterval() throws Exception {
+        AtomicLong now = new AtomicLong();
+        ExecutorProgressWatch watch = new ExecutorProgressWatch(now::get);
+        long token = watch.probeSubmitted();
+        BlockedHeadTimer timer = new BlockedHeadTimer(watch, true);
+        timer.start();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 10, 10,
+                new byte[] {9, 8, 7, 6, 5, 4, 3, 2}, watch);
+        ranking.connect("c", InetAddress.getByName("192.0.2.9"), null);
+        ranking.setRetained("c", 100);
+        now.set(12 * SEC);
+        watch.probeCompleted(token);
+        assertEquals(11 * SEC, timer.excludedNanos(), "the qualifying probe interval is the exclusion");
+        assertEquals(SEC, timer.activeNanos());
+        assertTrue(timer.stallConsumed());
+        assertEquals(100.0, ranking.score("c"), 0.01, "the ranking counts only the same single effective second");
     }
 }

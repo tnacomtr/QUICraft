@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 class BlockedHeadTimerTest {
     private static final long SEC = 1_000_000_000L;
@@ -256,5 +257,285 @@ class BlockedHeadTimerTest {
         timer.stallEnded(6 * SEC);
         assertEquals(2 * SEC, timer.excludedNanos(),
                 "an earlier start after a later one is out of order and is not rejoined into the union");
+    }
+
+    @Test void cumulativeTimerCountsExcludedTotalDifferences() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        timer.start();
+        source.set(10 * SEC, 4 * SEC);
+        assertEquals(4 * SEC, timer.excludedNanos());
+        assertEquals(6 * SEC, timer.activeNanos());
+        assertFalse(timer.expired(), "6 s of active time");
+        assertTrue(timer.stallConsumed());
+        source.set(16 * SEC, 4 * SEC);
+        assertEquals(4 * SEC, timer.excludedNanos());
+        assertEquals(12 * SEC, timer.activeNanos());
+        assertTrue(timer.expired());
+        assertTrue(timer.running());
+    }
+
+    @Test void cumulativeTimerLateAndFrequentObservationsAgree() {
+        Source frequentSource = new Source();
+        BlockedHeadTimer frequent = new BlockedHeadTimer(frequentSource, true);
+        frequent.start();
+        frequentSource.set(3 * SEC, SEC);
+        frequent.excludedNanos();
+        frequentSource.set(7 * SEC, 3 * SEC);
+        frequent.activeNanos();
+        frequentSource.set(12 * SEC, 5 * SEC);
+        long frequentExcluded = frequent.excludedNanos();
+        long frequentActive = frequent.activeNanos();
+
+        Source lateSource = new Source();
+        BlockedHeadTimer late = new BlockedHeadTimer(lateSource, true);
+        late.start();
+        lateSource.set(12 * SEC, 5 * SEC);
+        assertEquals(frequentExcluded, late.excludedNanos(), "a late observer sees the same exclusion");
+        assertEquals(frequentActive, late.activeNanos(), "a late observer sees the same active time");
+        assertEquals(5 * SEC, late.excludedNanos());
+        assertEquals(7 * SEC, late.activeNanos());
+    }
+
+    @Test void cumulativeTimerBaselineInsideAnOpenStallClipsLaterOverlap() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        source.set(2 * SEC, SEC);
+        timer.start();
+        source.set(6 * SEC, 5 * SEC);
+        assertEquals(4 * SEC, timer.excludedNanos(), "[1 s, 6 s] qualifies, only [2 s, 6 s] is after the baseline");
+        assertEquals(0, timer.activeNanos());
+        source.set(10 * SEC, 5 * SEC);
+        assertEquals(4 * SEC, timer.excludedNanos(), "the finished stall adds nothing more");
+        assertEquals(4 * SEC, timer.activeNanos());
+        assertFalse(timer.expired());
+    }
+
+    @Test void cumulativeTimerStopAndRestartRebaselines() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        timer.start();
+        source.set(5 * SEC, 2 * SEC);
+        assertEquals(2 * SEC, timer.excludedNanos());
+        int samples = source.samples;
+        timer.stop();
+        assertFalse(timer.running());
+        assertEquals(0, timer.excludedNanos());
+        assertEquals(0, timer.activeNanos());
+        assertFalse(timer.expired());
+        assertFalse(timer.stallConsumed());
+        assertEquals(samples, source.samples, "a stopped timer reads nothing");
+        source.set(10 * SEC, 5 * SEC);
+        timer.start();
+        source.set(14 * SEC, 9 * SEC);
+        assertEquals(4 * SEC, timer.excludedNanos(), "only the new wait's stall time counts");
+        assertEquals(0, timer.activeNanos());
+        assertEquals(samples + 3, source.samples, "the restart rebaselined from one reading, then two observations");
+    }
+
+    @Test void cumulativeResourceWaitExcludesNoStallTime() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, false);
+        timer.start();
+        source.set(9 * SEC, 8 * SEC);
+        assertEquals(0, timer.excludedNanos());
+        assertFalse(timer.stallConsumed());
+        assertEquals(9 * SEC, timer.activeNanos());
+        assertFalse(timer.expired(), "9 s of transport time, none of it excluded");
+        source.set(10 * SEC, 9 * SEC);
+        assertTrue(timer.expired());
+        assertEquals(10 * SEC, timer.activeNanos());
+        assertEquals(0, timer.excludedNanos());
+    }
+
+    @Test void cumulativeTimerExclusionStaysCappedAtSixtySeconds() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        timer.start();
+        source.set(30 * SEC, 25 * SEC);
+        assertEquals(25 * SEC, timer.excludedNanos());
+        assertEquals(5 * SEC, timer.activeNanos());
+        assertFalse(timer.expired());
+        source.set(100 * SEC, 80 * SEC);
+        assertEquals(60 * SEC, timer.excludedNanos(), "the allowance saturates");
+        assertEquals(40 * SEC, timer.activeNanos());
+        source.set(200 * SEC, 180 * SEC);
+        assertEquals(60 * SEC, timer.excludedNanos());
+        assertEquals(140 * SEC, timer.activeNanos());
+        assertTrue(timer.expired());
+    }
+
+    @Test void cumulativeTimerExpiresAtExactlyTenActiveSeconds() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        timer.start();
+        source.set(10 * SEC - 1, 0);
+        assertFalse(timer.expired());
+        source.set(10 * SEC, 0);
+        assertTrue(timer.expired(), "10 s of active time is the deadline");
+
+        Source stalledSource = new Source();
+        BlockedHeadTimer stalled = new BlockedHeadTimer(stalledSource, true);
+        stalled.start();
+        stalledSource.set(6 * SEC, 3 * SEC);
+        assertFalse(stalled.expired());
+        stalledSource.set(12 * SEC, 3 * SEC);
+        assertFalse(stalled.expired(), "9 s of active time");
+        stalledSource.set(13 * SEC, 3 * SEC);
+        assertTrue(stalled.expired(), "the same 3 s of stall pushes the deadline by 3 s");
+    }
+
+    @Test void cumulativeTimerRepeatedReadsSampleOncePerObservation() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        timer.start();
+        source.set(6 * SEC, 5 * SEC);
+        int before = source.samples;
+        assertEquals(5 * SEC, timer.excludedNanos());
+        assertEquals(1, source.samples - before);
+        assertEquals(SEC, timer.activeNanos());
+        assertEquals(2, source.samples - before);
+        assertFalse(timer.expired());
+        assertEquals(3, source.samples - before);
+        assertTrue(timer.stallConsumed());
+        assertEquals(4, source.samples - before);
+        assertEquals(5 * SEC, timer.excludedNanos(), "reading again changes nothing");
+        assertEquals(5, source.samples - before);
+    }
+
+    @Test void cumulativeTimerHandlesNegativeOriginAndSignedWrap() {
+        Source negative = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(negative, true);
+        negative.set(-20 * SEC, -3 * SEC);
+        timer.start();
+        negative.set(-8 * SEC, -1 * SEC);
+        assertEquals(2 * SEC, timer.excludedNanos(), "12 s elapsed, 2 s of it excluded");
+        assertEquals(10 * SEC, timer.activeNanos());
+
+        Source wrap = new Source();
+        BlockedHeadTimer wrapped = new BlockedHeadTimer(wrap, true);
+        long origin = Long.MAX_VALUE - 3 * SEC;
+        wrap.set(origin, Long.MAX_VALUE - SEC);
+        wrapped.start();
+        wrap.set(origin + 6 * SEC, Long.MAX_VALUE - SEC + 5 * SEC);
+        assertTrue(wrap.nowNanos < 0, "the reading wrapped past Long.MAX_VALUE");
+        assertEquals(5 * SEC, wrapped.excludedNanos(), "a 5 s counter progression across the wrap");
+        assertEquals(SEC, wrapped.activeNanos());
+    }
+
+    @Test void cumulativeTimerRejectsInvalidSamplesWithoutMutatingState() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        timer.start();
+        source.set(5 * SEC, 2 * SEC);
+        assertEquals(2 * SEC, timer.excludedNanos());
+        source.valid = false;
+        assertThrows(StallClock.UnavailableException.class, timer::excludedNanos);
+        assertThrows(StallClock.UnavailableException.class, timer::activeNanos);
+        assertThrows(StallClock.UnavailableException.class, timer::expired);
+        assertThrows(StallClock.UnavailableException.class, timer::stallConsumed);
+        source.valid = true;
+        source.set(10 * SEC, 3 * SEC);
+        assertEquals(3 * SEC, timer.excludedNanos(), "the rejected readings moved nothing");
+        assertEquals(7 * SEC, timer.activeNanos());
+    }
+
+    @Test void cumulativeTimerRejectsMalformedSamplesWithoutMutatingState() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        timer.start();
+        source.set(5 * SEC, 2 * SEC);
+        assertEquals(2 * SEC, timer.excludedNanos());
+        source.set(4 * SEC, 2 * SEC);
+        assertThrows(StallClock.UnavailableException.class, timer::excludedNanos, "backwards time");
+        source.set(6 * SEC, SEC);
+        assertThrows(StallClock.UnavailableException.class, timer::excludedNanos, "backwards cumulative counter");
+        source.set(7 * SEC, 6 * SEC);
+        assertThrows(StallClock.UnavailableException.class, timer::excludedNanos, "excluded delta above elapsed delta");
+        source.set(8 * SEC, 5 * SEC);
+        assertEquals(5 * SEC, timer.excludedNanos(), "the rejected readings moved nothing");
+        assertEquals(3 * SEC, timer.activeNanos());
+    }
+
+    @Test void cumulativeTimerStartsFromOneBaselineAndIgnoresRepeatedStart() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        source.set(5 * SEC, 2 * SEC);
+        timer.start();
+        assertEquals(1, source.samples);
+        source.set(8 * SEC, 2 * SEC);
+        timer.start();
+        assertEquals(1, source.samples, "a repeated start does not read the source again");
+        assertEquals(3 * SEC, timer.activeNanos(), "the wait still started at the first baseline");
+    }
+
+    @Test void cumulativeTimerNotStartedObservesNothing() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        assertFalse(timer.running());
+        assertEquals(0, timer.excludedNanos());
+        assertEquals(0, timer.activeNanos());
+        assertFalse(timer.expired());
+        assertFalse(timer.stallConsumed());
+        assertEquals(0, source.samples, "a wait that never started never reads its source");
+    }
+
+    @Test void cumulativeTimerStartRejectsAnInvalidSourceWithoutStarting() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        source.valid = false;
+        assertThrows(StallClock.UnavailableException.class, timer::start);
+        assertFalse(timer.running(), "an untrusted reading never captures a baseline");
+        assertEquals(1, source.samples, "the rejected start took one reading");
+        source.valid = true;
+        source.set(4 * SEC, 0);
+        timer.start();
+        assertEquals(2, source.samples);
+        source.set(5 * SEC, 0);
+        assertEquals(SEC, timer.activeNanos());
+    }
+
+    @Test void cumulativeTimerRejectsBoundaryStallHooksEvenWhenStopped() {
+        Source source = new Source();
+        BlockedHeadTimer timer = new BlockedHeadTimer(source, true);
+        assertThrows(IllegalStateException.class, timer::stallStarted);
+        assertThrows(IllegalStateException.class, () -> timer.stallStarted(SEC));
+        assertThrows(IllegalStateException.class, timer::stallEnded);
+        assertThrows(IllegalStateException.class, () -> timer.stallEnded(SEC));
+        timer.start();
+        assertThrows(IllegalStateException.class, timer::stallStarted);
+        assertThrows(IllegalStateException.class, () -> timer.stallEnded(SEC));
+        timer.stop();
+        assertThrows(IllegalStateException.class, timer::stallStarted);
+        assertThrows(IllegalStateException.class, timer::stallEnded);
+    }
+
+    @Test void cumulativeTimerRejectsANullSource() {
+        assertThrows(IllegalArgumentException.class, () -> new BlockedHeadTimer((StallClock) null, true));
+    }
+
+    /** Deterministic cumulative source: one scripted reading per {@link #sample()} call. */
+    private static final class Source implements StallClock {
+        long nowNanos;
+        long excludedNanos;
+        boolean valid = true;
+        int samples;
+
+        void set(long nowNanos, long excludedNanos) {
+            this.nowNanos = nowNanos;
+            this.excludedNanos = excludedNanos;
+        }
+
+        @Override public Sample sample() {
+            samples++;
+            final long now = nowNanos;
+            final long excluded = excludedNanos;
+            final boolean valid = this.valid;
+            return new Sample() {
+                @Override public long nowNanos() { return now; }
+                @Override public long excludedNanos() { return excluded; }
+                @Override public boolean valid() { return valid; }
+            };
+        }
     }
 }

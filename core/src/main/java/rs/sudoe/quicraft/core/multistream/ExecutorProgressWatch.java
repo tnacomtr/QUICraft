@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.core.multistream;
 
 import java.util.function.LongSupplier;
+import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
  * Cumulative progress accounting for one actual game-executor incarnation (docs/protocol.md 13.10).
@@ -39,8 +40,15 @@ import java.util.function.LongSupplier;
  * flag for the record, but a snapshot is only ready when {@code valid && proven}.
  *
  * <p>Thread-safe: probes are reserved and completed across the owner and executor threads.
+ *
+ * <p>The watch is the {@link StallClock} source of its incarnation: one {@link #sample()} returns
+ * one atomic reading whose {@code nowNanos}, {@code excludedNanos} and {@code valid} components are
+ * this class's snapshot fields, so a cumulative consumer that must not invent boundary timestamps
+ * (the blocked-head timer and the pressure ranking) can drive itself directly from it. Consumers
+ * keep the source object they were constructed with; a replacement executor is a different
+ * incarnation and therefore a different watch, never a new source under an existing consumer.
  */
-public final class ExecutorProgressWatch {
+public final class ExecutorProgressWatch implements StallClock {
     /** 13.10: a stall is known only after the executor completes nothing for at least one second. */
     public static final long THRESHOLD_NANOS = 1_000_000_000L;
 
@@ -64,9 +72,10 @@ public final class ExecutorProgressWatch {
     /**
      * An immutable reading of the accounting. {@code sampledAtNanos} is the clock reading the sample
      * was taken at, {@code excludedTotalNanos} the cumulative qualifying intervals through that
-     * reading with the currently open interval included.
+     * reading with the currently open interval included. It also serves as the {@link StallClock.Sample}
+     * view of the same reading, so both components always describe one instant.
      */
-    public static final class Snapshot {
+    public static final class Snapshot implements StallClock.Sample {
         /** The monotonic clock reading this snapshot was taken at. */
         public final long sampledAtNanos;
         /** Cumulative qualifying stall time through {@link #sampledAtNanos}, open interval included. */
@@ -83,6 +92,24 @@ public final class ExecutorProgressWatch {
             this.proven = proven;
         }
 
+        /** The reading's transport clock instant; identical to {@link #sampledAtNanos}. */
+        @Override
+        public long nowNanos() {
+            return sampledAtNanos;
+        }
+
+        /** The reading's cumulative exclusion; identical to {@link #excludedTotalNanos}. */
+        @Override
+        public long excludedNanos() {
+            return excludedTotalNanos;
+        }
+
+        /** The reading's validity; identical to {@link #valid}. */
+        @Override
+        public boolean valid() {
+            return valid;
+        }
+
         @Override
         public String toString() {
             return "Snapshot[sampledAtNanos=" + sampledAtNanos
@@ -91,7 +118,11 @@ public final class ExecutorProgressWatch {
         }
     }
 
-    /** Takes a reading of the cumulative accounting, the currently open interval included. */
+    /**
+     * Takes a reading of the cumulative accounting, the currently open interval included. The
+     * returned snapshot is the {@link StallClock.Sample} of this watch's incarnation for that reading.
+     */
+    @Override
     public synchronized Snapshot sample() {
         long now = clock.getAsLong();
         long excluded = excludedTotalNanos;
