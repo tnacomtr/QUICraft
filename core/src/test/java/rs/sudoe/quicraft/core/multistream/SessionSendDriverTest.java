@@ -14,7 +14,9 @@ import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 
 import org.junit.jupiter.api.Test;
 
@@ -1157,6 +1159,136 @@ class SessionSendDriverTest {
         }
         assertTrue(joinWaitsForUpdate, "the join carries the covered update frontier");
         assertEquals(TEST_SLICE, rig.pool.reserved(rig.owner), "every record charge is released");
+        driver.close();
+    }
+
+    /**
+     * A pre-assignment queue overflow on a covered send is terminal, like every other submit path:
+     * the token was validated but this submission owns no sequence, and the 0x12 close drops the
+     * live scope and token as terminal connection cleanup. The retirement is not a claim that the
+     * failed covered send assigned nothing; it only means the connection and its scope state end
+     * together. No sequence moved for the covered record.
+     */
+    @Test
+    void coveredOverflowBeforeAssignmentIsTerminalCleanupWithCause() throws Exception {
+        Rig rig = new Rig(2, 1);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        assertTrue(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned(),
+                "the ordinary record fills the queue");
+        long assignedBefore = driver.assignedSequence(LogicalStream.CONTROL);
+
+        SentPacket overflow = driver.submitCovered(token, frame(2), StreamSequencer.Fence.ORDINARY_CONTROL,
+                false, 0, 0);
+
+        assertFalse(overflow.isAssigned(), "the overflowing covered submission exposes no sequence");
+        assertTrue(driver.isClosed(), "a producer overflow is terminal");
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode(), "overflow closes 0x12");
+        assertTrue(driver.closeCause() instanceof IllegalStateException, "the overflow cause is retained");
+        assertEquals("covered submission overflows the queue", driver.closeCause().getMessage());
+        assertEquals(assignedBefore, driver.assignedSequence(LogicalStream.CONTROL),
+                "the overflow path assigned no sequence to the covered record");
+        assertEquals(0, driver.trackerScopeCount(), "the terminal close retires scopes as connection cleanup");
+        assertEquals(0, driver.trackerRetainedTokens(), "the terminal close retires tokens as connection cleanup");
+        assertNull(driver.poll(stream -> true), "nothing is pollable after the terminal close");
+    }
+
+    /**
+     * A failure after the covered sequence was assigned but before publication (here encoding) closes
+     * locally 0x12 with the original cause and exposes no half-assigned record.
+     */
+    @Test
+    void coveredEncodeFailureAfterAssignmentClosesWithOriginalCause() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        // Inner length 5 with one body byte: the sequencer assigns, then RecordCodec rejects it.
+        OutboundPacket malformed = new OutboundPacket(new byte[] {5, 7});
+
+        SentPacket handle = driver.submitCovered(token, malformed, StreamSequencer.Fence.ORDINARY_CONTROL,
+                false, 0, 0);
+
+        assertFalse(handle.isAssigned(), "a post-assignment failure exposes no sequence");
+        assertTrue(driver.isClosed(), "the driver closes locally");
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertTrue(driver.closeCause() instanceof IllegalArgumentException,
+                "the encoding failure is the original cause");
+        assertTrue(driver.closeCause().getCause() instanceof MultistreamProtocolException,
+                "the codec failure underneath is retained");
+        assertEquals(1, driver.assignedSequence(LogicalStream.CONTROL),
+                "the sequence existed before encoding failed");
+        assertNull(driver.poll(stream -> true), "the half-assigned record is not pollable");
+        assertEquals(0, rig.pool.reserved(rig.owner), "the close releases every charge");
+    }
+
+    /**
+     * A pump failure after the record was already queued closes locally 0x12 with the original cause
+     * and clears the queue, so the half-assigned record is never pollable.
+     */
+    @Test
+    void coveredPumpFailureAfterAssignmentClosesAndClearsTheQueue() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        AtomicBoolean failNextClockRead = new AtomicBoolean();
+        LongSupplier clock = () -> {
+            if (failNextClockRead.compareAndSet(true, false)) {
+                throw new IllegalStateException("injected pump failure");
+            }
+            return now.get();
+        };
+        PressureRanking ranking = new PressureRanking();
+        Object owner = new Object();
+        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, 1L << 40, 1L << 40, ranking.view(now::get));
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(2),
+                new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
+                InetAddress.getLoopbackAddress(), null, clock);
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.UpdateToken token = driver.registerUpdate(scope);
+        failNextClockRead.set(true);
+
+        SentPacket handle = driver.submitCovered(token, frame(2), StreamSequencer.Fence.ORDINARY_CONTROL,
+                false, 0, 0);
+
+        assertFalse(handle.isAssigned(), "a pump failure exposes no sequence");
+        assertTrue(driver.isClosed(), "the driver closes locally");
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertTrue(driver.closeCause() instanceof IllegalStateException);
+        assertEquals("injected pump failure", driver.closeCause().getMessage(),
+                "the pump failure is retained as the original cause");
+        assertEquals(1, driver.assignedSequence(LogicalStream.CONTROL),
+                "the sequence existed before the pump failed");
+        assertNull(driver.poll(stream -> true), "the queued half-assigned record is cleared");
+        assertEquals(0, pool.reserved(owner), "the close releases every charge");
+    }
+
+    /**
+     * Covering an ack after its membership was sealed is caller misuse: the driver translates the
+     * typed tracker failure to IllegalArgumentException with the original cause, stays open, and
+     * still accepts a subsequent valid submit.
+     */
+    @Test
+    void postSealCoverScopeIsCallerMisuseAndKeepsTheDriverOpen() throws Exception {
+        Rig rig = new Rig(2, 1000);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(1, frame(2).frame(), 8));
+        MultistreamSession.CausalScope scope = driver.openScope();
+        MultistreamSession.CausalScope late = driver.openScope();
+        driver.coverScope(1, scope);
+        driver.sealAckCoverage(1);
+
+        IllegalArgumentException misuse = assertThrows(IllegalArgumentException.class,
+                () -> driver.coverScope(1, late));
+
+        assertTrue(misuse.getCause() instanceof AckJoinTracker.SealedCoverageException,
+                "the typed tracker failure is retained as the cause");
+        assertFalse(driver.isClosed(), "caller misuse does not close the session");
+        assertEquals(0, driver.closeCode(), "no local close code is set");
+        assertNull(driver.closeCause(), "no local failure cause is recorded");
+        SentPacket after = driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        assertTrue(after.isAssigned(), "the driver still accepts a valid submit");
+        assertEquals(1, after.sequence(), "the misuse assigned no sequence");
         driver.close();
     }
 
