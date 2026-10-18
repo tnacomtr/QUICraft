@@ -307,8 +307,20 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     }
 
     @Override
+    public void activate(final LaneGame game, final boolean compressed, final String account,
+            ByteBuffer controlLeftover) {
+        activate(game, -1, compressed, account, controlLeftover);
+    }
+
+    @Override
     public void activate(final LaneGame game, final int protocolNumber, final boolean compressed,
             ByteBuffer controlLeftover) {
+        activate(game, protocolNumber, compressed, null, controlLeftover);
+    }
+
+    @Override
+    public void activate(final LaneGame game, final int protocolNumber, final boolean compressed,
+            final String account, ByteBuffer controlLeftover) {
         if (game == null) {
             throw new NullPointerException("game");
         }
@@ -316,7 +328,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         run(new Runnable() {
             @Override
             public void run() {
-                doActivate(game, protocolNumber, compressed, leftover);
+                doActivate(game, protocolNumber, compressed, account, leftover);
             }
         });
     }
@@ -791,7 +803,8 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         }
     }
 
-    private void doActivate(LaneGame game, int protocolNumber, boolean compressed, ByteBuffer controlLeftover) {
+    private void doActivate(LaneGame game, int protocolNumber, boolean compressed, String account,
+            ByteBuffer controlLeftover) {
         if (activated || rawClosed) {
             return;
         }
@@ -827,7 +840,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
         // The session installs itself first in stream 0's pipeline and drives reads itself.
         MultistreamSession started;
         try {
-            started = newSession(resolved, game, negotiated, compressed);
+            started = newSession(resolved, game, negotiated, compressed, account);
         } catch (RuntimeException e) {
             failActivation("the session cannot start: " + e.getMessage());
             return;
@@ -846,13 +859,13 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
      * resources, with the compression state the platform read at activation (13.4).
      */
     private MultistreamSession newSession(RoutingTable resolved, LaneGame game, SessionContext negotiated,
-            boolean compressed) {
+            boolean compressed, String account) {
         SessionResources shared = resources;
         if (shared == null) {
             shared = role == NStreamSession.Role.CLIENT ? SessionResources.client() : SessionResources.production(null);
             resources = shared;
         }
-        return new NStreamSession(connection, role, control, resolved, game, negotiated, shared, compressed);
+        return new NStreamSession(connection, role, control, resolved, game, negotiated, shared, compressed, account);
     }
 
     /** Concatenates the application's leftover and what core read after the detach; null for none. */

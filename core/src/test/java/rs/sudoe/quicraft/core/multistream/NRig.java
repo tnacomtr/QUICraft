@@ -255,6 +255,8 @@ final class NRig implements AutoCloseable {
         SessionResources serverResources = resources();
         SessionResources clientResources = resources();
         RoutingTable table = TABLE;
+        /** The 13.12 account key of the server session's charges, or null (see NStreamSession). */
+        String serverAccount;
     }
 
     final Config config;
@@ -334,7 +336,8 @@ final class NRig implements AutoCloseable {
             if (config.serverSession) {
                 serverConnection.eventLoop().submit(() -> {
                     server = new NStreamSession(serverConnection, NStreamSession.Role.SERVER, serverControl, config.table,
-                            serverGame, context, config.serverResources, config.serverTiming, config.compressed);
+                            serverGame, context, config.serverResources, config.serverTiming, config.compressed,
+                            config.serverAccount);
                     serverGame.session = server;
                     serverRef = server;
                     for (QuicStreamChannel s : serverEarly) {

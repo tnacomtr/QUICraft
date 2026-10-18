@@ -142,7 +142,6 @@ public final class SessionReadPump {
         this.ranking = ranking;
         this.clock = clock;
         if (ranking != null) {
-            // TODO(U9): pass the login identity once it is plumbed; account is null until then.
             ranking.connect(owner, (InetAddress) ip, account instanceof String ? (String) account : null,
                     clock.getAsLong());
         }

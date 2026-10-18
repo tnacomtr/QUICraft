@@ -74,8 +74,10 @@ import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
  * <p>Pressure rankings. The send driver registers the connection with the outbound ranking and the server's read
  * pump with the inbound ranking, keyed by the remote address.
  *
- * <p>TODO(U9): pool and ranking charges pass {@code account = null}, so the 13.12 per-account caps and account
- * histories do not apply yet; U9 plumbs the login identity in.
+ * <p>Account key (13.12). The pool and ranking charges of this connection carry the account the platform passes:
+ * the authenticated profile UUID as a String on an online-authenticated server connection, and {@code null}
+ * otherwise (offline mode, before authentication, and on clients). A non-String account is never charged:
+ * the ranking path reads only Strings, so a null is the only honest value for anything else.
  */
 public final class NStreamSession implements MultistreamSession {
     private static final Logger LOG = Logger.getLogger("QUICraft");
@@ -339,6 +341,8 @@ public final class NStreamSession implements MultistreamSession {
     private final Timing timing;
     private final EventLoop loop;
     private final boolean compressed;
+    /** The 13.12 account key of this connection's charges, or null (see the class comment). */
+    private final String account;
     private final int shards;
     private final int streams;
     private final int protocolNumber;
@@ -396,16 +400,38 @@ public final class NStreamSession implements MultistreamSession {
     public NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control,
             RoutingTable table, LaneGame game, SessionContext context, SessionResources resources,
             boolean compressed) {
-        this(connection, role, control, table, game, context, resources, Timing.DEFAULT, compressed);
+        this(connection, role, control, table, game, context, resources, Timing.DEFAULT, compressed, null);
+    }
+
+    /**
+     * As {@link #NStreamSession(QuicChannel, Role, QuicStreamChannel, RoutingTable, LaneGame, SessionContext,
+     * SessionResources, boolean)}, with the 13.12 account key of this connection's charges (see the class comment).
+     *
+     * @param account the authenticated account as a String, or null when unauthenticated
+     */
+    public NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control,
+            RoutingTable table, LaneGame game, SessionContext context, SessionResources resources,
+            boolean compressed, String account) {
+        this(connection, role, control, table, game, context, resources, Timing.DEFAULT, compressed, account);
     }
 
     NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
             LaneGame game, SessionContext context, SessionResources resources, Timing timing,
             boolean compressed) {
+        this(connection, role, control, table, game, context, resources, timing, compressed, null);
+    }
+
+    NStreamSession(QuicChannel connection, Role role, QuicStreamChannel control, RoutingTable table,
+            LaneGame game, SessionContext context, SessionResources resources, Timing timing,
+            boolean compressed, String account) {
         if (connection == null || role == null || control == null || table == null || context == null
                 || resources == null || timing == null) {
             throw new IllegalArgumentException("null argument");
         }
+        if (account != null && account.isEmpty()) {
+            throw new IllegalArgumentException("account key must be null or non-empty");
+        }
+        this.account = account;
         if (control.streamId() != 0 || control.type() != QuicStreamType.BIDIRECTIONAL) {
             throw new IllegalArgumentException("CONTROL must be bidirectional stream 0");
         }
@@ -442,7 +468,7 @@ public final class NStreamSession implements MultistreamSession {
         this.source = new QuicStreamByteSource(streams);
         this.preambles = new PreambleFilter();
         this.sendDriver = new SessionSendDriver(context, resources.profile(), resources.outbound(),
-                resources.outboundRanking(), this, ip, null, timing.clock, role == Role.CLIENT);
+                resources.outboundRanking(), this, ip, account, timing.clock, role == Role.CLIENT);
         // Submissions run on callers' threads; a close they trigger only stops the driver, and its charges are
         // returned by release() on the loop, serialized with polling and writes (13.12).
         sendDriver.releaseOnOwnerClose();
@@ -453,7 +479,7 @@ public final class NStreamSession implements MultistreamSession {
             SessionReceiveDriver.CloseSink closeSink = this::onReceiveClose;
             if (role == Role.SERVER) {
                 serverPump = new SessionReadPump(new ServerReadPartition(shards), resources.node(),
-                        resources.inboundExcess(), this, ip, null, limits, compressed, preambles,
+                        resources.inboundExcess(), this, ip, account, limits, compressed, preambles,
                         resources.inboundRanking(), resources.clock());
                 serverDriver = new ServerReceiveDriver(shards, serverPump, validator, routes, protocolNumber, proxy,
                         timing.clock, closeSink);
@@ -586,6 +612,31 @@ public final class NStreamSession implements MultistreamSession {
         return sendResolved(state, packetId, frame, uncompressedPacket, after);
     }
 
+    /**
+     * A level-creating or replacing packet (13.18): assigned as the GLOBAL epoch transition, which advances the
+     * sender's epoch right after it. Serverbound epochs never change (13.18), and the transition takes no
+     * explicit dependencies, so a call that names any, or comes from the client, fails closed (0x11).
+     */
+    private SentPacket sendEpochTransition(ProtocolState state, int packetId, byte[] frame, SentPacket... after) {
+        if (sendDirection == Direction.SERVERBOUND) {
+            refuse("packet " + packetId + " in " + state + " changes the serverbound epoch (13.18)");
+            return new SentPacket();
+        }
+        if (after != null && after.length > 0) {
+            refuse("epoch transition " + packetId + " in " + state + " names dependencies (13.18)");
+            return new SentPacket();
+        }
+        SentPacket handle;
+        try {
+            handle = sendDriver.submitEpochTransition(new OutboundPacket(frame));
+        } catch (RuntimeException e) {
+            refuse("epoch transition " + packetId + " in " + state + " was refused: " + e.getMessage());
+            return new SentPacket();
+        }
+        afterSubmit();
+        return handle;
+    }
+
     private SentPacket sendResolved(ProtocolState state, int packetId, byte[] frame, byte[] uncompressed,
             SentPacket... after) {
         if (state == null || frame == null || frame.length < 1) {
@@ -593,6 +644,10 @@ public final class NStreamSession implements MultistreamSession {
         }
         if (refused || closed) {
             return new SentPacket();
+        }
+        RouteV2 epochRoute = routes.routeFor(new RouteKey(protocolNumber, state, sendDirection, packetId));
+        if (epochRoute != null && epochRoute.epochChange) {
+            return sendEpochTransition(state, packetId, frame, after);
         }
         SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(routes, extractors, protocolNumber,
                 sendDirection, state, packetId, uncompressed);

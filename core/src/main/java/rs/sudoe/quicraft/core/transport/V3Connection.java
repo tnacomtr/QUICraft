@@ -94,6 +94,22 @@ public interface V3Connection extends QuicByteStream {
     void activate(LaneGame game, int protocolNumber, boolean compressed, ByteBuffer controlLeftover);
 
     /**
+     * As {@link #activate(LaneGame, int, boolean, ByteBuffer)}, with the 13.12 account key of the
+     * session's pool and ranking charges: the authenticated profile UUID as a String on an
+     * online-authenticated server connection, or {@code null} (offline, unauthenticated, clients).
+     * Additive: an implementation without account support fails closed.
+     */
+    default void activate(LaneGame game, int protocolNumber, boolean compressed, String account,
+            ByteBuffer controlLeftover) {
+        throw new UnsupportedOperationException("activation with an account key");
+    }
+
+    /** As {@link #activate(LaneGame, int, boolean, String, ByteBuffer)} for a client, whose table came from the dial. */
+    default void activate(LaneGame game, boolean compressed, String account, ByteBuffer controlLeftover) {
+        throw new UnsupportedOperationException("activation with an account key");
+    }
+
+    /**
      * The activated session, or null before {@link #activate} has run on the event loop. The game
      * sends, ends and aborts through it after activation (the N+2 session).
      */
