@@ -26,6 +26,7 @@ import net.minecraft.network.protocol.configuration.ServerboundFinishConfigurati
 import net.minecraft.server.Bootstrap;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.bridge.GameLanes;
 import rs.sudoe.quicraft.core.multistream.Envelope;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
@@ -159,6 +160,89 @@ class PacketLaneCodecTest {
                 ProtocolState.CONFIGURATION, (add, total) -> {
                     throw new IllegalStateException("over budget (13.12)");
                 }));
+        channel.finishAndReleaseAll();
+    }
+
+    /**
+     * The serverbound receive driver hands {@code decodeInflated} the packet id and body, already
+     * inflated (13.4). The production codec must answer it: the interface default is deliberately
+     * fail-closed, and before this method existed the first serverbound record closed 0x11.
+     */
+    @Test
+    void inflatedContentBecomesTheBarePacketWithoutCompression() throws Exception {
+        EmbeddedChannel channel = serverPipeline(-1);
+        PacketLaneCodec codec = new PacketLaneCodec(channel.pipeline(), REFLECTION);
+        byte[] packet = finishConfigurationPacket();
+        long[] charged = new long[1];
+        int[] total = new int[1];
+
+        // Through the interface: proves the production codec overrides the fail-closed default.
+        LaneGame.Decoded decoded = ((GameLanes.Codec) codec).decodeInflated(Unpooled.wrappedBuffer(packet),
+                ProtocolState.CONFIGURATION, (add, size) -> {
+                    charged[0] += add;
+                    total[0] = size;
+                });
+
+        assertEquals(ProtocolState.CONFIGURATION, decoded.state());
+        assertEquals(FrameCodec.packetId(packet), decoded.packetId());
+        assertEquals(Envelope.Bundle.NONE, decoded.bundle());
+        assertEquals(packet.length, charged[0], "the retained copy was charged before it existed");
+        assertEquals(packet.length, total[0]);
+        ByteBuf forPipeline = (ByteBuf) decoded.packet();
+        assertArrayEquals(packet, ByteBufUtil.getBytes(forPipeline));
+
+        channel.writeInbound(forPipeline);
+        assertInstanceOf(ServerboundFinishConfigurationPacket.class, channel.readInbound());
+        assertNull(channel.pipeline().get("decoder"), "the terminal packet swapped the decoder as on TCP");
+        channel.finishAndReleaseAll();
+    }
+
+    /**
+     * With compression on, inflated content still gets the stored (zero) frame the game's
+     * decompress handler takes, for a packet below and one above the threshold: the threshold is
+     * the peer's decision on the wire and does not survive into this already-inflated path.
+     */
+    @Test
+    void inflatedContentGetsAStoredFrameUnderCompressionForSmallAndLargePackets() throws Exception {
+        EmbeddedChannel channel = serverPipeline(64);
+        PacketLaneCodec codec = new PacketLaneCodec(channel.pipeline(), REFLECTION);
+        byte[] small = finishConfigurationPacket();
+        long[] charged = new long[1];
+        LaneGame.Decoded smallDecoded = codec.decodeInflated(Unpooled.wrappedBuffer(small),
+                ProtocolState.CONFIGURATION, (add, total) -> charged[0] += add);
+        assertEquals(small.length, charged[0]);
+        ByteBuf smallFrame = (ByteBuf) smallDecoded.packet();
+        assertEquals(0, smallFrame.getByte(0), "a stored (zero) compression header");
+        assertArrayEquals(small, ByteBufUtil.getBytes(smallFrame, 1, smallFrame.readableBytes() - 1));
+
+        // Above the threshold: the same stored form, never a bare packet the decompress handler
+        // would misread as a Data Length. Before the small frame reaches the pipeline, because its
+        // terminal packet swaps the decoder out.
+        byte[] large = new byte[3000];
+        large[0] = 3;
+        LaneGame.Decoded largeDecoded = codec.decodeInflated(Unpooled.wrappedBuffer(large),
+                ProtocolState.CONFIGURATION, (add, total) -> { });
+        ByteBuf largeFrame = (ByteBuf) largeDecoded.packet();
+        assertEquals(0, largeFrame.getByte(0), "stored even above the threshold");
+        assertEquals(large.length + 1, largeFrame.readableBytes());
+        assertArrayEquals(large, ByteBufUtil.getBytes(largeFrame, 1, largeFrame.readableBytes() - 1));
+
+        channel.writeInbound(smallFrame);
+        assertInstanceOf(ServerboundFinishConfigurationPacket.class, channel.readInbound());
+        channel.finishAndReleaseAll();
+    }
+
+    @Test
+    void anOverBudgetInflatedReservationStopsBeforeTheCopy() throws Exception {
+        EmbeddedChannel channel = serverPipeline(64);
+        PacketLaneCodec codec = new PacketLaneCodec(channel.pipeline(), REFLECTION);
+        byte[] packet = finishConfigurationPacket();
+
+        assertThrows(IllegalStateException.class, () -> codec.decodeInflated(Unpooled.wrappedBuffer(packet),
+                ProtocolState.CONFIGURATION, (add, total) -> {
+                    throw new IllegalStateException("over budget (13.12)");
+                }));
+        assertNotNull(channel.pipeline().get("decoder"), "nothing reached the pipeline");
         channel.finishAndReleaseAll();
     }
 

@@ -130,6 +130,37 @@ public final class PacketLaneCodec implements GameLanes.Codec {
     }
 
     /**
+     * Decodes one serverbound GAME record whose content the receive pump already inflated: the
+     * packet id and body with no Minecraft length or compression wrapper (13.4). It is the tail of
+     * {@link #decode} after {@code FrameCodec.decode}: the same id read, the same stored frame for
+     * the game's decompress handler, and the same reservation before the retained copy exists. The
+     * pre-U8g three-lane path reached this point by calling {@link #decode} with a whole frame, so
+     * no earlier codec implementation of this method exists to mirror; {@code da3e475} introduced
+     * the distinct serverbound contract with a fail-closed default.
+     */
+    @Override
+    public LaneGame.Decoded decodeInflated(ByteBuf content, ProtocolState state,
+            LaneGame.Reservation reservation) throws Exception {
+        PacketDecoder<?> decoder = (PacketDecoder<?>) pipeline.get(DECODER);
+        if (decoder == null) {
+            throw new IllegalStateException("no inbound protocol is configured (13.16)");
+        }
+        ProtocolInfo<?> info = access.decoderProtocol(decoder);
+        byte[] packet = ByteBufUtil.getBytes(content);
+        // 13.12: charge the retained packet copy before it exists; the pump already inflated the
+        // record under its own budget, so only these bytes are new.
+        reservation.reserve(packet.length, packet.length);
+        int id = FrameCodec.packetId(packet);
+        decodedSizes.accept(packet.length);
+        boolean compressed = pipeline.get(DECOMPRESS) instanceof CompressionDecoder;
+        ByteBuf forPipeline = compressed
+                ? Unpooled.wrappedBuffer(FrameCodec.varInt(0), packet)
+                : Unpooled.wrappedBuffer(packet);
+        return new LaneGame.Decoded(forPipeline, stateOf(info.id()), id, Envelope.Bundle.NONE, false,
+                packet.length, packet.length);
+    }
+
+    /**
      * The GAME record body for one packet the game's encoder wrote (its id VarInt and payload): the
      * frame its compression handler and length prepender would have produced, without encryption.
      */
