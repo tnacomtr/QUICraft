@@ -338,6 +338,7 @@ class SessionSendDriverTest {
         SessionSendDriver driver = rig.driver;
         assertTrue(driver.createAck(7, frame(2).frame(), 100));
         assertTrue(driver.coverPending(7, 42));
+        driver.sealAckCoverage(7);
         assertNull(driver.takeAck(7), "an ack waits for its covered update");
 
         // Unrelated submissions are never blocked by the pending ack.
@@ -357,6 +358,7 @@ class SessionSendDriverTest {
         for (int id = 100; id < 100 + 128; id++) {
             assertTrue(driver.createAck(id, frame(1).frame(), 1), "entry " + id);
             assertTrue(driver.coverPending(id, 10_000 + id), "keep ack " + id + " unresolved");
+            driver.sealAckCoverage(id);
         }
         assertFalse(driver.createAck(999, frame(1).frame(), 1), "entry limit is 128 pending acks");
 
@@ -371,6 +373,7 @@ class SessionSendDriverTest {
         // Transition settlement: a complete ack is sequenced in the old epoch before the transition.
         int beforeAck = driver.queuedRecords();
         assertTrue(driver.createAck(5000, frame(1).frame(), 10));
+        driver.sealAckCoverage(5000);
         driver.submitEpochTransition(frame(2));
         assertEquals(beforeAck + 2, driver.queuedRecords(), "the complete ack joins before the transition");
         assertFalse(driver.isClosed());
@@ -677,6 +680,7 @@ class SessionSendDriverTest {
         assertTrue(driver.createAck(1, frame(2).frame(), 16));
         assertEquals(16 + TEST_SLICE, pool.reserved(owner), "the ack is charged at creation");
         assertTrue(driver.coverPending(1, 42));
+        driver.sealAckCoverage(1);
         assertFalse(driver.createAck(2, frame(2).frame(), 16),
                 "a second precharged ack would starve the covered update, so the producer pauses");
 
@@ -789,6 +793,7 @@ class SessionSendDriverTest {
         SessionSendDriver driver = rig.driver;
         assertTrue(driver.createAck(7, frame(2).frame(), 100));
         assertTrue(driver.coverPending(7, 42));
+        driver.sealAckCoverage(7);
         SentPacket covered = driver.submit(frame(2), StreamSequencer.Fence.CHUNK, 0, 0);
         assertTrue(covered.isAssigned());
         driver.assignedPending(42, covered);

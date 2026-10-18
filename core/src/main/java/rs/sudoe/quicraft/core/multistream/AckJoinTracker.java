@@ -264,8 +264,9 @@ public final class AckJoinTracker {
      * takes conservatively. An inexact ack uses {@code safeSuperset} (see
      * {@link StreamSequencer#safeSupersetDependencies()}).
      *
-     * <p>Scope coverage gates resolution (U1, 13.19): if any scopes cover this ack, coverage must be
-     * sealed and every covering scope complete. Empty scope membership alone never establishes readiness.
+     * <p>Scope coverage gates resolution (U1, 13.19): the ack's membership must be sealed, even when
+     * no scope covers it, and every covering scope must be complete. Empty scope membership alone
+     * never establishes readiness.
      */
     public synchronized Ready take(long id, long nowNanos, long controlFrontier,
             Record.Dependency[] safeSuperset) {
@@ -302,8 +303,9 @@ public final class AckJoinTracker {
      * state and epoch. The others are dropped and counted. Every entry is removed; nothing carries
      * across the transition.
      *
-     * <p>Scope coverage is checked at the same gate (U1, 13.19): only acks whose covering scopes are
-     * sealed and complete resolve; others are dropped. All scope state is cleared here.
+     * <p>Scope coverage is checked at the same gate (U1, 13.19): only acks whose membership is
+     * sealed and whose covering scopes are complete resolve; others are dropped. All scope state is
+     * cleared here.
      */
     public synchronized List<Ready> settleForTransition(long controlFrontier, Record.Dependency[] safeSuperset) {
         List<Ready> ready = new ArrayList<Ready>();
@@ -555,21 +557,21 @@ public final class AckJoinTracker {
     }
 
     /**
-     * True when an ack's scope coverage, if any, is ready: sealed and every covering scope
-     * complete (U1, 13.19). No-scope acks are always ready at this check.
+     * True when an ack's membership is sealed and every covering scope is complete (U1, 13.19).
+     * Sealing is required even when no scope covers the ack: empty membership alone never
+     * establishes readiness.
      */
     private boolean isScopeReady(long ackId) {
-        Set<Long> scopeIds = ackScopes.get(ackId);
-        if (scopeIds == null || scopeIds.isEmpty()) {
-            return true;
-        }
         if (!sealedAcks.contains(ackId)) {
             return false;
         }
-        for (Long scopeId : scopeIds) {
-            Scope scope = scopes.get(scopeId);
-            if (scope == null || !scope.complete) {
-                return false;
+        Set<Long> scopeIds = ackScopes.get(ackId);
+        if (scopeIds != null) {
+            for (Long scopeId : scopeIds) {
+                Scope scope = scopes.get(scopeId);
+                if (scope == null || !scope.complete) {
+                    return false;
+                }
             }
         }
         return true;

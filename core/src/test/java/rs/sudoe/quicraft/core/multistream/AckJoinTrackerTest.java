@@ -36,6 +36,7 @@ class AckJoinTrackerTest {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 10, 100));
         acks.coverPending(1, 100L);
+        acks.sealAckCoverage(1);
         assertNull(acks.take(1, 101, 3, null), "unassigned coverage must hold the ack");
         assertEquals(1, acks.pendingCount());
         acks.assignedPending(100L, 2, 7);
@@ -54,6 +55,7 @@ class AckJoinTrackerTest {
         acks.coverAssigned(2, 3, 2);
         acks.coverPending(2, 200L);
         acks.suppressPending(200L);
+        acks.sealAckCoverage(2);
         AckJoinTracker.Ready ready = acks.take(2, 1, 0, null);
         assertNotNull(ready, "suppressed coverage must not be awaited");
         assertEquals(expect(3, 4), pairs(ready.dependencies()));
@@ -65,6 +67,7 @@ class AckJoinTrackerTest {
         // The game emits the ack first; the covered update U follows a view gate V in the game order.
         assertTrue(acks.create(9, 16, 0));
         acks.coverPending(9, 5L);
+        acks.sealAckCoverage(9);
         assertNull(acks.take(9, 1, 0, null));
         Record view = sequencer.assign(0, StreamSequencer.Fence.VIEW, NONE, false);
         Record update = sequencer.assign(2, StreamSequencer.Fence.CHUNK, NONE, false);
@@ -84,6 +87,7 @@ class AckJoinTrackerTest {
         }
         assertFalse(acks.create(129, 1, 0), "129th pending ack must be refused");
         assertEquals(AckJoinTracker.MAX_ENTRIES, acks.pendingCount());
+        acks.sealAckCoverage(1);
         assertNotNull(acks.take(1, 1, 0, null));
         assertTrue(acks.create(129, 1, 0), "a released slot is reusable");
 
@@ -97,6 +101,7 @@ class AckJoinTrackerTest {
         AckJoinTracker acks = new AckJoinTracker();
         acks.create(1, 10, 100);
         acks.coverPending(1, 9L);
+        acks.sealAckCoverage(1);
         long deadline = 100 + AckJoinTracker.DEADLINE_NANOS;
         assertNull(acks.take(1, deadline - 1, 0, null));
         assertEquals(1, acks.pendingCount());
@@ -107,6 +112,7 @@ class AckJoinTrackerTest {
         acks.assignedPending(9L, 2, 1);
 
         acks.create(2, 4, 0);
+        acks.sealAckCoverage(2);
         assertEquals(0, acks.expire(AckJoinTracker.DEADLINE_NANOS - 1, 0, null).size());
         assertEquals(1, acks.expire(AckJoinTracker.DEADLINE_NANOS, 0, null).size(),
                 "the fully covered ack resolves at its deadline instead of being dropped");
@@ -121,6 +127,8 @@ class AckJoinTrackerTest {
         acks.assignedPending(50L, 3, 6);
         acks.create(2, 4, 100);
         acks.coverPending(2, 51L);
+        acks.sealAckCoverage(1);
+        acks.sealAckCoverage(2);
         long deadline = 100 + AckJoinTracker.DEADLINE_NANOS;
         List<AckJoinTracker.Ready> ready = acks.expire(deadline, 4, null);
         assertEquals(1, ready.size(), "the complete ack is resolved at the deadline");
@@ -136,6 +144,7 @@ class AckJoinTrackerTest {
         acks.create(7, 4, 0);
         acks.coverPending(7, 70L);
         acks.assignedPending(70L, 2, 9);
+        acks.sealAckCoverage(7);
         AckJoinTracker.Ready ready = acks.take(7, AckJoinTracker.DEADLINE_NANOS, 0, null);
         assertNotNull(ready, "complete coverage is not discarded by the deadline");
         assertEquals(0, acks.droppedCount());
@@ -160,6 +169,7 @@ class AckJoinTrackerTest {
         assertEquals(1, update.sequence());
         acks.assignedPending(1L, 2, update.sequence());
         // Releasing one ack (its covered updates are now assigned) lets the producer resume.
+        acks.sealAckCoverage(1);
         assertNotNull(acks.take(1, 1, 0, null));
         assertTrue(acks.create(refused, 1, 0), "the producer resumes after a release");
     }
@@ -173,6 +183,9 @@ class AckJoinTrackerTest {
         acks.markInexact(3);
         acks.coverPending(3, 78L);
         acks.assignedPending(78L, 2, 5);
+        acks.sealAckCoverage(1);
+        acks.sealAckCoverage(2);
+        acks.sealAckCoverage(3);
         Record.Dependency[] superset = new Record.Dependency[] {
             new Record.Dependency(0, 1), new Record.Dependency(2, 5)};
         List<AckJoinTracker.Ready> settled = acks.settleForTransition(2, superset);
@@ -193,6 +206,7 @@ class AckJoinTrackerTest {
         AckJoinTracker acks = new AckJoinTracker();
         acks.create(4, 1, 0);
         acks.markInexact(4);
+        acks.sealAckCoverage(4);
         assertThrows(IllegalArgumentException.class, () -> acks.take(4, 0, 0, null));
     }
 
@@ -202,6 +216,7 @@ class AckJoinTrackerTest {
         AckJoinTracker acks = new AckJoinTracker();
         assertTrue(acks.create(1, 4, origin));
         acks.coverPending(1, 10L);
+        acks.sealAckCoverage(1);
         assertNull(acks.take(1, origin + AckJoinTracker.DEADLINE_NANOS - 1, 0, null));
         assertEquals(1, acks.pendingCount(), "not yet at the deadline");
         assertNull(acks.take(1, origin + AckJoinTracker.DEADLINE_NANOS, 0, null));
@@ -210,6 +225,7 @@ class AckJoinTrackerTest {
         assertEquals(0, acks.pendingBytes());
 
         assertTrue(acks.create(2, 4, origin));
+        acks.sealAckCoverage(2);
         assertNotNull(acks.take(2, origin, 0, null), "a complete ack resolves at once");
     }
 
@@ -219,6 +235,7 @@ class AckJoinTrackerTest {
         assertTrue(acks.coverPending(1, 5L), "first cover is recorded");
         assertFalse(acks.coverPending(1, 5L), "duplicate cover is not recorded twice");
         acks.assignedPending(5L, 2, 3);
+        acks.sealAckCoverage(1);
         assertNotNull(acks.take(1, 0, 0, null));
     }
 
