@@ -5,6 +5,9 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "CausalConnectionMixin",
+    "CausalPlayerListMixin",
+    "CausalPrepareSpawnMixin",
+    "CausalReadyMixin",
     "CipherBaseAccessor",
     "CipherDecoderAccessor",
     "CompressionDecoderAccessor",
