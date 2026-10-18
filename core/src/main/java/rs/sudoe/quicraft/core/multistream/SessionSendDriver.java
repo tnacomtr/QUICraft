@@ -200,7 +200,7 @@ public final class SessionSendDriver {
     private final SessionResources.Accounting accounting;
     private final StreamSequencer sequencer;
     private final SendScheduler scheduler;
-    private final AckJoinTracker acks = new AckJoinTracker();
+    private final AckJoinTracker acks;
     private final BatchJoinTracker batches = new BatchJoinTracker();
     private final Map<Long, PendingAck> pendingAcks = new HashMap<Long, PendingAck>();
     private final ArrayDeque<Charge> toOffer = new ArrayDeque<Charge>();
@@ -232,6 +232,8 @@ public final class SessionSendDriver {
     /** True when a close decided inside the driver waits for the owner's {@link #close()} to release charges. */
     private boolean deferRelease;
     private int closeCode;
+    /** The typed local failure that caused a 0x12 close, kept for diagnostics; null for other closes. */
+    private Throwable closeCause;
 
     /**
      * Creates the sender for one connection direction and registers the connection with the ranking.
@@ -346,6 +348,7 @@ public final class SessionSendDriver {
         this.account = account;
         this.clock = clock;
         this.accounting = accounting;
+        this.acks = new AckJoinTracker(context.logicalStreamCount());
         this.sequencer = new StreamSequencer(context.shardCount(), serverbound);
         this.scheduler = new SendScheduler(profile);
         boolean registered = false;
@@ -698,6 +701,108 @@ public final class SessionSendDriver {
         return handle;
     }
 
+    // --- Causal-scope driver operations (U1, 13.19) ---
+    // These delegate to the tracker. The matching MultistreamSession defaults throw; NStreamSession
+    // wiring (translating handles at the session boundary) is deferred to a later phase.
+
+    /** Opens a causal scope, returning its opaque handle. No send-path integration (U1). */
+    public synchronized MultistreamSession.CausalScope openScope() {
+        if (closed || sealed) {
+            return null;
+        }
+        try {
+            return acks.openScope();
+        } catch (AckJoinTracker.CapacityException failure) {
+            capacityFailure(failure);
+            return null;
+        }
+    }
+
+    /** Registers an update token in the scope, returning its opaque handle. No send-path integration (U1). */
+    public synchronized MultistreamSession.UpdateToken registerUpdate(MultistreamSession.CausalScope scope) {
+        if (closed || sealed) {
+            return null;
+        }
+        try {
+            return acks.registerUpdate(scope);
+        } catch (AckJoinTracker.CapacityException failure) {
+            capacityFailure(failure);
+            return null;
+        }
+    }
+
+    /** Resolves a token by assignment, merging its frontier into the covering scope(s). */
+    public synchronized void assignScopeToken(MultistreamSession.UpdateToken token, int stream, long sequence) {
+        if (closed || sealed) {
+            return;
+        }
+        acks.assignScopeToken(token, stream, sequence);
+    }
+
+    /** Suppresses a token: never assigned, no frontier. */
+    public synchronized void suppressUpdate(MultistreamSession.UpdateToken token) {
+        if (closed || sealed) {
+            return;
+        }
+        acks.suppressScopeToken(token);
+    }
+
+    /** Completes a scope: the producer's explicit completeness event. */
+    public synchronized void completeScope(MultistreamSession.CausalScope scope) {
+        if (closed || sealed) {
+            return;
+        }
+        acks.completeScope(scope);
+    }
+
+    /** Registers a scope as covering an ack. */
+    public synchronized void coverScope(long ackId, MultistreamSession.CausalScope scope) {
+        if (closed || sealed) {
+            return;
+        }
+        try {
+            acks.coverScope(ackId, scope);
+        } catch (AckJoinTracker.CapacityException failure) {
+            capacityFailure(failure);
+        }
+    }
+
+    /** Seals an ack's coverage membership: no more covering scopes will arise. */
+    public synchronized void sealAckCoverage(long ackId) {
+        if (closed || sealed) {
+            return;
+        }
+        acks.sealAckCoverage(ackId);
+    }
+
+    /** Live causal scopes retained by the tracker, for tests and diagnostics (U1, 13.19). */
+    public synchronized int trackerScopeCount() {
+        return acks.scopeCount();
+    }
+
+    /** Unresolved update tokens retained by the tracker, for tests and diagnostics (U1, 13.19). */
+    public synchronized int trackerRetainedTokens() {
+        return acks.retainedTokenCount();
+    }
+
+    /**
+     * The typed local failure that caused a 0x12 close, or null. Keeps the cause of a capacity
+     * failure observable; it is never a peer classification and never enters a failure cache.
+     */
+    public synchronized Throwable closeCause() {
+        return closeCause;
+    }
+
+    /**
+     * Maps a typed causal-scope capacity failure to a local resource close (0x12), keeping the
+     * cause for diagnostics. U1 has no adapter wiring yet; U2 completes the send-path integration
+     * and the per-call handling at the session boundary.
+     */
+    private void capacityFailure(AckJoinTracker.CapacityException failure) {
+        closeCause = failure;
+        closeWith(CLOSE_RESOURCE);
+    }
+
     /**
      * Assigns one bundle as one CONTROL run (13.15): the opening delimiter as a kind 4 record, every
      * member, then the closing delimiter. A bundle over 126 members or over B closes 0x11 locally and
@@ -840,6 +945,7 @@ public final class SessionSendDriver {
         realtimeOrder.clear();
         orphans.clear();
         pendingAcks.clear();
+        acks.closeScopes();
         disconnectRanking();
     }
 
