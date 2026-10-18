@@ -8,7 +8,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.net.InetAddress;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.time.StallClock;
 
@@ -555,6 +557,131 @@ class PressureRankingTest {
     @Test void cumulativeRankingRejectsANullSource() {
         assertThrows(IllegalArgumentException.class, () -> new PressureRanking((StallClock) null));
         assertThrows(IllegalArgumentException.class, () -> new PressureRanking(60_000, 10, 10, SECRET, null));
+    }
+
+    @Test void rejectedCumulativeOperationsDecideBeforeReadingAndKeepTheValidationPair() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 10, 10, SECRET, source);
+        ranking.connect("c", ip("192.0.2.240"), null);
+        ranking.setRetained("c", 100);
+        int accepted = source.samples;
+
+        source.set(100 * S, 0);
+        assertThrows(IllegalStateException.class, () -> ranking.connect("c", ip("192.0.2.241"), null),
+                "a duplicate registration is decided before the sample");
+        assertThrows(ArrayIndexOutOfBoundsException.class, () -> ranking.bucketScore(-1), "a bucket below zero");
+        assertThrows(ArrayIndexOutOfBoundsException.class, () -> ranking.bucketScore(PrefixKey.OVERFLOW_BUCKETS),
+                "a bucket at the exclusive bound");
+        assertThrows(ArrayIndexOutOfBoundsException.class, () -> ranking.bucketScore(10_000), "a bucket far out of range");
+        assertThrows(IllegalArgumentException.class, () -> ranking.setRetained("c", -1), "negative bytes");
+        assertThrows(IllegalStateException.class, () -> ranking.setRetained("nobody", 1), "an unknown owner");
+        assertThrows(IllegalStateException.class, () -> ranking.progress("nobody", 1), "an unknown owner");
+        assertThrows(IllegalStateException.class, () -> ranking.beginRefusedWait("nobody"), "an unknown owner");
+        assertEquals(accepted, source.samples, "every rejection is decided before the source is read");
+
+        source.set(10 * S, 0);
+        assertEquals(1, ranking.exactIpCount(), "the rejected operations registered nothing");
+        ranking.setRetained("c", 200);
+        source.set(20 * S, 0);
+        assertEquals(3000.0, ranking.score("c"), 0.05,
+                "the earlier-but-still-valid reading was not poisoned by the rejected later samples");
+    }
+
+    @Test void malformedSamplesAreRejectedByEveryOperationWithoutAdvancingThePair() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 10, 10, SECRET, source);
+        ranking.connect("c", ip("192.0.2.242"), null);
+        ranking.setRetained("c", 100);
+        int accepted = source.samples;
+
+        List<Runnable> operations = new ArrayList<Runnable>();
+        InetAddress other = ip("192.0.2.242");
+        operations.add(() -> ranking.score("c"));
+        operations.add(() -> ranking.setRetained("c", 50));
+        operations.add(() -> ranking.progress("c", 10));
+        operations.add(() -> ranking.connect("d", other, null));
+        operations.add(() -> ranking.beginRefusedWait("c"));
+        operations.add(() -> ranking.bucketScore(0));
+        operations.add(() -> ranking.disconnect("c"));
+
+        long pair = 0;
+        long attempt = 10 * S;
+        for (Runnable operation : operations) {
+            source.set(attempt, -S);
+            assertThrows(StallClock.UnavailableException.class, operation::run, "a backwards cumulative counter");
+            long verified = attempt - S;
+            source.set(verified, 0);
+            ranking.score("c");
+            pair = verified;
+            attempt += 10 * S;
+        }
+        for (Runnable operation : operations) {
+            long verified = attempt - S;
+            source.set(attempt, attempt - pair + S);
+            assertThrows(StallClock.UnavailableException.class, operation::run, "an excluded delta above the elapsed delta");
+            source.set(verified, 0);
+            ranking.score("c");
+            pair = verified;
+            attempt += 10 * S;
+        }
+        assertEquals(accepted + 4 * operations.size(), source.samples,
+                "each rejected attempt and each verifying reading took exactly one sample");
+
+        source.set(attempt, 0);
+        assertEquals(15000.0, ranking.score("c"), 2.0, "the still-registered owner keeps its charge and window");
+        assertEquals(1, ranking.exactIpCount(), "the rejected connect registered nothing");
+        assertThrows(IllegalStateException.class, () -> ranking.setRetained("d", 1), "the rejected connect left no owner");
+        assertFalse(ranking.inRefusedWait("c"), "the rejected refused wait started nothing");
+        assertEquals(0, ranking.bucketBytes(0), "the rejected bucket score charged nothing");
+    }
+
+    @Test void malformedCleanupKeepsTheOwnerAndItsCharge() throws Exception {
+        Source source = new Source();
+        PressureRanking ranking = new PressureRanking(1_000_000_000L, 1, 10, SECRET, source);
+        ranking.connect("holder", ip("192.0.2.243"), null);
+        InetAddress guest = ip("192.0.2.244");
+        int bucket = ranking.bucketFor(guest);
+        ranking.connect("guest", guest, null);
+        ranking.setRetained("guest", 100);
+        assertEquals(1, ranking.liveIdentities(bucket));
+        assertEquals(100, ranking.bucketBytes(bucket));
+        int accepted = source.samples;
+
+        source.set(10 * S, -S);
+        assertThrows(StallClock.UnavailableException.class, () -> ranking.disconnect("guest"),
+                "a malformed reading never releases a known owner");
+        assertEquals(accepted + 1, source.samples, "the cleanup took its one reading");
+        assertEquals(1, ranking.liveIdentities(bucket), "the owner is still registered");
+        assertEquals(100, ranking.bucketBytes(bucket), "its charge is untouched");
+
+        source.set(10 * S, 0);
+        ranking.setRetained("guest", 150);
+        assertEquals(150, ranking.bucketBytes(bucket), "the owner still accepts accounting");
+        source.set(11 * S, 0);
+        ranking.disconnect("guest");
+        assertEquals(0, ranking.liveIdentities(bucket), "a coherent cleanup still succeeds");
+        assertEquals(0, ranking.bucketBytes(bucket));
+    }
+
+    @Test void cumulativeSamplesAcceptSignedWrapOfClockAndCounter() throws Exception {
+        Source wrappedSource = new Source();
+        PressureRanking wrapped = new PressureRanking(1_000_000_000L, 10, 10, SECRET, wrappedSource);
+        long origin = Long.MAX_VALUE - 3 * S;
+        wrappedSource.set(origin, Long.MAX_VALUE - S);
+        wrapped.connect("c", ip("192.0.2.245"), null);
+        wrapped.setRetained("c", 100);
+        wrappedSource.set(origin + 6 * S, Long.MAX_VALUE - S + 5 * S);
+        assertTrue(wrappedSource.nowNanos < 0, "the timestamp wrapped past Long.MAX_VALUE");
+        assertTrue(wrappedSource.excludedNanos < 0, "the cumulative counter wrapped past Long.MAX_VALUE");
+        assertEquals(100.0, wrapped.score("c"), 0.05, "6 s elapsed with 5 s excluded leaves one effective second");
+
+        Source negativeSource = new Source();
+        PressureRanking negative = new PressureRanking(1_000_000_000L, 10, 10, SECRET, negativeSource);
+        negativeSource.set(-20 * S, -3 * S);
+        negative.connect("c", ip("192.0.2.246"), null);
+        negative.setRetained("c", 100);
+        negativeSource.set(-8 * S, -S);
+        assertEquals(1000.0, negative.score("c"), 0.05, "12 s elapsed with 2 s excluded leaves ten effective seconds");
     }
 
     /** Deterministic cumulative source: one scripted reading per {@link #sample()} call. */

@@ -193,13 +193,16 @@ public final class PressureRanking {
 
     /**
      * Starts a connection's statistics from one cumulative reading of the stall source. Identity
-     * histories persist across reconnects; only the connection-local statistics restart (13.12).
+     * histories persist across reconnects; only the connection-local statistics restart (13.12). A
+     * duplicate or null argument is rejected before the reading, so a refused call leaves both the
+     * validation pair and the accounting untouched.
      *
      * @param account authenticated account name, or {@code null} in offline mode or before authentication
      */
     public synchronized void connect(Object connection, InetAddress ip, String account) {
         requireCumulative("connect(Object, InetAddress, String)");
         if (connection == null || ip == null) throw new IllegalArgumentException("identity");
+        if (connections.containsKey(connection)) throw new IllegalStateException("connection already registered");
         StallClock.Sample sample = takeSample();
         connectInternal(connection, ip, account, sample.nowNanos(), sample.excludedNanos());
     }
@@ -466,12 +469,24 @@ public final class PressureRanking {
     /** Decayed score of an overflow bucket from one cumulative reading. */
     public synchronized double bucketScore(int bucket) {
         requireCumulative("bucketScore(int)");
+        requireBucket(bucket);
         StallClock.Sample sample = takeSample();
         return bucketScoreInternal(bucket, sample.nowNanos(), sample.excludedNanos());
     }
 
     private double bucketScoreInternal(int bucket, long nowNanos, long eff) {
         return buckets[bucket] == null ? 0 : buckets[bucket].score(nowNanos, eff, 0);
+    }
+
+    /**
+     * Rejects a bucket index outside the keyed bucket array before any reading is taken, with the same
+     * exception type the out-of-range array access would raise, so a refused call cannot advance the
+     * validation pair.
+     */
+    private static void requireBucket(int bucket) {
+        if (bucket < 0 || bucket >= OVERFLOW) {
+            throw new ArrayIndexOutOfBoundsException(bucket);
+        }
     }
 
     /**
