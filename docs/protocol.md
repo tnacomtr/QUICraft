@@ -1327,6 +1327,45 @@ before this revision can run.
    ids are pinned to the live game by `RoutingTableGameTest`, and route ordering by
    `ShippedRoutingOrderingTest`.
 
+   Reviewed extractor identifiers and the real 26.1.2 packets each one serves. The layout is
+   read from the id plus body bytes of an uncompressed packet, in the order named. The samples
+   are checked in at
+   `core/src/test/resources/rs/sudoe/quicraft/core/routing/captured-775-vectors.txt`: one line
+   per sample, each with the live packet name, the live packet id and the position or list the
+   game itself reported for exactly those bytes. `CapturedExtractorVectorTest` re-derives every
+   one of those rows from the checked-in file. The capture ran on the live client, between
+   decompression and the game's packet decoder, over TCP so the frames are the vanilla
+   pipeline's, at both coordinate signs (spawn and a far teleport into chunks around x=-800,
+   z=-1200); the regeneration command is below the table.
+
+   | Identifier | Layout after the packet id | Real 775 packet(s) | Route(s) that may use it | Captured |
+   | --- | --- | --- | --- | --- |
+   | `mc775.chunk_xz.v1` | big-endian int32 chunk x, int32 chunk z | `level_chunk_with_light` | CHUNK/lane install (13.8) | `level_chunk_with_light` |
+   | `mc775.block_position.v1` | packed BlockPos long: x in bits 38..63, z in 12..37, y in 0..11 (unread); chunk = `x/16`, `z/16` floor | `block_update`, `block_entity_data` | CHUNK/lane block and block-entity update (13.8) | `block_update`, `block_entity_data` |
+   | `mc775.section_position.v1` | packed SectionPos long: x in bits 42..63, z in 20..41, y in 0..19 (unread); already chunk coordinates | `section_blocks_update` | CHUNK/lane section update (13.8) | `section_blocks_update` |
+   | `mc775.chunk_list.v1` | VarInt count, then per entry a packed ChunkPos long (x low 32 bits, z high 32), a VarInt payload length and that many payload bytes | `chunks_biomes` | CONTROL/global only (13.8) | `chunks_biomes` |
+   | `mc775.join.v1` | the packet id alone; the body is never read | `chunk_batch_finished`, `block_changed_ack` | chunk join (13.19) | `chunk_batch_finished`, `block_changed_ack` |
+
+   Two 13.8 CHUNK-set packets have no reviewed layout here, so at `/3` they stay CONTROL/global
+   and are deliberately not shard-routable until a follow-up unit captures and reviews a layout
+   for them:
+   - `forget_level_chunk`: its packed position was not reviewed by this unit.
+   - `light_update`: the `varint_xz` layout was dropped from the production set (addendum A4).
+     Every light-changing play edit tried on the live 26.1.2 client (a surface block break, a
+     stone roof over a whole area, a torch and glowstone) produced no light update packet at all,
+     so naming `varint_xz` for it would be an assumption. The layout itself stays reachable as
+     the synthetic `primitive.varint_xz.v1` for the oracle. `set_chunk_cache_center` is the one
+     packet observed with leading VarInt x/z, but it is a view packet, not a CHUNK-lane one, so
+     it does not justify a production identifier for that layout.
+   Every other 13.8 CHUNK-set packet is in the table above.
+
+   Regenerate the checked-in vectors with (runs the whole client gametest suite, protocol 775):
+
+   ```sh
+   xvfb-run -a ./gradlew :fabric-26x:runClientGameTest \
+     -Pquicraft.emitExtractorVectors=core/src/test/resources/rs/sudoe/quicraft/core/routing/captured-775-vectors.txt
+   ```
+
 8. **13.8 Explicit game invariants (26.1.2, protocol 775).** Chunk install, block_update,
    section_blocks_update, block_entity_data, light_update and forget_level_chunk use the
    position's CHUNK shard, in original order: install, updates, forget. Never move an update
