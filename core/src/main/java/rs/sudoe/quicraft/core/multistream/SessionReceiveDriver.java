@@ -15,6 +15,7 @@ import rs.sudoe.quicraft.core.routing.Extractor;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.RouteKey;
 import rs.sudoe.quicraft.core.routing.RouteV2;
+import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
 import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
@@ -554,16 +555,28 @@ public final class SessionReceiveDriver {
                 break;
         }
         Extractor.Position position = null;
+        boolean join = v2.dependency == Dependency.ACK_JOIN || v2.dependency == Dependency.BATCH_JOIN;
         if (routeLane == ReceiveRoute.Lane.CHUNK) {
             Extractor extractor = v2.extractor == null ? null : extractors.get(v2.extractor);
             if (extractor == null || decoded.uncompressed() == null) return null;
-            try {
-                position = extractor.extract(decoded.uncompressed());
-            } catch (RuntimeException e) {
-                return null;
+            if (join) {
+                // A join is positionless (13.19): decode its marker through the registry path; its kind must agree.
+                if (!(extractor instanceof ExtractorRegistry.Decoder)) return null;
+                ExtractorRegistry.Decoder decoder = (ExtractorRegistry.Decoder) extractor;
+                if (decoder.kind != ExtractorRegistry.Kind.JOIN) return null;
+                try {
+                    if (decoder.decode(decoded.uncompressed()).kind != ExtractorRegistry.Kind.JOIN) return null;
+                } catch (RuntimeException e) {
+                    return null;
+                }
+            } else {
+                try {
+                    position = extractor.extract(decoded.uncompressed());
+                } catch (RuntimeException e) {
+                    return null;
+                }
             }
         }
-        boolean join = v2.dependency == Dependency.ACK_JOIN || v2.dependency == Dependency.BATCH_JOIN;
         return new ReceiveRoute(routeLane, v2.dependency, position, v2.epochChange, join);
     }
 

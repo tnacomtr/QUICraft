@@ -9,9 +9,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
+import io.netty.handler.codec.quic.QuicChannel;
 import io.netty.handler.codec.quic.QuicStreamChannel;
+import io.netty.handler.codec.quic.QuicStreamType;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -169,6 +172,97 @@ class NStreamSessionLoopbackTest {
             assertEquals(CLOSE_ORDERING, (int) rig.net.clientSawClose.get(15, TimeUnit.SECONDS));
             assertEquals(0, rig.clientGame.count(NRig.JOIN_ID));
         }
+    }
+
+    /**
+     * A peer's real ACK_JOIN on CHUNK[0] (13.19) is routed without a position, delivered and applied. The join
+     * extractor is decoded, not mistaken for a chunk position; a missing route would close 0x11 instead.
+     */
+    @Test
+    void aRealAckJoinOnChunk0IsDeliveredAndApplied() throws Exception {
+        NRig.Config config = new NRig.Config();
+        config.shards = 2;
+        config.serverSession = false; // a raw peer writes the join: the client receive path is under test
+        try (NRig rig = NRig.start(config)) {
+            rig.activateClient();
+            QuicStreamChannel chunk0 = rawServerStream(rig, 2);
+            rawServerStream(rig, 3); // the idle shard, so every expected peer preamble is present
+            LaneLoopback.write(chunk0, joinWireFromPeer());
+            assertTrue(SessionRigSupport.await(() -> rig.clientGame.count(NRig.JOIN_ID) == 1, 10_000),
+                    () -> "join delivered: " + rig.clientGame.units() + " " + rig.clientGame.closed.getNow(null));
+            NRig.Got got = rig.clientGame.units().get(0);
+            assertEquals(2, got.stream, "the join arrives on CHUNK[0]");
+            assertTrue(SessionRigSupport.await(() -> {
+                try {
+                    return NRig.onLoop(rig.client, () -> appliedWatermark(rig.client, 2)) == 1L;
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            }, 10_000), "the join is applied through the driver, not merely decoded");
+            assertFalse(rig.clientGame.closed.isDone(),
+                    () -> "no 0x11: " + rig.clientGame.closed.getNow(null));
+            assertEquals(0, rig.clientGame.count(NRig.CHUNK_ID), "a join is not a chunk packet");
+        }
+    }
+
+    /** Ordinary CHUNK routing still extracts the real position and delivers on the matching shard stream. */
+    @Test
+    void ordinaryChunkExtractionStillRoutesToItsShard() throws Exception {
+        NRig.Config config = new NRig.Config();
+        config.shards = 2;
+        config.serverSession = false; // a raw peer writes the chunk: the client receive path is under test
+        try (NRig rig = NRig.start(config)) {
+            rig.activateClient();
+            QuicStreamChannel chunk0 = rawServerStream(rig, 2);
+            QuicStreamChannel chunk1 = rawServerStream(rig, 3);
+            int x = 1;
+            int z = 1;
+            int index = shardStream(x, z, 2);
+            byte[] wire = RecordCodec.encodeRecord(new Record(index, 1, 0,
+                    java.util.Collections.<Record.Dependency>emptyList(), RecordCodec.KIND_GAME,
+                    SessionReadPumpTest.inner(NRig.chunkUncompressed(x, z))));
+            LaneLoopback.write(index == 2 ? chunk0 : chunk1, wire);
+            assertTrue(SessionRigSupport.await(() -> rig.clientGame.count(NRig.CHUNK_ID) == 1, 10_000),
+                    () -> "chunk delivered: " + rig.clientGame.units() + " " + rig.clientGame.closed.getNow(null));
+            NRig.Got got = rig.clientGame.units().get(0);
+            assertEquals(index, got.stream, "the extracted x/z picked the shard stream");
+            NRig.Pkt pkt = (NRig.Pkt) got.packets.get(0);
+            assertEquals(x, pkt.x);
+            assertEquals(z, pkt.z);
+            assertTrue(SessionRigSupport.await(() -> {
+                try {
+                    return NRig.onLoop(rig.client, () -> appliedWatermark(rig.client, index)) == 1L;
+                } catch (Exception e) {
+                    throw new IllegalStateException(e);
+                }
+            }, 10_000), "the chunk is applied");
+            assertFalse(rig.clientGame.closed.isDone(),
+                    () -> "no 0x11: " + rig.clientGame.closed.getNow(null));
+        }
+    }
+
+    /** A real kind-2 ACK_JOIN record on CHUNK[0], carrying the table's join packet. */
+    private static byte[] joinWireFromPeer() {
+        return RecordCodec.encodeRecord(new Record(2, 1, 0,
+                java.util.Collections.<Record.Dependency>emptyList(), RecordCodec.KIND_ACK_JOIN,
+                SessionReadPumpTest.inner(new byte[] {(byte) NRig.JOIN_ID, 'j'})));
+    }
+
+    /** Opens a server-initiated stream as a raw peer and writes its preamble (13.3). */
+    private static QuicStreamChannel rawServerStream(NRig rig, int logicalIndex) throws Exception {
+        QuicChannel connection = rig.net.serverConnection.get(10, TimeUnit.SECONDS);
+        QuicStreamChannel stream = connection.createStream(QuicStreamType.BIDIRECTIONAL,
+                new ChannelInboundHandlerAdapter()).get(10, TimeUnit.SECONDS);
+        LaneLoopback.write(stream, AuxPreamble.encode(logicalIndex));
+        return stream;
+    }
+
+    /** D, read on the client's receive loop, so the test sees the applied ack without a data race. */
+    private static long appliedWatermark(NStreamSession session, int stream) throws Exception {
+        java.lang.reflect.Field field = NStreamSession.class.getDeclaredField("clientDriver");
+        field.setAccessible(true);
+        SessionReceiveDriver driver = (SessionReceiveDriver) field.get(session);
+        return driver.receiver().appliedWatermark(stream);
     }
 
     @Test
