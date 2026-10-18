@@ -946,6 +946,79 @@ public final class NStreamSession implements MultistreamSession {
         return handle;
     }
 
+    // --- Causal scope API (U2, 13.19) ---
+    // Each override delegates to the send driver under its monitor, the same place the send path
+    // assigns sequences. The session adds no policy.
+
+    @Override
+    public CausalScope openScope() {
+        return sendDriver.openScope();
+    }
+
+    @Override
+    public UpdateToken registerUpdate(CausalScope scope) {
+        return sendDriver.registerUpdate(scope);
+    }
+
+    /**
+     * Resolves the packet's pure route first (GLOBAL and globally promoted routes included), then
+     * submits it and resolves its token atomically in the driver (U2, 13.19). A token the driver
+     * rejects is an argument error and leaves the connection untouched; a route that fails closed
+     * refuses the session as every other submission does.
+     */
+    @Override
+    public SentPacket sendCovered(UpdateToken token, ProtocolState state, int packetId, byte[] frame,
+            byte[] uncompressedPacket) {
+        if (state == null || frame == null || frame.length < 1) {
+            throw new IllegalArgumentException("state/frame");
+        }
+        if (refused || closed) {
+            return new SentPacket();
+        }
+        SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(routes, extractors, protocolNumber,
+                sendDirection, state, packetId, uncompressedPacket);
+        if (resolved.failed()) {
+            refuse("covered packet " + packetId + " in " + state + ": " + resolved.failure());
+            return new SentPacket();
+        }
+        SentPacket handle;
+        try {
+            handle = sendDriver.submitCovered(token, new OutboundPacket(frame), resolved.fence(),
+                    resolved.interaction(), resolved.chunkX(), resolved.chunkZ());
+        } catch (IllegalArgumentException misuse) {
+            // A token or route-shape contract violation before assignment: caller error, not a wire refusal.
+            throw misuse;
+        } catch (StallClock.UnavailableException e) {
+            closeOnUnavailable(e);
+            return new SentPacket();
+        } catch (RuntimeException e) {
+            refuse("covered packet " + packetId + " in " + state + " was refused: " + e.getMessage());
+            return new SentPacket();
+        }
+        afterSubmit();
+        return handle;
+    }
+
+    @Override
+    public void suppressUpdate(UpdateToken token) {
+        sendDriver.suppressUpdate(token);
+    }
+
+    @Override
+    public void completeScope(CausalScope scope) {
+        sendDriver.completeScope(scope);
+    }
+
+    @Override
+    public void coverScope(long ackId, CausalScope scope) {
+        sendDriver.coverScope(ackId, scope);
+    }
+
+    @Override
+    public void sealAckCoverage(long ackId) {
+        sendDriver.sealAckCoverage(ackId);
+    }
+
     // --- Activation and streams.
 
     private void doActivate(ByteBuffer leftover) {
