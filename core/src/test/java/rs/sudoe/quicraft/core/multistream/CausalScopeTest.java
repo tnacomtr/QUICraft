@@ -432,4 +432,67 @@ class CausalScopeTest {
         assertThrows(IllegalArgumentException.class, () -> acks.assignScopeToken(token, 2, 1),
                 "a token of a retired scope is no longer usable");
     }
+
+    // 22. An empty-but-unsealed ack stays pending across repeated take calls: empty membership
+    // alone never establishes readiness; the producer must seal even with no covering scopes.
+    @Test void emptyUnsealedAckStaysPendingAcrossRepeatedTake() {
+        AckJoinTracker acks = new AckJoinTracker();
+        assertTrue(acks.create(1, 4, 0));
+        for (int i = 0; i < 5; i++) {
+            assertNull(acks.take(1, i + 1, 0, null),
+                    "empty but unsealed ack must stay pending: iteration " + i);
+        }
+        assertEquals(1, acks.pendingCount(), "ack is still pending");
+        assertEquals(4, acks.pendingBytes(), "its charge is retained");
+        assertEquals(0, acks.droppedCount(), "not dropped before its deadline");
+    }
+
+    // 23. take() at the deadline drops the empty-but-unsealed ack, counts it and releases its charge.
+    @Test void emptyUnsealedAckIsDroppedByTakeAtItsDeadline() {
+        AckJoinTracker acks = new AckJoinTracker();
+        assertTrue(acks.create(1, 4, 100));
+        long deadline = 100 + AckJoinTracker.DEADLINE_NANOS;
+        assertNull(acks.take(1, deadline - 1, 0, null), "still pending before the deadline");
+        assertEquals(1, acks.pendingCount());
+        assertEquals(0, acks.droppedCount());
+        assertNull(acks.take(1, deadline, 0, null), "take drops the unsealed ack at its deadline");
+        assertEquals(0, acks.pendingCount());
+        assertEquals(0, acks.pendingBytes());
+        assertEquals(1, acks.droppedCount());
+    }
+
+    // 24. expire() leaves the empty-but-unsealed ack alone before the deadline and drops it there.
+    @Test void emptyUnsealedAckIsDroppedOnlyByExpireAtItsDeadline() {
+        AckJoinTracker acks = new AckJoinTracker();
+        assertTrue(acks.create(1, 4, 0));
+        assertEquals(0, acks.expire(AckJoinTracker.DEADLINE_NANOS - 1, 0, null).size(),
+                "an unsealed ack is untouched before its deadline");
+        assertEquals(1, acks.pendingCount());
+        assertEquals(4, acks.pendingBytes());
+        assertEquals(0, acks.droppedCount());
+        assertEquals(0, acks.expire(AckJoinTracker.DEADLINE_NANOS, 0, null).size(),
+                "an unsealed ack is dropped at its deadline, never resolved");
+        assertEquals(0, acks.pendingCount());
+        assertEquals(0, acks.pendingBytes());
+        assertEquals(1, acks.droppedCount());
+    }
+
+    // 25. A transition never settles an empty-but-unsealed ack; sealing an empty ack makes it resolve.
+    @Test void emptyUnsealedAckIsNotSettledAndSealingMakesItResolvable() {
+        AckJoinTracker acks = new AckJoinTracker();
+        assertTrue(acks.create(1, 4, 0));
+        assertEquals(0, acks.settleForTransition(0, null).size(),
+                "a transition never settles an unsealed ack");
+        assertEquals(0, acks.pendingCount());
+        assertEquals(1, acks.droppedCount());
+
+        assertTrue(acks.create(2, 4, 0));
+        acks.sealAckCoverage(2);
+        AckJoinTracker.Ready ready = acks.take(2, 1, 0, null);
+        assertNotNull(ready, "a sealed ack with empty membership resolves");
+        assertEquals(2L, ready.id());
+        assertEquals(0, ready.dependencies().length, "no scope contributed a frontier");
+        assertEquals(0, acks.pendingCount());
+        assertEquals(1, acks.droppedCount(), "the sealed ack is resolved, not dropped");
+    }
 }
