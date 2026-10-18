@@ -884,3 +884,79 @@ to measure so the scans are not forgotten.
   confirmed close costs O(waiters) plus one retry per woken newcomer. Measure it in the same 50k run.
 - Index either scan only if these measurements show it matters at the scale target (50,000 concurrent players
   per node). Until then both stay as written.
+
+## Transport-neutral /3 benchmark schema and six-profile matrix (planned, not measured)
+
+**Not measured yet. Nothing in this section is a result.** It defines the result fields and the
+comparison rows that a later run must fill in. The `/3` arm waits on U3: this scaffolding has no
+scope identities, barrier rules, packet routing or real `/3` game driver, and it must not be read
+as `/3` readiness.
+
+### Result schema
+
+Every measured run object in a bench result file carries these provenance fields next to the
+existing Phase 0 metric fields. The existing fields and their meanings are unchanged. The fields are
+part of `testkit/.../bench/RunResult.java`; `schemaVersion` is the result schema, not the routing
+resource schema.
+
+| Field | TCP | QUIC `/2` | QUIC `/3` |
+| --- | --- | --- | --- |
+| `schemaVersion` | `1` | `1` | `1` |
+| `transportVersion` | `TCP` | `QUIC_2` | `QUIC_3` |
+| `streamCount` | `1` | `1` | negotiated stream count, at least `1` |
+| `buildCommit` | Git commit, or `unknown` for a manual run | Git commit, or `unknown` for a manual run | Git commit, 7 to 40 lowercase hex characters, no `-dirty` suffix |
+| `routingTableId` | empty | empty | routing resource identity, not a placeholder |
+| `routingTableDigest` | empty | empty | SHA-256 R, 64 lowercase hex characters |
+| `routingTableSchema` | `0` | `0` | `2` |
+| `negotiatedAlpn` | empty | `quicraft/2` | `quicraft/3` |
+| `negotiatedTransportVerified` | true after a completed TCP join | true after a completed QUIC join | true only with the complete negotiated evidence below |
+
+A failed run keeps the transport it attempted but sets `negotiatedAlpn` empty and
+`negotiatedTransportVerified` false. A result file also records the base netem profile in
+`netemProfile`, while `profile` keeps the transport-suffixed label used by the Phase 0 summarizer.
+
+### Comparison rows
+
+`matrix-summarize` emits one row per netem profile and metric (`join`, `chunk load`, `play RTT`),
+with one cell for each transport: TCP, QUIC `/2`, QUIC `/3`. A cell is `verified` only when it has
+at least one successful measured value. A missing or rejected arm is printed as `not run` or
+`fail-closed` and carries no number.
+
+The `/3` cell is fail-closed. It may be `verified` only when every contributing `/3` run satisfies
+all of these:
+
+- `transportVersion` is `QUIC_3`;
+- the run completed successfully;
+- `negotiatedTransportVerified` is true and `negotiatedAlpn` is `quicraft/3`;
+- `routingTableId` is non-empty and not a placeholder, `routingTableDigest` is 64 lowercase hex
+  characters, and `routingTableSchema` is `2`;
+- `buildCommit` is a clean Git commit of 7 to 40 lowercase hex characters, and `streamCount` is
+  at least `1`;
+- the result schema is current;
+- all contributing `/3` runs use the same routing table, build commit and stream count.
+
+A run whose `transportVersion` is `QUIC_2` is never promoted to `/3`, even if every other field
+looks like `/3` evidence. The unit tests construct exactly that case and require `fail-closed`.
+
+### Six-profile matrix
+
+`testkit/run-matrix.sh` runs the matrix over the six profiles defined in
+`testkit/netem/profiles.sh`: `clean`, `loss`, `delay`, `delayloss`, `reorder`, `jitter`. It fixes
+the Phase 0 parameters and delegates measurement and container cleanup to
+`testkit/run-baseline.sh`; it does not duplicate the Docker or netem logic.
+
+- `BATCHES=3`.
+- `N=20` measured joins for `clean` and `delay`; `N=80` for `loss`, `delayloss`, `reorder` and
+  `jitter`; `WARMUP=2`.
+- Tolerance `max(10%, 5 ms)` per batch median against the all-batch median.
+- Zero disconnects and zero failed runs.
+- `TRANSPORTS="tcp quic"`: TCP and the single-stream `/2` path. The `/3` arm is deliberately not
+  started before U3.
+- Artifacts go to `testkit/results/matrix-<UTC timestamp>/`: `environment.txt`,
+  `matrix-environment.txt`, `run-baseline.log`, the Phase 0 `summary.md`, `matrix-summary.md` and
+  `matrix-status.txt`. Container cleanup stays with `run-baseline.sh`.
+
+`matrix-summarize` exits `0` only when every requested profile has verified TCP, `/2` and `/3`
+cells. It exits `1` when `/3` evidence is rejected, a measured run failed, or an artifact could not
+be read. It exits `2` while `/3` evidence is absent, which is the expected state before U3. The
+presence of `/2` results never turns that `2` into a pass.

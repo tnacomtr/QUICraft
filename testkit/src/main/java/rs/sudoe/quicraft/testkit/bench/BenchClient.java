@@ -45,17 +45,20 @@ public final class BenchClient {
     private static final int PING_EVERY_TICKS = 5;
 
     private record Options(
-            String host, int port, String transport, String profile, int runs, int warmup, boolean online, URI sessionUrl,
-            int viewDistance, long playNanos, long quietNanos, long timeoutNanos, Path out, boolean verbose) {}
+            String host, int port, String transport, String netemProfile, String profile, int runs, int warmup,
+            boolean online, URI sessionUrl, int viewDistance, long playNanos, long quietNanos, long timeoutNanos,
+            Path out, boolean verbose, String buildCommit) {}
 
     private BenchClient() {}
 
     public static int run(Args args) throws IOException, InterruptedException {
+        String profile = args.string("profile", "unknown");
         Options o = new Options(
                 args.string("host", "localhost"),
                 args.integer("port", 25565),
                 args.string("transport", "tcp"),
-                args.string("profile", "unknown"),
+                args.string("netem-profile", profile),
+                profile,
                 args.integer("runs", 20),
                 args.integer("warmup", 2),
                 args.flag("online"),
@@ -65,10 +68,14 @@ public final class BenchClient {
                 TimeUnit.MILLISECONDS.toNanos(args.integer("quiet-ms", 2_000)),
                 TimeUnit.MILLISECONDS.toNanos(args.integer("timeout-ms", 60_000)),
                 args.string("out", null) == null ? null : Path.of(args.string("out", null)),
-                args.flag("verbose"));
+                args.flag("verbose"),
+                args.string("build-commit", BenchmarkSchema.UNKNOWN_COMMIT));
 
         if (!List.of("tcp", "quic", "quic-0rtt").contains(o.transport())) {
-            throw new IllegalArgumentException("--transport must be tcp, quic or quic-0rtt");
+            // A negotiated /3 game driver waits on U3. It must not be emulated by relabelling /2
+            // traffic: transportVersion is derived from this argument, never from a CLI override.
+            throw new IllegalArgumentException("--transport must be tcp, quic or quic-0rtt"
+                    + " (no negotiated /3 game driver yet)");
         }
         String scenario = args.string("scenario", "join");
         if (!List.of("join", "early-fallback").contains(scenario)) {
@@ -91,6 +98,7 @@ public final class BenchClient {
         if (o.out() != null) {
             JsonObject doc = new JsonObject();
             doc.addProperty("profile", o.profile());
+            doc.addProperty("netemProfile", o.netemProfile());
             doc.addProperty("host", o.host());
             doc.addProperty("port", o.port());
             doc.addProperty("transport", o.transport());
@@ -129,7 +137,7 @@ public final class BenchClient {
                     MinecraftCodec.CODEC.getProtocolVersion(), 10_000)).orElse(null);
         } catch (IOException e) {
             return failure(index, warmup, new BenchSession(protocol(o, ZERO_RTT_PLAYER), o.viewDistance(),
-                    o.verbose()), "status ping failed: " + e);
+                    o.verbose()), "status ping failed: " + e, TransportVersion.QUIC_2, o.buildCommit());
         }
         EarlyFlight early = new EarlyFlight(joinInputs(o, ZERO_RTT_PLAYER));
         QuicClientSession abandoned = new QuicClientSession(address, protocol(o, ZERO_RTT_PLAYER));
@@ -140,7 +148,8 @@ public final class BenchClient {
         attempt.cancel(false);
         if (!early.sent()) {
             return failure(index, warmup, new BenchSession(protocol(o, ZERO_RTT_PLAYER), o.viewDistance(),
-                    o.verbose()), "the abandoned attempt sent no 0-RTT data");
+                    o.verbose()), "the abandoned attempt sent no 0-RTT data",
+                    TransportVersion.QUIC_2, o.buildCommit());
         }
         Thread.sleep(20); // the connector's grace after TCP wins (one TCP round trip, at least 20 ms)
         return runOnce(o, index, warmup, ZERO_RTT_PLAYER, "tcp");
@@ -169,6 +178,7 @@ public final class BenchClient {
 
     private static RunResult runOnce(Options o, int index, boolean warmup, String name, String transport)
             throws InterruptedException {
+        TransportVersion version = transportVersion(transport);
         MinecraftProtocol protocol = protocol(o, name);
         BenchSession bench = new BenchSession(protocol, o.viewDistance(), o.verbose());
         // Resolve before the clock starts, so DNS is not part of join time.
@@ -181,10 +191,10 @@ public final class BenchClient {
                 ad = Advertisement.extract(StatusPing.fetch(address, o.host(),
                         MinecraftCodec.CODEC.getProtocolVersion(), 10_000)).orElse(null);
             } catch (IOException e) {
-                return failure(index, warmup, bench, "status ping failed: " + e);
+                return failure(index, warmup, bench, "status ping failed: " + e, version, o.buildCommit());
             }
             if (ad == null) {
-                return failure(index, warmup, bench, "server does not advertise QUIC");
+                return failure(index, warmup, bench, "server does not advertise QUIC", version, o.buildCommit());
             }
         }
 
@@ -202,7 +212,7 @@ public final class BenchClient {
                 quic.openQuic(new InetSocketAddress(address.getAddress(), ad.port()), ad.fingerprint(),
                         config, early, false).get(o.timeoutNanos(), TimeUnit.NANOSECONDS);
             } catch (ExecutionException | TimeoutException e) {
-                return failure(index, warmup, bench, "QUIC connect failed: " + e);
+                return failure(index, warmup, bench, "QUIC connect failed: " + e, version, o.buildCommit());
             }
             session = quic;
         } else {
@@ -216,12 +226,12 @@ public final class BenchClient {
         try {
             session.connect(false);
             if (!bench.joined.await(o.timeoutNanos(), TimeUnit.NANOSECONDS) || bench.loginNanos == 0) {
-                return failure(index, warmup, bench, "no play login");
+                return failure(index, warmup, bench, "no play login", version, o.buildCommit());
             }
             double joinMs = millis(bench.loginNanos - start);
 
             if (!bench.positioned.await(o.timeoutNanos(), TimeUnit.NANOSECONDS) || bench.position == null) {
-                return failure(index, warmup, bench, "no spawn position");
+                return failure(index, warmup, bench, "no spawn position", version, o.buildCommit());
             }
             long deadline = System.nanoTime() + o.timeoutNanos();
             while (System.nanoTime() < deadline && !bench.disconnected
@@ -229,7 +239,7 @@ public final class BenchClient {
                 Thread.sleep(20);
             }
             if (bench.disconnected || bench.chunks.get() == 0) {
-                return failure(index, warmup, bench, "chunks did not load");
+                return failure(index, warmup, bench, "chunks did not load", version, o.buildCommit());
             }
             double chunkLoadMs = millis(bench.lastChunkNanos - bench.loginNanos);
 
@@ -240,7 +250,7 @@ public final class BenchClient {
                 Thread.sleep(10);
             }
             if (bench.disconnected) {
-                return failure(index, warmup, bench, "disconnected during play");
+                return failure(index, warmup, bench, "disconnected during play", version, o.buildCommit());
             }
             double[] rtt = bench.rttNanos.stream().mapToDouble(nanos -> millis(nanos)).sorted().toArray();
             double[] phases = {
@@ -249,7 +259,9 @@ public final class BenchClient {
             };
             return new RunResult(index, warmup, true, phases, joinMs, chunkLoadMs, bench.chunks.get(),
                     percentile(rtt, 0.5), percentile(rtt, 0.95), rtt.length, pingsSent - rtt.length, false, null,
-                    NetStats.delta(netBefore, NetStats.read()), quicStats(session), early != null && early.sent());
+                    NetStats.delta(netBefore, NetStats.read()), quicStats(session), early != null && early.sent(),
+                    BenchmarkSchema.VERSION, version, 1, o.buildCommit(),
+                    "", "", 0, version.alpn(), true);
         } finally {
             bench.benchClosing = !bench.disconnected;
             if (session.isConnected()) {
@@ -289,10 +301,26 @@ public final class BenchClient {
         }
     }
 
-    private static RunResult failure(int index, boolean warmup, BenchSession bench, String what) {
+    private static RunResult failure(int index, boolean warmup, BenchSession bench, String what,
+            TransportVersion version, String buildCommit) {
         String error = bench.disconnected ? what + ": " + bench.disconnectReason : what;
         return new RunResult(index, warmup, false, new double[0], -1, -1, bench.chunks.get(), -1, -1, 0, 0,
-                bench.disconnected, error, null, null, false);
+                bench.disconnected, error, null, null, false,
+                BenchmarkSchema.VERSION, version, 1, buildCommit,
+                "", "", 0, "", false);
+    }
+
+    /**
+     * Maps a bench transport argument to the transport path it actually uses. There is deliberately
+     * no mapping to {@link TransportVersion#QUIC_3}: only a future negotiated game driver may set it,
+     * so a {@code /2} argument can never produce a {@code /3} result.
+     */
+    private static TransportVersion transportVersion(String transport) {
+        return switch (transport) {
+            case "tcp" -> TransportVersion.TCP;
+            case "quic", "quic-0rtt" -> TransportVersion.QUIC_2;
+            default -> throw new IllegalArgumentException("no benchmark transport version for " + transport);
+        };
     }
 
     static double percentile(double[] sorted, double p) {

@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.testkit;
 
 import java.util.Arrays;
 import rs.sudoe.quicraft.testkit.bench.BenchClient;
+import rs.sudoe.quicraft.testkit.bench.MatrixSummarize;
 import rs.sudoe.quicraft.testkit.bench.Summarize;
 import rs.sudoe.quicraft.testkit.session.MockSessionServer;
 import rs.sudoe.quicraft.testkit.transport.TransportClient;
@@ -23,6 +24,7 @@ public final class Main {
             case "bench" -> BenchClient.run(Args.parse(rest));
             case "mocksession" -> MockSessionServer.run(Args.parse(rest));
             case "summarize" -> Summarize.run(Args.parse(rest));
+            case "matrix-summarize" -> MatrixSummarize.run(Args.parse(rest));
             case "transport-server" -> TransportServer.run(Args.parse(rest));
             case "transport-client" -> TransportClient.run(Args.parse(rest));
             case "transport-summarize" -> TransportSummarize.run(Args.parse(rest));
@@ -43,6 +45,7 @@ public final class Main {
                   bench        join a server repeatedly and record join, chunk-load and play RTT metrics
                   mocksession  run a mock Mojang session server for online-mode logins
                   summarize    aggregate bench results and check reproducibility
+                  matrix-summarize  emit TCP vs /2 vs /3 rows; /3 fails closed without negotiated evidence
                   transport-server     QUIC (Reno, CUBIC, BBR) and TCP servers with Minecraft-shaped traffic
                   transport-client     compare those transports: handshake, burst and play RTT
                   transport-summarize  medians and bootstrap CIs of QUIC minus TCP

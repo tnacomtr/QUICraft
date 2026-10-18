@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+package rs.sudoe.quicraft.testkit.bench;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import rs.sudoe.quicraft.testkit.Args;
+
+/** Comparison rows and the fail-closed {@code /3} gate. Fixtures are synthetic, not measurements. */
+class MatrixSummarizeTest {
+    private static final Gson GSON = new Gson();
+
+    @TempDir
+    Path dir;
+
+    @Test
+    void quic2RowsNeverSatisfyQuic3EvenWithQuic3LookingFields() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, 1),
+                RunFixtures.tcp(20, 200, 2));
+        RunResult disguised = RunFixtures.run(TransportVersion.QUIC_2, true, BenchmarkSchema.VERSION, 3,
+                RunFixtures.COMMIT, "protocol-775", RunFixtures.DIGEST, BenchmarkSchema.ROUTING_SCHEMA_V3,
+                TransportVersion.QUIC_3.alpn(), true, 30, 300, 3);
+        write("clean-quic.json", "clean-quic", "clean",
+                disguised,
+                RunFixtures.quic2(40, 400, 4));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(2, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        String join = line(text, "| clean | join (ms) |");
+        assertTrue(join.contains("15.0 (n=2)"), join);
+        assertTrue(join.contains("35.0 (n=2)"), join);
+        assertTrue(join.contains("| not run ("), join);
+        assertTrue(text.contains("Matrix /3 gate: INCOMPLETE"), text);
+    }
+
+    @Test
+    void completeNegotiatedEvidenceProducesAVerifiedQuic3Row() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, 1),
+                RunFixtures.tcp(20, 200, 2));
+        write("clean-quic.json", "clean-quic", "clean",
+                RunFixtures.quic2(30, 300, 3),
+                RunFixtures.quic2(40, 400, 4));
+        write("clean-quic3.json", "clean-quic3", "clean",
+                RunFixtures.quic3(50, 500, 5),
+                RunFixtures.quic3(60, 600, 6));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(0, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        String join = line(text, "| clean | join (ms) |");
+        assertTrue(join.contains("55.0 (n=2)"), join);
+        assertTrue(join.contains("R=0123456789ab schema=2 streams=3 alpn=quicraft/3"), join);
+        assertTrue(text.contains("Matrix /3 gate: PASS"), text);
+    }
+
+    @Test
+    void incompleteQuic3EvidenceFailsClosedWithoutAMedian() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, 1));
+        write("clean-quic.json", "clean-quic", "clean",
+                RunFixtures.quic2(30, 300, 3));
+        RunResult unverified = RunFixtures.run(TransportVersion.QUIC_3, true, BenchmarkSchema.VERSION, 3,
+                RunFixtures.COMMIT, "protocol-775", RunFixtures.DIGEST, BenchmarkSchema.ROUTING_SCHEMA_V3,
+                TransportVersion.QUIC_3.alpn(), false, 50, 500, 5);
+        write("clean-quic3.json", "clean-quic3", "clean", unverified);
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        String join = line(text, "| clean | join (ms) |");
+        assertTrue(join.contains("fail-closed (negotiatedTransportVerified is false)"), join);
+        assertFalse(join.contains("50.0"), join);
+        assertTrue(text.contains("Matrix /3 gate: FAIL-CLOSED"), text);
+    }
+
+    @Test
+    void aChangingRoutingTableBetweenQuic3RunsFailsClosed() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, 1));
+        write("clean-quic.json", "clean-quic", "clean",
+                RunFixtures.quic2(30, 300, 3));
+        String otherDigest = RunFixtures.DIGEST.replace('0', '1');
+        write("clean-quic3.json", "clean-quic3", "clean",
+                RunFixtures.quic3(50, 500, 5),
+                RunFixtures.run(TransportVersion.QUIC_3, true, BenchmarkSchema.VERSION, 3,
+                        RunFixtures.COMMIT, "protocol-775", otherDigest, BenchmarkSchema.ROUTING_SCHEMA_V3,
+                        TransportVersion.QUIC_3.alpn(), true, 60, 600, 6));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("routing table identity changed between /3 runs"), text);
+    }
+
+    @Test
+    void aFailedMeasuredRunFailsClosed() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, 1),
+                RunFixtures.run(TransportVersion.TCP, false, BenchmarkSchema.VERSION, 1,
+                        RunFixtures.COMMIT, "", "", 0, "", false, -1, -1, -1));
+        write("clean-quic.json", "clean-quic", "clean",
+                RunFixtures.quic2(30, 300, 3));
+        write("clean-quic3.json", "clean-quic3", "clean",
+                RunFixtures.quic3(50, 500, 5));
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("Failed measured runs: 1 (disconnects: 0)"), text);
+        assertTrue(text.contains("Matrix /3 gate: FAIL-CLOSED"), text);
+    }
+
+    @Test
+    void malformedArtifactFailsClosedEvenWhenAllRowsVerify() throws IOException {
+        write("clean-tcp.json", "clean-tcp", "clean",
+                RunFixtures.tcp(10, 100, 1));
+        write("clean-quic.json", "clean-quic", "clean",
+                RunFixtures.quic2(30, 300, 3));
+        write("clean-quic3.json", "clean-quic3", "clean",
+                RunFixtures.quic3(50, 500, 5));
+        Files.writeString(dir.resolve("broken.json"), "{not json", StandardCharsets.UTF_8);
+
+        Path markdown = dir.resolve("matrix-summary.md");
+        int status = summarize(markdown, "clean");
+
+        assertEquals(1, status);
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("Unreadable JSON files skipped: 1"), text);
+        assertTrue(text.contains("Matrix /3 gate: FAIL-CLOSED"), text);
+    }
+
+    @Test
+    void profileOfPrefersTheBaseNetemProfileAndFallsBackForLegacyFiles() {
+        JsonObject current = new JsonObject();
+        current.addProperty("profile", "clean-tcp");
+        current.addProperty("netemProfile", "clean");
+        assertEquals("clean", MatrixSummarize.profileOf(current));
+
+        JsonObject legacy = new JsonObject();
+        legacy.addProperty("profile", "clean-quic-0rtt");
+        assertEquals("clean", MatrixSummarize.profileOf(legacy));
+    }
+
+    @Test
+    void transportSuffixesFallBackToTheNetemProfile() {
+        assertEquals("clean", MatrixSummarize.baseProfile("clean-quic-0rtt"));
+        assertEquals("clean", MatrixSummarize.baseProfile("clean-quic"));
+        assertEquals("clean", MatrixSummarize.baseProfile("clean-tcp"));
+        assertEquals("delayloss", MatrixSummarize.baseProfile("delayloss"));
+    }
+
+    private void write(String file, String profile, String netemProfile, RunResult... runs) throws IOException {
+        JsonObject doc = new JsonObject();
+        doc.addProperty("profile", profile);
+        doc.addProperty("netemProfile", netemProfile);
+        doc.add("runs", GSON.toJsonTree(runs));
+        Files.writeString(dir.resolve(file), GSON.toJson(doc), StandardCharsets.UTF_8);
+    }
+
+    private int summarize(Path markdown, String profiles) throws IOException {
+        return MatrixSummarize.run(Args.parse(new String[] {
+                "--dir", dir.toString(),
+                "--profiles", profiles,
+                "--markdown", markdown.toString(),
+        }));
+    }
+
+    private static String line(String text, String prefix) {
+        return text.lines().filter(line -> line.startsWith(prefix)).findFirst().orElse("");
+    }
+}

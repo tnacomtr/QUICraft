@@ -16,6 +16,9 @@
 # server. The QUICraft plugin or mod is installed unless QUICRAFT_PLUGIN=false, so a TCP run also
 # checks that it leaves TCP joins alone.
 #
+# RESULTS_DIR=<dir under testkit/results> writes into that directory instead of a new timestamped
+# one. testkit/run-matrix.sh uses it to keep one matrix's artifacts together.
+#
 # Results land in testkit/results/<UTC timestamp>/batch<k>/<profile>.json plus summary.md.
 set -euo pipefail
 
@@ -41,14 +44,23 @@ TRANSPORTS="${TRANSPORTS:-${TRANSPORT:-tcp}}"
 QUICRAFT_PLUGIN="${QUICRAFT_PLUGIN:-true}"
 TARGET="${TARGET:-velocity}"
 SCENARIO="${SCENARIO:-join}"
+RESULTS_DIR="${RESULTS_DIR:-}"
 case "$TARGET" in
     velocity | fabric) ;;
     *) echo "TARGET must be velocity or fabric" >&2; exit 2 ;;
 esac
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-results="$here/results/$stamp-${TARGET}-${TRANSPORTS// /-}"
-[[ "$SCENARIO" != join ]] && results="$results-$SCENARIO"
+if [[ -n "$RESULTS_DIR" ]]; then
+    results="$RESULTS_DIR"
+else
+    results="$here/results/$stamp-${TARGET}-${TRANSPORTS// /-}"
+    [[ "$SCENARIO" != join ]] && results="$results-$SCENARIO"
+fi
+case "$results" in
+    "$here"/results/*) ;;
+    *) echo "RESULTS_DIR must be under $here/results for the Docker bind mount" >&2; exit 2 ;;
+esac
 mkdir -p "$results"
 
 export VELOCITY_ONLINE_MODE="$ONLINE" FABRIC_ONLINE_MODE="$ONLINE" QUICRAFT_PLUGIN HOST_UID="$(id -u)" HOST_GID="$(id -g)"
@@ -87,9 +99,15 @@ else
     wait_for_log velocity 'Done (' 120
 fi
 
+build_commit="$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [[ "$build_commit" != unknown ]] && ! git -C "$root" diff --quiet 2>/dev/null; then
+    build_commit="$build_commit-dirty"
+fi
+
 {
     echo "started: $stamp"
     echo "target=$TARGET batches=$BATCHES runs=$RUNS runs_loss=$RUNS_loss runs_reorder=$RUNS_reorder warmup=$WARMUP profiles=[$PROFILES] online=$ONLINE play_ms=$PLAY_MS transports=[$TRANSPORTS] scenario=$SCENARIO quicraft_plugin=$QUICRAFT_PLUGIN"
+    echo "build: $build_commit"
     echo "git: $(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo none)$(git -C "$root" diff --quiet 2>/dev/null || echo ' (dirty)')"
     echo "kernel: $(uname -r)"
     echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
@@ -124,6 +142,7 @@ for batch in $(seq 1 "$BATCHES"); do
             echo "== batch $batch/$BATCHES, profile $profile, $transport ($runs runs)"
             "${compose[@]}" run --rm --no-deps -e NETEM_PROFILE="$profile" bench \
                 bench --host "$TARGET" --port 25565 --transport "$transport" --profile "$label" \
+                --netem-profile "$profile" --build-commit "$build_commit" \
                 --runs "$runs" --warmup "$WARMUP" --play-ms "$PLAY_MS" --scenario "$SCENARIO" "${online_flag[@]}" \
                 --out "/results/$(basename "$results")/batch$batch/$label.json" || echo "!! bench reported failed runs"
         done
