@@ -50,6 +50,9 @@ processed="$root/fabric-26x/build/resources/gametest/fabric.mod.json"
 entrypoint="rs.sudoe.quicraft.fabric.gametest.CausalLoginGameTest"
 log="${CAUSAL_LOGIN_CAPTURE_LOG:-/tmp/opencode/causal-login-capture.log}"
 client_timeout="${CAUSAL_LOGIN_CLIENT_TIMEOUT:-600}"
+resource_lock="$root/.gradle/quicraft-gametest-resources.lock"
+nonce_file="$report_dir/active-run-id.txt"
+nonce_owned=false
 
 if [[ ! "$client_timeout" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: CAUSAL_LOGIN_CLIENT_TIMEOUT must be a positive number of seconds, got: $client_timeout" >&2
@@ -82,6 +85,25 @@ if [[ -z "${DISPLAY:-}" ]]; then
         exit 1
     fi
 fi
+
+# Serialize cooperating invocations before any shared resource, log, report, marker or backup changes.
+# This lock does not coordinate arbitrary Gradle commands that do not use this runner.
+if ! command -v flock >/dev/null 2>&1; then
+    echo "error: flock is required to serialize causal-login runner invocations" >&2
+    exit 1
+fi
+mkdir -p "$root/.gradle"
+exec {resource_lock_fd}>>"$resource_lock"
+if ! flock -n "$resource_lock_fd"; then
+    echo "error: another causal-login runner holds $resource_lock" >&2
+    exit 1
+fi
+run_id="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+if [[ ! "$run_id" =~ ^[0-9a-f]{32}$ ]]; then
+    echo "error: could not generate a valid causal-login run ID" >&2
+    exit 1
+fi
+echo "causal-login runId=$run_id (exclusive runner lock held through cleanup)"
 
 mkdir -p "$(dirname "$log")"
 backup="$(mktemp "${TMPDIR:-/tmp}/quicraft-causal-login-fabric-mod.XXXXXX")"
@@ -241,6 +263,15 @@ restore() {
             restore_code=1
         fi
     fi
+    if [[ "$nonce_owned" == true && -f "$nonce_file" ]]; then
+        if [[ "$(<"$nonce_file")" == "$run_id" ]]; then
+            rm -f "$nonce_file"
+            echo "removed this run's causal-login nonce metadata"
+        else
+            echo "ERROR: causal-login nonce metadata changed; leaving it in place" >&2
+            restore_code=1
+        fi
+    fi
     if [[ -n "$marker" ]]; then
         rm -f "$marker"
     fi
@@ -261,6 +292,10 @@ restore() {
 trap restore EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+mkdir -p "$report_dir"
+nonce_owned=true
+printf '%s\n' "$run_id" >"$nonce_file"
 
 cp -p "$mod" "$backup"
 backup_ready=true
@@ -459,18 +494,24 @@ else
     if [[ ! "$summary" -nt "$marker" ]]; then
         failures+=("the summary is stale, older than this run's marker: $first")
     fi
-    if python3 - "$summary" "$report_dir" "$marker" <<'PY'
+    if python3 - "$summary" "$report_dir" "$marker" "$run_id" <<'PY'
 import glob
 import json
 import os
 import sys
 
-summary, report_dir, marker = sys.argv[1:]
+summary, report_dir, marker, run_id = sys.argv[1:]
 with open(summary, encoding="utf-8") as handle:
-    first = handle.readline().strip()
+    summary_lines = [line.strip() for line in handle]
+first = summary_lines[0] if summary_lines else ""
 if "status=COMPLETED" not in first or "started=" not in first:
     raise SystemExit(f"invalid summary header: {first}")
 started = first.split("started=", 1)[1].split()[0]
+summary_values = {line.split("=", 1)[0]: line.split("=", 1)[1] for line in summary_lines[1:] if "=" in line}
+if summary_values.get("runId") != run_id:
+    raise SystemExit("summary runId mismatch")
+if summary_values.get("gameVersion") != "26.1.2" or summary_values.get("transport") != "TCP":
+    raise SystemExit("summary does not identify gameVersion=26.1.2 and transport=TCP")
 paths = glob.glob(os.path.join(report_dir, "causal-login-*.json"))
 paths = [p for p in paths if os.path.getmtime(p) > os.path.getmtime(marker)]
 if not paths:
@@ -480,6 +521,8 @@ with open(path, encoding="utf-8") as handle:
     report = json.load(handle)
 if report.get("status") != "COMPLETED" or report.get("started") != started:
     raise SystemExit(f"JSON status/start mismatch: {path}")
+if report.get("runId") != run_id or report.get("gameVersion") != "26.1.2" or report.get("transport") != "TCP":
+    raise SystemExit(f"JSON runId/gameVersion/transport mismatch: {path}")
 expected = [None, "causal login spawn", "causal login ready", "causal place new player"]
 rows = report.get("rows")
 if not isinstance(rows, list) or len(rows) != 4:

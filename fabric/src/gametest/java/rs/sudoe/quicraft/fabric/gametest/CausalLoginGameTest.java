@@ -29,6 +29,16 @@ public final class CausalLoginGameTest implements FabricClientGameTest {
 
     @Override
     public void runTest(ClientGameTestContext context) {
+        Path noncePath = outputDir().resolve("active-run-id.txt");
+        String runId;
+        try {
+            runId = Files.readString(noncePath).trim();
+        } catch (IOException error) {
+            throw new AssertionError("cannot read runner nonce metadata at " + noncePath, error);
+        }
+        if (runId == null || !runId.matches("[0-9a-f]{32}")) {
+            throw new AssertionError("invalid runner nonce metadata at " + noncePath + ": expected 32 lowercase hexadecimal characters");
+        }
         Instant started = Instant.now();
         List<Map<String, Object>> rows = new ArrayList<>();
         List<String> errors = new ArrayList<>();
@@ -95,14 +105,15 @@ public final class CausalLoginGameTest implements FabricClientGameTest {
             try {
                 Files.createDirectories(dir);
                 String content = "started=" + started + " status=" + (errors.isEmpty() ? "COMPLETED" : "FAILED")
-                        + "\ncompleted=" + completed + "\ngameVersion=" + gameVersion + "\ntransport=TCP\nrows="
+                        + " runId=" + runId + "\ncompleted=" + completed + "\nrunId=" + runId + "\ngameVersion=" + gameVersion + "\ntransport=TCP\nrows="
                         + rows.size() + "\nerrors=" + errors + "\n";
                 Files.writeString(summary, content);
-                System.out.println("CAUSAL-LOGIN " + content.replace('\n', ' '));
+                System.out.println("CAUSAL-LOGIN runId=" + runId + " " + content.replace('\n', ' '));
                 Map<String, Object> report = new LinkedHashMap<>();
                 report.put("status", errors.isEmpty() && rows.size() == FAULTS.length ? "COMPLETED" : "FAILED");
                 report.put("started", started.toString());
                 report.put("completed", completed.toString());
+                report.put("runId", runId);
                 report.put("gameVersion", gameVersion);
                 report.put("transport", "TCP");
                 report.put("rows", rows);
