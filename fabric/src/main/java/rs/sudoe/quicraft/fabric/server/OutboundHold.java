@@ -19,6 +19,21 @@ final class OutboundHold {
     interface Sender {
         boolean writable();
 
+        /** Whole-unit entry, overridden by V3 to validate authority before decomposition. */
+        default void send(OutboundUnit unit) {
+            unit.requireSupportedCoverage();
+            if (unit.hasCoverage()) {
+                throw new IllegalStateException("sender does not support causal coverage");
+            }
+            if (unit.bundle() && unit.packets().size() >= 2) {
+                sendBundle(unit.state(), unit.packets());
+            } else {
+                for (byte[] packet : unit.packets()) {
+                    send(unit.state(), packet);
+                }
+            }
+        }
+
         /** Frames one packet (compression wrapper and length), then submits it. */
         void send(ProtocolState state, byte[] packet);
 
@@ -47,6 +62,7 @@ final class OutboundHold {
 
     /** Submits {@code unit} now, or holds it behind earlier units or a layer that is not writable. */
     void submit(OutboundUnit unit) {
+        unit.requireSupportedCoverage();
         if (unit.isEmpty()) {
             return;
         }
@@ -130,12 +146,6 @@ final class OutboundHold {
     }
 
     private void send(OutboundUnit unit) {
-        if (unit.bundle() && unit.packets().size() >= 2) {
-            sender.sendBundle(unit.state(), unit.packets());
-            return;
-        }
-        for (byte[] packet : unit.packets()) {
-            sender.send(unit.state(), packet);
-        }
+        sender.send(unit);
     }
 }

@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.fabric.server;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 
@@ -16,17 +17,47 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
  */
 final class OutboundUnit {
     private final boolean bundle;
+    private final @Nullable CausalSendEnvelope envelope;
     private final List<byte[]> packets = new ArrayList<>();
     private ProtocolState state;
     private long bytes;
     private ReceiveBudget reservedAgainst;
 
     OutboundUnit(boolean bundle) {
+        this(bundle, null);
+    }
+
+    OutboundUnit(boolean bundle, @Nullable CausalSendEnvelope envelope) {
         this.bundle = bundle;
+        this.envelope = envelope;
+    }
+
+    /** The exact logical-send snapshot; never recovered again after encoding or queueing. */
+    @Nullable CausalSendEnvelope envelope() {
+        return envelope;
+    }
+
+    boolean hasCoverage() {
+        return envelope != null && !envelope.producer().equals(CausalSendEnvelope.ProducerSnapshot.EMPTY);
+    }
+
+    /** Refuse unsupported coverage before any packet in this unit can be submitted. */
+    void requireSupportedCoverage() {
+        if (!hasCoverage()) {
+            return;
+        }
+        CausalSendEnvelope.ProducerSnapshot producer = envelope.producer();
+        if (bundle || envelope.bundle().bundle() || packets.size() != 1 || producer.tokens().size() != 1
+                || !producer.scopes().isEmpty() || producer.ack() != null || producer.batch() != null) {
+            throw new IllegalStateException("unsupported causal coverage shape");
+        }
     }
 
     /** One encoded packet (its id VarInt and payload), in the state the encoder wrote it in. */
     void add(ProtocolState state, byte[] packet) {
+        if (state == null || packet == null || (this.state != null && this.state != state)) {
+            throw new IllegalArgumentException("mixed or missing outbound unit state/packet");
+        }
         this.state = state;
         packets.add(packet);
         bytes += packet.length;

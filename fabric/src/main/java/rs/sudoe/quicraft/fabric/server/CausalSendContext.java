@@ -15,6 +15,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
+import rs.sudoe.quicraft.core.transport.V3Connection;
 
 /**
  * The per-connection causal send state (U3-W2a/W3a): the only allocator of send identities, the
@@ -64,8 +65,11 @@ public class CausalSendContext {
     private final Map<Thread, Deque<ProducerScope>> producerFrames = new ConcurrentHashMap<>();
     /** Guards producer publication, removal, snapshot copying and terminal producer invalidation. */
     private final Object producerMonitor = new Object();
-    /** Guarded by producerMonitor; terminal only for producer admission, not send-frame entry. */
+    /** Guarded by producerMonitor; closes producer and wire admission, not send-frame entry. */
     private boolean producersClosed;
+    /** One-shot identity bindings, guarded by producerMonitor. Never inferred from packet listeners. */
+    private @Nullable V3Connection transport;
+    private @Nullable MultistreamSession coreSession;
     private volatile long epoch;
 
     public CausalSendContext(Object connection) {
@@ -87,7 +91,9 @@ public class CausalSendContext {
         if (epoch < 0) {
             throw new IllegalArgumentException("epoch must not be negative");
         }
-        this.epoch = epoch;
+        synchronized (producerMonitor) {
+            this.epoch = epoch;
+        }
     }
 
     /**
@@ -101,8 +107,74 @@ public class CausalSendContext {
     public CausalSendEnvelope newEnvelope(@Nullable Object sessionOwner,
             CausalSendEnvelope.ProducerSnapshot producer, CausalSendEnvelope.BundleMetadata bundle) {
         CausalSendEnvelope.ProducerSnapshot explicit = Objects.requireNonNull(producer, "producer");
-        return new CausalSendEnvelope(nextSendId.getAndIncrement(), connection, sessionOwner, epoch,
-                withProducerScopes(explicit), Objects.requireNonNull(bundle, "bundle"));
+        synchronized (producerMonitor) {
+            return new CausalSendEnvelope(nextSendId.getAndIncrement(), connection, sessionOwner, epoch,
+                    withProducerScopes(explicit), Objects.requireNonNull(bundle, "bundle"), this);
+        }
+    }
+
+    /** Binds the stable transport once; envelopes allocated before this call keep this origin. */
+    void bindTransport(V3Connection expected) {
+        Objects.requireNonNull(expected, "transport");
+        synchronized (producerMonitor) {
+            if (producersClosed || (transport != null && transport != expected)) {
+                throw new IllegalStateException("terminal or replaced causal transport");
+            }
+            transport = expected;
+        }
+    }
+
+    /** Binds the actual activated core session once, before any queued unit is released. */
+    void bindSession(V3Connection expected, MultistreamSession session) {
+        Objects.requireNonNull(session, "session");
+        synchronized (producerMonitor) {
+            if (transport != expected || expected.session() != session || producersClosed
+                    || (coreSession != null && coreSession != session)) {
+                throw new IllegalStateException("terminal or replaced causal session");
+            }
+            coreSession = session;
+        }
+    }
+
+    /**
+     * Serializes actual synchronous submission with terminal invalidation. The operation must not
+     * wait for an event loop. Core assignment is the commit point; reentrant invalidation afterwards
+     * throws and requires terminal join cleanup, never replay or an ordinary-send retry.
+     */
+    void admit(Channel channel, V3Connection expected, MultistreamSession session,
+            @Nullable CausalSendEnvelope envelope, Runnable operation) {
+        Objects.requireNonNull(session, "session");
+        synchronized (producerMonitor) {
+            requireAdmission(channel, expected, session, envelope);
+            operation.run();
+            requireAdmission(channel, expected, session, envelope);
+        }
+    }
+
+    /** The byte path is allowed only before session binding, with the same origin and no coverage. */
+    void replay(Channel channel, V3Connection expected, @Nullable CausalSendEnvelope envelope,
+            Runnable operation) {
+        synchronized (producerMonitor) {
+            requireAdmission(channel, expected, null, envelope);
+            if (envelope == null || !envelope.producer().equals(CausalSendEnvelope.ProducerSnapshot.EMPTY)) {
+                throw new IllegalStateException("causal coverage cannot use byte replay");
+            }
+            operation.run();
+            requireAdmission(channel, expected, null, envelope);
+        }
+    }
+
+    /** Caller holds producerMonitor; check terminal last, including after external identity reads. */
+    private void requireAdmission(Channel channel, V3Connection expected,
+            @Nullable MultistreamSession session, @Nullable CausalSendEnvelope envelope) {
+        boolean actualSession = session == null
+                ? coreSession == null && expected.session() == null
+                : coreSession == session && expected.session() == session;
+        if (attached(channel) != this || transport != expected || !actualSession || envelope == null
+                || envelope.origin() != this || envelope.connection() != connection
+                || envelope.epoch() != epoch || epoch != 0 || producersClosed) {
+            throw new IllegalStateException("missing, stale or foreign causal admission authority");
+        }
     }
 
     /**
@@ -287,8 +359,9 @@ public class CausalSendContext {
     /**
      * Permanently closes producer admission and drops retained producer and synchronous send frames.
      * Producer publication, removal and snapshot copying share this terminal invalidation boundary.
-     * Previously copied snapshots and carried envelopes are not invalidated or settled here: a
-     * deferred task still executes its vanilla action and may re-enter its original envelope.
+     * Wire admission also closes under this monitor. Previously copied snapshots and carried
+     * envelopes remain visible, but cannot be admitted; only core terminal close settles their refs.
+     * A deferred task still executes its vanilla action and may re-enter its original envelope.
      * Send-frame entry and exit are not serialized by the producer monitor.
      */
     public void teardown() {

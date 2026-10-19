@@ -41,6 +41,7 @@ import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
+import rs.sudoe.quicraft.core.multistream.SentPacket;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.transport.V3Connection;
@@ -97,6 +98,8 @@ public final class V3Join {
     private final SecretHolder secrets = new SecretHolder();
 
     private BindingPayloads payloads;
+    /** Stable connection origin, retained across listener swaps and preactivation queueing. */
+    private CausalSendContext causal;
     /** The login profile the configuration listener holds, captured at begin (13.12 account key). */
     private GameProfile profile;
     /** The 13.12 account key for this join's pool and ranking charges, or null (set at start). */
@@ -242,6 +245,11 @@ public final class V3Join {
         // fails the join closed (12.14) with no half-installed pipeline and no cipher cutover.
         int shardCount = connection.sessionContext().shardCount();
         ChannelPipeline pipeline = channel.pipeline();
+        causal = CausalSendContext.attached(channel);
+        if (causal == null) {
+            throw new IllegalStateException("no causal context for /3 binding");
+        }
+        causal.bindTransport(connection);
         protocol = SharedConstants.getProtocolVersion();
         table = MultistreamSwitch.tableFor(protocol);
         if (table == null) {
@@ -501,6 +509,7 @@ public final class V3Join {
                 AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
         // 13.4: the platform reads the live compression state once, here, and the session keeps it.
         connection.activate(lanes, protocol, PacketLaneCodec.compressionEnabled(pipeline), account, control);
+        causalContext().bindSession(connection, connection.session());
         sinkActive = true;
         // 12.13: what was queued during the exchange goes out as records, whole units in order. A
         // submission that fails takes every unit it did not hand over with it and gives their node
@@ -527,25 +536,103 @@ public final class V3Join {
 
         @Override
         public void send(ProtocolState packetState, byte[] packet) {
-            try {
-                submitUncompressed(connection.session(), codec, packetState, packet);
-            } catch (java.io.IOException e) {
-                throw new IllegalStateException(e);
-            }
+            throw new IllegalStateException("V3 requires whole-unit causal admission");
         }
 
         @Override
         public void sendBundle(ProtocolState packetState, List<byte[]> packets) {
+            throw new IllegalStateException("V3 requires whole-unit causal admission");
+        }
+
+        @Override
+        public void send(OutboundUnit unit) {
             try {
-                List<OutboundPacket> framed = new ArrayList<>();
-                for (byte[] packet : packets) {
-                    framed.add(new OutboundPacket(codec.outboundFrame(packet)));
-                }
-                connection.session().sendBundle(framed.get(0), framed.subList(1, framed.size() - 1),
-                        framed.get(framed.size() - 1));
-            } catch (java.io.IOException e) {
-                throw new IllegalStateException(e);
+                submitUnit(unit);
+            } catch (Throwable t) {
+                // Also covers hold/drain callers: unsupported coverage always ends the core owner.
+                fail("causal outbound admission: " + describe(t), t);
+                throw t instanceof RuntimeException ? (RuntimeException) t : new IllegalStateException(t);
             }
+        }
+    }
+
+    private CausalSendContext causalContext() {
+        CausalSendContext current = causal;
+        if (current == null || CausalSendContext.attached(channel) != current) {
+            throw new IllegalStateException("missing or replaced /3 causal context");
+        }
+        return current;
+    }
+
+    /** Frames the entire unit before any core operation, including the last split member. */
+    private List<OutboundPacket> frameUnit(OutboundUnit unit, PacketLaneCodec framing) throws java.io.IOException {
+        unit.requireSupportedCoverage();
+        if (unit.envelope() == null || unit.state() == null) {
+            throw new IllegalStateException("missing outbound envelope or protocol state");
+        }
+        List<OutboundPacket> frames = new ArrayList<>();
+        for (byte[] packet : unit.packets()) {
+            if (FrameCodec.packetId(packet) < 0) {
+                throw new IllegalStateException("negative outbound packet id");
+            }
+            frames.add(new OutboundPacket(framing.outboundFrame(packet), packet.length, false));
+        }
+        return frames;
+    }
+
+    /** A bounded real consumer: one token/one packet, or validated empty-coverage ordinary units. */
+    private void submitUnit(OutboundUnit unit) throws java.io.IOException {
+        List<OutboundPacket> frames = frameUnit(unit, codec);
+        CausalSendContext context = causalContext();
+        MultistreamSession core = connection.session();
+        context.admit(channel, connection, core, unit.envelope(), () -> {
+            if (unit.hasCoverage()) {
+                requireAssigned(core.sendCovered(unit.envelope().producer().tokens().get(0), unit.state(),
+                        packetId(unit.packets().get(0)), frames.get(0).frame(), unit.packets().get(0)));
+            } else if (unit.bundle() && frames.size() >= 2) {
+                List<SentPacket> sent = core.sendBundle(frames.get(0), frames.subList(1, frames.size() - 1),
+                        frames.get(frames.size() - 1));
+                if (sent == null || sent.size() != frames.size()) {
+                    throw new IllegalStateException("bundle admission was refused");
+                }
+                for (SentPacket handle : sent) {
+                    requireAssigned(handle);
+                }
+            } else {
+                for (int i = 0; i < frames.size(); i++) {
+                    final int member = i;
+                    // Reentrant invalidation during any member forbids all later members. The outer
+                    // monitor also excludes separate-thread invalidation throughout this unit.
+                    context.admit(channel, connection, core, unit.envelope(), () ->
+                            requireAssigned(core.send(unit.state(), packetId(unit.packets().get(member)),
+                                    frames.get(member).frame(), unit.packets().get(member))));
+                }
+            }
+        });
+    }
+
+    private static int packetId(byte[] packet) {
+        try {
+            return FrameCodec.packetId(packet);
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static void requireAssigned(@Nullable SentPacket handle) {
+        if (handle == null || !handle.isAssigned()) {
+            throw new IllegalStateException("core outbound assignment was refused");
+        }
+    }
+
+    /** Invalidate before queue discard or transport shutdown; never suppress individual tokens. */
+    private void invalidateAdmission() {
+        CausalSendContext current = causal;
+        if (current == null) {
+            current = CausalSendContext.attached(channel);
+        }
+        if (current != null) {
+            current.teardown();
         }
     }
 
@@ -594,6 +681,7 @@ public final class V3Join {
 
     /** The connection ended, whichever way: nothing of the join outlives it. */
     private void teardown() {
+        invalidateAdmission();
         secrets.wipe();
         discardRetained();
         BindingSession current = session;
@@ -614,6 +702,7 @@ public final class V3Join {
      * an internal-error close after it. Idempotent.
      */
     void fail(String reason, @Nullable Throwable cause) {
+        invalidateAdmission();
         int code = state.fail();
         if (code < 0) {
             return; // terminal: only the first failure closes
@@ -698,9 +787,13 @@ public final class V3Join {
                 promise.tryFailure(new java.nio.channels.ClosedChannelException());
                 return;
             }
-            OutboundUnit unit = new OutboundUnit(msg instanceof BundlePacket);
+            OutboundUnit unit = new OutboundUnit(msg instanceof BundlePacket,
+                    CausalSendContext.currentEnvelope(ctx.channel()));
             OutboundUnit outer = unitInFlight;
             try {
+                if (unit.envelope() == null) {
+                    throw new IllegalStateException("filtered GAME write has no causal envelope");
+                }
                 ProtocolState encoding = encoderState(ctx.pipeline());
                 if (encoding != null) {
                     // The encoder swaps itself out when it writes a terminal packet, so this is where
@@ -716,6 +809,9 @@ public final class V3Join {
                     unitInFlight = outer;
                 }
                 if (promise.isDone() && !promise.isSuccess()) {
+                    if (unit.hasCoverage()) {
+                        throw new IllegalStateException("encoder refused a covered write", promise.cause());
+                    }
                     return; // the encoder refused it: nothing partial goes anywhere
                 }
                 finish(unit);
@@ -726,6 +822,7 @@ public final class V3Join {
         }
 
         private void finish(OutboundUnit unit) {
+            unit.requireSupportedCoverage();
             if (unit.isEmpty()) {
                 return;
             }
@@ -745,6 +842,7 @@ public final class V3Join {
 
         @Override
         public void close(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+            invalidateAdmission();
             if (active) {
                 try {
                     connection.end();
@@ -767,9 +865,19 @@ public final class V3Join {
 
     /** The exchange does not hold this unit back: send it down the byte path exactly as TCP would. */
     private void replay(OutboundUnit unit) {
-        ChannelHandlerContext ctx = sinkContext;
-        for (byte[] packet : unit.packets()) {
-            ctx.write(io.netty.buffer.Unpooled.wrappedBuffer(packet));
+        try {
+            // Validate all framing before the first byte-path write, without consuming coverage.
+            frameUnit(unit, new PacketLaneCodec(channel.pipeline()));
+            CausalSendContext context = causalContext();
+            ChannelHandlerContext ctx = sinkContext;
+            context.replay(channel, connection, unit.envelope(), () -> {
+                for (byte[] packet : unit.packets()) {
+                    context.replay(channel, connection, unit.envelope(), () ->
+                            ctx.write(io.netty.buffer.Unpooled.wrappedBuffer(packet)));
+                }
+            });
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException(e);
         }
     }
 
@@ -810,9 +918,7 @@ public final class V3Join {
                 if (unit != null) {
                     unit.add(encoding, packet);
                 } else {
-                    OutboundUnit single = new OutboundUnit(false);
-                    single.add(encoding, packet);
-                    outHold.submit(single);
+                    throw new IllegalStateException("active encoder output has no causal outbound unit");
                 }
                 promise.trySuccess();
             } catch (Throwable t) {
