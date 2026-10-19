@@ -21,12 +21,19 @@ public final class CausalSendEnvelope {
     private final long sendId;
     private final Object connection;
     private final @Nullable Object sessionOwner;
+    private final @Nullable CausalSendContext origin;
     private final long epoch;
     private final ProducerSnapshot producer;
     private final BundleMetadata bundle;
 
+    /** Legacy construction has no admission origin and is never valid for V3 submission. */
     CausalSendEnvelope(long sendId, Object connection, @Nullable Object sessionOwner, long epoch,
             ProducerSnapshot producer, BundleMetadata bundle) {
+        this(sendId, connection, sessionOwner, epoch, producer, bundle, null);
+    }
+
+    CausalSendEnvelope(long sendId, Object connection, @Nullable Object sessionOwner, long epoch,
+            ProducerSnapshot producer, BundleMetadata bundle, @Nullable CausalSendContext origin) {
         if (sendId <= 0) {
             throw new IllegalArgumentException("sendId must be positive");
         }
@@ -36,6 +43,7 @@ public final class CausalSendEnvelope {
         this.sendId = sendId;
         this.connection = Objects.requireNonNull(connection, "connection");
         this.sessionOwner = sessionOwner;
+        this.origin = origin;
         this.epoch = epoch;
         this.producer = Objects.requireNonNull(producer, "producer");
         this.bundle = Objects.requireNonNull(bundle, "bundle");
@@ -54,6 +62,11 @@ public final class CausalSendEnvelope {
     /** The packet listener that owned the session when the send was snapshotted, or null. */
     public @Nullable Object sessionOwner() {
         return sessionOwner;
+    }
+
+    /** Stable allocation origin, independent of the game's replaceable packet listener. */
+    @Nullable CausalSendContext origin() {
+        return origin;
     }
 
     /** The lifecycle epoch stored by the connection at send time. */
