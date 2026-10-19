@@ -62,6 +62,10 @@ public class CausalSendContext {
     private final Map<Thread, Deque<Frame>> frames = new ConcurrentHashMap<>();
     /** Synchronous producer-scope frames by producer thread, innermost first on each stack. */
     private final Map<Thread, Deque<ProducerScope>> producerFrames = new ConcurrentHashMap<>();
+    /** Guards producer publication, removal, snapshot copying and terminal producer invalidation. */
+    private final Object producerMonitor = new Object();
+    /** Guarded by producerMonitor; terminal only for producer admission, not send-frame entry. */
+    private boolean producersClosed;
     private volatile long epoch;
 
     public CausalSendContext(Object connection) {
@@ -113,6 +117,8 @@ public class CausalSendContext {
      * Opens a producer scope on the current thread and copies its causal refs. Every envelope
      * created on this thread before the matching close snapshots these refs (outer frames first).
      * The frame is owned by the opening thread and is never visible to another thread's envelopes.
+     *
+     * @throws IllegalStateException if teardown has permanently closed producer admission
      */
     public ProducerScope openProducerScope(String name, List<MultistreamSession.CausalScope> scopes,
             List<MultistreamSession.UpdateToken> tokens) {
@@ -120,8 +126,13 @@ public class CausalSendContext {
         List<MultistreamSession.CausalScope> scopeCopy = List.copyOf(Objects.requireNonNull(scopes, "scopes"));
         List<MultistreamSession.UpdateToken> tokenCopy = List.copyOf(Objects.requireNonNull(tokens, "tokens"));
         ProducerScope scope = new ProducerScope(this, Thread.currentThread(), name, scopeCopy, tokenCopy);
-        // The frame is fully built before it becomes visible; publish is the last effect.
-        producerFrames.computeIfAbsent(scope.thread, ignored -> new ArrayDeque<>()).push(scope);
+        synchronized (producerMonitor) {
+            if (producersClosed) {
+                throw new IllegalStateException("producer admission is closed");
+            }
+            // The terminal check and publication are atomic with respect to teardown.
+            producerFrames.computeIfAbsent(scope.thread, ignored -> new ArrayDeque<>()).push(scope);
+        }
         return scope;
     }
 
@@ -134,20 +145,24 @@ public class CausalSendContext {
         if (scope == null || scope.owner != this || scope.thread != Thread.currentThread()) {
             return;
         }
-        Deque<ProducerScope> stack = producerFrames.get(scope.thread);
-        if (stack == null) {
-            return;
-        }
-        stack.remove(scope);
-        if (stack.isEmpty()) {
-            producerFrames.remove(scope.thread, stack);
+        synchronized (producerMonitor) {
+            Deque<ProducerScope> stack = producerFrames.get(scope.thread);
+            if (stack == null) {
+                return;
+            }
+            stack.remove(scope);
+            if (stack.isEmpty()) {
+                producerFrames.remove(scope.thread, stack);
+            }
         }
     }
 
     /**
      * The producer refs active on this thread, outer frame first, or {@link
      * CausalSendEnvelope.ProducerSnapshot#EMPTY} outside a producer scope. The snapshot is a copy:
-     * closing a frame afterwards does not change it.
+     * closing a frame afterwards does not change it. A snapshot copied before teardown may retain
+     * immutable old refs; one copied afterwards cannot read the removed producer frames. This is
+     * producer bookkeeping only, not lifecycle settlement or authorization for wire admission.
      */
     public CausalSendEnvelope.ProducerSnapshot currentProducerSnapshot() {
         CausalSendEnvelope.ProducerSnapshot active = activeProducerSnapshot();
@@ -270,13 +285,18 @@ public class CausalSendContext {
     }
 
     /**
-     * Drops every synchronous send and producer frame this connection still holds. A task that runs
-     * afterwards finds no envelope and still executes its vanilla action; a later send may enter
-     * again, and no producer ref is leaked into work that outlives the channel.
+     * Permanently closes producer admission and drops retained producer and synchronous send frames.
+     * Producer publication, removal and snapshot copying share this terminal invalidation boundary.
+     * Previously copied snapshots and carried envelopes are not invalidated or settled here: a
+     * deferred task still executes its vanilla action and may re-enter its original envelope.
+     * Send-frame entry and exit are not serialized by the producer monitor.
      */
     public void teardown() {
-        frames.clear();
-        producerFrames.clear();
+        synchronized (producerMonitor) {
+            producersClosed = true;
+            frames.clear();
+            producerFrames.clear();
+        }
     }
 
     /** Publishes this context on the connection's channel so write-side handlers can read it. */
@@ -305,19 +325,21 @@ public class CausalSendContext {
 
     /** The active frames' refs, outer frame first, or null when this thread has no producer frame. */
     private CausalSendEnvelope.@Nullable ProducerSnapshot activeProducerSnapshot() {
-        Deque<ProducerScope> stack = producerFrames.get(Thread.currentThread());
-        if (stack == null || stack.isEmpty()) {
-            return null;
+        synchronized (producerMonitor) {
+            Deque<ProducerScope> stack = producerFrames.get(Thread.currentThread());
+            if (stack == null || stack.isEmpty()) {
+                return null;
+            }
+            List<MultistreamSession.CausalScope> scopes = new ArrayList<>();
+            List<MultistreamSession.UpdateToken> tokens = new ArrayList<>();
+            // push() puts the innermost frame first, so iterate from the bottom for outer-to-inner order.
+            for (Iterator<ProducerScope> it = stack.descendingIterator(); it.hasNext();) {
+                ProducerScope scope = it.next();
+                scopes.addAll(scope.scopes());
+                tokens.addAll(scope.tokens());
+            }
+            return new CausalSendEnvelope.ProducerSnapshot(scopes, tokens, null, null);
         }
-        List<MultistreamSession.CausalScope> scopes = new ArrayList<>();
-        List<MultistreamSession.UpdateToken> tokens = new ArrayList<>();
-        // push() puts the innermost frame first, so iterate from the bottom for outer-to-inner order.
-        for (Iterator<ProducerScope> it = stack.descendingIterator(); it.hasNext();) {
-            ProducerScope scope = it.next();
-            scopes.addAll(scope.scopes());
-            tokens.addAll(scope.tokens());
-        }
-        return new CausalSendEnvelope.ProducerSnapshot(scopes, tokens, null, null);
     }
 
     /**
