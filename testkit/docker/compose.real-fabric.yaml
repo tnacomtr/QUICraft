@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Overlay for the real Fabric-server benchmark: exposes the unproxied fabric service and its
+# mock session server on loopback only, with a fixture entrypoint that owns the QUICraft
+# server config. Use together with docker/compose.yaml.
+#
+# The future launcher MUST start ONLY the named services `fabric` and `mocksession` in a fresh,
+# unique Compose project (`-p <unique>`). This overlay does NOT exclude velocity/paper: a plain
+# `docker compose up -d` would start every default service from compose.yaml.
+services:
+  mocksession:
+    ports:
+      - "127.0.0.1:${REAL_FABRIC_MOCK_PORT:-18080}:8080/tcp"
+
+  fabric:
+    # Testkit-only wrapper around the image's /usr/local/bin/fabric-entrypoint.sh; it validates
+    # its inputs and writes a fresh config before execing the normal entrypoint.
+    entrypoint: ["/bin/sh", "/usr/local/bin/real-client-fabric-entrypoint.sh"]
+    ports:
+      - "127.0.0.1:${REAL_FABRIC_PORT:-25575}:25565/tcp"
+      - "127.0.0.1:${REAL_FABRIC_PORT:-25575}:25565/udp"
+    environment:
+      FABRIC_ONLINE_MODE: ${REAL_FABRIC_ONLINE_MODE:-false}
+      REAL_FABRIC_MULTISTREAM: ${REAL_FABRIC_MULTISTREAM:-false}
+      # Keep the base service's switch: the mod is needed for QUIC and multistream.
+      QUICRAFT_PLUGIN: ${QUICRAFT_PLUGIN:-true}
+    volumes:
+      - ./fabric/real-client-entrypoint.sh:/usr/local/bin/real-client-fabric-entrypoint.sh:ro
