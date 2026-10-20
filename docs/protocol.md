@@ -1342,10 +1342,12 @@ before this revision can run.
    The causal machinery exists in core (`AckJoinTracker`, `SessionSendDriver.coverAssigned` and
    `assignedPending`), but no production adapter calls the coverage hooks (only bridge passthroughs
    and tests), and the route resolver fails closed on ACK_JOIN and BATCH_JOIN. A global ACK route alone
-   does not make block-update CHUNK routes safe, so those routes wait for that wiring. Later
-   block updates, forget and light remain global; the global fence orders them after every shard
-   record, preserving install-before-update and shard-before-forget ordering. REALTIME waits for
-   the latest CONTROL fence and the view gate is a fence for later REALTIME.
+   does not make block-update CHUNK routes safe (see 13.19 DRAFT). With the global fence giving
+   TCP order, block updates (8, 6) and section updates (84) are now safe on CHUNK shards (13.7),
+   while the ACK (4) and batch finished (11) stay CONTROL/global. Later block updates, forget
+   and light remain global; the global fence orders them after every shard record, preserving
+   install-before-update and shard-before-forget ordering. REALTIME waits for the latest
+   CONTROL fence and the view gate is a fence for later REALTIME.
    `ShippedRoutingTableTest` pins this reviewed relaxation.
 
    Deferrals, all CONTROL/global, with the reason for each:
