@@ -27,6 +27,7 @@ import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.ping.ServerboundPingRequestPacket;
+import rs.sudoe.quicraft.core.connect.ClientConnector;
 import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.transport.QuicClient;
@@ -94,12 +95,16 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             if (o.arm.equals("quic3")) {
                 check(client.multistreamConnector() != null, "multistream connector unavailable");
             }
-            check(GameTests.serverListPing(context, o.server), "status ping before the join failed");
-            InetSocketAddress key = new InetSocketAddress(InetAddress.getByName(o.host), o.port);
-            Advertisement ad = client.connector().advertisements().fresh(key).orElse(null);
-            check(ad != null, "no fresh advertisement cached for " + key + " after the status ping");
+            // A direct status request (as BenchClient's StatusPing), recorded under the connector's
+            // own key, so the join below takes the cached advertisement and runs no status query.
+            InetSocketAddress key = ClientConnector.key(new InetSocketAddress(InetAddress.getByName(o.host), o.port));
+            String status = statusJson(key);
+            Advertisement ad = Advertisement.extractForSelection(status).orElse(null);
+            check(ad != null, "no QUICraft advertisement in the status response: " + status);
             String expected = o.arm.equals("quic3") ? "quicraft/3" : null;
             check(expected == null || expected.equals(ad.alpn()), "server advertises " + ad.alpn());
+            client.connector().advertisements().record(key, java.util.Optional.of(ad));
+            check(client.connector().advertisements().fresh(key).isPresent(), "advertisement not cached for " + key);
         }
         ArmClock.reset();
         SENT.clear();
@@ -211,6 +216,55 @@ public class ExternalArmGameTest implements FabricClientGameTest {
                 ArmClock.chunks.get(), millis(ArmClock.lastChunkAt.get() - ArmClock.playLoginAt.get()), percentile(sorted, 0.5),
                 percentile(sorted, 0.95), sorted.length, sent, seen, ok));
         return row;
+    }
+
+    /** One status request over TCP (handshake, request, response); returns the status JSON. */
+    private static String statusJson(InetSocketAddress server) throws IOException {
+        try (java.net.Socket socket = new java.net.Socket()) {
+            socket.connect(server, 5_000);
+            socket.setSoTimeout(5_000);
+            java.io.ByteArrayOutputStream handshake = new java.io.ByteArrayOutputStream();
+            varInt(handshake, 0x00);
+            varInt(handshake, net.minecraft.SharedConstants.getProtocolVersion());
+            byte[] host = server.getHostString().getBytes(StandardCharsets.UTF_8);
+            varInt(handshake, host.length);
+            handshake.write(host);
+            handshake.write(server.getPort() >> 8);
+            handshake.write(server.getPort());
+            varInt(handshake, 1); // next state: status
+            java.io.ByteArrayOutputStream frames = new java.io.ByteArrayOutputStream();
+            varInt(frames, handshake.size());
+            handshake.writeTo(frames);
+            varInt(frames, 1);
+            varInt(frames, 0x00); // status request
+            socket.getOutputStream().write(frames.toByteArray());
+            java.io.DataInputStream in = new java.io.DataInputStream(socket.getInputStream());
+            readVarInt(in); // frame length
+            check(readVarInt(in) == 0x00, "unexpected status response packet");
+            byte[] json = new byte[readVarInt(in)];
+            in.readFully(json);
+            return new String(json, StandardCharsets.UTF_8);
+        }
+    }
+
+    private static void varInt(java.io.ByteArrayOutputStream out, int value) {
+        while ((value & ~0x7F) != 0) {
+            out.write((value & 0x7F) | 0x80);
+            value >>>= 7;
+        }
+        out.write(value);
+    }
+
+    private static int readVarInt(java.io.DataInputStream in) throws IOException {
+        int value = 0;
+        for (int shift = 0; shift < 35; shift += 7) {
+            int b = in.readUnsignedByte();
+            value |= (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) {
+                return value;
+            }
+        }
+        throw new IOException("varint too long");
     }
 
     /** Why the live transport is not the arm's, or null when it is. */
