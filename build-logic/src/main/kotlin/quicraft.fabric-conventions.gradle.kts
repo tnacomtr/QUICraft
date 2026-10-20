@@ -105,6 +105,19 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
     providers.gradleProperty("quicraft.externalServer").orNull?.let {
         property("quicraft.gametest.externalServer", it)
     }
+    // Opt-in: one real-Fabric benchmark sample per JVM (ExternalArmGameTest), driven by
+    // testkit/run-external-arms.sh: -Pquicraft.arm=tcp|quic2|quic3 plus -Pquicraft.armServer,
+    // armOut, armNetem, armRun, armWarmup, armCommit and optionally armPlaySeconds.
+    providers.gradleProperty("quicraft.arm").orNull?.let { arm ->
+        property("quicraft.gametest.arm", arm)
+        for (name in listOf("armServer", "armOut", "armNetem", "armRun", "armWarmup", "armCommit", "armPlaySeconds")) {
+            providers.gradleProperty("quicraft.$name").orNull?.let { property("quicraft.gametest.$name", it) }
+        }
+        // The offline /3 test profile; the server side gets it from the container fixture.
+        if (arm == "quic3") {
+            property("quicraft.multistream.offlineTest", "true")
+        }
+    }
     // Opt-in: online-mode login against the testkit's mock session server. The real client reads
     // its session/services/profiles hosts only when all three are set:
     // -Pquicraft.minecraftApi=http://127.0.0.1:8080
