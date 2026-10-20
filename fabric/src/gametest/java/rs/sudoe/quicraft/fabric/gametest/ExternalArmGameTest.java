@@ -11,7 +11,6 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
@@ -353,14 +352,33 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         runs.add(row);
         doc.add("runs", runs);
         String json = new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(doc) + "\n";
+        check(!Files.exists(o.out), "refusing to overwrite " + o.out);
+        Path tmp = o.out.resolveSibling(o.out.getFileName() + ".tmp");
+        boolean ownsTmp = false;
         try {
-            check(!Files.exists(o.out), "refusing to overwrite " + o.out);
-            Path tmp = o.out.resolveSibling(o.out.getFileName() + ".tmp");
-            Files.writeString(tmp, json, StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW,
-                    StandardOpenOption.WRITE);
-            Files.move(tmp, o.out, StandardCopyOption.ATOMIC_MOVE);
+            // One O_EXCL handle: fails if the name exists (symlink included), so ownership starts here
+            // and the bytes go to the file this call created.
+            try (java.nio.channels.SeekableByteChannel ch = Files.newByteChannel(tmp,
+                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                ownsTmp = true;
+                java.nio.ByteBuffer bytes = java.nio.ByteBuffer.wrap(json.getBytes(StandardCharsets.UTF_8));
+                while (bytes.hasRemaining()) {
+                    ch.write(bytes);
+                }
+            }
+            // A hard link publishes the complete file atomically and fails if the name exists,
+            // unlike a rename, which would replace a file created after the check above.
+            Files.createLink(o.out, tmp);
         } catch (IOException e) {
             throw new AssertionError("could not write " + o.out, e);
+        } finally {
+            try {
+                if (ownsTmp) { // never remove a temp file someone else left there
+                    Files.deleteIfExists(tmp);
+                }
+            } catch (IOException ignored) {
+                // the runner reports a leftover side file
+            }
         }
         QuicraftFabricTestLog.info("arm sample written to " + o.out);
     }
