@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.bridge.status;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -25,24 +26,86 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 @SuppressWarnings("deprecation") // NioEventLoopGroup: deprecated in 4.2, the only choice in 4.1
 class StatusHandlersTest {
     private static Advertisement ad;
+    /** The same listener advertising {@code quicraft/3} with one routing digest (13.1). */
+    private static Advertisement adV3;
+    private static int routingProtocol;
+    private static String routingDigest;
     private static final String STATUS = "{\"version\":{\"name\":\"26.1.2\",\"protocol\":775},\"description\":\"hi\"}";
 
     @BeforeAll
     static void setUp() throws Exception {
         ad = Advertisement.v1(25566, ServerIdentity.generate().fingerprint());
+        routingProtocol = 775;
+        routingDigest = "sha256:" + hexDigits('a');
+        adV3 = Advertisement.of(Protocol.ALPN_V3, 25566, ad.fingerprint(),
+                Collections.singletonMap(routingProtocol, routingDigest));
+    }
+
+    private static String hexDigits(char digit) {
+        StringBuilder text = new StringBuilder(64);
+        for (int i = 0; i < 64; i++) {
+            text.append(digit);
+        }
+        return text.toString();
+    }
+
+    /** Records exactly what the sniffer reported and how often, for the one-shot assertions. */
+    private static final class Observed implements Consumer<Optional<Advertisement>> {
+        final AtomicInteger calls = new AtomicInteger();
+        volatile Optional<Advertisement> last = Optional.empty();
+
+        @Override
+        public void accept(Optional<Advertisement> result) {
+            last = result;
+            calls.incrementAndGet();
+        }
+    }
+
+    /** A pipeline like the client's status one: a stand-in frame decoder, then the sniffer under test. */
+    private static EmbeddedChannel snifferOnly(boolean selectionAware, Observed seen) {
+        EmbeddedChannel ch = new EmbeddedChannel();
+        ch.pipeline().addLast("splitter", new ChannelInboundHandlerAdapter());
+        if (selectionAware) {
+            StatusSniffer.installForSelection(ch.pipeline(), "splitter", seen);
+        } else {
+            StatusSniffer.install(ch.pipeline(), "splitter", seen);
+        }
+        return ch;
+    }
+
+    /**
+     * What the pipeline reads next is the frame the sniffer saw: the original object, the reader
+     * index it found, its reference count and its bytes.
+     */
+    private static void assertPassedUnchanged(EmbeddedChannel ch, ByteBuf frame, ByteBuf original,
+            int readerIndex) {
+        ByteBuf passed = ch.readInbound();
+        assertSame(frame, passed, "the sniffer passes the pipeline's own frame on, never a copy");
+        assertEquals(readerIndex, passed.readerIndex(), "the reader index is exactly where it was found");
+        assertEquals(1, passed.refCnt(), "the sniffer must neither release nor retain the frame");
+        try {
+            assertEquals(original, passed, "the bytes the game's status parsing sees are unchanged");
+        } finally {
+            original.release();
+            passed.release();
+        }
     }
 
     /** A game-like pipeline: pass-through stand-ins for the frame decoder and encoder. */
@@ -69,6 +132,14 @@ class StatusHandlersTest {
         Wire.writeVarInt(b, 0);
         Wire.writeString(b, json);
         return b;
+    }
+
+    /** A status response frame with two bytes before it, so the reader index found is not zero. */
+    private static ByteBuf prefixedStatusResponse(String json) {
+        ByteBuf body = statusResponse(json);
+        ByteBuf frame = Unpooled.buffer().writeByte(0x55).writeByte(0x56).writeBytes(body);
+        body.release();
+        return frame;
     }
 
     private static String json(ByteBuf packet) {
@@ -181,6 +252,91 @@ class StatusHandlersTest {
         ((ByteBuf) plain.readInbound()).release();
         assertEquals(Optional.empty(), none.get());
         plain.finishAndReleaseAll();
+    }
+
+    @Test
+    void theShippedInstallStillReportsNoAdvertisementForAQuicraft3Response() {
+        Observed seen = new Observed();
+        EmbeddedChannel ch = snifferOnly(false, seen);
+        ByteBuf frame = statusResponse(adV3.insertInto(STATUS));
+        ByteBuf original = frame.copy();
+        ch.writeInbound(frame);
+        assertPassedUnchanged(ch, frame, original, 0);
+        assertEquals(Optional.empty(), seen.last, "13.1: the shipped parse keeps rejecting quicraft/3");
+        assertEquals(1, seen.calls.get());
+        assertNull(ch.pipeline().get(StatusSniffer.NAME), "the shipped sniffer still leaves anyway");
+
+        ByteBuf again = statusResponse(adV3.insertInto(STATUS));
+        ByteBuf againOriginal = again.copy();
+        ch.writeInbound(again);
+        assertPassedUnchanged(ch, again, againOriginal, 0);
+        assertEquals(1, seen.calls.get(), "the one-shot removal never reports the same result twice");
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    void theSelectionInstallReadsTheQuicraft3AdvertisementWithItsRoutingIntact() {
+        Observed seen = new Observed();
+        EmbeddedChannel ch = snifferOnly(true, seen);
+        ByteBuf frame = prefixedStatusResponse(adV3.insertInto(STATUS));
+        frame.readerIndex(2);
+        ByteBuf original = frame.copy();
+        ch.writeInbound(frame);
+        assertPassedUnchanged(ch, frame, original, 2);
+        assertEquals(1, seen.calls.get());
+        assertEquals(Optional.of(adV3), seen.last, "13.1: the opt-in parse accepts quicraft/3");
+        assertEquals(routingDigest, seen.last.get().routingDigest(routingProtocol).orElse("missing"),
+                "the routing member of " + routingProtocol + " is read, not dropped");
+        assertNull(ch.pipeline().get(StatusSniffer.NAME), "and the sniffer still leaves after one frame");
+
+        ByteBuf again = statusResponse(adV3.insertInto(STATUS));
+        ByteBuf againOriginal = again.copy();
+        ch.writeInbound(again);
+        assertPassedUnchanged(ch, again, againOriginal, 0);
+        assertEquals(1, seen.calls.get(), "a frame after the one-shot removal never reaches the handler");
+        assertEquals(Optional.of(adV3), seen.last, "so the recorded advertisement is still the first");
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    void bothInstallsReadTheQuicraft2AdvertisementTheSameWay() {
+        String status = ad.insertInto(STATUS);
+        for (boolean selectionAware : new boolean[] {false, true}) {
+            Observed seen = new Observed();
+            EmbeddedChannel ch = snifferOnly(selectionAware, seen);
+            ByteBuf frame = statusResponse(status);
+            ByteBuf original = frame.copy();
+            ch.writeInbound(frame);
+            assertPassedUnchanged(ch, frame, original, 0);
+            assertEquals(1, seen.calls.get());
+            assertEquals(Optional.of(ad), seen.last,
+                    (selectionAware ? "the selection" : "the shipped") + " install reads quicraft/2");
+            assertEquals(Collections.emptyMap(), seen.last.get().routing(),
+                    "the /2 parse still carries no routing");
+            ch.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    void anUnknownAlpnOrMalformedJsonIsNoAdvertisementToEitherInstall() {
+        String unknown = adV3.insertInto(STATUS).replace("\"quicraft/3\"", "\"quicraft/9\"");
+        String malformed = STATUS.substring(0, STATUS.length() - 1); // an unterminated object
+        for (boolean selectionAware : new boolean[] {false, true}) {
+            for (String broken : new String[] {unknown, malformed}) {
+                Observed seen = new Observed();
+                EmbeddedChannel ch = snifferOnly(selectionAware, seen);
+                ByteBuf frame = statusResponse(broken);
+                ByteBuf original = frame.copy();
+                ch.writeInbound(frame);
+                assertPassedUnchanged(ch, frame, original, 0);
+                assertEquals(1, seen.calls.get());
+                assertEquals(Optional.empty(), seen.last,
+                        (selectionAware ? "the selection" : "the shipped")
+                                + " install treats broken status as no advertisement");
+                assertNull(ch.pipeline().get(StatusSniffer.NAME), "and still leaves, frame passed on");
+                ch.finishAndReleaseAll();
+            }
+        }
     }
 
     /** One-shot status server on a plain socket: checks the handshake, answers with {@code json}. */

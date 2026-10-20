@@ -42,6 +42,8 @@ public final class CausalSendGameTest implements FabricClientGameTest {
 
     @Override public void runTest(ClientGameTestContext context) {
         String runId = readRunId();
+        BindingCodecProbe.probe(context, runId);
+        RealClientV3GameTest.smoke(context, runId);
         Instant started = Instant.now();
         Path dir = outputDir();
         List<String> errors = new ArrayList<>();

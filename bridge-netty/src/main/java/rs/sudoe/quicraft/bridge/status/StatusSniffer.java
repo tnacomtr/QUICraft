@@ -19,15 +19,28 @@ public final class StatusSniffer extends ChannelInboundHandlerAdapter {
     public static final String NAME = "quicraft-sniffer";
 
     private final Consumer<Optional<Advertisement>> result;
+    private final boolean selectionAware;
 
-    private StatusSniffer(Consumer<Optional<Advertisement>> result) {
+    private StatusSniffer(Consumer<Optional<Advertisement>> result, boolean selectionAware) {
         this.result = result;
+        this.selectionAware = selectionAware;
     }
 
     /** Installs after {@code frameDecoder}; does nothing if that is missing. */
     public static void install(ChannelPipeline pipeline, String frameDecoder, Consumer<Optional<Advertisement>> result) {
+        install(pipeline, frameDecoder, result, false);
+    }
+
+    /** Installs like {@link #install} but also reads a {@code quicraft/3} advertisement for selection. */
+    public static void installForSelection(ChannelPipeline pipeline, String frameDecoder,
+            Consumer<Optional<Advertisement>> result) {
+        install(pipeline, frameDecoder, result, true);
+    }
+
+    private static void install(ChannelPipeline pipeline, String frameDecoder,
+            Consumer<Optional<Advertisement>> result, boolean selectionAware) {
         if (pipeline.get(frameDecoder) != null && pipeline.get(NAME) == null) {
-            pipeline.addAfter(frameDecoder, NAME, new StatusSniffer(result));
+            pipeline.addAfter(frameDecoder, NAME, new StatusSniffer(result, selectionAware));
         }
     }
 
@@ -41,7 +54,7 @@ public final class StatusSniffer extends ChannelInboundHandlerAdapter {
                 Integer id = Wire.readVarInt(frame);
                 String json = id != null && id == 0 ? Wire.readString(frame, Wire.MAX_STATUS_BYTES) : null;
                 if (json != null) {
-                    ad = Advertisement.extract(json);
+                    ad = selectionAware ? Advertisement.extractForSelection(json) : Advertisement.extract(json);
                 }
             } catch (RuntimeException e) {
                 ad = Optional.empty();

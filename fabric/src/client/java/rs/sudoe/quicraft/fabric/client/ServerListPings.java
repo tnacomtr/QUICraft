@@ -3,9 +3,12 @@ package rs.sudoe.quicraft.fabric.client;
 
 import io.netty.channel.Channel;
 import java.net.InetSocketAddress;
+import java.util.Optional;
+import java.util.function.Consumer;
 import net.minecraft.network.Connection;
 import rs.sudoe.quicraft.bridge.status.StatusSniffer;
 import rs.sudoe.quicraft.core.connect.ClientConnector;
+import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
 
@@ -23,8 +26,13 @@ public final class ServerListPings {
                 return;
             }
             InetSocketAddress key = ClientConnector.key(remote);
-            StatusSniffer.install(channel.pipeline(), "splitter",
-                    ad -> client.connector().advertisements().record(key, ad));
+            Consumer<Optional<Advertisement>> record =
+                    ad -> client.connector().advertisements().record(key, ad);
+            if (client.multistream()) {
+                StatusSniffer.installForSelection(channel.pipeline(), "splitter", record);
+            } else {
+                StatusSniffer.install(channel.pipeline(), "splitter", record);
+            }
         } catch (Throwable t) {
             Hooks.failed("server list ping", t);
         }

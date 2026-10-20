@@ -52,6 +52,8 @@ import rs.sudoe.quicraft.fabric.mixin.CipherDecoderAccessor;
 import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
 import rs.sudoe.quicraft.fabric.mixin.PacketEncoderAccessor;
 
+import rs.sudoe.quicraft.fabric.net.BindingDecodeContext;
+import rs.sudoe.quicraft.fabric.net.BindingPayload;
 import rs.sudoe.quicraft.fabric.net.FrameCodec;
 import rs.sudoe.quicraft.fabric.net.PacketLaneCodec;
 
@@ -69,7 +71,7 @@ import rs.sudoe.quicraft.fabric.net.PacketLaneCodec;
  * <p>Threading: everything runs on the connection's event loop (which is the game channel's own)
  * except {@link #holdTask}'s tick, which only reads a flag.</p>
  */
-public final class V3Join {
+public final class V3Join implements BindingDecodeContext.Gate {
     private static final AttributeKey<V3Join> KEY = AttributeKey.valueOf("quicraft.v3join");
     private static final String PACKET_HANDLER = "packet_handler";
     private static final String DECRYPT = "decrypt";
@@ -139,13 +141,23 @@ public final class V3Join {
     /** Hook (listener accept): marks a bridge channel as a {@code /3} connection. Never throws. */
     static void attach(QuicBridgeChannel channel, V3Connection connection, MinecraftServer server,
             byte[] fingerprint, ReceiveBudget node) {
+        V3Join join = null;
         try {
-            V3Join join = new V3Join(channel, connection, server, fingerprint, node);
-            channel.attr(KEY).set(join);
+            V3Join attached = new V3Join(channel, connection, server, fingerprint, node);
+            join = attached;
             // Every way a join ends, a held secret, the binding session and a taken-over buffer go.
-            channel.closeFuture().addListener(f -> join.teardown());
+            channel.closeFuture().addListener(f -> attached.teardown());
+            if (channel.closeFuture().isDone()) {
+                throw new IllegalStateException("cannot attach binding to a closed channel");
+            }
+            channel.attr(KEY).set(attached);
+            channel.attr(BindingDecodeContext.SERVER_GATE).set(attached);
         } catch (Throwable t) {
-            // No attribute: the connection can never bind, so close it where it stands.
+            if (join != null) {
+                join.clearBindingGate();
+                channel.attr(KEY).compareAndSet(join, null);
+            }
+            // No owned gate: the connection can never bind, so close it where it stands.
             Hooks.failed("v3 attach", t);
             try {
                 connection.abort(Protocol.CLOSE_BINDING_FAILURE);
@@ -165,6 +177,16 @@ public final class V3Join {
     }
 
     // --- Hooks, called by the mixins.
+
+    /** Keep unsolicited NEW and unexpected ACTIVE payloads visible to the fail-closed validator. */
+    @Override
+    public boolean expectsBinding() {
+        return !state.failed();
+    }
+
+    private void clearBindingGate() {
+        channel.attr(BindingDecodeContext.SERVER_GATE).compareAndSet(this, null);
+    }
 
     /** Hook (login): Minecraft's shared secret {@code S} (12.6), kept only until binding starts. */
     public void onSecret(byte[] encoded) {
@@ -398,7 +420,7 @@ public final class V3Join {
         if (self == null) {
             throw new IllegalStateException("no outbound filter to write binding payloads below");
         }
-        lastBindingWrite = self.writeAndFlush(new ClientboundCustomPayloadPacket(new ServerBindingPayload(payload)));
+        lastBindingWrite = self.writeAndFlush(new ClientboundCustomPayloadPacket(new BindingPayload(payload)));
     }
 
     /**
@@ -681,6 +703,7 @@ public final class V3Join {
 
     /** The connection ended, whichever way: nothing of the join outlives it. */
     private void teardown() {
+        clearBindingGate();
         invalidateAdmission();
         secrets.wipe();
         discardRetained();
@@ -702,6 +725,7 @@ public final class V3Join {
      * an internal-error close after it. Idempotent.
      */
     void fail(String reason, @Nullable Throwable cause) {
+        clearBindingGate();
         invalidateAdmission();
         int code = state.fail();
         if (code < 0) {
