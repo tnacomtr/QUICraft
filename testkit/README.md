@@ -82,6 +82,46 @@ that its early-release count goes from 0 to 1 over the two connections and saves
 under `results/`. Needs a display or `xvfb-run`, and port 25565 free. Offline mode only: the
 client's authlib finds its session server through a discovery URL the mock doesn't serve.
 
+### External arms: real Fabric client against a fresh server
+
+```sh
+testkit/run-external-arms.sh --arm quic3 --run 0 --out-dir /tmp/opencode/arms
+testkit/run-external-arms.sh --arm tcp --run 0 --warmup --out-dir /tmp/opencode/arms
+```
+
+One invocation runs exactly one arm (`tcp`, `quic2`, `quic3`) against one fresh Fabric dedicated
+server container and one fresh client JVM. It refuses a dirty tracked tree, records `HEAD` as the
+build commit, starts ONLY `fabric` and `mocksession` from `docker/compose.yaml` +
+`docker/compose.real-fabric.yaml` in a fresh unique Compose project, waits for the loopback port,
+narrows the gametest `fabric.mod.json` to `ExternalArmGameTest`, and restores it byte for byte on
+every exit path. Teardown is scoped to that project (`down -v --remove-orphans`), including on
+failure; no image, host qdisc, route or firewall is touched. The run succeeds only when
+`<out-dir>/<arm>-<netem>-run<N>.json` exists, parses, and `runs[0].ok` is true.
+
+Options/knobs: `--port` (default 25575), `--play-seconds` (default 20), `--netem` (only `clean` is
+implemented; other profiles are refused until the server-side shaping unit lands),
+`QUICRAFT_ARM_READY_TIMEOUT` (180 s) and `QUICRAFT_ARM_MOD_JSON` (the entrypoint file; tests use a
+copy). Needs Docker Compose v2, JDK 25, `python3`, `git`, `flock`, and a display or `xvfb-run`.
+`ExternalArmGameTest` is deliberately not in the committed entrypoint list; the runner adds it for
+the invocation only.
+
+Merge the per-run documents of one arm and profile (all inputs must agree on clientType, arm,
+netemProfile, profile, server and build commit; run indexes must be unique; the output is written
+atomically and never overwritten):
+
+```sh
+python3 -I testkit/merge-arm-samples.py --out /tmp/opencode/arms/clean-quic-3.json \
+    /tmp/opencode/arms/quic3-clean-run0.json /tmp/opencode/arms/quic3-clean-run1.json
+```
+
+For `/3`, validate the merged document with the testkit CLI (the same `v3-samples` command that
+`run-matrix.sh` uses for its fail-closed row):
+
+```sh
+./gradlew :testkit:installDist
+testkit/build/install/quicraft-testkit/bin/quicraft-testkit v3-samples --in /tmp/opencode/arms/clean-quic-3.json
+```
+
 ### Updater end-to-end on a real server
 
 ```sh
