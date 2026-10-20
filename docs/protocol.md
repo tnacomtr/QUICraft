@@ -1329,11 +1329,16 @@ before this revision can run.
     CHUNK routes are enabled only for reviewed production extractors whose captured vectors,
     independent golden vectors, shipped-table coverage and ordering tests pass; the ordering
     argument and remaining deferrals are below.
-    Shipped routing, ordering argument (26.1.2). Only `level_chunk_with_light` (45) uses CHUNK,
-    with the reviewed `mc775.chunk_xz.v1` extractor. `block_update` (8), `block_entity_data` (6),
-    `section_blocks_update` (84) and `block_changed_ack` (4) stay CONTROL/global. The reason is
-    13.19: a covered update must be ordered before its acknowledgement even when the game emits
-    the acknowledgement first.
+    Shipped routing, ordering argument (26.1.2). **DRAFT pending security review.** `level_chunk_with_light`
+    (45) uses CHUNK with `mc775.chunk_xz.v1`. `block_update` (8) and `block_entity_data` (6) use CHUNK
+    with `mc775.block_position.v1` (lane order: install < update < entity data). `section_blocks_update`
+    (84) uses CHUNK with `mc775.section_position.v1`. `block_changed_ack` (4) and `chunk_batch_finished`
+    (11) stay CONTROL/global: no ACK_JOIN/BATCH_JOIN is needed, because the global fence gives TCP
+    order. `MinecraftServer.tickChildren` (line 1081+, 26.1.2 source) broadcasts block updates
+    (`ServerChunkCache.tick` -> `chunkHolder.broadcastChanges`) before `tickConnection()` ->
+    `ServerGamePacketListenerImpl.tick()` (line 291-293) sends `ClientboundBlockChangedAckPacket`.
+    So the game's own stream has covered updates before the ACK; the global fence equals TCP
+    order exactly, making the covered-update-first invariant true without coverage metadata.
    The causal machinery exists in core (`AckJoinTracker`, `SessionSendDriver.coverAssigned` and
    `assignedPending`), but no production adapter calls the coverage hooks (only bridge passthroughs
    and tests), and the route resolver fails closed on ACK_JOIN and BATCH_JOIN. A global ACK route alone
@@ -1375,8 +1380,8 @@ before this revision can run.
    | --- | --- | --- | --- |
    | `mc775.chunk_list.v1` | `chunks_biomes` (13) | CONTROL/global, list extractor | `captured-775-vectors.txt` |
    | `mc775.chunk_xz.v1` | `level_chunk_with_light` (45) | CHUNK/lane install | `captured-775-vectors.txt` |
-   | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | CONTROL/global pending ACK coverage | `captured-775-vectors.txt` |
-   | `mc775.section_position.v1` | `section_blocks_update` (84) | CONTROL/global pending ACK coverage | `captured-775-vectors.txt` |
+   | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | CHUNK/lane block and block-entity update (13.7) | `captured-775-vectors.txt` |
+   | `mc775.section_position.v1` | `section_blocks_update` (84) | CHUNK/lane section update (13.7) | `captured-775-vectors.txt` |
    | `mc775.join.v1` | `block_changed_ack` (4), `chunk_batch_finished` (11) | none: joins deferred | `captured-775-vectors.txt` |
    | `mc775.raw_copies.v1` | footprint accounting for every state's serverbound limits | `decodeFootprintBound` | 13.12 boundary vectors in `ExtractorGoldenTest` |
 
@@ -1426,8 +1431,10 @@ before this revision can run.
      the synthetic `primitive.varint_xz.v1` for the oracle. `set_chunk_cache_center` is the one
      packet observed with leading VarInt x/z, but it is a view packet, not a CHUNK-lane one, so
      it does not justify a production identifier for that layout.
-   `block_update` (8), `block_entity_data` (6) and `section_blocks_update` (84) remain
-   CONTROL/global until ACK/BATCH causal coverage (13.19) is wired. Joins (4/11),
+   `block_update` (8) and `block_entity_data` (6) (CHUNK with `mc775.block_position.v1`), and
+   `section_blocks_update` (84) (CHUNK with `mc775.section_position.v1`) ship in this release.
+   `block_changed_ack` (4) and `chunk_batch_finished` (11) stay CONTROL/global; no ACK_JOIN/BATCH_JOIN
+   is needed because the global fence gives TCP order. Joins (4/11),
    `forget_level_chunk` (37) and `light_update` (48) remain unchanged; the latter two lack
    reviewed production layouts.
 
@@ -2168,11 +2175,18 @@ before this revision can run.
     and successive epochs before implementation is accepted. The owner approved this hash
     (answered question 2); it is not an implementation choice.
 
-19. **13.19 Join records.** Joins live on CHUNK[0], even when their semantic positions hash
-    elsewhere. They have explicit dependencies on the actual covered frontiers, not an
-    estimate based on packet size, most recently installed chunk, or packet sequence field.
-    Their own-stream predecessor is implicit. They never become CONTROL/view/global
-    frontiers merely because they are joins; unrelated CONTROL and REALTIME continue.
+19. **13.19 Join records. DRAFT pending security review.** No ACK_JOIN or BATCH_JOIN is needed:
+    the global fence gives TCP order. `MinecraftServer.tickChildren` broadcasts block updates
+    (through `ServerChunkCache.tick` -> `chunkHolder.broadcastChanges`) before `tickConnection()`
+    (`MinecraftServer` line 1081+, 26.1.2 source) sends `ClientboundBlockChangedAckPacket`
+    (`ServerGamePacketListenerImpl.tick`, lines 291-293). So in vanilla's stream covered updates
+    precede their ACK; the global fence equals TCP order exactly, so the ACK stays
+    CONTROL/global with no coverage metadata required. `chunk_batch_finished` (11) also stays
+    CONTROL/global for the same reason. Joins live on CHUNK[0] only when a verified adapter
+    implements exact causal coverage; they have explicit dependencies on covered frontiers,
+    not estimates based on packet size or sequence. Their own-stream predecessor is implicit.
+    They never become CONTROL/view/global frontiers merely because they are joins; unrelated
+    CONTROL and REALTIME continue.
     - **ACK_JOIN (block_changed_ack):** the adapter tracks the causal set of authoritative
       block/section/block-entity updates covered by the game prediction sequence. At the ack's
       logical send point, take the maximum sequence of every covered update on each chunk
