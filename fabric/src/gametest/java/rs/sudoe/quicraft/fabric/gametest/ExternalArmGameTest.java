@@ -241,7 +241,9 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             java.io.DataInputStream in = new java.io.DataInputStream(socket.getInputStream());
             readVarInt(in); // frame length
             check(readVarInt(in) == 0x00, "unexpected status response packet");
-            byte[] json = new byte[readVarInt(in)];
+            int length = readVarInt(in);
+            check(length >= 0 && length <= 32767 * 4, "status response length out of range: " + length);
+            byte[] json = new byte[length];
             in.readFully(json);
             return new String(json, StandardCharsets.UTF_8);
         }

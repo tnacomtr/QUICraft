@@ -308,7 +308,13 @@ echo "== build :fabric-26x:testkitMod (image build context, commit $commit)"
 # REAL_FABRIC_ONLINE_MODE and REAL_FABRIC_MULTISTREAM. Set all of them so neither file can
 # silently fall back to its default.
 export FABRIC_ONLINE_MODE=false REAL_FABRIC_ONLINE_MODE=false
-export REAL_FABRIC_MULTISTREAM=true REAL_FABRIC_PORT="$port"
+# A /3 listener is /3-only (QuicServer: a /2 client fails the ALPN), so the /2 arm needs the same
+# build with multistream off; tcp and quic3 run against the /3 server.
+server_multistream=true
+if [[ "$arm" == quic2 ]]; then
+    server_multistream=false
+fi
+export REAL_FABRIC_MULTISTREAM="$server_multistream" REAL_FABRIC_PORT="$port"
 echo "== compose up ($project): fabric mocksession"
 project_started=true
 if ! "${compose[@]}" up -d --build fabric mocksession; then

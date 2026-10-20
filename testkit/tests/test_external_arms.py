@@ -373,7 +373,7 @@ class RunnerRunTest(Fixture):
         environment = self.docker_environments()[0]
         self.assertEqual(environment["FABRIC_ONLINE_MODE"], "false")
         self.assertEqual(environment["REAL_FABRIC_ONLINE_MODE"], "false")
-        self.assertEqual(environment["REAL_FABRIC_MULTISTREAM"], "true")
+        self.assertEqual(environment["REAL_FABRIC_MULTISTREAM"], "true")  # tcp arm; quic2 runs false
         self.assertEqual(environment["REAL_FABRIC_PORT"], self.port)
 
         downs = self.down_calls()
