@@ -115,26 +115,9 @@ public final class V3Samples {
             return 2;
         }
 
-        byte[] bytes;
-        try (InputStream in = Files.newInputStream(path)) {
-            bytes = in.readNBytes(MAX_BYTES + 1);
-        } catch (IOException e) {
-            return invalid("cannot read " + path + ": " + e.getMessage());
-        }
-        if (bytes.length > MAX_BYTES) {
-            return invalid("input is larger than " + MAX_BYTES + " bytes");
-        }
-
-        String text;
-        try {
-            text = UTF8.decode(ByteBuffer.wrap(bytes)).toString();
-        } catch (CharacterCodingException e) {
-            return invalid("input is not valid UTF-8");
-        }
-
         JsonElement root;
         try {
-            root = readDocument(text);
+            root = parse(path);
         } catch (InvalidDocument e) {
             return invalid(e.getMessage());
         } catch (IOException | RuntimeException e) {
@@ -158,12 +141,38 @@ public final class V3Samples {
     }
 
     /**
+     * Reads and strictly parses one document: at most {@link #MAX_BYTES} bytes, strict UTF-8,
+     * strict JSON syntax with no duplicate keys, at most {@link #MAX_DEPTH} levels and no trailing
+     * tokens. Shared with {@link ArmSamples} so every arm applies the same parser and limits;
+     * reading never writes.
+     */
+    static JsonElement parse(Path path) throws IOException, InvalidDocument {
+        byte[] bytes;
+        try (InputStream in = Files.newInputStream(path)) {
+            bytes = in.readNBytes(MAX_BYTES + 1);
+        } catch (IOException e) {
+            throw new InvalidDocument("cannot read " + path + ": " + e.getMessage());
+        }
+        if (bytes.length > MAX_BYTES) {
+            throw new InvalidDocument("input is larger than " + MAX_BYTES + " bytes");
+        }
+
+        String text;
+        try {
+            text = UTF8.decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException e) {
+            throw new InvalidDocument("input is not valid UTF-8");
+        }
+        return readDocument(text);
+    }
+
+    /**
      * Makes a rejection detail safe for stderr: LF, CR, TAB and every other ISO control character
      * (including DEL and C1) become printable escapes, and the result is capped at
      * {@link #MAX_DETAIL_LENGTH} emitted characters. Truncation happens between whole tokens, so
      * an escape is never cut, and reserves room for the marker inside the cap.
      */
-    private static String sanitize(String detail) {
+    static String sanitize(String detail) {
         if (detail == null) {
             return "invalid document";
         }
@@ -212,7 +221,7 @@ public final class V3Samples {
     }
 
     /** Counts of a valid document, for the success line only; never a performance value. */
-    private record Summary(int rows, int measured, int warmup) {}
+    record Summary(int rows, int measured, int warmup) {}
 
     private static JsonElement readDocument(String text) throws IOException, InvalidDocument {
         JsonReader reader = new JsonReader(new StringReader(text));
@@ -288,7 +297,30 @@ public final class V3Samples {
         }
     }
 
-    private static Summary validate(JsonElement rootElement) throws InvalidDocument {
+    /**
+     * Validates one complete {@code /3} document: envelope, every row's shape and transport
+     * evidence, and the cross-row identity rules.
+     */
+    static Summary validate(JsonElement rootElement) throws InvalidDocument {
+        JsonArray runs = validateEnvelope(rootElement, "-quic-3");
+        List<RunResult> results = validateRows(runs, V3Samples::validateRow);
+        requireSharedIdentity(results);
+        int warmups = 0;
+        for (RunResult result : results) {
+            if (result.warmup()) {
+                warmups++;
+            }
+        }
+        return new Summary(results.size(), results.size() - warmups, warmups);
+    }
+
+    /**
+     * Validates the envelope every merged samples document shares, returning its nonempty row
+     * array. {@code profileSuffix} is the suffix the profile must end with: {@code -quic-3} here,
+     * {@code -tcp} or {@code -quic-2} for {@link ArmSamples}.
+     */
+    static JsonArray validateEnvelope(JsonElement rootElement, String profileSuffix)
+            throws InvalidDocument {
         JsonObject root = asObject(rootElement, "root");
         String clientType = stringField(root, "clientType", "root");
         if (!"fabric".equals(clientType)) {
@@ -300,7 +332,7 @@ public final class V3Samples {
                     + quote(netemProfile));
         }
         String profile = stringField(root, "profile", "root");
-        String expectedProfile = netemProfile + "-quic-3";
+        String expectedProfile = netemProfile + profileSuffix;
         if (!expectedProfile.equals(profile)) {
             throw new InvalidDocument("root.profile must be " + quote(expectedProfile) + ", not "
                     + quote(profile));
@@ -309,13 +341,27 @@ public final class V3Samples {
         if (runs.isEmpty()) {
             throw new InvalidDocument("root.runs must hold at least one row");
         }
+        return runs;
+    }
 
+    /** A row validator returning the parsed result after its own transport-specific gates. */
+    @FunctionalInterface
+    interface RowValidator {
+        RunResult validate(JsonObject row, String what) throws InvalidDocument;
+    }
+
+    /**
+     * Validates every row with {@code validator}, rejects duplicate run indexes and a document
+     * holding only warmup rows.
+     */
+    static List<RunResult> validateRows(JsonArray runs, RowValidator validator)
+            throws InvalidDocument {
         List<RunResult> results = new ArrayList<>();
         Set<Integer> runIndexes = new HashSet<>();
         int warmups = 0;
         for (int i = 0; i < runs.size(); i++) {
             String what = "runs[" + i + "]";
-            RunResult result = validateRow(asObject(runs.get(i), what), what);
+            RunResult result = validator.validate(asObject(runs.get(i), what), what);
             if (!runIndexes.add(result.run())) {
                 throw new InvalidDocument(what + " repeats run index " + result.run());
             }
@@ -327,6 +373,14 @@ public final class V3Samples {
         if (warmups == results.size()) {
             throw new InvalidDocument("every row is a warmup; at least one measured row is required");
         }
+        return results;
+    }
+
+    /**
+     * Requires every row to share the first row's build commit, routing table identity, digest,
+     * schema and stream count.
+     */
+    static void requireSharedIdentity(List<RunResult> results) throws InvalidDocument {
         RunResult first = results.get(0);
         for (int i = 1; i < results.size(); i++) {
             RunResult other = results.get(i);
@@ -339,11 +393,32 @@ public final class V3Samples {
                         + " commit, routing table identity, digest, schema and stream count");
             }
         }
-        return new Summary(results.size(), results.size() - warmups, warmups);
     }
 
-    /** Shape-checks one row before the shared Gson turns it into a {@link RunResult}. */
+    /** Applies the {@code /3} transport gates to an already shape-checked row. */
     private static RunResult validateRow(JsonObject row, String what) throws InvalidDocument {
+        validateRowShape(row, what);
+        String transport = stringField(row, "transportVersion", what);
+        if (!TransportVersion.QUIC_3.name().equals(transport)) {
+            throw new InvalidDocument(what + ".transportVersion must be "
+                    + TransportVersion.QUIC_3.name() + ", not " + quote(transport));
+        }
+        RunResult result = convertRow(row, what);
+        NegotiatedTransportCheck.Result check =
+                NegotiatedTransportCheck.check(TransportVersion.QUIC_3, result);
+        if (!check.verified()) {
+            throw new InvalidDocument(what + " is not verified /3 evidence: " + check.detail());
+        }
+        return result;
+    }
+
+    /**
+     * Every transport-independent row rule of the {@code /3} validator: required components,
+     * status flags, four finite nondecreasing phases, metric bounds, optional fields and their
+     * types. Shared with {@link ArmSamples}; no transport identity or provenance value is judged
+     * here.
+     */
+    static void validateRowShape(JsonObject row, String what) throws InvalidDocument {
         for (String name : REQUIRED_COMPONENTS) {
             field(row, name, what);
         }
@@ -400,15 +475,14 @@ public final class V3Samples {
         stringField(row, "routingTableId", what);
         stringField(row, "routingTableDigest", what);
         stringField(row, "negotiatedAlpn", what);
-        String transport = stringField(row, "transportVersion", what);
-        if (!TransportVersion.QUIC_3.name().equals(transport)) {
-            throw new InvalidDocument(what + ".transportVersion must be "
-                    + TransportVersion.QUIC_3.name() + ", not " + quote(transport));
-        }
+        stringField(row, "transportVersion", what);
         optionalError(row, what);
         optionalLongMap(row, "net", what);
         optionalLongMap(row, "quic", what);
+    }
 
+    /** Converts an already shape-checked row with the shared Gson. */
+    static RunResult convertRow(JsonObject row, String what) throws InvalidDocument {
         RunResult result;
         try {
             result = GSON.fromJson(row, RunResult.class);
@@ -417,11 +491,6 @@ public final class V3Samples {
         }
         if (result == null) {
             throw new InvalidDocument(what + " converted to null");
-        }
-        NegotiatedTransportCheck.Result check =
-                NegotiatedTransportCheck.check(TransportVersion.QUIC_3, result);
-        if (!check.verified()) {
-            throw new InvalidDocument(what + " is not verified /3 evidence: " + check.detail());
         }
         return result;
     }
@@ -467,7 +536,7 @@ public final class V3Samples {
         }
     }
 
-    private static JsonObject asObject(JsonElement element, String what) throws InvalidDocument {
+    static JsonObject asObject(JsonElement element, String what) throws InvalidDocument {
         if (element == null || !element.isJsonObject()) {
             throw new InvalidDocument(what + " must be a JSON object");
         }
@@ -489,7 +558,7 @@ public final class V3Samples {
         return value;
     }
 
-    private static String stringField(JsonObject object, String name, String what) throws InvalidDocument {
+    static String stringField(JsonObject object, String name, String what) throws InvalidDocument {
         JsonElement value = field(object, name, what);
         if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
             throw new InvalidDocument(what + "." + name + " must be a JSON string");
@@ -561,7 +630,7 @@ public final class V3Samples {
         return converted;
     }
 
-    private static String quote(String value) {
+    static String quote(String value) {
         if (value == null) {
             return "null";
         }
@@ -570,7 +639,7 @@ public final class V3Samples {
     }
 
     /** A document-level rejection with a message safe to print without a stack trace. */
-    private static final class InvalidDocument extends Exception {
+    static final class InvalidDocument extends Exception {
         InvalidDocument(String message) {
             super(message);
         }

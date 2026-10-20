@@ -5,6 +5,7 @@ import java.util.Arrays;
 import rs.sudoe.quicraft.testkit.bench.BenchClient;
 import rs.sudoe.quicraft.testkit.bench.MatrixSummarize;
 import rs.sudoe.quicraft.testkit.bench.Summarize;
+import rs.sudoe.quicraft.testkit.bench.ArmSamples;
 import rs.sudoe.quicraft.testkit.bench.V3Samples;
 import rs.sudoe.quicraft.testkit.session.MockSessionServer;
 import rs.sudoe.quicraft.testkit.transport.TransportClient;
@@ -33,6 +34,7 @@ public final class Main {
             case "load-server" -> rs.sudoe.quicraft.testkit.load.LoadServer.run(Args.parse(rest));
             case "load-client" -> rs.sudoe.quicraft.testkit.load.LoadClient.run(Args.parse(rest));
             case "v3-samples" -> V3Samples.run(Args.parse(rest));
+            case "arm-samples" -> ArmSamples.run(Args.parse(rest));
             default -> {
                 usage();
                 yield 2;
@@ -55,6 +57,7 @@ public final class Main {
                   load-server  many-connection load spike: real QuicServer, admission limits raised unless --shipped-limits
                   load-client  many-connection load spike: real QuicClient, one loopback source IP per connection
                                (--mode v3 for /3: load-server binds /3 with --node-budget-mb, --lanes activates lanes)
-                  v3-samples   validate one /3 samples file: strict shape, completeness and provenance, read-only""");
+                  v3-samples   validate one /3 samples file: strict shape, completeness and provenance, read-only
+                  arm-samples  validate one tcp, quic2 or quic3 arm samples file: strict, read-only""");
     }
 }
