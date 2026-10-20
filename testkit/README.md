@@ -82,6 +82,25 @@ that its early-release count goes from 0 to 1 over the two connections and saves
 under `results/`. Needs a display or `xvfb-run`, and port 25565 free. Offline mode only: the
 client's authlib finds its session server through a discovery URL the mock doesn't serve.
 
+### Server-side netem on a fresh real-Fabric container
+
+`netem-attach.sh` applies one profile to the network namespace of the `fabric` container in a
+fresh, uniquely named Compose project (the arm runner's `quicraft-arm-<id>`), for runs where the
+link must be shaped on the server's side rather than the bench client's:
+
+```sh
+testkit/netem-attach.sh apply  --project quicraft-arm-<id> --profile delayloss [--port 25565]
+testkit/netem-attach.sh status --project quicraft-arm-<id> [--profile delayloss] [--port 25565]
+```
+
+It refuses any project not named `quicraft-arm-*`, anything but exactly one running `fabric`
+container, host or container networking, and any probe namespace or IPv4 mismatch. A
+non-privileged probe container is inspected before `NET_ADMIN` is granted, and only probes this
+script created are removed. `status` defaults to the `delay` layout because that is where the
+egress and ingress filters live; pass `--profile clean` after a clean attach. Its raw tc
+qdisc/filter counters are state, not a throughput result. Contract tests:
+`python3 -I testkit/tests/test_netem_attach.py -v`.
+
 ### Updater end-to-end on a real server
 
 ```sh
