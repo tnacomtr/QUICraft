@@ -5,6 +5,7 @@ import java.util.Arrays;
 import rs.sudoe.quicraft.testkit.bench.BenchClient;
 import rs.sudoe.quicraft.testkit.bench.MatrixSummarize;
 import rs.sudoe.quicraft.testkit.bench.Summarize;
+import rs.sudoe.quicraft.testkit.bench.V3Samples;
 import rs.sudoe.quicraft.testkit.session.MockSessionServer;
 import rs.sudoe.quicraft.testkit.transport.TransportClient;
 import rs.sudoe.quicraft.testkit.transport.TransportServer;
@@ -31,6 +32,7 @@ public final class Main {
             case "latency" -> rs.sudoe.quicraft.testkit.latency.LatencyBench.run(Args.parse(rest));
             case "load-server" -> rs.sudoe.quicraft.testkit.load.LoadServer.run(Args.parse(rest));
             case "load-client" -> rs.sudoe.quicraft.testkit.load.LoadClient.run(Args.parse(rest));
+            case "v3-samples" -> V3Samples.run(Args.parse(rest));
             default -> {
                 usage();
                 yield 2;
@@ -52,6 +54,7 @@ public final class Main {
                   latency      in-process loopback ping-pong: TCP vs QUIC vs QUIC through the bridge
                   load-server  many-connection load spike: real QuicServer, admission limits raised unless --shipped-limits
                   load-client  many-connection load spike: real QuicClient, one loopback source IP per connection
-                               (--mode v3 for /3: load-server binds /3 with --node-budget-mb, --lanes activates lanes)""");
+                               (--mode v3 for /3: load-server binds /3 with --node-budget-mb, --lanes activates lanes)
+                  v3-samples   validate one /3 samples file: strict shape, completeness and provenance, read-only""");
     }
 }
