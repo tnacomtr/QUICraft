@@ -356,9 +356,16 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         Path tmp = o.out.resolveSibling(o.out.getFileName() + ".tmp");
         boolean ownsTmp = false;
         try {
-            Files.createFile(tmp); // fails if it exists, so ownership starts exactly here
-            ownsTmp = true;
-            Files.writeString(tmp, json, StandardCharsets.UTF_8, StandardOpenOption.WRITE);
+            // One O_EXCL handle: fails if the name exists (symlink included), so ownership starts here
+            // and the bytes go to the file this call created.
+            try (java.nio.channels.SeekableByteChannel ch = Files.newByteChannel(tmp,
+                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+                ownsTmp = true;
+                java.nio.ByteBuffer bytes = java.nio.ByteBuffer.wrap(json.getBytes(StandardCharsets.UTF_8));
+                while (bytes.hasRemaining()) {
+                    ch.write(bytes);
+                }
+            }
             // A hard link publishes the complete file atomically and fails if the name exists,
             // unlike a rename, which would replace a file created after the check above.
             Files.createLink(o.out, tmp);
