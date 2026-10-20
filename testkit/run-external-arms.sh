@@ -22,7 +22,7 @@
 #
 # The emitter (ExternalArmGameTest) is a separate unit; this runner only uses the frozen property
 # names. `--netem` takes clean, loss, delay, delayloss, reorder or jitter; testkit/netem-attach.sh
-# shapes the server container's interface for every profile, clean included (same qdisc path in every arm).
+# shapes the server container's interface; clean attaches nothing (netem-attach reports no qdisc).
 #
 # Per-run documents are merged with testkit/merge-arm-samples.py. For `/3`, the merged document
 # must additionally pass the testkit validator (see testkit/README.md):
@@ -344,8 +344,9 @@ fi
 echo "server is ready: $status_json"
 printf '%s\n' "$status_json" >"$out_dir/$arm-$netem-run$run_index.status.json"
 
-# netem on the server's own namespace for every profile, clean included, so every arm crosses the
-# same qdisc path and the filter counters prove the game flows were classified.
+# netem on the server's own namespace. netem-attach runs for every profile, but clean installs no
+# qdisc, IFB or filter (its status says so); shaped profiles' filter counters prove the game flows
+# were classified.
 echo "== netem $netem on $project"
 "$here/netem-attach.sh" apply --project "$project" --profile "$netem" \
     >"$out_dir/$arm-$netem-run$run_index.netem-apply.txt" 2>&1 \
