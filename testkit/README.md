@@ -144,6 +144,60 @@ delivery. The latter **includes input/dependency/idle waits**, so it is not a pu
 measurement. Snapshots are cumulative from activation, not chunk-only deltas. Tracing retains
 no packets, payloads or connection identifiers and changes no acknowledgement decisions.
 
+Round-2 starvation/send diagnostics use the same property. For the **Docker server**, set
+`QUICRAFT_JAVA_OPTS=-Dquicraft.v3.trace=true` in the runner's environment (append to any existing
+flags). No Compose change is needed: `docker/compose.yaml`'s `fabric.environment.JAVA_OPTS`
+already expands `QUICRAFT_JAVA_OPTS`; the real-Fabric overlay preserves it;
+`docker/fabric/entrypoint.sh` executes `java ... ${JAVA_OPTS:-}`. The runner does not unset this
+variable. `JAVA_TOOL_OPTIONS` enables the client as described above, but is **not** forwarded
+into the server container. Enable both when comparing the two sides. The runner saves the
+server output in its `.server.log`; search for `/3 send trace phase=disconnect` (the snapshot
+is emitted at disconnect, not via a new game message or once per chunk batch).
+With that space-separated server JVM flag present, cleanup first gracefully stops only the
+invocation's owned `fabric` service, appends its Compose log to `.server.log`, then runs the
+existing project teardown. With tracing off there is no additional stop/log operation.
+
+Client core lines now include `unitsPerStream` (0 CONTROL, 1 REALTIME, 2..7 chunk shards),
+read/grant counters and disjoint `waits` totals/max contiguous segments for **completed**
+ack-to-next-delivery gaps. A currently unfinished gap appears separately as `pendingReason`;
+idle time after the final ack does not inflate the completed-gap totals. Attribution changes
+only at observed event-loop boundaries, not by polling or by speculative decoding. Priority
+is eligible head/workspace, held dependency, locally buffered bytes, incomplete bundle,
+incomplete record/read-grant-consumed, then no local bytes. `DRIVE_CPU` includes receive-driver
+work between those observations. These are observed states, not proof that a particular head
+was the sole limiting cause. The local source cannot inspect unread bytes inside quiche or
+the kernel: `NO_LOCAL_BYTES` is **not** proof that the server sent nothing. Read grants are
+per-read allocation caps, not a shared credit pool: `READ_GRANT_CONSUMED` means an observed
+partial stream consumed its last cap and has no pending read, not proven QUIC flow-control
+exhaustion. Grant-request-to-first-data latency also includes network/peer waits.
+
+Header dependencies identify stream/sequence barriers and epoch transitions. They do **not**
+identify whether a chunk prerequisite originated as a chunk fence or BATCH_JOIN, or whether
+a CONTROL prerequisite is a fence. Such chunk waits are deliberately labelled
+`CHUNK_SEQUENCE_FENCE_OR_JOIN_UNKNOWN`, and CONTROL waits `CONTROL_SEQUENCE`; incomplete
+and dependency-blocked bundles have separate labels. Tracing never decodes a blocked packet
+to guess its semantic type or releases a dependency.
+
+The send snapshot measures game-write-to-enqueue/first-selection, scheduler-offer-to-
+first-selection, and selection-to-stream-write/game-write-to-stream-write (the latter two
+per slice). Fabric server units carry an optional timestamp from the outbound packet filter,
+before vanilla encoding, through the existing hold/quiescence queues to core submission.
+Generic bridge writes are timestamped before their event-loop dispatch. Internally generated
+records with no game-write timestamp use record-enqueue time; pre-enqueue aggregation wait is
+not claimed for those. Queue depth peaks cover sequenced records awaiting
+their final slice selection, including pre-grant queues, per logical stream. The
+`notFullySelectedPerStream` count includes records canceled at disconnect. The unchanged
+sink calls `writeAndFlush` for **each slice**, hence one write per flush; byte/flush totals
+exclude preambles and QUIC's internal UDP batching. Writability intervals are event-observed
+Netty stream/parent flags, and the explicit write gate is separate; flags cannot distinguish
+congestion, stream/connection flow-control windows and transport buffering. Intervals include
+idle stream lifetime, and overlapping stream/parent intervals must not be added together.
+Pool-grant waits, observed tick spacing, configured tick period and writes actually selected
+inside `tick()` help distinguish lazy grant/timer recovery. BlockedHeadTimer is a deadline
+check, not a periodic send permit; its deadlines and ACK expiry are not changed. All storage
+is bounded and all new timing/counter work is opt-in; wire format and send/read policy stay
+unchanged.
+
 Merge the per-run documents of one arm and profile (all inputs must agree on clientType, arm,
 netemProfile, profile, server and build commit; run indexes must be unique; the output is written
 atomically and never overwritten):

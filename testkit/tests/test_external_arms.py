@@ -80,8 +80,10 @@ if name == "netem-attach.sh":
 if name == "docker":
     environment = {key: os.environ.get(key, "") for key in
                    ("FABRIC_ONLINE_MODE", "REAL_FABRIC_ONLINE_MODE",
-                    "REAL_FABRIC_MULTISTREAM", "REAL_FABRIC_PORT")}
+                     "REAL_FABRIC_MULTISTREAM", "REAL_FABRIC_PORT", "QUICRAFT_JAVA_OPTS")}
     append("docker-env.jsonl", json.dumps(environment, sort_keys=True))
+    if "logs" in args:
+        print("fake /3 send trace phase=disconnect")
     sys.exit(0)
 
 if name == "gradlew":
@@ -354,6 +356,8 @@ class RunnerRunTest(Fixture):
                                   "--port", self.port])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("OK: tcp run 0 wrote", result.stdout)
+        self.assertFalse(any("stop" in args or "logs" in args for args in self.calls("docker")),
+                         "baseline runs do not add diagnostic stop/log commands")
 
         out = self.active_out()
         self.assertTrue(os.path.isfile(out))
@@ -413,6 +417,26 @@ class RunnerRunTest(Fixture):
         })
         self.assertEqual([name for name in os.listdir(os.path.join(self.tmp, "tmp"))
                           if name.startswith("quicraft-arm-")], [])
+
+    def test_server_trace_environment_and_logs_survive_owned_teardown(self):
+        log = os.path.join(self.out_dir, "quic3-clean-run0.server.log")
+        result = self.run_runner(["--arm", "quic3", "--run", "0", "--out-dir", self.out_dir],
+                                 {"QUICRAFT_JAVA_OPTS": "-Dquicraft.v3.trace=true"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls("docker")
+        stop = next(i for i, args in enumerate(calls) if "stop" in args)
+        logs = next(i for i, args in enumerate(calls) if "logs" in args)
+        down = next(i for i, args in enumerate(calls) if "down" in args)
+        self.assertLess(stop, logs)
+        self.assertLess(logs, down)
+        project = self.project_of(self.up_call())
+        for index in (stop, logs, down):
+            self.assertEqual(self.project_of(calls[index]), project)
+        self.assertEqual(calls[stop][calls[stop].index("stop"):], ["stop", "fabric"])
+        self.assertTrue(all(env["QUICRAFT_JAVA_OPTS"] == "-Dquicraft.v3.trace=true"
+                            for env in self.docker_environments()))
+        with open(log, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "fake /3 send trace phase=disconnect\n")
 
     def test_warmup_and_overrides_reach_gradle(self):
         result = self.run_runner(["--arm", "quic3", "--run", "7", "--warmup",

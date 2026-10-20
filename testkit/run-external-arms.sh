@@ -218,6 +218,10 @@ backup_sha=""
 project_started=false
 client_log=""
 keep_client_log=false
+server_trace=false
+if [[ " ${QUICRAFT_JAVA_OPTS:-} " == *" -Dquicraft.v3.trace=true "* ]]; then
+    server_trace=true
+fi
 
 sha256_of() {
     python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
@@ -244,6 +248,17 @@ cleanup() {
         cleanup_status=1
     fi
     if [[ "$project_started" == true ]]; then
+        if [[ "$server_trace" == true ]]; then
+            # Opt-in diagnostics only. Stop this invocation's owned Fabric service gracefully before
+            # collecting logs, so its final session-disconnect summary survives the later down.
+            "${compose[@]}" stop fabric >/dev/null 2>&1 || echo "WARNING: trace server stop failed" >&2
+            server_log="$out_dir/$arm-$netem-run$run_index.server.log"
+            if "${compose[@]}" logs --no-color fabric >>"$server_log" 2>&1; then
+                echo "server trace log kept at $server_log" >&2
+            else
+                echo "WARNING: could not collect server trace log at $server_log" >&2
+            fi
+        fi
         if "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1; then
             echo "removed Compose project $project"
         else
