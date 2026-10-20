@@ -36,6 +36,37 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.time.StallClock;
 
 class SessionSendDriverTest {
+    @Test void optInTraceFollowsRealQueueAndSelectionWithoutChangingDrainOrder() throws Exception {
+        String previous = System.getProperty("quicraft.v3.trace");
+        System.setProperty("quicraft.v3.trace", "true");
+        try {
+            Rig rig = new Rig(2, 100);
+            try {
+                long started = System.nanoTime();
+                Long outer = SendTrace.beginGameWrite(started);
+                try {
+                    rig.driver.submit(frame(5), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+                    rig.driver.submit(frame(5), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+                } finally {
+                    SendTrace.endGameWrite(started, outer);
+                }
+                assertNotNull(rig.driver.trace());
+                assertTrue(rig.driver.trace().summary(System.nanoTime()).contains("queuedPeakPerStream=[2, 0"));
+                Drain drained = drainAndRelease(rig.driver);
+                assertEquals(2, drained.writes.size());
+                assertTrue(drained.writes.get(0).traceSelectedNanos > 0);
+                String summary = rig.driver.trace().summary(System.nanoTime());
+                assertTrue(summary.contains("gameToSelection={n=2"), summary);
+                assertTrue(summary.contains("notFullySelectedPerStream=[0, 0, 0, 0, 0, 0, 0, 0]"), summary);
+            } finally {
+                rig.driver.close();
+            }
+        } finally {
+            if (previous == null) System.clearProperty("quicraft.v3.trace");
+            else System.setProperty("quicraft.v3.trace", previous);
+        }
+    }
+
     private static final long MB = 1L << 20;
     /** The REALTIME slice used by small-cap rigs; caps in those rigs are raised by this amount (13.12). */
     private static final long TEST_SLICE = 32;

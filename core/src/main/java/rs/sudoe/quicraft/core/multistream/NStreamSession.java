@@ -857,8 +857,11 @@ public final class NStreamSession implements MultistreamSession {
             if (receiveTrace != null) {
                 receiveTrace.ackEventLoopQueue.add(System.nanoTime() - receivedNanos);
                 traceAckReceivedNanos = receivedNanos;
+                receiveTrace.waits.start(receivedNanos);
+                receiveTrace.waits.state(System.nanoTime(), ReceiveTrace.WaitReason.DRIVE_CPU);
             }
             doApplied(lane, sequence);
+            traceReceiveState();
         }));
     }
 
@@ -868,7 +871,8 @@ public final class NStreamSession implements MultistreamSession {
         loop.execute(() -> {
             if (!traceChunkReported) {
                 traceChunkReported = true;
-                LOG.info("/3 receive trace core phase=chunk-load-finished " + receiveTrace.timingSummary());
+                LOG.info("/3 receive trace core phase=chunk-load-finished " + receiveTrace.timingSummary()
+                        + " source=" + source.traceSummary());
             }
         });
     }
@@ -1255,6 +1259,7 @@ public final class NStreamSession implements MultistreamSession {
 
     /** One receive step; false when it closed the session. */
     private boolean receiveOnce() {
+        if (receiveTrace != null) receiveTrace.waits.state(System.nanoTime(), ReceiveTrace.WaitReason.DRIVE_CPU);
         try {
             if (serverDriver != null) {
                 serverDriver.receive();
@@ -1265,7 +1270,30 @@ public final class NStreamSession implements MultistreamSession {
             fail(CLOSE_ORDERING, NO_REASON, "stream read failed: " + e.getMessage(), e);
             return false;
         }
+        traceReceiveState();
         return !closed;
+    }
+
+    private void traceReceiveState() {
+        if (receiveTrace == null || clientDriver == null || closed) return;
+        StreamReceiver receiver = clientDriver.receiver();
+        ReceiveTrace.WaitReason reason;
+        if (receiver.nextToEnqueue() >= 0) {
+            reason = receiver.slots().workspaceInUse() > 0 ? ReceiveTrace.WaitReason.WORKSPACE
+                    : ReceiveTrace.WaitReason.ELIGIBLE_HEAD;
+        } else if ((reason = receiver.traceWaitReason()) != null) {
+            // Sequence dependencies cannot reveal the sender's fence/join type without speculative decode.
+        } else if (source.traceBufferedBytes() > 0) {
+            reason = ReceiveTrace.WaitReason.BUFFERED_AWAIT_PUMP;
+        } else if (clientPump.traceHasPartialBundle()) {
+            reason = ReceiveTrace.WaitReason.BUNDLE_PARTIAL;
+        } else if (clientPump.traceHasPartialUnit()) {
+            reason = source.traceGrantConsumed(clientPump.tracePartialStreams()) ? ReceiveTrace.WaitReason.READ_GRANT_CONSUMED
+                    : ReceiveTrace.WaitReason.PARTIAL_UNIT;
+        } else {
+            reason = ReceiveTrace.WaitReason.NO_LOCAL_BYTES;
+        }
+        receiveTrace.waits.state(System.nanoTime(), reason);
     }
 
     private void doApplied(Lane lane, long sequence) {
@@ -1403,10 +1431,15 @@ public final class NStreamSession implements MultistreamSession {
 
     /** One periodic tick (13.12, 13.14): STOP_SENDING probe, open timeout, receive deadlines, ACK expiry, END. */
     void tick() {
+        SendTrace trace = sendDriver.trace();
+        long beforeWrites = trace == null ? 0 : trace.writeCount();
+        if (trace != null) trace.tickStarted(System.nanoTime());
         try {
             tickNow();
         } catch (StallClock.UnavailableException e) {
             closeOnUnavailable(e);
+        } finally {
+            if (trace != null) trace.tick(beforeWrites, sendDriver.awaitingGrant());
         }
     }
 
@@ -1574,8 +1607,15 @@ public final class NStreamSession implements MultistreamSession {
             return;
         }
         closeNotified = true;
+        if (sendDriver.trace() != null) {
+            sink.traceWritability();
+            LOG.info("/3 send trace phase=disconnect tickPeriodMs=" + timing.tickNanos / 1e6
+                    + " blockedHeadTimer=deadline-only ackExpiryMs=" + AckJoinTracker.DEADLINE_NANOS / 1e6
+                    + " " + sendDriver.trace().summary(System.nanoTime()));
+        }
         if (receiveTrace != null) {
-            LOG.info("/3 receive trace core phase=disconnect " + receiveTrace.timingSummary());
+            LOG.info("/3 receive trace core phase=disconnect " + receiveTrace.timingSummary()
+                    + " source=" + source.traceSummary());
         }
         LaneGame current = game;
         if (current == null) {
@@ -1839,6 +1879,10 @@ public final class NStreamSession implements MultistreamSession {
 
         @Override
         public void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle) {
+            if (receiveTrace != null) {
+                receiveTrace.deliveredOnStream(executingStream);
+                receiveTrace.waits.finish(System.nanoTime());
+            }
             if (receiveTrace != null && traceAckReceivedNanos != 0) {
                 receiveTrace.ackToNextDelivery.add(System.nanoTime() - traceAckReceivedNanos);
                 traceAckReceivedNanos = 0;
@@ -1871,12 +1915,14 @@ public final class NStreamSession implements MultistreamSession {
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
             ctx.fireChannelRead(msg);
+            traceReceiveState();
             schedulePump();
         }
 
         @Override
         public void channelReadComplete(ChannelHandlerContext ctx) {
             ctx.fireChannelReadComplete();
+            traceReceiveState();
             schedulePump();
         }
 
@@ -1924,6 +1970,12 @@ public final class NStreamSession implements MultistreamSession {
 
     /** Reports the peer's CONNECTION_CLOSE and any other end of the connection. */
     private final class ConnectionWatch extends ChannelInboundHandlerAdapter {
+        @Override
+        public void channelWritabilityChanged(ChannelHandlerContext ctx) {
+            sink.traceWritability();
+            ctx.fireChannelWritabilityChanged();
+        }
+
         @Override
         public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
             if (evt instanceof QuicConnectionCloseEvent && !closed) {

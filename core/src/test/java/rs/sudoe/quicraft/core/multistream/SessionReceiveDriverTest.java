@@ -195,6 +195,32 @@ class SessionReceiveDriverTest {
         return Collections.singletonList(new Record.Dependency(stream, seq));
     }
 
+    @Test void diagnosticSeparatesPartialUnitFromBlockedHeadWithoutReleasingDependencies() throws Exception {
+        Harness h = new Harness();
+        byte[] wire = rec(2, 1, 0, dep(0, 1), PID_CHUNK);
+        h.source.put(2, Arrays.copyOf(wire, 1));
+        h.rounds(5);
+        assertTrue(h.pump.traceHasPartialUnit());
+        assertEquals(1 << 2, h.pump.tracePartialStreams());
+        assertNull(h.driver.receiver().traceWaitReason());
+        h.source.put(2, wire);
+        h.rounds(20);
+        assertFalse(h.pump.traceHasPartialUnit(), "a complete blocked head is not a partial unit");
+        assertEquals(ReceiveTrace.WaitReason.CONTROL_SEQUENCE, h.driver.receiver().traceWaitReason());
+        assertEquals(0, h.game.deliveries());
+        assertEquals(0, h.driver.receiver().appliedWatermark(0));
+        h.source.put(0, rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_CONTROL));
+        h.rounds(20);
+        assertEquals(1, h.game.deliveries());
+        assertEquals(ReceiveTrace.WaitReason.CONTROL_SEQUENCE, h.driver.receiver().traceWaitReason());
+        h.driver.acknowledged(0, 1);
+        assertEquals(2, h.game.deliveries());
+        assertNull(h.driver.receiver().traceWaitReason());
+        h.driver.acknowledged(2, 1);
+        assertFalse(h.pump.traceHasPartialUnit(), "committing resets the partial-unit diagnostic");
+        h.driver.close();
+    }
+
     @Test void applyDiscoveredViolationClosesBeforeNextDelivery() throws Exception {
         Harness h = new Harness();
         // Stream 2's epoch-2 record waits on stream 3, which is the only way out of the held epoch.

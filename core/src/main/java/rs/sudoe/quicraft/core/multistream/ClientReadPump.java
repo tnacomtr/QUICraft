@@ -146,10 +146,28 @@ public final class ClientReadPump {
         return oldest;
     }
 
+    boolean traceHasPartialUnit() {
+        return tracePartialStreams() != 0;
+    }
+
+    int tracePartialStreams() {
+        int mask = 0;
+        for (Lane lane : lanes) {
+            if (lane.ready == null && lane.traceStarted) mask |= 1 << lane.stream;
+        }
+        return mask;
+    }
+
+    boolean traceHasPartialBundle() {
+        for (Lane lane : lanes) if (lane.pending != null) return true;
+        return false;
+    }
+
     /** Releases a completed unit's slot after the game has executed it. */
     public void commit(Unit unit) {
         if (unit == null || unit.lane.ready != unit) throw new IllegalStateException("unit is not awaiting commit");
         unit.lane.ready = null;
+        unit.lane.traceStarted = false;
         slots.releaseHead(unit.lane.stream);
     }
 
@@ -192,6 +210,7 @@ public final class ClientReadPump {
         }
         int got = source.read(lane.stream, target, off, grant);
         if (got <= 0) return;
+        lane.traceStarted = true;
         if (got > grant) throw new IllegalStateException("byte source returned more than was requested");
         Record record = lane.decoder.next(ByteBuffer.wrap(target, off, got));
         if (record != null) complete(lane, record, done);
@@ -314,6 +333,7 @@ public final class ClientReadPump {
         boolean provisional;
         boolean admitted;
         Pending pending;
+        boolean traceStarted;
         Unit ready;
 
         Lane(int stream) {

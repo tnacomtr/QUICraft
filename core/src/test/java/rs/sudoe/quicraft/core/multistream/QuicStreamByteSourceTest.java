@@ -127,6 +127,31 @@ final class QuicStreamByteSourceTest {
     }
 
     @Test
+    void optInTraceObservesConsumedGrantWithoutIssuingARead() throws Exception {
+        String previous = System.getProperty("quicraft.v3.trace");
+        System.setProperty("quicraft.v3.trace", "true");
+        try (Fixture fx = new Fixture(TransportConfig.multistream())) {
+            QuicStreamChannel[] client = new QuicStreamChannel[1];
+            QuicStreamChannel server = fill(fx, client, 64 * 1024, 1024);
+            onLoop(server.eventLoop(), () -> {
+                int buffered = fx.source.traceBufferedBytes();
+                assertEquals(1024, buffered);
+                assertEquals(buffered, fx.source.read(0, new byte[buffered], 0, buffered));
+                int before = fx.source.readCalls(0);
+                assertTrue(fx.source.traceGrantConsumed(1));
+                assertTrue(fx.source.traceSummary().contains("receivedBytes=1024"));
+                assertEquals(before, fx.source.readCalls(0), "diagnostics must not request peer credit");
+                fx.source.read(0, new byte[1], 0, 1);
+                assertTrue(fx.source.traceSummary().contains("oneByteGrants=1"));
+                return null;
+            });
+        } finally {
+            if (previous == null) System.clearProperty("quicraft.v3.trace");
+            else System.setProperty("quicraft.v3.trace", previous);
+        }
+    }
+
+    @Test
     void noReadCallWhileTheGrantIsExhausted() throws Exception {
         try (Fixture fx = new Fixture(TransportConfig.multistream())) {
             QuicStreamChannel[] client = new QuicStreamChannel[1];

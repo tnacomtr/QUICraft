@@ -39,6 +39,8 @@ import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
+import rs.sudoe.quicraft.core.multistream.ReceiveTrace;
+import rs.sudoe.quicraft.core.multistream.SendTrace;
 import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.multistream.SentPacket;
@@ -116,6 +118,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
     private BindingSession session;
     /** The write being encoded right now, which the encoder sink collects into; event loop only. */
     private OutboundUnit unitInFlight;
+    private final boolean traceWrites = ReceiveTrace.enabled();
     private ChannelHandlerContext sinkContext;
     /** True from the moment the lane session exists: the sink submits instead of replaying. */
     private boolean sinkActive;
@@ -604,6 +607,15 @@ public final class V3Join implements BindingDecodeContext.Gate {
 
     /** A bounded real consumer: one token/one packet, or validated empty-coverage ordinary units. */
     private void submitUnit(OutboundUnit unit) throws java.io.IOException {
+        Long previous = SendTrace.beginGameWrite(unit.traceWriteStartedNanos);
+        try {
+            submitUnitNow(unit);
+        } finally {
+            SendTrace.endGameWrite(unit.traceWriteStartedNanos, previous);
+        }
+    }
+
+    private void submitUnitNow(OutboundUnit unit) throws java.io.IOException {
         List<OutboundPacket> frames = frameUnit(unit, codec);
         CausalSendContext context = causalContext();
         MultistreamSession core = connection.session();
@@ -813,6 +825,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
             }
             OutboundUnit unit = new OutboundUnit(msg instanceof BundlePacket,
                     CausalSendContext.currentEnvelope(ctx.channel()));
+            if (traceWrites) unit.traceWriteStartedNanos = System.nanoTime();
             OutboundUnit outer = unitInFlight;
             try {
                 if (unit.envelope() == null) {

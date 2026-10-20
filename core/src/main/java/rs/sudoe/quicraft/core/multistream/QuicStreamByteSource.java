@@ -35,6 +35,14 @@ import java.util.ArrayDeque;
 public final class QuicStreamByteSource implements SessionReadPump.ByteSource {
     private final Lane[] lanes;
     private boolean closed;
+    private final boolean trace = ReceiveTrace.enabled();
+    private long traceReadRequests;
+    private long traceOneByteGrants;
+    private long traceBytes;
+    private long traceZeroReads;
+    private long traceReadCompletes;
+    private long traceEmptyReadCompletes;
+    private final ReceiveTrace.Latencies traceGrantToData = ReceiveTrace.enabled() ? new ReceiveTrace.Latencies() : null;
 
     /** One logical stream: its channel, its buffered ByteBufs in arrival order, and its end state. */
     private static final class Lane {
@@ -44,6 +52,10 @@ public final class QuicStreamByteSource implements SessionReadPump.ByteSource {
         boolean eof;
         boolean reset;
         int readCalls;
+        int traceGrant;
+        int traceArrived;
+        boolean traceReadPending;
+        long traceRequestedNanos;
 
         Lane(QuicStreamChannel channel) {
             this.channel = channel;
@@ -81,6 +93,24 @@ public final class QuicStreamByteSource implements SessionReadPump.ByteSource {
             }
             lane.queue.add(buf);
             lane.buffered += buf.readableBytes();
+            if (source.trace) {
+                if (lane.traceRequestedNanos != 0) {
+                    source.traceGrantToData.add(System.nanoTime() - lane.traceRequestedNanos);
+                    lane.traceRequestedNanos = 0;
+                }
+                lane.traceArrived += buf.readableBytes();
+                source.traceBytes += buf.readableBytes();
+            }
+        }
+
+        @Override
+        public void channelReadComplete(ChannelHandlerContext ctx) {
+            if (source.trace) {
+                lane.traceReadPending = false;
+                source.traceReadCompletes++;
+                if (lane.traceArrived == 0) source.traceEmptyReadCompletes++;
+            }
+            ctx.fireChannelReadComplete();
         }
 
         @Override
@@ -174,11 +204,43 @@ public final class QuicStreamByteSource implements SessionReadPump.ByteSource {
         // record body never prefetches the next record before its admission (13.12).
         int room = max - copied - lane.buffered;
         if (!lane.eof && room > 0 && lane.channel.isOpen()) {
+            if (trace) {
+                traceReadRequests++;
+                if (lane.traceRequestedNanos == 0) lane.traceRequestedNanos = System.nanoTime();
+                lane.traceGrant = Math.min(room, ServerReadPartition.MAX_READ_GRANT);
+                if (lane.traceGrant == 1) traceOneByteGrants++;
+                lane.traceArrived = 0;
+                lane.traceReadPending = true;
+            }
             ReadGrantAllocator.limit(lane.channel, Math.min(room, ServerReadPartition.MAX_READ_GRANT));
             lane.readCalls++;
             lane.channel.read();
         }
+        if (trace && copied == 0) traceZeroReads++;
         return copied;
+    }
+
+    int traceBufferedBytes() {
+        int total = 0;
+        for (Lane lane : lanes) if (lane != null) total += lane.buffered;
+        return total;
+    }
+
+    boolean traceGrantConsumed(int partialStreams) {
+        for (int i = 0; i < lanes.length; i++) {
+            Lane lane = lanes[i];
+            if ((partialStreams & (1 << i)) != 0 && lane != null && !lane.traceReadPending && lane.traceGrant > 0
+                    && lane.traceArrived >= lane.traceGrant && lane.buffered == 0) return true;
+        }
+        return false;
+    }
+
+    String traceSummary() {
+        return "readRequests=" + traceReadRequests + " oneByteGrants=" + traceOneByteGrants
+                + " receivedBytes=" + traceBytes + " zeroCopyReads=" + traceZeroReads
+                + " readCompletes=" + traceReadCompletes + " emptyReadCompletes=" + traceEmptyReadCompletes
+                + " bufferedBytes=" + traceBufferedBytes() + " grantRequestToData={"
+                + (traceGrantToData == null ? "disabled" : traceGrantToData.summary()) + "}";
     }
 
     /**

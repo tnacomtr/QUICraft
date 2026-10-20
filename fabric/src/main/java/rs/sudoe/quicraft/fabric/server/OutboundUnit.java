@@ -22,6 +22,8 @@ final class OutboundUnit {
     private ProtocolState state;
     private long bytes;
     private ReceiveBudget reservedAgainst;
+    /** Opt-in timing metadata only; follows this unit through quiescence/backpressure queues. */
+    long traceWriteStartedNanos;
 
     OutboundUnit(boolean bundle) {
         this(bundle, null);

@@ -462,6 +462,22 @@ public final class StreamReceiver {
         return head[stream] == null ? null : head[stream].record;
     }
 
+    /** Read-only diagnostic; wire dependencies do not identify the sender's fence/join semantic type. */
+    ReceiveTrace.WaitReason traceWaitReason() {
+        for (Unit unit : head) {
+            if (unit == null || unit.enqueued) continue;
+            if (unit.record.epoch() > epoch) return ReceiveTrace.WaitReason.EPOCH_TRANSITION;
+            for (Record.Dependency dependency : unit.record.dependencies()) {
+                if (Long.compareUnsigned(dependency.sequence(), applied[dependency.streamIndex()]) <= 0) continue;
+                if (unit.record.kind() == RecordCodec.KIND_BUNDLE_OPEN) return ReceiveTrace.WaitReason.BUNDLE_SEQUENCE;
+                if (dependency.streamIndex() == 0) return ReceiveTrace.WaitReason.CONTROL_SEQUENCE;
+                if (dependency.streamIndex() == 1) return ReceiveTrace.WaitReason.REALTIME_SEQUENCE;
+                return ReceiveTrace.WaitReason.CHUNK_SEQUENCE_FENCE_OR_JOIN_UNKNOWN;
+            }
+        }
+        return null;
+    }
+
     /**
      * Records that the head unit opening at {@code sequence} was handed to the game executor (Q). It must
      * be ready. Q advances to the unit's closing sequence, so a bundle is enqueued as a whole (13.15).

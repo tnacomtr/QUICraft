@@ -98,6 +98,7 @@ public final class QuicStreamWriteSink {
      * are submitted and whenever a stream becomes writable.
      */
     public void drain() {
+        traceWritability();
         for (;;) {
             SessionSendDriver.Write write = driver.poll(writable);
             if (write == null) {
@@ -124,6 +125,10 @@ public final class QuicStreamWriteSink {
             return;
         }
         ByteBuf buf = Unpooled.wrappedBuffer(write.bytes());
+        if (driver.trace() != null) {
+            driver.trace().written(write.stream(), buf.readableBytes(), write.traceSelectedNanos,
+                    write.traceStartedNanos, System.nanoTime());
+        }
         channel.writeAndFlush(buf).addListener((ChannelFutureListener) future -> {
             boolean success = future.isSuccess();
             if (success) {
@@ -133,6 +138,16 @@ public final class QuicStreamWriteSink {
             }
             settled.settled(success);
         });
+    }
+
+    void traceWritability() {
+        if (driver.trace() == null) return;
+        long now = System.nanoTime();
+        for (int i = 0; i < channels.length; i++) {
+            QuicStreamChannel channel = channels[i];
+            if (channel != null) driver.trace().writable(i, channel.isActive(), channel.isWritable(),
+                    channel.parent().isWritable(), gate.test(i), now);
+        }
     }
 
     /** Installs or clears the poll-to-write test hook. */

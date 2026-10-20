@@ -98,6 +98,8 @@ public final class SessionSendDriver {
         private final int stream;
         private final byte[] bytes;
         private final boolean last;
+        long traceSelectedNanos;
+        long traceStartedNanos;
 
         Write(long token, int stream, byte[] bytes, boolean last) {
             this.token = token;
@@ -160,6 +162,9 @@ public final class SessionSendDriver {
         boolean local;
         /** True for a REALTIME record larger than the slice, which takes the main queue (13.12). */
         boolean viaMain;
+        long traceStartedNanos;
+        long traceOfferedNanos;
+        long traceGrantWaitNanos;
 
         Charge(long bytes) {
             this.bytes = bytes;
@@ -224,6 +229,7 @@ public final class SessionSendDriver {
     private int pendingGrants;
     private long nextToken = 1;
     private int queuedRecords;
+    private final SendTrace trace = ReceiveTrace.enabled() ? new SendTrace() : null;
     private long queuedBytes;
     private boolean closed;
     /** True once {@link #close()} returned every charge; with deferred release this can trail {@code closed}. */
@@ -1239,6 +1245,9 @@ public final class SessionSendDriver {
         if (charge == null) {
             throw new IllegalStateException("selected record has no charge");
         }
+        long selectedNanos = trace == null ? 0 : System.nanoTime();
+        if (trace != null) trace.selected(selection.record().streamIndex(), selection.offset() == 0,
+                selection.last(), charge.traceStartedNanos, charge.traceOfferedNanos, selectedNanos);
         byte[] slice = Arrays.copyOfRange(charge.encoded, selection.offset(),
                 selection.offset() + selection.length());
         long token = nextToken++;
@@ -1250,7 +1259,21 @@ public final class SessionSendDriver {
             queuedRecords--;
             queuedBytes -= charge.encoded.length;
         }
-        return new Write(token, selection.record().streamIndex(), slice, selection.last());
+        Write write = new Write(token, selection.record().streamIndex(), slice, selection.last());
+        write.traceSelectedNanos = selectedNanos;
+        write.traceStartedNanos = charge.traceStartedNanos;
+        return write;
+    }
+
+    SendTrace trace() {
+        return trace;
+    }
+
+    private void traceEnqueued(Charge charge) {
+        if (trace == null) return;
+        long now = System.nanoTime();
+        charge.traceStartedNanos = SendTrace.gameWriteStart(now);
+        trace.enqueued(charge.record.streamIndex(), charge.traceStartedNanos, now);
     }
 
     /** The transport released the send buffer of this slice; its record's charge is released once (13.12). */
@@ -1378,6 +1401,7 @@ public final class SessionSendDriver {
         charge.encoded = encoded;
         charge.continues = continues;
         byRecord.put(record, charge);
+        traceEnqueued(charge);
         if (record.streamIndex() == REALTIME) {
             // Every REALTIME record keeps its stream position; one above the slice also takes the main queue (13.12).
             charge.viaMain = encoded.length > realtimeSliceBytes;
@@ -1417,6 +1441,7 @@ public final class SessionSendDriver {
                 first.unreleased++;
             }
             byRecord.put(charge.record, charge);
+            traceEnqueued(charge);
             toOffer.addLast(charge);
             queuedRecords++;
             queuedBytes += charge.encoded.length;
@@ -1442,6 +1467,10 @@ public final class SessionSendDriver {
             }
         }
         pendingGrants++;
+        if (trace != null) {
+            charge.traceGrantWaitNanos = System.nanoTime();
+            trace.grantWaiting(true, charge.traceGrantWaitNanos);
+        }
     }
 
     /** True once the pool has charged this request; the grant is consumed by the first true answer. */
@@ -1454,7 +1483,12 @@ public final class SessionSendDriver {
         }
         charge.granted = true;
         pendingGrants--;
+        if (trace != null && charge.traceGrantWaitNanos != 0) {
+            trace.grantWait.add(System.nanoTime() - charge.traceGrantWaitNanos);
+            charge.traceGrantWaitNanos = 0;
+        }
         if (pendingGrants == 0) {
+            if (trace != null) trace.grantWaiting(false, System.nanoTime());
             ranking.endRefusedWait(owner);
         }
         return true;
@@ -1507,6 +1541,7 @@ public final class SessionSendDriver {
             it.remove();
             if (!charge.viaMain) {
                 scheduler.offer(charge.record, charge.encoded.length, charge.continues);
+                if (trace != null) charge.traceOfferedNanos = System.nanoTime();
             }
         }
     }
@@ -1534,6 +1569,7 @@ public final class SessionSendDriver {
             }
             it.remove();
             scheduler.offer(charge.record, charge.encoded.length, charge.continues);
+            if (trace != null) charge.traceOfferedNanos = System.nanoTime();
         }
     }
 
@@ -1580,6 +1616,7 @@ public final class SessionSendDriver {
         charge.encoded = encoded;
         charge.continues = false;
         byRecord.put(record, charge);
+        traceEnqueued(charge);
         toOffer.addLast(charge);
         queuedBytes += encoded.length - pending.queuedBytes;
         return handle;

@@ -15,6 +15,8 @@ import java.util.List;
 import java.util.function.Supplier;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
+import rs.sudoe.quicraft.core.multistream.ReceiveTrace;
+import rs.sudoe.quicraft.core.multistream.SendTrace;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.OutboundPacket;
 import rs.sudoe.quicraft.core.multistream.SentPacket;
@@ -322,6 +324,7 @@ public final class GameLanes implements LaneGame {
     private volatile boolean writable = true;
     private volatile boolean closed;
     private volatile Session session;
+    private final boolean traceWrites = ReceiveTrace.enabled();
 
     /**
      * Production: a game pipeline over the {@link NStreamSession} that activation creates. Build it
@@ -754,16 +757,18 @@ public final class GameLanes implements LaneGame {
     private final class Outbound extends ChannelOutboundHandlerAdapter {
         @Override
         public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+            long startedNanos = traceWrites ? System.nanoTime() : 0;
             EventLoop loop = game.eventLoop();
             if (loop.inEventLoop()) {
-                handle(ctx, msg, promise);
+                handle(ctx, msg, promise, startedNanos);
             } else {
-                loop.execute(() -> handle(ctx, msg, promise));
+                loop.execute(() -> handle(ctx, msg, promise, startedNanos));
             }
         }
 
         /** Game loop only. */
-        private void handle(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+        private void handle(ChannelHandlerContext ctx, Object msg, ChannelPromise promise, long startedNanos) {
+            Long previous = SendTrace.beginGameWrite(startedNanos);
             try {
                 Route route = codec.routeOf(msg);
                 if (route == null) {
@@ -784,6 +789,7 @@ public final class GameLanes implements LaneGame {
                 fail(t);
                 promise.tryFailure(t);
             } finally {
+                SendTrace.endGameWrite(startedNanos, previous);
                 ReferenceCountUtil.release(msg);
             }
         }

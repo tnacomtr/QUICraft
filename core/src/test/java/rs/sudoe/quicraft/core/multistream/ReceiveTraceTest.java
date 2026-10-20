@@ -36,4 +36,29 @@ class ReceiveTraceTest {
         assertTrue(trace.timingSummary().contains("ackEventLoopQueue={n=1"));
         assertTrue(trace.timingSummary().contains("ackToNextDelivery={n=1"));
     }
+
+    @Test void starvationReasonsPartitionCompletedGapsAndDoNotCountIdleTail() {
+        ReceiveTrace.Waits waits = new ReceiveTrace.Waits();
+        waits.start(1_000_000);
+        waits.state(2_000_000, ReceiveTrace.WaitReason.NO_LOCAL_BYTES);
+        waits.state(5_000_000, ReceiveTrace.WaitReason.NO_LOCAL_BYTES); // same state keeps contiguous max
+        waits.state(7_000_000, ReceiveTrace.WaitReason.PARTIAL_UNIT);
+        waits.finish(9_000_000);
+        waits.start(10_000_000); // no next delivery: pending gap must not inflate completed-gap totals
+        waits.state(11_000_000, ReceiveTrace.WaitReason.NO_LOCAL_BYTES);
+        String summary = waits.summary(99_000_000);
+        assertTrue(summary.contains("ACK_EVENT_LOOP={totalMs=1.0,maxSegmentMs=1.0}"), summary);
+        assertTrue(summary.contains("NO_LOCAL_BYTES={totalMs=5.0,maxSegmentMs=5.0}"), summary);
+        assertTrue(summary.contains("PARTIAL_UNIT={totalMs=2.0,maxSegmentMs=2.0}"), summary);
+        assertTrue(summary.contains("pendingReason=NO_LOCAL_BYTES pendingSegmentMs=88.0"), summary);
+        assertEquals(summary, waits.summary(99_000_000), "snapshot does not modify accounting");
+    }
+
+    @Test void countsUnitsByLogicalStream() {
+        ReceiveTrace trace = new ReceiveTrace();
+        trace.deliveredOnStream(0);
+        trace.deliveredOnStream(2);
+        trace.deliveredOnStream(2);
+        assertTrue(trace.timingSummary().contains("unitsPerStream=[1, 0, 2, 0, 0, 0, 0, 0]"));
+    }
 }
