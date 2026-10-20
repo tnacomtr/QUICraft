@@ -302,7 +302,7 @@ fi
 echo "narrowed $mod to $entrypoint (original sha256 $backup_sha)"
 
 echo "== build :fabric-26x:testkitMod (image build context, commit $commit)"
-"$root/gradlew" -p "$root" -q :fabric-26x:testkitMod --console=plain \
+"$root/gradlew" -p "$root" --no-daemon -q :fabric-26x:testkitMod --console=plain \
     || die "the :fabric-26x:testkitMod build failed"
 
 # The base service reads FABRIC_ONLINE_MODE; the real-fabric overlay templates
@@ -361,7 +361,7 @@ if [[ -e "$client_config" ]]; then
 fi
 
 echo "== :fabric-26x:processGametestResources (forced, so the narrowed entrypoint list is used)"
-if ! "$root/gradlew" -p "$root" :fabric-26x:processGametestResources --rerun-tasks --console=plain; then
+if ! "$root/gradlew" -p "$root" --no-daemon :fabric-26x:processGametestResources --rerun-tasks --console=plain; then
     die "the forced :fabric-26x:processGametestResources build failed"
 fi
 if [[ -f "$processed" ]]; then
