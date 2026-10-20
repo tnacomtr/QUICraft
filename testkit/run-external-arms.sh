@@ -194,9 +194,13 @@ fi
 mkdir -p "$out_dir" || die "cannot create --out-dir $out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
 out="$out_dir/$arm-$netem-run$run_index.json"
-if [[ -e "$out" || -L "$out" ]]; then
-    die "refusing to overwrite existing $out"
-fi
+# Every side file of this run (status, netem, client log, moved config) shares the prefix: refuse
+# when any of them already exists, so evidence is never overwritten or nested into.
+for existing in "$out_dir/$arm-$netem-run$run_index".*; do
+    if [[ -e "$existing" || -L "$existing" ]]; then
+        die "refusing to overwrite existing $existing"
+    fi
+done
 
 suffix="$(python3 -c 'import secrets; print(secrets.token_hex(6))')" \
     || die "could not generate a unique Compose project suffix"
@@ -233,7 +237,8 @@ restore_mod() {
 
 cleanup() {
     cleanup_status=$?
-    trap - EXIT INT TERM
+    trap - EXIT
+    trap '' INT TERM
     if ! restore_mod; then
         cleanup_status=1
     fi
@@ -261,8 +266,8 @@ trap 'exit 143' TERM
 # Record the original, then narrow to the one emitter. The trap restores it on every exit path.
 backup="$(mktemp "${TMPDIR:-/tmp}/quicraft-arm-fabric-mod.XXXXXX")" || die "cannot create a backup file"
 cp -p "$mod" "$backup" || die "cannot back up $mod"
-backup_ready=true
 backup_sha="$(sha256_of "$backup")" || die "cannot checksum $backup"
+backup_ready=true
 
 if ! python3 - "$mod" "$entrypoint" <<'PY'
 import json
@@ -343,7 +348,7 @@ echo "== netem $netem on $project"
 # refuses that. Move the client's previous config aside into the evidence (never delete it).
 client_config="$root/fabric-26x/build/run/clientGameTest/config/quicraft"
 if [[ -e "$client_config" ]]; then
-    mv "$client_config" "$out_dir/$arm-$netem-run$run_index.client-config-before" \
+    mv -T -n "$client_config" "$out_dir/$arm-$netem-run$run_index.client-config-before" \
         || die "cannot move the previous client config aside"
 fi
 
