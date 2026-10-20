@@ -36,9 +36,7 @@ class V3ChunkAssignmentTest {
         try (java.io.InputStream input = RoutingTable.class.getResourceAsStream("protocol-775.json")) {
             json = new String(input.readAllBytes(), StandardCharsets.UTF_8);
         }
-        json = json.replace("\"extractors\":{", "\"extractors\":{\"chunk_xz\":\"mc775.chunk_xz.v1\",")
-                .replace("\"direction\":\"clientbound\",\"packet_id\":45,\"lane\":\"control\",\"dependency\":\"global\",\"position\":null",
-                        "\"direction\":\"clientbound\",\"packet_id\":45,\"lane\":\"chunk\",\"dependency\":\"lane\",\"position\":\"chunk_xz\"");
+        // The shipped table routes level_chunk_with_light (45) to CHUNK with mc775.chunk_xz.v1.
         RoutingTable table = RoutingTableLoader.parse(json);
         assertEquals(rs.sudoe.quicraft.core.routing.RouteV2.StreamLane.CHUNK, table.routeV2For(
                 new rs.sudoe.quicraft.core.routing.RouteKey(775, ProtocolState.PLAY,
