@@ -11,7 +11,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import rs.sudoe.quicraft.fabric.Hooks;
-import rs.sudoe.quicraft.fabric.server.ServerBindingPayload;
+import rs.sudoe.quicraft.fabric.net.BindingPayload;
 import rs.sudoe.quicraft.fabric.net.FallbackPayload;
 import rs.sudoe.quicraft.fabric.server.ServerQuic;
 import rs.sudoe.quicraft.fabric.server.V3Join;
@@ -29,7 +29,7 @@ abstract class ServerCommonPacketListenerImplMixin {
 
     @Inject(method = "handleCustomPayload", at = @At("HEAD"), cancellable = true)
     private void quicraft$fallbackReport(ServerboundCustomPayloadPacket packet, CallbackInfo ci) {
-        if (packet.payload() instanceof ServerBindingPayload binding) {
+        if (packet.payload() instanceof BindingPayload binding) {
             // 12.8: never delivered to anything else, on any connection. Without a join (TCP, /2)
             // it is inert.
             ci.cancel();

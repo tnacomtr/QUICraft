@@ -3,21 +3,17 @@ package rs.sudoe.quicraft.fabric.client;
 
 import io.netty.channel.Channel;
 import org.jspecify.annotations.Nullable;
+import rs.sudoe.quicraft.fabric.net.BindingDecodeContext;
 
 /**
- * Which connection the packet decoder on this thread is working for. Payload codecs are built once
- * for the whole game and see only bytes, so a codec that must behave differently on a multi-stream
- * connection than on every other one (docs/protocol.md 12.8: {@code quicraft:binding} is inert
- * outside {@code /3}) asks here. Set by {@code PacketDecoderContextMixin} at the start of each
- * decode; a stale value only survives until the next decode on that thread overwrites it.
+ * Client compatibility facade for the common, finally-scoped decoder context. This class owns no
+ * thread-local state; both endpoints consult the same connection-local selection.
  */
 public final class DecodeContext {
-    private static final ThreadLocal<Channel> CURRENT = new ThreadLocal<>();
-
     private DecodeContext() {}
 
     public static void enter(@Nullable Channel channel) {
-        CURRENT.set(channel);
+        BindingDecodeContext.enter(channel);
     }
 
     /**
@@ -26,20 +22,9 @@ public final class DecodeContext {
      * else decodes exactly as vanilla does (the bytes are discarded).
      */
     public static boolean bindingExpected() {
-        Channel channel = CURRENT.get();
-        if (channel == null) {
-            return false;
-        }
-        for (java.util.Map.Entry<String, io.netty.channel.ChannelHandler> entry : channel.pipeline()) {
-            if (entry.getValue() instanceof Gate && ((Gate) entry.getValue()).expectsBinding()) {
-                return true;
-            }
-        }
-        return false;
+        return BindingDecodeContext.bindingExpected();
     }
 
     /** A pipeline handler that knows whether a binding payload is part of an exchange right now. */
-    public interface Gate {
-        boolean expectsBinding();
-    }
+    public interface Gate extends BindingDecodeContext.Gate {}
 }
