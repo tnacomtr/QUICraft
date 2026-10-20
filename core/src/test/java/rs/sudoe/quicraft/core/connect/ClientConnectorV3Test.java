@@ -1213,14 +1213,68 @@ class ClientConnectorV3Test {
     @Test
     void aConnectorWithoutV3SupportKeepsTheShippedPath() throws Exception {
         Fixture f = Fixture.empty();
-        f.advertiseV3();
+        Advertisement cachedAd = f.advertiseV3();
         FakePlatform p = new FakePlatform();
         ClientConnector plain = new ClientConnector(f.advertisements, f.failures);
         Outcome<String> outcome = plain.connect(SERVER, HOST, LOGICAL_PORT, Mode.AUTO, null, p)
                 .get(FIVE_SECONDS, TimeUnit.SECONDS);
         assertNotNull(outcome.quic());
         assertEquals(1, p.v2Dials.get(), "null V3Support means /3 is never selected");
+        assertEquals(0, p.v3Dials.get(), "so there is no /3 dial either");
+        assertEquals(TransportSelection.Transport.V2, p.dialAlpn, "the dial is the shipped /2 one");
         assertNull(outcome.v3Plan());
+        assertEquals(Optional.of(cachedAd), f.advertisements.fresh(SERVER),
+                "the cached /3 advertisement is untouched: the shipped run never rewrites it");
+    }
+
+    @Test
+    void anOptedOutSessionKeepsTheLegacyConnectorOffV3WithTheSharedCaches() throws Exception {
+        Fixture f = Fixture.empty();
+        f.advertiseV3();
+
+        // First, a client whose /3 support is all present: it selects and dials /3 as 13.1 says.
+        FakePlatform optedIn = new FakePlatform();
+        Outcome<String> v3 = f.connect(f.connector(true, true), optedIn, Mode.AUTO);
+        assertNotNull(v3.quic(), "the connector with /3 support dials /3 for a /3 listener");
+        assertEquals(1, optedIn.v3Dials.get());
+        assertEquals(0, optedIn.v2Dials.get());
+
+        // Then the plain legacy connector of an opt-out session, on the same advertisement and
+        // failure caches: the captured /3 entry must never teach it a dial it does not have (12.1).
+        FakePlatform legacy = new FakePlatform();
+        ClientConnector plain = new ClientConnector(f.advertisements, f.failures);
+        Outcome<String> shipped = f.connect(plain, legacy, Mode.AUTO);
+        assertNull(shipped.v3Plan(), "the legacy connector never produces a /3 plan");
+        assertEquals(0, legacy.v3Dials.get(), "no /3 dial reaches a platform through the shared cache");
+        assertEquals(1, legacy.v2Dials.get(), "the shipped legacy behaviour stays: the /2 dial");
+        assertEquals(TransportSelection.Transport.V2, legacy.dialAlpn);
+    }
+
+    @Test
+    void aFirstContactWithMissingPrerequisitesJoinsOverTcpWithoutAnySideEffect() throws Exception {
+        for (boolean[] capabilities : new boolean[][] {{false, true}, {true, false}, {false, false}}) {
+            Fixture f = Fixture.empty();
+            f.advertiseV3(); // the pin store is fresh, so this name's pin state is NONE
+            FakePlatform p = new FakePlatform();
+            Outcome<String> outcome = f.connect(
+                    f.connector(capabilities[0], capabilities[1]), p, Mode.AUTO);
+
+            assertEquals("tcp", outcome.tcp(), "13.1: a /3 listener this client cannot join is TCP");
+            assertEquals(0, p.v3Dials.get(), "no /3 dial can exist without the prerequisites");
+            assertEquals(0, p.v2Dials.get(), "and a /3 listener is never offered /2");
+            assertNull(outcome.v3Plan());
+            assertNull(outcome.fallbackMessage(), "nothing failed, so there is no fallback report");
+            assertFalse(f.pins.pin(HOST, LOGICAL_PORT, NO_ACTIVE_KEYS).isPresent(),
+                    "a first contact writes no pin");
+            assertEquals(0, f.rebinds.size(), "and it leaves no re-bind state behind");
+            assertTrue(f.rebinds.activeKeys().isEmpty(), "and it holds no attempt either");
+            assertFalse(f.failures.isActivationBlocked(f.address(), QUIC_PORT, f.fingerprint,
+                    f.clock.getAsLong()), "and it records no activation failure");
+            assertTrue(f.failures.allows(f.address(), QUIC_PORT, f.fingerprint),
+                    "so §6's backoff stays clear as well");
+            assertNotNull(f.rebinds.tryBeginAttempt(HOST, LOGICAL_PORT, f.clock.getAsLong()),
+                    "nothing this join wrote may delay the next attempt for this server");
+        }
     }
 
     @Test

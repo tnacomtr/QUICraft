@@ -111,8 +111,8 @@ public final class ClientConnect {
         ClientV3State files = multistream != null ? client.v3State() : null;
         CompletableFuture<ClientConnector.Outcome<Channel>> attempt = multistream != null && files != null
                 ? multistream.connect(address, logical.getHost(), logical.getPort(), mode, joinInputs,
-                        new Platform(address, holder, loop))
-                : client.connector().connect(address, mode, joinInputs, new Platform(address, holder, loop));
+                        new Platform(address, holder, loop, true))
+                : client.connector().connect(address, mode, joinInputs, new Platform(address, holder, loop, false));
         promise.addListener(f -> {
             if (f.isCancelled()) {
                 attempt.cancel(false);
@@ -376,11 +376,13 @@ public final class ClientConnect {
         private final InetSocketAddress address;
         private final EventLoopGroupHolder holder;
         private final EventLoop loop;
+        private final boolean selectionAware;
 
-        Platform(InetSocketAddress address, EventLoopGroupHolder holder, EventLoop loop) {
+        Platform(InetSocketAddress address, EventLoopGroupHolder holder, EventLoop loop, boolean selectionAware) {
             this.address = address;
             this.holder = holder;
             this.loop = loop;
+            this.selectionAware = selectionAware;
         }
 
         @Override
@@ -388,7 +390,8 @@ public final class ClientConnect {
             Hooks.enter("status query"); // a throw here counts as "no advertisement": TCP
             return StatusQuery.query(loop, new ReflectiveChannelFactory<>(holder.channelCls()), server,
                     address.getHostString(), currentProtocolNumber())
-                    .thenApply(Advertisement::extract);
+                    .thenApply(json -> selectionAware ? Advertisement.extractForSelection(json)
+                            : Advertisement.extract(json));
         }
 
         @Override
