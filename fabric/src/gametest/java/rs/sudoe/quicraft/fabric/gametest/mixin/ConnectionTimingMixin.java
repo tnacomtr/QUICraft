@@ -6,10 +6,14 @@ import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
 import net.minecraft.network.protocol.game.ClientboundLoginPacket;
+import net.minecraft.network.protocol.login.ClientboundHelloPacket;
+import net.minecraft.network.protocol.login.ClientboundLoginFinishedPacket;
+import net.minecraft.network.protocol.ping.ClientboundPongResponsePacket;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import rs.sudoe.quicraft.fabric.gametest.ArmClock;
 import rs.sudoe.quicraft.fabric.gametest.JoinClock;
 
 /** Test only: timestamps on the Netty thread, as packets arrive. */
@@ -26,8 +30,18 @@ abstract class ConnectionTimingMixin {
     private void quicraftTest$time(ChannelHandlerContext ctx, Packet<?> packet, CallbackInfo ci) {
         if (packet instanceof ClientboundLoginPacket) {
             JoinClock.login();
+            ArmClock.playLogin();
         } else if (packet instanceof ClientboundLevelChunkWithLightPacket) {
             JoinClock.chunk();
+            ArmClock.chunk();
+        } else if (packet instanceof ClientboundHelloPacket) {
+            ArmClock.hello();
+        } else if (packet instanceof ClientboundLoginFinishedPacket) {
+            ArmClock.loginFinished();
+        } else if (packet instanceof ClientboundPongResponsePacket pong) {
+            ArmClock.pong(pong.time());
+        } else {
+            ArmClock.other();
         }
     }
 }
