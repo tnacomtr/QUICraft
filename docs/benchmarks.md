@@ -1024,6 +1024,12 @@ first numbers", not as a comparison with a stated tolerance. No claim of improve
 
 ### Caveats
 
+- **The /3 rows measure /3 with no chunk shards in use.** The shipped table
+  `quicraft-routing-p775-s2` routes `level_chunk_with_light` to CONTROL (the CHUNK-route deferral
+  in `protocol.md` 13.7), so every chunk rides the control stream and the three chunk streams stay
+  idle. Opt-in traces (2026-10-20, branch `agent/p5-pipeline`) show zero writes on streams 2-7 and
+  one flush per server write. These rows are not a measure of sharded /3; the /3 >= 3 streams
+  check counts opened streams, not streams that carried data.
 - n=3 per cell: ranges are wide (e.g. delayloss quic2 join 2074-3323 ms). No tolerance is met or
   claimed.
 - Chunk load under delayloss/jitter varies most; the TCP cells there (18191 ms, 8254 ms) are
