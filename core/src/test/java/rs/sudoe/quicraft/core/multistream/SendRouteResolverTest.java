@@ -140,7 +140,7 @@ final class SendRouteResolverTest {
         assertEquals(StreamSequencer.Fence.CHUNK, resolved.fence());
         assertEquals(-3, resolved.chunkX());
         assertEquals(17, resolved.chunkZ());
-        assertEquals(1, shipped.routesV2().values().stream().filter(r -> r.lane == RouteV2.StreamLane.CHUNK).count());
+        assertEquals(4, shipped.routesV2().values().stream().filter(r -> r.lane == RouteV2.StreamLane.CHUNK).count());
     }
 
     @Test

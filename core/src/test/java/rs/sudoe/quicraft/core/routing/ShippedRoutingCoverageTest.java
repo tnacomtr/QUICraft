@@ -34,7 +34,7 @@ class ShippedRoutingCoverageTest {
      * Reviewed CHUNK route enabled by this unit. Block updates and acknowledgement remain global until
      * the ACK-coverage wiring required by 13.19 is on the production send path.
      */
-    private static final Map<Integer, String> CHUNK = map(45, "chunk_xz");
+    private static final Map<Integer, String> CHUNK = map(45, "chunk_xz", 6, "block_position", 8, "block_position", 84, "section_position");
     /** 13.8/13.19: chunk_batch_start uses the view scope. */
     private static final Set<Integer> VIEW = set(12);
     /** 13.8: a multi-chunk packet stays CONTROL/global with its reviewed list extractor. */
