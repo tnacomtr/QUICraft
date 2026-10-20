@@ -49,7 +49,11 @@ public final class LaneCodec implements GameLanes.Codec {
     private final Channel channel;
     private final RoutingTable table;
     private final java.util.function.LongConsumer decodedBytes;
-    /** Routing input kept per packet: id VarInt (at most 5 bytes) plus the reviewed leading fields. */
+    /**
+     * Routing input kept per packet: id VarInt (at most 5 bytes) plus the reviewed leading fields.
+     * Valid only because CHUNK routes accept SINGLE and JOIN layouts (at most 13 bytes,
+     * RoutingTableLoader); a LIST layout walks the body and must never read this prefix.
+     */
     static final int ROUTING_PREFIX_BYTES = 64;
 
     private final Access access;
