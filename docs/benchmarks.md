@@ -969,3 +969,66 @@ measured run failed or disconnected, a measured run comes from a different schem
 metric field is missing, a successful run reports an impossible metric value, or an artifact could
 not be read or carries no usable netem profile. It exits `2` while `/3` evidence is absent, which
 is the expected state before U3. The presence of `/2` results never turns that `2` into a pass.
+
+## Real Fabric client, TCP vs /2 vs /3, six profiles: first measured rows (2026-10-20, n=3)
+
+Not a gate result. Three measured runs per arm and profile, far below the matrix above (N=20 or 80
+per batch, 3 batches). Read the table as "the path works under every profile and these are the
+first numbers", not as a comparison with a stated tolerance. No claim of improvement is made here.
+
+### Method
+
+- Build `f9db03c` (`feat/phase5-multistream`), every row's `buildCommit`. Real Fabric 26.1.2
+  client (`ExternalArmGameTest`) against a containerized Fabric dedicated server, offline mode.
+  One fresh server container and one fresh client JVM per run; arms interleaved tcp, quic2, quic3
+  per run index; `testkit/run-external-arms.sh` per run, serialized by an flock.
+- Arms: `tcp` = `TCP_ONLY`; `quic2` = `QUIC_ONLY`, multistream off, server multistream off (a /3
+  listener is /3-only); `quic3` = `QUIC_ONLY`, multistream on (ALPN `quicraft/3`, 5 streams,
+  routing table `quicraft-routing-p775-s2`, schema 2). Every row self-checks the negotiated
+  transport (`negotiatedTransportVerified`) and fails if a status query runs inside the measurement.
+- Timing as `BenchClient`: join = play-login packet arrival after `startConnecting`; chunk load =
+  play login to the last chunk packet, after 2 s with no chunk; RTT = play ping/pong every 5 ticks for
+  20 s, idle player.
+- Netem on the server container's interface (`testkit/netem-attach.sh`, both directions):
+  loss `loss 2%`; delay `delay 75ms`; delayloss `delay 75ms loss 2%`; reorder
+  `delay 10ms reorder 25% 50%`; jitter `delay 10ms 5ms distribution normal`; clean attaches
+  nothing. Shaping proven per run: e.g. loss run 0 dropped tcp 26/1391, quic2 540/25447, quic3
+  490/25522 packets; delay gives ~151 ms ping RTT (75 ms each way).
+- Validation: per arm and profile the merged document passes `testkit arm-samples`; /3 also passes
+  `testkit v3-samples`. 54/54 runs ok. Structural checks only; provenance is self-reported by the
+  emitter.
+- Raw rows: `testkit/results/arms-2026-10-20/r2/<profile>/` (gitignored, local).
+
+### Rows (medians over 3 runs)
+
+| profile | arm | n ok/rows | join ms (median, min-max) | chunk load ms (median) | rtt median ms (median of runs) | rtt p95 ms (median) | rtt lost (sum) | streams |
+|---|---|---|---|---|---|---|---|---|
+| clean | tcp | 3/3 | 1224 (1157-1268) | 981 | 0.59 | 0.89 | 0 | 1 |
+| clean | quic2 | 3/3 | 1469 (1409-1616) | 1542 | 0.96 | 1.39 | 0 | 1 |
+| clean | quic3 | 3/3 | 1561 (1401-1585) | 2503 | 1.33 | 1.88 | 0 | 5 |
+| loss | tcp | 3/3 | 1393 (1151-1406) | 1027 | 0.64 | 1.16 | 0 | 1 |
+| loss | quic2 | 3/3 | 1516 (1458-1678) | 1637 | 0.96 | 1.56 | 0 | 1 |
+| loss | quic3 | 3/3 | 1631 (1615-1634) | 2475 | 1.31 | 2.45 | 0 | 5 |
+| delay | tcp | 3/3 | 1894 (1840-1934) | 2023 | 150.72 | 152.87 | 0 | 1 |
+| delay | quic2 | 3/3 | 2232 (2030-2331) | 2067 | 150.94 | 153.08 | 0 | 1 |
+| delay | quic3 | 3/3 | 2569 (2552-2602) | 3361 | 151.31 | 153.32 | 0 | 5 |
+| delayloss | tcp | 3/3 | 1863 (1815-1942) | 18191 | 150.65 | 308.27 | 0 | 1 |
+| delayloss | quic2 | 3/3 | 2411 (2074-3323) | 3596 | 263.69 | 346.50 | 0 | 1 |
+| delayloss | quic3 | 3/3 | 2629 (2497-2954) | 3220 | 261.84 | 406.25 | 0 | 5 |
+| reorder | tcp | 3/3 | 1243 (1209-1411) | 1745 | 20.63 | 21.05 | 0 | 1 |
+| reorder | quic2 | 3/3 | 1629 (1511-1649) | 1710 | 20.88 | 21.43 | 0 | 1 |
+| reorder | quic3 | 3/3 | 1732 (1727-1805) | 2713 | 21.04 | 21.83 | 0 | 5 |
+| jitter | tcp | 3/3 | 1335 (1294-1424) | 8254 | 21.95 | 31.82 | 0 | 1 |
+| jitter | quic2 | 3/3 | 1640 (1447-1668) | 2380 | 20.97 | 34.13 | 0 | 1 |
+| jitter | quic3 | 3/3 | 1752 (1644-1824) | 6125 | 20.55 | 32.40 | 0 | 5 |
+
+### Caveats
+
+- n=3 per cell: ranges are wide (e.g. delayloss quic2 join 2074-3323 ms). No tolerance is met or
+  claimed.
+- Chunk load under delayloss/jitter varies most; the TCP cells there (18191 ms, 8254 ms) are
+  medians of three and need the full matrix before any reading.
+- QUIC play-ping RTT under delayloss (~262 ms median) sits above TCP's (~151 ms); not investigated.
+- Clean link: /3 chunk load (2503 ms) and join (1561 ms) are above TCP (981 ms, 1224 ms) and /2;
+  not investigated.
+- Loopback host, one machine, idle player, 26.1.2 offline only. No online-mode (channel-binding) run.
