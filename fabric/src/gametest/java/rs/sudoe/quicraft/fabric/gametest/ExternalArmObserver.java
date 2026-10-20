@@ -24,6 +24,12 @@ final class ExternalArmObserver {
 
     private ExternalArmObserver() {}
 
+    static void traceChunkLoadFinished(Connection connection) {
+        if (!Boolean.getBoolean("quicraft.v3.trace")) return;
+        Object controller = staticCall("v3", connection);
+        if (controller != null) call(controller, "traceChunkLoadFinished");
+    }
+
     /** Call on the client thread while connected. */
     static Seen observe(Connection connection) {
         boolean quic = Transports.isQuic(connection);

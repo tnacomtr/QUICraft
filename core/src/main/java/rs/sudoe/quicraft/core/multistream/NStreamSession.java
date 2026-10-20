@@ -397,6 +397,9 @@ public final class NStreamSession implements MultistreamSession {
     private boolean executing;
     private int executingStream = -1;
     private long executingSequence;
+    private final ReceiveTrace receiveTrace = ReceiveTrace.enabled() ? new ReceiveTrace() : null;
+    private long traceAckReceivedNanos;
+    private boolean traceChunkReported;
     private boolean endSubmitted;
     private long endWrittenAt;
     private io.netty.util.concurrent.ScheduledFuture<?> ticker;
@@ -849,7 +852,25 @@ public final class NStreamSession implements MultistreamSession {
     @Override
     public void applied(final Lane lane, final long sequence) {
         // Always queued: a game may acknowledge from inside deliver, which runs in the receive driver.
-        loop.execute(() -> guarded(() -> doApplied(lane, sequence)));
+        final long receivedNanos = receiveTrace == null ? 0 : System.nanoTime();
+        loop.execute(() -> guarded(() -> {
+            if (receiveTrace != null) {
+                receiveTrace.ackEventLoopQueue.add(System.nanoTime() - receivedNanos);
+                traceAckReceivedNanos = receivedNanos;
+            }
+            doApplied(lane, sequence);
+        }));
+    }
+
+    /** Diagnostic snapshot only; ack-to-next includes idle/input waits, not just scheduler overhead. */
+    public void traceReceiveChunkLoadFinished() {
+        if (receiveTrace == null) return;
+        loop.execute(() -> {
+            if (!traceChunkReported) {
+                traceChunkReported = true;
+                LOG.info("/3 receive trace core phase=chunk-load-finished " + receiveTrace.timingSummary());
+            }
+        });
     }
 
     @Override
@@ -1553,6 +1574,9 @@ public final class NStreamSession implements MultistreamSession {
             return;
         }
         closeNotified = true;
+        if (receiveTrace != null) {
+            LOG.info("/3 receive trace core phase=disconnect " + receiveTrace.timingSummary());
+        }
         LaneGame current = game;
         if (current == null) {
             return;
@@ -1815,6 +1839,10 @@ public final class NStreamSession implements MultistreamSession {
 
         @Override
         public void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle) {
+            if (receiveTrace != null && traceAckReceivedNanos != 0) {
+                receiveTrace.ackToNextDelivery.add(System.nanoTime() - traceAckReceivedNanos);
+                traceAckReceivedNanos = 0;
+            }
             game.deliver(lane, sequence, packets, bundle);
         }
 

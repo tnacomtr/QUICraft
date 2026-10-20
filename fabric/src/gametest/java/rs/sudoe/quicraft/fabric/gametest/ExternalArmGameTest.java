@@ -150,6 +150,11 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             }
             context.waitTick();
         }
+        context.runOnClient(c -> {
+            if (c.getConnection() != null) {
+                ExternalArmObserver.traceChunkLoadFinished(c.getConnection().getConnection());
+            }
+        });
         // Idle play window: a play ping every 5 ticks, identical in every arm.
         int sent = 0;
         int ticks = o.playSeconds * 20;

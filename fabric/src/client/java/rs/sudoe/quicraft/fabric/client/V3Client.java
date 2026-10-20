@@ -38,6 +38,7 @@ import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.connect.TransportSelection;
 import rs.sudoe.quicraft.core.connect.V3Plan;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
+import rs.sudoe.quicraft.core.multistream.ReceiveTrace;
 import rs.sudoe.quicraft.core.routing.Lane;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
@@ -148,6 +149,12 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private long unrunPackets;
     private long unrunBytes;
     private GameLanes.Ack heldAck;
+    private final ReceiveTrace receiveTrace = ReceiveTrace.enabled() ? new ReceiveTrace() : null;
+    private long traceDeliveryStartedNanos;
+    private long traceHeldDeliveryNanos;
+    private long traceHeldSinceNanos;
+    private boolean traceChunkReported;
+    private boolean traceDisconnectReported;
     /** Event loop only: packets fired since the last acknowledgement. */
     private long deliveredPackets;
     private final java.util.concurrent.atomic.AtomicLong decodedBytes = new java.util.concurrent.atomic.AtomicLong();
@@ -478,6 +485,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     /** The bridge channel went inactive. */
     void channelClosed() {
+        traceReceive(false);
         wipeSecret();
         // The channel is gone, so the exchange is over whatever the state: the session closes here
         // too, and can no longer tick itself into a failure and a TCP join (12.6, 12.14).
@@ -555,13 +563,20 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         deliveredPackets = 0;
         final long bytes = decodedBytes.getAndSet(0);
         final V3Handler watcher = handler;
+        final long now = receiveTrace == null ? 0 : System.nanoTime();
+        final long deliveryNanos = traceDeliveryStartedNanos == 0 ? now : traceDeliveryStartedNanos;
+        traceDeliveryStartedNanos = 0;
+        if (receiveTrace != null) receiveTrace.delivered(bytes);
         boolean hold;
         synchronized (accounting) {
             unrunPackets += packets;
             unrunBytes += bytes;
             hold = overBound();
+            if (receiveTrace != null) receiveTrace.backlog(unrunPackets, unrunBytes);
             if (hold) {
                 heldAck = ack;
+                traceHeldDeliveryNanos = deliveryNanos;
+                traceHeldSinceNanos = now;
             }
         }
         if (watcher != null) {
@@ -570,26 +585,30 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         try {
             mainThread.accept(() -> {
                 GameLanes.Ack release = null;
+                long heldDeliveryNanos = 0;
+                long heldSinceNanos = 0;
                 synchronized (accounting) {
                     unrunPackets -= packets;
                     unrunBytes -= bytes;
                     if (heldAck != null && !overBound()) {
                         release = heldAck;
                         heldAck = null;
+                        heldDeliveryNanos = traceHeldDeliveryNanos;
+                        heldSinceNanos = traceHeldSinceNanos;
                     }
                 }
                 if (watcher != null) {
                     watcher.deliveryApplied();
                 }
                 if (release != null) {
-                    applyAck(release);
+                    applyAck(release, heldDeliveryNanos, heldSinceNanos);
                 }
             });
         } catch (RejectedExecutionException closing) {
             return; // the game is shutting down; nothing is left to acknowledge
         }
         if (!hold) {
-            applyAck(ack);
+            applyAck(ack, deliveryNanos, 0);
         }
     }
 
@@ -608,10 +627,13 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         return unrunPackets > MAX_UNRUN_PACKETS || unrunBytes > MAX_UNRUN_BYTES;
     }
 
-    private void applyAck(GameLanes.Ack ack) {
+    private void applyAck(GameLanes.Ack ack, long deliveryNanos, long heldSinceNanos) {
         try {
             GameLanes current = lanes;
             if (current != null && !current.isClosed()) {
+                if (receiveTrace != null) {
+                    receiveTrace.acknowledged(deliveryNanos, heldSinceNanos, System.nanoTime());
+                }
                 ackSink.accept(ack.lane(), ack.sequence());
             }
         } catch (Throwable t) {
@@ -621,7 +643,27 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     /** A decoded game packet is being fired into the game (counted for the next acknowledgement). */
     void packetDelivered() {
+        if (receiveTrace != null && traceDeliveryStartedNanos == 0) {
+            traceDeliveryStartedNanos = System.nanoTime();
+        }
         deliveredPackets++;
+    }
+
+    /** Called by the external-arm harness after its chunk quiet window, not once per chunk batch. */
+    void traceChunkLoadFinished() {
+        if (receiveTrace != null) loop.execute(() -> traceReceive(true));
+    }
+
+    private void traceReceive(boolean chunkFinished) {
+        if (receiveTrace == null) return;
+        if (chunkFinished ? traceChunkReported : traceDisconnectReported) return;
+        if (chunkFinished) traceChunkReported = true;
+        else traceDisconnectReported = true;
+        QuicraftFabric.LOG.info("/3 receive trace client phase={} {}", chunkFinished
+                ? "chunk-load-finished" : "disconnect", receiveTrace.summary());
+        if (chunkFinished && v3.session() instanceof NStreamSession session) {
+            session.traceReceiveChunkLoadFinished();
+        }
     }
 
     /** Tests: where acknowledgements run, and how the game's main thread is asked to run a marker. */

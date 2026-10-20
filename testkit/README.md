@@ -125,6 +125,25 @@ copy). Needs Docker Compose v2, JDK 25, `python3`, `git`, `flock`, and a display
 `ExternalArmGameTest` is deliberately not in the committed entrypoint list; the runner adds it for
 the invocation only.
 
+Receive diagnostics (baseline scheduling unchanged): start the client JVM with
+`-Dquicraft.v3.trace=true`; off by default. The external-arm runner has no client-JVM-args
+option. An operator can set `JAVA_TOOL_OPTIONS=-Dquicraft.v3.trace=true` in its environment
+before invoking the runner (this also enables traces in Gradle JVMs, not in Docker containers).
+Search the saved `.client.log` for `/3 receive trace`. The harness prints one cumulative
+snapshot after the chunk quiet window and one at disconnect, each with client and core lines.
+Outside this harness, only the disconnect snapshot is automatic.
+
+Client counters distinguish immediate acknowledgements from acknowledgements held by the
+existing `overBound()` check (256 packets / 1 MiB). They include peak queued packets/decoded
+bytes, decoded bytes per unit (mean/max), delivery-start-to-ack latency and held-time total/max.
+Delivery starts at the first packet's `packetDelivered()` notification; a unit finishes at its
+existing acknowledgement marker. Histograms use bounded storage: p50/p95 are **100 us bucket
+upper bounds**, with the observed maximum as the overflow bucket's bound, not exact percentiles.
+Core reports ack receipt to `doApplied` (event-loop queue), and ack receipt to the next
+delivery. The latter **includes input/dependency/idle waits**, so it is not a pure CPU or hop
+measurement. Snapshots are cumulative from activation, not chunk-only deltas. Tracing retains
+no packets, payloads or connection identifiers and changes no acknowledgement decisions.
+
 Merge the per-run documents of one arm and profile (all inputs must agree on clientType, arm,
 netemProfile, profile, server and build commit; run indexes must be unique; the output is written
 atomically and never overwritten):
