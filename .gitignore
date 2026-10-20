@@ -34,3 +34,4 @@ pubkeys/*
 *.key
 *private*.pem
 *.sec.pem
+__pycache__/

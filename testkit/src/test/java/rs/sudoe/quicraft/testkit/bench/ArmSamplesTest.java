@@ -173,6 +173,15 @@ class ArmSamplesTest {
     }
 
     @Test
+    void quic3WithTooFewStreamsRejected() throws IOException {
+        JsonObject d = good("quic3");
+        for (com.google.gson.JsonElement r : d.getAsJsonArray("runs")) {
+            r.getAsJsonObject().add("streamCount", num("2"));
+        }
+        assertRejected(d, "streamCount must be at least 3");
+    }
+
+    @Test
     void wrongProfileSuffixRejected() throws IOException {
         JsonObject d = good("tcp");
         d.add("profile", new JsonPrimitive("clean-quic-2"));

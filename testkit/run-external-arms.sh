@@ -5,7 +5,7 @@
 # Fabric server container plus a fresh client JVM, for exactly one arm `tcp`, `quic2` or `quic3`.
 #
 #   testkit/run-external-arms.sh --arm quic3 --run 0 --out-dir /tmp/opencode/arms
-#   testkit/run-external-arms.sh --arm tcp --run 0 --warmup --port 25575 --out-dir ./arms
+#   testkit/run-external-arms.sh --arm tcp --run 0 --warmup --port 25565 --out-dir ./arms
 #
 # Each invocation:
 #   1. refuses a dirty git tree and records HEAD as the 40-hex build commit;
@@ -21,7 +21,8 @@
 #   6. succeeds only when the emitted document exists, parses as JSON, and runs[0].ok is true.
 #
 # The emitter (ExternalArmGameTest) is a separate unit; this runner only uses the frozen property
-# names. Netem shaping is unit U3: `--netem` accepts only `clean` for now and refuses the rest.
+# names. `--netem` takes clean, loss, delay, delayloss, reorder or jitter; testkit/netem-attach.sh
+# shapes the server container's interface for every profile, clean included (same qdisc path in every arm).
 #
 # Per-run documents are merged with testkit/merge-arm-samples.py. For `/3`, the merged document
 # must additionally pass the testkit validator (see testkit/README.md):
@@ -48,7 +49,7 @@ ready_timeout="${QUICRAFT_ARM_READY_TIMEOUT:-180}"
 usage() {
     {
         echo "usage: run-external-arms.sh --arm tcp|quic2|quic3 --run N [--warmup] --out-dir DIR"
-        echo "                              [--port P] [--play-seconds S] [--netem clean]"
+        echo "                              [--port 25565] [--play-seconds S] [--netem PROFILE]"
         echo
         echo "One fresh Fabric server container and one fresh client JVM per invocation."
         echo "  --arm           tcp | quic2 | quic3 (required)"
