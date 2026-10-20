@@ -116,9 +116,17 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             }
             context.waitTick();
         }
-        ExternalArmObserver.Seen seen = context.computeOnClient(
-                c -> ExternalArmObserver.observe(c.getConnection().getConnection()));
-        String mismatch = mismatch(o.arm, seen);
+        // The /3 controller may still be finishing its cutover at the first rendered tick.
+        ExternalArmObserver.Seen seen = null;
+        String mismatch = null;
+        for (int t = 0; t < 40; t++) {
+            seen = context.computeOnClient(c -> ExternalArmObserver.observe(c.getConnection().getConnection()));
+            mismatch = mismatch(o.arm, seen);
+            if (mismatch == null) {
+                break;
+            }
+            context.waitTick();
+        }
         // Chunk load: chunks arrived and none for QUIET_NANOS (BenchClient's quiet rule).
         for (int t = 0; ArmClock.chunks.get() == 0
                 || System.nanoTime() - ArmClock.lastChunkAt.get() < QUIET_NANOS; t++) {
@@ -182,7 +190,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         row.addProperty("ok", ok);
         add(row, "phasesMs", phases);
         row.addProperty("joinMs", phases[3]);
-        row.addProperty("chunkLoadMs", millis(ArmClock.lastChunkAt.get() - start));
+        // As BenchClient: play login to the last chunk, not from the connect.
+        row.addProperty("chunkLoadMs", millis(ArmClock.lastChunkAt.get() - ArmClock.playLoginAt.get()));
         row.addProperty("chunks", ArmClock.chunks.get());
         row.addProperty("rttMedianMs", percentile(sorted, 0.5));
         row.addProperty("rttP95Ms", percentile(sorted, 0.95));
@@ -199,7 +208,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         row.addProperty("negotiatedTransportVerified", mismatch == null);
         QuicraftFabricTestLog.info(String.format(Locale.ROOT, "arm %s run %d: join %.1f ms, chunks %d in %.1f ms,"
                 + " rtt median %.2f ms p95 %.2f ms (%d/%d), seen %s, ok %s", o.arm, o.run, phases[3],
-                ArmClock.chunks.get(), millis(ArmClock.lastChunkAt.get() - start), percentile(sorted, 0.5),
+                ArmClock.chunks.get(), millis(ArmClock.lastChunkAt.get() - ArmClock.playLoginAt.get()), percentile(sorted, 0.5),
                 percentile(sorted, 0.95), sorted.length, sent, seen, ok));
         return row;
     }
