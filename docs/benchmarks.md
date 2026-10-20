@@ -1094,12 +1094,10 @@ unit-prefetch invariants are mandatory (13.12); exactly-one-byte client prefix p
 not itself a wire-format requirement. No correctness bug or licence to relax those bounds
 was established. Read behaviour is unchanged.
 
-**Flush proposal, not implemented:** `QuicStreamWriteSink.write` calls `writeAndFlush` per
-selected slice. The API-call counts are consequently one flush per write, not measured UDP
-datagram counts. Explore bounded drain batches (for example at most 64 writes or 256 KiB)
-using `write` plus one flush per touched stream, flushing before any return/wait and END.
-Keep 64 KiB scheduling quanta, dependency selection, writability rechecks, retained-charge
-release on write futures, fairness and urgent/control latency intact. Test grant exhaustion,
-partial writes, errors and close with pending flushes before comparing performance. This
-would be local scheduling/flush policy, not a change to routes or wire encoding; it is not
-permission to change the activation/cipher-cutover flush ordering.
+**Flush batching: tried, no effect (2026-10-20).** `QuicStreamWriteSink.write` calls
+`writeAndFlush` per selected slice, so the trace shows one flush per write. In our pinned Netty
+QUIC (4.2.19.Final-quicraft5) a stream's `flush()` is a no-op and `write()` already passes the
+bytes to quiche and sends the connection, so the count is API calls, not datagrams. A bounded
+batching change (`agent/p5-pipeline` `965e251`, not merged) ran /3 clean at 16.0, 16.8 and
+19.3 ms per chunk (157 chunks each) against 11.8-22.8 before: no measurable gain, as expected
+from the no-op flush. Any real batching would have to happen at the connection level.
