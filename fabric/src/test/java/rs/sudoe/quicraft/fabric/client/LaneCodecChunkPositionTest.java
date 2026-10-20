@@ -64,6 +64,30 @@ class LaneCodecChunkPositionTest {
         }
     }
 
+    /** A large packet keeps only the bounded routing prefix, so the 8 MiB workspace still fits it. */
+    @Test
+    void largePacketRetainsOnlyTheBoundedRoutingPrefix() throws Exception {
+        EmbeddedChannel channel = pipeline(true);
+        LaneCodec codec = new LaneCodec(channel, null, null, access(true));
+        byte[] packet = new byte[5 << 20];
+        ByteBuffer.wrap(packet).put((byte) 45).putInt(-7).putInt(8);
+        ByteBuf frame = Unpooled.wrappedBuffer(FrameCodec.encode(packet, 0));
+        long[] charged = {0};
+        try {
+            var decoded = codec.decode(frame, ProtocolState.PLAY, (add, total) -> charged[0] += add);
+            assertEquals(LaneCodec.ROUTING_PREFIX_BYTES, decoded.uncompressed().length);
+            assertEquals(packet.length, decoded.uncompressedBytes());
+            var position = ExtractorRegistry.productionDecoder("mc775.chunk_xz.v1").extract(decoded.uncompressed());
+            assertEquals(-7, position.chunkX);
+            assertEquals(8, position.chunkZ);
+            assertEquals((long) packet.length + LaneCodec.ROUTING_PREFIX_BYTES, charged[0],
+                    "the declared size plus the bounded prefix, never a second whole copy");
+        } finally {
+            frame.release();
+            channel.finishAndReleaseAll();
+        }
+    }
+
     @Test
     void routingCopyReservationRefusalPrecedesDestructiveGameDecode() throws Exception {
         EmbeddedChannel channel = pipeline(false);

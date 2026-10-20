@@ -49,6 +49,9 @@ public final class LaneCodec implements GameLanes.Codec {
     private final Channel channel;
     private final RoutingTable table;
     private final java.util.function.LongConsumer decodedBytes;
+    /** Routing input kept per packet: id VarInt (at most 5 bytes) plus the reviewed leading fields. */
+    static final int ROUTING_PREFIX_BYTES = 64;
+
     private final Access access;
 
     /** Private Minecraft handler operations, substituted only at the external codec boundary in tests. */
@@ -137,11 +140,14 @@ public final class LaneCodec implements GameLanes.Codec {
             }
             int packetId = VarInt.read(packetBytes.duplicate());
             // The game's decoder consumes this buffer (and the inflated buffer is released below).
-            // CHUNK validation needs id+body afterwards; an absent position input closes 0x11.
-            // Charge the retained routing copy before allocating it, separately from decode storage.
+            // CHUNK validation needs the id and the leading position fields afterwards; an absent
+            // position input closes 0x11. Keep only a bounded prefix: every reviewed extractor reads
+            // the id VarInt plus at most 8 bytes, and a whole copy would halve the largest packet the
+            // 8 MiB workspace accepts. Charge it before allocating, separately from decode storage.
             int uncompressedSize = packetBytes.readableBytes();
-            reservation.reserve(uncompressedSize, uncompressedSize);
-            byte[] uncompressed = ByteBufUtil.getBytes(packetBytes);
+            int prefix = Math.min(uncompressedSize, ROUTING_PREFIX_BYTES);
+            reservation.reserve(prefix, prefix);
+            byte[] uncompressed = ByteBufUtil.getBytes(packetBytes, packetBytes.readerIndex(), prefix);
             List<Object> out = new ArrayList<>(1);
             access.decode(decoderContext, packetBytes, out);
             if (out.size() != 1 || !(out.get(0) instanceof Packet)) {
@@ -149,7 +155,7 @@ public final class LaneCodec implements GameLanes.Codec {
             }
             Packet<?> packet = (Packet<?>) out.get(0);
             return new LaneGame.Decoded(packet, state, packetId, bundleOf(packet), packet.isTerminal(),
-                    2L * uncompressedSize, uncompressedSize, uncompressed);
+                    prefix, uncompressedSize, uncompressed);
         } finally {
             if (owned) {
                 packetBytes.release();
