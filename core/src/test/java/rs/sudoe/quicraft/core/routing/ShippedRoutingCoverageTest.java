@@ -31,12 +31,10 @@ class ShippedRoutingCoverageTest {
     /** 13.8 REALTIME entity and animation set, plus block_destruction and block_event (13.8 names them). */
     private static final Set<Integer> REALTIME = set(2, 42, 47, 53, 54, 55, 56, 83, 99, 101, 102, 116, 131, 5, 7);
     /**
-     * 13.8 chunk-shard set. Empty by CP2 (Sol): the CHUNK routes 45, 8, 6 and 84 stay out of the table,
-     * so they are CONTROL/global like every other unlisted id. Reason: block updates and the
-     * block_changed_ack must keep their causal order, and the ACK-coverage wiring that 13.19 needs is
-     * not on the production send path.
+     * Reviewed CHUNK route enabled by this unit. Block updates and acknowledgement remain global until
+     * the ACK-coverage wiring required by 13.19 is on the production send path.
      */
-    private static final Map<Integer, String> CHUNK = map();
+    private static final Map<Integer, String> CHUNK = map(45, "chunk_xz");
     /** 13.8/13.19: chunk_batch_start uses the view scope. */
     private static final Set<Integer> VIEW = set(12);
     /** 13.8: a multi-chunk packet stays CONTROL/global with its reviewed list extractor. */

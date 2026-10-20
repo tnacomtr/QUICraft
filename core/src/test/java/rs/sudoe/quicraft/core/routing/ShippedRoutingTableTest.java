@@ -36,39 +36,52 @@ class ShippedRoutingTableTest {
     }
 
     @Test
-    void theOnlyBoundExtractorIsTheReviewedChunkListForTheGlobalMultiChunkPacket() throws Exception {
+    void boundExtractorsAreTheReviewedChunkListAndChunkInstall() throws Exception {
         Faults.set();
         Map<String, String> expected = new LinkedHashMap<String, String>();
         expected.put("chunk_list", "mc775.chunk_list.v1");
-        // The CHUNK-lane layouts (chunk_xz, block_position, section_position) and mc775.join.v1 are
-        // reviewed but deliberately unbound: CHUNK routes stay out of the table (CP2, Sol), and the
-        // join routes fail closed on the send path (CP1).
+        expected.put("chunk_xz", "mc775.chunk_xz.v1");
         assertEquals(expected, RoutingTableLoader.loadResource(PROTOCOL).extractors());
     }
 
     @Test
-    void theTableHasNoChunkLaneRouteAtAll() throws Exception {
+    void onlyTheReviewedChunkInstallUsesTheChunkLane() throws Exception {
         Faults.set();
+        int count = 0;
         for (RouteV2 route : RoutingTableLoader.loadResource(PROTOCOL).routesV2().values()) {
-            assertTrue(route.lane != RouteV2.StreamLane.CHUNK, "CHUNK routes are out of the table (CP2)");
+            if (route.lane == RouteV2.StreamLane.CHUNK) {
+                count++;
+                assertEquals(Dependency.LANE, route.dependency);
+                assertEquals("mc775.chunk_xz.v1", route.extractor);
+                assertEquals("chunk_xz", route.position);
+            }
         }
+        assertEquals(1, count);
+        assertEquals(RouteV2.StreamLane.CHUNK, RoutingTableLoader.loadResource(PROTOCOL)
+                .routeV2For(new RouteKey(PROTOCOL, ProtocolState.PLAY, Direction.CLIENTBOUND, 45)).lane);
     }
 
     /**
-     * The ACK-ordering argument (CP2, Sol): covered block updates and their block_changed_ack must keep
-     * game order, so the table relaxes nothing against them. Every route is either global CONTROL (ordered
+     * Covered block updates and block_changed_ack remain global until 13.19 is wired. The chunk install
+     * is safe on CHUNK because later block updates, forget and light remain global, and the global fence
+     * orders them after every shard record. Every other route is either global CONTROL (ordered
      * against all records), the view gate, or REALTIME whose send waits for the latest CONTROL fence. The
-     * only relaxations are REALTIME against REALTIME and REALTIME against non-global control, and no
-     * CHUNK stream exists in this table, so no covered update can overtake its ack.
+     * only relaxations are REALTIME against REALTIME, REALTIME against non-global control, and install
+     * records against global records; global records wait for every shard record.
      */
     @Test
-    void everyShippedRelaxationIsRealtimeOrViewAndNoRouteLeavesGameOrderForChunks() throws Exception {
+    void everyShippedRelaxationPreservesGlobalFencesAroundChunkInstall() throws Exception {
         Faults.set();
-        for (RouteV2 route : RoutingTableLoader.loadResource(PROTOCOL).routesV2().values()) {
+        for (Map.Entry<RouteKey, RouteV2> entry : RoutingTableLoader.loadResource(PROTOCOL).routesV2().entrySet()) {
+            RouteV2 route = entry.getValue();
             boolean global = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.GLOBAL;
             boolean realtime = route.lane == RouteV2.StreamLane.REALTIME && route.dependency == Dependency.LANE;
             boolean view = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.VIEW;
-            assertTrue(global || realtime || view, "unexpected relaxation: " + route.lane + "/" + route.dependency);
+            boolean chunkInstall = entry.getKey().direction() == Direction.CLIENTBOUND
+                    && entry.getKey().state() == ProtocolState.PLAY && entry.getKey().packetId() == 45
+                    && route.lane == RouteV2.StreamLane.CHUNK && route.dependency == Dependency.LANE;
+            assertTrue(global || realtime || view || chunkInstall,
+                    "unexpected relaxation: " + route.lane + "/" + route.dependency);
         }
     }
 
