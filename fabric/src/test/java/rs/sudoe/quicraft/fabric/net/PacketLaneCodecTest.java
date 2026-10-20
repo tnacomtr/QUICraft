@@ -117,6 +117,7 @@ class PacketLaneCodecTest {
         assertEquals(Envelope.Bundle.NONE, decoded.bundle());
         ByteBuf forPipeline = (ByteBuf) decoded.packet();
         assertArrayEquals(packet, ByteBufUtil.getBytes(forPipeline));
+        assertArrayEquals(packet, decoded.uncompressed(), "retain the existing packet array for route extraction");
         assertNotNull(channel.pipeline().get("decoder"), "decoding for the pipeline changes nothing in it");
 
         // Fired into the pipeline, the game's own decoder produces the packet and, being a terminal
@@ -190,6 +191,7 @@ class PacketLaneCodecTest {
         assertEquals(Envelope.Bundle.NONE, decoded.bundle());
         assertEquals(packet.length, charged[0], "the retained copy was charged before it existed");
         assertEquals(packet.length, total[0]);
+        assertArrayEquals(packet, decoded.uncompressed(), "inflated input retains the same routing bytes");
         ByteBuf forPipeline = (ByteBuf) decoded.packet();
         assertArrayEquals(packet, ByteBufUtil.getBytes(forPipeline));
 

@@ -49,6 +49,38 @@ public final class LaneCodec implements GameLanes.Codec {
     private final Channel channel;
     private final RoutingTable table;
     private final java.util.function.LongConsumer decodedBytes;
+    /**
+     * Routing input kept per packet: id VarInt (at most 5 bytes) plus the reviewed leading fields.
+     * Valid only because CHUNK routes accept SINGLE and JOIN layouts (at most 13 bytes,
+     * RoutingTableLoader); a LIST layout walks the body and must never read this prefix.
+     */
+    static final int ROUTING_PREFIX_BYTES = 64;
+
+    private final Access access;
+
+    /** Private Minecraft handler operations, substituted only at the external codec boundary in tests. */
+    interface Access {
+        ProtocolState state(PacketDecoder<?> decoder);
+        void decode(ChannelHandlerContext context, ByteBuf bytes, List<Object> out) throws Exception;
+        void decompress(ChannelHandlerContext context, ByteBuf bytes, List<Object> out) throws Exception;
+    }
+
+    private static final Access MIXINS = new Access() {
+        @Override
+        public ProtocolState state(PacketDecoder<?> decoder) {
+            return stateOf(((PacketDecoderAccessor) decoder).quicraft$protocolInfo().id());
+        }
+
+        @Override
+        public void decode(ChannelHandlerContext context, ByteBuf bytes, List<Object> out) throws Exception {
+            ((PacketDecoderAccessor) context.handler()).quicraft$decode(context, bytes, out);
+        }
+
+        @Override
+        public void decompress(ChannelHandlerContext context, ByteBuf bytes, List<Object> out) throws Exception {
+            ((CompressionDecoderAccessor) context.handler()).quicraft$decode(context, bytes, out);
+        }
+    };
     /** Between {@code routeOf}, which encodes, and {@code encode}, which hands the bytes over. */
     private Packet<?> encodedPacket;
     private byte[] encodedFrame;
@@ -61,9 +93,14 @@ public final class LaneCodec implements GameLanes.Codec {
 
     /** {@code decodedBytes} is told the wire size of every frame decoded (for the main-thread backlog bound). */
     LaneCodec(Channel channel, RoutingTable table, java.util.function.LongConsumer decodedBytes) {
+        this(channel, table, decodedBytes, MIXINS);
+    }
+
+    LaneCodec(Channel channel, RoutingTable table, java.util.function.LongConsumer decodedBytes, Access access) {
         this.channel = channel;
         this.table = table;
         this.decodedBytes = decodedBytes;
+        this.access = access;
     }
 
     // --- Inbound.
@@ -76,8 +113,7 @@ public final class LaneCodec implements GameLanes.Codec {
         if (decoderContext == null || !(decoderContext.handler() instanceof PacketDecoder)) {
             throw new IllegalStateException("no inbound protocol is configured (13.16)");
         }
-        PacketDecoderAccessor decoder = (PacketDecoderAccessor) decoderContext.handler();
-        ProtocolState state = stateOf(decoder.quicraft$protocolInfo().id());
+        ProtocolState state = access.state((PacketDecoder<?>) decoderContext.handler());
 
         if (decodedBytes != null) {
             decodedBytes.accept(frame.readableBytes());
@@ -97,8 +133,7 @@ public final class LaneCodec implements GameLanes.Codec {
                 int charge = declared > 0 ? declared : frame.readableBytes();
                 reservation.reserve(charge, charge);
                 List<Object> inflated = new ArrayList<>(1);
-                ((CompressionDecoderAccessor) decompressContext.handler()).quicraft$decode(
-                        decompressContext, frame, inflated);
+                access.decompress(decompressContext, frame, inflated);
                 if (inflated.size() != 1) {
                     throw new IOException("decompression produced " + inflated.size() + " buffers");
                 }
@@ -108,13 +143,23 @@ public final class LaneCodec implements GameLanes.Codec {
                 reservation.reserve(frame.readableBytes(), frame.readableBytes());
             }
             int packetId = VarInt.read(packetBytes.duplicate());
+            // The game's decoder consumes this buffer (and the inflated buffer is released below).
+            // CHUNK validation needs the id and the leading position fields afterwards; an absent
+            // position input closes 0x11. Keep only a bounded prefix: every reviewed extractor reads
+            // the id VarInt plus at most 8 bytes, and a whole copy would halve the largest packet the
+            // 8 MiB workspace accepts. Charge it before allocating, separately from decode storage.
+            int uncompressedSize = packetBytes.readableBytes();
+            int prefix = Math.min(uncompressedSize, ROUTING_PREFIX_BYTES);
+            reservation.reserve(prefix, prefix);
+            byte[] uncompressed = ByteBufUtil.getBytes(packetBytes, packetBytes.readerIndex(), prefix);
             List<Object> out = new ArrayList<>(1);
-            decoder.quicraft$decode(decoderContext, packetBytes, out);
+            access.decode(decoderContext, packetBytes, out);
             if (out.size() != 1 || !(out.get(0) instanceof Packet)) {
                 throw new IOException("the packet decoder produced " + out.size() + " objects");
             }
             Packet<?> packet = (Packet<?>) out.get(0);
-            return new LaneGame.Decoded(packet, state, packetId, bundleOf(packet), packet.isTerminal());
+            return new LaneGame.Decoded(packet, state, packetId, bundleOf(packet), packet.isTerminal(),
+                    prefix, uncompressedSize, uncompressed);
         } finally {
             if (owned) {
                 packetBytes.release();

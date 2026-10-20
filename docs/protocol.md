@@ -1326,18 +1326,22 @@ before this revision can run.
     against `play-ids-775.txt` by `ShippedRoutingCoverageTest`. Its serverbound half is entirely
     CONTROL/global with `ordinarySmall:false`, because the serverbound dual-lane routes above are
     still "Proposed". Its packet ids are pinned to the live game by `RoutingTableGameTest`.
-    It has no CHUNK route; the ordering argument and the deferrals are below.
-   Shipped routing, ordering argument (CP2, design review). The shipped table routes no packet to
-   CHUNK. Chunk installs (45), block, section and block-entity updates (8, 84, 6) and the
-   block_changed_ack join (4) therefore stay CONTROL/global. The reason is 13.19: a covered update
-   must be ordered before its acknowledgement even when the game emits the acknowledgement first.
+    CHUNK routes are enabled only for reviewed production extractors whose captured vectors,
+    independent golden vectors, shipped-table coverage and ordering tests pass; the ordering
+    argument and remaining deferrals are below.
+    Shipped routing, ordering argument (26.1.2). Only `level_chunk_with_light` (45) uses CHUNK,
+    with the reviewed `mc775.chunk_xz.v1` extractor. `block_update` (8), `block_entity_data` (6),
+    `section_blocks_update` (84) and `block_changed_ack` (4) stay CONTROL/global. The reason is
+    13.19: a covered update must be ordered before its acknowledgement even when the game emits
+    the acknowledgement first.
    The causal machinery exists in core (`AckJoinTracker`, `SessionSendDriver.coverAssigned` and
    `assignedPending`), but no production adapter calls the coverage hooks (only bridge passthroughs
    and tests), and the route resolver fails closed on ACK_JOIN and BATCH_JOIN. A global ACK route alone
-   does not make that order safe, so the CHUNK routes wait for that wiring. With no CHUNK route,
-   every relaxation the table makes is ordered against every global record: REALTIME waits for the
-   latest CONTROL fence and the view gate is a fence for later REALTIME. The shipped order therefore
-   matches TCP's game order. `ShippedRoutingTableTest` pins this.
+   does not make block-update CHUNK routes safe, so those routes wait for that wiring. Later
+   block updates, forget and light remain global; the global fence orders them after every shard
+   record, preserving install-before-update and shard-before-forget ordering. REALTIME waits for
+   the latest CONTROL fence and the view gate is a fence for later REALTIME.
+   `ShippedRoutingTableTest` pins this reviewed relaxation.
 
    Deferrals, all CONTROL/global, with the reason for each:
    - `block_changed_ack` (4) and `chunk_batch_finished` (11): the join routes need the coverage
@@ -1370,9 +1374,9 @@ before this revision can run.
    | Identifier | Packet(s) | Route in the shipped table | Capture and vector |
    | --- | --- | --- | --- |
    | `mc775.chunk_list.v1` | `chunks_biomes` (13) | CONTROL/global, list extractor | `captured-775-vectors.txt` |
-   | `mc775.chunk_xz.v1` | `level_chunk_with_light` (45) | none: CHUNK deferred (above) | `captured-775-vectors.txt` |
-   | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | none: CHUNK deferred | `captured-775-vectors.txt` |
-   | `mc775.section_position.v1` | `section_blocks_update` (84) | none: CHUNK deferred | `captured-775-vectors.txt` |
+   | `mc775.chunk_xz.v1` | `level_chunk_with_light` (45) | CHUNK/lane install | `captured-775-vectors.txt` |
+   | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | CONTROL/global pending ACK coverage | `captured-775-vectors.txt` |
+   | `mc775.section_position.v1` | `section_blocks_update` (84) | CONTROL/global pending ACK coverage | `captured-775-vectors.txt` |
    | `mc775.join.v1` | `block_changed_ack` (4), `chunk_batch_finished` (11) | none: joins deferred | `captured-775-vectors.txt` |
    | `mc775.raw_copies.v1` | footprint accounting for every state's serverbound limits | `decodeFootprintBound` | 13.12 boundary vectors in `ExtractorGoldenTest` |
 
@@ -1422,8 +1426,10 @@ before this revision can run.
      the synthetic `primitive.varint_xz.v1` for the oracle. `set_chunk_cache_center` is the one
      packet observed with leading VarInt x/z, but it is a view packet, not a CHUNK-lane one, so
      it does not justify a production identifier for that layout.
-   Every other 13.8 CHUNK-set packet has a reviewed layout in the provenance table above, but no CHUNK
-   route ships yet (CP2), so all of them stay CONTROL/global until the ACK wiring lands.
+   `block_update` (8), `block_entity_data` (6) and `section_blocks_update` (84) remain
+   CONTROL/global until ACK/BATCH causal coverage (13.19) is wired. Joins (4/11),
+   `forget_level_chunk` (37) and `light_update` (48) remain unchanged; the latter two lack
+   reviewed production layouts.
 
    Regenerate the checked-in vectors with (runs the whole client gametest suite, protocol 775):
 

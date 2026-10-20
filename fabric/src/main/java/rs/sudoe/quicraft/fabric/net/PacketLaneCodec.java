@@ -126,7 +126,7 @@ public final class PacketLaneCodec implements GameLanes.Codec {
                 ? Unpooled.wrappedBuffer(FrameCodec.varInt(0), packet)
                 : Unpooled.wrappedBuffer(packet);
         return new LaneGame.Decoded(forPipeline, stateOf(info.id()), id, Envelope.Bundle.NONE, false, retained[0],
-                uncompressed[0]);
+                uncompressed[0], packet);
     }
 
     /**
@@ -158,7 +158,7 @@ public final class PacketLaneCodec implements GameLanes.Codec {
                 ? Unpooled.wrappedBuffer(FrameCodec.varInt(0), packet)
                 : Unpooled.wrappedBuffer(packet);
         return new LaneGame.Decoded(forPipeline, stateOf(info.id()), id, Envelope.Bundle.NONE, false,
-                packet.length, packet.length);
+                packet.length, packet.length, packet);
     }
 
     /**

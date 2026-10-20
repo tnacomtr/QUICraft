@@ -1024,6 +1024,9 @@ first numbers", not as a comparison with a stated tolerance. No claim of improve
 
 ### Caveats
 
+- **Routing table update (2026-10-20):** the current protocol-775 table digest is
+  `d7aae8281ba38d4a9463bcad90c14e97eb40620a268c296fc1db7bdb6e910c5c`. The measurements and
+  trace diagnosis below predate this update and retain their historical digest and routing behavior.
 - **The /3 rows measure /3 with no chunk shards in use.** The shipped table
   `quicraft-routing-p775-s2` routes `level_chunk_with_light` to CONTROL (the CHUNK-route deferral
   in `protocol.md` 13.7), so every chunk rides the control stream and the three chunk streams stay
@@ -1059,7 +1062,7 @@ client chunk-quiet totals include activation/configuration, not just the JSON ch
 Summed per-record queue latencies are not wall-clock elapsed time, and cannot be compared
 directly to that interval or treated as proof that flushing caused the delay.
 
-**Why no CHUNK writes:** this is the explicit shipped CP2 safety deferral, not resolver
+**Historical explanation for no CHUNK writes:** these samples used the previous shipped CP2 table, not resolver
 fallback, extractor failure, an epoch switch or a disabled/missing shard configuration.
 `protocol-775.json` explicitly assigns clientbound PLAY id 45 (`level_chunk_with_light`)
 CONTROL/global, with no position or extractor and `epoch_change:false`; the only bound

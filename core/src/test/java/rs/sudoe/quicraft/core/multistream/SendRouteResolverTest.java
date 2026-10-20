@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.multistream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.HashMap;
@@ -119,50 +120,53 @@ final class SendRouteResolverTest {
         assertFalse(r.failed());
     }
 
-    /** The production CP2 safety deferral is explicit, not a missing-id fallback or extractor failure. */
+    /** The shipped table enables only the reviewed chunk-install route. */
     @Test
-    void shipped775ChunkInstallResolvesToTheDocumentedGlobalDeferral() throws Exception {
+    void shipped775ChunkInstallUsesReviewedChunkRouteAndNoOtherRouteDoes() throws Exception {
         RoutingTable shipped = RoutingTableLoader.loadResource(775);
         RouteKey key = new RouteKey(775, ProtocolState.PLAY, Direction.CLIENTBOUND, 45);
         RouteV2 route = shipped.routeV2For(key); // minecraft:level_chunk_with_light
-        assertEquals(RouteV2.StreamLane.CONTROL, route.lane);
-        assertEquals(Dependency.GLOBAL, route.dependency);
-        assertNull(route.extractor);
-        assertNull(route.position);
+        assertEquals(RouteV2.StreamLane.CHUNK, route.lane);
+        assertEquals(Dependency.LANE, route.dependency);
+        assertEquals("mc775.chunk_xz.v1", route.extractor);
+        assertEquals("chunk_xz", route.position);
         assertFalse(route.epochChange);
-        SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(shipped::routeV2For,
-                Collections.<String, Extractor>emptyMap(), 775, Direction.CLIENTBOUND,
-                ProtocolState.PLAY, 45, null);
-        assertFalse(resolved.failed());
-        assertEquals(StreamSequencer.Fence.GLOBAL, resolved.fence());
-        assertTrue(shipped.routesV2().values().stream().noneMatch(r -> r.lane == RouteV2.StreamLane.CHUNK),
-                "CP2 deliberately has no CHUNK routes; changing that needs its causal-coverage gate");
-    }
-
-    /** An in-memory proposed route only: proves no resolver bug prevents real id 45 from using its extractor. */
-    @Test
-    void proposed775ChunkInstallUsesReviewedExtractorButDoesNotChangeTheShippedTable() throws Exception {
-        RoutingTable shipped = RoutingTableLoader.loadResource(775);
-        RouteKey key = new RouteKey(775, ProtocolState.PLAY, Direction.CLIENTBOUND, 45);
-        RouteV2 proposed = new RouteV2(RouteV2.StreamLane.CHUNK, Dependency.LANE,
-                "chunk", "chunk", false, null, null, null);
-        SessionReceiveDriver.RouteSource source = k -> key.equals(k) ? proposed : shipped.routeV2For(k);
-        Map<String, Extractor> decoders = Collections.<String, Extractor>singletonMap("chunk",
+        Map<String, Extractor> decoders = Collections.<String, Extractor>singletonMap("mc775.chunk_xz.v1",
                 ExtractorRegistry.productionDecoder("mc775.chunk_xz.v1"));
-        // Packet-id plus coordinate prefix only, not a complete Minecraft packet; trailing body is not extracted.
         byte[] prefix = {45, -1, -1, -1, -3, 0, 0, 0, 17};
-        SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(source, decoders, 775,
-                Direction.CLIENTBOUND, ProtocolState.PLAY, 45, prefix);
+        SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(shipped::routeV2For,
+                decoders, 775, Direction.CLIENTBOUND, ProtocolState.PLAY, 45, prefix);
         assertFalse(resolved.failed(), resolved.failure());
         assertEquals(StreamSequencer.Fence.CHUNK, resolved.fence());
         assertEquals(-3, resolved.chunkX());
         assertEquals(17, resolved.chunkZ());
-        SendRouteResolver.BundleScopes scopes = SendRouteResolver.bundleScopes(source, 775,
-                Direction.CLIENTBOUND, ProtocolState.PLAY, new int[] {45});
-        assertFalse(scopes.failed());
-        assertEquals(StreamSequencer.Fence.GLOBAL, StreamSequencer.bundleScope(scopes.scopes()),
-                "13.15 keeps a bundle containing a chunk whole on global CONTROL, even with a CHUNK route");
-        assertEquals(RouteV2.StreamLane.CONTROL, shipped.routeV2For(key).lane);
+        assertEquals(1, shipped.routesV2().values().stream().filter(r -> r.lane == RouteV2.StreamLane.CHUNK).count());
+    }
+
+    @Test
+    void shipped775ChunkInstallCoordinatesMapToTheirExtractorShard() throws Exception {
+        RoutingTable shipped = RoutingTableLoader.loadResource(775);
+        Map<String, Extractor> decoders = Collections.<String, Extractor>singletonMap("mc775.chunk_xz.v1",
+                ExtractorRegistry.productionDecoder("mc775.chunk_xz.v1"));
+        byte[][] packets = {{45, 0, 0, 0, 2, 0, 0, 0, 3}, {45, 0, 0, 0, 9, 0, 0, 0, 11}};
+        for (int i = 0; i < packets.length; i++) {
+            byte[] packet = packets[i];
+            SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(shipped::routeV2For, decoders,
+                    775, Direction.CLIENTBOUND, ProtocolState.PLAY, 45, packet);
+            assertFalse(resolved.failed(), resolved.failure());
+            int expectedX = i == 0 ? 2 : 9;
+            int expectedZ = i == 0 ? 3 : 11;
+            assertEquals(expectedX, resolved.chunkX());
+            assertEquals(expectedZ, resolved.chunkZ());
+            assertEquals(ShardHash.shardOf(expectedX, expectedZ, 0, 6),
+                    ShardHash.shardOf(resolved.chunkX(), resolved.chunkZ(), 0, 6));
+        }
+        SendRouteResolver.Resolved first = SendRouteResolver.resolve(shipped::routeV2For, decoders,
+                775, Direction.CLIENTBOUND, ProtocolState.PLAY, 45, packets[0]);
+        SendRouteResolver.Resolved second = SendRouteResolver.resolve(shipped::routeV2For, decoders,
+                775, Direction.CLIENTBOUND, ProtocolState.PLAY, 45, packets[1]);
+        assertNotEquals(ShardHash.shardOf(first.chunkX(), first.chunkZ(), 0, 6),
+                ShardHash.shardOf(second.chunkX(), second.chunkZ(), 0, 6));
     }
 
     @Test
