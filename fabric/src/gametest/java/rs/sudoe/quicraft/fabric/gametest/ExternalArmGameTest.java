@@ -53,6 +53,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
     private static final int CHUNK_TIMEOUT_TICKS = 20 * 60;
     /** Payloads of the pings this test sent, so only our pongs count as round trips. */
     private static final Set<Long> SENT = ConcurrentHashMap.newKeySet();
+    /** The connector's status-query hook name ({@code ClientConnect}'s platform). */
+    private static final String STATUS_QUERY_HOOK = "status query";
 
     static boolean ownPing(long payload) {
         return SENT.remove(payload);
@@ -78,6 +80,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         } catch (Throwable t) {
             row = failedRow(o, "harness: " + t);
         } finally {
+            Hooks.setFaultInjection(false);
             client.setMode(originalMode);
             client.setMultistream(originalMultistream);
         }
@@ -108,6 +111,9 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         }
         ArmClock.reset();
         SENT.clear();
+        // Any status query inside the timed window throws at its hook (so it cannot succeed quietly)
+        // and is recorded; the row then fails below.
+        Hooks.setFaultInjection(STATUS_QUERY_HOOK);
         long start = System.nanoTime();
         context.runOnClient(c -> ConnectScreen.startConnecting(new TitleScreen(), c,
                 ServerAddress.parseString(o.server), new ServerData("arm", o.server, ServerData.Type.OTHER),
@@ -117,9 +123,14 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             if (t > JOIN_TIMEOUT_TICKS) {
                 String state = context.computeOnClient(c -> "screen " + (Screens.current(c) == null ? "none"
                         : Screens.current(c).getClass().getName()));
-                return failedRow(o, "not in the world after " + JOIN_TIMEOUT_TICKS / 20 + " s (" + state + ")");
+                String query = Hooks.wasFaultInjected(STATUS_QUERY_HOOK)
+                        ? "; a status query ran inside the timed window" : "";
+                return failedRow(o, "not in the world after " + JOIN_TIMEOUT_TICKS / 20 + " s (" + state + ")" + query);
             }
             context.waitTick();
+        }
+        if (Hooks.wasFaultInjected(STATUS_QUERY_HOOK)) {
+            return failedRow(o, "a status query ran inside the timed window");
         }
         // The /3 controller may still be finishing its cutover at the first rendered tick.
         ExternalArmObserver.Seen seen = null;
@@ -163,6 +174,10 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         }
         for (int t = 0; ArmClock.rtts.size() < sent && t < 40; t++) {
             context.waitTick(); // 2 s grace for the last pongs
+        }
+        // Still armed through chunk load and play; the finally in runTest disarms it.
+        if (Hooks.wasFaultInjected(STATUS_QUERY_HOOK)) {
+            return failedRow(o, "a status query ran during the measurement");
         }
         boolean connected = context.computeOnClient(c -> c.getConnection() != null && c.level != null);
         ExternalArmObserver.Seen after = connected ? context.computeOnClient(

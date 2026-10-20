@@ -38,6 +38,8 @@ import rs.sudoe.quicraft.testkit.Args;
  */
 public final class ArmSamples {
     private static final Set<String> ARMS = Set.of("tcp", "quic2", "quic3");
+    /** Control + realtime + at least one chunk shard. */
+    private static final int MIN_QUIC3_STREAMS = 3;
 
     /** A clean full Git SHA-1: exactly 40 lowercase hex characters, no dirty suffix. */
     private static final Pattern FULL_COMMIT = Pattern.compile("[0-9a-f]{40}");
@@ -104,6 +106,16 @@ public final class ArmSamples {
         }
         if ("quic3".equals(arm)) {
             V3Samples.Summary v3 = V3Samples.validate(rootElement);
+            // /3 opens the control stream, the realtime stream and at least one chunk shard.
+            JsonArray rows = root.getAsJsonArray("runs");
+            for (int i = 0; i < rows.size(); i++) {
+                JsonObject row = rows.get(i).getAsJsonObject();
+                int streams = row.get("streamCount").getAsInt();
+                if (row.get("ok").getAsBoolean() && streams < MIN_QUIC3_STREAMS) {
+                    throw new V3Samples.InvalidDocument("runs[" + i + "].streamCount must be at least "
+                            + MIN_QUIC3_STREAMS + " for arm quic3, not " + streams);
+                }
+            }
             return new Summary(arm, v3.rows(), v3.measured(), v3.warmup());
         }
 
