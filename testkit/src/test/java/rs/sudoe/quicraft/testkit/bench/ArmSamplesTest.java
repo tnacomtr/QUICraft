@@ -169,7 +169,7 @@ class ArmSamplesTest {
         assertEquals(0, runDoc(good("quic3")).code());
         JsonObject bad = good("quic3");
         firstMeasured(bad).add("streamCount", num("1"));
-        assertEquals(1, runDoc(bad).code());
+        assertRejected(bad, "does not share the first row's build");
     }
 
     @Test
@@ -203,6 +203,13 @@ class ArmSamplesTest {
     }
 
     @Test
+    void tcpWithAlpnRejected() throws IOException {
+        JsonObject d = good("tcp");
+        firstMeasured(d).add("negotiatedAlpn", new JsonPrimitive("quicraft/2"));
+        assertRejected(d, "negotiatedAlpn");
+    }
+
+    @Test
     void streamCountNotOneRejected() throws IOException {
         JsonObject d = good("quic2");
         firstMeasured(d).add("streamCount", num("2"));
@@ -217,26 +224,59 @@ class ArmSamplesTest {
     }
 
     @Test
+    void nonzeroRoutingSchemaRejectedForTcpAndQuic2() throws IOException {
+        for (String arm : new String[] {"tcp", "quic2"}) {
+            JsonObject d = good(arm);
+            firstMeasured(d).add("routingTableSchema", num("1"));
+            assertRejected(d, "routingTableSchema must be 0");
+        }
+    }
+
+    @Test
+    void nonemptyRoutingDigestRejectedForTcpAndQuic2() throws IOException {
+        for (String arm : new String[] {"tcp", "quic2"}) {
+            JsonObject d = good(arm);
+            firstMeasured(d).add("routingTableDigest", new JsonPrimitive(DIGEST));
+            assertRejected(d, "routingTableDigest must be empty");
+        }
+    }
+
+    @Test
+    void wrongSchemaVersionRejected() throws IOException {
+        JsonObject d = good("quic2");
+        firstMeasured(d).add("schemaVersion", num(Integer.toString(BenchmarkSchema.VERSION + 1)));
+        assertRejected(d, "schemaVersion must be");
+    }
+
+    @Test
     void dirtyCommitRejected() throws IOException {
         JsonObject d = good("tcp");
         for (var e : d.getAsJsonArray("runs")) {
             e.getAsJsonObject().add("buildCommit", new JsonPrimitive(COMMIT + "-dirty"));
         }
-        assertEquals(1, runDoc(d).code());
+        assertRejected(d, "buildCommit must be a clean 40-hex");
     }
 
     @Test
     void mixedCommitsRejected() throws IOException {
         JsonObject d = good("quic2");
         firstMeasured(d).add("buildCommit", new JsonPrimitive("0".repeat(40)));
-        assertEquals(1, runDoc(d).code());
+        assertRejected(d, "does not share the first row's build commit");
     }
 
     @Test
     void unverifiedTransportRejected() throws IOException {
         JsonObject d = good("quic2");
         firstMeasured(d).add("negotiatedTransportVerified", new JsonPrimitive(false));
-        assertEquals(1, runDoc(d).code());
+        assertRejected(d, "negotiatedTransportVerified must be true");
+    }
+
+    @Test
+    void rowShapeFailureWinsOverTransportIdentityFailure() throws IOException {
+        JsonObject d = good("tcp");
+        firstMeasured(d).add("transportVersion", new JsonPrimitive(TransportVersion.QUIC_2.name()));
+        firstMeasured(d).add("negotiatedTransportVerified", new JsonPrimitive(false));
+        assertRejected(d, "negotiatedTransportVerified must be true");
     }
 
     @Test
@@ -251,11 +291,18 @@ class ArmSamplesTest {
         assertRejected(d, "root.arm");
         JsonObject m = good("tcp");
         m.remove("arm");
-        assertEquals(1, runDoc(m).code());
+        assertRejected(m, "arm");
     }
 
     @Test
     void onlyWarmupRowsRejected() throws IOException {
-        assertEquals(1, runDoc(doc("tcp", row("tcp", true))).code());
+        assertRejected(doc("tcp", row("tcp", true)), "every row is a warmup");
+    }
+
+    @Test
+    void unsuccessfulRowRejectedWithReason() throws IOException {
+        JsonObject d = good("tcp");
+        firstMeasured(d).add("ok", new JsonPrimitive(false));
+        assertRejected(d, ".ok must be true");
     }
 }

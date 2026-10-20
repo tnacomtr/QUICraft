@@ -111,7 +111,7 @@ public final class ArmSamples {
             for (int i = 0; i < rows.size(); i++) {
                 JsonObject row = rows.get(i).getAsJsonObject();
                 int streams = row.get("streamCount").getAsInt();
-                if (row.get("ok").getAsBoolean() && streams < MIN_QUIC3_STREAMS) {
+                if (streams < MIN_QUIC3_STREAMS) {
                     throw new V3Samples.InvalidDocument("runs[" + i + "].streamCount must be at least "
                             + MIN_QUIC3_STREAMS + " for arm quic3, not " + streams);
                 }
@@ -124,16 +124,10 @@ public final class ArmSamples {
                 V3Samples.validateRows(runs, (row, what) -> validateRow(row, what, arm));
         V3Samples.requireSharedIdentity(results);
         int warmups = 0;
-        int measuredOk = 0;
         for (RunResult result : results) {
             if (result.warmup()) {
                 warmups++;
-            } else if (result.ok()) {
-                measuredOk++;
             }
-        }
-        if (measuredOk == 0) {
-            throw new V3Samples.InvalidDocument("at least one non-warmup ok row is required");
         }
         return new Summary(arm, results.size(), results.size() - warmups, warmups);
     }
@@ -147,6 +141,8 @@ public final class ArmSamples {
         V3Samples.validateRowShape(row, what);
         TransportVersion expected =
                 "tcp".equals(arm) ? TransportVersion.TCP : TransportVersion.QUIC_2;
+        // Keep this gate order: after shared row-shape checks, report transport identity first,
+        // then negotiated evidence and routing/schema provenance.
         String transport = V3Samples.stringField(row, "transportVersion", what);
         if (!expected.name().equals(transport)) {
             throw new V3Samples.InvalidDocument(what + ".transportVersion must be "
