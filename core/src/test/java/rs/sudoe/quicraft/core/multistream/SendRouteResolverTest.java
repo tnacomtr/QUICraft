@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.HashMap;
+import java.util.Collections;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
@@ -17,6 +18,9 @@ import rs.sudoe.quicraft.core.routing.Extractor;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.routing.RouteKey;
 import rs.sudoe.quicraft.core.routing.RouteV2;
+import rs.sudoe.quicraft.core.routing.RoutingTable;
+import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
+import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
 
 /** Send-side fence resolution against a schema-2 table (13.5-13.9, 13.6). */
 final class SendRouteResolverTest {
@@ -113,6 +117,52 @@ final class SendRouteResolverTest {
         assertEquals(3, r.chunkX());
         assertEquals(-4, r.chunkZ());
         assertFalse(r.failed());
+    }
+
+    /** The production CP2 safety deferral is explicit, not a missing-id fallback or extractor failure. */
+    @Test
+    void shipped775ChunkInstallResolvesToTheDocumentedGlobalDeferral() throws Exception {
+        RoutingTable shipped = RoutingTableLoader.loadResource(775);
+        RouteKey key = new RouteKey(775, ProtocolState.PLAY, Direction.CLIENTBOUND, 45);
+        RouteV2 route = shipped.routeV2For(key); // minecraft:level_chunk_with_light
+        assertEquals(RouteV2.StreamLane.CONTROL, route.lane);
+        assertEquals(Dependency.GLOBAL, route.dependency);
+        assertNull(route.extractor);
+        assertNull(route.position);
+        assertFalse(route.epochChange);
+        SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(shipped::routeV2For,
+                Collections.<String, Extractor>emptyMap(), 775, Direction.CLIENTBOUND,
+                ProtocolState.PLAY, 45, null);
+        assertFalse(resolved.failed());
+        assertEquals(StreamSequencer.Fence.GLOBAL, resolved.fence());
+        assertTrue(shipped.routesV2().values().stream().noneMatch(r -> r.lane == RouteV2.StreamLane.CHUNK),
+                "CP2 deliberately has no CHUNK routes; changing that needs its causal-coverage gate");
+    }
+
+    /** An in-memory proposed route only: proves no resolver bug prevents real id 45 from using its extractor. */
+    @Test
+    void proposed775ChunkInstallUsesReviewedExtractorButDoesNotChangeTheShippedTable() throws Exception {
+        RoutingTable shipped = RoutingTableLoader.loadResource(775);
+        RouteKey key = new RouteKey(775, ProtocolState.PLAY, Direction.CLIENTBOUND, 45);
+        RouteV2 proposed = new RouteV2(RouteV2.StreamLane.CHUNK, Dependency.LANE,
+                "chunk", "chunk", false, null, null, null);
+        SessionReceiveDriver.RouteSource source = k -> key.equals(k) ? proposed : shipped.routeV2For(k);
+        Map<String, Extractor> decoders = Collections.<String, Extractor>singletonMap("chunk",
+                ExtractorRegistry.productionDecoder("mc775.chunk_xz.v1"));
+        // Packet-id plus coordinate prefix only, not a complete Minecraft packet; trailing body is not extracted.
+        byte[] prefix = {45, -1, -1, -1, -3, 0, 0, 0, 17};
+        SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(source, decoders, 775,
+                Direction.CLIENTBOUND, ProtocolState.PLAY, 45, prefix);
+        assertFalse(resolved.failed(), resolved.failure());
+        assertEquals(StreamSequencer.Fence.CHUNK, resolved.fence());
+        assertEquals(-3, resolved.chunkX());
+        assertEquals(17, resolved.chunkZ());
+        SendRouteResolver.BundleScopes scopes = SendRouteResolver.bundleScopes(source, 775,
+                Direction.CLIENTBOUND, ProtocolState.PLAY, new int[] {45});
+        assertFalse(scopes.failed());
+        assertEquals(StreamSequencer.Fence.GLOBAL, StreamSequencer.bundleScope(scopes.scopes()),
+                "13.15 keeps a bundle containing a chunk whole on global CONTROL, even with a CHUNK route");
+        assertEquals(RouteV2.StreamLane.CONTROL, shipped.routeV2For(key).lane);
     }
 
     @Test

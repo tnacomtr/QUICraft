@@ -1038,3 +1038,68 @@ first numbers", not as a comparison with a stated tolerance. No claim of improve
 - Clean link: /3 chunk load (2503 ms) and join (1561 ms) are above TCP (981 ms, 1224 ms) and /2;
   not investigated.
 - Loopback host, one machine, idle player, 26.1.2 offline only. No online-mode (channel-binding) run.
+
+### /3 clean-link trace diagnosis (2026-10-20, diagnostic only)
+
+Read the two operator-run `testkit/results/trace2/` samples and their client/server logs,
+build `21035c7fed92d029dc86cf7f812b5739494ff43b`. These are opt-in instrumented observations,
+not a performance gate or new uninstrumented baseline. Both JSON rows verify `/3`, schema 2,
+`quicraft-routing-p775-s2`, digest
+`ced506e3ab08c092eadb12c9ef1fa215c2eb75ecf4eab5dbfc8ddec78df94ff1`, N=3 (five streams).
+
+| Run | Chunks | chunkLoadMs (JSON) | Client units/stream at chunk quiet | Client one-byte/read requests | Server writes/stream at disconnect |
+| --- | ---: | ---: | --- | --- | --- |
+| 0 | 157 | 1851.285440 | [713,3788,0,0,0] | 93780 / 98814 | [2128,21226,0,0,0] |
+| 1 | 157 | 3482.787638 | [852,4952,0,0,0] | 120535 / 126912 | [2270,18706,0,0,0] |
+
+The client chunk-quiet snapshots report no-local-bytes totals 3800.829 / 5367.604 ms;
+server snapshots report zero pool-grant wait, zero stream/parent unwritability and zero
+writes selected inside the one-second tick. Server totals include the idle-play interval;
+client chunk-quiet totals include activation/configuration, not just the JSON chunk interval.
+Summed per-record queue latencies are not wall-clock elapsed time, and cannot be compared
+directly to that interval or treated as proof that flushing caused the delay.
+
+**Why no CHUNK writes:** this is the explicit shipped CP2 safety deferral, not resolver
+fallback, extractor failure, an epoch switch or a disabled/missing shard configuration.
+`protocol-775.json` explicitly assigns clientbound PLAY id 45 (`level_chunk_with_light`)
+CONTROL/global, with no position or extractor and `epoch_change:false`; the only bound
+position decoder is the multi-chunk list decoder. `SendRouteResolver.resolve` therefore
+returns GLOBAL, and `SessionSendDriver.streamFor` chooses CONTROL without calling a chunk
+extractor. The frozen shipped-table exception in protocol.md 13.7 explicitly defers all
+CHUNK routes, although the intended complete routing model in 13.8 places installs/updates/
+forget on position shards. `ShippedRoutingCoverageTest` intentionally expects an empty
+CHUNK set. Core's reviewed coordinate extractor works for real id 45 under an in-memory
+proposed route; new resolver tests pin both behaviours, including 13.15 bundle promotion.
+Those are diagnostic coverage tests, not a fail-before/pass-after bug fix.
+
+Some causal submission infrastructure has since landed (`V3Join.submitUnitNow` calls
+`sendCovered`), so the older statement in 13.7 that no adapter calls coverage hooks is
+historical. That does not prove the gate complete: the production source has no calls to
+the ACK/batch lifecycle methods, and `OutboundUnit.requireSupportedCoverage` still refuses
+ACK/batch metadata and multi-token/bundle coverage. Flipping chunk routes alone would
+bypass the explicit ordering/security deferral. No frozen table/spec or routing policy was
+changed for this diagnosis. The real-Fabric wrapper enables multistream, and negotiation
+uses the configured preference N=3 (maximum 6); changing N does not change table lanes.
+
+**Why one-byte grants:** `CompactDecoder.wanted()` requests one byte until the outer length
+VarInt is complete; `ClientReadPump` then requests a bounded prefix/body, never more than
+the current charged unit still needs. `QuicStreamByteSource.read` issues a capped channel
+read when its local buffer is empty. Every pump step probes all available streams, including
+the three unused CHUNK streams still waiting for their first record-length byte. Thus the
+one-byte counter counts requests, including repeated pending/empty probes, not received
+bytes or UDP packets. Actual client read-complete counts at chunk quiet are 10013 / 12691,
+far below the request counts. This is conservative framing/admission implementation, not
+evidence that payloads are transferred byte-by-byte. The one-head/charged-capacity/no-next-
+unit-prefetch invariants are mandatory (13.12); exactly-one-byte client prefix probing is
+not itself a wire-format requirement. No correctness bug or licence to relax those bounds
+was established. Read behaviour is unchanged.
+
+**Flush proposal, not implemented:** `QuicStreamWriteSink.write` calls `writeAndFlush` per
+selected slice. The API-call counts are consequently one flush per write, not measured UDP
+datagram counts. Explore bounded drain batches (for example at most 64 writes or 256 KiB)
+using `write` plus one flush per touched stream, flushing before any return/wait and END.
+Keep 64 KiB scheduling quanta, dependency selection, writability rechecks, retained-charge
+release on write futures, fairness and urgent/control latency intact. Test grant exhaustion,
+partial writes, errors and close with pending flushes before comparing performance. This
+would be local scheduling/flush policy, not a change to routes or wire encoding; it is not
+permission to change the activation/cipher-cutover flush ordering.
