@@ -379,6 +379,8 @@ public final class NStreamSession implements MultistreamSession {
     private SessionSendDriver sendDriver;
     private final QuicStreamWriteSink sink;
     private final QuicStreamByteSource source;
+    /** Stall watchdog ({@code -Dquicraft.v3.stalldiag=true}); null when off, so the tick pays one null test. */
+    private final StallDiag stallDiag;
     private final PreambleFilter preambles;
     private final QuicStreamChannel[] channels;
     /** Logical indexes ever attached, so a replacement stream for an index is refused (13.3). */
@@ -492,6 +494,7 @@ public final class NStreamSession implements MultistreamSession {
         this.table = table;
         this.context = context;
         this.resources = resources;
+        this.stallDiag = StallDiag.ENABLED ? new StallDiag(resources.clock(), msg -> LOG.info(msg)) : null;
         this.timing = timing;
         this.compressed = compressed;
         this.loop = connection.eventLoop();
@@ -1452,6 +1455,9 @@ public final class NStreamSession implements MultistreamSession {
             fail(CLOSE_ORDERING, NO_REASON, "acknowledgement refused: " + e.getMessage(), e);
             return;
         }
+        if (stallDiag != null) {
+            stallDiag.progress();
+        }
         afterWork();
         schedulePump();
     }
@@ -1581,6 +1587,43 @@ public final class NStreamSession implements MultistreamSession {
         } finally {
             if (trace != null) trace.tick(beforeWrites, sendDriver.awaitingGrant());
         }
+        if (stallDiag != null && !closed) {
+            stallCheck();
+        }
+    }
+
+    /** Stall watchdog step (diagnostics only): gathers state for a due event and never changes it. */
+    private void stallCheck() {
+        StreamReceiver receiver = clientDriver != null ? clientDriver.receiver()
+                : serverDriver != null ? serverDriver.receiver() : null;
+        boolean receiverBlocked = receiver != null && receiver.hasBlockedHead();
+        boolean senderQueued = sendDriver.queuedRecords() > 0;
+        String side = serverDriver != null ? "server" : "client";
+        stallDiag.tick(side, receiverBlocked, senderQueued, () -> stallLines(receiver));
+    }
+
+    private List<String> stallLines(StreamReceiver receiver) {
+        List<String> lines = new ArrayList<String>();
+        if (receiver != null) {
+            lines.add(receiver.stallSummary());
+        }
+        for (int stream = 0; stream < channels.length; stream++) {
+            QuicStreamChannel channel = channels[stream];
+            if (channel == null) {
+                lines.add("chan s" + stream + " attached=no");
+                continue;
+            }
+            lines.add("chan s" + stream + " attached=yes streamId=" + channel.streamId()
+                    + " active=" + channel.isActive() + " autoRead=" + channel.config().isAutoRead()
+                    + " buffered=" + (source == null ? -1 : source.buffered(stream)));
+        }
+        lines.add("send queuedRecords=" + sendDriver.queuedRecords() + " awaitingGrant=" + sendDriver.awaitingGrant());
+        lines.add("session executing=" + executing + " executingSequence=" + executingSequence
+                + " pumping=" + pumping + " pumpHeld=" + pumpHeld);
+        if (source != null) {
+            lines.add("source " + source.traceSummary());
+        }
+        return lines;
     }
 
     private void tickNow() {

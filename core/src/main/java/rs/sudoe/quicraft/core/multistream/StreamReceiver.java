@@ -738,6 +738,41 @@ public final class StreamReceiver {
         return queued;
     }
 
+    /**
+     * Stall diagnostics only: whether some stream holds a head that is not enqueued yet, that is, a head waiting on
+     * its dependencies or on a slot. Reads state; changes nothing.
+     */
+    public boolean hasBlockedHead() {
+        for (Unit unit : head) {
+            if (unit != null && !unit.enqueued) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Stall diagnostics only: the executing head, the queued count and, per stream, the applied sequence and the held
+     * head (sequence, enqueued, dependency-ready). Reads state; changes nothing.
+     */
+    public String stallSummary() {
+        StringBuilder text = new StringBuilder("recv executing=").append(executingHead())
+                .append(" queuedUnits=").append(queuedUnits());
+        for (int stream = 0; stream < streams; stream++) {
+            Unit unit = head[stream];
+            text.append(" | s").append(stream).append(" applied=").append(applied[stream]);
+            if (unit == null) {
+                text.append(" head=none");
+            } else {
+                text.append(" head=").append(unit.record.sequence())
+                        .append(" enq=").append(unit.enqueued ? "yes" : "no")
+                        .append(" ready=").append(ready(unit) ? "yes" : "no")
+                        .append(" closing=").append(unit.closing);
+            }
+        }
+        return text.toString();
+    }
+
     /** Transport reading for diagnostics: the boundary clock, or the sample taken for the current check. */
     private long diagnosticNanos(StallClock.Sample sample) {
         return source == null ? clock.getAsLong() : sample.nowNanos();
