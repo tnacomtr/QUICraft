@@ -118,12 +118,11 @@ class AckBacklogTest {
         backlog.delivered(Lane.CONTROL, 3, 1, 400);
         assertEquals(List.of(1L, 2L), acked, "the node cannot carry 3: its acknowledgement is held, not failed");
         assertEquals(800, node.reserved(), "and nothing is charged for it yet");
-        assertTrue(backlog.hasBlocked(), "the connection retries it");
+        assertFalse(backlog.hasBlocked(), "no retry timer: its own marker resolves it");
 
         mainThread.poll().run();
         assertEquals(List.of(1L, 2L, 3L), acked, "a marker that ran made room: 3 is charged and acknowledged");
         assertEquals(800, node.reserved());
-        assertFalse(backlog.hasBlocked());
         runMainThread();
         assertEquals(0, node.reserved());
     }
@@ -164,11 +163,7 @@ class AckBacklogTest {
         assertEquals(99_000, node.available(), "the rest of the node stays free for reading");
 
         runMainThread();
-        for (AckBacklog backlog : connections) {
-            backlog.retry();
-            runMainThread();
-        }
-        assertEquals(50, acked.size(), "every held acknowledgement completes once the share drains");
+        assertEquals(50, acked.size(), "every held acknowledgement completes as the markers run, no timer");
         assertEquals(0, share.reserved());
         assertEquals(0, node.reserved());
     }

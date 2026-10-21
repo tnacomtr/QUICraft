@@ -91,7 +91,7 @@ final class AckBacklog {
      * One delivery of {@code packets} packets and {@code bytes} bytes was accepted by the game. Its bytes
      * are reserved against the backlog share and the node budget; when either refuses, its acknowledgement
      * is held (the unit keeps its read/decode charge, and its stream, until then) and the reservation is
-     * tried again, in order, on {@link #retry} and whenever a marker runs. A refusal never fails the
+     * tried again, in order, whenever a marker runs (at the latest its own) and on {@link #retry}. A refusal never fails the
      * connection: it is local pressure, not the peer's fault (13.10, 13.12).
      */
     synchronized void delivered(Lane lane, long sequence, long packets, long bytes) {
@@ -126,10 +126,13 @@ final class AckBacklog {
         releaseReady();
     }
 
-    /** Whether anything waits for a retry: a refused marker or a refused reservation. */
+    /**
+     * Whether a refused marker waits for {@link #retry}. A refused reservation needs no timer: its own
+     * marker is queued, and when it (or any earlier one) runs, the reservation is tried again or dropped.
+     */
     synchronized boolean hasBlocked() {
         for (Entry entry : held) {
-            if (entry.blocked || !entry.charged) {
+            if (entry.blocked) {
                 return true;
             }
         }

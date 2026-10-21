@@ -1004,6 +1004,11 @@ public final class V3Join implements BindingDecodeContext.Gate {
         }
 
         private void acknowledge(ChannelHandlerContext ctx, GameLanes.Ack ack) {
+            acknowledge(ctx, ack, 1);
+        }
+
+        /** {@code delayMs}: the next swap poll, 1 ms doubling to 100 ms like the client's. */
+        private void acknowledge(ChannelHandlerContext ctx, GameLanes.Ack ack, long delayMs) {
             try {
                 if (!ctx.channel().isOpen() || lanes.isClosed() || state.failed()) {
                     return;
@@ -1011,7 +1016,8 @@ public final class V3Join implements BindingDecodeContext.Gate {
                 if (PacketLaneCodec.inboundSwapPending(ctx.pipeline())) {
                     // The protocol change the packet asked for is not applied yet; the next record would
                     // be decoded with the old one.
-                    ctx.executor().schedule(() -> acknowledge(ctx, ack), 1, TimeUnit.MILLISECONDS);
+                    long next = Math.min(100, delayMs * 2);
+                    ctx.executor().schedule(() -> acknowledge(ctx, ack, next), delayMs, TimeUnit.MILLISECONDS);
                     return;
                 }
                 backlog.delivered(ack.lane(), ack.sequence(), 1, ack.decodedBytes());
@@ -1022,8 +1028,8 @@ public final class V3Join implements BindingDecodeContext.Gate {
         }
 
         /**
-         * While a not-accepting listener or a full backlog share holds acknowledgements back, try again
-         * shortly, backing off to 64 ms so a node-wide full share does not spin every connection.
+         * While a not-accepting listener holds markers back, try its queue again shortly, backing off to
+         * 64 ms. A refused backlog reservation needs no timer (AckBacklog#hasBlocked).
          */
         private void scheduleRetry(ChannelHandlerContext ctx) {
             if (retryScheduled) {
