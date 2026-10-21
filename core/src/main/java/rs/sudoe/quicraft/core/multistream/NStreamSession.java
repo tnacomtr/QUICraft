@@ -396,6 +396,10 @@ public final class NStreamSession implements MultistreamSession {
     private long activatedAt;
     private boolean pumpScheduled;
     private boolean pumping;
+    /** Per-session copy of {@link #INLINE_PUMP}; tests change it through {@link #configureForTests}. */
+    private boolean inlinePump = INLINE_PUMP;
+    /** Test seam: sees every receive step's entry and exit on the loop thread. Null in production. */
+    private ReceiveObserver receiveObserver;
     private boolean closeNotified;
     private boolean executing;
     private int executingStream = -1;
@@ -1288,8 +1292,34 @@ public final class NStreamSession implements MultistreamSession {
         schedulePump();
     }
 
+    /** Observer of receive steps (test seam; see {@link #configureForTests}). */
+    interface ReceiveObserver {
+        void enter();
+
+        void exit();
+    }
+
+    /** Test seam: sets the inline-pump flag and the receive observer. Call on the loop before activation. */
+    void configureForTests(boolean inlinePumpOn, ReceiveObserver observer) {
+        this.inlinePump = inlinePumpOn;
+        this.receiveObserver = observer;
+    }
+
     /** One receive step; false when it closed the session. */
     private boolean receiveOnce() {
+        ReceiveObserver observer = receiveObserver;
+        if (observer == null) {
+            return receiveStep();
+        }
+        observer.enter();
+        try {
+            return receiveStep();
+        } finally {
+            observer.exit();
+        }
+    }
+
+    private boolean receiveStep() {
         if (receiveTrace != null) receiveTrace.waits.state(System.nanoTime(), ReceiveTrace.WaitReason.DRIVE_CPU);
         try {
             if (serverDriver != null) {
@@ -1974,7 +2004,7 @@ public final class NStreamSession implements MultistreamSession {
         public void channelReadComplete(ChannelHandlerContext ctx) {
             ctx.fireChannelReadComplete();
             traceReceiveState();
-            if (INLINE_PUMP) {
+            if (inlinePump) {
                 pumpInline();
             } else {
                 schedulePump();

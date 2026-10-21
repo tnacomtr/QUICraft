@@ -16,6 +16,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.LongSupplier;
 import rs.sudoe.quicraft.core.resource.NodePools;
 import rs.sudoe.quicraft.core.routing.Lane;
@@ -221,7 +222,21 @@ final class NRig implements AutoCloseable {
         public void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle) {
             got.add(new Got(lane, lastStream, sequence, packets));
             if (autoApply) session.applied(lane, sequence);
+            Runnable reaction = onDeliver;
+            if (reaction != null) {
+                reaction.run();
+            }
+            RuntimeException failure = deliverFailure;
+            if (failure != null && !packets.isEmpty() && failureLabel.equals(((Pkt) packets.get(0)).label)) {
+                throw failure;
+            }
         }
+
+        /** Test hook: runs on the loop inside every delivery, after the unit is recorded and applied. */
+        volatile Runnable onDeliver;
+        /** Test hook: thrown from the delivery of the packet labelled {@link #failureLabel}. */
+        volatile RuntimeException deliverFailure;
+        volatile String failureLabel = "";
 
         @Override
         public void onWritabilityChanged(boolean writable) {
@@ -274,7 +289,39 @@ final class NRig implements AutoCloseable {
         RoutingTable table = TABLE;
         /** The 13.12 account key of the server session's charges, or null (see NStreamSession). */
         String serverAccount;
+        /** Inline-pump flag for both sessions; null keeps the production default. */
+        Boolean inlinePump;
     }
+
+    /** Counts receive steps on one session: the live depth and its maximum, and the total entries. */
+    static final class ReceiveDepth implements NStreamSession.ReceiveObserver {
+        private final AtomicInteger depth = new AtomicInteger();
+        private final AtomicInteger max = new AtomicInteger();
+        private final AtomicInteger entries = new AtomicInteger();
+
+        @Override
+        public void enter() {
+            int now = depth.incrementAndGet();
+            max.accumulateAndGet(now, Math::max);
+            entries.incrementAndGet();
+        }
+
+        @Override
+        public void exit() {
+            depth.decrementAndGet();
+        }
+
+        int maxDepth() {
+            return max.get();
+        }
+
+        int entries() {
+            return entries.get();
+        }
+    }
+
+    final ReceiveDepth serverDepth = new ReceiveDepth();
+    final ReceiveDepth clientDepth = new ReceiveDepth();
 
     final Config config;
     final LaneLoopback net;
@@ -355,6 +402,7 @@ final class NRig implements AutoCloseable {
                     server = new NStreamSession(serverConnection, NStreamSession.Role.SERVER, serverControl, config.table,
                             serverGame, context, config.serverResources, config.serverTiming, config.compressed,
                             config.serverAccount);
+                    server.configureForTests(inlinePumpFlag(config), serverDepth);
                     serverGame.session = server;
                     serverRef = server;
                     for (QuicStreamChannel s : serverEarly) {
@@ -367,6 +415,7 @@ final class NRig implements AutoCloseable {
                     client = new NStreamSession(net.clientConnection, NStreamSession.Role.CLIENT, clientControl,
                             config.table,
                             clientGame, context, config.clientResources, config.clientTiming, config.compressed);
+                    client.configureForTests(inlinePumpFlag(config), clientDepth);
                     clientGame.session = client;
                     clientRef = client;
                     for (QuicStreamChannel s : clientEarly) {
@@ -378,6 +427,11 @@ final class NRig implements AutoCloseable {
             net.close();
             throw t;
         }
+    }
+
+    /** The explicit override, else the production default (the same system property NStreamSession reads). */
+    private static boolean inlinePumpFlag(Config config) {
+        return config.inlinePump != null ? config.inlinePump : Boolean.getBoolean("quicraft.v3.inlinePump");
     }
 
     private static void raw(QuicStreamChannel stream, BlockingQueue<QuicStreamChannel> streams,
