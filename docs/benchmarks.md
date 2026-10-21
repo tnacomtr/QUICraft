@@ -1104,3 +1104,23 @@ bytes to quiche and sends the connection, so the count is API calls, not datagra
 batching change (`agent/p5-pipeline` `965e251`, not merged) ran /3 clean at 16.0, 16.8 and
 19.3 ms per chunk (157 chunks each) against 11.8-22.8 before: no measurable gain, as expected
 from the no-op flush. Any real batching would have to happen at the connection level.
+
+### /2 write coalescing experiment (2026-10-21, delayloss, n=3, interleaved TCP)
+
+`-Dquicraft.coalesceWrites` (server and client, `agent/p5-coalesce-bench` `9de193d`) merges small
+`NettyQuicByteStream` writes into one buffer per event-loop turn and flushes once. Real Fabric client,
+delayloss profile (75 ms delay, 2% loss), 20 s play window, runs interleaved tcp / off / on, one TCP warmup
+discarded. Results in `testkit/results/coalesce2-2026-10-21/` (gitignored).
+
+| arm | join ms (median, min-max) | chunk load ms (median, min-max) | rtt median ms | rtt p95 ms (median) |
+|---|---|---|---|---|
+| tcp | 2101 (2077-2155) | 23555 (13957-29225) | 150.7 | 281.1 |
+| /2 coalescing off | 2265 (2208-3556) | 2964 (2723-3215) | 273.5 | 372.5 |
+| /2 coalescing on | 2480 (2316-2663) | 4852 (3461-6753) | 151.2 | 322.0 |
+
+Coalescing removes the movement-RTT penalty under loss (median 273.5 -> 151.2 ms, TCP 150.7): the
+penalty came from one QUIC packet per small write (the pinned Netty QUIC sends on every stream
+`write()`; `flush()` is a no-op), which multiplies the loss exposure of the single ordered stream. Chunk
+load got slower and noisier (median 2964 -> 4852 ms), still far ahead of TCP. An earlier round without the
+drain flush (n=3) gave the same RTT gain (151.2 ms) with chunk load 5567 ms. Not yet the default; /3 has
+the same 262 ms RTT penalty under delayloss (six-profile table above) and gets its own experiment.
