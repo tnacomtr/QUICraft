@@ -30,13 +30,17 @@ class ShippedRoutingCoverageTest {
 
     /** 13.8 REALTIME entity and animation set, plus block_destruction (13.8 names it); block_event stays global. */
     private static final Set<Integer> REALTIME = set(2, 42, 47, 53, 54, 55, 56, 83, 99, 101, 102, 116, 131, 5);
-    /**
-     * Reviewed CHUNK routes: install (45), block updates (6, 8, 84) and forget (37). The block
-     * acknowledgement (4) and chunk_batch_finished (11) remain global until the ACK-coverage wiring
-     * required by 13.19 is on the production send path.
-     */
+    /** Reviewed CHUNK routes: install (45), block updates (6, 8, 84) and forget (37). */
     private static final Map<Integer, String> CHUNK = map(45, "chunk_xz", 6, "block_position", 8, "block_position",
             84, "section_position", 37, "chunk_pos_long");
+    /**
+     * 13.21 {@code ack}: the CHUNK routes that also wait for the latest ACK-stream record. Install,
+     * block-entity data and forget must not overtake a pending prediction acknowledgement; the plain
+     * block-state updates (8, 84) stay {@code lane} and rely on the {@code trailing} order instead.
+     */
+    private static final Set<Integer> CHUNK_ACK = set(45, 6, 37);
+    /** 13.21: block_changed_ack (4) and chunk_batch_finished (11) ride the ACK stream. */
+    private static final Set<Integer> ACK_LANE = set(4, 11);
     /** 13.8/13.19: chunk_batch_start uses the view scope. */
     private static final Set<Integer> VIEW = set(12);
     /** 13.5 control fences: no chunk wait, but later REALTIME waits for them (B1 minus 72). */
@@ -49,8 +53,7 @@ class ShippedRoutingCoverageTest {
             123, 126, 127, 128, 130, 132, 133, 134, 135, 136, 137, 138, 139, 140);
     /** 13.8: a multi-chunk packet stays CONTROL/global with its reviewed list extractor. */
     private static final Map<Integer, String> LIST = map(13, "chunk_list");
-    // Deliberate global deferrals (CP1), all CONTROL/global: block_changed_ack (4) and chunk_batch_finished (11)
-    // join routes, because the send path fails closed on ACK_JOIN/BATCH_JOIN; login (49) and respawn (82),
+    // Deliberate global deferrals (CP1), all CONTROL/global: login (49) and respawn (82),
     // because epoch routes are not wired; light_update (48), with no reviewed layout; explode (36) and
     // level_event (46), kept global as a safe superset of 13.8.
 
@@ -118,6 +121,33 @@ class ShippedRoutingCoverageTest {
     }
 
     /**
+     * 13.21: exactly block_changed_ack (4) and chunk_batch_finished (11) use the ACK lane, both
+     * {@code trailing}; exactly install (45), block-entity data (6) and forget (37) add the
+     * {@code ack} dependency to their CHUNK route.
+     */
+    @Test
+    void theAckStreamAndAckDependencySetsAreExactlyTheReviewedIds() throws IOException {
+        Faults.set();
+        Set<Integer> ackLane = new HashSet<Integer>();
+        Set<Integer> ackDependency = new HashSet<Integer>();
+        for (Map.Entry<RouteKey, RouteV2> entry : RoutingTableLoader.loadResource(PROTOCOL).routesV2().entrySet()) {
+            RouteKey key = entry.getKey();
+            if (key.state() != ProtocolState.PLAY || key.direction() != Direction.CLIENTBOUND) continue;
+            RouteV2 route = entry.getValue();
+            if (route.lane == RouteV2.StreamLane.ACK) {
+                ackLane.add(key.packetId());
+                assertEquals(Dependency.TRAILING, route.dependency, "ACK lane dependency for " + key);
+                assertEquals(null, route.position, "the ACK lane carries no position: " + key);
+            }
+            if (route.dependency == Dependency.ACK) {
+                ackDependency.add(key.packetId());
+            }
+        }
+        assertEquals(ACK_LANE, ackLane, "the clientbound ACK-lane set");
+        assertEquals(CHUNK_ACK, ackDependency, "the clientbound ack-dependency set");
+    }
+
+    /**
      * Problems between the table and the inventory: a missing or extra id, or a route that does not
      * match the class written above for its id. Empty when the table is exactly the reviewed one.
      */
@@ -167,8 +197,12 @@ class ShippedRoutingCoverageTest {
         if (REALTIME.contains(id)) {
             return expect(route, RouteV2.StreamLane.REALTIME, Dependency.LANE, null);
         }
+        if (ACK_LANE.contains(id)) {
+            return expect(route, RouteV2.StreamLane.ACK, Dependency.TRAILING, null);
+        }
         if (CHUNK.containsKey(id)) {
-            return expect(route, RouteV2.StreamLane.CHUNK, Dependency.LANE, CHUNK.get(id));
+            return expect(route, RouteV2.StreamLane.CHUNK,
+                    CHUNK_ACK.contains(id) ? Dependency.ACK : Dependency.LANE, CHUNK.get(id));
         }
         if (VIEW.contains(id)) {
             return expect(route, RouteV2.StreamLane.CONTROL, Dependency.VIEW, null);

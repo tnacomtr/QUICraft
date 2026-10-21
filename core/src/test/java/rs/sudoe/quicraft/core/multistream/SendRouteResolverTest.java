@@ -120,14 +120,18 @@ final class SendRouteResolverTest {
         assertFalse(r.failed());
     }
 
-    /** The shipped table enables the five reviewed routes (45, 6, 8, 37, 84) on the CHUNK lane. */
+    /**
+     * The shipped table enables the five reviewed routes (45, 6, 8, 37, 84) on the CHUNK lane; 45
+     * installs with the 13.21 {@code ack} dependency, so the resolver hands the lifecycle fence to
+     * the send driver.
+     */
     @Test
     void shipped775ChunkRoutesAreTheReviewedSet() throws Exception {
         RoutingTable shipped = RoutingTableLoader.loadResource(775);
         RouteKey key = new RouteKey(775, ProtocolState.PLAY, Direction.CLIENTBOUND, 45);
         RouteV2 route = shipped.routeV2For(key); // minecraft:level_chunk_with_light
         assertEquals(RouteV2.StreamLane.CHUNK, route.lane);
-        assertEquals(Dependency.LANE, route.dependency);
+        assertEquals(Dependency.ACK, route.dependency);
         assertEquals("mc775.chunk_xz.v1", route.extractor);
         assertEquals("chunk_xz", route.position);
         assertFalse(route.epochChange);
@@ -137,10 +141,48 @@ final class SendRouteResolverTest {
         SendRouteResolver.Resolved resolved = SendRouteResolver.resolve(shipped::routeV2For,
                 decoders, 775, Direction.CLIENTBOUND, ProtocolState.PLAY, 45, prefix);
         assertFalse(resolved.failed(), resolved.failure());
-        assertEquals(StreamSequencer.Fence.CHUNK, resolved.fence());
+        assertEquals(StreamSequencer.Fence.CHUNK_INSTALL, resolved.fence());
         assertEquals(-3, resolved.chunkX());
         assertEquals(17, resolved.chunkZ());
         assertEquals(5, shipped.routesV2().values().stream().filter(r -> r.lane == RouteV2.StreamLane.CHUNK).count());
+    }
+
+    /**
+     * 13.21 against the shipped table: 4 and 11 go to the ACK stream ({@code trailing}); 6 and 37 use
+     * the chunk {@code ack} fence (BE data and forget), 8 stays a plain chunk record, and 45's install
+     * resolves through the held-chunk driver.
+     */
+    @Test
+    void shipped775AckRoutesUseTheAckStreamAndAckFences() throws Exception {
+        RoutingTable shipped = RoutingTableLoader.loadResource(775);
+        Map<String, Extractor> decoders = new HashMap<String, Extractor>();
+        for (String identifier : new String[] {"mc775.chunk_xz.v1", "mc775.block_position.v1",
+                "mc775.chunk_pos_long.v1"}) {
+            decoders.put(identifier, ExtractorRegistry.productionDecoder(identifier));
+        }
+        for (int id : new int[] {4, 11}) {
+            SendRouteResolver.Resolved ack = SendRouteResolver.resolve(shipped::routeV2For, decoders, 775,
+                    Direction.CLIENTBOUND, ProtocolState.PLAY, id, null);
+            assertFalse(ack.failed(), ack.failure());
+            assertEquals(StreamSequencer.Fence.ACK_TRAILING, ack.fence(), "packet " + id);
+        }
+        byte[] blockEntity = {6, 0, 0, 0, 0, 0, 0, 0, 0};
+        SendRouteResolver.Resolved entity = SendRouteResolver.resolve(shipped::routeV2For, decoders, 775,
+                Direction.CLIENTBOUND, ProtocolState.PLAY, 6, blockEntity);
+        assertFalse(entity.failed(), entity.failure());
+        assertEquals(StreamSequencer.Fence.CHUNK_ACK, entity.fence());
+
+        byte[] forget = {37, 0, 0, 0, 0, 0, 0, 0, 0};
+        SendRouteResolver.Resolved forgotten = SendRouteResolver.resolve(shipped::routeV2For, decoders, 775,
+                Direction.CLIENTBOUND, ProtocolState.PLAY, 37, forget);
+        assertFalse(forgotten.failed(), forgotten.failure());
+        assertEquals(StreamSequencer.Fence.CHUNK_FORGET, forgotten.fence());
+
+        byte[] blockUpdate = {8, 0, 0, 0, 0, 0, 0, 0, 0};
+        SendRouteResolver.Resolved update = SendRouteResolver.resolve(shipped::routeV2For, decoders, 775,
+                Direction.CLIENTBOUND, ProtocolState.PLAY, 8, blockUpdate);
+        assertFalse(update.failed(), update.failure());
+        assertEquals(StreamSequencer.Fence.CHUNK, update.fence());
     }
 
     @Test
