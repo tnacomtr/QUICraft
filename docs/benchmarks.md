@@ -1238,3 +1238,34 @@ under delay and loss holds: 2974 vs 21129 ms chunk load, about 7x. Open: the cle
 load, ~0.9 ms RTT) is not in the client's read pump or in per-stream buffering; next suspect is the two
 cross-thread hops per applied unit (QUIC loop -> game loop for delivery, game loop -> QUIC loop for the ack),
 paid serially by ~3800 units in a join.
+
+### /3 chunk batch timer from network-thread busy time (2026-10-21, n=2 per arm, interleaved TCP)
+
+Vanilla's client sizes chunk batches from how long the network thread takes per chunk. On TCP that is decode
+time (~0.3-0.4 ms/chunk); on /3 the wall time from a batch's first chunk also contains transport gating between
+units, so the calculator saw ~1.0-1.2 ms/chunk and the server sent ~5.6 chunks per batch instead of ~9.8. With
+`-Dquicraft.v3.batchTimerBusy=true` (default off) a /3 batch is timed by the connection's busy time on the
+receive path (decode plus synchronous fire, accumulated in `GameLanes`) instead of wall time. Same real-Fabric
+method as above, arms interleaved tcp, /3, /3 busy per profile and round. Per-run values:
+
+| build | profile | arm | join ms | chunk load ms | rtt median ms | disconnects |
+|---|---|---|---|---|---|---|
+| c6ebc4e (first chunk's decode not counted) | clean | tcp | 1418, 1552 | 869, 1032 | 0.58, 0.59 | 0 |
+| | clean | /3 | 1635, 1805 | 1518, 1821 | 1.43, 1.42 | 0 |
+| | clean | /3 busy | 1618, 1708 | 885, 835 | 1.37, 1.46 | 0 |
+| | delayloss | tcp | 2219, 1954 | 6680, 4587 | 150.70, 151.60 | 0 |
+| | delayloss | /3 | 2804, 4371 | 3245, 3840 | 151.55, 151.50 | 0 |
+| | delayloss | /3 busy | 3408, 2891 | 2110, 2042 | 152.71, 152.65 | 0 |
+| 3cb3d66 (first chunk's decode counted) | clean | tcp | 1290, 1739 | 815, 809 | 0.61, 0.65 | 0 |
+| | clean | /3 | 1592, 1641 | 1350, 1433 | 1.47, 1.42 | 0 |
+| | clean | /3 busy | 1657, 1757 | 1115, 1143 | 1.51, 1.41 | 0 |
+| | delayloss | tcp | 2061, 2110 | 38562, 7298 | 150.70, 150.77 | 0 |
+| | delayloss | /3 | 2859, 2787 | 3349, 3492 | 151.57, 151.79 | 0 |
+| | delayloss | /3 busy | 2840, 3222 | 2908, 2023 | 151.86, 151.67 | 0 |
+
+Every run loaded all 157 chunks. Mean batch size with the busy timer: 8.7 (c6ebc4e, clean) and 8.3 clean / 6.5
+delayloss (3cb3d66); about 5.6 without it. The first build left the first chunk's decode out of each interval
+(review finding), which flattered it; the corrected timer (3cb3d66) narrows the clean-link chunk-load gap to TCP
+by roughly half (about 1.4 s -> 1.1 s against 0.8 s) and is the fastest arm under delayloss in both rounds. n=2:
+direction, not a gate. Still off by default: the reviewer's default-on conditions are a lagging-main-thread run
+(bounded backlog, no runaway batches) and a broader interleaved matrix.
