@@ -81,7 +81,14 @@ public class CausalSendContext {
         return connection;
     }
 
-    /** The lifecycle epoch stored for this connection. Read once per send into the envelope. */
+    /**
+     * The lifecycle epoch stored for this connection. Read once per send into the envelope.
+     *
+     * <p>This is a local admission generation, not the {@code /3} wire epoch: the core sequencer assigns the
+     * wire epoch atomically when login (49) or respawn (82) is submitted (docs/protocol.md 13.18), and nothing
+     * here is sent. It stays 0; {@code requireAdmission} rejects any other value, so advancing it at a
+     * transition would fail envelopes already queued. Reviewed 2026-10-21: no stale wire epoch is reachable.
+     */
     public long epoch() {
         return epoch;
     }
