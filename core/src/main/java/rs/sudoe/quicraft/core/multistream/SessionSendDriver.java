@@ -656,7 +656,11 @@ public final class SessionSendDriver {
         Record record = sequencer.assignEpochTransition(packet.frame());
         // 13.21: a same-dimension respawn keeps the client's ClientLevel and its prediction map, and the sender cannot
         // tell it from a dimension change, so an epoch change stops tracking instead of restoring first installs.
-        heldChunks.markUnknown();
+        // A trusted set that holds nothing is exact either way (the client holds none of this session's chunks;
+        // forgotten ones stay in the ring), so it keeps tracking: login (49) must not end the initial-view exemption.
+        if (heldChunks.heldCount() != 0) {
+            heldChunks.markUnknown();
+        }
         if (!enqueueRecord(record, false)) {
             return handle;
         }

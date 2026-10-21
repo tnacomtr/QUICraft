@@ -1578,8 +1578,10 @@ before this revision can run.
    is not tracked either: it carries `ack` and stops tracking the same way. A chunk-lane route
    whose table dependency is not `ack` is sent as if it were `ack`; only the sender's proven first
    install of 45 omits it.
-   Every epoch change marks the held set unknown (`markUnknown()`), never clears it
-   (`clear()`): a same-dimension respawn keeps the client's `ClientLevel` and its prediction map
+   An epoch change while the held set holds a position marks it unknown (`markUnknown()`), never
+   clears it (`clear()`); a trusted set that holds nothing keeps tracking, because it is exact for
+   both outcomes (the client holds none of this session's chunks, and forgotten positions stay in
+   the ring), so login (49) does not end the exemption. Reason for the rule: a same-dimension respawn keeps the client's `ClientLevel` and its prediction map
    (`ClientPacketListener.java:1227-1251`, `ClientLevel.java:162`), so the sender cannot distinguish
    a dimension change from a same-dimension respawn; the first-install exemption covers the initial
    view burst after join only. Memory: the open-addressing `long[]` table grows
@@ -2267,8 +2269,8 @@ before this revision can run.
     a level or increment epoch. Sequences remain connection-scoped, never restart at epoch
     boundaries; positions, installed-chunk tracking and batch/update frontiers are keyed by
     epoch and cleared at level replacement. The 13.9 first-install held set and 256-entry
-    forget ring are not cleared: an epoch change marks them unknown (`markUnknown()`), because
-    a same-dimension respawn keeps the client's level and prediction map (13.9). No old-epoch
+    forget ring are not cleared: an epoch change marks them unknown (`markUnknown()`) unless no
+    position is held (13.9), because a same-dimension respawn keeps the client's level and prediction map (13.9). No old-epoch
     record can execute after that fence. Epoch drain counts a record
     as applied (D), not queued (Q), on every stream, the ACK stream included (13.10).
     New-epoch envelopes may arrive early, but remain opaque until their transition dependency
@@ -2562,8 +2564,8 @@ before this revision can run.
       rules the ACK keeps the game's emission order against every record, the TCP order.
     - First install: a 45 omits `ack` only when its position is neither held nor in the last
       256 forgotten positions. Held positions are added on a 45 and removed on a 37, cap 4096;
-      above the cap, on a forget-ring overflow, on a 45 or 37 sent inside a bundle and on every
-      epoch change tracking stops (`markUnknown()`) and every 45 carries `ack` for the rest of
+      above the cap, on a forget-ring overflow, on a 45 or 37 sent inside a bundle and on an
+      epoch change while a position is held, tracking stops (`markUnknown()`) and every 45 carries `ack` for the rest of
       the session (13.9, 13.18). A sender that cannot tell uses `ack`.
     - Bundles: a bundle containing 4 or 11 is promoted whole to CONTROL/global, like a CHUNK
       member; the ACK stream carries only single records (13.15).

@@ -15,7 +15,7 @@ package rs.sudoe.quicraft.core.multistream;
  * <p>Fail safe: above {@link #HELD_CAPACITY} held positions, or on the forget that would overflow the ring of
  * {@link #RING_CAPACITY} forgotten positions, the set stops tracking and every install needs the ack
  * dependency for the rest of the session. {@link #markUnknown()} does the same for a chunk lifecycle record
- * the sender could not track, such as one inside a bundle, and for an epoch change: a same-dimension respawn
+ * the sender could not track, such as one inside a bundle, and for an epoch change while a position is held: a same-dimension respawn
  * keeps the client's level and its prediction map, and the sender cannot tell it from a dimension change. The
  * exemption therefore covers the initial view burst after join, where most installs are, and fails safe once
  * the player has moved far or respawned.
