@@ -513,6 +513,20 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         }
     }
 
+    /** For the log only: why a local close happened (blocked-head expiry, refused wait, ...), bounded. */
+    private static String localCause(GameLanes.LaneClosedException e) {
+        try {
+            Throwable cause = e.getCause();
+            if (e.byPeer() || cause == null) {
+                return "";
+            }
+            String text = cause.getClass().getSimpleName() + ": " + cause.getMessage();
+            return " (local cause: " + (text.length() > 200 ? text.substring(0, 200) : text) + ")";
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
     void laneClosed(GameLanes.LaneClosedException e) {
         boolean localResource = e.code() == Protocol.CLOSE_RESOURCE
                 && e.getCause() instanceof StallClock.UnavailableException;
@@ -520,7 +534,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             state = State.FAILED;
             failureText = "QUIC multi-stream failed (" + e.getMessage() + ")";
             Transports.v3Failure(connection, failureText);
-            QuicraftFabric.LOG.warn("QUICraft: {}; the next join uses TCP", failureText);
+            QuicraftFabric.LOG.warn("QUICraft: {}; the next join uses TCP{}", failureText, localCause(e));
             try {
                 if (localResource) {
                     // 13.10/13.12: the stall source is gone. This is a local resource abort after

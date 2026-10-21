@@ -18,7 +18,7 @@ import rs.sudoe.quicraft.testkit.Args;
  *
  * <p>Envelope contract: {@code clientType} is {@code fabric}, {@code arm} is {@code tcp},
  * {@code quic2} or {@code quic3}, {@code netemProfile} is one of {@code clean loss delay delayloss
- * reorder jitter}, {@code profile} is exactly {@code <netemProfile>-tcp}, {@code -quic-2} or
+ * reorder jitter slow}, {@code profile} is exactly {@code <netemProfile>-tcp}, {@code -quic-2} or
  * {@code -quic-3} matching the arm, and {@code runs} is a nonempty array. Other envelope fields
  * are allowed.
  *

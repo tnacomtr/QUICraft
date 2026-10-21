@@ -21,7 +21,7 @@
 #   6. succeeds only when the emitted document exists, parses as JSON, and runs[0].ok is true.
 #
 # The emitter (ExternalArmGameTest) is a separate unit; this runner only uses the frozen property
-# names. `--netem` takes clean, loss, delay, delayloss, reorder or jitter; testkit/netem-attach.sh
+# names. `--netem` takes clean, loss, delay, delayloss, reorder, jitter or slow; testkit/netem-attach.sh
 # shapes the server container's interface; clean attaches nothing (netem-attach reports no qdisc).
 #
 # Per-run documents are merged with testkit/merge-arm-samples.py. For `/3`, the merged document
@@ -58,7 +58,7 @@ usage() {
         echo "  --out-dir       directory for <arm>-<netem>-run<N>.json (required, must not exist yet)"
         echo "  --port          loopback TCP+UDP port; must be 25565, the port the server advertises"
         echo "  --play-seconds  measured play time (default: 20)"
-        echo "  --netem         clean (default) | loss | delay | delayloss | reorder | jitter"
+        echo "  --netem         clean (default) | loss | delay | delayloss | reorder | jitter | slow"
         echo "  --coalesce      -Dquicraft.coalesceWrites=true on server and client"
         echo "  --no-coalesce   -Dquicraft.coalesceWrites=false (without either flag each side uses its default: /3 on, /2 off)"
         echo "  --coalesce-max N  experiment: -Dquicraft.coalesceMaxBytes=N (soft per-stream cap, default 65536)"
@@ -162,8 +162,8 @@ if ! [[ "$play_seconds" =~ ^[1-9][0-9]{0,6}$ ]]; then
     refuse "--play-seconds must be a positive integer, got '$play_seconds'"
 fi
 case "$netem" in
-    clean | loss | delay | delayloss | reorder | jitter) ;;
-    *) refuse "--netem must be clean, loss, delay, delayloss, reorder or jitter, got '$netem'" ;;
+    clean | loss | delay | delayloss | reorder | jitter | slow) ;;
+    *) refuse "--netem must be clean, loss, delay, delayloss, reorder, jitter or slow, got '$netem'" ;;
 esac
 # The container advertises its internal port 25565 for QUIC; the client dials the advertised port
 # on the host it resolved, so the host mapping must be the same number.
