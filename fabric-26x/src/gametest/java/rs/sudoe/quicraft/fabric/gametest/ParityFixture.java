@@ -231,6 +231,8 @@ final class ParityFixture implements AutoCloseable {
         }
         if (!context.computeOnClient(c -> c.getConnection().hasClientLoaded())) {
             // The loading screen never reported ready; the state a loaded client is in is what counts.
+            QuicraftFabricTestLog.warn("[QUICraft parity] WARN: the level-load tracker never reported ready;"
+                    + " clientLoaded was set by reflection");
             context.runOnClient(c -> setField(c.getConnection(), "clientLoaded", Boolean.TRUE));
         }
         context.waitTicks(2);

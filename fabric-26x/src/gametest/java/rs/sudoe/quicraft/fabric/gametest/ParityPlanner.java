@@ -26,7 +26,8 @@ import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
  * shipped routing table, SendRouteResolver, HeldChunkSet and a real StreamSequencer assign every
  * packet its stream, sequence and dependencies; a delivery order is legal when each record comes
  * after its own-stream predecessor and every listed dependency (the receiver's rule, docs/protocol.md
- * 13.10). Nothing about routing is written down here, so a table change changes the orders.
+ * 13.10). The DAG mirrors StreamReceiver.prerequisitesApplied; the receiver itself is not driven here
+ * (it needs a route validator per record). Nothing about routing is written down here, so a table change changes the orders.
  */
 final class ParityPlanner {
     static final int PROTOCOL = 775;
