@@ -44,18 +44,9 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     private volatile boolean wroteAny;
     private volatile Listener listener;
 
-    /** Coalescing state: pending bytes, their entry records, and whether a drain is scheduled. */
+    /** Coalesced bytes not yet handed to quiche; touched only on the stream's event loop. */
     private ByteBuf pendingBuffer;
-    private java.util.List<WriteEntry> pendingEntries;
     private boolean drainScheduled;
-
-    private static final class WriteEntry {
-        final int length;
-        final java.util.concurrent.CompletableFuture<Void> promise = new java.util.concurrent.CompletableFuture<>();
-        WriteEntry(int length) {
-            this.length = length;
-        }
-    }
 
     NettyQuicByteStream(QuicStreamChannel channel) {
         this.channel = channel;
@@ -106,102 +97,68 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
             return;
         }
 
-        // Coalescing path: bounded buffer (~QUIC max payload), never reorder.
-        boolean directPass = length >= COALESCE_TARGET;
-        if (directPass) {
-            // Large write passes through directly after draining any pending buffer.
-            if (pendingBuffer != null && pendingBuffer.readableBytes() > 0) {
-                drainPending();
-            }
-            ByteBuf copy = channel.alloc().buffer(length);
-            copy.writeBytes(data.duplicate());
-            inFlight.addAndGet(length);
-            wroteAny = true;
-            channel.write(copy).addListener(f -> {
-                long left = inFlight.addAndGet(-length);
-                if (!f.isSuccess()) {
-                    channel.pipeline().fireExceptionCaught(f.cause());
-                }
-                if (left == 0 && finWhenWritten) {
-                    sendFin();
-                }
-                if (throttled && left <= LOW_WATER) {
-                    throttled = false;
-                    notifyWritable();
-                }
-            });
+        // Coalescing path. The caller may be another event loop (the bridge's), so copy here and do
+        // every buffer operation on the stream's own loop; tasks run in submission order.
+        ByteBuf copy = channel.alloc().buffer(length);
+        copy.writeBytes(data.duplicate());
+        inFlight.addAndGet(length);
+        wroteAny = true;
+        if (channel.eventLoop().inEventLoop()) {
+            append(copy);
+        } else {
+            channel.eventLoop().execute(() -> append(copy));
+        }
+    }
+
+    /** Appends one caller write to the bounded buffer, never reordering bytes (event loop only). */
+    private void append(ByteBuf copy) {
+        int length = copy.readableBytes();
+        if (length >= COALESCE_TARGET) {
+            drainPending();
+            writeOut(copy);
             return;
         }
-
-        // Small write: append if room, else drain pending first then append.
-        if (pendingBuffer != null && pendingBuffer.readableBytes() > 0) {
-            if (pendingBuffer.readableBytes() + length > COALESCE_TARGET) {
-                drainPending();
-                pendingBuffer = channel.alloc().buffer();
-                pendingEntries = new java.util.ArrayList<>();
-                pendingBuffer.writeBytes(data.duplicate());
-                pendingEntries.add(new WriteEntry(length));
-                inFlight.addAndGet(length);
-                wroteAny = true;
-                scheduleDrain();
-                return;
-            }
-            pendingBuffer.writeBytes(data.duplicate());
-            pendingEntries.add(new WriteEntry(length));
-            inFlight.addAndGet(length);
-            wroteAny = true;
-            scheduleDrain();
-        } else {
-            pendingBuffer = channel.alloc().buffer();
-            pendingEntries = new java.util.ArrayList<>();
-            pendingBuffer.writeBytes(data.duplicate());
-            pendingEntries.add(new WriteEntry(length));
-            inFlight.addAndGet(length);
-            wroteAny = true;
-            scheduleDrain();
+        if (pendingBuffer != null && pendingBuffer.readableBytes() + length > COALESCE_TARGET) {
+            drainPending();
         }
-    }
-
-    @Override
-    public void flush() {
-        if (COALESCE && pendingBuffer != null && pendingBuffer.readableBytes() > 0) {
-            if (!drainScheduled) {
-                drainScheduled = true;
-                channel.eventLoop().execute(this::drainPending);
-            }
-        } else {
-            channel.flush();
+        if (pendingBuffer == null) {
+            pendingBuffer = channel.alloc().buffer(COALESCE_TARGET);
         }
-    }
-
-    private void scheduleDrain() {
+        pendingBuffer.writeBytes(copy);
+        copy.release();
         if (!drainScheduled) {
             drainScheduled = true;
             channel.eventLoop().execute(this::drainPending);
         }
     }
 
+    @Override
+    public void flush() {
+        if (!COALESCE) {
+            channel.flush();
+        }
+        // Coalescing: the scheduled drain writes on the next loop turn; quiche sends on write.
+    }
+
+    /** Hands the coalesced bytes to quiche (event loop only). */
     private void drainPending() {
         drainScheduled = false;
-        if (pendingBuffer == null || pendingBuffer.readableBytes() == 0) {
-            return;
-        }
         ByteBuf coalesced = pendingBuffer;
         pendingBuffer = null;
-        java.util.List<WriteEntry> entries = pendingEntries;
-        pendingEntries = null;
+        if (coalesced == null) {
+            return;
+        }
+        if (!coalesced.isReadable()) {
+            coalesced.release();
+            return;
+        }
+        writeOut(coalesced);
+    }
 
-        int totalLen = coalesced.readableBytes();
-        // inFlight was incremented when bytes were appended.
-        channel.write(coalesced).addListener(f -> {
-            long left = inFlight.addAndGet(-totalLen);
-            for (WriteEntry entry : entries) {
-                if (f.isSuccess()) {
-                    entry.promise.complete(null);
-                } else {
-                    entry.promise.completeExceptionally(f.cause());
-                }
-            }
+    private void writeOut(ByteBuf bytes) {
+        int length = bytes.readableBytes();
+        channel.write(bytes).addListener(f -> {
+            long left = inFlight.addAndGet(-length);
             if (!f.isSuccess()) {
                 channel.pipeline().fireExceptionCaught(f.cause());
             }
@@ -278,34 +235,9 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
         if (!channel.parent().isOpen()) {
             return;
         }
-        // Deliver any coalesced pending data before deciding to close.
-        if (COALESCE && pendingBuffer != null && pendingBuffer.readableBytes() > 0) {
-            ByteBuf coalesced = pendingBuffer;
-            pendingBuffer = null;
-            java.util.List<WriteEntry> entries = pendingEntries;
-            pendingEntries = null;
-            drainScheduled = false;
-            int totalLen = coalesced.readableBytes();
-            channel.write(coalesced).addListener(f -> {
-                long left = inFlight.addAndGet(-totalLen);
-                for (WriteEntry entry : entries) {
-                    if (f.isSuccess()) {
-                        entry.promise.complete(null);
-                    } else {
-                        entry.promise.completeExceptionally(f.cause());
-                    }
-                }
-                if (!f.isSuccess()) {
-                    channel.pipeline().fireExceptionCaught(f.cause());
-                }
-                if (left == 0 && finWhenWritten) {
-                    sendFin();
-                }
-                if (throttled && left <= LOW_WATER) {
-                    throttled = false;
-                    notifyWritable();
-                }
-            });
+        // Deliver any coalesced pending data before deciding to close (close0 runs on the loop).
+        if (COALESCE) {
+            drainPending();
         }
         if (inputShutdown || !wroteAny || !channel.isActive()) {
             // Nothing of ours to deliver (or the peer is already done): close now.
