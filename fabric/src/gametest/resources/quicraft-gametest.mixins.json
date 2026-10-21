@@ -4,7 +4,7 @@
   "package": "rs.sudoe.quicraft.fabric.gametest.mixin",
   "compatibilityLevel": "JAVA_21",
   "mixins": ["V3JoinBindingObserverMixin", "CausalLoginContextAccess", "CausalLoginSpawnObserverMixin", "CausalLoginReadyObserverMixin", "CausalLoginPlaceObserverMixin", "CausalSendAllocationObserverMixin", "CausalSendContextAccess"],
-  "client": ["ConnectionTimingMixin"],
+  "client": ["ConnectionTimingMixin", "ClientTickLagMixin", "ChunkBatchRateLogMixin"],
   "injectors": {
     "defaultRequire": 1
   }
