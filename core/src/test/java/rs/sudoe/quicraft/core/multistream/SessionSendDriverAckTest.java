@@ -175,6 +175,25 @@ class SessionSendDriverAckTest {
     }
 
     @Test
+    void anEpochChangeWithNothingHeldKeepsTheFirstInstallExemption() throws Exception {
+        Rig rig = new Rig();
+        // Login (49) is an epoch change before any chunk: the initial view burst stays exempt.
+        assertTrue(rig.driver.submitEpochTransition(frame()).isAssigned());
+        rig.send(Fence.ACK_TRAILING, 0, 0);
+        SentPacket fresh = rig.send(Fence.CHUNK_INSTALL, 4, 4);
+        rig.send(Fence.CHUNK_FORGET, 4, 4);
+        // Nothing held again, but 4 is in the forget ring: a second change keeps tracking, and the ring still binds.
+        assertTrue(rig.driver.submitEpochTransition(frame()).isAssigned());
+        rig.send(Fence.ACK_TRAILING, 0, 0);
+        SentPacket reinstall = rig.send(Fence.CHUNK_INSTALL, 4, 4);
+        SentPacket other = rig.send(Fence.CHUNK_INSTALL, 900, 900);
+        rig.drain();
+        assertFalse(rig.dependsOnAck(fresh), "a first install after login is exempt");
+        assertTrue(rig.dependsOnAck(reinstall), "a forgotten position still needs the ack");
+        assertFalse(rig.dependsOnAck(other), "a first install after an empty-set epoch change is exempt");
+    }
+
+    @Test
     void twoConsecutiveEpochChangesWithAPendingAckAndHeldInstallsKeepOrderAndStopTrusting() throws Exception {
         Rig rig = new Rig();
         // An ACK-stream record the client has not acknowledged, and a first install that is still held.
