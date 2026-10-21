@@ -52,6 +52,14 @@ public final class ParityRunner {
             return f.standardChunks();
         }
 
+        /** False for a case with so many records that one tick per packet would take minutes. */
+        boolean spread() {
+            return true;
+        }
+
+        /** Structural assertions on the derived plan (a dependency that must exist). */
+        void checkPlan(ParityPlanner plan, List<String> problems) {}
+
         /** An order the rules forbid, whose snapshot must differ from TCP's; null when none. */
         int[] illegalOrder(int items) {
             return null;
@@ -92,7 +100,8 @@ public final class ParityRunner {
 
     private static void runCase(ParityFixture f, ParityCase c, List<String> problems) {
         List<ParityPlanner.Item> items = c.items(f);
-        ParityPlanner plan = ParityPlanner.plan(items);
+        ParityPlanner plan = ParityPlanner.plan(items, f.standardChunks());
+        c.checkPlan(plan, problems);
         List<int[]> orders = plan.orders(EXHAUSTIVE_CAP, RANDOM_EXTRAS);
         log(c, "records:\n" + plan.describe() + "legal orders: " + orders.size()
                 + (orders.size() > EXHAUSTIVE_CAP ? " (sampled)" : " (exhaustive)"));
@@ -113,7 +122,7 @@ public final class ParityRunner {
             problems.add("expected reorderable records, but the shipped routes allow only the TCP order, so this"
                     + " control case no longer explores anything");
         }
-        for (boolean spread : new boolean[] {false, true}) {
+        for (boolean spread : c.spread() ? new boolean[] {false, true} : new boolean[] {false}) {
             String mode = spread ? "tick-spread" : "same-tick";
             String reference = once(f, c, items, tcp, spread);
             String second = once(f, c, items, tcp, spread);
@@ -137,7 +146,7 @@ public final class ParityRunner {
                 String got = once(f, c, items, illegal, spread);
                 if (got.equals(reference)) {
                     problems.add(mode + ": the deliberately illegal order " + labels(items, illegal)
-                            + " gave the same snapshot as TCP, so this case cannot see its hazard");
+                            + " gave the same snapshot as TCP, so this case cannot see its hazard; snapshot was:\n" + got);
                 } else {
                     log(c, mode + " sensitivity ok: illegal order " + labels(items, illegal) + " differs: "
                             + firstDiff(reference, got));
@@ -154,16 +163,19 @@ public final class ParityRunner {
         for (int i = 0; i < order.length; i++) {
             frames[i] = items.get(order[i]).frame();
         }
+        String early;
         if (spread) {
             for (byte[] frame : frames) {
                 f.deliver(frame);
                 f.context.waitTick();
             }
+            early = "";
         } else {
-            f.deliver(frames);
+            early = f.deliverAndSnapshot(frames, c.watchBlocks(f), c.watchChunks(f));
         }
         f.context.waitTicks(SETTLE_TICKS);
-        return f.snapshot(c.watchBlocks(f), c.watchChunks(f));
+        return "[right after delivery]\n" + early + "[after " + SETTLE_TICKS + " ticks]\n"
+                + f.snapshot(c.watchBlocks(f), c.watchChunks(f));
     }
 
     private static String labels(List<ParityPlanner.Item> items, int[] order) {

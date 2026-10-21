@@ -193,6 +193,16 @@ final class ParityFixture implements AutoCloseable {
         });
     }
 
+    /** Delivers all frames and snapshots in the same client-thread task, before any tick runs. */
+    String deliverAndSnapshot(byte[][] frames, List<BlockPos> watchBlocks, List<int[]> watchChunks) {
+        return context.computeOnClient(c -> {
+            for (byte[] frame : frames) {
+                handle(c, decode(frame));
+            }
+            return snapshot(c, watchBlocks, watchChunks);
+        });
+    }
+
     // ---- reset --------------------------------------------------------------------------------
 
     /** The chunks every run starts with: a 3x3 block around the spawn chunk. */
@@ -269,6 +279,17 @@ final class ParityFixture implements AutoCloseable {
             }
         }
         throw new NoSuchFieldException(type.getName() + "." + name);
+    }
+
+    /** A private static field of a game class (an entity data accessor). */
+    static Object staticField(Class<?> type, String name) {
+        try {
+            Field f = type.getDeclaredField(name);
+            f.setAccessible(true);
+            return f.get(null);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
     }
 
     /** ClientLevel's package-private prediction handler. */

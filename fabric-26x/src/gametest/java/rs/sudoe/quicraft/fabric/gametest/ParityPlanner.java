@@ -62,6 +62,14 @@ final class ParityPlanner {
     }
 
     static ParityPlanner plan(List<Item> items) {
+        return plan(items, List.of());
+    }
+
+    /**
+     * @param heldChunks chunk positions the client already holds, as the session's first-view burst
+     *     would have installed them; they make a later install of the same position a re-install
+     */
+    static ParityPlanner plan(List<Item> items, List<int[]> heldChunks) {
         RoutingTable table = RoutingRegistry.forProtocol(PROTOCOL).orElseThrow(
                 () -> new AssertionError("no shipped routing table for protocol " + PROTOCOL));
         Map<String, Extractor> extractors = new HashMap<>();
@@ -70,6 +78,9 @@ final class ParityPlanner {
         }
         StreamSequencer sequencer = new StreamSequencer(SHARDS);
         HeldChunkSet held = new HeldChunkSet();
+        for (int[] chunk : heldChunks) {
+            held.install(chunk[0], chunk[1]);
+        }
         List<Record> records = new ArrayList<>();
         List<Step> raw = new ArrayList<>();
         Map<Long, Integer> byKey = new HashMap<>();
@@ -115,6 +126,26 @@ final class ParityPlanner {
 
     private static long key(int stream, long sequence) {
         return ((long) stream << 40) | sequence;
+    }
+
+    /** True when record {@code later} cannot be applied before record {@code earlier} (transitively). */
+    boolean mustFollow(int later, int earlier) {
+        boolean[] seen = new boolean[steps.size()];
+        java.util.ArrayDeque<Integer> queue = new java.util.ArrayDeque<>();
+        queue.add(later);
+        while (!queue.isEmpty()) {
+            int i = queue.poll();
+            for (int p : steps.get(i).preds()) {
+                if (p == earlier) {
+                    return true;
+                }
+                if (!seen[p]) {
+                    seen[p] = true;
+                    queue.add(p);
+                }
+            }
+        }
+        return false;
     }
 
     /** True when the shipped rules allow exactly the TCP order. */
