@@ -246,6 +246,9 @@ final class ParityFixture implements AutoCloseable {
             LocalPlayer player = c.player;
             player.absSnapTo(basePos.x, basePos.y, basePos.z, 0.0F, 0.0F);
             player.setDeltaMovement(Vec3.ZERO);
+            // A respawn copies the old player's base attribute values (handleRespawn), so a case that
+            // changed SCALE would leak into the next run. The self-check on the TCP order found it.
+            player.getAttribute(Attributes.SCALE).setBaseValue(1.0);
         });
         for (int i = 0; i < 60 && !context.computeOnClient(c -> c.getConnection().hasClientLoaded()); i++) {
             context.waitTick();
@@ -346,7 +349,9 @@ final class ParityFixture implements AutoCloseable {
         sb.append("player.motion=").append(p.getDeltaMovement()).append('\n');
         sb.append("player.pose=").append(p.getPose()).append(" onGround=").append(p.onGround()).append('\n');
         sb.append("player.box=").append(p.getBoundingBox()).append('\n');
-        sb.append("player.dimensions=").append(p.getDimensions(p.getPose())).append('\n');
+        net.minecraft.world.entity.EntityDimensions dims = p.getDimensions(p.getPose());
+        sb.append("player.dimensions=").append(dims.width()).append('x').append(dims.height()).append(" eye=")
+                .append(dims.eyeHeight()).append('\n');
         sb.append("player.noCollision=").append(level.noCollision(p)).append('\n');
         sb.append("player.scale=").append(p.getAttributeValue(Attributes.SCALE)).append('\n');
         Entity vehicle = p.getVehicle();

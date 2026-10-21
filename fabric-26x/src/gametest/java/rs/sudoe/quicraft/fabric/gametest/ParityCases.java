@@ -61,6 +61,9 @@ final class ParityCases {
         cases.add(new RiderPositionSync());
         cases.add(new RespawnWithHeldChunks());
         cases.add(new LoginLikeEpochChange());
+        cases.add(new MountPoseAroundAck());
+        cases.add(new EquipmentPowderSnowAroundAck());
+        cases.add(new DelayedAckMovementAndScale());
         return cases;
     }
 
@@ -589,5 +592,139 @@ final class ParityCases {
             chunks.add(fresh);
             return chunks;
         }
+    }
+
+    // ---- cases 7-9: the r3 additions ----------------------------------------------------------------
+
+    private static net.minecraft.world.item.ItemStack leatherBoots() {
+        return new ItemStack(Items.LEATHER_BOOTS);
+    }
+
+    /**
+     * Case 7. A crawling player straddles two cells; a ceiling block keeps it crawling, and a block above
+     * the other cell was broken by prediction. A crawling box (0.6 high) does not touch the restored block,
+     * a standing box does. 107 (set_passengers) mounts the player, which forces STANDING. TCP order: ACK,
+     * then the mount. Delivered the other way round, the ACK snaps the now-standing player.
+     */
+    static final class MountPoseAroundAck extends ParityCase {
+        @Override String name() { return "mount-pose-107-around-ack"; }
+
+        @Override Expect expect() { return Expect.TCP_ONLY; }
+
+        private static BlockPos ceiling(ParityFixture f) { return f.base.offset(3, 1, 0); }
+
+        private static BlockPos broken(ParityFixture f) { return f.base.offset(4, 1, 0); }
+
+        @Override List<ParityPlanner.Item> items(ParityFixture f) {
+            FriendlyByteBuf buffer = new FriendlyByteBuf(Unpooled.buffer());
+            buffer.writeVarInt(VEHICLE);
+            buffer.writeVarIntArray(new int[] {f.context.computeOnClient(c -> c.player.getId())});
+            Packet<ClientGamePacketListener> passengers = net.minecraft.network.protocol.game
+                    .ClientboundSetPassengersPacket.STREAM_CODEC.decode(buffer);
+            List<ParityPlanner.Item> items = new ArrayList<>();
+            items.add(item(f, "block_changed_ack(4)", ack(1)));
+            items.add(item(f, "set_passengers(107) mount", passengers));
+            return items;
+        }
+
+        @Override void setup(Minecraft client, ParityFixture f) {
+            ClientLevel level = client.level;
+            level.setBlock(ceiling(f), Blocks.STONE.defaultBlockState(), 3);
+            predictedBreak(level, broken(f));
+            addVehicle(client, f);
+            expectSequence(level, 1);
+            // On the boundary of the two cells, crawling under the ceiling.
+            client.player.absSnapTo(broken(f).getX(), f.base.getY(), broken(f).getZ() + 0.5, 0.0F, 0.0F);
+            client.player.setPose(net.minecraft.world.entity.Pose.SWIMMING);
+        }
+
+        @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(ceiling(f), broken(f)); }
+
+        /** The mounted player is repositioned every tick, which erases the snap. */
+        @Override boolean illegalChecksSpread() { return false; }
+
+        @Override int[] illegalOrder(int items) { return new int[] {1, 0}; }
+    }
+
+    /**
+     * Case 8. Powder snow is solid for a player in leather boots only, and the ACK consults that when it
+     * restores a block the player overlaps by an epsilon at the surface. TCP: ACK, then 102 (set_equipment)
+     * and 108 (set_player_inventory, the feet slot) put the boots on. Boots first would make the restored
+     * powder snow solid and snap the player.
+     */
+    static final class EquipmentPowderSnowAroundAck extends ParityCase {
+        @Override String name() { return "equipment-powder-snow-102-108-around-ack"; }
+
+        /** 102 (REALTIME) and 108 (ordinary CONTROL) both follow the ACK but not each other, so they can swap. */
+        @Override Expect expect() { return Expect.REORDERABLE; }
+
+        private static BlockPos t(ParityFixture f) { return f.base.offset(3, -1, 0); }
+
+        @Override List<ParityPlanner.Item> items(ParityFixture f) {
+            int playerId = f.context.computeOnClient(c -> c.player.getId());
+            List<ParityPlanner.Item> items = new ArrayList<>();
+            items.add(item(f, "block_changed_ack(4)", ack(1)));
+            items.add(item(f, "set_equipment(102) boots", new net.minecraft.network.protocol.game
+                    .ClientboundSetEquipmentPacket(playerId, List.of(com.mojang.datafixers.util.Pair.of(
+                            net.minecraft.world.entity.EquipmentSlot.FEET, leatherBoots())))));
+            items.add(item(f, "set_player_inventory(108) feet slot", new ClientboundSetPlayerInventoryPacket(36,
+                    leatherBoots())));
+            return items;
+        }
+
+        @Override void setup(Minecraft client, ParityFixture f) {
+            ClientLevel level = client.level;
+            BlockPos t = t(f);
+            level.setBlock(t, Blocks.POWDER_SNOW.defaultBlockState(), 3);
+            ParityFixture.predict(level, t, Blocks.AIR.defaultBlockState());
+            expectSequence(level, 1);
+            // Standing on the surface with a sliver of overlap: inside the epsilon the context allows.
+            client.player.absSnapTo(t.getX() + 0.5, t.getY() + 1 - 5.0E-6, t.getZ() + 0.5, 0.0F, 0.0F);
+        }
+
+        @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(t(f)); }
+
+        @Override int[] illegalOrder(int items) { return new int[] {1, 2, 0}; }
+    }
+
+    /**
+     * Case 9. A predicted-broken block sits one step beside the player. 131 (update_attributes, SCALE 2)
+     * and 101 (set_entity_motion) are REALTIME; they follow the ACK in TCP order. Before the ACK they would
+     * let the scaled or moving player overlap the block the ACK restores. The effect needs ticks, so the
+     * illegal-order check runs in the tick-spread mode only.
+     */
+    static final class DelayedAckMovementAndScale extends ParityCase {
+        @Override String name() { return "delayed-ack-131-101"; }
+
+        @Override Expect expect() { return Expect.TCP_ONLY; }
+
+        @Override boolean illegalNeedsSpread() { return true; }
+
+        private static BlockPos t(ParityFixture f) { return f.base.offset(3, 0, 0); }
+
+        @Override List<ParityPlanner.Item> items(ParityFixture f) {
+            int playerId = f.context.computeOnClient(c -> c.player.getId());
+            net.minecraft.world.entity.ai.attributes.AttributeInstance scale =
+                    new net.minecraft.world.entity.ai.attributes.AttributeInstance(
+                            net.minecraft.world.entity.ai.attributes.Attributes.SCALE, i -> { });
+            scale.setBaseValue(2.0);
+            List<ParityPlanner.Item> items = new ArrayList<>();
+            items.add(item(f, "block_changed_ack(4)", ack(1)));
+            items.add(item(f, "update_attributes(131) scale 2", new net.minecraft.network.protocol.game
+                    .ClientboundUpdateAttributesPacket(playerId, List.of(scale))));
+            items.add(item(f, "set_entity_motion(101)", new net.minecraft.network.protocol.game
+                    .ClientboundSetEntityMotionPacket(playerId, new Vec3(0.25, 0.0, 0.0))));
+            return items;
+        }
+
+        @Override void setup(Minecraft client, ParityFixture f) {
+            predictedBreak(client.level, t(f));
+            expectSequence(client.level, 1);
+            client.player.absSnapTo(t(f).getX() - 0.35, f.base.getY(), t(f).getZ() + 0.5, 0.0F, 0.0F);
+        }
+
+        @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(t(f)); }
+
+        @Override int[] illegalOrder(int items) { return new int[] {1, 2, 0}; }
     }
 }

@@ -65,6 +65,16 @@ public final class ParityRunner {
         /** Structural assertions on the derived plan (a dependency that must exist). */
         void checkPlan(ParityPlanner plan, List<String> problems) {}
 
+        /** True when the illegal order only shows a difference once ticks run between packets. */
+        boolean illegalNeedsSpread() {
+            return false;
+        }
+
+        /** False when ticks between packets erase the difference the illegal order makes (a mounted player). */
+        boolean illegalChecksSpread() {
+            return true;
+        }
+
         /** An order the rules forbid, whose snapshot must differ from TCP's; null when none. */
         int[] illegalOrder(int items) {
             return null;
@@ -147,7 +157,7 @@ public final class ParityRunner {
                 }
             }
             int[] illegal = c.illegalOrder(n);
-            if (illegal != null) {
+            if (illegal != null && (spread ? c.illegalChecksSpread() : !c.illegalNeedsSpread())) {
                 String got = once(f, c, items, illegal, spread);
                 if (got.equals(reference)) {
                     problems.add(mode + ": the deliberately illegal order " + labels(items, illegal)
