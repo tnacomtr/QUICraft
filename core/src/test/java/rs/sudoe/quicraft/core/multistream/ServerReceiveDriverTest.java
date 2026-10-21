@@ -416,7 +416,9 @@ class ServerReceiveDriverTest {
         assertEquals(Collections.singletonList(0x12), h.codes);
         String detail = h.details.get(0);
         assertTrue(detail.startsWith("expiry=no-progress lapsed=yes head=0:1 "), detail);
-        assertTrue(detail.contains("stream=1 need=1 applied=0 queued=1"), detail);
+        assertTrue(detail.contains("stream=1 need=1 applied=0 queued=1 admitted=1 held=yes ready=yes enq=yes seq=1"),
+                detail);
+        assertTrue(detail.contains("executing=1:1 executor-queued-units=1"), detail);
         assertTrue(detail.contains("blocked-ms=11000"), detail);
     }
 

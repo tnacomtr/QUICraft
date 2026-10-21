@@ -400,6 +400,80 @@ class StreamReceiverTest {
         assertNull(local.reason(), "local withholding blocks the phrase");
     }
 
+    /** The local diagnostic of an expiry, which every expiry close carries. */
+    private static String diagnosticOf(ReceiveClose close) {
+        assertNotNull(close, "expected an expiry");
+        assertNotNull(close.diagnostic(), "an expiry carries the local diagnostic");
+        return close.diagnostic();
+    }
+
+    @Test void expiryDiagnosticReportsAHeldReadyEnqueuedPrerequisiteAndTheExecutingHead() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(1, 1, 0));
+        enqueue(f.receiver, 1, 1);
+        assertAdmitted(f.receiver, rec(0, 1, 0, dep(1, 1)));
+        f.now.set(10 * SEC);
+        String detail = diagnosticOf(f.receiver.expiredWait());
+        assertTrue(detail.contains("unresolved=[stream=1 need=1 applied=0 queued=1 admitted=1 held=yes ready=yes enq=yes seq=1]"),
+                detail);
+        assertTrue(detail.endsWith(" executing=1:1 executor-queued-units=1 ms-since-last-apply-any-stream=none"
+                + " last-renewal-source=none"), detail);
+    }
+
+    @Test void expiryDiagnosticTellsAHeldUnitThatIsNotReadyFromAMissingOne() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(1, 1, 0, dep(3, 1)));
+        assertAdmitted(f.receiver, rec(0, 1, 0, dep(1, 1), dep(2, 1)));
+        f.now.set(10 * SEC);
+        String detail = diagnosticOf(f.receiver.expiredWait());
+        assertTrue(detail.startsWith("expiry=no-progress lapsed=no head=0:1 "), detail);
+        assertTrue(detail.contains("stream=1 need=1 applied=0 queued=0 admitted=1 held=yes ready=no enq=no seq=1"), detail);
+        assertTrue(detail.contains("stream=2 need=1 applied=0 queued=0 admitted=0 held=no ready=no enq=no seq=none"),
+                detail);
+        assertTrue(detail.endsWith(" executing=none executor-queued-units=0 ms-since-last-apply-any-stream=none"
+                + " last-renewal-source=none"), detail);
+    }
+
+    @Test void expiryDiagnosticNamesTheLastApplyAndTheCommitThatRenewedTheWait() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(1, 1), dep(3, 1)));
+        assertAdmitted(f.receiver, rec(3, 1, 0));
+        enqueue(f.receiver, 3, 1);
+        f.now.set(5 * SEC);
+        f.receiver.applied(3, 1);
+        f.now.set(15 * SEC);
+        String detail = diagnosticOf(f.receiver.expiredWait());
+        assertTrue(detail.contains("unresolved=[stream=1 need=1 applied=0 queued=0 admitted=0 held=no ready=no enq=no"
+                + " seq=none]"), detail);
+        assertTrue(detail.contains("blocked-ms=15000 since-renewal-ms=10000"), detail);
+        assertTrue(detail.endsWith(" executing=none executor-queued-units=0 ms-since-last-apply-any-stream=10000"
+                + " last-renewal-source=3:1"), detail);
+    }
+
+    @Test void cumulativeReceiverTimesTheLastApplyFromItsOwnSample() {
+        final AtomicLong clock = new AtomicLong();
+        StallClock source = new StallClock() {
+            @Override public Sample sample() {
+                final long reading = clock.get();
+                return new Sample() {
+                    @Override public long nowNanos() { return reading; }
+                    @Override public long excludedNanos() { return 0; }
+                    @Override public boolean valid() { return true; }
+                };
+            }
+        };
+        StreamReceiver rx = new StreamReceiver(2, Direction.CLIENTBOUND, (s, r, route) -> true, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(1, 1)));
+        assertAdmitted(rx, rec(3, 1, 0));
+        enqueue(rx, 3, 1);
+        clock.set(4 * SEC);
+        rx.applied(3, 1);
+        clock.set(10 * SEC);
+        String detail = diagnosticOf(rx.expiredWait());
+        assertTrue(detail.endsWith(" executing=none executor-queued-units=0 ms-since-last-apply-any-stream=6000"
+                + " last-renewal-source=none"), detail);
+    }
+
     @Test void enqueueStopsTheTimerAndOnlyApplyReleasesDependencies() {
         Fixture f = new Fixture(2);
         assertAdmitted(f.receiver, rec(2, 1, 0));
