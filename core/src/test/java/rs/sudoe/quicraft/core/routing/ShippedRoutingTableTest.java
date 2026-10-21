@@ -9,9 +9,12 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.security.MessageDigest;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.Faults;
 
@@ -24,6 +27,9 @@ import rs.sudoe.quicraft.core.Faults;
 class ShippedRoutingTableTest {
     private static final int PROTOCOL = 775;
     private static final String RESOURCE = RoutingTableLoader.resourcePath(PROTOCOL);
+    /** 13.21: every CHUNK route adds the {@code ack} dependency (6, 8, 37, 45, 84). */
+    private static final Set<Integer> CHUNK_ACK =
+            new HashSet<Integer>(Arrays.asList(45, 6, 8, 37, 84));
 
     @Test
     void theShippedTableParsesAsReviewedSchemaTwoAndIsTheRegistryAnswer() throws Exception {
@@ -48,13 +54,15 @@ class ShippedRoutingTableTest {
     }
 
     @Test
-    void everyChunkRouteUsesTheChunkLaneWithLaneDependency() throws Exception {
+    void everyChunkRouteUsesTheChunkLaneWithItsReviewedDependency() throws Exception {
         Faults.set();
         int count = 0;
-        for (RouteV2 route : RoutingTableLoader.loadResource(PROTOCOL).routesV2().values()) {
+        for (Map.Entry<RouteKey, RouteV2> entry : RoutingTableLoader.loadResource(PROTOCOL).routesV2().entrySet()) {
+            RouteV2 route = entry.getValue();
             if (route.lane == RouteV2.StreamLane.CHUNK) {
                 count++;
-                assertEquals(Dependency.LANE, route.dependency);
+                assertEquals(CHUNK_ACK.contains(entry.getKey().packetId()) ? Dependency.ACK : Dependency.LANE,
+                        route.dependency, "chunk route dependency for " + entry.getKey());
                 assertTrue(route.extractor.equals("mc775.chunk_xz.v1")
                         || route.extractor.equals("mc775.chunk_pos_long.v1")
                         || route.extractor.equals("mc775.block_position.v1")
@@ -73,9 +81,9 @@ class ShippedRoutingTableTest {
 
     /**
      * Every shipped route is one of the reviewed classes: CONTROL/global, the view gate,
-     * REALTIME/lane, a CHUNK route (45, 6, 8, 37, 84), ordinary CONTROL, or a control fence.
-     * block_changed_ack (4) and chunk_batch_finished (11) stay global until 13.19 is wired, so a
-     * global record still orders them after every shard record. Ordinary routes wait for their
+     * REALTIME/lane, a CHUNK route (45, 6, 8, 37, 84), the ACK lane (4, 11), ordinary CONTROL, or a
+     * control fence. Every CHUNK route carries the 13.21 {@code ack} dependency. An ACK-lane record is {@code trailing}: it
+     * orders after every earlier record and advances no frontier. Ordinary routes wait for their
      * CONTROL predecessor and G only; control fences additionally order later REALTIME.
      */
     @Test
@@ -83,18 +91,21 @@ class ShippedRoutingTableTest {
         Faults.set();
         for (Map.Entry<RouteKey, RouteV2> entry : RoutingTableLoader.loadResource(PROTOCOL).routesV2().entrySet()) {
             RouteV2 route = entry.getValue();
+            int id = entry.getKey().packetId();
+            boolean clientboundPlay = entry.getKey().direction() == Direction.CLIENTBOUND
+                    && entry.getKey().state() == ProtocolState.PLAY;
             boolean global = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.GLOBAL;
             boolean realtime = route.lane == RouteV2.StreamLane.REALTIME && route.dependency == Dependency.LANE;
             boolean view = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.VIEW;
             boolean ordinary = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.ORDINARY;
             boolean controlFence = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.CONTROL;
-            boolean chunkRoute = entry.getKey().direction() == Direction.CLIENTBOUND
-                    && entry.getKey().state() == ProtocolState.PLAY
-                    && (entry.getKey().packetId() == 45 || entry.getKey().packetId() == 6
-                            || entry.getKey().packetId() == 8 || entry.getKey().packetId() == 84
-                            || entry.getKey().packetId() == 37)
-                    && route.lane == RouteV2.StreamLane.CHUNK && route.dependency == Dependency.LANE;
-            assertTrue(global || realtime || view || ordinary || controlFence || chunkRoute,
+            boolean ackLane = clientboundPlay && (id == 4 || id == 11)
+                    && route.lane == RouteV2.StreamLane.ACK && route.dependency == Dependency.TRAILING;
+            boolean chunkRoute = clientboundPlay
+                    && (id == 45 || id == 6 || id == 8 || id == 84 || id == 37)
+                    && route.lane == RouteV2.StreamLane.CHUNK
+                    && route.dependency == Dependency.ACK;
+            assertTrue(global || realtime || view || ordinary || controlFence || ackLane || chunkRoute,
                     "unexpected relaxation: " + route.lane + "/" + route.dependency);
         }
     }

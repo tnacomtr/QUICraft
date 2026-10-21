@@ -10,7 +10,7 @@ import rs.sudoe.quicraft.core.routing.RoutingTableLoader;
  * The synthetic protocol-775 table the ACK lane tests run against (13.21): block_changed_ack (4) and
  * chunk_batch_finished (11) on the ACK lane, block_entity_data (6), forget (37) and level_chunk_with_light (45) on
  * CHUNK with the {@code ack} dependency, a plain CHUNK/lane packet (3) and a few CONTROL and REALTIME ones. The
- * shipped table is untouched; a later unit switches it.
+ * shipped table routes the same ids this way; this synthetic table keeps the ACK tests independent of it.
  */
 final class AckLaneTables {
     static final int ORDINARY = 1;

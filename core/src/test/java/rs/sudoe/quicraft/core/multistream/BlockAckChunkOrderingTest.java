@@ -4,9 +4,10 @@ package rs.sudoe.quicraft.core.multistream;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
-/** Ordering test: with the shipped 775 table, a global ACK after shard records carries
- *  dependencies >= every stream's assigned max, and a later chunk record depends on the
- *  ACK's global frontier (13.19 global-fence contract, no ACK_JOIN needed). */
+/** Ordering test for the global-fence fallback: a bundle that carries an ACK is promoted whole to
+ *  CONTROL/global (13.15), so the ACK still carries dependencies >= every stream's assigned max, and a
+ *  later chunk record depends on its global frontier. The ACK stream's own {@code trailing} order is
+ *  tested in StreamSequencerAckTest and the ACK-lane loopback tests. */
 class BlockAckChunkOrderingTest {
 
     @Test
@@ -18,7 +19,7 @@ class BlockAckChunkOrderingTest {
         Record chunkB = sequencer.assign(3, StreamSequencer.Fence.CHUNK, new byte[0], false);
         // A realtime record on the realtime stream (stream 1).
         Record realtime = sequencer.assign(1, StreamSequencer.Fence.REALTIME, new byte[0], false);
-        // The global ACK (packet 4, block_changed_ack) is CONTROL/GLOBAL: it waits for all.
+        // An ACK promoted with a bundle is CONTROL/GLOBAL (13.15): it waits for all.
         Record ack = sequencer.assign(0, StreamSequencer.Fence.GLOBAL, new byte[0], false);
         // The ACK's dependencies must cover every stream's max assigned sequence.
         assertEquals(pairs(1, realtime.sequence(), 2, chunkA.sequence(), 3, chunkB.sequence()),

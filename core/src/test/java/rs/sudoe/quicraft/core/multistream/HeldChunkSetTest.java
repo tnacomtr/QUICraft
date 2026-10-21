@@ -44,15 +44,20 @@ class HeldChunkSetTest {
     }
 
     @Test
-    void theRingRemembersTheLast1024ForgottenPositionsOnly() {
+    void aRingOverflowFailsSafeInsteadOfEvictingTheOldestForget() {
         HeldChunkSet set = new HeldChunkSet();
-        for (int i = 0; i < HeldChunkSet.RING_CAPACITY + 1; i++) {
+        for (int i = 0; i < HeldChunkSet.RING_CAPACITY; i++) {
             set.forget(i, 0);
         }
         assertEquals(HeldChunkSet.RING_CAPACITY, set.forgottenCount());
-        assertFalse(set.install(0, 0), "the oldest forgotten position fell out of the ring");
-        assertTrue(set.install(1, 0), "position 1 is still in the ring");
-        assertTrue(set.install(HeldChunkSet.RING_CAPACITY, 0), "the newest is in the ring");
+        assertTrue(set.install(0, 0), "the oldest forgotten position is still in the full ring");
+        set.forget(HeldChunkSet.RING_CAPACITY, 0);
+        // Astra 2026-10-21: prediction in C, forget C, 256 other forgets, ACK, reinstall C must still wait.
+        assertTrue(set.install(0, 0), "an evicted forget would have let the reinstall overtake the ACK");
+        assertTrue(set.install(5000, 5000), "untrusted: even a never-seen position needs the ack");
+        assertEquals(0, set.footprintWords(), "untrusted releases its arrays");
+        set.clear();
+        assertFalse(set.install(5000, 5000), "clear() restores tracking");
     }
 
     @Test
@@ -63,9 +68,8 @@ class HeldChunkSetTest {
             set.forget(i, 0);
         }
         set.forget(0, 0);
-        set.forget(HeldChunkSet.RING_CAPACITY, 0);
-        assertTrue(set.install(0, 0), "refreshed, so it outlived position 1");
-        assertEquals(HeldChunkSet.RING_CAPACITY, set.forgottenCount());
+        assertEquals(HeldChunkSet.RING_CAPACITY, set.forgottenCount(), "a refresh does not grow the ring");
+        assertTrue(set.install(0, 0), "refreshed position is still remembered");
     }
 
     @Test
@@ -101,7 +105,7 @@ class HeldChunkSetTest {
         assertFalse(set.untrusted());
         assertEquals(0, set.heldCount());
         assertEquals(0, set.forgottenCount());
-        assertFalse(set.install(1, 1), "the client dropped every chunk at the epoch change");
+        assertFalse(set.install(1, 1), "clear() drops every held chunk");
         assertFalse(set.install(2, 2), "and the ring is gone with it");
     }
 
@@ -125,7 +129,7 @@ class HeldChunkSetTest {
                 set.install(x, z);
             }
         }
-        for (int i = 0; i < 2 * HeldChunkSet.RING_CAPACITY; i++) {
+        for (int i = 0; i < HeldChunkSet.RING_CAPACITY; i++) {
             set.forget(100 + i, 100);
         }
         assertEquals(441, set.heldCount());
@@ -163,7 +167,7 @@ class HeldChunkSetTest {
         assertTrue(set.install(0, 0), "in the ring after the forget");
     }
 
-    /** Randomized comparison against a HashSet and a bounded LinkedHashSet, including deletes inside clusters. */
+    /** Randomized comparison against a HashSet and a LinkedHashSet whose overflow fails safe, including deletes inside clusters. */
     @Test
     void behavesLikeAReferenceModelUnderRandomOperations() {
         java.util.Random random = new java.util.Random(0x5EEDL);
@@ -171,6 +175,7 @@ class HeldChunkSetTest {
             HeldChunkSet set = new HeldChunkSet();
             java.util.Set<Long> held = new java.util.HashSet<Long>();
             java.util.LinkedHashSet<Long> ring = new java.util.LinkedHashSet<Long>();
+            boolean untrusted = false;
             int space = 4 + random.nextInt(round < 20 ? 40 : 400);
             for (int step = 0; step < 6000; step++) {
                 int x = random.nextInt(space) - space / 3;
@@ -181,18 +186,23 @@ class HeldChunkSetTest {
                     set.clear();
                     held.clear();
                     ring.clear();
+                    untrusted = false;
                 } else if (op < 6) {
-                    boolean expected = held.contains(k) || ring.contains(k);
-                    held.add(k);
+                    boolean expected = untrusted || held.contains(k) || ring.contains(k);
+                    if (!untrusted) {
+                        held.add(k);
+                    }
                     assertEquals(expected, set.install(x, z), "round " + round + " step " + step);
                 } else {
-                    held.remove(k);
-                    ring.remove(k);
-                    ring.add(k);
-                    if (ring.size() > HeldChunkSet.RING_CAPACITY) {
-                        java.util.Iterator<Long> eldest = ring.iterator();
-                        eldest.next();
-                        eldest.remove();
+                    if (!untrusted) {
+                        held.remove(k);
+                        ring.remove(k);
+                        ring.add(k);
+                        if (ring.size() > HeldChunkSet.RING_CAPACITY) {
+                            untrusted = true;
+                            held.clear();
+                            ring.clear();
+                        }
                     }
                     set.forget(x, z);
                 }

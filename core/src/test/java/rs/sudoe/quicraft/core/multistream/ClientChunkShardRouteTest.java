@@ -86,7 +86,7 @@ class ClientChunkShardRouteTest {
     /** One clientbound receive path: the shipped table, the production shard validator and the pump. */
     private static final class Harness {
         final long[] now = {0L};
-        final SessionReadPumpTest.Streams source = new SessionReadPumpTest.Streams(SHARDS + 2, 1 << 20);
+        final SessionReadPumpTest.Streams source = new SessionReadPumpTest.Streams(SHARDS + 3, 1 << 20);
         final ReceiveSlots slots = new ReceiveSlots(SHARDS);
         final ClientReadPump pump = new ClientReadPump(SHARDS, slots, false, source, () -> now[0]);
         final List<Integer> codes = new ArrayList<Integer>();

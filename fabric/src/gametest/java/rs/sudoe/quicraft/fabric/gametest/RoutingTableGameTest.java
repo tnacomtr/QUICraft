@@ -43,14 +43,15 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * moves or reclassifies a route, fails here by name.
  *
  * <p>The table is schema 2 (13.7): 210 explicit routes, one per live play id. REALTIME is exactly
- * the 14 entity and animation updates 13.8 names; chunk_batch_start is the one VIEW route and
+ * 12 of the entity and animation updates 13.8 names (animate 2 and set_entity_data 99 are global); chunk_batch_start is the one VIEW route and
  * chunks_biomes the one listed-control route ({@code chunk_list}). Five chunk routes (45, 6, 8,
- * 37, 84) are CHUNK/lane with their reviewed position layouts; 93 clientbound routes are ordinary
- * CONTROL and eight are control fences (13.5, B1 minus player_position 72). Every other clientbound
- * route is CONTROL/global, no route carries an epoch change, and every serverbound route is
- * CONTROL/global with {@code ordinarySmall} false. The ack/batch-finished joins, light updates and
- * login/respawn stay CONTROL/global until their wiring lands. A future CHUNK or epoch flip must
- * deliberately revise these pins together with its wiring tests.
+ * 37, 84) are CHUNK with their reviewed position layouts, and all five carry the 13.21 {@code ack}
+ * dependency. The ACK stream carries block_changed_ack (4) and chunk_batch_finished (11),
+ * {@code trailing}. 92 clientbound routes are ordinary CONTROL and six are control fences (13.5,
+ * B1 minus player_position 72, move_vehicle 35 and teleport_entity 125; player_look_at 71 is global too). Every other clientbound route is CONTROL/global, no route carries an epoch
+ * change, and every serverbound route is CONTROL/global with {@code ordinarySmall} false.
+ * light_update and login/respawn stay CONTROL/global until their wiring lands. A future CHUNK,
+ * ACK or epoch flip must deliberately revise these pins together with its wiring tests.
  *
  * <p>The game classes are reached by reflection: this source set is shared with the 1.21.11 jar,
  * where the same names are obfuscated and the test has nothing to pin. It returns early there.
@@ -103,7 +104,6 @@ public class RoutingTableGameTest implements FabricClientGameTest {
      * CONTROL (13.6, 13.8). The lane's ordering is tested in core's ShippedRoutingOrderingTest.
      */
     private static final String[] REALTIME = {
-        "2 minecraft:animate",
         "5 minecraft:block_destruction",
         "42 minecraft:hurt_animation",
         "47 minecraft:level_particles",
@@ -112,7 +112,6 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         "55 minecraft:move_minecart_along_track",
         "56 minecraft:move_entity_rot",
         "83 minecraft:rotate_head",
-        "99 minecraft:set_entity_data",
         "101 minecraft:set_entity_motion",
         "102 minecraft:set_equipment",
         "116 minecraft:sound_entity",
@@ -126,24 +125,30 @@ public class RoutingTableGameTest implements FabricClientGameTest {
     private static final int LIST_ID = 13;
     private static final String LIST_POSITION = "chunk_list";
 
-    /** The five reviewed CHUNK routes, as {@code live-id name position} (13.7). */
+    /** The five reviewed CHUNK routes, as {@code live-id name position dependency} (13.7, 13.21). */
     private static final String[] CHUNK = {
-        "45 minecraft:level_chunk_with_light chunk_xz",
-        "6 minecraft:block_entity_data block_position",
-        "8 minecraft:block_update block_position",
-        "84 minecraft:section_blocks_update section_position",
-        "37 minecraft:forget_level_chunk chunk_pos_long",
+        "45 minecraft:level_chunk_with_light chunk_xz ack",
+        "6 minecraft:block_entity_data block_position ack",
+        "8 minecraft:block_update block_position ack",
+        "84 minecraft:section_blocks_update section_position ack",
+        "37 minecraft:forget_level_chunk chunk_pos_long ack",
     };
 
-    /** The 93 clientbound ordinary CONTROL ids (13.5): no chunk wait, no later-REALTIME fence. */
+    /** The ACK stream, as {@code live-id name}: both routes are trailing with no position (13.21). */
+    private static final String[] ACK = {
+        "4 minecraft:block_changed_ack",
+        "11 minecraft:chunk_batch_finished",
+    };
+
+    /** The 92 clientbound ordinary CONTROL ids (13.5): no chunk wait, no later-REALTIME fence. */
     private static final int[] ORDINARY = {3, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25,
         26, 27, 28, 29, 30, 31, 33, 34, 38, 39, 40, 41, 43, 44, 50, 51, 52, 58, 59, 61, 62, 63, 65,
-        66, 67, 68, 69, 70, 71, 73, 74, 75, 76, 78, 79, 80, 81, 85, 86, 87, 88, 89, 90, 91, 92, 93,
+        66, 67, 68, 69, 70, 73, 74, 75, 76, 78, 79, 80, 81, 85, 86, 87, 88, 89, 90, 91, 92, 93,
         96, 97, 98, 103, 104, 105, 106, 108, 109, 110, 112, 113, 114, 115, 117, 119, 120, 121, 122,
         123, 126, 127, 128, 130, 132, 133, 134, 135, 136, 137, 138, 139, 140};
 
-    /** The eight clientbound control fences (13.5, B1 minus player_position 72). */
-    private static final int[] CONTROL_FENCE = {1, 35, 64, 77, 100, 107, 124, 125};
+    /** The six clientbound control fences (13.5, B1 minus player_position 72, move_vehicle 35, teleport_entity 125). */
+    private static final int[] CONTROL_FENCE = {1, 64, 77, 100, 107, 124};
 
     /**
      * The 13.5 must-use-CONTROL keys, already enforced by the loader from
@@ -224,7 +229,7 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         check(routes.keySet().equals(live.keySet()), "the shipped table keys are not the live play"
                 + " ids: " + keyDifferences(routes.keySet(), live.keySet()));
 
-        // The literal REALTIME pins: exactly these 14 clientbound names, LANE, no position, no epoch.
+        // The literal REALTIME pins: exactly these 12 clientbound names, LANE, no position, no epoch.
         Set<Integer> realtime = new HashSet<Integer>();
         for (String line : REALTIME) {
             String[] parts = line.split(" ", 2);
@@ -233,14 +238,23 @@ public class RoutingTableGameTest implements FabricClientGameTest {
             expectLive(routes, clientbound, Direction.CLIENTBOUND, id, parts[1],
                     RouteV2.StreamLane.REALTIME, Dependency.LANE, null);
         }
-        // The five reviewed CHUNK routes, each with its live name and position layout.
+        // The five reviewed CHUNK routes, each with its live name, position layout and dependency.
         Set<Integer> chunk = new HashSet<Integer>();
         for (String line : CHUNK) {
             String[] parts = line.split(" ");
             int id = Integer.parseInt(parts[0]);
             chunk.add(id);
             expectLive(routes, clientbound, Direction.CLIENTBOUND, id, parts[1],
-                    RouteV2.StreamLane.CHUNK, Dependency.LANE, parts[2]);
+                    RouteV2.StreamLane.CHUNK, Dependency.of(parts[3]), parts[2]);
+        }
+        // The two ACK-stream routes, each with its live name, trailing, no position.
+        Set<Integer> ack = new HashSet<Integer>();
+        for (String line : ACK) {
+            String[] parts = line.split(" ", 2);
+            int id = Integer.parseInt(parts[0]);
+            ack.add(id);
+            expectLive(routes, clientbound, Direction.CLIENTBOUND, id, parts[1],
+                    RouteV2.StreamLane.ACK, Dependency.TRAILING, null);
         }
         Set<Integer> ordinary = ids(ORDINARY);
         Set<Integer> controlFence = ids(CONTROL_FENCE);
@@ -251,7 +265,7 @@ public class RoutingTableGameTest implements FabricClientGameTest {
                 RouteV2.StreamLane.CONTROL, Dependency.GLOBAL, LIST_POSITION);
         for (Map.Entry<String, Integer> entry : clientbound.entrySet()) {
             int id = entry.getValue();
-            if (realtime.contains(id) || chunk.contains(id) || id == VIEW_ID || id == LIST_ID) {
+            if (realtime.contains(id) || chunk.contains(id) || ack.contains(id) || id == VIEW_ID || id == LIST_ID) {
                 continue;
             }
             if (ordinary.contains(id)) {
@@ -270,6 +284,7 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         // other id uses the class (13.5, 13.8).
         Set<Integer> routedRealtime = new HashSet<Integer>();
         Set<Integer> routedChunk = new HashSet<Integer>();
+        Set<Integer> routedAck = new HashSet<Integer>();
         Set<Integer> routedOrdinary = new HashSet<Integer>();
         Set<Integer> routedControl = new HashSet<Integer>();
         for (Map.Entry<RouteKey, RouteV2> entry : routes.entrySet()) {
@@ -280,6 +295,9 @@ public class RoutingTableGameTest implements FabricClientGameTest {
             }
             if (route.lane == RouteV2.StreamLane.CHUNK) {
                 routedChunk.add(key.packetId());
+            }
+            if (route.lane == RouteV2.StreamLane.ACK) {
+                routedAck.add(key.packetId());
             }
             if (key.state() == ProtocolState.PLAY && key.direction() == Direction.CLIENTBOUND) {
                 if (route.dependency == Dependency.ORDINARY) {
@@ -293,6 +311,8 @@ public class RoutingTableGameTest implements FabricClientGameTest {
                 + routedRealtime + ", expected " + realtime);
         check(routedChunk.equals(chunk), "the shipped table routes CHUNK ids "
                 + routedChunk + ", expected " + chunk);
+        check(routedAck.equals(ack), "the shipped table routes ACK-stream ids "
+                + routedAck + ", expected " + ack);
         check(routedOrdinary.equals(ordinary), "the shipped table routes ordinary CONTROL ids "
                 + routedOrdinary + ", expected " + ordinary);
         check(routedControl.equals(controlFence), "the shipped table routes control-fence ids "
@@ -314,7 +334,8 @@ public class RoutingTableGameTest implements FabricClientGameTest {
 
         System.out.println("[QUICraft] schema 2 pins passed: " + routes.size() + " routes, "
                 + routedRealtime.size() + " REALTIME, " + routedChunk.size() + " CHUNK, "
-                + routedOrdinary.size() + " ordinary, " + routedControl.size() + " control fences");
+                + routedAck.size() + " ACK-stream, " + routedOrdinary.size() + " ordinary, "
+                + routedControl.size() + " control fences");
     }
 
     /** The live name must bind to {@code id}, and the route must carry the literal classification. */

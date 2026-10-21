@@ -52,7 +52,7 @@ class SendRouteResolverAckTest {
         assertEquals(Fence.CHUNK_ACK, entity.fence(), "6 always carries the ack dependency");
         assertEquals(3, entity.chunkX());
         SendRouteResolver.Resolved plain = resolve(AckLaneTables.CHUNK_PLAIN, AckLaneTables.chunkUncompressed(3, 3, 4));
-        assertEquals(Fence.CHUNK, plain.fence());
+        assertEquals(Fence.CHUNK_ACK, plain.fence(), "only the driver's proven first install skips the ack (13.21)");
     }
 
     @Test

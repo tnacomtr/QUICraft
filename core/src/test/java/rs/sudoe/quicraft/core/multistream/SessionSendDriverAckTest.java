@@ -113,7 +113,23 @@ class SessionSendDriverAckTest {
     }
 
     @Test
-    void anInstallAfterTheForgetLeftTheRingIsAFirstInstallAgain() throws Exception {
+    void aBatchInstallCarriesTheAckAndStopsFirstInstallTracking() throws Exception {
+        Rig rig = new Rig();
+        rig.send(Fence.ACK_TRAILING, 0, 0);
+        rig.driver.beginBatch(1, frame());
+        SentPacket batched = rig.driver.batchInstall(1, frame(), 20, 20);
+        assertTrue(batched.isAssigned());
+        rig.driver.finishBatch(1, frame());
+        SentPacket replacement = rig.send(Fence.CHUNK_INSTALL, 20, 20);
+        SentPacket fresh = rig.send(Fence.CHUNK_INSTALL, 30, 30);
+        rig.drain();
+        assertTrue(rig.dependsOnAck(batched), "a batch install is never an exempted first install");
+        assertTrue(rig.dependsOnAck(replacement), "the held set did not see the batch install");
+        assertTrue(rig.dependsOnAck(fresh), "tracking stopped after the untracked batch install");
+    }
+
+    @Test
+    void aForgetRingOverflowMakesEveryLaterInstallCarryTheAck() throws Exception {
         Rig rig = new Rig();
         rig.send(Fence.ACK_TRAILING, 0, 0);
         rig.send(Fence.CHUNK_FORGET, 0, 0);
@@ -123,7 +139,7 @@ class SessionSendDriverAckTest {
         SentPacket aged = rig.send(Fence.CHUNK_INSTALL, 0, 0);
         SentPacket recent = rig.send(Fence.CHUNK_INSTALL, HeldChunkSet.RING_CAPACITY, 0);
         rig.drain();
-        assertFalse(rig.dependsOnAck(aged));
+        assertTrue(rig.dependsOnAck(aged), "the overflow must not let the oldest forget pass as a first install");
         assertTrue(rig.dependsOnAck(recent));
     }
 
@@ -142,7 +158,7 @@ class SessionSendDriverAckTest {
     }
 
     @Test
-    void anEpochChangeForgetsEveryHeldChunk() throws Exception {
+    void anEpochChangeStopsTrackingBecauseASameDimensionRespawnKeepsPredictions() throws Exception {
         Rig rig = new Rig();
         rig.send(Fence.CHUNK_INSTALL, 4, 4);
         rig.send(Fence.CHUNK_FORGET, 5, 5);
@@ -150,9 +166,12 @@ class SessionSendDriverAckTest {
         rig.send(Fence.ACK_TRAILING, 0, 0);
         SentPacket held = rig.send(Fence.CHUNK_INSTALL, 4, 4);
         SentPacket forgotten = rig.send(Fence.CHUNK_INSTALL, 5, 5);
+        SentPacket fresh = rig.send(Fence.CHUNK_INSTALL, 900, 900);
         rig.drain();
-        assertFalse(rig.dependsOnAck(held), "the client dropped every chunk at the epoch change");
-        assertFalse(rig.dependsOnAck(forgotten), "the ring is cleared as well");
+        // Astra 2026-10-21: respawn in the same dimension keeps ClientLevel and its prediction map.
+        assertTrue(rig.dependsOnAck(held), "a chunk installed before the epoch change");
+        assertTrue(rig.dependsOnAck(forgotten), "a chunk forgotten before the epoch change");
+        assertTrue(rig.dependsOnAck(fresh), "no first install is trusted after an epoch change");
     }
 
     @Test

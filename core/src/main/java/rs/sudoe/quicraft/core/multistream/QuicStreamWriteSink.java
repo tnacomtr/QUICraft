@@ -10,7 +10,7 @@ import io.netty.handler.codec.quic.QuicStreamChannel;
 import java.util.function.IntPredicate;
 
 /**
- * The send side of an N+2 session: drains {@link SessionSendDriver#poll} into the Netty QUIC stream channels
+ * The send side of an N+3 session: drains {@link SessionSendDriver#poll} into the Netty QUIC stream channels
  * (protocol.md 13.12).
  *
  * <p>A stream is writable when its channel is active and {@link QuicStreamChannel#isWritable()}. Each slice
@@ -44,7 +44,7 @@ public final class QuicStreamWriteSink {
     }
 
     /**
-     * Creates a sink for {@code streams} logical streams (N+2), none attached yet.
+     * Creates a sink for {@code streams} logical streams (N+3), none attached yet.
      *
      * @param driver the connection's send driver
      * @param streams the number of logical streams; indexes run from 0 to {@code streams - 1}

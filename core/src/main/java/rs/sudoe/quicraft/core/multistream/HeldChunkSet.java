@@ -8,13 +8,17 @@ package rs.sudoe.quicraft.core.multistream;
  * <p>A position is HELD from its install record until its forget record. A first install, for a position
  * that is neither held nor among the last {@link #RING_CAPACITY} forgotten positions, cannot have a pending
  * block prediction on the client, so it need not wait for the last ACK-stream record. Every other install
- * (a replacement, or a re-install shortly after a forget) must wait. The ring covers the forget case because
- * a forget does not clear the client's prediction map; a forget-then-reinstall race needs the reinstall within
- * about one round trip, so a short ring is enough.
+ * (a replacement, or a re-install after a forget) must wait. The ring covers the forget case because a forget
+ * does not clear the client's prediction map. Elapsed time bounds nothing here, so the ring never evicts: the
+ * forget that would push out its oldest entry stops tracking instead (below).
  *
- * <p>Fail safe: above {@link #HELD_CAPACITY} held positions the set stops tracking and every install needs
- * the ack dependency, until {@link #clear()} (epoch change). {@link #markUnknown()} does the same for a
- * chunk lifecycle record the sender could not track, such as one inside a bundle.
+ * <p>Fail safe: above {@link #HELD_CAPACITY} held positions, or on the forget that would overflow the ring of
+ * {@link #RING_CAPACITY} forgotten positions, the set stops tracking and every install needs the ack
+ * dependency for the rest of the session. {@link #markUnknown()} does the same for a chunk lifecycle record
+ * the sender could not track, such as one inside a bundle, and for an epoch change: a same-dimension respawn
+ * keeps the client's level and its prediction map, and the sender cannot tell it from a dimension change. The
+ * exemption therefore covers the initial view burst after join, where most installs are, and fails safe once
+ * the player has moved far or respawned.
  *
  * <p>Memory (scale target of 50,000 connections per node): primitive arrays only, allocated on the first install
  * or forget and released by {@link #clear()}, {@link #markUnknown()} and overflow. The held set is an
@@ -88,8 +92,9 @@ public final class HeldChunkSet {
             ringSize--;
         }
         if (ringSize == RING_CAPACITY) {
-            ringHead = (ringHead + 1) % RING_CAPACITY;
-            ringSize--;
+            // Evicting the oldest forget would let a later re-install of it pass as a first install (13.21).
+            markUnknown();
+            return;
         }
         ring[(ringHead + ringSize) % RING_CAPACITY] = key;
         ringSize++;
@@ -102,8 +107,8 @@ public final class HeldChunkSet {
     }
 
     /**
-     * Drops everything on an epoch change (respawn, dimension change, configuration): the client discards
-     * all its chunks there, so no prediction can outlive it.
+     * Drops everything and trusts first installs again. Only for a proven fresh client level; the send driver
+     * never calls it (an epoch change uses {@link #markUnknown()}, 13.21).
      */
     public void clear() {
         release();

@@ -17,7 +17,7 @@ import rs.sudoe.quicraft.core.resource.ResourcePools;
 import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
- * The shared resources of every N+2 session of one listener (docs/protocol.md 13.12): the node pools, the
+ * The shared resources of every N+3 session of one listener (docs/protocol.md 13.12): the node pools, the
  * outbound pool with its own pressure ranking, the inbound excess pool with its own ranking, and the server
  * profile the send drivers schedule with. Built once per listener; the client endpoint has one process-wide
  * instance, {@link #client()}.
@@ -170,7 +170,7 @@ public final class SessionResources {
 
     /**
      * The production resources of one listener with the 13.12 defaults and cumulative stall accounting.
-     * {@code shared} is reused when it is the listener's {@link NodePools}, so the N+2 sessions and pre-login
+     * {@code shared} is reused when it is the listener's {@link NodePools}, so the N+3 sessions and pre-login
      * admission charge the same node; otherwise the sessions get node pools of their own. The pools of the
      * returned resources belong to the listener, never to one admission.
      */

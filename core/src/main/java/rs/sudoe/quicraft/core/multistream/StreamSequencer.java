@@ -452,26 +452,42 @@ public final class StreamSequencer {
             case CONTROL_FENCE:
                 deps[CONTROL] = Math.max(deps[CONTROL], assigned[CONTROL]);
                 deps[REALTIME] = Math.max(deps[REALTIME], assigned[REALTIME]);
+                afterLastAck(deps);
                 break;
             case REALTIME:
                 deps[CONTROL] = Math.max(deps[CONTROL], controlFence);
+                afterLastAck(deps);
                 break;
             case CHUNK:
+                // Only an exempted first install (13.21) or a bundle member promoted to global uses plain CHUNK.
                 deps[CONTROL] = Math.max(deps[CONTROL], viewFrontier);
                 break;
             case CHUNK_ACK:
                 deps[CONTROL] = Math.max(deps[CONTROL], viewFrontier);
-                deps[ackIndex()] = Math.max(deps[ackIndex()], lastAck);
+                afterLastAck(deps);
                 break;
             case ORDINARY_CONTROL:
                 if (interaction) {
                     deps[REALTIME] = Math.max(deps[REALTIME], assigned[REALTIME]);
                 }
+                afterLastAck(deps);
                 break;
             default:
                 throw new IllegalArgumentException("fence");
         }
         return deps;
+    }
+
+    /**
+     * 13.21: no record assigned after an ACK-stream record executes before it. The ACK already trails every
+     * earlier record, so its position relative to every record matches the game's emission order: a pending
+     * prediction rollback and collision snap never sees a later player, entity, inventory or block change early.
+     * Only an exempted first install (plain CHUNK) skips it.
+     */
+    private void afterLastAck(long[] deps) {
+        if (lastAck > 0) {
+            deps[ackIndex()] = Math.max(deps[ackIndex()], lastAck);
+        }
     }
 
     /** Moves the scope frontiers after a fence has been assigned (13.9). */
