@@ -1207,7 +1207,7 @@ before this revision can run.
      Keepalive and reviewed unrelated control packets MUST NOT fence REALTIME. The shipped
      clientbound set is the 93 ids listed in 13.7 (including keepalive 44 and set_time 113).
    Reconfiguration globally drains play, retains streams/sequences, and uses CONTROL only
-   until play resumes. Fences/gates take effect after game-handler execution (13.10), not
+   until play resumes. Fences/gates take effect in game-handler order (13.10), not
    receipt. Scope is per sending direction; game acknowledgements handle cross-direction
    transitions, never implicit references to reverse-stream sequence numbers.
 6. **13.6 Routing algorithm.** At the sender's original game packet ordering point, assign
@@ -1612,10 +1612,65 @@ before this revision can run.
     Validate the decoded packet's required fence/route before execution; a header cannot
     downgrade an unknown id from global. The ACK stream is one more lane for D, Q, cycle and
     blocked-head accounting; 13.21 adds its body-kind, packet-id and size caps. No speculative
-    game execution or blocked-body decompression. Commit dependency watermarks D only after actual serial handler application
-    completes. Separately track FIFO-enqueued watermark Q for timeout accounting only:
-    successful enqueue of a validated eligible unit commits it for the application timer,
-    but Q MUST NOT release dependencies, reuse receive/workspace capacity or change epochs.
+    game execution or blocked-body decompression. The default commit of D is actual serial
+    handler completion. The following bounded accepted-commit exception is
+    **DRAFT pending security review**:
+     - **Clientbound accepted commit.** “Accepted” means returned from the game Connection's inbound handler
+       in delivered order (vanilla TCP-equivalent). Vanilla inline network-thread handlers are
+       chunk batch start/finished, debug sample, pong, low disk space, keepalive, custom payload,
+       transfer, disconnect, enabled-features and reset-chat; server chat/commands use FutureChain.
+       These are vanilla-equivalent. Completion-only commit is required only for handlers
+       QUICraft itself moves off the queue or where a routing-table dependency needs the handler
+       executed. A marker on another executor MUST NOT be used: hold and retry instead.
+       Merely decoding or scheduling on another executor is not acceptance.
+       A bundle is accepted only as a complete, validated atomic game-handler unit, never member
+       by member. Enqueue rejection MUST NOT commit D.
+     - Count all accepted-but-unexecuted packets and their retained decoded/queued bytes across
+       ALL lanes, including ACK and bundle packets. The client thresholds are fixed maxima of
+       **256 packets and 1 MiB** per connection; local policy MAY lower either, never raise it.
+       Commit is allowed at equality. If accepting the current unit takes either count ABOVE
+       its threshold, the receiver MUST hold its commit until BOTH counts return to or below
+       their thresholds. There is only one such uncommitted delivered unit connection-wide;
+       do not deliver another while its commit is held. This is a commit threshold, not a
+       promise that one indivisible unit cannot temporarily overshoot it (13.12).
+       Completion markers queued behind the unit's handlers MAY retire its charge, but not
+       before those handlers finish. Off-FIFO chat/command work after marker retirement is not
+       counted; it is bounded by vanilla message limits.
+     - Accepted D releases dependencies, the stream's head slot and the execution workspace,
+       permitting the next head to be read/decoded. It does NOT free the queued packet objects
+       or their backlog charge. Transfer ownership/accounting before reusing buffers; queued
+       objects MUST NOT alias reused workspace. Dependencies remain correct because every
+       prerequisite was enqueued before its dependent and the one FIFO executes them in that
+       order. Application side effects still occur only when the handlers run. Adapter protocol/
+       decoder transitions needed to decode the next unit MUST actually complete before that
+       unit is decoded; after a client unit with a terminal packet, hold its commit until the new
+       inbound protocol decoder is installed. An enqueue acknowledgement cannot substitute for a pipeline swap.
+     - **Serverbound finding/rule.** Fabric's server also uses accepted commits, NOT completion-
+       only commits: `V3Join.AckHandler` feeds `AckBacklog`, which queues markers on the server's
+       packet processor and calls `lanes.applied` while the backlog is within its thresholds.
+       It uses provisional local maxima of **2,048 packets and 2 MiB**, not the client's limits;
+       these are the server maxima for this draft, with lower local policy allowed. Apply the
+       same FIFO, eligibility, equality, held-commit and completion-accounting requirements,
+       except the client's 64-byte per-packet overhead: the server counts decoded bytes only,
+       and its 2,048-packet cap bounds per-packet overhead instead.
+       A listener refusing markers holds commits (and retries in order); a refused backlog
+       charge holds the commit for local retry, in delivery order, and never closes the
+       connection; until its charge succeeds the unit keeps its read/decode charge and stream.
+       The backlog charge (node budget plus a node-wide backlog sub-cap, default 25% of the node
+       budget, so backlogs can never starve read admission) is a separate ledger from the
+       per-connection decode partition: each retained unit is charged once to each ledger,
+       never twice to the node budget. A commit held
+       for backlog marks the executing unit locally withheld, never peer blame. A pending inbound
+       protocol swap waits for actual completion. Queued bytes additionally remain charged
+       against the node receive budget until the marker runs; refusal is a local wait, not
+       permission to drop accounting or blame the peer. Benchmark/review these
+       provisional maxima under 13.17 before enablement. Core `NStreamSession.applied` trusts
+       the adapter acknowledgement: it advances the receive driver and resumes pumping, not
+       an independent check that the game handler completed.
+     Separately track FIFO-enqueued watermark Q for timeout accounting: successful enqueue
+     of a validated eligible unit completes its application timer. Q alone MUST NOT release
+     dependencies, reuse receive/workspace capacity or change epochs. D may coincide with Q
+     only under the bounded accepted-commit rule above; over-threshold units have Q but not D.
      Each endpoint uses its local monotonic transport clock for network/incomplete/resource
       waits (only the incomplete-read pause expressly specified in 13.12 applies), and its
       local executor-active clock for decode/application work. A blocked-head timer starts
@@ -1627,9 +1682,11 @@ before this revision can run.
       10 seconds plus 60 seconds. The
       receiver cannot distinguish an honestly lost prerequisite from a forged future one.
       Dependency chains are bounded by composition: cycles close immediately, and every
-      seen-but-blocked chain ends at an unseen record or one being executed.
-      A prerequisite is locally withheld only during a recorded tick stall, or while its lane
-      has unread bytes in our native receive window that we are not reading. Here and below
+      seen-but-blocked chain ends at an unseen record, one being executed, or a queued unit
+      whose accepted commit is held by the backlog bound.
+      A prerequisite is locally withheld during a recorded tick stall, while its lane
+      has unread bytes in our native receive window that we are not reading, or while its
+      FIFO-accepted commit is held by the backlog bound. Here and below
       a recorded tick stall means the game executor completes no task for at least 1 second,
       measured locally.
      "executor" means the game's serial/main-thread executor, NOT the Netty event loop.
@@ -1638,19 +1695,30 @@ before this revision can run.
     Executor-active time excludes intervals waiting for the game executor to run, including
     prerequisites already queued there and a handler suspended by a main-thread/tick stall.
      Track the enqueue/completion acknowledgements and recorded stall intervals on each endpoint;
-      ordinary FIFO queueing does not pause or reset blocked-head timers. Retain/charge queued data until actual completion.
+       ordinary FIFO queueing does not pause or reset blocked-head timers. Retain/charge queued
+       data until actual completion: accepted commits transfer it to the separately accounted
+       backlog, never discard its charge merely because D advanced (13.12).
     Decode/dispatch work actually running BEFORE Q still consumes its 10-second allowance;
     a decoder busy loop is not an excluded scheduling wait. After Q there is no transport
     application timeout on that unit; local game-handler watchdogs are separate from `0x11`.
-    Heads waiting on that unit remain blocked until D commits; ordinary FIFO queueing does not pause or reset blocked-head timers. Never classify local game
-    execution/stalls as peer misconduct or release dependencies early to evade a stall.
+     Heads waiting on that unit remain blocked until D commits, including when a backlog-bound
+     commit is held; ordinary FIFO queueing does not pause or reset blocked-head timers. A
+     stalled executor eventually fills the bound and holds D, stopping further delivery and
+     reads on the held stream; other streams can only fill their reserved head slots. No
+     post-Q application timeout applies to the held unit, and no resource timer starts solely
+     for this executor wait. Dependency-blocked heads still expire after 10 seconds of counted
+     transport time with at most 60 seconds of recorded tick-stall exclusion (13.12); an
+     executor-held prerequisite makes that a local/resource close, not peer misconduct.
+     Incomplete-read timers retain their same-lane pause rule; transport idle/dead-path rules
+     remain independent. Never advance D over the bound merely to evade a stall.
 11. **13.11 Barrier example.** CONTROL spawn 5 precedes REALTIME move 9, whose explicit
     CONTROL dependency is 5 (own predecessor 8 implicit). CONTROL remove 6 waits for REALTIME
     9, not chunks. CHUNK[0] install 7, update 8 and forget 9 run in that order independently
     of those entities. A later view gate waits for missing chunk 7 (and its prior chunk
     frontier), and new chunk records wait for that gate. A respawn/global waits for every
     old chunk, and new-epoch
-    records wait for respawn execution. Independently withhold every predecessor in tests.
+    records wait for respawn commit; with accepted commit they queue behind respawn, never
+    execute ahead of it. Independently withhold every predecessor in tests.
 12. **13.12 Direction-specific memory, reservations and progress.**
     **Clientbound (client receives):** give every active stream a non-borrowable
     receive slot and 128 record slots; each CHUNK shard, CONTROL and REALTIME get
@@ -1666,26 +1734,53 @@ before this revision can run.
     slot 79 bytes, so the stream slots total 14 MiB + 975 bytes, within the 16 MiB + 1 KiB
     wire target. A sixth chunk shard would add another 2 MiB + 128 bytes and break that
     target: hard cap 5. At most `128*(N+3) <= 1024` records, including delimiters and
-    partials, are retained.
+    partials, are retained in the stream slots; accepted backlog is additional.
     Separately reserve one connection-wide 8 MiB execution workspace for decompression and
-    retained decoded packet/bundle data (or stricter game limits). Only one unit decodes/
-    applies at a time; all copies and decoder scratch must fit this workspace or fail closed.
-    Worst application-held data is therefore 22 MiB + 975 bytes, not 16 MiB; allocations are lazy.
-    Do not decompress other heads while the execution workspace is occupied.
+    retained decoded packet/bundle data (or stricter game limits). Only one unit is decoded/
+    dispatched at a time; all copies and decoder scratch must fit this workspace or fail closed.
+    **Accepted backlog accounting (DRAFT pending security review):** separately allow at most
+    1 MiB and 256 packets of committed-but-unexecuted data (13.10), outside the stream slots
+    and workspace. Charge decoded (uncompressed) bytes plus 64 bytes per retained packet, not
+    just compressed wire bytes. Decoded bytes are not heap footprint: NBT/components and object
+    overhead can grow, so measure and account conservatively. Third-party codecs retaining
+    slices without `retain()` are out of scope and unsafe;
+    packet counts include bundle members/delimiters actually retained by the executor. The
+    current unit that overshoots either threshold remains uncommitted and charged to the
+    existing 8 MiB workspace (and its stream slot) until its commit can be released; do not
+    count the same storage twice or free it while the FIFO retains it. When committed, any
+    still-live storage transfers to the backlog charge before the workspace is reused.
+    Thus even with one overshooting unit, worst application-held byte data at N=5 is
+    **23 MiB + 975 bytes**, not 22 MiB + 975 bytes or 16 MiB; allocations are lazy. Queue nodes,
+    packet objects and markers require bounded implementation overhead in addition to these
+    byte budgets; measure it under 13.17. The 1,024 stream-record limit excludes committed
+    FIFO packets (up to 256 more); the held unit already occupies a stream's existing limit.
+    Do not decompress other heads while the execution workspace is occupied. Reusing it after
+    accepted commit permits serial decoding to overlap FIFO execution, not parallel decoding.
+    **Implementation audit caveat:** the current client `LaneCodec.decode` reports
+    `frame.readableBytes()` before decompression to `V3Client.decodedBytes`; the server
+    `PacketLaneCodec` reports uncompressed packet lengths to `AckBacklog`. Neither counter
+    alone proves the retained decoded/queued footprint required here. In particular, the
+    client's counter can undercount compressed expansion. The byte totals above are normative
+    accounting requirements, NOT a claim that the current counters establish them. Review
+    retained copies/object overhead and prove conservative accounting before enabling this draft.
     A bundle opener (kind 4, 13.4) is admitted as a whole unit from its own declaration: its
     unit_wire_bytes and unit_records are charged to the CONTROL slot at the opener, and the
     stream reads the following kind 0 members and closer into that same slot until the declared
     count is reached, with no commit in between. The declared bytes and the declared count must
     both match what arrives exactly; a shortfall or excess in either closes `0x11`.
     **Progress argument:** all edges point backward in logical send order. Among pending
-    stream heads there is an earliest unit whose prerequisites are already applied or earlier
+    stream heads there is an earliest unit whose prerequisites are already committed or earlier
     heads. Every stream has room to finish receiving its head even when every other slot is
     full, and an eligible head has its reserved execution workspace. Fair receiving/handler
     scheduling therefore advances the earliest unit; a blocked join cannot steal the missing
-    predecessor's capacity. This assumes transport progress and a completing game handler,
+    predecessor's capacity. Accepted commit moves this frontier to FIFO acceptance, but does
+    not assume unbounded game throughput: once the bound holds a commit, progress additionally
+    requires the executor to drain to or below both thresholds. A stalled executor is not a capacity
+    deadlock and cannot justify unbounded enqueueing; 13.10/13.12's timers bound dependent waits.
+    This assumes transport progress and a completing game handler,
     not a malicious or stalled peer. The timer is a failure bound, not the deadlock remedy.
     Client native credit and unparsed read chunks are additional exposure (13.13). The
-    client reserves capacity for its progress slots, workspace and transport exposure;
+    client reserves capacity for its progress slots, workspace, accepted backlog and transport exposure;
     reserve capacity need not allocate buffers. These are client receive reservations,
     NOT reservations imposed on the server for every connected player.
 
@@ -1696,7 +1791,15 @@ before this revision can run.
      separately accounted. Reserve one inflater per connection when compression is enabled, shared by both
     lanes; decoding is serialized and MUST NOT create a second per-lane inflater. Its
     state/window is about 40 KiB, separately charged as connection memory outside the 24 KiB
-    receive share. Vanilla already pays this cost per compressed connection. These two
+    receive share. Vanilla already pays this cost per compressed connection. Server accepted
+    backlog (13.10) is capped at 2 MiB/2,048 committed-but-unexecuted packets per connection,
+    allocated lazily and charged to the node receive budget until completion, never twice: the
+    per-connection decode partition is a separate ledger, released at commit only after the
+    backlog charge succeeds or the unit's marker has already run. All backlogs together stay within a node-wide sub-cap (default 25%
+    of the node budget), so they may not starve read admission. A refused charge holds the
+    commit for local retry in delivery order, not connection close. One over-threshold uncommitted unit retains its existing
+    read/decode charge until release; accepted commit MUST NOT release that live data charge.
+    This backlog is NOT covered by the 24 KiB admission share or inflater reservation. These two
      reservations total about 64 KiB per logged-in compressed connection. The staged
      pre-login reservation must cover native stream exposure (at most `2*8 KiB + (N+1)`, which the
      stream windows bound below the 24 KiB connection credit; 12.13), read buffers, and measured
@@ -1704,7 +1807,13 @@ before this revision can run.
      connections on top of 50,000 logged-in players, including churn. At 50,000 logged-in compressed connections the
     receive shares total 1,228,800,000 bytes (about 1.14 GiB), inflater reservations total
     2,048,000,000 bytes (about 1.91 GiB), and the combined admission total is 3,276,800,000
-    bytes (about 3.05 GiB), excluding other subsystems.
+    bytes (about 3.05 GiB), excluding accepted backlog and other subsystems. At 50,000 connections,
+    simultaneous 2 MiB committed backlogs alone would add 104,857,600,000 bytes (about 97.66 GiB).
+    That product is not reachable: the game has already queued a unit when its backlog charge is
+    tried, so retention is bounded instead by the charged entries, which together stay within the
+    node-wide backlog sub-cap, plus each uncharged unit, which keeps its acknowledgement held and
+    its decode/excess charge (bounded by the per-connection share and the node excess pool) until
+    the charge succeeds or its marker runs. The shared node budget MUST bound actual retention.
     Admit at most one complete head per lane. REALTIME uses its fixed protected slice and
     wire slot, never inbound excess. At most one CONTROL record uses excess at a time. Let
     L and F be that CONTROL state's maximum wire record (including outer prefix) and decoded
@@ -1963,10 +2072,12 @@ before this revision can run.
      prerequisites change or partly resolve. Subtract recorded executor tick-stall intervals,
      up to 60 seconds total per wait; retention is at most 70 seconds. The receiver cannot
      distinguish an honestly lost prerequisite from a forged future dependency. A prerequisite
-     is locally withheld only while a tick stall is recorded, or while that lane has unread
-     bytes in our native receive window that we are not reading. Decode/application dispatch: 10 seconds
-     of pre-enqueue active work; FIFO enqueue Q completes that timer, while D still waits for actual
-     application (13.10). Executor queue/tick-stall time is excluded at both client and server;
+     is locally withheld while a tick stall is recorded, while that lane has unread
+     bytes in our native receive window that we are not reading, or while its FIFO-accepted
+     commit is backlog-bound. Decode/application dispatch: 10 seconds
+     of pre-enqueue active work; FIFO enqueue Q completes that timer. D waits for actual
+     application unless bounded accepted commit applies (13.10); a backlog-held commit has no
+     post-Q application timeout. Executor queue/tick-stall time is excluded at both client and server;
      do not let a >10-second tick stall disconnect every peer. Unrelated network progress
      restarts none of these clocks. **Peer attribution before resource classification
      (INBOUND only):** "peer" means this one connection's OWN sent bytes; other
@@ -2032,7 +2143,8 @@ before this revision can run.
       local/resource-code close means generic shedding or refusal. A server MUST NOT send the
       phrase, and closes as generic resource instead, when the expired wait consumed any
       recorded tick-stall time or when any part of the blocked record's prerequisite chain was
-      withheld locally (node pool, read grant or decode refusal). This applies even if the
+      withheld locally (node pool, read grant, decode refusal or backlog-held accepted commit).
+      The client applies the same exclusion to its own expiry. This applies even if the
       blocked record is complete or held in excess.
        **Repeated unseen-prerequisite closes (the only resource-close failure-cache write):**
        per (address,fingerprint), regardless of which direction carried the prerequisite, the
@@ -2054,8 +2166,8 @@ before this revision can run.
        other clients or a long server stall cannot produce a counted event, so shedding never
        moves honest clients to TCP.
        For any other deadline, if its transitive prerequisite chain includes a locally withheld
-      read, grant or decode, close with the current local/resource code and do not write a
-      failure-cache entry. A deadline with no local withholding otherwise follows its existing
+      read, grant, decode or backlog-held accepted commit, close with the current local/resource
+      code and do not write a failure-cache entry. A deadline with no local withholding otherwise follows its existing
       rule. This covers activation, missing-stream/preamble, bundle and transitive dependency
       deadlines; incomplete timers retain their own stated pause rule. Never evict a record, skip, release a barrier or retry mid-play.
 
@@ -2143,7 +2255,9 @@ before this revision can run.
     Later external records depend on the closing record as the fence frontier, never a
     partially staged member. Receiver uses provisional CONTROL watermarks only inside the
     bundle, validates the strongest member policy before execution, and commits the closing
-    watermark only after applying the complete bundle atomically to the game's bundle handler.
+    watermark only after applying the complete bundle atomically to the game's bundle handler,
+    or accepting that whole atomic unit under 13.10's bounded FIFO rule. No intermediate
+    member watermark may release an external dependent.
     A missing close after 10 seconds, nested delimiter or policy violation closes `0x11`.
     Scope mapping for the strongest-member rule: GLOBAL and FENCE map to global, VIEW to view, INTERACTION to
     interaction, CONTROL to control and ORDINARY to ordinary. Global beats all; global beats interaction and
@@ -2254,7 +2368,37 @@ before this revision can run.
      consumed recorded tick-stall time closes without the phrase; an existing longer
      non-resource entry is not shortened; the phrase on a pre-handshake, pre-verification or
      transport-type (`0x1c`) close is not counted. Verify the server warning is rate-limited per IP under the existing limits.
-     Phase 5
+     **Bounded accepted-commit gate (DRAFT pending security review):** at client thresholds
+     256 packets/1 MiB and server thresholds 2,048 packets/2 MiB, independently test both
+     counters at threshold-1, equality and threshold+1, with lower configured thresholds too.
+     At equality commit is allowed; an overshooting unit MUST hold D, the head slot and
+     workspace, even though Q advances. Drain only one counter below threshold and assert no
+     release while the other remains over; drain both to equality and assert exactly one
+     commit and resumed reads. Include a single large unit and a 128-record bundle overshoot;
+     prove retained committed backlog plus the held workspace stays within the amended byte
+     totals and no reused buffer aliases a queued packet. Include highly compressed,
+     large-decoded packets; wire-byte-only counters MUST fail that accounting test.
+     Keep backlog/node charges until the behind-handlers marker actually runs;
+     enqueue/marker refusal and teardown must not
+     leak charges or commit unaccepted work. Assert prerequisite-before-dependent execution
+     across every lane, ACK, atomic bundle, fence and epoch change even when D advances before
+     any handler runs. Verify acceptance means return from the Connection inbound handler in
+     delivered order, including vanilla inline handlers (chunk batch start/finished, debug
+     sample, pong, low disk space, keepalive, custom payload, transfer, disconnect,
+     enabled-features, reset-chat) and server chat/commands via FutureChain. Require completion-
+     only commit for handlers QUICraft moves off-queue or routing dependencies; never accept a
+     marker on another executor. Test terminal client units holding commit through inbound
+     decoder installation, backlog charge refusal/ordered retry and local-withheld attribution,
+     uncompressed bytes plus 64-byte packet overhead, sub-cap read-admission protection, and
+     bounded off-FIFO work after marker retirement.
+     Stall the FIFO until the bound holds D: no further delivery, bounded reserved head reads,
+     no post-Q application timeout, no executor-only resource timer and no peer blame. Test
+     >10-second stalls within the 60-second exclusion, then exhaustion of that allowance:
+     dependent-head expiry is a local/resource close under deadline precedence, not `0x11`;
+     distinguish a genuinely unseen prerequisite and independent transport dead-path timeout.
+     Resume before expiry and assert ordered execution, charge release and normal progress.
+     Measure object/marker overhead and server node-budget refusal under simultaneous backlogs
+     at 50,000 connections; these are required tests, not a claim they have passed. Phase 5
     requires measured loss improvement over TCP AND single-stream and security review;
     this draft makes no performance or completed-review claim.
 
@@ -2263,7 +2407,9 @@ before this revision can run.
 18. **13.18 Epoch and position sharding.** Epoch starts at 0 independently per sending
     direction after activation. A reviewed level-creating/replacing global packet (play login,
     respawn, including same-dimension level replacement) carries the old epoch; only its
-    serial-handler completion advances that direction's receive epoch by exactly one.
+    D commit advances that direction's logical receive epoch by exactly one: actual serial-
+    handler completion by default, or 13.10's bounded accepted commit. Under accepted commit
+    this is a scheduling epoch only; the game's level changes when the FIFO executes the fence.
     Sender advances its assignment epoch immediately after assigning that fence; subsequent
     records carry the new epoch and depend on it. Start-configuration alone does not create
     a level or increment epoch. Sequences remain connection-scoped, never restart at epoch
@@ -2272,9 +2418,10 @@ before this revision can run.
     forget ring are not cleared: an epoch change marks them unknown (`markUnknown()`) unless no
     position is held (13.9), because a same-dimension respawn keeps the client's level and prediction map (13.9). No old-epoch
     record can execute after that fence. Epoch drain counts a record
-    as applied (D), not queued (Q), on every stream, the ACK stream included (13.10).
+    as committed (D), not merely queued (Q), on every stream, the ACK stream included (13.10).
     New-epoch envelopes may arrive early, but remain opaque until their transition dependency
-    executes; reject stale epochs or a future epoch without the corresponding transition
+    commits; accepted new-epoch work MUST queue behind that transition and may not execute
+    before it. Reject stale epochs or a future epoch without the corresponding transition
     once prerequisites are available. Epoch exhaustion closes with `0x11`, never wraps.
     Serverbound epoch is always 0: no serverbound route may change epoch, and any nonzero
     serverbound epoch is `0x11`. Acknowledgements do not mirror the clientbound epoch.
@@ -2580,7 +2727,7 @@ before this revision can run.
     - Resources: a protected receive slot of `max(64, prefix staging)` bytes (79) and one
       record, outside the shard pool and counted in the connection's receive reservation;
       partial records are bounded by that slot (13.12).
-    - Epoch drain counts ACK records as applied (D), not queued (Q), on every stream including
+    - Epoch drain counts ACK records as committed (D), not merely queued (Q), on every stream including
       the ACK stream (13.18).
     - Sender priority: the ACK stream is scheduled in the CONTROL class. It takes turns with
       stream 0 when both are ready, ages like a CONTROL head, is never subject to the chunk
@@ -2610,10 +2757,14 @@ The owner accepted all five recommendations:
 2. Lane assignment uses the fixed epoch-mixed 32-bit position hash of 13.18; golden vectors
    follow.
 3. Receive policy as specified in 13.12/13.13 and 12.13. Client: stream slots 14 MiB + 975
-   bytes within the 16 MiB + 1 KiB wire target, 8 MiB execution, 2 MiB native exposure, at most
-   128 KiB unparsed reads. Server, logged in:
+   bytes within the 16 MiB + 1 KiB wire target, 8 MiB execution, plus the 2026-10-21 draft
+   accepted backlog of 1 MiB/256 packets (13.10/13.12): 23 MiB + 975 bytes application-held,
+   plus 2 MiB native exposure and at most 128 KiB unparsed reads, totaling
+   25 MiB + 128 KiB + 975 bytes before object/transport metadata overhead. Server, logged in:
    24 KiB share plus the 40 KiB inflater once compression is enabled (about 64 KiB, about
-   3.05 GiB at 50,000 connections). Server, pre-login (`/3` only): native exposure (at most
+   3.05 GiB at 50,000 connections), excluding the separately node-charged provisional
+   accepted backlog of up to 2 MiB/2,048 packets per connection (13.10/13.12).
+   Server, pre-login (`/3` only): native exposure (at most
    `2*8 KiB + (N+1)`), read buffers and measured QUIC/TLS state, charged to a pool capped at 10% of
    the node budget, moved to the node budget at promotion (online: Login Success; offline:
    `/3` activation). Protected area P <= 7667 bytes at N=5 (CONTROL allowance <= 5619 bytes),
