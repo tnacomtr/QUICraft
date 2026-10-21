@@ -1650,7 +1650,9 @@ before this revision can run.
        packet processor and calls `lanes.applied` while the backlog is within its thresholds.
        It uses provisional local maxima of **2,048 packets and 2 MiB**, not the client's limits;
        these are the server maxima for this draft, with lower local policy allowed. Apply the
-       same FIFO, eligibility, equality, held-commit and completion-accounting requirements.
+       same FIFO, eligibility, equality, held-commit and completion-accounting requirements,
+       except the client's 64-byte per-packet overhead: the server counts decoded bytes only,
+       and its 2,048-packet cap bounds per-packet overhead instead.
        A listener refusing markers holds commits (and retries in order); a refused backlog
        charge holds the commit for local retry, in delivery order, and never closes the
        connection; until its charge succeeds the unit keeps its read/decode charge and stream.
@@ -1793,7 +1795,7 @@ before this revision can run.
     backlog (13.10) is capped at 2 MiB/2,048 committed-but-unexecuted packets per connection,
     allocated lazily and charged to the node receive budget until completion, never twice: the
     per-connection decode partition is a separate ledger, released at commit only after the
-    backlog charge succeeds. All backlogs together stay within a node-wide sub-cap (default 25%
+    backlog charge succeeds or the unit's marker has already run. All backlogs together stay within a node-wide sub-cap (default 25%
     of the node budget), so they may not starve read admission. A refused charge holds the
     commit for local retry in delivery order, not connection close. One over-threshold uncommitted unit retains its existing
     read/decode charge until release; accepted commit MUST NOT release that live data charge.
@@ -1806,9 +1808,12 @@ before this revision can run.
     receive shares total 1,228,800,000 bytes (about 1.14 GiB), inflater reservations total
     2,048,000,000 bytes (about 1.91 GiB), and the combined admission total is 3,276,800,000
     bytes (about 3.05 GiB), excluding accepted backlog and other subsystems. At 50,000 connections,
-    simultaneous 2 MiB committed backlogs alone would add 104,857,600,000 bytes (about 97.66 GiB),
-    an unreachable per-connection product because the node budget is enforced before the game
-    takes the packet; the shared node budget MUST bound actual retention.
+    simultaneous 2 MiB committed backlogs alone would add 104,857,600,000 bytes (about 97.66 GiB).
+    That product is not reachable: the game has already queued a unit when its backlog charge is
+    tried, so retention is bounded instead by the charged entries, which together stay within the
+    node-wide backlog sub-cap, plus each uncharged unit, which keeps its acknowledgement held and
+    its decode/excess charge (bounded by the per-connection share and the node excess pool) until
+    the charge succeeds or its marker runs. The shared node budget MUST bound actual retention.
     Admit at most one complete head per lane. REALTIME uses its fixed protected slice and
     wire slot, never inbound excess. At most one CONTROL record uses excess at a time. Let
     L and F be that CONTROL state's maximum wire record (including outer prefix) and decoded
