@@ -6,6 +6,7 @@
   "client": [
     "ClientCommonPacketListenerImplMixin",
     "ClientHandshakePacketListenerImplMixin",
+    "ChunkBatchTimerMixin",
     "ClientPacketListenerMixin",
     "CompressionDecoderAccessor",
     "CompressionEncoderAccessor",

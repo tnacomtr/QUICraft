@@ -59,7 +59,8 @@ usage() {
         echo "  --port          loopback TCP+UDP port; must be 25565, the port the server advertises"
         echo "  --play-seconds  measured play time (default: 20)"
         echo "  --netem         clean (default) | loss | delay | delayloss | reorder | jitter"
-        echo "  --coalesce      experiment: -Dquicraft.coalesceWrites=true on server and client"
+        echo "  --coalesce      -Dquicraft.coalesceWrites=true on server and client"
+        echo "  --no-coalesce   -Dquicraft.coalesceWrites=false (without either flag each side uses its default: /3 on, /2 off)"
         echo "  --coalesce-max N  experiment: -Dquicraft.coalesceMaxBytes=N (soft per-stream cap, default 65536)"
     } >&2
     exit "${1:-2}"
@@ -82,7 +83,7 @@ warmup=false
 port="25565"
 play_seconds="20"
 netem="clean"
-coalesce=false
+coalesce=""
 coalesce_max=""
 
 while (($# > 0)); do
@@ -103,6 +104,10 @@ while (($# > 0)); do
             ;;
         --coalesce)
             coalesce=true
+            shift
+            ;;
+        --no-coalesce)
+            coalesce=false
             shift
             ;;
         --coalesce-max)
@@ -427,7 +432,7 @@ client=(
     "-Pquicraft.armWarmup=$warmup_value"
     "-Pquicraft.armCommit=$commit"
     "-Pquicraft.armPlaySeconds=$play_seconds"
-    "-Pquicraft.armCoalesce=$coalesce"
+    ${coalesce:+"-Pquicraft.armCoalesce=$coalesce"}
     ${coalesce_max:+"-Pquicraft.armCoalesceMax=$coalesce_max"}
     "$module:runClientGameTest"
 )
