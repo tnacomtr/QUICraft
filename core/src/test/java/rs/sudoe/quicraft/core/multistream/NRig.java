@@ -298,12 +298,23 @@ final class NRig implements AutoCloseable {
         private final AtomicInteger depth = new AtomicInteger();
         private final AtomicInteger max = new AtomicInteger();
         private final AtomicInteger entries = new AtomicInteger();
+        private volatile Runnable onEnter;
+
+        /** Runs {@code hook} once, on the loop, inside the next receive step's entry (before the step's work). */
+        void arm(Runnable hook) {
+            onEnter = hook;
+        }
 
         @Override
         public void enter() {
             int now = depth.incrementAndGet();
             max.accumulateAndGet(now, Math::max);
             entries.incrementAndGet();
+            Runnable hook = onEnter;
+            if (hook != null) {
+                onEnter = null;
+                hook.run();
+            }
         }
 
         @Override

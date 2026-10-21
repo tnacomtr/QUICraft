@@ -404,6 +404,8 @@ public final class NStreamSession implements MultistreamSession {
     private boolean inlinePump = INLINE_PUMP;
     /** Test seam: sees every receive step's entry and exit on the loop thread. Null in production. */
     private ReceiveObserver receiveObserver;
+    /** Test seam: named events on the inline pump and drain paths (loop thread). Null in production. */
+    private PathProbe pathProbe;
     private boolean closeNotified;
     private boolean executing;
     private int executingStream = -1;
@@ -1256,12 +1258,23 @@ public final class NStreamSession implements MultistreamSession {
             return;
         }
         guarded(() -> {
+            probe("inline.begin");
             pumpNow();
             // What the game answered during this round leaves now, not behind the rest of the loop's I/O.
             if (drainScheduled.get() && !closed) {
+                probe("drain.inline");
                 drainNow();
             }
+            probe("inline.end");
         });
+    }
+
+    /** Test seam: names one path event on the loop thread; a no-op unless a probe is configured. */
+    private void probe(String event) {
+        PathProbe current = pathProbe;
+        if (current != null) {
+            current.event(event);
+        }
     }
 
     private void pumpNow() {
@@ -1303,10 +1316,20 @@ public final class NStreamSession implements MultistreamSession {
         void exit();
     }
 
+    /** Test seam: sees the named path events of the inline pump and the drains (see {@link #probe}). */
+    interface PathProbe {
+        void event(String name);
+    }
+
     /** Test seam: sets the inline-pump flag and the receive observer. Call on the loop before activation. */
     void configureForTests(boolean inlinePumpOn, ReceiveObserver observer) {
         this.inlinePump = inlinePumpOn;
         this.receiveObserver = observer;
+    }
+
+    /** Test seam: sets the path probe. Call on the loop. */
+    void configurePathProbe(PathProbe probe) {
+        this.pathProbe = probe;
     }
 
     /** One receive step; false when it closed the session. */
@@ -1422,6 +1445,7 @@ public final class NStreamSession implements MultistreamSession {
         }
         loop.execute(() -> guarded(() -> {
             drainScheduled.set(false);
+            probe("drain.queued");
             drainNow();
         }));
     }

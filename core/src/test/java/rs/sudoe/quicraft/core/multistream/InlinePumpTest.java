@@ -6,19 +6,24 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.codec.quic.QuicStreamChannel;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import rs.sudoe.quicraft.core.routing.ProtocolState;
 
 /**
  * The /3 inline receive pump (-Dquicraft.v3.inlinePump) over loopback QUIC: ordered delivery in both directions
- * with bursts longer than MAX_STEPS, no nested receive on the loop, replies sent from inside a delivery, and a
- * throwing delivery failing the session closed. Each test pins the flag explicitly through {@link NRig.Config}.
+ * with bursts longer than MAX_STEPS, no nested receive on the loop from either entry (pump and tick), replies sent
+ * from inside a delivery, and a throwing delivery failing the session closed. Each test pins the flag explicitly
+ * through {@link NRig.Config}.
  */
 @Timeout(value = 120, unit = TimeUnit.SECONDS)
 class InlinePumpTest {
@@ -110,8 +115,114 @@ class InlinePumpTest {
     }
 
     /**
-     * The client answers "s0" from inside its own delivery. The reply is sent on the loop while the inline pump is
-     * still on the stack, reaches the server, and the server's CONTROL stream keeps its order.
+     * Forced re-entrancy from the pump entry: the first receive step after arming issues a synchronous read-complete
+     * on the client's control stream while that step is on the stack (inside the pump round or a queued pump). The
+     * nested call must defer to a later pump (pumpInline's guard), so the depth stays 1 and every record still
+     * arrives in order. Removing the pump-side guard in pumpInline makes this test fail with depth 2.
+     */
+    @Test
+    void readCompleteFromInsideAPumpRoundNeverNestsTheReceive() throws Exception {
+        NRig.Config config = new NRig.Config();
+        config.inlinePump = true;
+        try (NRig rig = NRig.start(config)) {
+            rig.activateBoth();
+            AtomicInteger nested = new AtomicInteger();
+            rig.clientDepth.arm(nestedReadComplete(rig, nested));
+            List<String> toClient = new ArrayList<String>();
+            List<String> toServer = new ArrayList<String>();
+            for (int i = 0; i < 60; i++) {
+                send(rig.server, "c" + i, toClient);
+                send(rig.client, "s" + i, toServer);
+            }
+            assertTrue(SessionRigSupport.await(() -> labels(rig.clientGame).size() == 60, WAIT_MILLIS),
+                    () -> "records to the client: " + labels(rig.clientGame));
+            assertTrue(SessionRigSupport.await(() -> labels(rig.serverGame).size() == 60, WAIT_MILLIS),
+                    () -> "records to the server: " + labels(rig.serverGame));
+            assertEquals(1, nested.get(), "the read-complete was issued from inside a receive step");
+            assertEquals(1, rig.clientDepth.maxDepth(), "the nested read-complete did not nest a receive");
+            assertEquals(toClient, labels(rig.clientGame), "the deferred pump delivered client order");
+            assertEquals(toServer, labels(rig.serverGame), "the deferred pump delivered server order");
+        }
+    }
+
+    /**
+     * Forced re-entrancy from the tick entry: the tick's own receive step issues the synchronous read-complete. The
+     * tick holds the pump's guard, so the nested call must defer. Removing the tick's guard makes this test fail,
+     * because the nested pump then runs a receive step inside the tick's step (depth 2).
+     */
+    @Test
+    void readCompleteFromInsideTheTickNeverNestsTheReceive() throws Exception {
+        NRig.Config config = new NRig.Config();
+        config.inlinePump = true;
+        try (NRig rig = NRig.start(config)) {
+            rig.activateBoth();
+            List<String> toClient = new ArrayList<String>();
+            List<String> toServer = new ArrayList<String>();
+            for (int i = 0; i < 20; i++) {
+                send(rig.server, "c" + i, toClient);
+                send(rig.client, "s" + i, toServer);
+            }
+            assertTrue(SessionRigSupport.await(() -> labels(rig.clientGame).size() == 20, WAIT_MILLIS),
+                    () -> "records to the client: " + labels(rig.clientGame));
+            assertTrue(SessionRigSupport.await(() -> labels(rig.serverGame).size() == 20, WAIT_MILLIS),
+                    () -> "records to the server: " + labels(rig.serverGame));
+            AtomicInteger nested = new AtomicInteger();
+            rig.clientDepth.arm(nestedReadComplete(rig, nested));
+            int before = rig.clientDepth.entries();
+            NRig.onLoop(rig.client, () -> {
+                rig.client.tick();
+                return null;
+            });
+            assertTrue(rig.clientDepth.entries() > before, "the tick entered a receive step");
+            assertEquals(1, nested.get(), "the tick's receive step issued the read-complete");
+            assertEquals(1, rig.clientDepth.maxDepth(), "the tick's nested read-complete did not nest a receive");
+            // The deferred pump still delivers what follows.
+            for (int i = 20; i < 40; i++) {
+                send(rig.server, "c" + i, toClient);
+                send(rig.client, "s" + i, toServer);
+            }
+            assertTrue(SessionRigSupport.await(() -> labels(rig.clientGame).size() == 40, WAIT_MILLIS),
+                    () -> "records after the tick to the client: " + labels(rig.clientGame));
+            assertTrue(SessionRigSupport.await(() -> labels(rig.serverGame).size() == 40, WAIT_MILLIS),
+                    () -> "records after the tick to the server: " + labels(rig.serverGame));
+            assertEquals(toClient, labels(rig.clientGame), "client order after the tick");
+            assertEquals(toServer, labels(rig.serverGame), "server order after the tick");
+        }
+    }
+
+    /**
+     * One pump round must not drain a burst of more than MAX_STEPS. A task queued on the client's loop during the
+     * first receive step runs before the burst completes: the round yields after 64 steps with a continuation queued
+     * behind that task. The check is that the task saw fewer than BURST records delivered. This proves a yield only
+     * if the burst was readable at the start of the round, which the burst send right after arming makes likely but
+     * does not force; without MAX_STEPS yielding the round would deliver all of it before the task runs.
+     */
+    @Test
+    void aBurstLongerThanOneRoundYieldsToQueuedWork() throws Exception {
+        NRig.Config config = new NRig.Config();
+        config.inlinePump = true;
+        try (NRig rig = NRig.start(config)) {
+            rig.activateBoth();
+            List<String> events = Collections.synchronizedList(new ArrayList<String>());
+            rig.clientDepth.arm(() -> rig.client.eventLoop().execute(
+                    () -> events.add("queued@" + labels(rig.clientGame).size())));
+            List<String> toClient = new ArrayList<String>();
+            for (int i = 0; i < BURST; i++) {
+                send(rig.server, "c" + i, toClient);
+            }
+            assertTrue(SessionRigSupport.await(() -> labels(rig.clientGame).size() == BURST, WAIT_MILLIS),
+                    () -> "burst to the client stalled at " + labels(rig.clientGame).size() + " of " + BURST);
+            assertEquals(toClient, labels(rig.clientGame), "burst order");
+            assertEquals(1, events.size(), "the queued task ran once: " + events);
+            int seen = Integer.parseInt(events.get(0).substring("queued@".length()));
+            assertTrue(seen < BURST, "the queued task ran before the burst completed (saw " + seen + ")");
+        }
+    }
+
+    /**
+     * The client answers "s0" from inside its own delivery. The path probe shows the delivery ran inside the inline
+     * pump round, and that the reply was drained by that round's inline drain, before any queued drain task. The
+     * reply then reaches the server, and the server's CONTROL stream keeps its order.
      */
     @Test
     void replySentFromInsideADeliveryArrivesInOrder() throws Exception {
@@ -119,12 +230,18 @@ class InlinePumpTest {
         config.inlinePump = true;
         try (NRig rig = NRig.start(config)) {
             rig.activateBoth();
+            List<String> events = Collections.synchronizedList(new ArrayList<String>());
+            NRig.onLoop(rig.client, () -> {
+                rig.client.configurePathProbe(events::add);
+                return null;
+            });
             AtomicBoolean replied = new AtomicBoolean();
             rig.clientGame.onDeliver = () -> {
                 List<NRig.Got> units = rig.clientGame.units();
                 NRig.Got last = units.get(units.size() - 1);
                 if (!replied.get() && last.packets.size() == 1 && "s0".equals(((NRig.Pkt) last.packets.get(0)).label)) {
                     replied.set(true);
+                    events.add("reply");
                     rig.client.send(ProtocolState.PLAY, NRig.CONTROL_ID, NRig.frame(NRig.CONTROL_ID, "reply"));
                 }
             };
@@ -137,6 +254,23 @@ class InlinePumpTest {
             assertTrue(replied.get(), "the client replied from inside a delivery");
             assertTrue(SessionRigSupport.await(() -> labels(rig.clientGame).size() == 3, WAIT_MILLIS),
                     () -> "the client delivered s0..s2: " + labels(rig.clientGame));
+            assertTrue(SessionRigSupport.await(() -> afterReplyInlineEnded(events), WAIT_MILLIS),
+                    () -> "the inline round ended after the reply: " + events);
+            int reply = events.indexOf("reply");
+            assertTrue(reply >= 0, "the reply was recorded: " + events);
+            int begin = events.subList(0, reply).lastIndexOf("inline.begin");
+            int end = indexFrom(events, "inline.end", reply);
+            assertTrue(begin >= 0 && end > reply, "the delivery ran inside an inline pump round: " + events);
+            assertFalse(events.subList(begin, reply).contains("inline.end"),
+                    "no inline round had ended before the reply: " + events);
+            int firstDrain = -1;
+            for (int i = reply + 1; i < events.size() && firstDrain < 0; i++) {
+                if (events.get(i).startsWith("drain.")) {
+                    firstDrain = i;
+                }
+            }
+            assertTrue(firstDrain > reply && "drain.inline".equals(events.get(firstDrain)) && firstDrain < end,
+                    "the reply was drained inline, before any queued drain task: " + events);
             assertEquals(toClient, labels(rig.clientGame), "the client's deliveries keep their order");
             assertEquals(Collections.singletonList("reply"), labels(rig.serverGame),
                     "the server got exactly the one reply");
@@ -146,8 +280,10 @@ class InlinePumpTest {
     }
 
     /**
-     * A delivery that throws inside the inline stack fails the session closed: the close carries the cause, the
-     * peer sees the same code, nothing escapes to Netty as an unhandled exception, and nothing after it is delivered.
+     * A delivery that throws inside the inline stack fails the session closed: the close carries the cause, the peer
+     * sees the same code, and nothing after it is delivered. The recorders at the tail of every server stream pipeline
+     * and of the server connection pipeline must not see the delivery exception (or a wrapper of it): the pump's own
+     * guard absorbs it. Other errors from the close path itself are not asserted here.
      */
     @Test
     void throwingDeliveryInsideTheInlineStackFailsClosed() throws Exception {
@@ -155,6 +291,13 @@ class InlinePumpTest {
         config.inlinePump = true;
         try (NRig rig = NRig.start(config)) {
             rig.activateBoth();
+            List<Throwable> reached = Collections.synchronizedList(new ArrayList<Throwable>());
+            for (int i = 0; i < config.shards + 3; i++) {
+                QuicStreamChannel stream = NRig.channel(rig.server, i);
+                stream.eventLoop().submit(() -> stream.pipeline().addLast(recorder(reached))).get(10, TimeUnit.SECONDS);
+            }
+            rig.serverConnection.eventLoop().submit(
+                    () -> rig.serverConnection.pipeline().addLast(recorder(reached))).get(10, TimeUnit.SECONDS);
             RuntimeException failure = new IllegalStateException("game delivery exploded");
             rig.serverGame.failureLabel = "x0";
             rig.serverGame.deliverFailure = failure;
@@ -169,7 +312,45 @@ class InlinePumpTest {
             List<String> delivered = labels(rig.serverGame);
             assertFalse(delivered.contains("x1") || delivered.contains("x2"),
                     "nothing after the failing delivery was delivered: " + delivered);
+            for (Throwable t : reached) {
+                assertFalse(t == failure || t.getCause() == failure,
+                        "the delivery exception reached the Netty pipeline: " + t);
+            }
         }
+    }
+
+    /** Arms a one-shot synchronous read-complete on the client's control stream, counting it in {@code nested}. */
+    private static Runnable nestedReadComplete(NRig rig, AtomicInteger nested) {
+        return () -> {
+            nested.incrementAndGet();
+            rig.client.channelOf(0).pipeline().fireChannelReadComplete();
+        };
+    }
+
+    /** A tail handler that records exceptions and does not handle them further. */
+    private static ChannelInboundHandlerAdapter recorder(List<Throwable> reached) {
+        return new ChannelInboundHandlerAdapter() {
+            @Override
+            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+                reached.add(cause);
+            }
+        };
+    }
+
+    /** True once the reply's inline round has closed (inline.end after the reply) on the client's loop. */
+    private static boolean afterReplyInlineEnded(List<String> events) {
+        int reply = events.indexOf("reply");
+        return reply >= 0 && indexFrom(events, "inline.end", reply) >= 0;
+    }
+
+    /** The first index at or after {@code from} holding {@code value}, or -1. */
+    private static int indexFrom(List<String> events, String value, int from) {
+        for (int i = Math.max(0, from); i < events.size(); i++) {
+            if (value.equals(events.get(i))) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private static void send(NStreamSession from, String label, List<String> expected) {
