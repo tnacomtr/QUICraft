@@ -633,6 +633,11 @@ public final class SessionSendDriver {
         return submit(packet, fence, chunkX, chunkZ, dependenciesOf(after));
     }
 
+    /** The sender's current assignment epoch (13.18); package-private for tests and diagnostics. */
+    synchronized long sendEpoch() {
+        return sequencer.epoch();
+    }
+
     /**
      * Assigns a level-creating epoch transition (13.18). Pending ACK_JOINs settle first, in the old
      * epoch, and any active batch is discarded.
