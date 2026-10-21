@@ -31,9 +31,14 @@ abstract class ChunkBatchRateLogMixin {
 
     @Inject(method = "handleChunkBatchFinished", at = @At("TAIL"))
     private void quicraftTest$logRate(ClientboundChunkBatchFinishedPacket packet, CallbackInfo ci) {
+        // One line per batch on purpose: opt-in, and the analysis needs every batch of a join (a few hundred).
         if (ENABLED) {
-            LOGGER.info("QUICraft test batch: size={} desired={}", packet.batchSize(),
-                    chunkBatchSizeCalculator.getDesiredChunksPerTick());
+            try {
+                LOGGER.info("QUICraft test batch: size={} desired={}", packet.batchSize(),
+                        chunkBatchSizeCalculator.getDesiredChunksPerTick());
+            } catch (Throwable ignored) {
+                // Diagnostics never reach vanilla's handler.
+            }
         }
     }
 }
