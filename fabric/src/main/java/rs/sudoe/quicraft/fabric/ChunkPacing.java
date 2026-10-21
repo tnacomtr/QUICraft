@@ -49,7 +49,7 @@ public final class ChunkPacing {
         this(enabled, false);
     }
 
-    ChunkPacing(boolean enabled, boolean busy) {
+    public ChunkPacing(boolean enabled, boolean busy) {
         this.enabled = enabled;
         this.busy = busy;
     }
