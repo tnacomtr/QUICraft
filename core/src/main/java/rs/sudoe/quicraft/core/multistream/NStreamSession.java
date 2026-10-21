@@ -1487,8 +1487,18 @@ public final class NStreamSession implements MultistreamSession {
             fail(CLOSE_ORDERING, NO_REASON, "a peer stream did not open in time (13.3)", null);
             return;
         }
-        if (game != null && !receiveOnce()) {
-            return;
+        if (game != null && !pumping) {
+            // Same guard as the pump: a read this step issues may complete synchronously and pump inline.
+            boolean open;
+            pumping = true;
+            try {
+                open = receiveOnce();
+            } finally {
+                pumping = false;
+            }
+            if (!open) {
+                return;
+            }
         }
         sendDriver.expireAcks();
         drainNow();
