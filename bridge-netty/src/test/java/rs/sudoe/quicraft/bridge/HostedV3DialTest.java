@@ -162,9 +162,14 @@ class HostedV3DialTest {
             await(() -> negotiated(client), 10_000);
             StubGame clientGame = new StubGame();
             StubGame serverGame = new StubGame();
-            client.activate(clientGame, false, null);
+            // Protocol order (12.9, 12.12): the server activates first, when it queues SERVER_SWITCH;
+            // the client activates only after validating it. A client stream (REALTIME) reaching the
+            // server before its activation is fatal 0x11 (13.3), so activating the client first would
+            // race the server's loop and close a healthy session at random.
             serverSide.activate(serverGame, PROTOCOL, false, null);
-            await(() -> client.session() != null && serverSide.session() != null, 5_000);
+            await(() -> serverSide.session() != null, 5_000);
+            client.activate(clientGame, false, null);
+            await(() -> client.session() != null, 5_000);
             // Several ticks of the session's periodic task: it used to throw here and close 0x2.
             Thread.sleep(300);
             assertTrue(client.isOpen(), "the client /3 connection stayed open: " + clientGame);
@@ -205,6 +210,9 @@ class HostedV3DialTest {
     /** Records a close; no record is expected in this test. */
     private static final class StubGame implements LaneGame {
         volatile boolean closed;
+        volatile int closeCode = -1;
+        volatile boolean closeByPeer;
+        volatile Throwable closeCause;
 
         @Override
         public Decoded decode(Lane lane, long sequence, byte[] frame, boolean insideBundle, Reservation reservation) {
@@ -221,12 +229,19 @@ class HostedV3DialTest {
 
         @Override
         public void onClosed(int code, boolean byPeer, Throwable cause) {
+            closeCode = code;
+            closeByPeer = byPeer;
+            closeCause = cause;
             closed = true;
         }
 
         @Override
         public String toString() {
-            return closed ? "closed" : "open";
+            if (!closed) {
+                return "open";
+            }
+            return "closed code=0x" + Integer.toHexString(closeCode) + " byPeer=" + closeByPeer
+                    + " cause=" + closeCause;
         }
     }
 
