@@ -80,6 +80,26 @@ class GameLanesTest {
     }
 
     @Test
+    void decodedSizeTravelsWithItsDeliveryAcrossLanesAndSequenceGaps() {
+        EmbeddedChannel channel = new EmbeddedChannel();
+        GameLanes lanes = GameLanes.forTest(channel, new FakeCodec(), new FakeSession(),
+                ProtocolState.PLAY, null);
+        lanes.deliver(Lane.REALTIME, 7, Collections.<Object>singletonList("first"), false, 123);
+        lanes.deliver(Lane.CONTROL, 2, Collections.<Object>singletonList("second"), false, 456);
+        assertEquals("first", channel.readInbound());
+        GameLanes.Ack first = channel.readInbound();
+        assertEquals(Lane.REALTIME, first.lane());
+        assertEquals(7, first.sequence());
+        assertEquals(123, first.decodedBytes());
+        assertEquals("second", channel.readInbound());
+        GameLanes.Ack second = channel.readInbound();
+        assertEquals(Lane.CONTROL, second.lane());
+        assertEquals(2, second.sequence());
+        assertEquals(456, second.decodedBytes());
+        channel.finishAndReleaseAll();
+    }
+
+    @Test
     void deliverFromAnotherThreadKeepsTheDeliveryOrder() throws Exception {
         FakeCodec codec = new FakeCodec();
         FakeSession session = new FakeSession();

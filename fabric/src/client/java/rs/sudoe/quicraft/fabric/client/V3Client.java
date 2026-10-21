@@ -149,6 +149,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     private long unrunPackets;
     private long unrunBytes;
     private GameLanes.Ack heldAck;
+    /** Guarded by accounting: only this delivery's marker may clear a refused/pending offer. */
+    private GameLanes.Ack markerPending;
     private final ReceiveTrace receiveTrace = ReceiveTrace.enabled() ? new ReceiveTrace() : null;
     private long traceDeliveryStartedNanos;
     private long traceHeldDeliveryNanos;
@@ -158,7 +160,10 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     /** Event loop only: packets fired since the last acknowledgement. */
     private long deliveredPackets;
     private final java.util.concurrent.atomic.AtomicLong decodedBytes = new java.util.concurrent.atomic.AtomicLong();
-    private volatile java.util.function.Consumer<Runnable> mainThread = this::onGamePacketQueue;
+    /** Offers a marker to the game's main thread; false while it is not accepting (F1). */
+    private volatile java.util.function.Predicate<Runnable> mainThread = this::onGamePacketQueue;
+    /** Protocol-swap retry delay, event loop only; capped to avoid polling a stalled game at 1 kHz. */
+    private long decoderRetryMillis = 1;
     private volatile AckSink ackSink = (lane, sequence) -> lanes.applied(lane, sequence);
 
     V3Client(Connection connection, QuicBridgeChannel channel, EventLoop loop, V3Connection v3, V3Plan plan,
@@ -573,6 +578,17 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
      * back, until the main thread has caught up: that is the backpressure on a game that cannot keep up.</p>
      */
     void acknowledge(GameLanes.Ack ack) {
+        if (!channel.isOpen() || (lanes != null && lanes.isClosed())) return;
+        if (channel.pipeline().get("decoder") == null) {
+            // M3: a terminal packet swapped the inbound protocol and the game has not installed the new
+            // decoder yet. Acknowledging now would let the next record decode with no protocol (13.16), so
+            // wait, like the server does (V3Join.acknowledge), and keep the counts for the next attempt.
+            long delay = decoderRetryMillis;
+            decoderRetryMillis = Math.min(PacketQueueRetry.MAX_DELAY_MILLIS, delay * 2);
+            loop.schedule(() -> acknowledge(ack), delay, java.util.concurrent.TimeUnit.MILLISECONDS);
+            return;
+        }
+        decoderRetryMillis = 1;
         final long packets = deliveredPackets;
         deliveredPackets = 0;
         final long bytes = decodedBytes.getAndSet(0);
@@ -583,6 +599,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         if (receiveTrace != null) receiveTrace.delivered(bytes);
         boolean hold;
         synchronized (accounting) {
+            markerPending = ack;
             unrunPackets += packets;
             unrunBytes += bytes;
             hold = overBound();
@@ -596,15 +613,15 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         if (watcher != null) {
             watcher.deliveryQueued();
         }
-        try {
-            mainThread.accept(() -> {
+        Runnable marker = () -> {
                 GameLanes.Ack release = null;
                 long heldDeliveryNanos = 0;
                 long heldSinceNanos = 0;
                 synchronized (accounting) {
+                    if (markerPending == ack) markerPending = null;
                     unrunPackets -= packets;
                     unrunBytes -= bytes;
-                    if (heldAck != null && !overBound()) {
+                    if (heldAck != null && markerPending == null && !overBound()) {
                         release = heldAck;
                         heldAck = null;
                         heldDeliveryNanos = traceHeldDeliveryNanos;
@@ -617,24 +634,61 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                 if (release != null) {
                     applyAck(release, heldDeliveryNanos, heldSinceNanos);
                 }
-            });
+            };
+        boolean queued;
+        try {
+            queued = mainThread.test(marker);
         } catch (RejectedExecutionException closing) {
             return; // the game is shutting down; nothing is left to acknowledge
         }
+        if (!queued) {
+            // F1: the listener does not accept the marker yet. The acknowledgement waits with it, in order,
+            // and the marker releases it when it runs; it is never applied from another executor.
+            synchronized (accounting) {
+                heldAck = ack;
+                traceHeldDeliveryNanos = deliveryNanos;
+                traceHeldSinceNanos = now;
+            }
+            new PacketQueueRetry(marker, () -> channel.isOpen() && (lanes == null || !lanes.isClosed()),
+                    task -> mainThread.test(task),
+                    (task, delay) -> loop.schedule(task, delay, java.util.concurrent.TimeUnit.MILLISECONDS),
+                    this::fail).start();
+            return;
+        }
+        GameLanes.Ack release = null;
+        long releaseDeliveryNanos = 0;
+        long releaseHeldSinceNanos = 0;
+        synchronized (accounting) {
+            if (markerPending == ack) markerPending = null;
+            // An older marker may have drained the bound while this offer was in progress.
+            if (hold && heldAck == ack && !overBound()) {
+                release = heldAck;
+                heldAck = null;
+                releaseDeliveryNanos = traceHeldDeliveryNanos;
+                releaseHeldSinceNanos = traceHeldSinceNanos;
+            }
+        }
+        if (release != null) applyAck(release, releaseDeliveryNanos, releaseHeldSinceNanos);
         if (!hold) {
             applyAck(ack, deliveryNanos, 0);
         }
     }
 
-    /** Production: behind the packets already queued for the main thread. */
-    private void onGamePacketQueue(Runnable marker) {
-        Minecraft minecraft = Minecraft.getInstance();
+    /**
+     * Production: behind the packets already queued for the main thread. False while the listener does
+     * not accept the marker; the caller holds it and retries on the loop (never another executor, F1).
+     */
+    private boolean onGamePacketQueue(Runnable marker) {
         PacketListener listener = connection.getPacketListener();
         if (listener == null) {
-            minecraft.execute(marker);
-        } else {
-            minecraft.packetProcessor().scheduleIfPossible(listener, new AckPacket(marker));
+            return false;
         }
+        AckPacket packet = new AckPacket(marker);
+        if (!listener.shouldHandleMessage(packet)) {
+            return false;
+        }
+        Minecraft.getInstance().packetProcessor().scheduleIfPossible(listener, packet);
+        return true;
     }
 
     private boolean overBound() {
@@ -681,7 +735,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     }
 
     /** Tests: where acknowledgements run, and how the game's main thread is asked to run a marker. */
-    void useAcknowledgement(java.util.function.Consumer<Runnable> mainThread, AckSink sink) {
+    void useAcknowledgement(java.util.function.Predicate<Runnable> mainThread, AckSink sink) {
         this.mainThread = mainThread;
         this.ackSink = sink;
     }

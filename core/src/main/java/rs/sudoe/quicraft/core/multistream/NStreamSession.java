@@ -1884,6 +1884,11 @@ public final class NStreamSession implements MultistreamSession {
 
         @Override
         public void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle) {
+            deliver(lane, sequence, packets, bundle, 0);
+        }
+
+        @Override
+        public void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle, long decodedBytes) {
             if (receiveTrace != null) {
                 receiveTrace.deliveredOnStream(executingStream);
                 receiveTrace.waits.finish(System.nanoTime());
@@ -1892,7 +1897,7 @@ public final class NStreamSession implements MultistreamSession {
                 receiveTrace.ackToNextDelivery.add(System.nanoTime() - traceAckReceivedNanos);
                 traceAckReceivedNanos = 0;
             }
-            game.deliver(lane, sequence, packets, bundle);
+            game.deliver(lane, sequence, packets, bundle, decodedBytes);
         }
 
         @Override

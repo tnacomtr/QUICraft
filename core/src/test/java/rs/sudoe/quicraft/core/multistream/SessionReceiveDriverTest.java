@@ -444,6 +444,20 @@ class SessionReceiveDriverTest {
         assertEquals(wire.length, h.slots.heldBytes(LogicalStream.CONTROL));
     }
 
+    @Test void heldCommitPastBlockedHeadDeadlineNeverBlamesPeer() throws Exception {
+        Harness h = new Harness();
+        h.source.put(LogicalStream.CONTROL,
+                rec(0, 1, 0, Collections.<Record.Dependency>emptyList(), PID_CONTROL));
+        h.source.put(2, rec(2, 1, 0, dep(0, 1), PID_CHUNK));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("enqueued 0:1"));
+        h.now[0] = TimeUnit.SECONDS.toNanos(11);
+        h.rounds(1);
+        assertEquals(Collections.singletonList(CLOSE_RESOURCE), h.codes);
+        assertEquals(Collections.singletonList("resource"), h.reasons,
+                "our held commit must not emit unseen-prerequisite");
+    }
+
     @Test void bundleCloserWithheldSuppressesUnseenPhrase() throws Exception {
         Harness h = new Harness();
         // The opener waits on stream 2, which never arrives. Its closer is withheld locally.

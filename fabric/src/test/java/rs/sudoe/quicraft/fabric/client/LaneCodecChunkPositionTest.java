@@ -141,10 +141,34 @@ class LaneCodecChunkPositionTest {
         }
     }
 
+    /**
+     * The backlog bound counts decoded size, not wire size: a highly compressible packet is a few hundred
+     * bytes on the wire but 5 MiB once decoded, so the count is the uncompressed size plus the fixed overhead.
+     */
+    @Test
+    void decodedByteCountUsesUncompressedSizeNotWireSizeForCompressiblePacket() throws Exception {
+        EmbeddedChannel channel = pipeline(true);
+        long[] counted = {-1};
+        LaneCodec codec = new LaneCodec(channel, null, size -> counted[0] = size, access(true));
+        byte[] packet = new byte[5 << 20];
+        ByteBuffer.wrap(packet).put((byte) 45).putInt(-7).putInt(8);
+        ByteBuf frame = Unpooled.wrappedBuffer(FrameCodec.encode(packet, 0));
+        long wireBytes = frame.readableBytes();
+        try {
+            assertTrue(wireBytes < 8192,"the frame must be highly compressible, was " + wireBytes + " bytes");
+            codec.decode(frame, ProtocolState.PLAY, (add, total) -> { });
+            assertEquals(packet.length + LaneCodec.PER_PACKET_OVERHEAD_BYTES, counted[0]);
+        } finally {
+            frame.release();
+            channel.finishAndReleaseAll();
+        }
+    }
+
     @Test
     void routingCopyReservationRefusalPrecedesDestructiveGameDecode() throws Exception {
         EmbeddedChannel channel = pipeline(false);
-        LaneCodec codec = new LaneCodec(channel, null, null, access(false));
+        long[] counted = {0};
+        LaneCodec codec = new LaneCodec(channel, null, size -> counted[0] += size, access(false));
         byte[] packet = ByteBuffer.allocate(9).put((byte) 45).putInt(-7).putInt(8).array();
         ByteBuf frame = Unpooled.wrappedBuffer(FrameCodec.encode(packet, -1));
         int[] reservations = {0};
@@ -153,6 +177,7 @@ class LaneCodecChunkPositionTest {
                 if (++reservations[0] == 2) throw new IllegalStateException("routing copy budget refused");
             }));
             assertEquals(1, frame.readerIndex(), "only the framing prefix was consumed; game decode did not run");
+            assertEquals(0, counted[0], "a refused attempt must not inflate the next delivery's byte count");
         } finally {
             frame.release();
             channel.finishAndReleaseAll();

@@ -3,7 +3,6 @@ package rs.sudoe.quicraft.fabric.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayDeque;
@@ -116,11 +115,82 @@ class AckBacklogTest {
         backlog.delivered(Lane.CONTROL, 1, 1, 400);
         backlog.delivered(Lane.CONTROL, 2, 1, 400);
         assertEquals(800, node.reserved());
-        assertThrows(IllegalStateException.class, () -> backlog.delivered(Lane.CONTROL, 3, 1, 400),
-                "a delivery the node cannot carry fails the connection (13.12)");
+        backlog.delivered(Lane.CONTROL, 3, 1, 400);
+        assertEquals(List.of(1L, 2L), acked, "the node cannot carry 3: its acknowledgement is held, not failed");
+        assertEquals(800, node.reserved(), "and nothing is charged for it yet");
+        assertFalse(backlog.hasBlocked(), "no retry timer: its own marker resolves it");
 
         mainThread.poll().run();
-        assertEquals(400, node.reserved());
+        assertEquals(List.of(1L, 2L, 3L), acked, "a marker that ran made room: 3 is charged and acknowledged");
+        assertEquals(800, node.reserved());
+        runMainThread();
+        assertEquals(0, node.reserved());
+    }
+
+    @Test
+    void aRefusedReservationKeepsDeliveryOrder() {
+        ReceiveBudget node = ReceiveBudget.bounded(500);
+        AckBacklog backlog = backlog(node, AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
+
+        backlog.delivered(Lane.CONTROL, 1, 1, 400);
+        backlog.delivered(Lane.CONTROL, 2, 1, 300);
+        backlog.delivered(Lane.CONTROL, 3, 1, 50);
+        assertEquals(List.of(1L), acked, "3 would fit, but never ahead of the held 2");
+        assertEquals(400, node.reserved(), "and does not take the room 2 waits for");
+
+        mainThread.poll().run();
+        assertEquals(List.of(1L, 2L, 3L), acked);
+        assertEquals(350, node.reserved());
+    }
+
+    @Test
+    void aSharedBacklogCapHoldsEveryConnectionWithoutFailingAny() {
+        ReceiveBudget node = ReceiveBudget.bounded(100_000);
+        ReceiveBudget share = ReceiveBudget.bounded(1000);
+        List<AckBacklog> connections = new ArrayList<>();
+        for (int i = 0; i < 50; i++) {
+            AckBacklog backlog = new AckBacklog((lane, sequence) -> acked.add(sequence), task -> {
+                mainThread.add(task);
+                return true;
+            }, node, share, AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
+            connections.add(backlog);
+            backlog.delivered(Lane.CONTROL, i, 1, 100);
+        }
+
+        assertEquals(10, acked.size(), "the share carries 10 x 100 bytes; the other 40 are held");
+        assertEquals(1000, share.reserved());
+        assertEquals(1000, node.reserved(), "one charge per retained unit, never two");
+        assertEquals(99_000, node.available(), "the rest of the node stays free for reading");
+
+        runMainThread();
+        assertEquals(50, acked.size(), "every held acknowledgement completes as the markers run, no timer");
+        assertEquals(0, share.reserved());
+        assertEquals(0, node.reserved());
+    }
+
+    @Test
+    void aUnitThatRunsBeforeItsReservationGivesNothingBackAndReleasesItsAck() {
+        ReceiveBudget node = ReceiveBudget.bounded(100);
+        AckBacklog backlog = backlog(node, AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
+
+        backlog.delivered(Lane.CONTROL, 1, 1, 100);
+        backlog.delivered(Lane.CONTROL, 2, 1, 100);
+        assertEquals(List.of(1L), acked);
+        runMainThread(); // both markers run; 2 never got its reservation
+        assertEquals(List.of(1L, 2L), acked);
+        assertEquals(0, node.reserved(), "no release for bytes never charged");
+        assertEquals(0, backlog.pendingBytes());
+    }
+
+    @Test
+    void teardownWithAHeldReservationReleasesOnlyWhatWasCharged() {
+        ReceiveBudget node = ReceiveBudget.bounded(100);
+        AckBacklog backlog = backlog(node, AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
+        backlog.delivered(Lane.CONTROL, 1, 1, 100);
+        backlog.delivered(Lane.CONTROL, 2, 1, 100);
+
+        backlog.teardown();
+        assertEquals(0, node.reserved());
         runMainThread();
         assertEquals(0, node.reserved());
     }

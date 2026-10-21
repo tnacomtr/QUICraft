@@ -46,6 +46,8 @@ final class AckBacklog {
         final long packets;
         final long bytes;
         boolean blocked;
+        /** Its bytes are reserved against the backlog share and the node budget. */
+        boolean charged;
         boolean ran;
 
         Entry(Lane lane, long sequence, long packets, long bytes) {
@@ -59,35 +61,42 @@ final class AckBacklog {
     private final Sink sink;
     private final SerialQueue queue;
     private final ReceiveBudget node;
+    /** The node-wide sub-cap every connection's backlog shares (default a quarter of the node budget). */
+    private final ReceiveBudget share;
     private final long maxPackets;
     private final long maxBytes;
     /** Deliveries not yet acknowledged, in order. */
     private final ArrayDeque<Entry> held = new ArrayDeque<>();
-    /** Deliveries whose marker has not run, in order; their bytes are reserved. */
+    /** Deliveries whose marker has not run, in order; their bytes are reserved once {@code charged}. */
     private final Set<Entry> live = new LinkedHashSet<>();
     private long pendingPackets;
     private long pendingBytes;
     private boolean closed;
 
     AckBacklog(Sink sink, SerialQueue queue, ReceiveBudget node, long maxPackets, long maxBytes) {
+        this(sink, queue, node, ReceiveBudget.unlimited(), maxPackets, maxBytes);
+    }
+
+    AckBacklog(Sink sink, SerialQueue queue, ReceiveBudget node, ReceiveBudget share, long maxPackets,
+            long maxBytes) {
         this.sink = sink;
         this.queue = queue;
         this.node = node == null ? ReceiveBudget.unlimited() : node;
+        this.share = share == null ? ReceiveBudget.unlimited() : share;
         this.maxPackets = maxPackets;
         this.maxBytes = maxBytes;
     }
 
     /**
-     * One delivery of {@code packets} packets and {@code bytes} bytes was accepted by the game.
-     *
-     * @throws IllegalStateException when the node budget refuses the bytes
+     * One delivery of {@code packets} packets and {@code bytes} bytes was accepted by the game. Its bytes
+     * are reserved against the backlog share and the node budget; when either refuses, its acknowledgement
+     * is held (the unit keeps its read/decode charge, and its stream, until then) and the reservation is
+     * tried again, in order, whenever a marker runs (at the latest its own) and on {@link #retry}. A refusal never fails the
+     * connection: it is local pressure, not the peer's fault (13.10, 13.12).
      */
     synchronized void delivered(Lane lane, long sequence, long packets, long bytes) {
         if (closed) {
             return;
-        }
-        if (!node.tryReserve(bytes)) {
-            throw new IllegalStateException("the node receive budget refused " + bytes + " accepted bytes (13.12)");
         }
         Entry entry = new Entry(lane, sequence, packets, bytes);
         live.add(entry);
@@ -100,7 +109,10 @@ final class AckBacklog {
         releaseReady();
     }
 
-    /** Queues the markers of deliveries a not-accepting listener refused earlier, in order. */
+    /**
+     * Queues the markers of deliveries a not-accepting listener refused earlier, in order, and tries the
+     * held reservations again.
+     */
     synchronized void retry() {
         for (Entry entry : held) {
             if (!entry.blocked) {
@@ -114,6 +126,10 @@ final class AckBacklog {
         releaseReady();
     }
 
+    /**
+     * Whether a refused marker waits for {@link #retry}. A refused reservation needs no timer: its own
+     * marker is queued, and when it (or any earlier one) runs, the reservation is tried again or dropped.
+     */
     synchronized boolean hasBlocked() {
         for (Entry entry : held) {
             if (entry.blocked) {
@@ -128,15 +144,46 @@ final class AckBacklog {
         if (live.remove(entry)) {
             pendingPackets -= entry.packets;
             pendingBytes -= entry.bytes;
-            node.release(entry.bytes);
+            if (entry.charged) {
+                uncharge(entry.bytes);
+            } else {
+                // Ran before its bytes could be reserved: nothing to give back, and nothing left to hold.
+                entry.charged = true;
+            }
         }
         releaseReady();
     }
 
+    /** Reserves against the share, then the node; all or nothing. */
+    private boolean charge(long bytes) {
+        if (!share.tryReserve(bytes)) {
+            return false;
+        }
+        if (!node.tryReserve(bytes)) {
+            share.release(bytes);
+            return false;
+        }
+        return true;
+    }
+
+    private void uncharge(long bytes) {
+        node.release(bytes);
+        share.release(bytes);
+    }
+
     private void releaseReady() {
+        // Reservations in delivery order: a later unit never takes room an earlier held one waits for.
+        for (Entry entry : held) {
+            if (!entry.charged) {
+                if (closed || !charge(entry.bytes)) {
+                    break;
+                }
+                entry.charged = true;
+            }
+        }
         while (!closed && !held.isEmpty()) {
             Entry head = held.peek();
-            if (head.blocked || pendingPackets > maxPackets || pendingBytes > maxBytes) {
+            if (head.blocked || !head.charged || pendingPackets > maxPackets || pendingBytes > maxBytes) {
                 return;
             }
             held.poll();
@@ -148,7 +195,9 @@ final class AckBacklog {
     synchronized void teardown() {
         closed = true;
         for (Entry entry : live) {
-            node.release(entry.bytes);
+            if (entry.charged) {
+                uncharge(entry.bytes);
+            }
         }
         live.clear();
         held.clear();

@@ -412,6 +412,9 @@ public final class SessionReceiveDriver {
             return false;
         }
         receiver.enqueued(stream, entry.openerSeq);
+        // Q -> D is a local application wait, including held acceptance acknowledgements.
+        // Mark the bundle opener; applied() retires the mark at the same time as the slot.
+        markWithheld(stream, entry.openerSeq);
         entry.enqueued = true;
         executing = entry;
         game.onEnqueued(lane, stream, entry.closingSeq);
