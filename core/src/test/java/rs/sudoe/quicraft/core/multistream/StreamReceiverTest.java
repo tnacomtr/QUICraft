@@ -307,7 +307,7 @@ class StreamReceiverTest {
             return true;
         });
         assertAdmitted(f.receiver, rec(0, 1, 0));
-        assertAdmitted(f.receiver, rec(1, 1, 0, dep(0, 1)));
+        assertAdmitted(f.receiver, rec(1, 1, 1, dep(0, 1)));
         assertAdmitted(f.receiver, rec(2, 1, 1));
         assertEquals(0, calls.get(), "blocked and future-epoch admission must not touch the body");
         assertNull(f.receiver.validateEligible(0, boundary()));

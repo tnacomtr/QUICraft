@@ -390,6 +390,9 @@ public final class StreamReceiver {
      * still needs {@link #validateEligible} before {@link #enqueued}.
      */
     public int nextToEnqueue() {
+        if (violation != null) {
+            return -1;
+        }
         int[] order = new int[streams];
         order[0] = LogicalStream.REALTIME;
         order[1] = LogicalStream.CONTROL;
@@ -529,11 +532,29 @@ public final class StreamReceiver {
         if (unit.route.epochChange()) {
             epoch = epoch + 1;
             transitionPending = false;
+            if (violation == null) {
+                violation = staleHeadViolation();
+            }
         }
         stopTimersOfReadyHeads();
         if (violation == null) {
             violation = heldPathViolation(transitionReachable());
         }
+    }
+
+    /**
+     * After the epoch advanced, any retained head still below the new epoch (enqueued or not) was admitted
+     * before the fence and would execute after it, which 13.18 forbids. The applied transition's own unit is
+     * already cleared. O(streams), no allocation unless it fails.
+     */
+    private ReceiveClose staleHeadViolation() {
+        for (Unit unit : head) {
+            if (unit != null && unit.record.epoch() < epoch) {
+                return ReceiveClose.peerViolation("epoch " + unit.record.epoch()
+                        + " record retained across the epoch " + epoch + " fence (13.18)");
+            }
+        }
+        return null;
     }
 
     /**
