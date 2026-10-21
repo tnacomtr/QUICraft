@@ -9,7 +9,10 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
@@ -94,12 +97,13 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
     }
 
     private static void run(ClientGameTestContext context) {
+        Map<String, Set<Object>> baseline = failureKeys(); // earlier tests may have left failures
         try (TestDedicatedServerContext server = GameTests.server(context)) {
             Advertisement ad = server.computeOnServer(s -> ServerQuic.advertisement());
             check(ad != null && "quicraft/3".equals(ad.alpn()), "the server advertises quicraft/3: " + ad);
             try (var join = server.connect()) {
                 GameTests.waitForChunks(join);
-                Rig rig = new Rig(context, server);
+                Rig rig = new Rig(context, server, baseline);
                 rig.capture();
                 long epoch = rig.receiveEpoch();
                 QuicraftFabricTestLog.info("respawn-live: joined over /3, receive epoch " + epoch + ", level "
@@ -169,7 +173,9 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                         + " " + spawn.getZ());
                 epoch = rig.settle("back to the overworld", Level.OVERWORLD, epoch + 1);
 
-                // 3. A client block break (prediction + ack) immediately followed by a respawn.
+                // 3. A client block break that the server accepts, then a respawn. The exact ordering of a
+                // block_changed_ack around the respawn is covered by the parity tests; this only proves the
+                // live connection survives a respawn right after a client-driven world edit.
                 BlockPos target = rig.clientBlockPos().east(2);
                 server.runCommand("setblock " + target.getX() + " " + target.getY() + " " + target.getZ()
                         + " minecraft:stone");
@@ -177,17 +183,22 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                 check(context.computeOnClient(c -> !c.level.getBlockState(target).isAir()),
                         "the target block reached the client before the break");
                 context.runOnClient(c -> c.gameMode.startDestroyBlock(target, Direction.UP));
+                boolean brokenOnServer = false;
+                for (int tick = 0; tick < 100 && !brokenOnServer; tick++) {
+                    context.waitTick();
+                    brokenOnServer = server.computeOnServer(s -> s.overworld().getBlockState(target).isAir());
+                }
+                check(brokenOnServer, "the server accepted the client's block break within 100 ticks");
                 server.runCommand("kill @a");
                 context.waitForScreen(DeathScreen.class);
-                boolean airBeforeRespawn = context.computeOnClient(c -> c.level.getBlockState(target).isAir());
                 context.waitTicks(30);
                 context.clickScreenButton("deathScreen.respawn");
                 epoch = rig.settle("respawn after a block break", Level.OVERWORLD, epoch + 1);
                 boolean serverAir = server.computeOnServer(s -> s.overworld().getBlockState(target).isAir());
                 boolean clientAir = context.computeOnClient(c -> c.level.getBlockState(target).isAir());
-                QuicraftFabricTestLog.info("respawn-live: block break: client predicted air at the death screen="
-                        + airBeforeRespawn + ", server air=" + serverAir + ", client air after respawn=" + clientAir);
-                check(serverAir == clientAir, "the broken block agrees on both sides after the respawn: server "
+                QuicraftFabricTestLog.info("respawn-live: block break accepted by the server; after the respawn "
+                        + "server air=" + serverAir + ", client air=" + clientAir);
+                check(serverAir && clientAir, "the broken block is air on both sides after the respawn: server "
                         + serverAir + ", client " + clientAir);
 
                 // Leave the world as the later tests expect it.
@@ -200,7 +211,7 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
             context.waitTicks(20);
             try (var join = server.connect()) {
                 GameTests.waitForChunks(join);
-                Rig rig = new Rig(context, server);
+                Rig rig = new Rig(context, server, baseline);
                 rig.capture();
                 long epoch = rig.receiveEpoch();
                 Boolean untrustedAtJoin = rig.heldChunksUntrusted();
@@ -234,15 +245,18 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
     private static final class Rig {
         final ClientGameTestContext context;
         final TestDedicatedServerContext server;
+        final Map<String, Set<Object>> failureBaseline;
         Connection connection;
         Object serverListener;
         Connection serverConnection;
         V3Connection transport;
         Object controller;
 
-        Rig(ClientGameTestContext context, TestDedicatedServerContext server) {
+        Rig(ClientGameTestContext context, TestDedicatedServerContext server,
+                Map<String, Set<Object>> failureBaseline) {
             this.context = context;
             this.server = server;
+            this.failureBaseline = failureBaseline;
         }
 
         void capture() {
@@ -275,7 +289,10 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                     Object held = read(driver, "heldChunks");
                     Method untrusted = held.getClass().getDeclaredMethod("untrusted");
                     untrusted.setAccessible(true);
-                    return (Boolean) untrusted.invoke(held);
+                    // The send driver mutates the set under its own monitor.
+                    synchronized (driver) {
+                        return (Boolean) untrusted.invoke(held);
+                    }
                 } catch (Throwable t) {
                     QuicraftFabricTestLog.info("respawn-live: HeldChunkSet not reachable: " + t);
                     return null;
@@ -330,7 +347,7 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                     label + ": a /3 failure was recorded: " + transportEntry("v3Failure", connection));
             check(!Boolean.TRUE.equals(transportEntry("takeRetryOverTcp", connection)),
                     label + ": the next join would use TCP");
-            checkFailureCacheEmpty(label);
+            checkNoNewFailure(label);
             check(context.computeOnClient(c -> c.level != null && c.level.dimension() == dimension),
                     label + ": client not in " + dimension.identifier());
             boolean chunk = context.computeOnClient(c -> c.level.getChunkSource()
@@ -371,15 +388,30 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
             }
         }
 
-        void checkFailureCacheEmpty(String label) {
-            Object cache = read(QuicraftClient.get(), "failures");
-            synchronized (cache) {
-                for (String name : new String[] {"entries", "activationEntries", "unseen"}) {
-                    check(read(cache, name) instanceof Map<?, ?> map && map.isEmpty(),
-                            label + ": a QUIC failure was recorded in the failure cache (" + name + ")");
-                }
+        /** This test must add no failure; earlier tests of the default run may have left some. */
+        void checkNoNewFailure(String label) {
+            Map<String, Set<Object>> now = failureKeys();
+            for (Map.Entry<String, Set<Object>> entry : now.entrySet()) {
+                Set<Object> added = new HashSet<>(entry.getValue());
+                added.removeAll(failureBaseline.get(entry.getKey()));
+                check(added.isEmpty(), label + ": this test added a QUIC failure to the failure cache ("
+                        + entry.getKey() + "): " + added);
             }
         }
+    }
+
+    /** The keys of the shared failure cache's three maps, copied. */
+    private static Map<String, Set<Object>> failureKeys() {
+        Object cache = read(QuicraftClient.get(), "failures");
+        Map<String, Set<Object>> keys = new LinkedHashMap<>();
+        synchronized (cache) {
+            for (String name : new String[] {"entries", "activationEntries", "unseen"}) {
+                Object map = read(cache, name);
+                check(map instanceof Map<?, ?>, "failure cache field " + name + " is a map");
+                keys.put(name, new HashSet<Object>(((Map<?, ?>) map).keySet()));
+            }
+        }
+        return keys;
     }
 
     private static Object transportEntry(String name, Connection connection) {
