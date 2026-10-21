@@ -21,6 +21,7 @@ services:
     environment:
       FABRIC_ONLINE_MODE: ${REAL_FABRIC_ONLINE_MODE:-false}
       REAL_FABRIC_MULTISTREAM: ${REAL_FABRIC_MULTISTREAM:-false}
+      REAL_FABRIC_COALESCE: ${REAL_FABRIC_COALESCE:-false}
       # Keep the base service's switch: the mod is needed for QUIC and multistream.
       QUICRAFT_PLUGIN: ${QUICRAFT_PLUGIN:-true}
     volumes:

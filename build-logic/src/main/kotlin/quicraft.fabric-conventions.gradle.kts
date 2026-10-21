@@ -117,6 +117,10 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
         if (arm == "quic3") {
             property("quicraft.multistream.offlineTest", "true")
         }
+        // Experiment: -Pquicraft.armCoalesce=true turns on opt-in write coalescing in the client.
+        if (providers.gradleProperty("quicraft.armCoalesce").orNull == "true") {
+            property("quicraft.coalesceWrites", "true")
+        }
     }
     // Opt-in: online-mode login against the testkit's mock session server. The real client reads
     // its session/services/profiles hosts only when all three are set:

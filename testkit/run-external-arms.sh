@@ -59,6 +59,7 @@ usage() {
         echo "  --port          loopback TCP+UDP port; must be 25565, the port the server advertises"
         echo "  --play-seconds  measured play time (default: 20)"
         echo "  --netem         clean (default) | loss | delay | delayloss | reorder | jitter"
+        echo "  --coalesce      experiment: -Dquicraft.coalesceWrites=true on server and client"
     } >&2
     exit "${1:-2}"
 }
@@ -80,6 +81,7 @@ warmup=false
 port="25565"
 play_seconds="20"
 netem="clean"
+coalesce=false
 
 while (($# > 0)); do
     case "$1" in
@@ -95,6 +97,10 @@ while (($# > 0)); do
             ;;
         --warmup)
             warmup=true
+            shift
+            ;;
+        --coalesce)
+            coalesce=true
             shift
             ;;
         --out-dir)
@@ -330,7 +336,7 @@ server_multistream=true
 if [[ "$arm" == quic2 ]]; then
     server_multistream=false
 fi
-export REAL_FABRIC_MULTISTREAM="$server_multistream" REAL_FABRIC_PORT="$port"
+export REAL_FABRIC_MULTISTREAM="$server_multistream" REAL_FABRIC_PORT="$port" REAL_FABRIC_COALESCE="$coalesce"
 echo "== compose up ($project): fabric mocksession"
 project_started=true
 if ! "${compose[@]}" up -d --build fabric mocksession; then
@@ -413,6 +419,7 @@ client=(
     "-Pquicraft.armWarmup=$warmup_value"
     "-Pquicraft.armCommit=$commit"
     "-Pquicraft.armPlaySeconds=$play_seconds"
+    "-Pquicraft.armCoalesce=$coalesce"
     "$module:runClientGameTest"
 )
 echo "== client: ${client[*]}"
