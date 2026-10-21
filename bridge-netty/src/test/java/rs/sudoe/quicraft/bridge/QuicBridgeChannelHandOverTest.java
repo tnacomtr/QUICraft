@@ -151,6 +151,10 @@ class QuicBridgeChannelHandOverTest {
         assertThrows(ExecutionException.class, () -> future.get(5, TimeUnit.SECONDS),
                 "the hand-over fails rather than silently reordering");
         assertTrue(future.isCompletedExceptionally());
+        // Netty completes the close promise before it fails and releases the queued outbound messages (the
+        // zero-byte marker among them) in the same event-loop task (AbstractChannel.AbstractUnsafe.close, 4.1 and
+        // 4.2). Waiting for one more loop task lets that release finish, so the check cannot race it.
+        onLoop(channel, () -> { });
         allocator.assertAllReleased("a failed hand-over must release the leftover it took ownership of,");
     }
 
