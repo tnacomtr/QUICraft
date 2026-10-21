@@ -1331,28 +1331,23 @@ before this revision can run.
     argument and remaining deferrals are below.
     Shipped routing, ordering argument (26.1.2). **DRAFT pending security review.** `level_chunk_with_light`
     (45) uses CHUNK with `mc775.chunk_xz.v1`. `block_update` (8) and `block_entity_data` (6) use CHUNK
-    with `mc775.block_position.v1` (lane order: install < update < entity data). `section_blocks_update`
-    (84) uses CHUNK with `mc775.section_position.v1`. `block_changed_ack` (4) and `chunk_batch_finished`
-    (11) stay CONTROL/global: no ACK_JOIN/BATCH_JOIN is needed, because the global fence gives TCP
-    order. `MinecraftServer.tickChildren` (line 1081+, 26.1.2 source) broadcasts block updates
-    (`ServerChunkCache.tick` -> `chunkHolder.broadcastChanges`) before `tickConnection()` ->
-    `ServerGamePacketListenerImpl.tick()` (line 291-293) sends `ClientboundBlockChangedAckPacket`.
-    So the game's own stream has covered updates before the ACK; the global fence equals TCP
-    order exactly, making the covered-update-first invariant true without coverage metadata.
-   The causal machinery exists in core (`AckJoinTracker`, `SessionSendDriver.coverAssigned` and
-   `assignedPending`), but no production adapter calls the coverage hooks (only bridge passthroughs
-   and tests), and the route resolver fails closed on ACK_JOIN and BATCH_JOIN. A global ACK route alone
-   does not make block-update CHUNK routes safe (see 13.19 DRAFT). With the global fence giving
-   TCP order, block updates (8, 6) and section updates (84) are now safe on CHUNK shards (13.7),
-   while the ACK (4) and batch finished (11) stay CONTROL/global. Later block updates, forget
-   and light remain global; the global fence orders them after every shard record, preserving
-   install-before-update and shard-before-forget ordering. REALTIME waits for the latest
-   CONTROL fence and the view gate is a fence for later REALTIME.
-   `ShippedRoutingTableTest` pins this reviewed relaxation.
+    with `mc775.block_position.v1`, and `section_blocks_update` (84) uses CHUNK with
+    `mc775.section_position.v1`. They hash the same chunk column as `level_chunk_with_light`, so one
+    chunk's install, updates and block-entity data keep game order in one lane. `block_changed_ack` (4)
+    and `chunk_batch_finished` (11) stay CONTROL/global. A global record depends on the assigned maximum
+    of every stream, and every later record depends on it through G. Each ack therefore executes after
+    every update the game emitted before it and before every update emitted after it. This is the game's
+    emission order, i.e. TCP parity. It includes the rare case where the game emits an ack before an
+    update it covers (26.1.2: tasks run inside a tick by `reloadResources`); vanilla TCP shows the same
+    transient there. ACK_JOIN/BATCH_JOIN (13.19) are an unshipped latency optimisation, not a safety
+    requirement. `block_event` (7) is CONTROL/global, because the client applies it to its current block
+    state and a piston event run against a reordered state can leave a permanent ghost block. Remaining
+    relaxation: records for different chunk columns may reorder among themselves and against REALTIME.
+    Forget and light remain global. REALTIME waits for the latest CONTROL fence and the view gate is a
+    fence for later REALTIME. `ShippedRoutingTableTest` pins this reviewed relaxation.
 
    Deferrals, all CONTROL/global, with the reason for each:
-   - `block_changed_ack` (4) and `chunk_batch_finished` (11): the join routes need the coverage
-     wiring above. The reviewed `mc775.join.v1` layout is unbound for the same reason.
+   - The reviewed `mc775.join.v1` layout stays unbound until ACK_JOIN is shipped as an optimisation.
    - `login` (49) and `respawn` (82): `epoch_change` is `false`. RELEASE BLOCKER: 13.18 requires
      level replacement to advance the epoch and clear epoch-keyed frontiers, and `epoch_change:false`
      breaks that invariant. The send path fails closed on epoch routes until `submitEpochTransition`
