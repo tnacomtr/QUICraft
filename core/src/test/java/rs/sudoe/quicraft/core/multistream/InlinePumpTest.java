@@ -117,8 +117,9 @@ class InlinePumpTest {
     /**
      * Forced re-entrancy from the pump entry: the first receive step after arming issues a synchronous read-complete
      * on the client's control stream while that step is on the stack (inside the pump round or a queued pump). The
-     * nested call must defer to a later pump (pumpInline's guard), so the depth stays 1 and every record still
-     * arrives in order. Removing the pump-side guard in pumpInline makes this test fail with depth 2.
+     * nested call must defer to a later pump, so the depth stays 1 and every record still arrives in order. The
+     * guards in pumpInline and pumpNow cover each other: removing either alone still passes, removing both fails
+     * this test (depth 4 when measured).
      */
     @Test
     void readCompleteFromInsideAPumpRoundNeverNestsTheReceive() throws Exception {
