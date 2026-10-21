@@ -55,6 +55,11 @@ public final class LaneCodec implements GameLanes.Codec {
      * RoutingTableLoader); a LIST layout walks the body and must never read this prefix.
      */
     static final int ROUTING_PREFIX_BYTES = 64;
+    /**
+     * Fixed heap cost counted per decoded packet on top of its uncompressed size (object header, decoded
+     * packet fields, routing prefix bookkeeping), so a flood of tiny packets still moves the backlog bound.
+     */
+    static final long PER_PACKET_OVERHEAD_BYTES = 64;
 
     private final Access access;
 
@@ -115,9 +120,6 @@ public final class LaneCodec implements GameLanes.Codec {
         }
         ProtocolState state = access.state((PacketDecoder<?>) decoderContext.handler());
 
-        if (decodedBytes != null) {
-            decodedBytes.accept(frame.readableBytes());
-        }
         int length = VarInt.read(frame);
         if (length < 0 || length != frame.readableBytes()) {
             throw new IOException("a GAME body must be exactly one frame (13.4), length " + length + " of "
@@ -149,6 +151,10 @@ public final class LaneCodec implements GameLanes.Codec {
             // the id VarInt plus at most 8 bytes, and a whole copy would halve the largest packet the
             // 8 MiB workspace accepts. Charge it before allocating, separately from decode storage.
             int uncompressedSize = packetBytes.readableBytes();
+            if (decodedBytes != null) {
+                // The backlog bound counts what the decoded packet holds, not the (possibly compressed) wire size.
+                decodedBytes.accept(uncompressedSize + PER_PACKET_OVERHEAD_BYTES);
+            }
             int prefix = Math.min(uncompressedSize, ROUTING_PREFIX_BYTES);
             reservation.reserve(prefix, prefix);
             byte[] uncompressed = ByteBufUtil.getBytes(packetBytes, packetBytes.readerIndex(), prefix);
