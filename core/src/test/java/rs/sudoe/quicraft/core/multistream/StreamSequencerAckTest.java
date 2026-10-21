@@ -72,19 +72,36 @@ class StreamSequencerAckTest {
         assertEquals(second.sequence(), s.lastAck());
     }
 
+    /**
+     * Security review 2026-10-21 (r3): nothing assigned after an ACK may run before it, or a later mount, equipment,
+     * attribute or block change could alter the ACK's rollback and collision snap. Only plain CHUNK, the exempted
+     * first install, skips it.
+     */
     @Test
-    void laterOrdinaryControlAndChunkRecordsDoNotDependOnTheAckStream() {
+    void everyLaterRecordExceptAPlainChunkWaitsForTheLastAck() {
         StreamSequencer s = sequencer();
         s.assign(2, Fence.CHUNK, NONE, false);
         Record ack = s.assign(s.ackIndex(), Fence.ACK_TRAILING, NONE, false);
         int ackStream = s.ackIndex();
+        Long expected = Long.valueOf(ack.sequence());
         for (Fence fence : new Fence[] {Fence.ORDINARY_CONTROL, Fence.CONTROL_FENCE}) {
-            assertTrue(!deps(s.assign(0, fence, NONE, false)).containsKey(ackStream), fence + " waits for no ACK");
+            assertEquals(expected, deps(s.assign(0, fence, NONE, false)).get(ackStream), fence + " waits for the ACK");
         }
-        assertTrue(!deps(s.assign(1, Fence.REALTIME, NONE, false)).containsKey(ackStream), "REALTIME waits for no ACK");
+        assertEquals(expected, deps(s.assign(1, Fence.REALTIME, NONE, false)).get(ackStream), "REALTIME waits for the ACK");
+        assertEquals(expected, deps(s.assign(3, Fence.CHUNK_ACK, NONE, false)).get(ackStream), "CHUNK_ACK waits for the ACK");
         assertTrue(!deps(s.assign(2, Fence.CHUNK, NONE, false)).containsKey(ackStream), "plain CHUNK waits for no ACK");
-        assertTrue(!deps(s.assign(3, Fence.CHUNK, NONE, false)).containsKey(ackStream));
         assertEquals(ack.sequence(), s.lastAck());
+    }
+
+    @Test
+    void beforeAnyAckNoRecordCarriesAnAckDependency() {
+        StreamSequencer s = sequencer();
+        int ackStream = s.ackIndex();
+        for (Fence fence : new Fence[] {Fence.ORDINARY_CONTROL, Fence.CONTROL_FENCE}) {
+            assertTrue(!deps(s.assign(0, fence, NONE, false)).containsKey(ackStream), fence);
+        }
+        assertTrue(!deps(s.assign(1, Fence.REALTIME, NONE, false)).containsKey(ackStream));
+        assertTrue(!deps(s.assign(2, Fence.CHUNK_ACK, NONE, false)).containsKey(ackStream));
     }
 
     @Test
