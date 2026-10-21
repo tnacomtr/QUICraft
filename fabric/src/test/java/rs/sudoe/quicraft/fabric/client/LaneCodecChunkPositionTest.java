@@ -64,6 +64,32 @@ class LaneCodecChunkPositionTest {
         }
     }
 
+    /** Block updates (8, 6) and section updates (84) keep their position through the real decode, compressed or not. */
+    @Test
+    void blockAndSectionUpdatesKeepTheirPositionThroughCompressedAndPlainDecode() throws Exception {
+        String[] hex = {"08fffffe8000006fcae829", "06000000000000000000", "54000003fffff00000"};
+        String[] extractors = {"mc775.block_position.v1", "mc775.block_position.v1", "mc775.section_position.v1"};
+        int[][] chunks = {{-1, 0}, {0, 0}, {0, -1}};
+        for (boolean compressed : new boolean[] {false, true}) {
+            for (int i = 0; i < hex.length; i++) {
+                EmbeddedChannel channel = pipeline(compressed);
+                LaneCodec codec = new LaneCodec(channel, null, null, access(compressed));
+                byte[] packet = io.netty.buffer.ByteBufUtil.decodeHexDump(hex[i]);
+                ByteBuf frame = Unpooled.wrappedBuffer(FrameCodec.encode(packet, compressed ? 0 : -1));
+                try {
+                    var decoded = codec.decode(frame, ProtocolState.PLAY, (add, total) -> { });
+                    assertArrayEquals(packet, decoded.uncompressed(), "routing copy is the inflated packet");
+                    var position = ExtractorRegistry.productionDecoder(extractors[i]).extract(decoded.uncompressed());
+                    assertEquals(chunks[i][0], position.chunkX, hex[i] + " compressed=" + compressed);
+                    assertEquals(chunks[i][1], position.chunkZ, hex[i] + " compressed=" + compressed);
+                } finally {
+                    frame.release();
+                    channel.finishAndReleaseAll();
+                }
+            }
+        }
+    }
+
     /** A large packet keeps only the bounded routing prefix, so the 8 MiB workspace still fits it. */
     @Test
     void largePacketRetainsOnlyTheBoundedRoutingPrefix() throws Exception {
