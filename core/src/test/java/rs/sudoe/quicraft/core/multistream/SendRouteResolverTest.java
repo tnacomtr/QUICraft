@@ -120,9 +120,9 @@ final class SendRouteResolverTest {
         assertFalse(r.failed());
     }
 
-    /** The shipped table enables only the reviewed chunk-install route. */
+    /** The shipped table enables the five reviewed routes (45, 6, 8, 37, 84) on the CHUNK lane. */
     @Test
-    void shipped775ChunkInstallUsesReviewedChunkRouteAndNoOtherRouteDoes() throws Exception {
+    void shipped775ChunkRoutesAreTheReviewedSet() throws Exception {
         RoutingTable shipped = RoutingTableLoader.loadResource(775);
         RouteKey key = new RouteKey(775, ProtocolState.PLAY, Direction.CLIENTBOUND, 45);
         RouteV2 route = shipped.routeV2For(key); // minecraft:level_chunk_with_light
@@ -140,7 +140,7 @@ final class SendRouteResolverTest {
         assertEquals(StreamSequencer.Fence.CHUNK, resolved.fence());
         assertEquals(-3, resolved.chunkX());
         assertEquals(17, resolved.chunkZ());
-        assertEquals(4, shipped.routesV2().values().stream().filter(r -> r.lane == RouteV2.StreamLane.CHUNK).count());
+        assertEquals(5, shipped.routesV2().values().stream().filter(r -> r.lane == RouteV2.StreamLane.CHUNK).count());
     }
 
     @Test

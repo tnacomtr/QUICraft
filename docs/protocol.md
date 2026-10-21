@@ -1331,9 +1331,10 @@ before this revision can run.
     argument and remaining deferrals are below.
     Shipped routing, ordering argument (26.1.2). **DRAFT pending security review.** `level_chunk_with_light`
     (45) uses CHUNK with `mc775.chunk_xz.v1`. `block_update` (8) and `block_entity_data` (6) use CHUNK
-    with `mc775.block_position.v1`, and `section_blocks_update` (84) uses CHUNK with
-    `mc775.section_position.v1`. They hash the same chunk column as `level_chunk_with_light`, so one
-    chunk's install, updates and block-entity data keep game order in one lane. `block_changed_ack` (4)
+    with `mc775.block_position.v1`, `section_blocks_update` (84) uses CHUNK with
+    `mc775.section_position.v1`, and `forget_level_chunk` (37) uses CHUNK with
+    `mc775.chunk_pos_long.v1`. They hash the same chunk column as `level_chunk_with_light`, so one
+    chunk's install, updates, block-entity data and forget keep game order in one lane. `block_changed_ack` (4)
     and `chunk_batch_finished` (11) stay CONTROL/global. A global record depends on the assigned maximum
     of every stream, and every later record depends on it through G. Each ack therefore executes after
     every update the game emitted before it and before every update emitted after it. This is the game's
@@ -1343,7 +1344,7 @@ before this revision can run.
     requirement. `block_event` (7) is CONTROL/global, because the client applies it to its current block
     state and a piston event run against a reordered state can leave a permanent ghost block. Remaining
     relaxation: records for different chunk columns may reorder among themselves and against REALTIME.
-    Forget and light remain global. REALTIME waits for the latest CONTROL fence and the view gate is a
+    Light remains global. REALTIME waits for the latest CONTROL fence and the view gate is a
     fence for later REALTIME. `ShippedRoutingTableTest` pins this reviewed relaxation.
 
    Deferrals, all CONTROL/global, with the reason for each:
@@ -1354,7 +1355,6 @@ before this revision can run.
      is wired into the production path (adapters unit). The flip to `epoch_change:true` lands after
      that wiring merges, with its test. Until then the epoch path is unexercised by the shipped
      table, and a release must not ship with it.
-   - `forget_level_chunk` (37): no reviewed layout (see the list below).
    - `light_update` (48): the `varint_xz` layout was dropped (addendum A4). Every light-changing play
      edit tried on the live 26.1.2 client produced no light update, so naming `varint_xz` would be an
      assumption.
@@ -1379,6 +1379,7 @@ before this revision can run.
    | `mc775.chunk_xz.v1` | `level_chunk_with_light` (45) | CHUNK/lane install | `captured-775-vectors.txt` |
    | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | CHUNK/lane block and block-entity update (13.7) | `captured-775-vectors.txt` |
    | `mc775.section_position.v1` | `section_blocks_update` (84) | CHUNK/lane section update (13.7) | `captured-775-vectors.txt` |
+   | `mc775.chunk_pos_long.v1` | `forget_level_chunk` (37) | CHUNK/lane forget (13.8) | `ForgetLevelChunkGameCodecTest`: the game's own play-packet encoder |
    | `mc775.join.v1` | `block_changed_ack` (4), `chunk_batch_finished` (11) | none: joins deferred | `captured-775-vectors.txt` |
    | `mc775.raw_copies.v1` | footprint accounting for every state's serverbound limits | `decodeFootprintBound` | 13.12 boundary vectors in `ExtractorGoldenTest` |
 
@@ -1386,6 +1387,12 @@ before this revision can run.
    footprint-bound algorithm, so it has no captured packet pair. Its evidence is the closed-form
    13.12 bound and its boundary vectors, and the production load path rejects the synthetic
    `primitive.raw_copies.v1`, so no primitive is silently reused as production evidence.
+   `mc775.chunk_pos_long.v1` is the one layout whose evidence is the game's own encoder instead of
+   a captured frame: the capture run produced no `forget_level_chunk` packet.
+   `ForgetLevelChunkGameCodecTest` encodes `ClientboundForgetLevelChunkPacket` through
+   `STREAM_CODEC` for both coordinate signs and reads the bytes back with the extractor, including
+   `ChunkPos.pack`'s exact long. Any future capture that adds a 37 frame should be added to
+   `captured-775-vectors.txt` as for the other layouts.
 
    REALTIME routes, with their 13.8 basis: the shipped entity and animation set `animate` (2),
    `hurt_animation` (42), `level_particles` (47), `move_entity_pos` (53), `move_entity_pos_rot` (54),
@@ -1414,13 +1421,13 @@ before this revision can run.
    | `mc775.chunk_xz.v1` | big-endian int32 chunk x, int32 chunk z | `level_chunk_with_light` | CHUNK/lane install (13.8) | `level_chunk_with_light` |
    | `mc775.block_position.v1` | packed BlockPos long: x in bits 38..63, z in 12..37, y in 0..11 (unread); chunk = `x/16`, `z/16` floor | `block_update`, `block_entity_data` | CHUNK/lane block and block-entity update (13.8) | `block_update`, `block_entity_data` |
    | `mc775.section_position.v1` | packed SectionPos long: x in bits 42..63, z in 20..41, y in 0..19 (unread); already chunk coordinates | `section_blocks_update` | CHUNK/lane section update (13.8) | `section_blocks_update` |
+   | `mc775.chunk_pos_long.v1` | one big-endian packed ChunkPos long: x low 32 bits, z high 32 (`ChunkPos.pack`, `FriendlyByteBuf.writeChunkPos`) | `forget_level_chunk` | CHUNK/lane forget (13.8) | `ForgetLevelChunkGameCodecTest` (game encoder) |
    | `mc775.chunk_list.v1` | VarInt count, then per entry a packed ChunkPos long (x low 32 bits, z high 32), a VarInt payload length and that many payload bytes | `chunks_biomes` | CONTROL/global only (13.8) | `chunks_biomes` |
    | `mc775.join.v1` | the packet id alone; the body is never read | `chunk_batch_finished`, `block_changed_ack` | chunk join (13.19) | `chunk_batch_finished`, `block_changed_ack` |
 
-   Two 13.8 CHUNK-set packets have no reviewed layout here, so at `/3` they stay CONTROL/global
-   and are deliberately not shard-routable until a follow-up unit captures and reviews a layout
-   for them:
-   - `forget_level_chunk`: its packed position was not reviewed by this unit.
+   One 13.8 CHUNK-set packet has no reviewed layout here, so at `/3` it stays CONTROL/global
+   and is deliberately not shard-routable until a follow-up unit captures and reviews a layout
+   for it:
    - `light_update`: the `varint_xz` layout was dropped from the production set (addendum A4).
      Every light-changing play edit tried on the live 26.1.2 client (a surface block break, a
      stone roof over a whole area, a torch and glowstone) produced no light update packet at all,
@@ -1431,9 +1438,8 @@ before this revision can run.
    `block_update` (8) and `block_entity_data` (6) (CHUNK with `mc775.block_position.v1`), and
    `section_blocks_update` (84) (CHUNK with `mc775.section_position.v1`) ship in this release.
    `block_changed_ack` (4) and `chunk_batch_finished` (11) stay CONTROL/global; no ACK_JOIN/BATCH_JOIN
-   is needed because the global fence gives TCP order. Joins (4/11),
-   `forget_level_chunk` (37) and `light_update` (48) remain unchanged; the latter two lack
-   reviewed production layouts.
+   is needed because the global fence gives TCP order. Joins (4/11) and `light_update` (48) remain
+   unchanged; the latter lacks a reviewed production layout.
 
    Regenerate the checked-in vectors with (runs the whole client gametest suite, protocol 775):
 

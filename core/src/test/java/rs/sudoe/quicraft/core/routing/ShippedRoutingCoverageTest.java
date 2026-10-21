@@ -31,18 +31,20 @@ class ShippedRoutingCoverageTest {
     /** 13.8 REALTIME entity and animation set, plus block_destruction and block_event (13.8 names them). */
     private static final Set<Integer> REALTIME = set(2, 42, 47, 53, 54, 55, 56, 83, 99, 101, 102, 116, 131, 5);
     /**
-     * Reviewed CHUNK route enabled by this unit. Block updates and acknowledgement remain global until
-     * the ACK-coverage wiring required by 13.19 is on the production send path.
+     * Reviewed CHUNK routes: install (45), block updates (6, 8, 84) and forget (37). The block
+     * acknowledgement (4) and chunk_batch_finished (11) remain global until the ACK-coverage wiring
+     * required by 13.19 is on the production send path.
      */
-    private static final Map<Integer, String> CHUNK = map(45, "chunk_xz", 6, "block_position", 8, "block_position", 84, "section_position");
+    private static final Map<Integer, String> CHUNK = map(45, "chunk_xz", 6, "block_position", 8, "block_position",
+            84, "section_position", 37, "chunk_pos_long");
     /** 13.8/13.19: chunk_batch_start uses the view scope. */
     private static final Set<Integer> VIEW = set(12);
     /** 13.8: a multi-chunk packet stays CONTROL/global with its reviewed list extractor. */
     private static final Map<Integer, String> LIST = map(13, "chunk_list");
     // Deliberate global deferrals (CP1), all CONTROL/global: block_changed_ack (4) and chunk_batch_finished (11)
     // join routes, because the send path fails closed on ACK_JOIN/BATCH_JOIN; login (49) and respawn (82),
-    // because epoch routes are not wired; forget_level_chunk (37) and light_update (48), with no reviewed
-    // layout; explode (36) and level_event (46), kept global as a safe superset of 13.8.
+    // because epoch routes are not wired; light_update (48), with no reviewed layout; explode (36) and
+    // level_event (46), kept global as a safe superset of 13.8.
 
     @Test
     void theShippedTableRoutesEveryInventoryIdExactlyOnce() throws IOException {

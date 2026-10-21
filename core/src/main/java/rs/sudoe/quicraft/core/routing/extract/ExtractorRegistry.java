@@ -21,7 +21,8 @@ import rs.sudoe.quicraft.core.routing.Extractor;
  * <p>Every layout has one synthetic identifier ({@code test.*}, {@code primitive.*}) and, when a
  * real packet carries it, one production identifier of the form {@code mc775.<layout>.v1}. The two
  * identifiers decode with the same reviewed math; the production identifier is the one a shipped
- * table may name, and its evidence is the captured real 775 packets checked in next to the code.
+ * table may name, and its evidence is the captured real 775 packets checked in next to the code,
+ * or, for {@code chunk_pos_long}, the game's own play-packet encoder test (13.7).
  * The production load path accepts only the production allowlist: renaming a primitive is not
  * review (13.7). {@code varint_xz} has no production identifier: no captured 775 packet carried
  * that layout.
@@ -92,8 +93,8 @@ public final class ExtractorRegistry {
     private static Map<String, Decoder> decoders() {
         Map<String, Decoder> decoders = new LinkedHashMap<String, Decoder>();
         synthetic(decoders, "test.chunk_xz.v1", "chunk_xz");
-        for (String layout : new String[] {"chunk_xz", "block_position", "section_position",
-                "varint_xz", "chunk_list", "join"}) {
+        for (String layout : new String[] {"chunk_xz", "chunk_pos_long", "block_position",
+                "section_position", "varint_xz", "chunk_list", "join"}) {
             synthetic(decoders, "primitive." + layout + ".v1", layout);
             // No production packet carried the varint_xz layout on the live 26.1.2 client: light
             // changing play edits (a surface break, a stone roof, a torch, glowstone) produced no
@@ -177,6 +178,12 @@ public final class ExtractorRegistry {
                             throw new IllegalArgumentException("invalid chunk list entry length");
                         c.skip(length);
                     }
+                    break;
+                case "chunk_pos_long":
+                    // One big-endian packed ChunkPos long (ChunkPos.pack / FriendlyByteBuf.writeChunkPos):
+                    // x in the low 32 bits, z in the high 32 bits.
+                    long packedChunk = c.longValue();
+                    positions.add(new Extractor.Position((int) packedChunk, (int) (packedChunk >>> 32)));
                     break;
                 case "block_position":
                     long block = c.longValue();

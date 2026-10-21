@@ -36,11 +36,12 @@ class ShippedRoutingTableTest {
     }
 
     @Test
-    void boundExtractorsAreTheReviewedChunkListAndChunkInstall() throws Exception {
+    void boundExtractorsAreTheReviewedChunkListChunkInstallAndForget() throws Exception {
         Faults.set();
         Map<String, String> expected = new LinkedHashMap<String, String>();
         expected.put("chunk_list", "mc775.chunk_list.v1");
         expected.put("chunk_xz", "mc775.chunk_xz.v1");
+        expected.put("chunk_pos_long", "mc775.chunk_pos_long.v1");
         expected.put("block_position", "mc775.block_position.v1");
         expected.put("section_position", "mc775.section_position.v1");
         assertEquals(expected, RoutingTableLoader.loadResource(PROTOCOL).extractors());
@@ -55,15 +56,17 @@ class ShippedRoutingTableTest {
                 count++;
                 assertEquals(Dependency.LANE, route.dependency);
                 assertTrue(route.extractor.equals("mc775.chunk_xz.v1")
+                        || route.extractor.equals("mc775.chunk_pos_long.v1")
                         || route.extractor.equals("mc775.block_position.v1")
                         || route.extractor.equals("mc775.section_position.v1"),
                         "chunk route extractor: " + route.extractor);
-                assertTrue(route.position.equals("chunk_xz") || route.position.equals("block_position")
+                assertTrue(route.position.equals("chunk_xz") || route.position.equals("chunk_pos_long")
+                        || route.position.equals("block_position")
                         || route.position.equals("section_position"),
                         "chunk route position: " + route.position);
             }
         }
-        assertEquals(4, count);
+        assertEquals(5, count);
         assertEquals(RouteV2.StreamLane.CHUNK, RoutingTableLoader.loadResource(PROTOCOL)
                 .routeV2For(new RouteKey(PROTOCOL, ProtocolState.PLAY, Direction.CLIENTBOUND, 45)).lane);
     }
@@ -87,7 +90,8 @@ class ShippedRoutingTableTest {
             boolean chunkRoute = entry.getKey().direction() == Direction.CLIENTBOUND
                     && entry.getKey().state() == ProtocolState.PLAY
                     && (entry.getKey().packetId() == 45 || entry.getKey().packetId() == 6
-                            || entry.getKey().packetId() == 8 || entry.getKey().packetId() == 84)
+                            || entry.getKey().packetId() == 8 || entry.getKey().packetId() == 84
+                            || entry.getKey().packetId() == 37)
                     && route.lane == RouteV2.StreamLane.CHUNK && route.dependency == Dependency.LANE;
             assertTrue(global || realtime || view || chunkRoute,
                     "unexpected relaxation: " + route.lane + "/" + route.dependency);
