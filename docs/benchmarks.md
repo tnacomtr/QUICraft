@@ -1148,3 +1148,26 @@ is neutral on a clean link. Its chunk-load cost under loss is within run-to-run 
 the off arm). A 1200 B cap is not better than 64 KiB. Decision: /3 coalesces by default (`-Dquicraft.coalesceWrites=false`
 turns it off); /2 keeps it opt-in because its chunk-load cost was larger (2964 -> 4852 ms). Open: /3 on a clean link
 still trails TCP on chunk load (3296 vs 1251 ms) and RTT (1.37 vs 0.58 ms).
+
+### /3 chunk-batch pacing: batch timer from the first chunk (2026-10-21, n=3 per arm, interleaved TCP)
+
+Diagnosis: the vanilla client times a chunk batch from `chunk_batch_start` to `chunk_batch_finished` and the server
+sizes the next batch from that rate. On /3 the start record rides CONTROL and arrives well before the chunks on their
+shards, so the measured rate collapses to about 3 chunks per tick (batches of 1-2 chunks against 9-13 on TCP; a
+diagnostic build forcing 64 chunks per tick loaded in 806 ms vs TCP 858 ms, n=1). Fix: on /3 only, the client
+restarts the batch timer at the first `level_chunk_with_light` of the batch (`ChunkBatchTimerMixin`,
+`-Dquicraft.v3.batchTimerFromFirstChunk=false` turns it off). A server-side rate floor was also tried and rejected:
+under delayloss it out-produced the link and 3 of 6 runs closed with 0x12 (blocked-head timeout).
+
+Production defaults (coalescing on, timer fix on), commit ce9b9e1, same real-Fabric method as above:
+
+| profile | arm | join ms | chunk load ms | rtt median ms | rtt p95 ms | disconnects |
+|---|---|---|---|---|---|---|
+| clean | tcp | 1470 | 753 (729-856) | 0.59 | 0.93 | 0 |
+| clean | /3 | 1695 | 1497 (1480-1783) | 1.50 | 2.26 | 0 |
+| delayloss | tcp | 2115 | 22676 (14384-34903) | 150.72 | 265.21 | 0 |
+| delayloss | /3 | 2724 | 3212 (2617-3737) | 151.69 | 305.03 | 0 |
+
+Against the coalescing table above (clean /3 3296 ms, delayloss /3 4699-5190 ms) the clean-link chunk load halves
+and delayloss improves, with RTT still at TCP parity under loss. Open: clean /3 still trails TCP (1497 vs 753 ms
+chunk load, 1.50 vs 0.59 ms RTT); join is ~0.2-0.6 s slower.
