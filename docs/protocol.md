@@ -1407,12 +1407,8 @@ before this revision can run.
    Deferrals, with the reason for each:
    - The reviewed `mc775.join.v1` layout stays unbound: packets 4 and 11 use the ACK stream with
      `trailing` (13.21), so no join route ships. ACK_JOIN/BATCH_JOIN remain unshipped options (13.19).
-   - `login` (49) and `respawn` (82): `epoch_change` is `false`. RELEASE BLOCKER: 13.18 requires
-     level replacement to advance the epoch and clear epoch-keyed frontiers, and `epoch_change:false`
-     breaks that invariant. The send path fails closed on epoch routes until `submitEpochTransition`
-     is wired into the production path (adapters unit). The flip to `epoch_change:true` lands after
-     that wiring merges, with its test. Until then the epoch path is unexercised by the shipped
-     table, and a release must not ship with it.
+   - `login` (49) and `respawn` (82) carry `epoch_change:true` (13.18); `EpochFlipShippedTableTest`,
+     `ShippedRoutingCoverageTest`, `ProductionRoutingResourceTest` (digest) and `RoutingTableGameTest` pin it.
    - `light_update` (48): the `varint_xz` layout was dropped (addendum A4). Every light-changing play
      edit tried on the live 26.1.2 client produced no light update, so naming `varint_xz` would be an
      assumption.
