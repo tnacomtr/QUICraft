@@ -649,8 +649,9 @@ public final class SessionSendDriver {
         settleAcksLocked();
         batches.abort();
         Record record = sequencer.assignEpochTransition(packet.frame());
-        // 13.21: the client drops every chunk at an epoch change, so no install can meet a pending prediction.
-        heldChunks.clear();
+        // 13.21: a same-dimension respawn keeps the client's ClientLevel and its prediction map, and the sender cannot
+        // tell it from a dimension change, so an epoch change stops tracking instead of restoring first installs.
+        heldChunks.markUnknown();
         if (!enqueueRecord(record, false)) {
             return handle;
         }

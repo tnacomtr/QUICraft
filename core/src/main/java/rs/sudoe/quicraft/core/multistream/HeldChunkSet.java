@@ -14,9 +14,11 @@ package rs.sudoe.quicraft.core.multistream;
  *
  * <p>Fail safe: above {@link #HELD_CAPACITY} held positions, or on the forget that would overflow the ring of
  * {@link #RING_CAPACITY} forgotten positions, the set stops tracking and every install needs the ack
- * dependency, until {@link #clear()} (epoch change). The exemption therefore covers the initial view burst
- * after join or an epoch change, where most installs are, and fails safe once the player has moved far. {@link #markUnknown()} does the same for a
- * chunk lifecycle record the sender could not track, such as one inside a bundle.
+ * dependency for the rest of the session. {@link #markUnknown()} does the same for a chunk lifecycle record
+ * the sender could not track, such as one inside a bundle, and for an epoch change: a same-dimension respawn
+ * keeps the client's level and its prediction map, and the sender cannot tell it from a dimension change. The
+ * exemption therefore covers the initial view burst after join, where most installs are, and fails safe once
+ * the player has moved far or respawned.
  *
  * <p>Memory (scale target of 50,000 connections per node): primitive arrays only, allocated on the first install
  * or forget and released by {@link #clear()}, {@link #markUnknown()} and overflow. The held set is an
@@ -105,8 +107,8 @@ public final class HeldChunkSet {
     }
 
     /**
-     * Drops everything on an epoch change (respawn, dimension change, configuration): the client discards
-     * all its chunks there, so no prediction can outlive it.
+     * Drops everything and trusts first installs again. Only for a proven fresh client level; the send driver
+     * never calls it (an epoch change uses {@link #markUnknown()}, 13.21).
      */
     public void clear() {
         release();

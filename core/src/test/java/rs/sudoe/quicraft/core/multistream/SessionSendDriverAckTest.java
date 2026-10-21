@@ -142,7 +142,7 @@ class SessionSendDriverAckTest {
     }
 
     @Test
-    void anEpochChangeForgetsEveryHeldChunk() throws Exception {
+    void anEpochChangeStopsTrackingBecauseASameDimensionRespawnKeepsPredictions() throws Exception {
         Rig rig = new Rig();
         rig.send(Fence.CHUNK_INSTALL, 4, 4);
         rig.send(Fence.CHUNK_FORGET, 5, 5);
@@ -150,9 +150,12 @@ class SessionSendDriverAckTest {
         rig.send(Fence.ACK_TRAILING, 0, 0);
         SentPacket held = rig.send(Fence.CHUNK_INSTALL, 4, 4);
         SentPacket forgotten = rig.send(Fence.CHUNK_INSTALL, 5, 5);
+        SentPacket fresh = rig.send(Fence.CHUNK_INSTALL, 900, 900);
         rig.drain();
-        assertFalse(rig.dependsOnAck(held), "the client dropped every chunk at the epoch change");
-        assertFalse(rig.dependsOnAck(forgotten), "the ring is cleared as well");
+        // Astra 2026-10-21: respawn in the same dimension keeps ClientLevel and its prediction map.
+        assertTrue(rig.dependsOnAck(held), "a chunk installed before the epoch change");
+        assertTrue(rig.dependsOnAck(forgotten), "a chunk forgotten before the epoch change");
+        assertTrue(rig.dependsOnAck(fresh), "no first install is trusted after an epoch change");
     }
 
     @Test

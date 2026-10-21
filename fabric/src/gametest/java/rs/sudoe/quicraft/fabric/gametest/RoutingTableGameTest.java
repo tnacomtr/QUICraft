@@ -43,12 +43,12 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * moves or reclassifies a route, fails here by name.
  *
  * <p>The table is schema 2 (13.7): 210 explicit routes, one per live play id. REALTIME is exactly
- * the 14 entity and animation updates 13.8 names; chunk_batch_start is the one VIEW route and
+ * 12 of the entity and animation updates 13.8 names (animate 2 and set_entity_data 99 are global); chunk_batch_start is the one VIEW route and
  * chunks_biomes the one listed-control route ({@code chunk_list}). Five chunk routes (45, 6, 8,
  * 37, 84) are CHUNK with their reviewed position layouts, and all five carry the 13.21 {@code ack}
  * dependency. The ACK stream carries block_changed_ack (4) and chunk_batch_finished (11),
- * {@code trailing}. 92 clientbound routes are ordinary CONTROL and seven are control fences (13.5,
- * B1 minus player_position 72 and teleport_entity 125; player_look_at 71 is global too). Every other clientbound route is CONTROL/global, no route carries an epoch
+ * {@code trailing}. 92 clientbound routes are ordinary CONTROL and six are control fences (13.5,
+ * B1 minus player_position 72, move_vehicle 35 and teleport_entity 125; player_look_at 71 is global too). Every other clientbound route is CONTROL/global, no route carries an epoch
  * change, and every serverbound route is CONTROL/global with {@code ordinarySmall} false.
  * light_update and login/respawn stay CONTROL/global until their wiring lands. A future CHUNK,
  * ACK or epoch flip must deliberately revise these pins together with its wiring tests.
@@ -104,7 +104,6 @@ public class RoutingTableGameTest implements FabricClientGameTest {
      * CONTROL (13.6, 13.8). The lane's ordering is tested in core's ShippedRoutingOrderingTest.
      */
     private static final String[] REALTIME = {
-        "2 minecraft:animate",
         "5 minecraft:block_destruction",
         "42 minecraft:hurt_animation",
         "47 minecraft:level_particles",
@@ -113,7 +112,6 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         "55 minecraft:move_minecart_along_track",
         "56 minecraft:move_entity_rot",
         "83 minecraft:rotate_head",
-        "99 minecraft:set_entity_data",
         "101 minecraft:set_entity_motion",
         "102 minecraft:set_equipment",
         "116 minecraft:sound_entity",
@@ -149,8 +147,8 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         96, 97, 98, 103, 104, 105, 106, 108, 109, 110, 112, 113, 114, 115, 117, 119, 120, 121, 122,
         123, 126, 127, 128, 130, 132, 133, 134, 135, 136, 137, 138, 139, 140};
 
-    /** The seven clientbound control fences (13.5, B1 minus player_position 72 and teleport_entity 125). */
-    private static final int[] CONTROL_FENCE = {1, 35, 64, 77, 100, 107, 124};
+    /** The six clientbound control fences (13.5, B1 minus player_position 72, move_vehicle 35, teleport_entity 125). */
+    private static final int[] CONTROL_FENCE = {1, 64, 77, 100, 107, 124};
 
     /**
      * The 13.5 must-use-CONTROL keys, already enforced by the loader from
@@ -231,7 +229,7 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         check(routes.keySet().equals(live.keySet()), "the shipped table keys are not the live play"
                 + " ids: " + keyDifferences(routes.keySet(), live.keySet()));
 
-        // The literal REALTIME pins: exactly these 14 clientbound names, LANE, no position, no epoch.
+        // The literal REALTIME pins: exactly these 12 clientbound names, LANE, no position, no epoch.
         Set<Integer> realtime = new HashSet<Integer>();
         for (String line : REALTIME) {
             String[] parts = line.split(" ", 2);

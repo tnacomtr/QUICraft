@@ -57,7 +57,7 @@ class HeldChunkSetTest {
         assertTrue(set.install(5000, 5000), "untrusted: even a never-seen position needs the ack");
         assertEquals(0, set.footprintWords(), "untrusted releases its arrays");
         set.clear();
-        assertFalse(set.install(5000, 5000), "an epoch change restores tracking");
+        assertFalse(set.install(5000, 5000), "clear() restores tracking");
     }
 
     @Test
@@ -105,7 +105,7 @@ class HeldChunkSetTest {
         assertFalse(set.untrusted());
         assertEquals(0, set.heldCount());
         assertEquals(0, set.forgottenCount());
-        assertFalse(set.install(1, 1), "the client dropped every chunk at the epoch change");
+        assertFalse(set.install(1, 1), "clear() drops every held chunk");
         assertFalse(set.install(2, 2), "and the ring is gone with it");
     }
 
