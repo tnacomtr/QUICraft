@@ -180,7 +180,8 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
             check(rig.channel.pipeline().get("decrypt") == null, "the boundary decoder removed itself");
             check(rig.awaitCondition(() -> rig.channel.pipeline().get("encrypt") == null),
                     "the encrypt handler was removed after CLIENT_SWITCH");
-            check(rig.connection.isEncrypted(), "12.13: the game still knows the login was encrypted");
+            Boolean knows = gameKnowsEncrypted(rig.connection);
+            check(knows == null || knows, "12.13: the game still knows the login was encrypted");
             check(rig.channel.pipeline().get(V3Handler.TAIL_NAME) != null, "the lanes' outbound handler is installed");
             check(rig.plan.isActivated(), "the plan recorded the activation");
             check(rig.files.pins().pin(HOST, PORT, Collections.emptySet()).isPresent(),
@@ -1913,6 +1914,20 @@ public class MultistreamCutoverGameTest implements FabricClientGameTest {
                                 return null;
                         }
                     });
+        }
+    }
+
+    /**
+     * Whether the game's {@code Connection} records that its login was encrypted: {@code isEncrypted()} on 26.1.x,
+     * null on 26.2+, which dropped the flag (the game no longer tracks it, so there is nothing to check).
+     */
+    private static Boolean gameKnowsEncrypted(Object connection) {
+        try {
+            return (Boolean) connection.getClass().getMethod("isEncrypted").invoke(connection);
+        } catch (NoSuchMethodException e) {
+            return null;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("isEncrypted() failed", e);
         }
     }
 }

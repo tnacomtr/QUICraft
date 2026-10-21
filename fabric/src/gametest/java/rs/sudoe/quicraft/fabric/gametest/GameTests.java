@@ -93,6 +93,23 @@ final class GameTests {
         }
     }
 
+    /**
+     * The open screen, or null: 26.1.x keeps it in {@code Minecraft.screen}, 26.2+ behind {@code gui.screen()}.
+     * Reflection keeps one gametest source compiling for every 26.x build.
+     */
+    static Object screen(Object minecraft) {
+        try {
+            try {
+                return minecraft.getClass().getField("screen").get(minecraft);
+            } catch (NoSuchFieldException e) {
+                Object gui = minecraft.getClass().getField("gui").get(minecraft);
+                return gui.getClass().getMethod("screen").invoke(gui);
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("no screen accessor on " + minecraft.getClass().getName(), e);
+        }
+    }
+
     static boolean connectedOverQuic(ClientGameTestContext context) {
         return context.computeOnClient(c -> c.getConnection() != null
                 && Transports.isQuic(c.getConnection().getConnection()));

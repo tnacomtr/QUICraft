@@ -317,7 +317,7 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
             boolean reached = false;
             for (int tick = 0; tick < SETTLE_TICKS && !reached; tick++) {
                 context.waitTick();
-                reached = context.computeOnClient(c -> c.level != null && c.player != null && c.screen == null
+                reached = context.computeOnClient(c -> c.level != null && c.player != null && GameTests.screen(c) == null
                         && c.level.dimension() == dimension && c.player.isAlive()
                         && c.level.getChunkSource().hasChunk(c.player.chunkPosition().x(),
                                 c.player.chunkPosition().z()))
@@ -327,7 +327,7 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                     + expectedEpoch + " in " + SETTLE_TICKS + " ticks (level "
                     + context.computeOnClient(c -> c.level == null ? "none" : c.level.dimension().identifier().toString())
                     + ", epoch " + receiveEpoch() + ", screen "
-                    + context.computeOnClient(c -> c.screen == null ? "none" : c.screen.getClass().getSimpleName())
+                    + context.computeOnClient(c -> GameTests.screen(c) == null ? "none" : GameTests.screen(c).getClass().getSimpleName())
                     + ")");
             context.waitTicks(20); // a stray second advance or a close would show up here
             long epoch = assertLive(label, dimension, expectedEpoch);
@@ -353,7 +353,7 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
             boolean chunk = context.computeOnClient(c -> c.level.getChunkSource()
                     .hasChunk(c.player.chunkPosition().x(), c.player.chunkPosition().z()));
             check(chunk, label + ": the player's own chunk is not loaded on the client");
-            check(context.computeOnClient(c -> c.player.isAlive() && c.screen == null),
+            check(context.computeOnClient(c -> c.player.isAlive() && GameTests.screen(c) == null),
                     label + ": player dead or a screen is still up");
             Vec3 client = clientPosition();
             Object[] onServer = server.computeOnServer(s -> {
