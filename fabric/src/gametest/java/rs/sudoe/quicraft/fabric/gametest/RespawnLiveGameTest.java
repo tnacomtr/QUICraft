@@ -53,6 +53,22 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
     private static final String OFFLINE = "quicraft.multistream.offlineTest";
     private static final int SETTLE_TICKS = 600;
 
+    /**
+     * A chunk coordinate of a ChunkPos: public {@code x}/{@code z} fields on 1.21.11, {@code x()}/{@code z()} accessors
+     * on 26.x. Reflection keeps one gametest source compiling on both.
+     */
+    private static int chunkCoord(Object pos, String name) {
+        try {
+            try {
+                return (int) pos.getClass().getMethod(name).invoke(pos);
+            } catch (NoSuchMethodException e) {
+                return pos.getClass().getField(name).getInt(pos);
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("no " + name + " on " + pos.getClass().getName(), e);
+        }
+    }
+
     @Override
     public void runTest(ClientGameTestContext context) {
         RoutingTable table = MultistreamSwitch.tableFor(SharedConstants.getProtocolVersion());
@@ -317,11 +333,11 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
             boolean reached = false;
             for (int tick = 0; tick < SETTLE_TICKS && !reached; tick++) {
                 context.waitTick();
-                reached = context.computeOnClient(c -> c.level != null && c.player != null && GameTests.screen(c) == null
+                boolean ready = context.computeOnClient(c -> c.level != null && c.player != null && GameTests.screen(c) == null
                         && c.level.dimension() == dimension && c.player.isAlive()
-                        && c.level.getChunkSource().hasChunk(c.player.chunkPosition().x(),
-                                c.player.chunkPosition().z()))
-                        && receiveEpoch() >= expectedEpoch;
+                        && c.level.getChunkSource().hasChunk(chunkCoord(c.player.chunkPosition(), "x"),
+                                chunkCoord(c.player.chunkPosition(), "z")));
+                reached = ready && receiveEpoch() >= expectedEpoch;
             }
             check(reached, label + ": the client did not finish loading " + dimension.identifier() + " with epoch "
                     + expectedEpoch + " in " + SETTLE_TICKS + " ticks (level "
@@ -351,7 +367,7 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
             check(context.computeOnClient(c -> c.level != null && c.level.dimension() == dimension),
                     label + ": client not in " + dimension.identifier());
             boolean chunk = context.computeOnClient(c -> c.level.getChunkSource()
-                    .hasChunk(c.player.chunkPosition().x(), c.player.chunkPosition().z()));
+                    .hasChunk(chunkCoord(c.player.chunkPosition(), "x"), chunkCoord(c.player.chunkPosition(), "z")));
             check(chunk, label + ": the player's own chunk is not loaded on the client");
             check(context.computeOnClient(c -> c.player.isAlive() && GameTests.screen(c) == null),
                     label + ": player dead or a screen is still up");
