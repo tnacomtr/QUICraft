@@ -2,7 +2,9 @@
 package rs.sudoe.quicraft.fabric;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -75,5 +77,115 @@ class ChunkPacingTest {
         }));
         chunk(pacing, true, true);
         assertEquals(0, restarts.get());
+    }
+
+    private static long busyAt(long nanos) {
+        return nanos;
+    }
+
+    @Test
+    void busyDeltaIsTheCounterSinceTheFirstChunkOfTheBatch() {
+        ChunkPacing pacing = new ChunkPacing(false, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(100));
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(180));
+        assertEquals(350 - 100, pacing.batchFinished(() -> busyAt(350)));
+        assertEquals(0, restarts.get());
+    }
+
+    @Test
+    void busyTimerOffReturnsNoDeltaAndNeverReadsTheCounter() {
+        ChunkPacing pacing = new ChunkPacing(true, false);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(100));
+        assertEquals(-1, pacing.batchFinished(() -> {
+            throw new AssertionError("the counter must not be read with the busy timer off");
+        }));
+        assertEquals(1, restarts.get());
+    }
+
+    @Test
+    void busyOnlyDoesNotRestartTheWallTimer() {
+        ChunkPacing pacing = new ChunkPacing(false, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(10));
+        assertEquals(0, restarts.get());
+        assertEquals(40, pacing.batchFinished(() -> busyAt(50)));
+    }
+
+    @Test
+    void tcpBatchHasNoBusyDelta() {
+        ChunkPacing pacing = new ChunkPacing(false, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> false, restarts::incrementAndGet, () -> busyAt(100));
+        assertEquals(-1, pacing.batchFinished(() -> busyAt(900)));
+    }
+
+    @Test
+    void emptyBatchHasNoBusyDeltaAndNeverReadsTheCounter() {
+        ChunkPacing pacing = new ChunkPacing(false, true);
+        pacing.batchStarted();
+        assertEquals(-1, pacing.batchFinished(() -> {
+            throw new AssertionError("an empty batch must keep vanilla timing");
+        }));
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(7));
+        assertEquals(10, pacing.batchFinished(() -> busyAt(17)));
+    }
+
+    @Test
+    void mainThreadReplayDoesNotMoveTheBusyMark() {
+        ChunkPacing pacing = new ChunkPacing(false, true);
+        pacing.batchStarted();
+        pacing.chunk(false, () -> true, restarts::incrementAndGet, () -> busyAt(1));
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(200));
+        assertEquals(60, pacing.batchFinished(() -> busyAt(260)));
+    }
+
+    @Test
+    void anUnavailableCounterGivesNoDelta() {
+        ChunkPacing pacing = new ChunkPacing(false, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> -1L);
+        assertEquals(-1, pacing.batchFinished(() -> busyAt(500)));
+    }
+
+    @Test
+    void theBusyMarkTakenAtTheFirstChunkIsTheBaseEvenWhenLaterChunksOfTheBatchReportMore() {
+        ChunkPacing pacing = new ChunkPacing(false, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(40));
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(90));
+        assertEquals(150 - 40, pacing.batchFinished(() -> busyAt(150)));
+    }
+
+    @Test
+    void aThrowingBusyCounterAtTheFirstChunkStillRestartsTheWallTimerAndGivesVanillaTiming() {
+        ChunkPacing pacing = new ChunkPacing(true, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> {
+            throw new IllegalStateException("busy hook broke");
+        });
+        assertEquals(1, restarts.get(), "the wall timer restart must not depend on the busy hook");
+        assertEquals(-1, pacing.batchFinished(() -> busyAt(500)));
+    }
+
+    @Test
+    void aThrowingBusyCounterAtTheFinishGivesVanillaTiming() {
+        ChunkPacing pacing = new ChunkPacing(true, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(100));
+        assertEquals(-1, pacing.batchFinished(() -> {
+            throw new IllegalStateException("busy hook broke");
+        }));
+        assertEquals(1, restarts.get());
+    }
+
+    @Test
+    void theBusyActivationIsLoggedOnce() {
+        ChunkPacing pacing = new ChunkPacing(false, true);
+        assertTrue(pacing.takeBusyActivation());
+        assertFalse(pacing.takeBusyActivation());
+        assertFalse(new ChunkPacing(false, false).takeBusyActivation());
     }
 }

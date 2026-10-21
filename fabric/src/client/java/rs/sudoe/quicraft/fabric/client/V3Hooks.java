@@ -6,6 +6,7 @@ import javax.crypto.SecretKey;
 import net.minecraft.network.Connection;
 import net.minecraft.network.DisconnectionDetails;
 import net.minecraft.network.chat.Component;
+import rs.sudoe.quicraft.bridge.GameLanes;
 import rs.sudoe.quicraft.fabric.Hooks;
 
 /**
@@ -20,6 +21,33 @@ public final class V3Hooks {
     /** Whether this game connection is a {@code /3} one (false on TCP, {@code /2}). */
     public static boolean isV3(Connection connection) {
         return Transports.v3(connection) != null;
+    }
+
+    /**
+     * The connection's cumulative network-thread busy nanoseconds on the {@code /3} inbound path, or -1 when it is
+     * not {@code /3}, has no lanes yet, or the busy timer is off. See {@code GameLanes#busyNanos()}.
+     */
+    public static long busyNanos(Connection connection) {
+        V3Client client = Transports.v3(connection);
+        if (client == null) {
+            return -1L;
+        }
+        GameLanes lanes = client.lanes();
+        return lanes == null ? -1L : lanes.busyNanos();
+    }
+
+    /**
+     * The busy counter at the start of the decode of the delivery being fired (its first chunk's batch interval
+     * starts there), or -1 when it is not {@code /3}, has no lanes, the busy timer is off or no delivery is firing.
+     * See {@code GameLanes#busyMarkForCurrentDelivery()}.
+     */
+    public static long busyMark(Connection connection) {
+        V3Client client = Transports.v3(connection);
+        if (client == null) {
+            return -1L;
+        }
+        GameLanes lanes = client.lanes();
+        return lanes == null ? -1L : lanes.busyMarkForCurrentDelivery();
     }
 
     /** Hello arrived. False cancels vanilla's handling: the {@code /3} attempt is over. */
