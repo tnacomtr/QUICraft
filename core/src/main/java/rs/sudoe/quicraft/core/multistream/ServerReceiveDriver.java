@@ -180,14 +180,16 @@ public final class ServerReceiveDriver {
             throw new IllegalStateException("acknowledgement for an unexpected unit on stream " + stream);
         }
         receiver.applied(stream, entry.sequence);
-        held[stream] = null;
         executing = null;
         releaseCharge(reservedWorkspace);
+        // A lapsed wait or an unavailable source leaves the head and its slot retained by the receiver. Keep held[]
+        // set until the check passes: the terminal cleanup then releases that slot, which it can only do for a held entry.
         ReceiveClose violation = receiver.pendingViolation();
         if (violation != null) {
             fail(violation);
             return;
         }
+        held[stream] = null;
         entry.unit.close();
         game.onApplicationComplete(laneOf(stream), stream, sequence);
         drive();

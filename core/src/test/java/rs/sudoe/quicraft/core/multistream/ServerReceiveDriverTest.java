@@ -304,6 +304,69 @@ class ServerReceiveDriverTest {
         assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL), "the blocked head's slot is released");
     }
 
+    /**
+     * A blocked CONTROL head expires between the last receive step and the game's acknowledgement of the executing
+     * REALTIME unit. The lapsed wait retains the executing head and its slot (13.10); the terminal cleanup must
+     * release every head slot and workspace byte, once, and a repeated close must stay harmless.
+     */
+    @Test void lapsedExpiryAtAcknowledgementReleasesEveryHeadSlotOnce() throws Exception {
+        Harness h = new Harness(false);
+        h.source.put(LogicalStream.REALTIME,
+                SessionReceiveDriverTest.rec(1, 1, 0, Collections.<Record.Dependency>emptyList(), PID_REALTIME));
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(1, 1), PID_CONTROL));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("deliver REALTIME 1s 1"), h.game.log.toString());
+        assertTrue(h.driver.receiver().slots().holdsHead(LogicalStream.REALTIME));
+        assertTrue(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL));
+        h.now[0] = TimeUnit.SECONDS.toNanos(11);
+        h.driver.acknowledged(LogicalStream.REALTIME, 1);
+        assertEquals(Collections.singletonList(0x12), h.codes, "the lapsed wait is the only close");
+        assertEquals(Collections.singletonList("resource"), h.reasons, "the locally withheld commit is generic");
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.REALTIME),
+                "the retained executing head's slot is released");
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL),
+                "the blocked head's slot is released");
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse(), "every workspace byte is returned");
+        h.driver.close();
+        h.driver.acknowledged(LogicalStream.REALTIME, 1);
+        h.driver.receive();
+        assertEquals(Collections.singletonList(0x12), h.codes, "a repeated close is harmless");
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.REALTIME));
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse());
+    }
+
+    /**
+     * The stall source becomes unavailable during the settlement of the executing REALTIME unit. The receiver keeps
+     * the executing head as a generic 0x12 wait; the driver must release every head slot and workspace byte once.
+     */
+    @Test void unavailableSourceAtAcknowledgementReleasesEveryHeadSlotOnce() throws Exception {
+        Harness h = new Harness(false, true);
+        h.source.put(LogicalStream.REALTIME,
+                SessionReceiveDriverTest.rec(1, 1, 0, Collections.<Record.Dependency>emptyList(), PID_REALTIME));
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(1, 1), PID_CONTROL));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("deliver REALTIME 1s 1"), h.game.log.toString());
+        assertTrue(h.driver.receiver().slots().holdsHead(LogicalStream.REALTIME));
+        assertTrue(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL));
+        h.stalls.valid = false;
+        h.driver.acknowledged(LogicalStream.REALTIME, 1);
+        assertEquals(Collections.singletonList(0x12), h.codes, "the unavailable source closes once");
+        assertEquals(Collections.singletonList("resource"), h.reasons, "an unavailable source has no phrase");
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.REALTIME),
+                "the retained executing head's slot is released");
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL),
+                "the blocked head's slot is released");
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse(), "every workspace byte is returned");
+        h.driver.close();
+        h.driver.acknowledged(LogicalStream.REALTIME, 1);
+        h.driver.receive();
+        assertEquals(Collections.singletonList(0x12), h.codes, "a repeated close is harmless");
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.REALTIME));
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse());
+    }
+
     /** A cumulative source coherent with the harness's non-excluding transport clock. */
     private static final class CumulativeSource implements StallClock {
         private final long[] now;
