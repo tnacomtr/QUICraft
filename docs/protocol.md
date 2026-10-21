@@ -1615,14 +1615,14 @@ before this revision can run.
     game execution or blocked-body decompression. The default commit of D is actual serial
     handler completion. The following bounded accepted-commit exception is
     **DRAFT pending security review**:
-      - **Accepted commit.** “Accepted” means returned from the game Connection's inbound handler
-        in delivered order (vanilla TCP-equivalent). Vanilla inline network-thread handlers are
-        chunk batch start/finished, debug sample, pong, low disk space, keepalive, custom payload,
-        transfer, disconnect, enabled-features and reset-chat; server chat/commands use FutureChain.
-        These are vanilla-equivalent. Completion-only commit is required only for handlers
-        QUICraft itself moves off the queue or where a routing-table dependency needs the handler
-        executed. A marker on another executor MUST NOT be used: hold and retry instead.
-        Merely decoding or scheduling on another executor is not acceptance.
+     - **Clientbound accepted commit.** “Accepted” means returned from the game Connection's inbound handler
+       in delivered order (vanilla TCP-equivalent). Vanilla inline network-thread handlers are
+       chunk batch start/finished, debug sample, pong, low disk space, keepalive, custom payload,
+       transfer, disconnect, enabled-features and reset-chat; server chat/commands use FutureChain.
+       These are vanilla-equivalent. Completion-only commit is required only for handlers
+       QUICraft itself moves off the queue or where a routing-table dependency needs the handler
+       executed. A marker on another executor MUST NOT be used: hold and retry instead.
+       Merely decoding or scheduling on another executor is not acceptance.
        A bundle is accepted only as a complete, validated atomic game-handler unit, never member
        by member. Enqueue rejection MUST NOT commit D.
      - Count all accepted-but-unexecuted packets and their retained decoded/queued bytes across
@@ -1634,8 +1634,8 @@ before this revision can run.
        do not deliver another while its commit is held. This is a commit threshold, not a
        promise that one indivisible unit cannot temporarily overshoot it (13.12).
        Completion markers queued behind the unit's handlers MAY retire its charge, but not
-        before those handlers finish. Off-FIFO chat/command work after marker retirement is not
-        counted; it is bounded by vanilla message limits.
+       before those handlers finish. Off-FIFO chat/command work after marker retirement is not
+       counted; it is bounded by vanilla message limits.
      - Accepted D releases dependencies, the stream's head slot and the execution workspace,
        permitting the next head to be read/decoded. It does NOT free the queued packet objects
        or their backlog charge. Transfer ownership/accounting before reusing buffers; queued
@@ -1643,22 +1643,22 @@ before this revision can run.
        prerequisite was enqueued before its dependent and the one FIFO executes them in that
        order. Application side effects still occur only when the handlers run. Adapter protocol/
        decoder transitions needed to decode the next unit MUST actually complete before that
-        unit is decoded; after a client unit with a terminal packet, hold its commit until the new
-        inbound protocol decoder is installed. An enqueue acknowledgement cannot substitute for a pipeline swap.
+       unit is decoded; after a client unit with a terminal packet, hold its commit until the new
+       inbound protocol decoder is installed. An enqueue acknowledgement cannot substitute for a pipeline swap.
      - **Serverbound finding/rule.** Fabric's server also uses accepted commits, NOT completion-
        only commits: `V3Join.AckHandler` feeds `AckBacklog`, which queues markers on the server's
        packet processor and calls `lanes.applied` while the backlog is within its thresholds.
        It uses provisional local maxima of **2,048 packets and 2 MiB**, not the client's limits;
        these are the server maxima for this draft, with lower local policy allowed. Apply the
        same FIFO, eligibility, equality, held-commit and completion-accounting requirements.
-        A listener refusing markers holds commits (and retries in order); a refused backlog
-        charge holds the commit for local retry and never closes the connection. Backlog takes
-        over the unit's existing decode reservation, with no second charge. A backlog sub-cap
-        inside the node budget defaults to 25% and MUST NOT starve read admission. A commit held
-        for backlog marks the executing unit locally withheld, never peer blame. A pending inbound
+       A listener refusing markers holds commits (and retries in order); a refused backlog
+       charge holds the commit for local retry and never closes the connection. Backlog takes
+       over the unit's existing decode reservation, with no second charge. A backlog sub-cap
+       inside the node budget defaults to 25% and MUST NOT starve read admission. A commit held
+       for backlog marks the executing unit locally withheld, never peer blame. A pending inbound
        protocol swap waits for actual completion. Queued bytes additionally remain charged
-        against the node receive budget until the marker runs; refusal is a local wait, not
-        permission to drop accounting or blame the peer. Benchmark/review these
+       against the node receive budget until the marker runs; refusal is a local wait, not
+       permission to drop accounting or blame the peer. Benchmark/review these
        provisional maxima under 13.17 before enablement. Core `NStreamSession.applied` trusts
        the adapter acknowledgement: it advances the receive driver and resumes pumping, not
        an independent check that the game handler completed.
@@ -2377,7 +2377,7 @@ before this revision can run.
      delivered order, including vanilla inline handlers (chunk batch start/finished, debug
      sample, pong, low disk space, keepalive, custom payload, transfer, disconnect,
      enabled-features, reset-chat) and server chat/commands via FutureChain. Require completion-
-     only only for handlers QUICraft moves off-queue or routing dependencies; never accept a
+     only commit for handlers QUICraft moves off-queue or routing dependencies; never accept a
      marker on another executor. Test terminal client units holding commit through inbound
      decoder installation, backlog charge transfer/refusal and local-withheld attribution,
      uncompressed bytes plus 64-byte packet overhead, sub-cap read-admission protection, and
