@@ -1194,3 +1194,21 @@ on). Cap confirmed in the netem status (`rate 2Mbit` on both qdiscs). Per run:
 With vanilla pacing (no server-side rate floor) /3 does not hit the blocked-head deadline (0x12) on this link, and
 loads chunks about 5x faster than TCP. The 0x12 seen with the rejected server floor stays a risk for any change
 that makes the server send faster than the client's measured rate.
+
+### /3 clean-link chunk gap: what it is not (2026-10-21, diagnostic)
+
+Batch trace (`agent/p5-batchdiag`, gametest-only `quicraft.batch.trace`, clean, n=1 per arm): time from the last
+chunk of a batch to `chunk_batch_finished` is 0.1-0.6 ms on TCP and 0.2-0.6 ms on /3 (one 10.4 ms outlier), so the
+batch end is not skewed, and chunk deliveries do not wait for main-thread application (applies trail by tens of ms).
+The difference is inside the batch: /3 shows 5-10 ms gaps between chunk deliveries in about half the batches,
+and the client's desired rate settles at ~5.5 chunks per tick against ~9.7 on TCP.
+
+Congestion control is not it: clean, n=2, interleaved TCP, both ends switched with `-Dquicraft.congestionControl`:
+
+| arm | chunk load ms (r0, r1) | rtt median ms (r0, r1) |
+|---|---|---|
+| tcp | 767, 1116 | 0.59, 0.58 |
+| /3 BBR (default) | 1360, 1395 | 1.58, 1.42 |
+| /3 CUBIC | 1371, 1536 | 1.43, 1.45 |
+
+Open: the in-batch gaps (server send scheduling, the client read pump, or ACK timing remain candidates).
