@@ -222,9 +222,11 @@ public final class QuicStreamWriteSink {
             try {
                 writeCombined(stream, slices[stream], tokens[stream], counts[stream]);
             } catch (RuntimeException | Error e) {
-                failAll(tokens, counts, stream + 1);
+                // writeCombined throws before its listener is attached, so this stream's tokens are unsettled too.
+                failAll(tokens, counts, stream);
                 throw e;
             }
+            counts[stream] = 0;
         }
         if (capped) {
             // A stream stopped at the cap may still have queued records and no writability change to come.

@@ -34,6 +34,7 @@ final class QuicStreamWriteSinkCoalesceTest {
         final java.io.ByteArrayOutputStream written = new java.io.ByteArrayOutputStream();
         boolean writable = true;
         boolean failNextWrite = false;
+        boolean throwOnWrite = false;
 
         Stream(int index) { this.index = index; }
 
@@ -55,7 +56,12 @@ final class QuicStreamWriteSinkCoalesceTest {
                             case "isActive": return channel.isActive();
                             case "isWritable": return writable;
                             case "write": return channel.write(args[0]);
-                            case "writeAndFlush": return channel.writeAndFlush(args[0]);
+                            case "writeAndFlush":
+                                if (throwOnWrite) {
+                                    ReferenceCountUtil.release(args[0]);
+                                    throw new IllegalStateException("injected synchronous write failure");
+                                }
+                                return channel.writeAndFlush(args[0]);
                             case "flush":
                                 flushCalls++;
                                 events.add("flush" + index);
@@ -270,11 +276,8 @@ final class QuicStreamWriteSinkCoalesceTest {
             for (int i = 0; i < 10; i++) {
                 rig.submit(frame(10000), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
             }
-            rig.sink.drain(); // the writability watch re-drains what the cap left queued
-            for (int i = 0; i < 10 && rig.successes < 10; i++) {
-                rig.sink.drain();
-            }
-            assertEquals(10, rig.successes, "every record is eventually written");
+            rig.sink.drain(); // one call: the capped stream goes round again inside it
+            assertEquals(10, rig.successes, "every record is written by a single drain");
             assertTrue(rig.streams[0].writes >= 2, "the 64 KiB cap split the writes: " + rig.streams[0].events);
             for (String event : rig.streams[0].events) {
                 int len = Integer.parseInt(event.substring(event.indexOf(':') + 1));
@@ -364,6 +367,28 @@ final class QuicStreamWriteSinkCoalesceTest {
             rig.sink.beforeWriteForTest(null);
             rig.sink.drain();
             assertEquals(1, rig.successes, "the slice never polled is still written");
+        } finally {
+            rig.close();
+        }
+    }
+
+    @Test
+    void aSynchronouslyThrowingWriteFailsItsOwnAndEveryLaterStreamsSlices() throws Exception {
+        long idle;
+        Rig empty = new Rig(true);
+        try {
+            idle = empty.pool.reserved(empty.owner);
+        } finally {
+            empty.close();
+        }
+        Rig rig = new Rig(true);
+        try {
+            rig.streams[0].throwOnWrite = true;
+            rig.submit(frame(100), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+            rig.submit(frame(100), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+            assertTrue(rig.pool.reserved(rig.owner) > idle, "queued records hold charges");
+            assertThrows(IllegalStateException.class, rig.sink::drain);
+            assertEquals(idle, rig.pool.reserved(rig.owner), "the throwing stream's gathered slices were failed");
         } finally {
             rig.close();
         }
