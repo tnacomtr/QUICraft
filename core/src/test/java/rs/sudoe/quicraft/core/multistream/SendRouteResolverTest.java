@@ -182,7 +182,8 @@ final class SendRouteResolverTest {
         SendRouteResolver.Resolved update = SendRouteResolver.resolve(shipped::routeV2For, decoders, 775,
                 Direction.CLIENTBOUND, ProtocolState.PLAY, 8, blockUpdate);
         assertFalse(update.failed(), update.failure());
-        assertEquals(StreamSequencer.Fence.CHUNK, update.fence());
+        // Security review 2026-10-21: a later block update must not overtake a pending ACK.
+        assertEquals(StreamSequencer.Fence.CHUNK_ACK, update.fence());
     }
 
     @Test
