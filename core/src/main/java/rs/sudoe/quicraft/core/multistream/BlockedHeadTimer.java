@@ -10,11 +10,15 @@ import rs.sudoe.quicraft.core.time.StallClock;
  * (protocol.md 13.10 and 13.12).
  *
  * <p>The wait starts once and is never reset when prerequisites change: {@link #start()} while the timer
- * is already running is ignored. The base is 10 seconds of transport time. A blocked head additionally
- * excludes recorded game-executor tick stalls, but only up to {@link #STALL_ALLOWANCE_NANOS} in total per
- * wait; after that allowance is used up, further stall time counts and the timer expires. The 10 second
- * base and 60 second allowance give a retention of at most 70 seconds. Local resource waits construct the
- * timer with {@code excludeStalls=false}, so executor stalls never pause them.
+ * is already running is ignored. The base is 10 seconds of transport time, measured from the wait's start
+ * or from its last renewal. A blocked head additionally excludes recorded game-executor tick stalls, but
+ * only up to {@link #STALL_ALLOWANCE_NANOS} in total per wait; after that allowance is used up, further
+ * stall time counts. A blocked head also has a nonrenewable {@link #RETENTION_NANOS} active-time deadline
+ * from the wait's start, so its retention is at most 120 seconds of active time plus the 60 second
+ * allowance, 180 seconds. Qualified progress renews only the 10 second base, through {@link #renew()}, and
+ * only when the owning receiver decides so (see {@link #addCredit(long)}). Local resource waits construct
+ * the timer with {@code excludeStalls=false}, so executor stalls never pause them, and they are never
+ * renewed.
  *
  * <p>The timer has two modes and never mixes them. A timer constructed with a {@link LongSupplier} is
  * boundary-driven: stall intervals are reported with {@link #stallStarted} and {@link #stallEnded} and
@@ -53,6 +57,10 @@ public final class BlockedHeadTimer {
     public static final long TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
     /** Total recorded tick-stall time excluded per wait, 60 seconds (13.10). */
     public static final long STALL_ALLOWANCE_NANOS = TimeUnit.SECONDS.toNanos(60);
+    /** Nonrenewable active-time retention of a blocked head, 120 seconds (13.10, 13.12). */
+    public static final long RETENTION_NANOS = TimeUnit.SECONDS.toNanos(120);
+    /** Qualifying encoded wire bytes that renew the base deadline, 64 KiB (13.10). */
+    public static final long RENEWAL_BYTES = 64L * 1024L;
 
     /** The boundary clock; null in cumulative mode. */
     private final LongSupplier clock;
@@ -68,6 +76,11 @@ public final class BlockedHeadTimer {
     private long coveredEndOffset;
     private boolean inStall;
     private long stallBeganOffset;
+
+    // Renewal state, shared by both modes: active time at the last renewal (0 for the wait's start) and the
+    // qualifying bytes credited since then, saturating at RENEWAL_BYTES.
+    private long renewedActiveNanos;
+    private long creditBytes;
 
     // Cumulative mode state: an explicit initialization flag, never a negative sentinel.
     private boolean initialized;
@@ -119,6 +132,8 @@ public final class BlockedHeadTimer {
             coveredEndOffset = 0;
             inStall = false;
             stallBeganOffset = 0;
+            renewedActiveNanos = 0;
+            creditBytes = 0;
             return;
         }
         StallClock.Sample sample = source.sample();
@@ -130,7 +145,63 @@ public final class BlockedHeadTimer {
         lastNowNanos = baseNowNanos;
         lastExcludedNanos = baseExcludedNanos;
         initialized = true;
+        renewedActiveNanos = 0;
+        creditBytes = 0;
         running = true;
+    }
+
+    /**
+     * Credits qualifying encoded wire bytes toward the next renewal (13.10). The receiver calls this once per
+     * waiting head for each qualifying commit. Credit saturates at {@link #RENEWAL_BYTES} and is discarded by
+     * {@link #renew()}.
+     */
+    public void addCredit(long bytes) {
+        if (bytes <= 0) {
+            return;
+        }
+        creditBytes = bytes >= RENEWAL_BYTES - creditBytes ? RENEWAL_BYTES : creditBytes + bytes;
+    }
+
+    /** Reports whether the credit since the last renewal reached {@link #RENEWAL_BYTES}. */
+    public boolean creditReached() {
+        return creditBytes >= RENEWAL_BYTES;
+    }
+
+    /**
+     * Renews the 10 second base from the current active time and discards any surplus credit (13.10). The
+     * receiver calls it only for an unexpired wait that has qualified progress; it is a no-op on a stopped
+     * timer. The absolute retention deadline is unaffected.
+     */
+    public void renew() {
+        if (!running) {
+            return;
+        }
+        renewedActiveNanos = activeNanos();
+        creditBytes = 0;
+    }
+
+    /**
+     * Reports whether the base deadline has been reached: 10 seconds of active time since the wait's start or
+     * its last renewal. A resource wait is never renewed, so for it this is the 10 second base from the start.
+     */
+    public boolean expired() {
+        if (source != null) {
+            Observation observation = observe();
+            return observation != null && observation.activeNanos() - renewedActiveNanos >= TIMEOUT_NANOS;
+        }
+        return running && activeNanos() - renewedActiveNanos >= TIMEOUT_NANOS;
+    }
+
+    /**
+     * Reports whether the nonrenewable retention deadline has been reached: {@link #RETENTION_NANOS} of active
+     * time since the wait's start, independent of renewals (13.10, 13.12).
+     */
+    public boolean absoluteExpired() {
+        if (source != null) {
+            Observation observation = observe();
+            return observation != null && observation.activeNanos() >= RETENTION_NANOS;
+        }
+        return running && activeNanos() >= RETENTION_NANOS;
     }
 
     /** Stops the wait, for example when the head is enqueued (Q) or released. */
@@ -222,15 +293,6 @@ public final class BlockedHeadTimer {
         }
         long elapsed = waitOffset(clock.getAsLong());
         return Math.max(0, elapsed - excludedNanos());
-    }
-
-    /** Reports whether the wait has reached its 10 second base. */
-    public boolean expired() {
-        if (source != null) {
-            Observation observation = observe();
-            return observation != null && observation.elapsedNanos - observation.exclusionNanos >= TIMEOUT_NANOS;
-        }
-        return running && activeNanos() >= TIMEOUT_NANOS;
     }
 
     /**
@@ -333,6 +395,11 @@ public final class BlockedHeadTimer {
         Observation(long elapsedNanos, long exclusionNanos) {
             this.elapsedNanos = elapsedNanos;
             this.exclusionNanos = exclusionNanos;
+        }
+
+        /** Active time of this observation: elapsed minus excluded, never negative. */
+        long activeNanos() {
+            return Math.max(0, elapsedNanos - exclusionNanos);
         }
     }
 }

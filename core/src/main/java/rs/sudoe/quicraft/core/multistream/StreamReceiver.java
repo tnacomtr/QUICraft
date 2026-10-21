@@ -120,6 +120,8 @@ public final class StreamReceiver {
         final Record record;
         /** Sequence of the last record of the unit; equals the opener's for a single record. */
         final long closing;
+        /** Total wire size of the unit, prefixes included; credited toward renewal when it commits (13.10). */
+        final long wireBytes;
         final BlockedHeadTimer timer;
         /** Route from the body, known only once the head is eligible and validated (null before). */
         ReceiveRoute route;
@@ -129,9 +131,10 @@ public final class StreamReceiver {
         /** Sticky for the current wait: some prerequisite on the chain was withheld locally (13.12). */
         boolean chainWasWithheld;
 
-        Unit(Record record, long closing, BlockedHeadTimer timer) {
+        Unit(Record record, long closing, long wireBytes, BlockedHeadTimer timer) {
             this.record = record;
             this.closing = closing;
+            this.wireBytes = wireBytes;
             this.timer = timer;
         }
     }
@@ -156,6 +159,11 @@ public final class StreamReceiver {
     private boolean stalled;
     /** First 0x11 found by a re-check after an apply; sticky, every later offer returns it (13.18). */
     private ReceiveClose violation;
+    /**
+     * A blocked-head expiry reached before a commit, sticky: a later commit cannot rescue it (13.10). Captured
+     * from the pre-commit state in {@link #applied}, returned by {@link #expiredWait} until the connection closes.
+     */
+    private ReceiveClose lapsedWait;
 
     /**
      * Clientbound receiver, kept for existing callers (legacy boundary mode).
@@ -372,7 +380,7 @@ public final class StreamReceiver {
         if (!slotsHeldByPump && !slots.admitHead(stream, wireBytes, recordCount)) {
             return Admission.busy();
         }
-        Unit unit = new Unit(record, closingSequence, new BlockedHeadTimer(clock, true));
+        Unit unit = new Unit(record, closingSequence, wireBytes, new BlockedHeadTimer(clock, true));
         head[stream] = unit;
         admitted[stream] = closingSequence;
         if (!ready(unit)) {
@@ -521,6 +529,7 @@ public final class StreamReceiver {
         if (!unit.enqueued) {
             throw new IllegalStateException("applied before enqueued on stream " + stream);
         }
+        settleWaitsBeforeCommit(stream, unit);
         rememberWithheldChains();
         head[stream] = null;
         applied[stream] = unit.closing;
@@ -566,18 +575,71 @@ public final class StreamReceiver {
     }
 
     /**
-     * Checks every held head that is dependency-blocked and not yet at Q whose timer has expired
-     * (13.10, 13.12). Returns the 0x12 close to send, or null. A ready head never expires.
+     * Checks every held head that is dependency-blocked and not yet at Q (13.10, 13.12). Returns the 0x12 close
+     * to send, or null. A ready head never expires. A no-progress expiry closes with the phrase rules of
+     * {@link ReceiveClose#blockedExpiry}; with no such expiry, an absolute-retention expiry closes generic 0x12
+     * with no phrase. A lapsed wait captured by {@link #applied} is returned first.
      */
     public ReceiveClose expiredWait() {
+        return lapsedWait != null ? lapsedWait : expiredClose();
+    }
+
+    /**
+     * The close of the first expired wait in the current state, or null. A no-progress expiry takes precedence
+     * over an absolute-retention expiry on any other head (13.12, "Deadline precedence").
+     */
+    private ReceiveClose expiredClose() {
+        ReceiveClose retention = null;
         for (int stream = 0; stream < streams; stream++) {
             Unit unit = head[stream];
-            if (unit != null && !unit.enqueued && !ready(unit) && unit.timer.expired()) {
+            if (unit == null || unit.enqueued || ready(unit)) {
+                continue;
+            }
+            if (unit.timer.expired()) {
                 boolean wasWithheld = unit.chainWasWithheld || chainWithheld(unit.record);
                 return ReceiveClose.blockedExpiry(unit.timer.stallConsumed(), wasWithheld);
             }
+            if (retention == null && unit.timer.absoluteExpired()) {
+                retention = ReceiveClose.retentionExpiry();
+            }
         }
-        return null;
+        return retention;
+    }
+
+    /**
+     * Runs before a commit changes any state (13.10). An expiry already reached in the pre-commit state is captured
+     * as sticky and this commit cannot rescue it. Otherwise each waiting head is credited with this commit when it
+     * qualifies, and its base deadline renews at once when the commit reaches the required watermark or the credit
+     * reaches {@link BlockedHeadTimer#RENEWAL_BYTES}.
+     */
+    private void settleWaitsBeforeCommit(int stream, Unit committing) {
+        if (lapsedWait == null) {
+            lapsedWait = expiredClose();
+        }
+        if (lapsedWait != null) {
+            return;
+        }
+        for (Unit waiting : head) {
+            if (waiting != null && !waiting.enqueued && !ready(waiting)) {
+                creditQualifyingCommit(waiting, stream, committing);
+            }
+        }
+    }
+
+    /**
+     * Credits a commit to one waiting head when it qualifies (13.10): the stream is an unresolved prerequisite of
+     * the head's pre-commit chain (transitive included) and the unit opens at or below that prerequisite's required
+     * sequence. Raw arrivals, Q, ACKs, unrelated commits and changes of prerequisite earn nothing. O(streams).
+     */
+    private void creditQualifyingCommit(Unit waiting, int stream, Unit committing) {
+        long required = chainReach(waiting.record)[stream];
+        if (required <= applied[stream] || committing.record.sequence() > required) {
+            return;
+        }
+        waiting.timer.addCredit(committing.wireBytes);
+        if (committing.closing >= required || waiting.timer.creditReached()) {
+            waiting.timer.renew();
+        }
     }
 
     /**
@@ -978,7 +1040,7 @@ public final class StreamReceiver {
      */
     private Admission admitCumulative(int stream, Record record, long closingSequence, long wireBytes,
                                       int recordCount) {
-        Unit unit = new Unit(record, closingSequence, new BlockedHeadTimer(source, true));
+        Unit unit = new Unit(record, closingSequence, wireBytes, new BlockedHeadTimer(source, true));
         if (!ready(unit)) {
             unit.timer.start();
         }

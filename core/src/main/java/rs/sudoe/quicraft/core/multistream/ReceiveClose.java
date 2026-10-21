@@ -56,6 +56,14 @@ public final class ReceiveClose {
         return new ReceiveClose(RESOURCE, phrase, phrase ? "blocked-head expiry" : "generic resource");
     }
 
+    /**
+     * Absolute retention expiry of a blocked head (13.10, 13.12): generic 0x12 with no phrase. Renewals never
+     * delay it, and it is not a counted unseen-prerequisite event.
+     */
+    public static ReceiveClose retentionExpiry() {
+        return new ReceiveClose(RESOURCE, false, "blocked-head retention");
+    }
+
     /** Returns 0x11 or 0x12. */
     public int errorCode() {
         return errorCode;
