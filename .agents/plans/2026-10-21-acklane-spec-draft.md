@@ -50,7 +50,7 @@ Let `lastAck` be the sequence of the latest record the sender assigned on the AC
 For packet 45 (level_chunk_with_light) routed with `ack`, the sender keeps per session:
 
 - the set of HELD chunk positions: add on a 45, remove on a 37 (forget_level_chunk), both carry the position;
-- a ring of the last 1024 forgotten positions.
+- a ring of the last 256 forgotten positions.
 
 A 45 omits the `ack` dependency only when its position is neither held nor in the ring. Reason: a first install
 cannot meet a pending block prediction (the client cannot predict in an unloaded chunk); a replacement or a
