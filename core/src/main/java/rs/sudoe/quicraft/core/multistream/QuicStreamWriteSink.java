@@ -30,8 +30,9 @@ import java.util.function.IntPredicate;
  * writes.
  *
  * <p>When the system property {@code quicraft.coalesceWrites} is {@code true}, the sink gathers slices per logical
- * stream during a single {@link #drain()} call and writes one combined buffer per stream, capped at 64 KiB per
- * stream. Otherwise each slice is written individually with the behavior unchanged.
+ * stream during a single {@link #drain()} call and writes one combined buffer per stream. The cap is soft: a stream
+ * stops being polled once it gathered 64 KiB, so one buffer is at most 64 KiB plus one slice. A drain re-entered
+ * from a write completion only makes the running drain go round again, so a stream's bytes stay in order. Otherwise each slice is written individually with the behavior unchanged.
  */
 public final class QuicStreamWriteSink {
     private static final boolean COALESCE_DEFAULT = Boolean.parseBoolean(
@@ -48,6 +49,9 @@ public final class QuicStreamWriteSink {
     private boolean coalesce;
     /** Bytes gathered per stream in the running coalesced drain; all zero outside a drain's poll loop. */
     private final int[] gatheredBytes;
+    /** True while a coalesced drain runs; a nested drain() then only sets {@link #drainAgain}. */
+    private boolean draining;
+    private boolean drainAgain;
 
     /** Told after each slice's write future completed and the driver was told; on the event loop. */
     interface Settled {
@@ -131,30 +135,40 @@ public final class QuicStreamWriteSink {
                 write(write);
             }
         }
-        // Gather per stream without writing; a write can complete inline and its settled callback can re-enter
-        // drain(), so everything gathered here is local and gatheredBytes is reset before the first write.
+        // A write can complete inline and re-enter drain() through settled or the writability watch. A nested
+        // drain must not poll: it would take a later slice of a stream whose earlier gathered slices this drain has
+        // not written yet. It only asks the running drain to go round again.
+        if (draining) {
+            drainAgain = true;
+            return;
+        }
+        draining = true;
+        try {
+            do {
+                drainAgain = false;
+                drainCoalesced();
+            } while (drainAgain);
+        } finally {
+            draining = false;
+        }
+    }
+
+    /** One coalesced round: gather up to the cap per stream, then write one buffer per stream. */
+    private void drainCoalesced() {
         byte[][][] slices = null;
         long[][] tokens = null;
         int[] counts = null;
+        boolean capped = false;
         try {
             for (;;) {
                 SessionSendDriver.Write write = driver.poll(writable);
                 if (write == null) {
                     break;
                 }
-                Runnable hook = beforeWrite;
-                if (hook != null) {
-                    hook.run();
-                }
                 int stream = write.stream();
                 if (stream < 0 || stream >= channels.length || channels[stream] == null) {
                     driver.failed(write.token());
                     continue;
-                }
-                byte[] bytes = write.bytes();
-                if (driver.trace() != null) {
-                    driver.trace().written(stream, bytes.length, write.traceSelectedNanos,
-                            write.traceStartedNanos, System.nanoTime());
                 }
                 if (slices == null) {
                     slices = new byte[channels.length][][];
@@ -169,11 +183,27 @@ public final class QuicStreamWriteSink {
                     slices[stream] = Arrays.copyOf(slices[stream], count * 2);
                     tokens[stream] = Arrays.copyOf(tokens[stream], count * 2);
                 }
+                // Owned from here: an exception below fails it with the rest of the gathered tokens.
+                byte[] bytes = write.bytes();
                 slices[stream][count] = bytes;
                 tokens[stream][count] = write.token();
                 counts[stream] = count + 1;
                 gatheredBytes[stream] += bytes.length;
+                if (gatheredBytes[stream] >= COALESCE_MAX_BYTES) {
+                    capped = true;
+                }
+                Runnable hook = beforeWrite;
+                if (hook != null) {
+                    hook.run();
+                }
+                if (driver.trace() != null) {
+                    driver.trace().written(stream, bytes.length, write.traceSelectedNanos,
+                            write.traceStartedNanos, System.nanoTime());
+                }
             }
+        } catch (RuntimeException | Error e) {
+            failAll(tokens, counts, 0);
+            throw e;
         } finally {
             Arrays.fill(gatheredBytes, 0);
         }
@@ -181,13 +211,43 @@ public final class QuicStreamWriteSink {
             return;
         }
         for (int stream = 0; stream < slices.length; stream++) {
-            if (counts[stream] > 0) {
-                writeCombined(stream, slices[stream], tokens[stream], counts[stream]);
+            if (counts[stream] == 0) {
+                continue;
             }
+            if (driver.isClosed()) {
+                // An inline failure closed the session and released every charge; submit nothing more.
+                failAll(tokens, counts, stream);
+                return;
+            }
+            try {
+                writeCombined(stream, slices[stream], tokens[stream], counts[stream]);
+            } catch (RuntimeException | Error e) {
+                failAll(tokens, counts, stream + 1);
+                throw e;
+            }
+        }
+        if (capped) {
+            // A stream stopped at the cap may still have queued records and no writability change to come.
+            drainAgain = true;
         }
     }
 
-    /** Writes one stream's gathered slices as one buffer; its future settles every gathered token. */
+    private void failAll(long[][] tokens, int[] counts, int fromStream) {
+        if (tokens == null) {
+            return;
+        }
+        for (int stream = fromStream; stream < tokens.length; stream++) {
+            for (int i = 0; i < counts[stream]; i++) {
+                driver.failed(tokens[stream][i]);
+            }
+            counts[stream] = 0;
+        }
+    }
+
+    /**
+     * Writes one stream's gathered slices as one buffer. Its future settles every gathered token with the driver
+     * first, then tells the owner once per token.
+     */
     private void writeCombined(int stream, byte[][] slices, long[] tokens, int count) {
         int total = 0;
         for (int i = 0; i < count; i++) {
@@ -208,6 +268,8 @@ public final class QuicStreamWriteSink {
                         } else {
                             driver.failed(tokens[i]);
                         }
+                    }
+                    for (int i = 0; i < count; i++) {
                         settled.settled(success);
                     }
                 });

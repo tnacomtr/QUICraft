@@ -301,4 +301,71 @@ final class QuicStreamWriteSinkCoalesceTest {
             rig.close();
         }
     }
+
+    private static byte[] chunkBytesUncoalesced(int records) throws Exception {
+        Rig off = new Rig(false);
+        try {
+            off.submit(frame(10), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+            for (int i = 0; i < records; i++) {
+                off.submit(frame(10000 + i), StreamSequencer.Fence.CHUNK, 2);
+            }
+            off.sink.drain();
+            return off.streams[2].written.toByteArray();
+        } finally {
+            off.close();
+        }
+    }
+
+    @Test
+    void aDrainReenteredWhileGatheredSlicesWaitKeepsTheStreamInOrder() throws Exception {
+        byte[] expected = chunkBytesUncoalesced(12);
+        Rig rig = new Rig(true);
+        try {
+            // Stream 0 is written first and completes inline; its settled re-drains while stream 2 still has
+            // gathered, unwritten slices and a capped tail in the driver.
+            rig.onSettled = rig.sink::drain;
+            rig.submit(frame(10), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+            for (int i = 0; i < 12; i++) {
+                rig.submit(frame(10000 + i), StreamSequencer.Fence.CHUNK, 2);
+            }
+            rig.sink.drain();
+            assertEquals(13, rig.successes);
+            assertTrue(rig.streams[2].writes >= 2, "the cap split stream 2: " + rig.streams[2].events);
+            assertArrayEquals(expected, rig.streams[2].written.toByteArray(), "stream 2 bytes in record order");
+        } finally {
+            rig.close();
+        }
+    }
+
+    @Test
+    void aThrowingHookFailsEveryGatheredSliceSoNoChargeIsHeld() throws Exception {
+        Rig rig = new Rig(true);
+        try {
+            for (int i = 0; i < 3; i++) {
+                rig.submit(frame(100), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+            }
+            long perRecord;
+            Rig one = new Rig(true);
+            try {
+                one.submit(frame(100), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+                perRecord = one.pool.reserved(one.owner);
+            } finally {
+                one.close();
+            }
+            int[] calls = {0};
+            rig.sink.beforeWriteForTest(() -> {
+                if (++calls[0] == 2) {
+                    throw new IllegalStateException("injected");
+                }
+            });
+            assertThrows(IllegalStateException.class, rig.sink::drain);
+            assertEquals(0, rig.streams[0].writes, "nothing gathered was written");
+            assertEquals(perRecord, rig.pool.reserved(rig.owner), "only the never-polled record still holds a charge");
+            rig.sink.beforeWriteForTest(null);
+            rig.sink.drain();
+            assertEquals(1, rig.successes, "the slice never polled is still written");
+        } finally {
+            rig.close();
+        }
+    }
 }
