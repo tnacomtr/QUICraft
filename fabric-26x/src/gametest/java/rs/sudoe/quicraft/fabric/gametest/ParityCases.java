@@ -582,10 +582,11 @@ final class ParityCases {
         @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
             // TCP: sleeping in P, then the ACK snaps the player back to the spawn. Illegal: the ACK finds the
             // player at the spawn, nothing to snap, and the player then sleeps in P.
-            // Observed: same-tick the player sleeps at P's centre (3.5); after the settle ticks it has been pushed
-            // on to x about 4.3, still beside P and far from the spawn.
+            // Same-tick the player sleeps at P's centre; after settling it is pushed about 3.8
+            // blocks east of basePos. CI 26.1: -4.5 -> -0.7; 26.1.1: -5.5 -> -1.7.
+            // The original threshold 3.0 assumed basePos.x=0.5, not a fixed world origin.
             return List.of(new ParityRunner.Hazard(playerXNear(f.basePos.x),
-                    spread ? playerXAbove(3.0) : playerXNear(p(f).getX() + 0.5)));
+                    spread ? playerXAbove(f.basePos.x + 2.5) : playerXNear(p(f).getX() + 0.5)));
         }
 
         @Override int[] illegalOrder(int items) { return new int[] {1, 0, 2, 3}; }
@@ -907,17 +908,18 @@ final class ParityCases {
         @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(t(f)); }
 
         @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
-            // Observed in the tick-spread run: TCP leaves the player near the block (x about 2.4); the illegal
-            // order lets the scaled player overlap the restored block, so the ACK snaps it to the spawn
-            // (x 0.5) and the remaining motion carries it a little further (about 0.9).
-            return List.of(new ParityRunner.Hazard(playerXAbove(1.5), playerXBelow(1.2)));
+            // TCP ends about basePos.x+1.896; illegal order overlaps the restored block, so the ACK
+            // snaps to basePos and remaining motion ends about basePos.x+0.397. Both offsets occur
+            // on 26.1 (-4.5 base) and 26.1.1 (-5.5 base), as on 26.1.2 (0.5 base).
+            return List.of(new ParityRunner.Hazard(playerXAbove(f.basePos.x + 1.0),
+                    playerXBelow(f.basePos.x + 0.7)));
         }
 
         @Override int[] illegalOrder(int items) { return new int[] {1, 2, 0}; }
 
         /** Without a prediction the ACK has no rollback, so the player must not end near the spawn. */
         @Override List<ParityRunner.Check> controlForbidden(ParityFixture f, boolean spread) {
-            return List.of(playerXBelow(1.2));
+            return List.of(playerXBelow(f.basePos.x + 0.7));
         }
 
         @Override boolean hasControl() { return true; }
