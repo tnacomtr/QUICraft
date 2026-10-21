@@ -52,7 +52,7 @@ class ChunkPosLongExtractorTest {
             assertEquals(chunk[1], forgotten.chunkZ);
             assertEquals(installed.chunkX, forgotten.chunkX);
             assertEquals(installed.chunkZ, forgotten.chunkZ);
-            for (int shards : new int[] {1, 2, 3, 6}) {
+            for (int shards : new int[] {1, 2, 3, 5}) {
                 assertEquals(ShardHash.shardOf(installed.chunkX, installed.chunkZ, 0L, shards),
                         ShardHash.shardOf(forgotten.chunkX, forgotten.chunkZ, 0L, shards),
                         "37 and 45 for chunk " + chunk[0] + "," + chunk[1] + " with N=" + shards);
