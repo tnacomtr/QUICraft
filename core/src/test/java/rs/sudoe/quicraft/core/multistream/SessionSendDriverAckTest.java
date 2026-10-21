@@ -113,7 +113,7 @@ class SessionSendDriverAckTest {
     }
 
     @Test
-    void anInstallAfterTheForgetLeftTheRingIsAFirstInstallAgain() throws Exception {
+    void aForgetRingOverflowMakesEveryLaterInstallCarryTheAck() throws Exception {
         Rig rig = new Rig();
         rig.send(Fence.ACK_TRAILING, 0, 0);
         rig.send(Fence.CHUNK_FORGET, 0, 0);
@@ -123,7 +123,7 @@ class SessionSendDriverAckTest {
         SentPacket aged = rig.send(Fence.CHUNK_INSTALL, 0, 0);
         SentPacket recent = rig.send(Fence.CHUNK_INSTALL, HeldChunkSet.RING_CAPACITY, 0);
         rig.drain();
-        assertFalse(rig.dependsOnAck(aged));
+        assertTrue(rig.dependsOnAck(aged), "the overflow must not let the oldest forget pass as a first install");
         assertTrue(rig.dependsOnAck(recent));
     }
 
