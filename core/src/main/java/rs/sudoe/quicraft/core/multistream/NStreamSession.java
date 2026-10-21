@@ -124,6 +124,18 @@ public final class NStreamSession implements MultistreamSession {
     public static final int MAX_KEPT_AFTER_DETACH = MAX_ACTIVATION_LEFTOVER / 2;
     /** Receive steps per pump task before it yields the loop. */
     private static final int MAX_STEPS = 64;
+    /**
+     * Run the receive pump at a stream's read-complete instead of a queued loop task, so the body grant after a
+     * length prefix is issued in the same loop turn (measured: -0.16 ms clean-link ping, docs/benchmarks.md).
+     * On by default; {@code -Dquicraft.v3.inlinePump=false} restores the queued pump.
+     */
+    /**
+     * Whether the CHUNK streams pump inline as well. Off: under delay and loss an inline pump on every stream
+     * measured a higher median chunk load (3602 vs 3366 ms, n=8, not significant), so the chunk path keeps the
+     * queued pump and only CONTROL, REALTIME and ACK take the inline one ({@code -Dquicraft.v3.inlineChunks=true}).
+     */
+    private static final boolean INLINE_CHUNKS = Boolean.getBoolean("quicraft.v3.inlineChunks");
+    private static final boolean INLINE_PUMP = !"false".equals(System.getProperty("quicraft.v3.inlinePump"));
     private static final byte[] NO_REASON = new byte[0];
 
     /** Clocks and periods; tests shorten them, production uses {@link #defaults(SessionResources)}. */
@@ -393,6 +405,18 @@ public final class NStreamSession implements MultistreamSession {
     private boolean activated;
     private long activatedAt;
     private boolean pumpScheduled;
+    private boolean pumping;
+    /** Per-session copy of {@link #INLINE_PUMP}; tests change it through {@link #configureForTests}. */
+    private boolean inlinePump = INLINE_PUMP;
+    /** Whether CHUNK streams pump inline too; tests set it with {@link #configureForTests}. */
+    private boolean inlineChunks = INLINE_CHUNKS;
+    /** Test seam: sees every receive step's entry and exit on the loop thread. Null in production. */
+    private ReceiveObserver receiveObserver;
+    /** Test seam: named events on the inline pump and drain paths (loop thread). Null in production. */
+    private PathProbe pathProbe;
+    /** Test seam: a held pump defers its rounds (see {@link #holdPumpForTests}). Always false in production. */
+    private boolean pumpHeld;
+    private boolean pumpHeldDeferred;
     private boolean closeNotified;
     private boolean executing;
     private int executingStream = -1;
@@ -1238,8 +1262,52 @@ public final class NStreamSession implements MultistreamSession {
         loop.execute(() -> guarded(this::pumpNow));
     }
 
+    /** Pumps now, unless a pump is already on the stack (a read it issued completed): then queue one. */
+    private void pumpInline() {
+        if (pumping || closed) {
+            schedulePump();
+            return;
+        }
+        guarded(() -> {
+            probe("inline.begin");
+            pumpNow();
+            // What the game answered during this round leaves now, not behind the rest of the loop's I/O.
+            if (drainScheduled.get() && !closed) {
+                probe("drain.inline");
+                drainNow();
+            }
+            probe("inline.end");
+        });
+    }
+
+    /** Test seam: names one path event on the loop thread; a no-op unless a probe is configured. */
+    private void probe(String event) {
+        PathProbe current = pathProbe;
+        if (current != null) {
+            current.event(event);
+        }
+    }
+
     private void pumpNow() {
         pumpScheduled = false;
+        if (pumping) {
+            schedulePump();
+            return;
+        }
+        if (pumpHeld) {
+            pumpHeldDeferred = true;
+            return;
+        }
+        probe("pump.round");
+        pumping = true;
+        try {
+            pumpSteps();
+        } finally {
+            pumping = false;
+        }
+    }
+
+    private void pumpSteps() {
         if (closed || !activated || game == null) {
             return;
         }
@@ -1257,8 +1325,64 @@ public final class NStreamSession implements MultistreamSession {
         schedulePump();
     }
 
+    /** Observer of receive steps (test seam; see {@link #configureForTests}). */
+    interface ReceiveObserver {
+        void enter();
+
+        void exit();
+    }
+
+    /** Test seam: sees the named path events of the inline pump and the drains (see {@link #probe}). */
+    interface PathProbe {
+        void event(String name);
+    }
+
+    /** Test seam: sets the inline-pump flag and the receive observer. Call on the loop before activation. */
+    void configureForTests(boolean inlinePumpOn, ReceiveObserver observer) {
+        this.inlinePump = inlinePumpOn;
+        this.inlineChunks = inlinePumpOn;
+        this.receiveObserver = observer;
+    }
+
+    /** Test seam: sets the path probe. Call on the loop. */
+    void configurePathProbe(PathProbe probe) {
+        this.pathProbe = probe;
+    }
+
+    /** Test seam: while held, a pump round is only recorded as requested. Call on the loop. */
+    void holdPumpForTests() {
+        pumpHeld = true;
+    }
+
+    /** Test seam: releases a held pump; a round requested meanwhile is scheduled now. Call on the loop. */
+    void releasePumpForTests() {
+        pumpHeld = false;
+        if (pumpHeldDeferred) {
+            pumpHeldDeferred = false;
+            schedulePump();
+        }
+    }
+
+    /** Test seam: bytes buffered for a logical stream and not yet read by the pump. Call on the loop. */
+    int bufferedForTests(int stream) {
+        return source.buffered(stream);
+    }
+
     /** One receive step; false when it closed the session. */
     private boolean receiveOnce() {
+        ReceiveObserver observer = receiveObserver;
+        if (observer == null) {
+            return receiveStep();
+        }
+        observer.enter();
+        try {
+            return receiveStep();
+        } finally {
+            observer.exit();
+        }
+    }
+
+    private boolean receiveStep() {
         if (receiveTrace != null) receiveTrace.waits.state(System.nanoTime(), ReceiveTrace.WaitReason.DRIVE_CPU);
         try {
             if (serverDriver != null) {
@@ -1357,6 +1481,7 @@ public final class NStreamSession implements MultistreamSession {
         }
         loop.execute(() -> guarded(() -> {
             drainScheduled.set(false);
+            probe("drain.queued");
             drainNow();
         }));
     }
@@ -1456,8 +1581,19 @@ public final class NStreamSession implements MultistreamSession {
             fail(CLOSE_ORDERING, NO_REASON, "a peer stream did not open in time (13.3)", null);
             return;
         }
-        if (game != null && !receiveOnce()) {
-            return;
+        if (game != null && !pumping && !pumpHeld) {
+            // Same guard as the pump: a read this step issues may complete synchronously and pump inline.
+            // A held pump (test seam) also holds the tick's receive step.
+            boolean open;
+            pumping = true;
+            try {
+                open = receiveOnce();
+            } finally {
+                pumping = false;
+            }
+            if (!open) {
+                return;
+            }
         }
         sendDriver.expireAcks();
         drainNow();
@@ -1933,7 +2069,11 @@ public final class NStreamSession implements MultistreamSession {
         public void channelReadComplete(ChannelHandlerContext ctx) {
             ctx.fireChannelReadComplete();
             traceReceiveState();
-            schedulePump();
+            if (inlinePump && (inlineChunks || !isChunk(index))) {
+                pumpInline();
+            } else {
+                schedulePump();
+            }
         }
 
         @Override
@@ -1957,6 +2097,10 @@ public final class NStreamSession implements MultistreamSession {
                 guarded(() -> fail(CLOSE_ORDERING, NO_REASON, "logical stream " + index + " closed (13.14)", null));
             }
         }
+    }
+
+    private boolean isChunk(int index) {
+        return index >= 2 && index < streams - 1;
     }
 
     /** Turns any close of stream 0 after activation into END (13.14). */

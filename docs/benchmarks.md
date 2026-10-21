@@ -1269,3 +1269,34 @@ delayloss (3cb3d66); about 5.6 without it. The first build left the first chunk'
 by roughly half (about 1.4 s -> 1.1 s against 0.8 s) and is the fastest arm under delayloss in both rounds. n=2:
 direction, not a gate. Still off by default: the reviewer's default-on conditions are a lagging-main-thread run
 (bounded backlog, no runaway batches) and a broader interleaved matrix.
+
+### /3 inline receive pump on CONTROL, REALTIME and ACK (2026-10-21, interleaved TCP)
+
+Ping hop trace (`-Dquicraft.v3.rttTrace=true`, clean, diagnostic): after a stream's data arrived the receive pump ran
+as a queued loop task; it read the 1-byte length prefix, then issued the body grant (13.12) in a second turn. That
+prefix -> body-grant hop was p50 0.19 ms on the server and 0.09 ms on the client. Running the pump at the stream's
+read-complete (with a re-entrancy guard shared by the tick) brings it to 0.026 / 0.008 ms. Draining the writes a
+round submitted right after it moves the server's pong submit -> drain from 0.185 to 0.067 ms. Two send-side
+experiments (draining at the game's flush, flushing the QUIC connection after a drain) moved no time out of the
+round trip: the datagram still leaves at the end of the loop's read batch. They were dropped.
+
+Inline on every stream, delayloss chunk load (n=8 per arm): /3 median 3366 ms, inline 3602 ms. Capping an inline
+round at 4 steps did not help (n=3, 4170 ms). The difference is not significant, but it points the same way as the
+earlier pump-after-apply variant, so CHUNK streams keep the queued pump. Shipped default: inline on CONTROL,
+REALTIME and ACK (`-Dquicraft.v3.inlinePump=false` restores the queued pump everywhere;
+`-Dquicraft.v3.inlineChunks=true` adds the CHUNK streams). Branch `agent/p5-inline-pump-tests2`, n=3 per arm, no
+tracing:
+
+| profile | arm | join ms | chunk load ms (runs) | rtt median ms |
+|---|---|---|---|---|
+| clean | tcp | 1421 | 1125 (1125, 1393, 881) | 0.603 |
+| clean | /3 queued pump | 1886 | 1619 (1348, 1822, 1619) | 1.461 |
+| clean | /3 inline non-chunk | 1715 | 1479 (1195, 1479, 1496) | 1.342 |
+| delayloss | tcp | 2818 | 33266 (33266, 37505, 9861) | 151.16 |
+| delayloss | /3 queued pump | 3163 | 3797 (4596, 3797, 3413) | 151.71 |
+| delayloss | /3 inline non-chunk | 2815 | 3334 (4306, 3130, 3334) | 152.46 |
+
+The clean-link RTT gain is about 0.12 ms, consistent across every traced and untraced round (inline-everywhere
+rounds: 1.27-1.45 ms against 1.41-1.60 ms). The gap to TCP is still about 0.7 ms. It is spread over the remaining
+hops: client send path to the datagram (~0.3 ms), the server's quiche receive (~0.11 ms), and decode plus game delivery
+(~0.2 ms). No single hop dominates.
