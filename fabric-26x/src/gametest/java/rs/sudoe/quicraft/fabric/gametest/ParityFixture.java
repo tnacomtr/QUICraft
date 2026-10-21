@@ -141,6 +141,17 @@ final class ParityFixture implements AutoCloseable {
         QuicraftClient.get().setMode(Mode.AUTO);
     }
 
+    /** A respawn into the dimension the player is already in: the client keeps its ClientLevel. */
+    Packet<ClientGamePacketListener> sameDimensionRespawn() {
+        // The server's dimension-type holder is bound to the server's registry; encoding needs the client's.
+        net.minecraft.core.Holder<net.minecraft.world.level.dimension.DimensionType> type = access
+                .lookupOrThrow(net.minecraft.core.registries.Registries.DIMENSION_TYPE)
+                .getOrThrow(overworld.dimensionType().unwrapKey().orElseThrow());
+        return new ClientboundRespawnPacket(new CommonPlayerSpawnInfo(type, overworld.dimension(), overworld.seed(),
+                overworld.gameType(), overworld.previousGameType(), overworld.isDebug(), overworld.isFlat(),
+                overworld.lastDeathLocation(), overworld.portalCooldown(), overworld.seaLevel()), (byte) 0);
+    }
+
     // ---- frames -------------------------------------------------------------------------------
 
     byte[] encode(Packet<ClientGamePacketListener> packet) {
@@ -329,8 +340,9 @@ final class ParityFixture implements AutoCloseable {
         ClientLevel level = c.level;
         sb.append("player.pos=").append(p.getX()).append(',').append(p.getY()).append(',').append(p.getZ()).append('\n');
         sb.append("player.old=").append(p.xo).append(',').append(p.yo).append(',').append(p.zo).append('\n');
-        sb.append("player.rot=").append(p.getYRot()).append(',').append(p.getXRot()).append(',')
-                .append(p.getYHeadRot()).append('\n');
+        // The head rotation is left out: a respawned LocalPlayer starts with a random one (LivingEntity's
+        // constructor), which is not ordering-dependent.
+        sb.append("player.rot=").append(p.getYRot()).append(',').append(p.getXRot()).append('\n');
         sb.append("player.motion=").append(p.getDeltaMovement()).append('\n');
         sb.append("player.pose=").append(p.getPose()).append(" onGround=").append(p.onGround()).append('\n');
         sb.append("player.box=").append(p.getBoundingBox()).append('\n');

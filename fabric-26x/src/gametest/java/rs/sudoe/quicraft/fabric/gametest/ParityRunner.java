@@ -52,6 +52,11 @@ public final class ParityRunner {
             return f.standardChunks();
         }
 
+        /** Chunk positions the sender believes the client holds when the sequence starts. */
+        List<int[]> heldChunks(ParityFixture f) {
+            return f.standardChunks();
+        }
+
         /** False for a case with so many records that one tick per packet would take minutes. */
         boolean spread() {
             return true;
@@ -100,11 +105,11 @@ public final class ParityRunner {
 
     private static void runCase(ParityFixture f, ParityCase c, List<String> problems) {
         List<ParityPlanner.Item> items = c.items(f);
-        ParityPlanner plan = ParityPlanner.plan(items, f.standardChunks());
+        ParityPlanner plan = ParityPlanner.plan(items, c.heldChunks(f));
         c.checkPlan(plan, problems);
         List<int[]> orders = plan.orders(EXHAUSTIVE_CAP, RANDOM_EXTRAS);
         log(c, "records:\n" + plan.describe() + "legal orders: " + orders.size()
-                + (orders.size() > EXHAUSTIVE_CAP ? " (sampled)" : " (exhaustive)"));
+                + (plan.exhaustive(EXHAUSTIVE_CAP) ? " (exhaustive)" : " (sampled)"));
         int n = items.size();
         int[] tcp = new int[n];
         for (int i = 0; i < n; i++) {

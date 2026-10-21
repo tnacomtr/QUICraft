@@ -84,20 +84,44 @@ final class ParityPlanner {
         List<Record> records = new ArrayList<>();
         List<Step> raw = new ArrayList<>();
         Map<Long, Integer> byKey = new HashMap<>();
+        // heldCount() is package-private in core, so the planner counts held positions itself.
+        Set<Long> heldPositions = new LinkedHashSet<>();
+        for (int[] chunk : heldChunks) {
+            heldPositions.add(((long) chunk[0] << 32) ^ (chunk[1] & 0xffffffffL));
+        }
         for (Item item : items) {
             int id = packetId(item.frame());
-            SendRouteResolver.Resolved r = SendRouteResolver.resolve(table::routeV2For, extractors, PROTOCOL,
-                    Direction.CLIENTBOUND, ProtocolState.PLAY, id, item.frame());
-            if (r.failed()) {
-                throw new AssertionError(item.label() + " (id " + id + ") does not resolve: " + r.failure());
+            rs.sudoe.quicraft.core.routing.RouteV2 route = table.routeV2For(new rs.sudoe.quicraft.core.routing.RouteKey(
+                    PROTOCOL, ProtocolState.PLAY, Direction.CLIENTBOUND, id));
+            Record rec;
+            Fence fence;
+            boolean ack = false;
+            if (route != null && route.epochChange) {
+                // The table's flag, not an id: SessionSendDriver.submitEpochTransition (:645-669).
+                rec = sequencer.assignEpochTransition(item.frame());
+                fence = Fence.GLOBAL;
+                ParitySendReplica.afterEpochTransition(held, !heldPositions.isEmpty());
+                heldPositions.clear();
+            } else {
+                SendRouteResolver.Resolved r = SendRouteResolver.resolve(table::routeV2For, extractors, PROTOCOL,
+                        Direction.CLIENTBOUND, ProtocolState.PLAY, id, item.frame());
+                if (r.failed()) {
+                    throw new AssertionError(item.label() + " (id " + id + ") does not resolve: " + r.failure());
+                }
+                long position = ((long) r.chunkX() << 32) ^ (r.chunkZ() & 0xffffffffL);
+                if (r.fence() == Fence.CHUNK_INSTALL) {
+                    heldPositions.add(position);
+                } else if (r.fence() == Fence.CHUNK_FORGET) {
+                    heldPositions.remove(position);
+                }
+                fence = ParitySendReplica.effectiveFence(held, r.fence(), r.chunkX(), r.chunkZ());
+                int stream = ParitySendReplica.streamFor(sequencer, SHARDS, fence, r.chunkX(), r.chunkZ());
+                rec = sequencer.assign(stream, fence, item.frame(), r.interaction());
+                ack = fence == Fence.ACK_TRAILING;
             }
-            Fence fence = ParitySendReplica.effectiveFence(held, r.fence(), r.chunkX(), r.chunkZ());
-            int stream = ParitySendReplica.streamFor(sequencer, SHARDS, fence, r.chunkX(), r.chunkZ());
-            Record rec = sequencer.assign(stream, fence, item.frame(), r.interaction());
             byKey.put(key(rec.streamIndex(), rec.sequence()), records.size());
             records.add(rec);
-            raw.add(new Step(item.label(), id, fence, rec.streamIndex(), rec.sequence(), null,
-                    fence == Fence.ACK_TRAILING));
+            raw.add(new Step(item.label(), id, fence, rec.streamIndex(), rec.sequence(), null, ack));
         }
         List<Step> steps = new ArrayList<>();
         for (int i = 0; i < records.size(); i++) {
@@ -146,6 +170,11 @@ final class ParityPlanner {
             }
         }
         return false;
+    }
+
+    /** True when {@link #orders} lists every legal order. */
+    boolean exhaustive(int cap) {
+        return enumerate(cap + 1).size() <= cap;
     }
 
     /** True when the shipped rules allow exactly the TCP order. */

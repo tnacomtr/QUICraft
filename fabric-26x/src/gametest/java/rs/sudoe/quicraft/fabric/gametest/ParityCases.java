@@ -59,6 +59,8 @@ final class ParityCases {
         cases.add(new PlayerMotionAroundAck());
         cases.add(new VehicleAndMetadataAroundAck());
         cases.add(new RiderPositionSync());
+        cases.add(new RespawnWithHeldChunks());
+        cases.add(new LoginLikeEpochChange());
         return cases;
     }
 
@@ -461,5 +463,131 @@ final class ParityCases {
         }
 
         @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(p(f)); }
+    }
+
+    // ---- case 4: epoch changes (same-dimension respawn, login) --------------------------------------
+
+    /** The index of the epoch-change record, found by the table's flag via its packet id 82's label. */
+    private static int indexOf(ParityPlanner plan, String label) {
+        for (int i = 0; i < plan.steps().size(); i++) {
+            if (plan.steps().get(i).label().equals(label)) {
+                return i;
+            }
+        }
+        throw new AssertionError("no record labelled " + label);
+    }
+
+    /**
+     * (a) A same-dimension respawn while chunks are held and a prediction is pending: the client keeps its
+     * ClientLevel and prediction map. The sender cannot tell it from a dimension change, so after it every
+     * install carries the ack dependency, and nothing assigned after the respawn can cross it. TCP order:
+     * respawn (epoch change), ACK, reinstall of a held chunk, install of a new chunk. Illegal: both installs
+     * before the ACK, which makes the ACK overwrite the fresh chunk with the stone it restores.
+     */
+    static final class RespawnWithHeldChunks extends ParityCase {
+        @Override String name() { return "epoch-respawn-held-chunks"; }
+
+        @Override Expect expect() { return Expect.REORDERABLE; }
+
+        private int[] fresh;
+
+        @Override List<ParityPlanner.Item> items(ParityFixture f) {
+            int[] y = neighbourChunk(f);
+            fresh = ParityRunner.chunkInOtherShard(f, y[0], y[1]);
+            List<ParityPlanner.Item> items = new ArrayList<>();
+            items.add(item(f, "respawn(82) same dimension", f.sameDimensionRespawn()));
+            items.add(item(f, "block_changed_ack(4)", ack(1)));
+            items.add(new ParityPlanner.Item("level_chunk_with_light(45) reinstall held", f.chunkFrame(y[0], y[1])));
+            items.add(new ParityPlanner.Item("level_chunk_with_light(45) new chunk", f.chunkFrame(fresh[0], fresh[1])));
+            return items;
+        }
+
+        @Override void checkPlan(ParityPlanner plan, List<String> problems) {
+            int respawn = indexOf(plan, "respawn(82) same dimension");
+            int ack = indexOf(plan, "block_changed_ack(4)");
+            for (int i = 0; i < plan.steps().size(); i++) {
+                if (i != respawn && i > respawn && !plan.mustFollow(i, respawn)) {
+                    problems.add(plan.steps().get(i).label() + " can cross the epoch transition");
+                }
+            }
+            for (String label : List.of("level_chunk_with_light(45) reinstall held", "level_chunk_with_light(45) new chunk")) {
+                int install = indexOf(plan, label);
+                if (plan.steps().get(install).fence() != rs.sudoe.quicraft.core.multistream.StreamSequencer.Fence.CHUNK_ACK
+                        || !plan.mustFollow(install, ack)) {
+                    problems.add(label + " after a respawn with chunks held does not carry the ack dependency ("
+                            + plan.steps().get(install).fence() + ")");
+                }
+            }
+        }
+
+        @Override void setup(Minecraft client, ParityFixture f) {
+            predictedBreak(client.level, inNeighbour(f));
+            expectSequence(client.level, 1);
+        }
+
+        @Override List<BlockPos> watchBlocks(ParityFixture f) {
+            return List.of(inNeighbour(f), new BlockPos(fresh[0] << 4, f.base.getY() - 1, fresh[1] << 4));
+        }
+
+        @Override List<int[]> watchChunks(ParityFixture f) {
+            List<int[]> chunks = new ArrayList<>(f.standardChunks());
+            chunks.add(fresh);
+            return chunks;
+        }
+
+        @Override int[] illegalOrder(int items) { return new int[] {0, 2, 3, 1}; }
+    }
+
+    /**
+     * (b) The login-like shape: an epoch change while the sender holds nothing (a fresh session). The
+     * first-install exemption survives, so the install of a new chunk floats against the ACK; every order
+     * must still match TCP.
+     */
+    static final class LoginLikeEpochChange extends ParityCase {
+        @Override String name() { return "epoch-login-like-nothing-held"; }
+
+        @Override Expect expect() { return Expect.REORDERABLE; }
+
+        private int[] fresh;
+
+        @Override List<int[]> heldChunks(ParityFixture f) { return List.of(); }
+
+        @Override List<ParityPlanner.Item> items(ParityFixture f) {
+            int[] y = neighbourChunk(f);
+            fresh = ParityRunner.chunkInOtherShard(f, y[0], y[1]);
+            List<ParityPlanner.Item> items = new ArrayList<>();
+            items.add(item(f, "respawn(82) same dimension", f.sameDimensionRespawn()));
+            items.add(item(f, "block_changed_ack(4)", ack(1)));
+            items.add(new ParityPlanner.Item("level_chunk_with_light(45) first install", f.chunkFrame(fresh[0], fresh[1])));
+            return items;
+        }
+
+        @Override void checkPlan(ParityPlanner plan, List<String> problems) {
+            int respawn = indexOf(plan, "respawn(82) same dimension");
+            int install = indexOf(plan, "level_chunk_with_light(45) first install");
+            int ack = indexOf(plan, "block_changed_ack(4)");
+            if (plan.steps().get(install).fence() != rs.sudoe.quicraft.core.multistream.StreamSequencer.Fence.CHUNK) {
+                problems.add("the first install after an epoch change with nothing held is "
+                        + plan.steps().get(install).fence() + ", not the exempt CHUNK");
+            }
+            if (!plan.mustFollow(install, respawn) || plan.mustFollow(install, ack)) {
+                problems.add("the first install must follow the transition and float against the ACK");
+            }
+        }
+
+        @Override void setup(Minecraft client, ParityFixture f) {
+            predictedBreak(client.level, inNeighbour(f));
+            expectSequence(client.level, 1);
+        }
+
+        @Override List<BlockPos> watchBlocks(ParityFixture f) {
+            return List.of(inNeighbour(f), new BlockPos(fresh[0] << 4, f.base.getY() - 1, fresh[1] << 4));
+        }
+
+        @Override List<int[]> watchChunks(ParityFixture f) {
+            List<int[]> chunks = new ArrayList<>(f.standardChunks());
+            chunks.add(fresh);
+            return chunks;
+        }
     }
 }

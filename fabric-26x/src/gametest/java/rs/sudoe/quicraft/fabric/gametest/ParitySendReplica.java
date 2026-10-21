@@ -31,6 +31,13 @@ final class ParitySendReplica {
         return fence;
     }
 
+    /** The tracking part of SessionSendDriver.submitEpochTransition: an epoch change with chunks held stops tracking. */
+    static void afterEpochTransition(HeldChunkSet held, boolean anyHeld) {
+        if (anyHeld) {
+            held.markUnknown();
+        }
+    }
+
     /** SessionSendDriver.streamFor; throws for a fence it does not know (the guard). */
     static int streamFor(StreamSequencer sequencer, int shards, Fence fence, int chunkX, int chunkZ) {
         switch (fence) {
