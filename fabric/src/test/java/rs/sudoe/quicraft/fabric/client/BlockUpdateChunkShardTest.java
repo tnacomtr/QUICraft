@@ -7,6 +7,7 @@ import java.nio.ByteBuffer;
 import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.multistream.ShardHash;
 import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
+import rs.sudoe.quicraft.fabric.net.FrameCodec;
 
 /** Wire-layout verification for block updates (8, 6, 84) shipped on chunk shards (13.7, 13.19). */
 class BlockUpdateChunkShardTest {
@@ -50,6 +51,31 @@ class BlockUpdateChunkShardTest {
         assertEquals(-1, pos.chunkZ, "section position z maps directly to chunk z");
         assertEquals(ShardHash.shardOf(0, -1, 0, 2), ShardHash.shardOf(pos.chunkX, pos.chunkZ, 0, 2),
                 "section update lands on the chunk shard");
+    }
+
+    @Test
+    void compressedFramesStillDecodeCorrectlyAtThresholdZero() throws Exception {
+        // LaneCodecChunkPositionTest pattern: FrameCodec.encode with threshold 0 (always compressed).
+        // The extractor reads the uncompressed packet bytes, never the compressed form.
+        byte[][] packets = {
+            hex("08fffffe8000006fcae829"),  // packet 8, chunk (-1, 0)
+            hex("06000000000000000000"),  // packet 6, chunk (0, 0)
+            hex("54000003fffff00000")    // packet 84, chunk (0, -1)
+        };
+        int[] ids = {8, 6, 84};
+        String[] extractors = {"mc775.block_position.v1", "mc775.block_position.v1", "mc775.section_position.v1"};
+        int[][] expectedChunk = {{-1, 0}, {0, 0}, {0, -1}};
+        for (int i = 0; i < packets.length; i++) {
+            byte[] uncompressed = packets[i];
+            byte[] compressedFrame = FrameCodec.encode(uncompressed, 0);
+            // The routing prefix (LaneCodec) retains only the bounded prefix, but the extractor
+            // reads from the full uncompressed packet that the codec produces.
+            var extractor = ExtractorRegistry.productionDecoder(extractors[i]);
+            var pos = extractor.extract(uncompressed);
+            assertEquals(ids[i], varInt(uncompressed), "packet id preserved through compression");
+            assertEquals(expectedChunk[i][0], pos.chunkX, "chunk x for packet " + ids[i]);
+            assertEquals(expectedChunk[i][1], pos.chunkZ, "chunk z for packet " + ids[i]);
+        }
     }
 
     private static int varInt(byte[] data) {

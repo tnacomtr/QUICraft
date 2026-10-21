@@ -2189,6 +2189,7 @@ before this revision can run.
     not estimates based on packet size or sequence. Their own-stream predecessor is implicit.
     They never become CONTROL/view/global frontiers merely because they are joins; unrelated
     CONTROL and REALTIME continue.
+    An adapter MAY instead route block_changed_ack and chunk_batch_finished as CONTROL/global. That reproduces game emission order against every stream without coverage tracking, and makes every ack wait behind every earlier shard record (head-of-line blocking). The guarantees below, including ordering covered updates before an ack the game emitted first, apply only when ACK_JOIN is used.
     - **ACK_JOIN (block_changed_ack):** the adapter tracks the causal set of authoritative
       block/section/block-entity updates covered by the game prediction sequence. At the ack's
       logical send point, take the maximum sequence of every covered update on each chunk

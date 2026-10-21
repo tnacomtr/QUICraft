@@ -24,7 +24,7 @@ class ProductionRoutingResourceTest {
      * the table replaces this constant in the same commit.
      */
     private static final String DIGEST =
-            "177f7d87948dbaa201dda848f9b852675785dab1c27f9318a705327659bbd2c1";
+            "93392946b92f348fe7a353df9ba4944730a79d32050d8908b7ee830a7a5bda59";
 
     @Test
     void theShippedResourceLoadsThroughTheRegistry() {

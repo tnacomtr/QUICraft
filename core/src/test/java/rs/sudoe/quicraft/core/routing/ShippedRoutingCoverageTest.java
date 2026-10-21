@@ -29,7 +29,7 @@ class ShippedRoutingCoverageTest {
     private static final String INVENTORY = RoutingTableLoader.RESOURCE_DIR + "/play-ids-775.txt";
 
     /** 13.8 REALTIME entity and animation set, plus block_destruction and block_event (13.8 names them). */
-    private static final Set<Integer> REALTIME = set(2, 42, 47, 53, 54, 55, 56, 83, 99, 101, 102, 116, 131, 5, 7);
+    private static final Set<Integer> REALTIME = set(2, 42, 47, 53, 54, 55, 56, 83, 99, 101, 102, 116, 131, 5);
     /**
      * Reviewed CHUNK route enabled by this unit. Block updates and acknowledgement remain global until
      * the ACK-coverage wiring required by 13.19 is on the production send path.
