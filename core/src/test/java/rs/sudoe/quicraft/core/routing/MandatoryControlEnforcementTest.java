@@ -59,10 +59,17 @@ class MandatoryControlEnforcementTest {
         for (RouteKey key : EXPECTED) {
             // A serverbound route carries ordinarySmall, which only a CONTROL route may have (13.7), so the
             // rewrite to REALTIME drops it. The match includes the whole route tail, so it is exact.
+            // Clientbound login (49) and respawn (82) are epoch changes (13.18); the rewrite clears that flag too,
+            // so the mandatory-CONTROL rule is what rejects it, not the earlier epoch_change rule (13.7).
+            boolean epochKey = key.direction() == Direction.CLIENTBOUND
+                    && table.contains("\"packet_id\":" + key.packetId()
+                    + ",\"lane\":\"control\",\"dependency\":\"global\",\"position\":null,\"epoch_change\":true");
             String tail = key.direction() == Direction.SERVERBOUND
-                    ? ",\"position\":null,\"epoch_change\":false,\"ordinarySmall\":false" : "";
+                    ? ",\"position\":null,\"epoch_change\":false,\"ordinarySmall\":false"
+                    : epochKey ? ",\"position\":null,\"epoch_change\":true" : "";
             String rewritten = key.direction() == Direction.SERVERBOUND
-                    ? ",\"position\":null,\"epoch_change\":false" : "";
+                    ? ",\"position\":null,\"epoch_change\":false"
+                    : epochKey ? ",\"position\":null,\"epoch_change\":false" : "";
             String from = "\"direction\":\"" + key.direction().wireName() + "\",\"packet_id\":"
                     + key.packetId() + ",\"lane\":\"control\",\"dependency\":\"global\"" + tail;
             String to = "\"direction\":\"" + key.direction().wireName() + "\",\"packet_id\":"

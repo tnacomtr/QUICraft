@@ -60,9 +60,10 @@ class ShippedRoutingCoverageTest {
     private static final Map<Integer, String> LIST = map(13, "chunk_list");
     // Position-dependent, kept global so they never overtake a pending ACK collision snap or a block update:
     // animate (2), move_vehicle (35), player_look_at (71), set_entity_data (99) and teleport_entity (125).
-    // Deliberate global deferrals (CP1), all CONTROL/global: login (49) and respawn (82),
-    // because epoch routes are not wired; light_update (48), with no reviewed layout; explode (36) and
-    // level_event (46), kept global as a safe superset of 13.8.
+    /** 13.18: the level-creating packets login (49) and respawn (82) are CONTROL/global epoch changes. */
+    private static final Set<Integer> EPOCH = new HashSet<Integer>(java.util.Arrays.asList(49, 82));
+    // Deliberate global deferrals (CP1), all CONTROL/global: light_update (48), with no reviewed layout;
+    // explode (36) and level_event (46), kept global as a safe superset of 13.8.
 
     @Test
     void theShippedTableRoutesEveryInventoryIdExactlyOnce() throws IOException {
@@ -200,7 +201,9 @@ class ShippedRoutingCoverageTest {
 
     /** What the reviewed class of a clientbound id is, or null when the route matches it. */
     private static String clientboundMismatch(int id, RouteV2 route) {
-        if (route.epochChange) return "epoch change is deferred (CP1)";
+        if (route.epochChange != EPOCH.contains(id)) {
+            return "epoch_change is " + route.epochChange + ", expected " + EPOCH.contains(id) + " (13.18)";
+        }
         if (REALTIME.contains(id)) {
             return expect(route, RouteV2.StreamLane.REALTIME, Dependency.LANE, null);
         }

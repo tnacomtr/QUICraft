@@ -175,6 +175,63 @@ class SessionSendDriverAckTest {
     }
 
     @Test
+    void anEpochChangeWithNothingHeldKeepsTheFirstInstallExemption() throws Exception {
+        Rig rig = new Rig();
+        // Login (49) is an epoch change before any chunk: the initial view burst stays exempt.
+        assertTrue(rig.driver.submitEpochTransition(frame()).isAssigned());
+        rig.send(Fence.ACK_TRAILING, 0, 0);
+        SentPacket fresh = rig.send(Fence.CHUNK_INSTALL, 4, 4);
+        rig.send(Fence.CHUNK_FORGET, 4, 4);
+        // Nothing held again, but 4 is in the forget ring: a second change keeps tracking, and the ring still binds.
+        assertTrue(rig.driver.submitEpochTransition(frame()).isAssigned());
+        rig.send(Fence.ACK_TRAILING, 0, 0);
+        SentPacket reinstall = rig.send(Fence.CHUNK_INSTALL, 4, 4);
+        SentPacket other = rig.send(Fence.CHUNK_INSTALL, 900, 900);
+        rig.drain();
+        assertFalse(rig.dependsOnAck(fresh), "a first install after login is exempt");
+        assertTrue(rig.dependsOnAck(reinstall), "a forgotten position still needs the ack");
+        assertFalse(rig.dependsOnAck(other), "a first install after an empty-set epoch change is exempt");
+    }
+
+    @Test
+    void twoConsecutiveEpochChangesWithAPendingAckAndHeldInstallsKeepOrderAndStopTrusting() throws Exception {
+        Rig rig = new Rig();
+        // An ACK-stream record the client has not acknowledged, and a first install that is still held.
+        SentPacket ack = rig.send(Fence.ACK_TRAILING, 0, 0);
+        SentPacket held = rig.send(Fence.CHUNK_INSTALL, 4, 4);
+        SentPacket first = rig.driver.submitEpochTransition(frame());
+        SentPacket afterFirst = rig.send(Fence.CHUNK_INSTALL, 40, 40);
+        // A same-dimension respawn straight after: a second transition at the new epoch (13.18).
+        SentPacket second = rig.driver.submitEpochTransition(frame());
+        SentPacket afterSecond = rig.send(Fence.CHUNK_INSTALL, 4, 4);
+        SentPacket fresh = rig.send(Fence.CHUNK_INSTALL, 900, 900);
+        assertEquals(2, rig.driver.sendEpoch());
+        rig.drain();
+        assertFalse(rig.dependsOnAck(held), "before any epoch change the first install is exempt");
+        assertEquals(0, rig.record(first).epoch(), "a transition carries the old epoch");
+        assertEquals(1, rig.record(afterFirst).epoch());
+        assertEquals(1, rig.record(second).epoch());
+        assertEquals(2, rig.record(afterSecond).epoch());
+        assertTrue(second.sequence() > first.sequence(), "same CONTROL stream: the first is its implicit predecessor");
+        assertEquals(second.sequence(), dependencyOn(rig.record(afterSecond), 0),
+                "later records depend on the latest transition");
+        assertTrue(rig.dependsOnAck(afterFirst), "no first install is trusted after the first change");
+        assertTrue(rig.dependsOnAck(afterSecond), "a position held before both changes needs the ack");
+        assertTrue(rig.dependsOnAck(fresh), "still untrusted after the second change");
+        assertEquals(ack.sequence(), dependencyOn(rig.record(first), N + 2),
+                "the transition waits for the pending ACK-stream record (13.10)");
+    }
+
+    private static long dependencyOn(Record record, int stream) {
+        for (Record.Dependency dependency : record.dependencies()) {
+            if (dependency.streamIndex() == stream) {
+                return dependency.sequence();
+            }
+        }
+        return -1;
+    }
+
+    @Test
     void aChunkLifecycleRecordInsideABundleMakesLaterInstallsCarryTheAck() throws Exception {
         Rig rig = new Rig();
         rig.send(Fence.ACK_TRAILING, 0, 0);

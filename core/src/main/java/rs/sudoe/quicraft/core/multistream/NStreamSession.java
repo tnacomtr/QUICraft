@@ -1751,6 +1751,11 @@ public final class NStreamSession implements MultistreamSession {
         return sendDriver;
     }
 
+    /** The receive epoch of a client session (13.18), or -1 on a server session; call on the loop. */
+    long receiveEpoch() {
+        return clientDriver == null ? -1 : clientDriver.receiver().epoch();
+    }
+
     QuicStreamWriteSink sink() {
         return sink;
     }

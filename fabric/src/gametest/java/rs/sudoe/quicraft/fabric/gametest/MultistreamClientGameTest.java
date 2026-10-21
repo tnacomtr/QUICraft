@@ -190,7 +190,10 @@ public class MultistreamClientGameTest implements FabricClientGameTest {
                     "keep-alive decoded: " + decoded.packet());
             check(decoded.state() == ProtocolState.CONFIGURATION, "decoded in configuration: " + decoded.state());
             check(decoded.bundle() == Envelope.Bundle.NONE && !decoded.stateChange(), "an ordinary packet");
-            check(reservations.retained.size() == 1, "the budget was charged before decoding: " + reservations.retained);
+            // Two charges, both before decoding: the decode storage, then the bounded routing prefix (13.12).
+            check(reservations.retained.size() == 2 && reservations.retained.get(1) <= 64
+                    && reservations.retained.get(1) == decoded.retainedBytes(),
+                    "the budget was charged before decoding: " + reservations.retained);
 
             if (compressed) {
                 String big = "x".repeat(2000);
