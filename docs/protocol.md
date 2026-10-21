@@ -1500,7 +1500,7 @@ before this revision can run.
      it does not justify a production identifier for that layout.
    `block_update` (8) and `block_entity_data` (6) (CHUNK with `mc775.block_position.v1`), and
    `section_blocks_update` (84) (CHUNK with `mc775.section_position.v1`) ship in this release;
-   6 carries the `ack` dependency and 8 does not (13.9). `block_changed_ack` (4) and
+   6, 8 and 84 carry the `ack` dependency (13.9). `block_changed_ack` (4) and
    `chunk_batch_finished` (11) ship on the ACK stream with `trailing` (13.21); no ACK_JOIN or
    BATCH_JOIN route ships. `light_update` (48) remains unchanged and lacks a reviewed
    production layout.
@@ -1547,15 +1547,23 @@ before this revision can run.
      include the previous BATCH_JOIN frontier as an explicit semantic dependency (13.19).
    - Control fence: previous A[CONTROL,REALTIME]; then set C to this record.
    - Ordinary CONTROL: nothing further (the shipped clientbound set is in 13.7; an unlisted
-     CONTROL route stays global). Ordinary CONTROL, REALTIME and plain `lane` records have no
-     dependency on the ACK stream.
+     CONTROL route stays global).
     - Serverbound interaction CONTROL (`interaction`): latest serverbound REALTIME A[1],
       in addition to G and implicit own predecessor; ordinary CONTROL omits this edge.
     - REALTIME: latest C; serverbound REALTIME explicitly encodes max(G,C), the latest global
       or control fence.
    - Ordinary chunk: latest V only. It never waits for unrelated CONTROL or REALTIME.
-   - Chunk `ack` (6, 37 and a replacing 45; 13.21): the ordinary chunk dependencies plus
+   - Chunk `ack` (6, 8, 84, 37 and a replacing 45; 13.21): the ordinary chunk dependencies plus
      `lastAck` on the ACK stream when non-zero.
+   - After the ACK (13.21): every control fence, ordinary CONTROL and REALTIME record also
+     depends on `lastAck` when non-zero, like chunk `ack`. No record assigned after an ACK-stream
+     record runs before it; since the ACK trails every earlier record, its position relative to
+     every record is the game's emission order. A later mount (107), equipment or inventory
+     change (102, 18, 20, 108), attribute (131), velocity (101) or block change therefore never
+     alters the ACK's prediction rollback and collision snap (security review 2026-10-21, r3).
+     The only record that skips it is an exempted first install (plain chunk, below). The cost
+     falls only on records sent while an ACK is still undelivered, that is during block
+     interaction; with no pending ACK the dependency is already satisfied.
    - ACK `trailing` (4, 11; 13.21): the componentwise maximum of everything assigned on every
      stream, the global footprint with the ACK stream included. The record advances no
      frontier: not G, not C, not V. It sets `lastAck`.
@@ -1567,11 +1575,10 @@ before this revision can run.
    block prediction (the client cannot predict in an unloaded chunk), while a replacement or a
    re-install after a forget can, because a forget does not clear the client's prediction map.
    The ring never evicts: the forget that would overflow the 256-entry ring stops tracking
-   (`markUnknown()`), making the set untrusted; from then on every 45 carries `ack` until the next
-   epoch change (`markUnknown()` marks tracking unknown; `clear()` is never used at epoch). Packets 6 (block_entity_data)
-   and 37 (forget_level_chunk) always carry `ack`. Held-set cap 4096: above the cap the sender
-   stops tracking and every 45 carries `ack` until the next epoch change. A 45 or 37 sent inside
-   a bundle is not tracked; from then on every 45 carries `ack` until the next epoch change.
+   (`markUnknown()`), making the set untrusted; from then on every 45 carries `ack` for the rest
+   of the session. Packets 6, 8, 84 and 37 always carry `ack`. Held-set cap 4096: above the cap
+   the sender stops tracking the same way. A 45 or 37 sent inside a bundle is not tracked; from
+   then on every 45 carries `ack` for the rest of the session.
    Every epoch change marks the held set unknown (`markUnknown()`), never clears it
    (`clear()`): a same-dimension respawn keeps the client's `ClientLevel` and its prediction map
    (`ClientPacketListener.java:1227-1251`, `ClientLevel.java:162`), so the sender cannot distinguish
@@ -2545,21 +2552,20 @@ before this revision can run.
     13.13).
     - Sender dependencies: `trailing` is the componentwise maximum of everything assigned on
       every stream, the global footprint with the ACK stream included. It advances no frontier
-      (not G, not C, not V) and sets `lastAck`. Chunk records routed `ack` (6, 37 and a
-      replacing 45) take their usual chunk dependencies plus `lastAck` when non-zero (13.9).
-      Global and view records take the maximum over every stream, so login, respawn,
-      configuration changes and chunk_batch_start wait for earlier ACKs.
+      (not G, not C, not V) and sets `lastAck`. Every later record except an exempted first
+      install also depends on `lastAck` when non-zero: chunk `ack` (6, 8, 84, 37, a replacing
+      45), control fences, ordinary CONTROL and REALTIME (13.9). Global and view records take
+      the maximum over every stream, so they wait for earlier ACKs too.
     - Why: an ACK before an earlier block update would write stale state, so `trailing`
-      forbids exactly that. Block updates after an ACK may overtake it: the client only
-      refreshes its stored server state while a prediction is open, and the ACK then writes
-      the newest stored state, the same final state as TCP. Data that must not overtake a
-      pending ACK (6, 37, a replacing 45) carries the `ack` dependency.
+      forbids that. A record after an ACK must not run before it either: the ACK restores the
+      saved server state and collision-snaps the player, so a later block update, mount,
+      equipment, attribute or position change applied first changes the outcome. With both
+      rules the ACK keeps the game's emission order against every record, the TCP order.
     - First install: a 45 omits `ack` only when its position is neither held nor in the last
       256 forgotten positions. Held positions are added on a 45 and removed on a 37, cap 4096;
-      above the cap tracking stops and every 45 carries `ack` until the next epoch change. A
-      45 or 37 sent inside a bundle is not tracked, and from then on every 45 carries `ack`
-      until the next epoch change (marked unknown by `markUnknown()`, never cleared by `clear()`;
-      13.9, 13.18). A sender that cannot tell uses `ack`.
+      above the cap, on a forget-ring overflow, on a 45 or 37 sent inside a bundle and on every
+      epoch change tracking stops (`markUnknown()`) and every 45 carries `ack` for the rest of
+      the session (13.9, 13.18). A sender that cannot tell uses `ack`.
     - Bundles: a bundle containing 4 or 11 is promoted whole to CONTROL/global, like a CHUNK
       member; the ACK stream carries only single records (13.15).
     - Receiver: a record must be kind GAME, a single record (no bundle, END or join), and match
