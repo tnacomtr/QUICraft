@@ -1197,9 +1197,12 @@ before this revision can run.
      fence. Later REALTIME waits for it; chunks do not. Use for entity spawn/remove and
      teleport relations, preserving spawn-before-move, move-before-remove/id reuse, and
      teleport-before-dependent movement. The shipped clientbound set is `add_entity` (1),
-     `entity_position_sync` (35), `player_abilities` (64), `remove_entities` (77),
-     `set_entity_link` (100), `set_passengers` (107), `take_item_entity` (124) and
-     `teleport_entity` (125).
+     `player_abilities` (64), `remove_entities` (77), `set_entity_link` (100), `set_passengers` (107),
+     `take_item_entity` (124) and `teleport_entity` (125); `entity_position_sync` (35, `move_vehicle`)
+     is global: it snaps a non-authoritative vehicle and repositions the local passenger
+     (`ClientPacketListener.java:654-666`), and a local passenger need not control the vehicle
+     (`Entity.java:3490-3496`). A later target-sensitive route (only records about the receiving
+     player's own entity or vehicle stay global) is future work.
    - **Ordinary CONTROL:** waits for its CONTROL predecessor and latest global fence only.
      Keepalive and reviewed unrelated control packets MUST NOT fence REALTIME. The shipped
      clientbound set is the 93 ids listed in 13.7 (including keepalive 44 and set_time 113).
@@ -1392,7 +1395,7 @@ before this revision can run.
     player (`ClientPacketListener.java:674-680,805-823`), and the vehicle handler can reposition the
     rider (`:699-701`); reordering against an ACK snap changes the outcome. Keepalive (44),
     set_time (113) and the rest of that set are unrelated control traffic, not ordering barriers.
-    The seven control fences are 1, 35, 64, 77, 100, 107, 124 (13.5); `teleport_entity` (125) stays
+    The six control fences are 1, 64, 77, 100, 107, 124 (13.5); `teleport_entity` (125) stays
     global, not a fence. They keep the REALTIME fence but no longer wait for chunks. Every other
     clientbound CONTROL route is global as listed in the deferrals below, except the view gate
     (12) and the list route (13).
@@ -1450,13 +1453,16 @@ before this revision can run.
    `ChunkPos.pack`'s exact long. Any future capture that adds a 37 frame should be added to
    `captured-775-vectors.txt` as for the other layouts.
 
-   REALTIME routes, with their 13.8 basis: the shipped entity and animation set `animate` (2),
-   `hurt_animation` (42), `level_particles` (47), `move_entity_pos` (53), `move_entity_pos_rot` (54),
-   `move_minecart_along_track` (55), `move_entity_rot` (56), `rotate_head` (83), `set_entity_data` (99),
-   `set_entity_motion` (101), `set_equipment` (102), `sound_entity` (116) and `update_attributes` (131),
-   which the msv scratch run exercised live. `block_destruction` (5) is the no-chunk-ordering class 13.8
-   names: "block_event, level_event, explode and block_destruction need no chunk ordering; reviewed
-   routes may use REALTIME/lane without a chunk dependency". `block_event` (7) stays CONTROL/global
+   REALTIME routes (12 ids): `block_destruction` (5), `hurt_animation` (42), `level_particles` (47),
+   `move_entity_pos` (53), `move_entity_pos_rot` (54), `move_minecart_along_track` (55),
+   `move_entity_rot` (56), `rotate_head` (83), `set_entity_motion` (101), `set_equipment` (102),
+   `sound_entity` (116) and `update_attributes` (131). `animate` (2) and `set_entity_data` (99) are
+   CONTROL/global: `animate` action 2 (wake from bed) reads the bed and surroundings
+   (`ClientPacketListener.java:1092-1094`, `LivingEntity.java:3705-3725`); sleeping-position
+   metadata (`set_entity_data`) calls `setPosToBed` (`LivingEntity.java:3424-3428`).
+   The 12 REALTIME routes above are the msv scratch run exercised live set. `block_destruction` (5)
+   fits the no-chunk-ordering class 13.8 names: "block_event, level_event, explode and block_destruction
+   need no chunk ordering; reviewed routes may use REALTIME/lane without a chunk dependency". `block_event` (7) stays CONTROL/global
    (ghost-block reason above); `level_event` (46) and `explode` (36) stay global as the safe superset.
    `level_particles` (47) is kept from the shipped table; 13.8 does not name it, so it is the one
    REALTIME route resting on the shipped classification rather than on the spec text.
@@ -1517,7 +1523,7 @@ before this revision can run.
    Entity storage is chunk-independent: spawn does not wait for a chunk install; forgetting
    a chunk does not remove entities. Spawn and entity-data bundles stay whole on CONTROL
    under 13.15. Entity updates on REALTIME wait for their CONTROL fence; removal waits for
-   earlier REALTIME, not chunk traffic. The shipped control fences are the eight ids of 13.5;
+   earlier REALTIME, not chunk traffic. The shipped control fences are the six ids of 13.5;
    the shipped ordinary CONTROL ids wait only for their CONTROL predecessor and G.
    block_event, level_event, explode and block_destruction need no chunk ordering; reviewed
    routes may use REALTIME/lane without a chunk dependency. View changes and joins obey 13.5/13.19. Any unproven type remains
@@ -1562,12 +1568,15 @@ before this revision can run.
    re-install after a forget can, because a forget does not clear the client's prediction map.
    The ring never evicts: the forget that would overflow the 256-entry ring stops tracking
    (`markUnknown()`), making the set untrusted; from then on every 45 carries `ack` until the next
-   epoch change (`clear()` clears both the held set and the ring). Packets 6 (block_entity_data)
+   epoch change (`markUnknown()` marks tracking unknown; `clear()` is never used at epoch). Packets 6 (block_entity_data)
    and 37 (forget_level_chunk) always carry `ack`. Held-set cap 4096: above the cap the sender
    stops tracking and every 45 carries `ack` until the next epoch change. A 45 or 37 sent inside
    a bundle is not tracked; from then on every 45 carries `ack` until the next epoch change.
-   Every epoch change (a route with `epoch_change:true`) clears both the held set and the ring,
-   since the client drops all chunks there. Memory: the open-addressing `long[]` table grows
+   Every epoch change marks the held set unknown (`markUnknown()`), never clears it
+   (`clear()`): a same-dimension respawn keeps the client's `ClientLevel` and its prediction map
+   (`ClientPacketListener.java:1227-1251`, `ClientLevel.java:162`), so the sender cannot distinguish
+   a dimension change from a same-dimension respawn; the first-install exemption covers the initial
+   view burst after join only. Memory: the open-addressing `long[]` table grows
    lazily from 64 entries to at most 8192 (doubling on growth); the 256-entry ring is a fixed
    `long[256]`. Worst case per session: 8192 table entries (65,536 bytes) plus the ring
    (2,048 bytes) = 67,584 bytes, plus overhead. The arrays are released by `clear()`,
@@ -2251,8 +2260,9 @@ before this revision can run.
     records carry the new epoch and depend on it. Start-configuration alone does not create
     a level or increment epoch. Sequences remain connection-scoped, never restart at epoch
     boundaries; positions, installed-chunk tracking, batch/update frontiers and the 13.9
-    first-install held set and 256-entry forget ring are keyed by epoch and cleared at level
-    replacement. No old-epoch record can execute after that fence. Epoch drain counts a record
+    first-install held set and 256-entry forget ring are keyed by epoch; an epoch change
+    marks them unknown (`markUnknown()`), never clears them (`clear()`), because a same-dimension
+    respawn keeps the client's level and prediction map (13.9, 13.18). No old-epoch record can execute after that fence. Epoch drain counts a record
     as applied (D), not queued (Q), on every stream, the ACK stream included (13.10).
     New-epoch envelopes may arrive early, but remain opaque until their transition dependency
     executes; reject stale epochs or a future epoch without the corresponding transition
@@ -2547,8 +2557,8 @@ before this revision can run.
       256 forgotten positions. Held positions are added on a 45 and removed on a 37, cap 4096;
       above the cap tracking stops and every 45 carries `ack` until the next epoch change. A
       45 or 37 sent inside a bundle is not tracked, and from then on every 45 carries `ack`
-      until the next epoch change. Every epoch change clears the held set and the ring (13.9,
-      13.18). A sender that cannot tell uses `ack`.
+      until the next epoch change (marked unknown by `markUnknown()`, never cleared by `clear()`;
+      13.9, 13.18). A sender that cannot tell uses `ack`.
     - Bundles: a bundle containing 4 or 11 is promoted whole to CONTROL/global, like a CHUNK
       member; the ACK stream carries only single records (13.15).
     - Receiver: a record must be kind GAME, a single record (no bundle, END or join), and match
