@@ -1171,3 +1171,9 @@ Production defaults (coalescing on, timer fix on), commit ce9b9e1, same real-Fab
 Against the coalescing table above (clean /3 3296 ms, delayloss /3 4699-5190 ms) the clean-link chunk load halves
 and delayloss improves, with RTT still at TCP parity under loss. Open: clean /3 still trails TCP (1497 vs 753 ms
 chunk load, 1.50 vs 0.59 ms RTT); join is ~0.2-0.6 s slower.
+
+After review, the timer restarts only on the network-thread pass of a chunk (vanilla replays the handler on the
+main thread). Smoke rerun at 4b10c7d, n=2 per arm, interleaved TCP: clean tcp chunk 861 (843-880) / /3 1591
+(1472-1710) ms, RTT 0.61 / 1.81 ms; delayloss tcp 24056 / /3 3101 ms, RTT 150.67 / 151.70 ms; 0 disconnects. The
+gain holds. The clean /3 RTT (1.81 vs 1.50 ms) and join (2049 vs 1695 ms) are higher than the n=3 table, within
+what n=2 can tell apart.
