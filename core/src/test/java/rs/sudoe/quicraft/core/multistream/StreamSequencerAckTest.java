@@ -98,7 +98,7 @@ class StreamSequencerAckTest {
         StreamSequencer s = sequencer();
         int ackStream = s.ackIndex();
         for (Fence fence : new Fence[] {Fence.ORDINARY_CONTROL, Fence.CONTROL_FENCE}) {
-            assertTrue(!deps(s.assign(0, fence, NONE, false)).containsKey(ackStream), fence);
+            assertTrue(!deps(s.assign(0, fence, NONE, false)).containsKey(ackStream), fence.name());
         }
         assertTrue(!deps(s.assign(1, Fence.REALTIME, NONE, false)).containsKey(ackStream));
         assertTrue(!deps(s.assign(2, Fence.CHUNK_ACK, NONE, false)).containsKey(ackStream));
