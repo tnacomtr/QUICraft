@@ -1357,34 +1357,44 @@ before this revision can run.
     vectors, shipped-table coverage and ordering tests pass; the ordering argument and
     remaining deferrals are below.
     Shipped routing, ordering argument (26.1.2). **DRAFT pending security review.** `level_chunk_with_light`
-    (45) uses CHUNK with `mc775.chunk_xz.v1` and the 13.21 `ack` dependency; `block_update` (8) uses CHUNK
-    with `mc775.block_position.v1` and `lane`; `block_entity_data` (6) uses CHUNK with
+    (45) uses CHUNK with `mc775.chunk_xz.v1` and `ack`; `block_update` (8) uses CHUNK with
+    `mc775.block_position.v1` and `ack`; `block_entity_data` (6) uses CHUNK with
     `mc775.block_position.v1` and `ack`; `section_blocks_update` (84) uses CHUNK with
-    `mc775.section_position.v1` and `lane`; and `forget_level_chunk` (37) uses CHUNK with
-    `mc775.chunk_pos_long.v1` and `ack`. They hash the same chunk column as `level_chunk_with_light`, so one
-    chunk's install, updates, block-entity data and forget keep game order in one lane.
+    `mc775.section_position.v1` and `ack`; and `forget_level_chunk` (37) uses CHUNK with
+    `mc775.chunk_pos_long.v1` and `ack`. All five CHUNK routes carry `ack`: a later block-state
+    update (6, 8, 84) applied before the ACK would change the client's saved server state before
+    the ACK restores it, and would alter the collision-snap outcome; the dependency is not
+    ACK-commutative. They hash the same chunk column as `level_chunk_with_light`, so one chunk's
+    install, updates, block-entity data and forget stay ordered by `ack`.
     `block_changed_ack` (4) and `chunk_batch_finished` (11) use the ACK stream (13.21) with `trailing`: a
     trailing record depends on the assigned maximum of every stream, ACK included, and advances no frontier.
-    Each ack therefore executes after every update the game emitted before it, while later block-state updates
-    (8, 84) may overtake it: while a prediction is open the client only refreshes its stored server state, and
-    the ack then writes the newest stored state, the same final state as TCP. That is the game's emission order
-    on the dangerous side, i.e. TCP parity. It includes the rare case where the game emits an ack before an
-    update it covers (26.1.2: tasks run inside a tick by `reloadResources`); vanilla TCP shows the same
+    Each ack executes after every earlier assigned record, including any chunk update (6, 8, 84) that
+    carries `ack`. A later block-state update applied before the ACK changes the client's saved
+    server state and the collision-snap outcome: if the saved state is SOLID and the update is AIR,
+    applying AIR first lets the ACK see AIR as visible and skip the snap to the saved SOLID, so
+    TCP parity requires the `ack` dependency on all five CHUNK routes. The dependency is not
+    ACK-commutative. It includes the rare case where the game emits an ack before an update it
+    covers (26.1.2: tasks run inside a tick by `reloadResources`); vanilla TCP shows the same
     transient there. Block-entity data (6), forget (37) and a replacing install (45) must not overtake a
     pending ack, so they carry `ack` (13.9, 13.21). ACK_JOIN/BATCH_JOIN (13.19) remain unshipped; the ACK
     stream replaces them. `block_event` (7) is CONTROL/global, because the client applies it to its current block
     state and a piston event run against a reordered state can leave a permanent ghost block.
-    Clientbound CONTROL dependencies are narrowed (13.5): the 93 ordinary CONTROL ids are 3, 9,
+    Clientbound CONTROL dependencies are narrowed (13.5): the 92 ordinary CONTROL ids are 3, 9,
     10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 33, 34, 38, 39, 40,
-    41, 43, 44, 50, 51, 52, 58, 59, 61, 62, 63, 65, 66, 67, 68, 69, 70, 71, 73, 74, 75, 76, 78,
-    79, 80, 81, 85, 86, 87, 88, 89, 90, 91, 92, 93, 96, 97, 98, 103, 104, 105, 106, 108, 109,
-    110, 112, 113, 114, 115, 117, 119, 120, 121, 122, 123, 126, 127, 128, 130, 132, 133, 134,
-    135, 136, 137, 138, 139, 140. They wait only for their CONTROL predecessor and G, so they
-    neither wait for chunk frontiers nor fence later REALTIME. Keepalive (44), set_time (113)
-    and the rest of that set are unrelated control traffic, not ordering barriers. The eight
-    control fences are 1, 35, 64, 77, 100, 107, 124 and 125 (13.5); they keep the REALTIME
-    fence but no longer wait for chunks. Every other clientbound CONTROL route is global as
-    listed in the deferrals below, except the view gate (12) and the list route (13).
+    41, 43, 44, 50, 51, 52, 58, 59, 61, 62, 63, 65, 66, 67, 68, 69, 70, 73, 74, 75, 76, 78, 79, 80, 81,
+    85, 86, 87, 88, 89, 90, 91, 92, 93, 96, 97, 98, 103, 104, 105, 106, 108, 109, 110, 112, 113, 114, 115,
+    117, 119, 120, 121, 122, 123, 126, 127, 128, 130, 132, 133, 134, 135, 136, 137, 138, 139, 140. They wait
+    only for their CONTROL predecessor and G, so they neither wait for chunk frontiers nor fence
+    later REALTIME. `player_look_at` (71) is global: `Entity.lookAt` computes rotation from the
+    player's current position, and a pending ACK collision snap changes that position. `teleport_entity`
+    (125) is global: the removed-player-vehicle branch applies a relative teleport directly to the
+    player (`ClientPacketListener.java:674-680,805-823`), and the vehicle handler can reposition the
+    rider (`:699-701`); reordering against an ACK snap changes the outcome. Keepalive (44),
+    set_time (113) and the rest of that set are unrelated control traffic, not ordering barriers.
+    The seven control fences are 1, 35, 64, 77, 100, 107, 124 (13.5); `teleport_entity` (125) stays
+    global, not a fence. They keep the REALTIME fence but no longer wait for chunks. Every other
+    clientbound CONTROL route is global as listed in the deferrals below, except the view gate
+    (12) and the list route (13).
     Remaining relaxation: records for different chunk columns may reorder among themselves and against
     REALTIME. Light remains global. REALTIME waits for the latest CONTROL fence and the view gate is a
     fence for later REALTIME; ordinary CONTROL records do not fence later REALTIME.
@@ -1402,8 +1412,10 @@ before this revision can run.
    - `light_update` (48): the `varint_xz` layout was dropped (addendum A4). Every light-changing play
      edit tried on the live 26.1.2 client produced no light update, so naming `varint_xz` would be an
      assumption.
-   - `explode` (36) and `level_event` (46): kept global. 13.8 says they need no chunk ordering, so
-     REALTIME would also be safe; global is the safe superset until a reviewed route is wanted.
+   - `explode` (36) and `level_event` (46): kept global. `level_event` (46) is not REALTIME-safe:
+     `LevelEventHandler` makes sound conditional on the current block state (`LevelEventHandler.java:450-463`)
+     and drops vault activation effects without the block entity (`:495-501`). Global is the safe
+     superset until a reviewed route is wanted.
    - Serverbound dual-lane (13.8 "Proposed"): every serverbound id is CONTROL/global.
    - `chunks_biomes` (13): CONTROL/global with its reviewed `mc775.chunk_list.v1` extractor, as 13.8 says.
 
@@ -1420,8 +1432,8 @@ before this revision can run.
    | --- | --- | --- | --- |
    | `mc775.chunk_list.v1` | `chunks_biomes` (13) | CONTROL/global, list extractor | `captured-775-vectors.txt` |
    | `mc775.chunk_xz.v1` | `level_chunk_with_light` (45) | CHUNK install with `ack` (13.9, 13.21) | `captured-775-vectors.txt` |
-   | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | CHUNK/lane block update (8); CHUNK/`ack` block-entity update (6) | `captured-775-vectors.txt` |
-   | `mc775.section_position.v1` | `section_blocks_update` (84) | CHUNK/lane section update (13.7) | `captured-775-vectors.txt` |
+   | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | CHUNK block update with `ack` (8); CHUNK/`ack` block-entity update (6) | `captured-775-vectors.txt` |
+   | `mc775.section_position.v1` | `section_blocks_update` (84) | CHUNK section update with `ack` (13.8) | `captured-775-vectors.txt` |
    | `mc775.chunk_pos_long.v1` | `forget_level_chunk` (37) | CHUNK forget with `ack` (13.9, 13.21) | `ForgetLevelChunkGameCodecTest`: the game's own play-packet encoder |
    | `mc775.join.v1` | `block_changed_ack` (4), `chunk_batch_finished` (11) | none: the ACK stream (13.21) replaces joins | `captured-775-vectors.txt` |
    | `mc775.raw_copies.v1` | footprint accounting for every state's serverbound limits | `decodeFootprintBound` | 13.12 boundary vectors in `ExtractorGoldenTest` |
@@ -1463,8 +1475,8 @@ before this revision can run.
    | Identifier | Layout after the packet id | Real 775 packet(s) | Route(s) that may use it | Captured |
    | --- | --- | --- | --- | --- |
    | `mc775.chunk_xz.v1` | big-endian int32 chunk x, int32 chunk z | `level_chunk_with_light` | CHUNK install with conditional `ack` (13.9, 13.21) | `level_chunk_with_light` |
-   | `mc775.block_position.v1` | packed BlockPos long: x in bits 38..63, z in 12..37, y in 0..11 (unread); chunk = `x/16`, `z/16` floor | `block_update`, `block_entity_data` | CHUNK/lane block update (8); CHUNK/`ack` block-entity update (6) | `block_update`, `block_entity_data` |
-   | `mc775.section_position.v1` | packed SectionPos long: x in bits 42..63, z in 20..41, y in 0..19 (unread); already chunk coordinates | `section_blocks_update` | CHUNK/lane section update (13.8) | `section_blocks_update` |
+   | `mc775.block_position.v1` | packed BlockPos long: x in bits 38..63, z in 12..37, y in 0..11 (unread); chunk = `x/16`, `z/16` floor | `block_update`, `block_entity_data` | CHUNK block update with `ack` (8); CHUNK/`ack` block-entity update (6) | `block_update`, `block_entity_data` |
+   | `mc775.section_position.v1` | packed SectionPos long: x in bits 42..63, z in 20..41, y in 0..19 (unread); already chunk coordinates | `section_blocks_update` | CHUNK section update with `ack` (13.8) | `section_blocks_update` |
    | `mc775.chunk_pos_long.v1` | one big-endian packed ChunkPos long: x low 32 bits, z high 32 (`ChunkPos.pack`, `FriendlyByteBuf.writeChunkPos`) | `forget_level_chunk` | CHUNK forget with `ack` (13.9, 13.21) | `ForgetLevelChunkGameCodecTest` (game encoder) |
    | `mc775.chunk_list.v1` | VarInt count, then per entry a packed ChunkPos long (x low 32 bits, z high 32), a VarInt payload length and that many payload bytes | `chunks_biomes` | CONTROL/global only (13.8) | `chunks_biomes` |
    | `mc775.join.v1` | the packet id alone; the body is never read | `chunk_batch_finished`, `block_changed_ack` | none: the ACK stream (13.21) replaces joins | `chunk_batch_finished`, `block_changed_ack` |
@@ -1547,12 +1559,18 @@ before this revision can run.
    only when its position is neither held nor in the ring: a first install cannot meet a pending
    block prediction (the client cannot predict in an unloaded chunk), while a replacement or a
    re-install after a forget can, because a forget does not clear the client's prediction map.
-   Packets 6 (block_entity_data) and 37 (forget_level_chunk) always carry `ack`. Held-set cap
-   4096: above the cap the sender stops tracking and every 45 carries `ack` until the next epoch
-   change. A 45 or 37 sent inside a bundle is not tracked; from then on every 45 carries `ack`
-   until the next epoch change. Every epoch change (a route with `epoch_change:true`) clears
-   both the held set and the ring, since the client drops all chunks there. A sender that cannot
-   tell uses `ack`.
+   The ring never evicts: the forget that would overflow the 256-entry ring stops tracking
+   (`markUnknown()`), making the set untrusted; from then on every 45 carries `ack` until the next
+   epoch change (`clear()` clears both the held set and the ring). Packets 6 (block_entity_data)
+   and 37 (forget_level_chunk) always carry `ack`. Held-set cap 4096: above the cap the sender
+   stops tracking and every 45 carries `ack` until the next epoch change. A 45 or 37 sent inside
+   a bundle is not tracked; from then on every 45 carries `ack` until the next epoch change.
+   Every epoch change (a route with `epoch_change:true`) clears both the held set and the ring,
+   since the client drops all chunks there. Memory: the open-addressing `long[]` table grows
+   lazily from 64 entries to at most 8192 (doubling on growth); the 256-entry ring is a fixed
+   `long[256]`. Worst case per session: 8192 table entries (65,536 bytes) plus the ring
+   (2,048 bytes) = 67,584 bytes, plus overhead. The arrays are released by `clear()`,
+   `markUnknown()` and overflow. A sender that cannot tell uses `ack`.
    Encode only nonzero cross-stream maxima; own predecessor remains implicit. All edges
    MUST point to previously assigned records, including joins, ACK records and bundle units. Never queue
    a join behind a record that depends on it on its own stream. No post-scheduling discovery
