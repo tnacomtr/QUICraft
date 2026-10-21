@@ -1247,7 +1247,13 @@ public final class NStreamSession implements MultistreamSession {
             schedulePump();
             return;
         }
-        guarded(this::pumpNow);
+        guarded(() -> {
+            pumpNow();
+            // What the game answered during this round leaves now, not behind the rest of the loop's I/O.
+            if (drainScheduled.get() && !closed) {
+                drainNow();
+            }
+        });
     }
 
     private void pumpNow() {
