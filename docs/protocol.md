@@ -1183,9 +1183,13 @@ before this revision can run.
    - **Control fence:** waits for previous CONTROL and REALTIME, plus the latest global
      fence. Later REALTIME waits for it; chunks do not. Use for entity spawn/remove and
      teleport relations, preserving spawn-before-move, move-before-remove/id reuse, and
-     teleport-before-dependent movement.
+     teleport-before-dependent movement. The shipped clientbound set is `add_entity` (1),
+     `entity_position_sync` (35), `player_abilities` (64), `remove_entities` (77),
+     `set_entity_link` (100), `set_passengers` (107), `take_item_entity` (124) and
+     `teleport_entity` (125).
    - **Ordinary CONTROL:** waits for its CONTROL predecessor and latest global fence only.
-     Keepalive and reviewed unrelated control packets MUST NOT fence REALTIME.
+     Keepalive and reviewed unrelated control packets MUST NOT fence REALTIME. The shipped
+     clientbound set is the 93 ids listed in 13.7 (including keepalive 44 and set_time 113).
    Reconfiguration globally drains play, retains streams/sequences, and uses CONTROL only
    until play resumes. Fences/gates take effect after game-handler execution (13.10), not
    receipt. Scope is per sending direction; game acknowledgements handle cross-direction
@@ -1326,14 +1330,16 @@ before this revision can run.
     against `play-ids-775.txt` by `ShippedRoutingCoverageTest`. Its serverbound half is entirely
     CONTROL/global with `ordinarySmall:false`, because the serverbound dual-lane routes above are
     still "Proposed". Its packet ids are pinned to the live game by `RoutingTableGameTest`.
-    CHUNK routes are enabled only for reviewed production extractors whose captured vectors,
-    independent golden vectors, shipped-table coverage and ordering tests pass; the ordering
-    argument and remaining deferrals are below.
+    CHUNK routes are enabled only for reviewed production extractors whose captured vectors
+    (or, for `mc775.chunk_pos_long.v1`, the game-encoder evidence below), independent golden
+    vectors, shipped-table coverage and ordering tests pass; the ordering argument and
+    remaining deferrals are below.
     Shipped routing, ordering argument (26.1.2). **DRAFT pending security review.** `level_chunk_with_light`
     (45) uses CHUNK with `mc775.chunk_xz.v1`. `block_update` (8) and `block_entity_data` (6) use CHUNK
-    with `mc775.block_position.v1`, and `section_blocks_update` (84) uses CHUNK with
-    `mc775.section_position.v1`. They hash the same chunk column as `level_chunk_with_light`, so one
-    chunk's install, updates and block-entity data keep game order in one lane. `block_changed_ack` (4)
+    with `mc775.block_position.v1`, `section_blocks_update` (84) uses CHUNK with
+    `mc775.section_position.v1`, and `forget_level_chunk` (37) uses CHUNK with
+    `mc775.chunk_pos_long.v1`. They hash the same chunk column as `level_chunk_with_light`, so one
+    chunk's install, updates, block-entity data and forget keep game order in one lane. `block_changed_ack` (4)
     and `chunk_batch_finished` (11) stay CONTROL/global. A global record depends on the assigned maximum
     of every stream, and every later record depends on it through G. Each ack therefore executes after
     every update the game emitted before it and before every update emitted after it. This is the game's
@@ -1341,10 +1347,22 @@ before this revision can run.
     update it covers (26.1.2: tasks run inside a tick by `reloadResources`); vanilla TCP shows the same
     transient there. ACK_JOIN/BATCH_JOIN (13.19) are an unshipped latency optimisation, not a safety
     requirement. `block_event` (7) is CONTROL/global, because the client applies it to its current block
-    state and a piston event run against a reordered state can leave a permanent ghost block. Remaining
-    relaxation: records for different chunk columns may reorder among themselves and against REALTIME.
-    Forget and light remain global. REALTIME waits for the latest CONTROL fence and the view gate is a
-    fence for later REALTIME. `ShippedRoutingTableTest` pins this reviewed relaxation.
+    state and a piston event run against a reordered state can leave a permanent ghost block.
+    Clientbound CONTROL dependencies are narrowed (13.5): the 93 ordinary CONTROL ids are 3, 9,
+    10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 33, 34, 38, 39, 40,
+    41, 43, 44, 50, 51, 52, 58, 59, 61, 62, 63, 65, 66, 67, 68, 69, 70, 71, 73, 74, 75, 76, 78,
+    79, 80, 81, 85, 86, 87, 88, 89, 90, 91, 92, 93, 96, 97, 98, 103, 104, 105, 106, 108, 109,
+    110, 112, 113, 114, 115, 117, 119, 120, 121, 122, 123, 126, 127, 128, 130, 132, 133, 134,
+    135, 136, 137, 138, 139, 140. They wait only for their CONTROL predecessor and G, so they
+    neither wait for chunk frontiers nor fence later REALTIME. Keepalive (44), set_time (113)
+    and the rest of that set are unrelated control traffic, not ordering barriers. The eight
+    control fences are 1, 35, 64, 77, 100, 107, 124 and 125 (13.5); they keep the REALTIME
+    fence but no longer wait for chunks. Every other clientbound CONTROL route is global as
+    listed in the deferrals below, except the view gate (12) and the list route (13).
+    Remaining relaxation: records for different chunk columns may reorder among themselves and against
+    REALTIME. Light remains global. REALTIME waits for the latest CONTROL fence and the view gate is a
+    fence for later REALTIME; ordinary CONTROL records do not fence later REALTIME.
+    `ShippedRoutingTableTest` pins this reviewed relaxation.
 
    Deferrals, all CONTROL/global, with the reason for each:
    - The reviewed `mc775.join.v1` layout stays unbound until ACK_JOIN is shipped as an optimisation.
@@ -1354,13 +1372,11 @@ before this revision can run.
      is wired into the production path (adapters unit). The flip to `epoch_change:true` lands after
      that wiring merges, with its test. Until then the epoch path is unexercised by the shipped
      table, and a release must not ship with it.
-   - `forget_level_chunk` (37): no reviewed layout (see the list below).
    - `light_update` (48): the `varint_xz` layout was dropped (addendum A4). Every light-changing play
      edit tried on the live 26.1.2 client produced no light update, so naming `varint_xz` would be an
      assumption.
    - `explode` (36) and `level_event` (46): kept global. 13.8 says they need no chunk ordering, so
      REALTIME would also be safe; global is the safe superset until a reviewed route is wanted.
-   - Control-fence entity classes (spawn, remove, teleport relations; 13.5): global, a safe superset.
    - Serverbound dual-lane (13.8 "Proposed"): every serverbound id is CONTROL/global.
    - `chunks_biomes` (13): CONTROL/global with its reviewed `mc775.chunk_list.v1` extractor, as 13.8 says.
 
@@ -1379,6 +1395,7 @@ before this revision can run.
    | `mc775.chunk_xz.v1` | `level_chunk_with_light` (45) | CHUNK/lane install | `captured-775-vectors.txt` |
    | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | CHUNK/lane block and block-entity update (13.7) | `captured-775-vectors.txt` |
    | `mc775.section_position.v1` | `section_blocks_update` (84) | CHUNK/lane section update (13.7) | `captured-775-vectors.txt` |
+   | `mc775.chunk_pos_long.v1` | `forget_level_chunk` (37) | CHUNK/lane forget (13.8) | `ForgetLevelChunkGameCodecTest`: the game's own play-packet encoder |
    | `mc775.join.v1` | `block_changed_ack` (4), `chunk_batch_finished` (11) | none: joins deferred | `captured-775-vectors.txt` |
    | `mc775.raw_copies.v1` | footprint accounting for every state's serverbound limits | `decodeFootprintBound` | 13.12 boundary vectors in `ExtractorGoldenTest` |
 
@@ -1386,16 +1403,23 @@ before this revision can run.
    footprint-bound algorithm, so it has no captured packet pair. Its evidence is the closed-form
    13.12 bound and its boundary vectors, and the production load path rejects the synthetic
    `primitive.raw_copies.v1`, so no primitive is silently reused as production evidence.
+   `mc775.chunk_pos_long.v1` is the one layout whose evidence is the game's own encoder instead of
+   a captured frame: the capture run produced no `forget_level_chunk` packet.
+   `ForgetLevelChunkGameCodecTest` encodes `ClientboundForgetLevelChunkPacket` through
+   `STREAM_CODEC` for both coordinate signs and reads the bytes back with the extractor, including
+   `ChunkPos.pack`'s exact long. Any future capture that adds a 37 frame should be added to
+   `captured-775-vectors.txt` as for the other layouts.
 
    REALTIME routes, with their 13.8 basis: the shipped entity and animation set `animate` (2),
    `hurt_animation` (42), `level_particles` (47), `move_entity_pos` (53), `move_entity_pos_rot` (54),
    `move_minecart_along_track` (55), `move_entity_rot` (56), `rotate_head` (83), `set_entity_data` (99),
    `set_entity_motion` (101), `set_equipment` (102), `sound_entity` (116) and `update_attributes` (131),
-   which the msv scratch run exercised live. `block_destruction` (5) and `block_event` (7) are the
-   no-chunk-ordering class 13.8 names: "block_event, level_event, explode and block_destruction need no
-   chunk ordering; reviewed routes may use REALTIME/lane without a chunk dependency". `level_particles`
-   (47) is kept from the shipped table; 13.8 does not name it, so it is the one REALTIME route resting on
-   the shipped classification rather than on the spec text.
+   which the msv scratch run exercised live. `block_destruction` (5) is the no-chunk-ordering class 13.8
+   names: "block_event, level_event, explode and block_destruction need no chunk ordering; reviewed
+   routes may use REALTIME/lane without a chunk dependency". `block_event` (7) stays CONTROL/global
+   (ghost-block reason above); `level_event` (46) and `explode` (36) stay global as the safe superset.
+   `level_particles` (47) is kept from the shipped table; 13.8 does not name it, so it is the one
+   REALTIME route resting on the shipped classification rather than on the spec text.
 
    Reviewed extractor identifiers and the real 26.1.2 packets each one serves. The layout is
    read from the id plus body bytes of an uncompressed packet, in the order named. The samples
@@ -1414,13 +1438,13 @@ before this revision can run.
    | `mc775.chunk_xz.v1` | big-endian int32 chunk x, int32 chunk z | `level_chunk_with_light` | CHUNK/lane install (13.8) | `level_chunk_with_light` |
    | `mc775.block_position.v1` | packed BlockPos long: x in bits 38..63, z in 12..37, y in 0..11 (unread); chunk = `x/16`, `z/16` floor | `block_update`, `block_entity_data` | CHUNK/lane block and block-entity update (13.8) | `block_update`, `block_entity_data` |
    | `mc775.section_position.v1` | packed SectionPos long: x in bits 42..63, z in 20..41, y in 0..19 (unread); already chunk coordinates | `section_blocks_update` | CHUNK/lane section update (13.8) | `section_blocks_update` |
+   | `mc775.chunk_pos_long.v1` | one big-endian packed ChunkPos long: x low 32 bits, z high 32 (`ChunkPos.pack`, `FriendlyByteBuf.writeChunkPos`) | `forget_level_chunk` | CHUNK/lane forget (13.8) | `ForgetLevelChunkGameCodecTest` (game encoder) |
    | `mc775.chunk_list.v1` | VarInt count, then per entry a packed ChunkPos long (x low 32 bits, z high 32), a VarInt payload length and that many payload bytes | `chunks_biomes` | CONTROL/global only (13.8) | `chunks_biomes` |
    | `mc775.join.v1` | the packet id alone; the body is never read | `chunk_batch_finished`, `block_changed_ack` | chunk join (13.19) | `chunk_batch_finished`, `block_changed_ack` |
 
-   Two 13.8 CHUNK-set packets have no reviewed layout here, so at `/3` they stay CONTROL/global
-   and are deliberately not shard-routable until a follow-up unit captures and reviews a layout
-   for them:
-   - `forget_level_chunk`: its packed position was not reviewed by this unit.
+   One 13.8 CHUNK-set packet has no reviewed layout here, so at `/3` it stays CONTROL/global
+   and is deliberately not shard-routable until a follow-up unit captures and reviews a layout
+   for it:
    - `light_update`: the `varint_xz` layout was dropped from the production set (addendum A4).
      Every light-changing play edit tried on the live 26.1.2 client (a surface block break, a
      stone roof over a whole area, a torch and glowstone) produced no light update packet at all,
@@ -1431,9 +1455,8 @@ before this revision can run.
    `block_update` (8) and `block_entity_data` (6) (CHUNK with `mc775.block_position.v1`), and
    `section_blocks_update` (84) (CHUNK with `mc775.section_position.v1`) ship in this release.
    `block_changed_ack` (4) and `chunk_batch_finished` (11) stay CONTROL/global; no ACK_JOIN/BATCH_JOIN
-   is needed because the global fence gives TCP order. Joins (4/11),
-   `forget_level_chunk` (37) and `light_update` (48) remain unchanged; the latter two lack
-   reviewed production layouts.
+   is needed because the global fence gives TCP order. Joins (4/11) and `light_update` (48) remain
+   unchanged; the latter lacks a reviewed production layout.
 
    Regenerate the checked-in vectors with (runs the whole client gametest suite, protocol 775):
 
@@ -1442,19 +1465,21 @@ before this revision can run.
      -Pquicraft.emitExtractorVectors=core/src/test/resources/rs/sudoe/quicraft/core/routing/captured-775-vectors.txt
    ```
 
-8. **13.8 Explicit game invariants (26.1.2, protocol 775).** Chunk install, block_update,
-   section_blocks_update, block_entity_data, light_update and forget_level_chunk use the
-   position's CHUNK shard, in original order: install, updates, forget. Never move an update
-   to REALTIME; block/section/block-entity updates before install are lost, and stale light
-   after forget must not overtake it. Multiple positions colliding on a shard share its order.
+8. **13.8 Explicit game invariants (26.1.2, protocol 775).** When routed, chunk install,
+   block_update, section_blocks_update, block_entity_data, light_update and forget_level_chunk
+   use the position's CHUNK shard, in original order: install, updates, forget. The shipped
+   table routes all but light_update that way (13.7). Never move an update to REALTIME;
+   block/section/block-entity updates before install are lost, and stale light after forget
+   must not overtake it. Multiple positions colliding on a shard share its order.
    chunks_biomes spans chunks: keep the whole packet CONTROL/global, with its list extractor;
    it waits for prior installs and later chunk updates wait for it. Do not split/rewrite it.
    Entity storage is chunk-independent: spawn does not wait for a chunk install; forgetting
    a chunk does not remove entities. Spawn and entity-data bundles stay whole on CONTROL
    under 13.15. Entity updates on REALTIME wait for their CONTROL fence; removal waits for
-   earlier REALTIME, not chunk traffic. block_event, level_event, explode and
-   block_destruction need no chunk ordering; reviewed routes may use REALTIME/lane without
-   a chunk dependency. View changes and joins obey 13.5/13.19. Any unproven type remains
+   earlier REALTIME, not chunk traffic. The shipped control fences are the eight ids of 13.5;
+   the shipped ordinary CONTROL ids wait only for their CONTROL predecessor and G.
+   block_event, level_event, explode and block_destruction need no chunk ordering; reviewed
+   routes may use REALTIME/lane without a chunk dependency. View changes and joins obey 13.5/13.19. Any unproven type remains
     CONTROL/global, including unknown ids at both sender and receiver. Proposed serverbound
     REALTIME routes are reviewed movement/vehicle/input/animation/keepalive/pong; interaction
     CONTROL routes depend on latest REALTIME. REALTIME waits for CONTROL fences, including
@@ -1472,7 +1497,8 @@ before this revision can run.
    - View: all previous A; then set V and C to this record. For chunk_batch_start also
      include the previous BATCH_JOIN frontier as an explicit semantic dependency (13.19).
    - Control fence: previous A[CONTROL,REALTIME]; then set C to this record.
-   - Ordinary CONTROL: nothing further.
+   - Ordinary CONTROL: nothing further (the shipped clientbound set is in 13.7; an unlisted
+     CONTROL route stays global).
     - Serverbound interaction CONTROL (`interaction`): latest serverbound REALTIME A[1],
       in addition to G and implicit own predecessor; ordinary CONTROL omits this edge.
     - REALTIME: latest C; serverbound REALTIME explicitly encodes max(G,C), the latest global

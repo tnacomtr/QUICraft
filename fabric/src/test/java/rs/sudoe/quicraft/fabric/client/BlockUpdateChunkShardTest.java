@@ -8,7 +8,7 @@ import org.junit.jupiter.api.Test;
 import rs.sudoe.quicraft.core.multistream.ShardHash;
 import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
 
-/** Wire-layout verification for block updates (8, 6, 84) shipped on chunk shards (13.7, 13.19). */
+/** Wire-layout verification for block updates (8, 6, 84) and forget (37) shipped on chunk shards (13.7, 13.19). */
 class BlockUpdateChunkShardTest {
 
     /** BlockPos is a packed long (BlockPos.STREAM_CODEC / FriendlyByteBuf.readBlockPos): x bits 38-63,
@@ -37,6 +37,24 @@ class BlockUpdateChunkShardTest {
         assertEquals(0, pos.chunkZ);
         assertEquals(ShardHash.shardOf(0, 0, 0, 2), ShardHash.shardOf(pos.chunkX, pos.chunkZ, 0, 2),
                 "block entity data at origin lands on the same shard as level_chunk_with_light at (0, 0)");
+    }
+
+    @Test
+    void forgetLevelChunkWireIsPackedChunkPosLongAndDecodesToChunkShard() throws Exception {
+        var extractor = ExtractorRegistry.productionDecoder("mc775.chunk_pos_long.v1");
+        int[][] chunks = {{-1, 0}, {0, -1}, {800, -1200}};
+        for (int[] chunk : chunks) {
+            // Packet 37 followed by ChunkPos.pack: x low 32 bits, z high 32 (FriendlyByteBuf.writeChunkPos).
+            long packed = chunk[0] & 0xffffffffL | (chunk[1] & 0xffffffffL) << 32;
+            byte[] wire = ByteBuffer.allocate(9).put((byte) 37).putLong(packed).array();
+            assertEquals(37, varInt(wire));
+            var pos = extractor.extract(wire);
+            assertEquals(chunk[0], pos.chunkX, "forget x for " + chunk[0] + "," + chunk[1]);
+            assertEquals(chunk[1], pos.chunkZ, "forget z for " + chunk[0] + "," + chunk[1]);
+            assertEquals(ShardHash.shardOf(chunk[0], chunk[1], 0, 2),
+                    ShardHash.shardOf(pos.chunkX, pos.chunkZ, 0, 2),
+                    "forget lands on the same chunk shard as the install for " + chunk[0] + "," + chunk[1]);
+        }
     }
 
     @Test

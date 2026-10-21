@@ -90,6 +90,33 @@ class LaneCodecChunkPositionTest {
         }
     }
 
+    /** forget_level_chunk (37) keeps its packed-long chunk position through the real decode, compressed or not. */
+    @Test
+    void forgetLevelChunkKeepsItsPositionThroughCompressedAndPlainDecode() throws Exception {
+        int[][] chunks = {{-1, 0}, {0, -1}, {-7, 8}};
+        for (boolean compressed : new boolean[] {false, true}) {
+            for (int[] chunk : chunks) {
+                EmbeddedChannel channel = pipeline(compressed);
+                LaneCodec codec = new LaneCodec(channel, null, null, access(compressed));
+                long packed = chunk[0] & 0xffffffffL | (chunk[1] & 0xffffffffL) << 32;
+                byte[] packet = ByteBuffer.allocate(9).put((byte) 37).putLong(packed).array();
+                ByteBuf frame = Unpooled.wrappedBuffer(FrameCodec.encode(packet, compressed ? 0 : -1));
+                try {
+                    var decoded = codec.decode(frame, ProtocolState.PLAY, (add, total) -> { });
+                    assertEquals(37, decoded.packetId());
+                    assertArrayEquals(packet, decoded.uncompressed(), "routing copy is the inflated packet");
+                    var position = ExtractorRegistry.productionDecoder("mc775.chunk_pos_long.v1")
+                            .extract(decoded.uncompressed());
+                    assertEquals(chunk[0], position.chunkX, "compressed=" + compressed);
+                    assertEquals(chunk[1], position.chunkZ, "compressed=" + compressed);
+                } finally {
+                    frame.release();
+                    channel.finishAndReleaseAll();
+                }
+            }
+        }
+    }
+
     /** A large packet keeps only the bounded routing prefix, so the 8 MiB workspace still fits it. */
     @Test
     void largePacketRetainsOnlyTheBoundedRoutingPrefix() throws Exception {

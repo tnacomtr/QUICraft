@@ -28,21 +28,31 @@ class ShippedRoutingCoverageTest {
     private static final int PROTOCOL = 775;
     private static final String INVENTORY = RoutingTableLoader.RESOURCE_DIR + "/play-ids-775.txt";
 
-    /** 13.8 REALTIME entity and animation set, plus block_destruction and block_event (13.8 names them). */
+    /** 13.8 REALTIME entity and animation set, plus block_destruction (13.8 names it); block_event stays global. */
     private static final Set<Integer> REALTIME = set(2, 42, 47, 53, 54, 55, 56, 83, 99, 101, 102, 116, 131, 5);
     /**
-     * Reviewed CHUNK route enabled by this unit. Block updates and acknowledgement remain global until
-     * the ACK-coverage wiring required by 13.19 is on the production send path.
+     * Reviewed CHUNK routes: install (45), block updates (6, 8, 84) and forget (37). The block
+     * acknowledgement (4) and chunk_batch_finished (11) remain global until the ACK-coverage wiring
+     * required by 13.19 is on the production send path.
      */
-    private static final Map<Integer, String> CHUNK = map(45, "chunk_xz", 6, "block_position", 8, "block_position", 84, "section_position");
+    private static final Map<Integer, String> CHUNK = map(45, "chunk_xz", 6, "block_position", 8, "block_position",
+            84, "section_position", 37, "chunk_pos_long");
     /** 13.8/13.19: chunk_batch_start uses the view scope. */
     private static final Set<Integer> VIEW = set(12);
+    /** 13.5 control fences: no chunk wait, but later REALTIME waits for them (B1 minus 72). */
+    private static final Set<Integer> CONTROL_FENCE = set(1, 35, 64, 77, 100, 107, 124, 125);
+    /** 13.5 ordinary CONTROL: own CONTROL predecessor and G only; no chunk wait, no REALTIME fence. */
+    private static final Set<Integer> ORDINARY = set(3, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25,
+            26, 27, 28, 29, 30, 31, 33, 34, 38, 39, 40, 41, 43, 44, 50, 51, 52, 58, 59, 61, 62, 63, 65,
+            66, 67, 68, 69, 70, 71, 73, 74, 75, 76, 78, 79, 80, 81, 85, 86, 87, 88, 89, 90, 91, 92, 93,
+            96, 97, 98, 103, 104, 105, 106, 108, 109, 110, 112, 113, 114, 115, 117, 119, 120, 121, 122,
+            123, 126, 127, 128, 130, 132, 133, 134, 135, 136, 137, 138, 139, 140);
     /** 13.8: a multi-chunk packet stays CONTROL/global with its reviewed list extractor. */
     private static final Map<Integer, String> LIST = map(13, "chunk_list");
     // Deliberate global deferrals (CP1), all CONTROL/global: block_changed_ack (4) and chunk_batch_finished (11)
     // join routes, because the send path fails closed on ACK_JOIN/BATCH_JOIN; login (49) and respawn (82),
-    // because epoch routes are not wired; forget_level_chunk (37) and light_update (48), with no reviewed
-    // layout; explode (36) and level_event (46), kept global as a safe superset of 13.8.
+    // because epoch routes are not wired; light_update (48), with no reviewed layout; explode (36) and
+    // level_event (46), kept global as a safe superset of 13.8.
 
     @Test
     void theShippedTableRoutesEveryInventoryIdExactlyOnce() throws IOException {
@@ -82,6 +92,29 @@ class ShippedRoutingCoverageTest {
         routes.put(install, new RouteV2(RouteV2.StreamLane.REALTIME, Dependency.LANE, null, null, false, null, null, null));
         List<String> problems = coverage(routes, inventory("clientbound"), inventory("serverbound"));
         assertTrue(problems.toString().contains("clientbound 45"), problems.toString());
+    }
+
+    /**
+     * The narrowed clientbound classes are exact id sets, not merely "some routes are ordinary":
+     * 93 ordinary CONTROL ids and the eight control fences of 13.5 (B1 minus player_position 72).
+     * Every other clientbound route is global, view, list, realtime or CHUNK, and each of those is
+     * pinned separately above.
+     */
+    @Test
+    void theOrdinaryAndControlFenceSetsAreExactlyTheReviewedIds() throws IOException {
+        Faults.set();
+        Set<Integer> ordinary = new HashSet<Integer>();
+        Set<Integer> control = new HashSet<Integer>();
+        for (Map.Entry<RouteKey, RouteV2> entry : RoutingTableLoader.loadResource(PROTOCOL).routesV2().entrySet()) {
+            RouteKey key = entry.getKey();
+            if (key.state() != ProtocolState.PLAY || key.direction() != Direction.CLIENTBOUND) continue;
+            if (entry.getValue().dependency == Dependency.ORDINARY) ordinary.add(key.packetId());
+            if (entry.getValue().dependency == Dependency.CONTROL) control.add(key.packetId());
+        }
+        assertEquals(ORDINARY, ordinary, "the clientbound ordinary CONTROL set");
+        assertEquals(CONTROL_FENCE, control, "the clientbound control-fence set");
+        assertEquals(93, ordinary.size(), "93 ordinary ids (13.5)");
+        assertEquals(8, control.size(), "eight control fences (B1 minus 72)");
     }
 
     /**
@@ -139,6 +172,12 @@ class ShippedRoutingCoverageTest {
         }
         if (VIEW.contains(id)) {
             return expect(route, RouteV2.StreamLane.CONTROL, Dependency.VIEW, null);
+        }
+        if (CONTROL_FENCE.contains(id)) {
+            return expect(route, RouteV2.StreamLane.CONTROL, Dependency.CONTROL, null);
+        }
+        if (ORDINARY.contains(id)) {
+            return expect(route, RouteV2.StreamLane.CONTROL, Dependency.ORDINARY, null);
         }
         if (LIST.containsKey(id)) {
             return expect(route, RouteV2.StreamLane.CONTROL, Dependency.GLOBAL, LIST.get(id));

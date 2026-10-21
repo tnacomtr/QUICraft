@@ -81,11 +81,12 @@ class MandatoryControlEnforcementTest {
     void theSameRewriteOfAnUnlistedIdIsAcceptedWithoutTheSet() throws IOException {
         Faults.set();
         String table = new String(bytes(TABLE), StandardCharsets.UTF_8);
-        String from = "\"direction\":\"clientbound\",\"packet_id\":1,\"lane\":\"control\",\"dependency\":\"global\"";
-        String to = "\"direction\":\"clientbound\",\"packet_id\":1,\"lane\":\"realtime\",\"dependency\":\"lane\"";
-        assertTrue(table.contains(from), "add_entity (1) is routed as global control");
+        // custom_payload (24) is not in the mandatory set and stays CONTROL/global in the shipped table.
+        String from = "\"direction\":\"clientbound\",\"packet_id\":24,\"lane\":\"control\",\"dependency\":\"global\"";
+        String to = "\"direction\":\"clientbound\",\"packet_id\":24,\"lane\":\"realtime\",\"dependency\":\"lane\"";
+        assertTrue(table.contains(from), "custom_payload (24) is routed as global control");
         RoutingTable parsed = RoutingTableLoader.parse(table.replace(from, to).getBytes(StandardCharsets.UTF_8), EXPECTED);
-        assertEquals(RouteV2.StreamLane.REALTIME, parsed.routeV2For(key(Direction.CLIENTBOUND, 1)).lane);
+        assertEquals(RouteV2.StreamLane.REALTIME, parsed.routeV2For(key(Direction.CLIENTBOUND, 24)).lane);
     }
 
     private static RouteKey key(Direction direction, int packetId) {

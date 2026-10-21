@@ -65,16 +65,16 @@ class ProductionExtractorAllowlistTest {
     }
 
     @Test void theAllowlistIsClosedAndEveryIdentifierKeepsItsDecoding() {
-        assertEquals(setOf("mc775.block_position.v1", "mc775.chunk_list.v1", "mc775.chunk_xz.v1",
-                "mc775.join.v1", "mc775.section_position.v1"),
+        assertEquals(setOf("mc775.block_position.v1", "mc775.chunk_list.v1", "mc775.chunk_pos_long.v1",
+                "mc775.chunk_xz.v1", "mc775.join.v1", "mc775.section_position.v1"),
                 ExtractorRegistry.productionIds());
         for (String id : ExtractorRegistry.productionIds()) {
             assertTrue(ExtractorRegistry.isProduction(id), id);
             assertEquals(id, ExtractorRegistry.productionDecoder(id).identifier, id);
         }
-        for (String id : new String[] {"primitive.chunk_xz.v1", "primitive.chunk_list.v1",
-                "primitive.join.v1", "primitive.block_position.v1", "primitive.section_position.v1",
-                "primitive.varint_xz.v1", "test.chunk_xz.v1"}) {
+        for (String id : new String[] {"primitive.chunk_xz.v1", "primitive.chunk_pos_long.v1",
+                "primitive.chunk_list.v1", "primitive.join.v1", "primitive.block_position.v1",
+                "primitive.section_position.v1", "primitive.varint_xz.v1", "test.chunk_xz.v1"}) {
             assertFalse(ExtractorRegistry.isProduction(id), id);
             assertThrows(IllegalArgumentException.class, () -> ExtractorRegistry.productionDecoder(id));
         }
