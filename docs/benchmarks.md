@@ -1300,3 +1300,55 @@ The clean-link RTT gain is about 0.12 ms, consistent across every traced and unt
 rounds: 1.27-1.45 ms against 1.41-1.60 ms). The gap to TCP is still about 0.7 ms. It is spread over the remaining
 hops: client send path to the datagram (~0.3 ms), the server's quiche receive (~0.11 ms), and decode plus game delivery
 (~0.2 ms). No single hop dominates.
+
+### /3 busy batch timer: seven-profile matrix and a lagging client (2026-10-21, n=2 per arm, interleaved TCP)
+
+Default-on gate for `-Dquicraft.v3.batchTimerBusy=true` (above). Feat d3e2c22f (inline receive pump on) plus the
+gametest lag injection (b7c22bc6). Arms run interleaved tcp, /3, /3 busy per profile and round. The lagging-client
+rows (one round) sleep the client main thread 40 ms per tick and 1 s every 100 ticks
+(`-Dquicraft.test.clientTickLagMs=40 -Dquicraft.test.clientStallMs=1000 -Dquicraft.test.clientStallEveryTicks=100`).
+Per-run values:
+
+| profile | arm | join ms | chunk load ms | rtt median ms |
+|---|---|---|---|---|
+| clean | tcp | 1224, 1462 | 1018, 892 | 0.58, 0.58 |
+| clean | /3 | 1731, 1812 | 1641, 1574 | 1.30, 1.26 |
+| clean | /3 busy | 1637, 1909 | 938, 974 | 1.37, 1.51 |
+| clean | tcp, lagging client | 1139 | 710 | 0.55 |
+| clean | /3, lagging client | 1383 | 1210 | 1.20 |
+| clean | /3 busy, lagging client | 1289 | 819 | 1.21 |
+| loss | tcp | 1226, 1372 | 716, 1199 | 0.65, 0.61 |
+| loss | /3 | 1532, 1556 | 2418, 1497 | 1.34, 1.42 |
+| loss | /3 busy | 1610, 1667 | 1153, 868 | 1.37, 1.38 |
+| delay | tcp | 2034, 2202 | 2226, 2120 | 150.71, 150.67 |
+| delay | /3 | 2674, 2845 | 1904, 1967 | 151.43, 151.52 |
+| delay | /3 busy | 2901, 3049 | 1207, 1263 | 151.60, 151.77 |
+| delayloss | tcp | 2118, 2277 | 10876, 24944 | 150.63, 150.76 |
+| delayloss | /3 | 3206, 3371 | 3194, 2782 | 151.55, 151.75 |
+| delayloss | /3 busy | 2780, 3231 | 2537, 2209 | 152.54, 151.90 |
+| delayloss | tcp, lagging client | 1942 | 24302 | 150.67 |
+| delayloss | /3, lagging client | 3937 | 3034 | 151.44 |
+| delayloss | /3 busy, lagging client | 3742 | 1800 | 151.35 |
+| reorder | tcp | 1356, 1681 | 1285, 1165 | 20.67, 20.66 |
+| reorder | /3 | 1782, 2149 | 2099, 1670 | 21.30, 21.35 |
+| reorder | /3 busy | 1997, 1915 | 929, 1015 | 21.34, 21.30 |
+| jitter | tcp | 1414, 1504 | 7431, 7050 | 19.74, 20.65 |
+| jitter | /3 | 2040, 1956 | 1825, 1933 | 23.05, 22.09 |
+| jitter | /3 busy | 1963, 2036 | 1319, 1374 | 21.09, 22.31 |
+| slow | tcp | 2367, 2496 | 41246, 29653 | 151.37, 159.31 |
+| slow | /3 | 3329, 2595 | 5962, 5948 | 152.55, 152.96 |
+| slow | /3 busy | closed 0x12, 3571 | closed 0x12, 5529 | -, 154.73 |
+
+The busy timer gives the fastest chunk load on every profile but slow. On clean it reaches TCP (938/974 vs 1018/892
+ms). With a lagging client main thread the backlog stays at the accepted-commit bound and no batch runs away.
+
+**It stays off.** On `slow` (2 Mbit, 75 ms, 2% loss) one of two busy runs closed with 0x12 after 16 s of play. The
+batch log explains it. Busy time leaves out wire transfer time, so the client asked for 12.6 and 15.8 chunks per
+tick (/3 settles near 2, TCP at 0.1-1.8). The server then queued more chunk data than the link could carry, and a
+cross-stream dependency waited past the 10 s blocked-head timer (13.10/13.12). Two follow-ups:
+
+- The batch interval must keep the wire time. Next prototype: vanilla wall time minus the measured local-gating
+  waits (apply/ack hops, sequence and eligible-head waits, data buffered but not yet pumped), keeping every
+  unexplained or no-local-bytes wait.
+- The blocked-head timer turns deep queueing into a disconnect where TCP only lags. That is a spec question for the
+  13.10/13.12 timer design.
