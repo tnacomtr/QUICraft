@@ -78,6 +78,12 @@ case "$coalesce" in
     false) ;;
     *) fail "REAL_FABRIC_COALESCE must be true or false, got '$coalesce'" ;;
 esac
+coalesce_max="${REAL_FABRIC_COALESCE_MAX:-}"
+case "$coalesce_max" in
+    '') ;;
+    *[!0-9]*) fail "REAL_FABRIC_COALESCE_MAX must be a byte count, got '$coalesce_max'" ;;
+    *) JAVA_OPTS="-Dquicraft.coalesceMaxBytes=$coalesce_max${JAVA_OPTS:+ $JAVA_OPTS}"; export JAVA_OPTS ;;
+esac
 
 if [ "$online" = false ] && [ "$multistream" = true ]; then
     JAVA_OPTS="-Dquicraft.multistream.offlineTest=true${JAVA_OPTS:+ $JAVA_OPTS}"

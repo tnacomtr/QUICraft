@@ -37,7 +37,8 @@ import java.util.function.IntPredicate;
 public final class QuicStreamWriteSink {
     private static final boolean COALESCE_DEFAULT = Boolean.parseBoolean(
             System.getProperty("quicraft.coalesceWrites", "false"));
-    private static final int COALESCE_MAX_BYTES = 64 * 1024;
+    /** Soft per-stream cap of one combined write; experiment knob {@code quicraft.coalesceMaxBytes}. */
+    private static final int COALESCE_MAX_BYTES = Math.max(1, Integer.getInteger("quicraft.coalesceMaxBytes", 64 * 1024));
 
     private final SessionSendDriver driver;
     private final QuicStreamChannel[] channels;

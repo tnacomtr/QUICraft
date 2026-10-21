@@ -60,6 +60,7 @@ usage() {
         echo "  --play-seconds  measured play time (default: 20)"
         echo "  --netem         clean (default) | loss | delay | delayloss | reorder | jitter"
         echo "  --coalesce      experiment: -Dquicraft.coalesceWrites=true on server and client"
+        echo "  --coalesce-max N  experiment: -Dquicraft.coalesceMaxBytes=N (soft per-stream cap, default 65536)"
     } >&2
     exit "${1:-2}"
 }
@@ -82,6 +83,7 @@ port="25565"
 play_seconds="20"
 netem="clean"
 coalesce=false
+coalesce_max=""
 
 while (($# > 0)); do
     case "$1" in
@@ -102,6 +104,12 @@ while (($# > 0)); do
         --coalesce)
             coalesce=true
             shift
+            ;;
+        --coalesce-max)
+            (($# >= 2)) || refuse "missing value for --coalesce-max"
+            [[ "$2" =~ ^[0-9]+$ ]] || refuse "--coalesce-max takes a byte count"
+            coalesce_max="$2"
+            shift 2
             ;;
         --out-dir)
             (($# >= 2)) || refuse "missing value for --out-dir"
@@ -336,7 +344,7 @@ server_multistream=true
 if [[ "$arm" == quic2 ]]; then
     server_multistream=false
 fi
-export REAL_FABRIC_MULTISTREAM="$server_multistream" REAL_FABRIC_PORT="$port" REAL_FABRIC_COALESCE="$coalesce"
+export REAL_FABRIC_MULTISTREAM="$server_multistream" REAL_FABRIC_PORT="$port" REAL_FABRIC_COALESCE="$coalesce" REAL_FABRIC_COALESCE_MAX="$coalesce_max"
 echo "== compose up ($project): fabric mocksession"
 project_started=true
 if ! "${compose[@]}" up -d --build fabric mocksession; then
@@ -420,6 +428,7 @@ client=(
     "-Pquicraft.armCommit=$commit"
     "-Pquicraft.armPlaySeconds=$play_seconds"
     "-Pquicraft.armCoalesce=$coalesce"
+    ${coalesce_max:+"-Pquicraft.armCoalesceMax=$coalesce_max"}
     "$module:runClientGameTest"
 )
 echo "== client: ${client[*]}"
