@@ -126,6 +126,11 @@ class InlinePumpTest {
         config.inlinePump = true;
         try (NRig rig = NRig.start(config)) {
             rig.activateBoth();
+            // Held, so the periodic tick cannot take the armed hook: the first receive step after release is a pump's.
+            NRig.onLoop(rig.client, () -> {
+                rig.client.holdPumpForTests();
+                return null;
+            });
             AtomicInteger nested = new AtomicInteger();
             rig.clientDepth.arm(nestedReadComplete(rig, nested));
             List<String> toClient = new ArrayList<String>();
@@ -134,6 +139,10 @@ class InlinePumpTest {
                 send(rig.server, "c" + i, toClient);
                 send(rig.client, "s" + i, toServer);
             }
+            NRig.onLoop(rig.client, () -> {
+                rig.client.releasePumpForTests();
+                return null;
+            });
             assertTrue(SessionRigSupport.await(() -> labels(rig.clientGame).size() == 60, WAIT_MILLIS),
                     () -> "records to the client: " + labels(rig.clientGame));
             assertTrue(SessionRigSupport.await(() -> labels(rig.serverGame).size() == 60, WAIT_MILLIS),
@@ -167,9 +176,10 @@ class InlinePumpTest {
             assertTrue(SessionRigSupport.await(() -> labels(rig.serverGame).size() == 20, WAIT_MILLIS),
                     () -> "records to the server: " + labels(rig.serverGame));
             AtomicInteger nested = new AtomicInteger();
-            rig.clientDepth.arm(nestedReadComplete(rig, nested));
             int before = rig.clientDepth.entries();
+            // Arm and tick in one loop task, so the periodic tick cannot run in between and take the hook.
             NRig.onLoop(rig.client, () -> {
+                rig.clientDepth.arm(nestedReadComplete(rig, nested));
                 rig.client.tick();
                 return null;
             });
@@ -191,11 +201,11 @@ class InlinePumpTest {
     }
 
     /**
-     * One pump round must not drain a burst of more than MAX_STEPS. A task queued on the client's loop during the
-     * first receive step runs before the burst completes: the round yields after 64 steps with a continuation queued
-     * behind that task. The check is that the task saw fewer than BURST records delivered. This proves a yield only
-     * if the burst was readable at the start of the round, which the burst send right after arming makes likely but
-     * does not force; without MAX_STEPS yielding the round would deliver all of it before the task runs.
+     * One pump round must not drain a burst of more than MAX_STEPS. The client's pump is held, the whole burst is sent
+     * and buffered on the client's receiver, then one release starts the round. The first step queues a task on the
+     * client's loop. The round yields after 64 steps with its continuation queued behind that task, so the task runs
+     * between round 1 and round 2 and sees fewer than BURST delivered. Without MAX_STEPS yielding, one round would
+     * deliver the whole buffered burst before the queued task runs, and the test would fail.
      */
     @Test
     void aBurstLongerThanOneRoundYieldsToQueuedWork() throws Exception {
@@ -204,19 +214,68 @@ class InlinePumpTest {
         try (NRig rig = NRig.start(config)) {
             rig.activateBoth();
             List<String> events = Collections.synchronizedList(new ArrayList<String>());
+            NRig.onLoop(rig.client, () -> {
+                rig.client.holdPumpForTests();
+                rig.client.configurePathProbe(events::add);
+                return null;
+            });
+            // Held: no receive step runs, so the first step after release is the round's own first step.
             rig.clientDepth.arm(() -> rig.client.eventLoop().execute(
                     () -> events.add("queued@" + labels(rig.clientGame).size())));
             List<String> toClient = new ArrayList<String>();
             for (int i = 0; i < BURST; i++) {
                 send(rig.server, "c" + i, toClient);
             }
+            int buffered = awaitBufferedStable(rig.client, 0);
+            assertTrue(buffered > 0, "the burst is buffered on the client's receiver: " + buffered);
+            NRig.onLoop(rig.client, () -> {
+                rig.client.releasePumpForTests();
+                return null;
+            });
             assertTrue(SessionRigSupport.await(() -> labels(rig.clientGame).size() == BURST, WAIT_MILLIS),
                     () -> "burst to the client stalled at " + labels(rig.clientGame).size() + " of " + BURST);
             assertEquals(toClient, labels(rig.clientGame), "burst order");
-            assertEquals(1, events.size(), "the queued task ran once: " + events);
-            int seen = Integer.parseInt(events.get(0).substring("queued@".length()));
+            int rounds = countOf(events, "pump.round");
+            assertTrue(rounds >= 2, "the burst took at least two pump rounds: " + events);
+            assertEquals(1, countOf(events, "queued@"), "the queued task ran once: " + events);
+            int queued = 0;
+            while (!events.get(queued).startsWith("queued@")) {
+                queued++;
+            }
+            int firstRound = indexFrom(events, "pump.round", 0);
+            int secondRound = indexFrom(events, "pump.round", firstRound + 1);
+            assertTrue(firstRound < queued && queued < secondRound,
+                    "the queued task ran between the first and second round: " + events);
+            int seen = Integer.parseInt(events.get(queued).substring("queued@".length()));
             assertTrue(seen < BURST, "the queued task ran before the burst completed (saw " + seen + ")");
         }
+    }
+
+    /** Waits until the buffered byte count of {@code stream} is non-zero and unchanged for a run of polls. */
+    private static int awaitBufferedStable(NStreamSession session, int stream) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WAIT_MILLIS);
+        int last = -1;
+        int stableRuns = 0;
+        while (System.nanoTime() < deadline) {
+            int now = NRig.onLoop(session, () -> session.bufferedForTests(stream));
+            stableRuns = now > 0 && now == last ? stableRuns + 1 : 0;
+            if (stableRuns >= 20) {
+                return now;
+            }
+            last = now;
+            Thread.sleep(5);
+        }
+        return last;
+    }
+
+    private static int countOf(List<String> events, String prefix) {
+        int n = 0;
+        for (String event : events) {
+            if (event.startsWith(prefix)) {
+                n++;
+            }
+        }
+        return n;
     }
 
     /**

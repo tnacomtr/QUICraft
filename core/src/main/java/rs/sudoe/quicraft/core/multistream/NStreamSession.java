@@ -406,6 +406,9 @@ public final class NStreamSession implements MultistreamSession {
     private ReceiveObserver receiveObserver;
     /** Test seam: named events on the inline pump and drain paths (loop thread). Null in production. */
     private PathProbe pathProbe;
+    /** Test seam: a held pump defers its rounds (see {@link #holdPumpForTests}). Always false in production. */
+    private boolean pumpHeld;
+    private boolean pumpHeldDeferred;
     private boolean closeNotified;
     private boolean executing;
     private int executingStream = -1;
@@ -1283,6 +1286,11 @@ public final class NStreamSession implements MultistreamSession {
             schedulePump();
             return;
         }
+        if (pumpHeld) {
+            pumpHeldDeferred = true;
+            return;
+        }
+        probe("pump.round");
         pumping = true;
         try {
             pumpSteps();
@@ -1330,6 +1338,25 @@ public final class NStreamSession implements MultistreamSession {
     /** Test seam: sets the path probe. Call on the loop. */
     void configurePathProbe(PathProbe probe) {
         this.pathProbe = probe;
+    }
+
+    /** Test seam: while held, a pump round is only recorded as requested. Call on the loop. */
+    void holdPumpForTests() {
+        pumpHeld = true;
+    }
+
+    /** Test seam: releases a held pump; a round requested meanwhile is scheduled now. Call on the loop. */
+    void releasePumpForTests() {
+        pumpHeld = false;
+        if (pumpHeldDeferred) {
+            pumpHeldDeferred = false;
+            schedulePump();
+        }
+    }
+
+    /** Test seam: bytes buffered for a logical stream and not yet read by the pump. Call on the loop. */
+    int bufferedForTests(int stream) {
+        return source.buffered(stream);
     }
 
     /** One receive step; false when it closed the session. */
@@ -1545,8 +1572,9 @@ public final class NStreamSession implements MultistreamSession {
             fail(CLOSE_ORDERING, NO_REASON, "a peer stream did not open in time (13.3)", null);
             return;
         }
-        if (game != null && !pumping) {
+        if (game != null && !pumping && !pumpHeld) {
             // Same guard as the pump: a read this step issues may complete synchronously and pump inline.
+            // A held pump (test seam) also holds the tick's receive step.
             boolean open;
             pumping = true;
             try {
