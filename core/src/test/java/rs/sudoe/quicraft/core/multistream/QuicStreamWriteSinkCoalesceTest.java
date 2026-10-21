@@ -31,6 +31,7 @@ final class QuicStreamWriteSinkCoalesceTest {
         final int index;
         int writes;
         int flushCalls;
+        final java.io.ByteArrayOutputStream written = new java.io.ByteArrayOutputStream();
         boolean writable = true;
         boolean failNextWrite = false;
 
@@ -72,6 +73,9 @@ final class QuicStreamWriteSinkCoalesceTest {
             ByteBuf buf = (ByteBuf) msg;
             int len = buf.readableBytes();
             events.add("write" + index + ":" + len);
+            byte[] copy = new byte[len];
+            buf.getBytes(buf.readerIndex(), copy);
+            written.write(copy, 0, len);
             if (failNextWrite) {
                 failNextWrite = false;
                 ReferenceCountUtil.release(msg);
@@ -90,6 +94,8 @@ final class QuicStreamWriteSinkCoalesceTest {
         final Stream[] streams;
         int successes;
         int failures;
+        /** Runs after every settled token, like the owner's re-drain. */
+        Runnable onSettled = () -> { };
         final List<String> events = new ArrayList<>();
 
         Rig(boolean coalesce) throws Exception {
@@ -105,6 +111,7 @@ final class QuicStreamWriteSinkCoalesceTest {
             sink = new QuicStreamWriteSink(driver, 3, i -> true, success -> {
                 if (success) successes++;
                 else failures++;
+                onSettled.run();
             }, coalesce);
             streams = new Stream[3];
             for (int i = 0; i < streams.length; i++) {
@@ -224,6 +231,72 @@ final class QuicStreamWriteSinkCoalesceTest {
             assertTrue(rig.streams[0].writes >= 1, "at least one write");
             // After reaching cap, no more writes
             assertTrue(rig.streams[0].writes <= 2, "cap limits writes");
+        } finally {
+            rig.close();
+        }
+    }
+
+    @Test
+    void theCombinedWriteIsTheInOrderConcatenationOfTheUncoalescedWrites() throws Exception {
+        byte[] expected;
+        Rig off = new Rig(false);
+        try {
+            for (int i = 1; i <= 5; i++) {
+                off.submit(frame(100 * i), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+            }
+            off.sink.drain();
+            expected = off.streams[0].written.toByteArray();
+        } finally {
+            off.close();
+        }
+        Rig on = new Rig(true);
+        try {
+            for (int i = 1; i <= 5; i++) {
+                on.submit(frame(100 * i), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+            }
+            on.sink.drain();
+            assertEquals(1, on.streams[0].writes);
+            assertArrayEquals(expected, on.streams[0].written.toByteArray());
+            assertEquals(5, on.successes);
+        } finally {
+            on.close();
+        }
+    }
+
+    @Test
+    void theCapEndsACombinedWriteAndEveryRecordIsStillWritten() throws Exception {
+        Rig rig = new Rig(true);
+        try {
+            for (int i = 0; i < 10; i++) {
+                rig.submit(frame(10000), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+            }
+            rig.sink.drain(); // the writability watch re-drains what the cap left queued
+            for (int i = 0; i < 10 && rig.successes < 10; i++) {
+                rig.sink.drain();
+            }
+            assertEquals(10, rig.successes, "every record is eventually written");
+            assertTrue(rig.streams[0].writes >= 2, "the 64 KiB cap split the writes: " + rig.streams[0].events);
+            for (String event : rig.streams[0].events) {
+                int len = Integer.parseInt(event.substring(event.indexOf(':') + 1));
+                assertTrue(len < 64 * 1024 + 10100, "one write is at most the cap plus one slice: " + len);
+            }
+        } finally {
+            rig.close();
+        }
+    }
+
+    @Test
+    void aDrainReenteredFromSettledLosesNoGatheredSlice() throws Exception {
+        Rig rig = new Rig(true);
+        try {
+            rig.onSettled = rig.sink::drain;
+            for (int i = 0; i < 4; i++) {
+                rig.submit(frame(200), StreamSequencer.Fence.ORDINARY_CONTROL, 0);
+                rig.submit(frame(300), StreamSequencer.Fence.CHUNK, 2);
+            }
+            rig.sink.drain();
+            assertEquals(8, rig.successes, "both streams' gathered slices settle");
+            assertEquals(0, rig.failures);
         } finally {
             rig.close();
         }
