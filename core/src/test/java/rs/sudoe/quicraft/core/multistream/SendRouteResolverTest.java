@@ -114,7 +114,7 @@ final class SendRouteResolverTest {
     @Test
     void chunkRouteUsesTheExtractedPosition() {
         SendRouteResolver.Resolved r = resolve(PID_CHUNK, BYTES);
-        assertEquals(StreamSequencer.Fence.CHUNK, r.fence());
+        assertEquals(StreamSequencer.Fence.CHUNK_ACK, r.fence(), "a non-ack chunk route fails safe to CHUNK_ACK");
         assertEquals(3, r.chunkX());
         assertEquals(-4, r.chunkZ());
         assertFalse(r.failed());

@@ -810,7 +810,10 @@ public final class SessionSendDriver {
             closeWith(CLOSE_RESOURCE);
             return new SentPacket();
         }
-        SentPacket handle = submit(new OutboundPacket(frame), StreamSequencer.Fence.CHUNK, chunkX, chunkZ,
+        // A batch install is not tracked by the held set, so later installs can no longer be proven first
+        // installs (13.21); the batch itself carries the ack dependency like any other non-exempted install.
+        heldChunks.markUnknown();
+        SentPacket handle = submit(new OutboundPacket(frame), StreamSequencer.Fence.CHUNK_ACK, chunkX, chunkZ,
                 new Record.Dependency[0]);
         if (handle.isAssigned() && !closed && !sealed) {
             batches.chunk(batchId, handle.logicalStream(), handle.sequence(), epoch);

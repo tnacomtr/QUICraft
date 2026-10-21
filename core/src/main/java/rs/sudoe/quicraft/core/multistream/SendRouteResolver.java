@@ -216,9 +216,11 @@ public final class SendRouteResolver {
             return Resolved.of(StreamSequencer.Fence.ACK_TRAILING, false);
         }
         if (v2.lane == RouteV2.StreamLane.CHUNK) {
+            // A chunk-lane route without the ack dependency fails safe to CHUNK_ACK: only the driver's proven first
+            // install (13.21) may skip the last ACK-stream record.
             return resolveChunk(extractors, v2, uncompressed,
                     v2.dependency == Dependency.ACK ? chunkAckFence(protocolNumber, packetId)
-                            : StreamSequencer.Fence.CHUNK);
+                            : StreamSequencer.Fence.CHUNK_ACK);
         }
         switch (v2.dependency) {
             case GLOBAL:

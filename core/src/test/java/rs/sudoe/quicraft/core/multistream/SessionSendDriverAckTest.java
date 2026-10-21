@@ -113,6 +113,22 @@ class SessionSendDriverAckTest {
     }
 
     @Test
+    void aBatchInstallCarriesTheAckAndStopsFirstInstallTracking() throws Exception {
+        Rig rig = new Rig();
+        rig.send(Fence.ACK_TRAILING, 0, 0);
+        rig.driver.beginBatch(1, frame());
+        SentPacket batched = rig.driver.batchInstall(1, frame(), 20, 20);
+        assertTrue(batched.isAssigned());
+        rig.driver.finishBatch(1, frame());
+        SentPacket replacement = rig.send(Fence.CHUNK_INSTALL, 20, 20);
+        SentPacket fresh = rig.send(Fence.CHUNK_INSTALL, 30, 30);
+        rig.drain();
+        assertTrue(rig.dependsOnAck(batched), "a batch install is never an exempted first install");
+        assertTrue(rig.dependsOnAck(replacement), "the held set did not see the batch install");
+        assertTrue(rig.dependsOnAck(fresh), "tracking stopped after the untracked batch install");
+    }
+
+    @Test
     void aForgetRingOverflowMakesEveryLaterInstallCarryTheAck() throws Exception {
         Rig rig = new Rig();
         rig.send(Fence.ACK_TRAILING, 0, 0);

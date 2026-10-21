@@ -1578,7 +1578,10 @@ before this revision can run.
    (`markUnknown()`), making the set untrusted; from then on every 45 carries `ack` for the rest
    of the session. Packets 6, 8, 84 and 37 always carry `ack`. Held-set cap 4096: above the cap
    the sender stops tracking the same way. A 45 or 37 sent inside a bundle is not tracked; from
-   then on every 45 carries `ack` for the rest of the session.
+   then on every 45 carries `ack` for the rest of the session. A batch install (13.19, unshipped)
+   is not tracked either: it carries `ack` and stops tracking the same way. A chunk-lane route
+   whose table dependency is not `ack` is sent as if it were `ack`; only the sender's proven first
+   install of 45 omits it.
    Every epoch change marks the held set unknown (`markUnknown()`), never clears it
    (`clear()`): a same-dimension respawn keeps the client's `ClientLevel` and its prediction map
    (`ClientPacketListener.java:1227-1251`, `ClientLevel.java:162`), so the sender cannot distinguish
