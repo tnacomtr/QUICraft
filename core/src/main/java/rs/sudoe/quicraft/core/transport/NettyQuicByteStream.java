@@ -114,18 +114,24 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     private void append(ByteBuf copy) {
         int length = copy.readableBytes();
         if (length >= COALESCE_TARGET) {
-            drainPending();
+            writePending();
             writeOut(copy);
+            scheduleDrain();
             return;
         }
         if (pendingBuffer != null && pendingBuffer.readableBytes() + length > COALESCE_TARGET) {
-            drainPending();
+            writePending();
         }
         if (pendingBuffer == null) {
             pendingBuffer = channel.alloc().buffer(COALESCE_TARGET);
         }
         pendingBuffer.writeBytes(copy);
         copy.release();
+        scheduleDrain();
+    }
+
+    /** One drain per loop turn: every write of this turn reaches quiche with a single flush. */
+    private void scheduleDrain() {
         if (!drainScheduled) {
             drainScheduled = true;
             channel.eventLoop().execute(this::drainPending);
@@ -137,12 +143,21 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
         if (!COALESCE) {
             channel.flush();
         }
-        // Coalescing: the scheduled drain writes on the next loop turn; quiche sends on write.
+        // Coalescing: the scheduled drain writes and flushes on the next loop turn.
     }
 
-    /** Hands the coalesced bytes to quiche (event loop only). */
+    /**
+     * Writes the coalesced bytes and flushes (event loop only). A stream channel only hands queued writes to
+     * quiche on flush, so a drain without one leaves them waiting for an unrelated flush.
+     */
     private void drainPending() {
         drainScheduled = false;
+        writePending();
+        channel.flush();
+    }
+
+    /** Queues the coalesced bytes on the channel without flushing (event loop only). */
+    private void writePending() {
         ByteBuf coalesced = pendingBuffer;
         pendingBuffer = null;
         if (coalesced == null) {
