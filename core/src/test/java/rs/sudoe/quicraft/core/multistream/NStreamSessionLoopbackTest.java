@@ -58,7 +58,7 @@ class NStreamSessionLoopbackTest {
             try (NRig rig = NRig.start(n)) {
                 rig.activateBoth();
                 SessionContext context = SessionContext.of(n);
-                for (int i = 0; i < n + 2; i++) {
+                for (int i = 0; i < n + 3; i++) {
                     assertEquals(context.quicIdOf(i), NRig.channel(rig.server, i).streamId(), "server stream " + i);
                     assertEquals(context.quicIdOf(i), NRig.channel(rig.client, i).streamId(), "client stream " + i);
                 }

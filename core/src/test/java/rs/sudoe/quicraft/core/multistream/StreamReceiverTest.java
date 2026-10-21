@@ -18,7 +18,7 @@ class StreamReceiverTest {
     private static final int ACK_JOIN = 2;
     private static final int BATCH_JOIN = 3;
 
-    private static final class Fixture {
+    static final class Fixture {
         final AtomicLong now = new AtomicLong();
         final StreamReceiver receiver;
 

@@ -45,6 +45,17 @@ class PreambleV2Test {
         assertArrayEquals(TOKEN, PreambleV2.encode(tokenBytes()));
     }
 
+    /** 13.2, 13.21: the ACK stream is the sixth server-opened stream, so an offer of six shards is refused. */
+    @Test
+    void anOfferOfSixShardsIsRefusedOnBothSides() {
+        assertThrows(IllegalArgumentException.class, () -> PreambleV2.encode(null, 1, 6));
+        assertThrows(IllegalArgumentException.class, () -> PreambleV2.encode(null, 6, 6));
+        PreambleV2.Parser parser = new PreambleV2.Parser();
+        MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class,
+                () -> parser.feed(ByteBuffer.wrap(new byte[] {0x04, 0x02, 0x00, 0x01, 0x06})));
+        assertEquals(0x1, e.closeCode());
+    }
+
     @Test
     void encodeRejectsOtherTokenLengths() {
         assertThrows(IllegalArgumentException.class, () -> PreambleV2.encode(new byte[15]));
