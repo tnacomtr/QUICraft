@@ -126,9 +126,39 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                         + rig.clientDimension() + ", position " + rig.clientPosition());
                 rig.assertLive("after join", Level.OVERWORLD, epoch);
 
-                // 0. The scripted play session over /3, ending with a far teleport that forgets the
-                // chunks around the start (more than the 256-entry forget ring), then a teleport back.
+                // 0. Start the overflow check on a fresh connection, BEFORE the play session's walking
+                // and teleports. Those already forget a timing-dependent number of chunks and can
+                // exhaust the 256-entry ring (26.1 CI reached untrusted=true before the old check).
                 BlockPos home = rig.clientBlockPos();
+                Boolean untrustedBefore = rig.heldChunksUntrusted();
+                QuicraftFabricTestLog.info("respawn-live: server HeldChunkSet untrusted before the hops: "
+                        + untrustedBefore);
+                check(Boolean.FALSE.equals(untrustedBefore),
+                        "the fresh held set is trusted before the hops: " + untrustedBefore);
+                // Four disjoint view-distance-4 areas exhaust the 256-entry forget ring without
+                // depending on how many chunks the scripted play session happened to forget.
+                int[][] hops = {{-3000, 0}, {0, 3000}, {4000, 4000}, {-4000, -4000}};
+                for (int[] hop : hops) {
+                    server.runCommand("tp @a " + (home.getX() + hop[0]) + " " + (home.getY() + 1) + " "
+                            + (home.getZ() + hop[1]));
+                    context.waitTicks(20);
+                    GameTests.waitForChunks(join);
+                    QuicraftFabricTestLog.info("respawn-live: HeldChunkSet untrusted after hop "
+                            + hop[0] + "," + hop[1] + ": " + rig.heldChunksUntrusted());
+                }
+                rig.assertLive("after four far hops", Level.OVERWORLD, epoch);
+                Boolean untrustedAfter = rig.heldChunksUntrusted();
+                QuicraftFabricTestLog.info("respawn-live: server HeldChunkSet untrusted after the hops: "
+                        + untrustedAfter);
+                check(Boolean.TRUE.equals(untrustedAfter),
+                        "the forget ring overflowed and the held set is untrusted: " + untrustedAfter);
+                server.runCommand("tp @a " + home.getX() + " " + home.getY() + " " + home.getZ());
+                context.waitTicks(20);
+                GameTests.waitForChunks(join);
+                rig.assertLive("back at spawn before the play session", Level.OVERWORLD, epoch);
+
+                // 0b. Run the full play session on the now-untrusted connection. Revisit both spawn
+                // and its far target to check reinstalled chunks after the proven ring overflow.
                 PlaySession.run(context, server, join);
                 rig.assertLive("after the play session", Level.OVERWORLD, epoch);
                 server.runCommand("tp @a " + home.getX() + " " + home.getY() + " " + home.getZ());
@@ -137,28 +167,6 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                 rig.assertLive("after the far teleport back near spawn", Level.OVERWORLD, epoch);
                 PlaySession.compareBlocks(context, server, home.offset(-8, -3, -8), home.offset(8, 3, 8));
                 QuicraftFabricTestLog.info("respawn-live: blocks around spawn agree after the ring overflow");
-
-                // 0b. Overflow the held-chunk forget ring (256 entries): each far hop forgets about 81 chunks
-                // (view distance 4), so four hops on top of the play session pass it. Then return to the
-                // play session's far target, whose chunks are reinstalled after the overflow.
-                Boolean untrustedBefore = rig.heldChunksUntrusted();
-                QuicraftFabricTestLog.info("respawn-live: server HeldChunkSet untrusted before the hops: "
-                        + untrustedBefore);
-                check(Boolean.FALSE.equals(untrustedBefore),
-                        "the held set is still trusted before the hops: " + untrustedBefore);
-                int[][] hops = {{-3000, 0}, {0, 3000}, {4000, 4000}, {-4000, -4000}};
-                for (int[] hop : hops) {
-                    server.runCommand("tp @a " + (home.getX() + hop[0]) + " " + (home.getY() + 1) + " "
-                            + (home.getZ() + hop[1]));
-                    context.waitTicks(20);
-                    GameTests.waitForChunks(join);
-                }
-                rig.assertLive("after four far hops", Level.OVERWORLD, epoch);
-                Boolean untrustedAfter = rig.heldChunksUntrusted();
-                QuicraftFabricTestLog.info("respawn-live: server HeldChunkSet untrusted after the hops: "
-                        + untrustedAfter);
-                check(Boolean.TRUE.equals(untrustedAfter),
-                        "the forget ring overflowed and the held set is untrusted: " + untrustedAfter);
                 int fx = home.getX() + 2000;
                 int fz = home.getZ() + 3 - 1500; // PlaySession's far target
                 server.runCommand("tp @a " + fx + " " + (home.getY() + 1) + " " + fz);
@@ -307,7 +315,10 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                     untrusted.setAccessible(true);
                     // The send driver mutates the set under its own monitor.
                     synchronized (driver) {
-                        return (Boolean) untrusted.invoke(held);
+                        Boolean result = (Boolean) untrusted.invoke(held);
+                        QuicraftFabricTestLog.info("respawn-live: held-set snapshot: held=" + read(held, "heldSize")
+                                + ", forgotten=" + read(held, "ringSize") + ", untrusted=" + result);
+                        return result;
                     }
                 } catch (Throwable t) {
                     QuicraftFabricTestLog.info("respawn-live: HeldChunkSet not reachable: " + t);
