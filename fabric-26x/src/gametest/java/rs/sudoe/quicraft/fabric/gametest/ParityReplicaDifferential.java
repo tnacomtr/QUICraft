@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.fabric.gametest;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -134,6 +135,12 @@ final class ParityReplicaDifferential {
                         + a.epoch() + " deps " + deps(a) + " vs replica epoch " + e.epoch() + " deps " + deps(e));
                 return;
             }
+            // Each op's frame is unique, so equal payloads prove the same packet took this slot on both paths.
+            if (!Arrays.equals(a.gameFrame(), e.gameFrame())) {
+                problems.add(name + ": record " + e.streamIndex() + "#" + e.sequence() + " carries driver payload "
+                        + Arrays.toString(a.gameFrame()) + " vs replica payload " + Arrays.toString(e.gameFrame()));
+                return;
+            }
         }
         if (actual.size() != expected.size()) {
             problems.add(name + ": the driver wrote " + actual.size() + " records, the replica assigned "
@@ -212,7 +219,9 @@ final class ParityReplicaDifferential {
                 ByteBuffer in = ByteBuffer.wrap(write.bytes());
                 Record record;
                 while ((record = decoder.next(in)) != null) {
-                    out.put(key(stream, record.sequence()), record);
+                    if (out.put(key(stream, record.sequence()), record) != null) {
+                        throw new IllegalStateException("the driver wrote " + stream + "#" + record.sequence() + " twice");
+                    }
                 }
             }
             return out;
