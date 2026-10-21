@@ -1212,3 +1212,29 @@ Congestion control is not it: clean, n=2, interleaved TCP, both ends switched wi
 | /3 CUBIC | 1371, 1536 | 1.43, 1.45 |
 
 Open: the in-batch gaps (server send scheduling, the client read pump, or ACK timing remain candidates).
+
+### /3 receive-path experiments: inline pump and read-ahead (2026-10-21, n=3 per arm, interleaved TCP)
+
+Same real-Fabric method as above (one fresh server and client per run, arms interleaved
+tcp, /3, /3 inline pump, tcp, /3 read-ahead; n=6 for tcp). Base = integration 43c1f29; inline pump =
+`agent/p5-pump-hops` 4cf519c (the client runs the receive pump on the loop right after an apply instead of
+queueing it); read-ahead = `agent/p5-readahead` ed63bd5 with `-Dquicraft.v3.readAhead=true` confirmed on the
+client JVM (several complete units buffered per stream within the 13.12 slot). Median (per-run values):
+
+| profile | arm | join ms | chunk load ms | rtt median ms | disconnects |
+|---|---|---|---|---|---|
+| clean | tcp | 1317 | 825 (704-1164) | 0.59 | 0 |
+| clean | /3 | 1788 | 1329 (1162, 1329, 1665) | 1.47 | 0 |
+| clean | /3 inline pump | 1628 | 1286 (1268, 1286, 1419) | 1.48 | 0 |
+| clean | /3 read-ahead | 1697 | 1388 (1367, 1388, 1489) | 1.43 | 0 |
+| delayloss | tcp | 2131 | 21129 (3167-42292) | 150.77 | 0 |
+| delayloss | /3 | 2935 | 2974 (2805, 2974, 3206) | 151.56 | 0 |
+| delayloss | /3 inline pump | 2960 | 3487 (3283, 3487, 4333) | 151.29 | 0 |
+| delayloss | /3 read-ahead | 2745 | 3231 (2998, 3231, 3616) | 151.75 | 0 |
+
+Neither change moves the clean-link chunk load beyond run-to-run noise, so neither is merged (both branches
+kept). Under delayloss the inline-pump runs all sit above the base runs (n=3, not conclusive). The /3 gain
+under delay and loss holds: 2974 vs 21129 ms chunk load, about 7x. Open: the clean-link gap (~0.5 s chunk
+load, ~0.9 ms RTT) is not in the client's read pump or in per-stream buffering; next suspect is the two
+cross-thread hops per applied unit (QUIC loop -> game loop for delivery, game loop -> QUIC loop for the ack),
+paid serially by ~3800 units in a join.
