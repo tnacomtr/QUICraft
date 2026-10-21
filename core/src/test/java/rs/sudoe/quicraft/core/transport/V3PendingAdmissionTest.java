@@ -50,7 +50,7 @@ class V3PendingAdmissionTest {
         // One open connection, and room in the pre-login pool for exactly one staged connection: the second
         // connection must shed the first, and waits until the first's close is confirmed.
         ResourcePools pools = new PreLoginTrackerTest.FakePools()
-                .capacity(ResourcePools.Pool.PRE_LOGIN, PreLoginTracker.stagedShare(6));
+                .capacity(ResourcePools.Pool.PRE_LOGIN, PreLoginTracker.stagedShare(5));
         TransportConfig config = TransportConfig.builder().maxOpen(1).resourcePools(pools).build();
         Queue<Runnable> held = new ConcurrentLinkedQueue<>();
         QuicServer.heldWakes = held;

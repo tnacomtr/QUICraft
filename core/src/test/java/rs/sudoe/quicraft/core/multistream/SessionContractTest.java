@@ -57,39 +57,40 @@ class SessionContractTest {
 
     @Test
     void selectedNIsImmutableAndWithinOffer() throws Exception {
-        for (int n = 1; n <= 6; n++) {
-            // Client offers 1..6; the server's configured maximum and preference both equal n.
-            SessionContext selected = SessionContext.select(parse(PreambleV2.encode(null, 1, 6)), n, n);
+        for (int n = 1; n <= 5; n++) {
+            // Client offers 1..5; the server's configured maximum and preference both equal n.
+            SessionContext selected = SessionContext.select(parse(PreambleV2.encode(null, 1, 5)), n, n);
             assertEquals(n, selected.shardCount(), "N=" + n);
-            assertEquals(n + 2, selected.logicalStreamCount());
+            assertEquals(n + 3, selected.logicalStreamCount());
+            assertEquals(n + 2, selected.ackIndex());
             assertEquals(selected, SessionContext.of(n));
             assertEquals(n, selected.shardCount(), "the selection never changes after it is made");
             // The server's reply names N in both fields, and the client accepts it inside its offer.
-            assertEquals(selected, SessionContext.accept(n, n, 1, 6));
+            assertEquals(selected, SessionContext.accept(n, n, 1, 5));
         }
         // A narrow offer clamps the preference into the intersection, never outside it.
-        assertEquals(5, SessionContext.select(parse(PreambleV2.encode(null, 5, 6)), 6, 3).shardCount());
-        assertEquals(4, SessionContext.select(parse(PreambleV2.encode(null, 1, 4)), 6, 6).shardCount());
+        assertEquals(4, SessionContext.select(parse(PreambleV2.encode(null, 4, 5)), 5, 3).shardCount());
+        assertEquals(4, SessionContext.select(parse(PreambleV2.encode(null, 1, 4)), 5, 5).shardCount());
     }
 
     @Test
     void malformedRangesCloseWithProtocolViolation() {
         // Length 4, version 2, no token, then min/max that the parser must refuse (13.2).
-        assertEquals(0x1, closeCodeOf(new byte[] {4, 2, 0, 0, 6}), "min 0");
-        assertEquals(0x1, closeCodeOf(new byte[] {4, 2, 0, 1, 7}), "max 7");
+        assertEquals(0x1, closeCodeOf(new byte[] {4, 2, 0, 0, 5}), "min 0");
+        assertEquals(0x1, closeCodeOf(new byte[] {4, 2, 0, 1, 6}), "max 6 is above the cap of 5");
         assertEquals(0x1, closeCodeOf(new byte[] {4, 2, 0, 5, 3}), "min above max");
-        assertEquals(0x1, closeCodeOf(new byte[] {4, 3, 0, 1, 6}), "unknown version");
+        assertEquals(0x1, closeCodeOf(new byte[] {4, 3, 0, 1, 5}), "unknown version");
         // The client side refuses a reply that is not one shard count.
         assertEquals(0x1, reply(2, 3));
         assertEquals(0x1, reply(0, 0));
-        assertEquals(0x1, reply(7, 7));
+        assertEquals(0x1, reply(6, 6));
     }
 
     @Test
     void emptyIntersectionOrSelectionOutsideTheOfferCloseWithNoCommonShards() throws Exception {
-        // Offer 5..6 against a configured maximum of 4 leaves no common shard count.
+        // Offer 4..5 against a configured maximum of 3 leaves no common shard count.
         MultistreamProtocolException none = assertThrows(MultistreamProtocolException.class,
-                () -> SessionContext.select(parse(PreambleV2.encode(null, 5, 6)), 4, 3));
+                () -> SessionContext.select(parse(PreambleV2.encode(null, 4, 5)), 3, 3));
         assertEquals(0x10, none.closeCode());
         // A reply naming 4 when the client offered only 1..3 is an invalid selection.
         assertEquals(0x10, reply(4, 4, 1, 3));
@@ -98,11 +99,11 @@ class SessionContractTest {
     @Test
     void invalidSharedCountIsLocalMisuse() {
         assertThrows(IllegalArgumentException.class, () -> SessionContext.of(0));
-        assertThrows(IllegalArgumentException.class, () -> SessionContext.of(7));
+        assertThrows(IllegalArgumentException.class, () -> SessionContext.of(6));
     }
 
     private static int reply(int min, int max) {
-        return reply(min, max, 1, 6);
+        return reply(min, max, 1, 5);
     }
 
     private static int reply(int min, int max, int offerMin, int offerMax) {
@@ -124,8 +125,12 @@ class SessionContractTest {
         assertEquals(1L, two.quicIdOf(2));
         assertEquals(5L, two.quicIdOf(3));
         assertEquals(3, two.logicalIndexOf(5L));
-        assertThrows(IllegalArgumentException.class, () -> two.quicIdOf(4));
-        assertThrows(IllegalArgumentException.class, () -> two.logicalIndexOf(9L));
+        // The ACK stream is logical index N+2 = 4, QUIC id 1+4N = 9 (13.3).
+        assertEquals(9L, two.quicIdOf(4));
+        assertEquals(4, two.logicalIndexOf(9L));
+        assertEquals(4, two.ackIndex());
+        assertThrows(IllegalArgumentException.class, () -> two.quicIdOf(5));
+        assertThrows(IllegalArgumentException.class, () -> two.logicalIndexOf(13L));
     }
 
     @Test

@@ -3,7 +3,7 @@ package rs.sudoe.quicraft.core.multistream;
 
 /**
  * The negotiated shape of one {@code /3} connection (docs/protocol.md 13.2-13.3): the selected
- * shard count N and the N+2 logical streams it implies. Created once, when the preambles have
+ * shard count N and the N+3 logical streams it implies. Created once, when the preambles have
  * been exchanged, and never changed afterwards. Holds no connection state, so any thread may read it.
  */
 public final class SessionContext {
@@ -19,7 +19,7 @@ public final class SessionContext {
     /**
      * The context for an already selected N.
      *
-     * @throws IllegalArgumentException if N is outside 1..6 (local misuse, never a wire event)
+     * @throws IllegalArgumentException if N is outside 1..5 (local misuse, never a wire event)
      */
     public static SessionContext of(int shardCount) {
         LogicalStream.validateShardCount(shardCount);
@@ -45,7 +45,7 @@ public final class SessionContext {
      * @param selectedMin the reply's first range field
      * @param selectedMax the reply's second range field
      * @param offerMin the client's offered minimum (1 in the draft)
-     * @param offerMax the client's offered maximum (6 in the draft)
+     * @param offerMax the client's offered maximum (5)
      * @throws MultistreamProtocolException with 0x1 when the two fields differ or name no legal
      *     shard count, and with 0x10 when the selection lies outside the offer
      */
@@ -66,13 +66,18 @@ public final class SessionContext {
         return of(selectedMin);
     }
 
-    /** The selected shard count N, 1..6. */
+    /** The selected shard count N, 1..5. */
     public int shardCount() {
         return shardCount;
     }
 
-    /** The number of logical streams, N+2: CONTROL, REALTIME and one per chunk shard (13.3). */
+    /** The number of logical streams, N+3: CONTROL, REALTIME, one per chunk shard and the ACK stream (13.3). */
     public int logicalStreamCount() {
+        return shardCount + 3;
+    }
+
+    /** The logical index of the ACK stream, N+2 (13.3). */
+    public int ackIndex() {
         return shardCount + 2;
     }
 

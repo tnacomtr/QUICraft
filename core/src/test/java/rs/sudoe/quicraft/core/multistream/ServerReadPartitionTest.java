@@ -6,17 +6,17 @@ import static org.junit.jupiter.api.Assertions.*;
 import org.junit.jupiter.api.Test;
 
 class ServerReadPartitionTest {
-    @Test void atSixChunksProtectedAreaIsSevenThousandSixHundredSixtySevenBytes() {
-        ServerReadPartition partition = new ServerReadPartition(6);
+    @Test void atFiveChunksAndTheAckStreamProtectedAreaIsSevenThousandSixHundredSixtySevenBytes() {
+        ServerReadPartition partition = new ServerReadPartition(5);
         assertEquals(7667, partition.protectedBytes());
         assertEquals(5459, partition.controlAllowance());
         assertTrue(partition.controlAllowance() <= partition.protectedBytes() - 2048);
-        assertEquals(ServerReadPartition.SHARE, ServerReadPartition.NATIVE_EXPOSURE + (2 * 6 + 1)
+        assertEquals(ServerReadPartition.SHARE, ServerReadPartition.NATIVE_EXPOSURE + (2 * (5 + 1) + 1)
                 + partition.protectedBytes() + ServerReadPartition.REALTIME_WIRE_CAP);
     }
 
     @Test void controlAllowanceRefusesExcessWhileRealtimeSliceStaysProtected() {
-        ServerReadPartition partition = new ServerReadPartition(6);
+        ServerReadPartition partition = new ServerReadPartition(5);
         assertTrue(partition.reserve(LogicalStream.CONTROL, partition.controlAllowance()));
         assertFalse(partition.reserve(LogicalStream.CONTROL, 1), "CONTROL must use excess beyond its allowance");
         assertEquals(2048, partition.available(LogicalStream.REALTIME));
@@ -25,7 +25,7 @@ class ServerReadPartitionTest {
     }
 
     @Test void prefixSliceIsFixedAndSeparate() {
-        ServerReadPartition partition = new ServerReadPartition(6);
+        ServerReadPartition partition = new ServerReadPartition(5);
         assertTrue(partition.reservePrefix(ServerReadPartition.PREFIX_SLICE));
         assertFalse(partition.reservePrefix(1));
         partition.releasePrefix(ServerReadPartition.PREFIX_SLICE);
@@ -33,7 +33,7 @@ class ServerReadPartitionTest {
     }
 
     @Test void readGrantIsTheMinimumOfNativeCapAvailableAndUnitBytes() {
-        ServerReadPartition partition = new ServerReadPartition(6);
+        ServerReadPartition partition = new ServerReadPartition(5);
         assertEquals(5459, partition.readGrant(LogicalStream.CONTROL, 1 << 20), "capped by the CONTROL allowance");
         assertEquals(2048, partition.readGrant(LogicalStream.REALTIME, 1 << 20), "capped by the REALTIME slice");
         assertEquals(100, partition.readGrant(LogicalStream.CONTROL, 100));
@@ -50,7 +50,7 @@ class ServerReadPartitionTest {
     }
 
     @Test void protectedRealtimeReadIsServedBeforeControl() {
-        ServerReadPartition partition = new ServerReadPartition(6);
+        ServerReadPartition partition = new ServerReadPartition(5);
         assertEquals(LogicalStream.REALTIME, partition.nextReadStream(100, 100));
         assertTrue(partition.reserve(LogicalStream.REALTIME, 2048));
         assertEquals(LogicalStream.CONTROL, partition.nextReadStream(100, 100), "full REALTIME slice yields to CONTROL");
@@ -58,7 +58,7 @@ class ServerReadPartitionTest {
     }
 
     @Test void readGrantsComeOnlyFromProtectedPAndNeverFromExcess() {
-        ServerReadPartition partition = new ServerReadPartition(6);
+        ServerReadPartition partition = new ServerReadPartition(5);
         assertTrue(partition.reserve(LogicalStream.CONTROL, partition.controlAllowance()));
         // CONTROL's in-share allowance is exhausted: no protected grant, so the caller must use excess.
         assertEquals(0, partition.readGrant(LogicalStream.CONTROL, 1000));

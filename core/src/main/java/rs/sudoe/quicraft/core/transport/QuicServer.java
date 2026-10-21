@@ -80,7 +80,7 @@ public final class QuicServer implements Closeable {
      * Chunk streams charged for a staged connection. N is not negotiated before OFFER, so every
      * staged connection is charged for the largest N (13.2): conservative, and at most six streams.
      */
-    static final int STAGED_LANES = 6;
+    static final int STAGED_LANES = rs.sudoe.quicraft.core.multistream.LogicalStream.MAX_CHUNKS;
     /** How often a staged connection's pre-login deadline is checked (12.13). */
     private static final long STAGED_CHECK_MILLIS = 1_000;
     /** RFC 9001 §4.8: CRYPTO_ERROR 0x100 + TLS alert handshake_failure (40). */

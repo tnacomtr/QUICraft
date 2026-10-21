@@ -37,7 +37,7 @@ class Schema2RoutingTest {
 
     @Test void validatesEveryDirectionLaneDependencyTuple() {
         for (String direction : new String[] {"clientbound", "serverbound"}) {
-            for (String lane : new String[] {"control", "realtime", "chunk", "world", "unknown"}) {
+            for (String lane : new String[] {"control", "realtime", "chunk", "ack", "world", "unknown"}) {
                 for (Dependency dep : Dependency.values()) {
                     boolean control = lane.equals("control");
                     boolean chunk = lane.equals("chunk");
@@ -46,7 +46,8 @@ class Schema2RoutingTest {
                             || dep == Dependency.CONTROL || dep == Dependency.ORDINARY
                             || (direction.equals("serverbound") && dep == Dependency.INTERACTION)
                             : (lane.equals("realtime") && dep == Dependency.LANE)
-                            || (chunk && direction.equals("clientbound") && (dep == Dependency.LANE || join));
+                            || (chunk && direction.equals("clientbound") && (dep == Dependency.LANE || join || dep == Dependency.ACK));
+                    // An ACK lane route is legal only for packets 4 and 11 (AckLaneRoutingTest), never for id 1.
                     String json = table(route(direction, lane, dep.wireName(), chunk ? (join ? "\"join\"" : "\"one\"") : "null"));
                     if (valid) assertDoesNotThrow(() -> RoutingTableLoader.parse(json), json);
                     else assertThrows(RoutingTableException.class, () -> RoutingTableLoader.parse(json), json);

@@ -96,6 +96,19 @@ class ProfileStoreTest {
         assertEquals(40_000, loaded.maxConnections, "the rest of the old file still loads");
     }
 
+    /** The shard cap dropped from 6 to 5 for the ACK stream: an old override loads as 5, never disables /3. */
+    @Test
+    void anOverrideWrittenForTheOldCapOfSixLoadsAsFiveAndOtherBadValuesStillFail() throws IOException {
+        Path file = dir.resolve("profile.properties");
+        String text = "maxConnections=40000\nmaxLanes=6\nnodeBudgetBytes=134217728\npreLoginPoolFraction=0.05\n"
+                + "queuePacketLimit=2048\nqueueByteLimit=4194304\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n";
+        Files.write(file, text.getBytes(StandardCharsets.UTF_8));
+        ServerProfile loaded = new ProfileStore(file, ServerProfileTest.valid()).load();
+        assertEquals(5, loaded.maxLanes);
+        Files.write(file, text.replace("maxLanes=6", "maxLanes=7").getBytes(StandardCharsets.UTF_8));
+        assertThrows(IllegalArgumentException.class, () -> new ProfileStore(file, ServerProfileTest.valid()).load());
+    }
+
     @Test
     void aMalformedPerPrefixCapFailsToLoadAndNamesTheField() throws IOException {
         Path file = dir.resolve("profile.properties");

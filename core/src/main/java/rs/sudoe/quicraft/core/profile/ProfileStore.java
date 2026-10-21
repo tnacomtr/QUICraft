@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.Objects;
 import java.util.Properties;
+import rs.sudoe.quicraft.core.multistream.LogicalStream;
 
 /**
  * Persisted server-profile overrides (docs/protocol.md 12.13, 13.12, 13.20).
@@ -60,7 +61,7 @@ public final class ProfileStore {
         }
         ServerProfile value = new ServerProfile(
                 intValue(p, "maxConnections"),
-                intValue(p, "maxLanes"),
+                clampLanes(intValue(p, "maxLanes")),
                 longValue(p, "nodeBudgetBytes"),
                 doubleValue(p, "preLoginPoolFraction"),
                 intValue(p, "queuePacketLimit"),
@@ -73,6 +74,14 @@ public final class ProfileStore {
                 optionalLong(p, "declaredBytesPerPrefix", defaults.declaredBytesPerPrefix));
         value.validate();
         return value;
+    }
+
+    /**
+     * The /3 shard cap is 5 (the ACK stream is the sixth server-opened stream). An override file written
+     * for the earlier cap of 6 loads as 5 instead of failing, so an old file never disables /3.
+     */
+    private static int clampLanes(int lanes) {
+        return lanes == LogicalStream.MAX_CHUNKS + 1 ? LogicalStream.MAX_CHUNKS : lanes;
     }
 
     /**

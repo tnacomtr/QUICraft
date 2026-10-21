@@ -19,7 +19,9 @@ public final class ReceiveRoute {
         /** REALTIME, logical stream 1. */
         REALTIME,
         /** CHUNK[i], logical streams 2 onward. */
-        CHUNK
+        CHUNK,
+        /** ACK stream, logical stream N+2 (13.21). */
+        ACK
     }
 
     private final Lane lane;

@@ -110,7 +110,7 @@ public final class SessionReceiveDriver {
      * Legacy boundary mode: the blocked-head timer is driven by the forwarded
      * {@link #stallStarted(long)} and {@link #stallEnded(long)} notifications on {@code clock}.
      *
-     * @param chunks negotiated chunk count N, 1..6, equal to the pump's
+     * @param chunks negotiated chunk count N, 1..5, equal to the pump's
      * @param pump the clientbound read pump; it charges and commits the slots
      * @param slots the pump's slots; the receiver shares them and never charges again
      * @param validator injected shard, fence and join checks, also run on each bundle member
@@ -138,7 +138,7 @@ public final class SessionReceiveDriver {
         this.game = game;
         this.clock = clock;
         this.sink = sink;
-        this.streams = chunks + 2;
+        this.streams = chunks + 3;
         this.held = new Entry[streams];
     }
 
@@ -148,7 +148,7 @@ public final class SessionReceiveDriver {
      * non-excluding transport clock for the bundle-close deadline (13.15), which never excludes stalls.
      * Boundary stall notifications forwarded through this driver throw in this mode.
      *
-     * @param chunks negotiated chunk count N, 1..6, equal to the pump's
+     * @param chunks negotiated chunk count N, 1..5, equal to the pump's
      * @param pump the clientbound read pump; it charges and commits the slots
      * @param slots the pump's slots; the receiver shares them and never charges again
      * @param validator injected shard, fence and join checks, also run on each bundle member
@@ -177,7 +177,7 @@ public final class SessionReceiveDriver {
         this.game = game;
         this.clock = clock;
         this.sink = sink;
-        this.streams = chunks + 2;
+        this.streams = chunks + 3;
         this.held = new Entry[streams];
     }
 
@@ -339,7 +339,7 @@ public final class SessionReceiveDriver {
             // Another holder has the workspace for now: wait and retry, as for decoded output.
             return retryLater();
         }
-        Attempt attempt = new Attempt();
+        Attempt attempt = new Attempt(stream == streams - 1 ? ReceiveSlots.ACK_RECORD_MAX_BYTES : Integer.MAX_VALUE);
         List<Object> packets = new ArrayList<Object>(entry.unit.recordCount());
         List<ReceiveRoute> memberRoutes = new ArrayList<ReceiveRoute>(entry.unit.recordCount());
         boolean bundle = entry.unit.recordCount() > 1;
@@ -361,6 +361,11 @@ public final class SessionReceiveDriver {
             }
             if (decoded == null) {
                 fail(ReceiveClose.peerViolation("decoder returned nothing"));
+                return false;
+            }
+            if (decoded.uncompressedBytes() > attempt.inflatedCap) {
+                fail(ReceiveClose.peerViolation("ACK stream packet of " + decoded.uncompressedBytes()
+                        + " inflated bytes (13.21)"));
                 return false;
             }
             if (attempt.reserved == before && decoded.retainedBytes() > 0) {
@@ -550,6 +555,9 @@ public final class SessionReceiveDriver {
             case REALTIME:
                 routeLane = ReceiveRoute.Lane.REALTIME;
                 break;
+            case ACK:
+                // 13.21: positionless, never a join or an epoch change (the loader guarantees both).
+                return new ReceiveRoute(ReceiveRoute.Lane.ACK, v2.dependency, null, false, false);
             default:
                 routeLane = ReceiveRoute.Lane.CHUNK;
                 break;
@@ -580,8 +588,8 @@ public final class SessionReceiveDriver {
         return new ReceiveRoute(routeLane, v2.dependency, position, v2.epochChange, join);
     }
 
-    private static Lane laneOf(int stream) {
-        if (stream == LogicalStream.CONTROL) return Lane.CONTROL;
+    private Lane laneOf(int stream) {
+        if (stream == LogicalStream.CONTROL || stream == streams - 1) return Lane.CONTROL;
         if (stream == LogicalStream.REALTIME) return Lane.REALTIME;
         return Lane.WORLD;
     }
@@ -604,9 +612,19 @@ public final class SessionReceiveDriver {
     private final class Attempt implements LaneGame.Reservation {
         /** Bytes the game reserved during this attempt, across its records. */
         long reserved;
+        /** Largest inflated packet this attempt may declare: 64 bytes on the ACK stream (13.21). */
+        final int inflatedCap;
+
+        Attempt(int inflatedCap) {
+            this.inflatedCap = inflatedCap;
+        }
 
         @Override
         public void reserve(long additionalRetainedBytes, int totalUncompressedBytes) {
+            if (totalUncompressedBytes > inflatedCap) {
+                throw new IllegalStateException("ACK stream packet inflates to " + totalUncompressedBytes
+                        + " bytes (13.21)");
+            }
             if (additionalRetainedBytes < 0 || !charge(additionalRetainedBytes)) {
                 throw new RetryLater();
             }

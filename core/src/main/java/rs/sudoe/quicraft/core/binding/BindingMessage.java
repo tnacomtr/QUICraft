@@ -169,7 +169,7 @@ public final class BindingMessage {
     }
 
     private static void checkShardCount(int n) {
-        if (n < 1 || n > 6) throw new IllegalArgumentException("shard count must be 1..6");
+        if (n < 1 || n > 5) throw new IllegalArgumentException("shard count must be 1..5");
     }
 
     /**

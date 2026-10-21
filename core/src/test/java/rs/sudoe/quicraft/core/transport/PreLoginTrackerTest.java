@@ -16,74 +16,74 @@ import rs.sudoe.quicraft.core.resource.ResourcePools;
 
 /** docs/protocol.md 12.13 and 13.17: staged /3 admission charges, clocks and promotion. */
 class PreLoginTrackerTest {
-    private static final long STAGED_N6 = 2L * 8192 + 6 + 4096 + 4096;
+    private static final long STAGED_N5 = 2L * 8192 + 5 + 1 + 4096 + 4096;
 
     @Test
-    void theStagedShareIsTwoEightKibPlusNPlusTheReadBufferAndTheTlsEstimate() {
-        assertEquals(STAGED_N6, PreLoginTracker.stagedShare(6));
-        assertEquals(2L * 8192 + 1 + 4096 + 4096, PreLoginTracker.stagedShare(1));
-        assertThrows(IllegalArgumentException.class, () -> PreLoginTracker.stagedShare(7));
+    void theStagedShareIsTwoEightKibPlusNPlusOnePlusTheReadBufferAndTheTlsEstimate() {
+        assertEquals(STAGED_N5, PreLoginTracker.stagedShare(5));
+        assertEquals(2L * 8192 + 1 + 1 + 4096 + 4096, PreLoginTracker.stagedShare(1), "one guard byte per shard plus the ACK stream's");
+        assertThrows(IllegalArgumentException.class, () -> PreLoginTracker.stagedShare(6));
     }
 
     @Test
     void theFirstAcceptedInitialChargesThePreLoginPoolAndNotTheNodeBudget() {
         FakePools pools = new FakePools();
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
-        assertEquals(STAGED_N6, pools.held(ResourcePools.Pool.PRE_LOGIN));
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
+        assertEquals(STAGED_N5, pools.held(ResourcePools.Pool.PRE_LOGIN));
         assertEquals(0, pools.held(ResourcePools.Pool.NODE));
         assertEquals(PreLoginTracker.State.STAGED, tracker.state());
     }
 
     @Test
     void aFullPreLoginPoolRefusesTheStagedCharge() {
-        FakePools pools = new FakePools().capacity(ResourcePools.Pool.PRE_LOGIN, STAGED_N6 - 1);
-        assertNull(PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock()));
+        FakePools pools = new FakePools().capacity(ResourcePools.Pool.PRE_LOGIN, STAGED_N5 - 1);
+        assertNull(PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock()));
         assertEquals(0, pools.held(ResourcePools.Pool.PRE_LOGIN));
     }
 
     @Test
     void earlyDataBeyondTheStagedShareIsChargedAndReleasedOnlyAsExtra() {
         FakePools pools = new FakePools();
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         assertTrue(tracker.chargeEarlyData(1000));
-        assertEquals(STAGED_N6 + 1000, pools.held(ResourcePools.Pool.PRE_LOGIN));
+        assertEquals(STAGED_N5 + 1000, pools.held(ResourcePools.Pool.PRE_LOGIN));
         tracker.releaseExtra(5000);
-        assertEquals(STAGED_N6, pools.held(ResourcePools.Pool.PRE_LOGIN), "releases at most the extra");
+        assertEquals(STAGED_N5, pools.held(ResourcePools.Pool.PRE_LOGIN), "releases at most the extra");
     }
 
     @Test
     void aDeclaredFrameWithinTheStagedShareNeedsNoExtraCharge() {
         FakePools pools = new FakePools();
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         assertEquals(PreLoginTracker.ChargeResult.CHARGED, tracker.chargeDeclaredFrame(1000, 5));
-        assertEquals(STAGED_N6, pools.held(ResourcePools.Pool.PRE_LOGIN));
+        assertEquals(STAGED_N5, pools.held(ResourcePools.Pool.PRE_LOGIN));
     }
 
     @Test
     void aLargeLegalLoginAnswerIsChargedAtItsExactDeclaredLength() {
         FakePools pools = new FakePools();
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         long declared = 900_000;
         assertEquals(PreLoginTracker.ChargeResult.CHARGED, tracker.chargeDeclaredFrame(declared, 3));
-        assertEquals(STAGED_N6 + declared + 3, pools.held(ResourcePools.Pool.PRE_LOGIN));
+        assertEquals(STAGED_N5 + declared + 3, pools.held(ResourcePools.Pool.PRE_LOGIN));
         tracker.releaseExtra(declared + 3);
-        assertEquals(STAGED_N6, pools.held(ResourcePools.Pool.PRE_LOGIN));
+        assertEquals(STAGED_N5, pools.held(ResourcePools.Pool.PRE_LOGIN));
     }
 
     @Test
     void aDeclaredFrameAboveOneMebibyteIsOversizedAndNeverCharged() {
         FakePools pools = new FakePools();
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         assertEquals(PreLoginTracker.ChargeResult.OVERSIZED,
                 tracker.chargeDeclaredFrame(PreLoginTracker.MAX_DECLARED_FRAME_BYTES + 1, 0));
-        assertEquals(STAGED_N6, pools.held(ResourcePools.Pool.PRE_LOGIN));
+        assertEquals(STAGED_N5, pools.held(ResourcePools.Pool.PRE_LOGIN));
     }
 
     @Test
     void aFrameThatCannotBeChargedWaitsNonFatally() {
         FakePools pools = new FakePools();
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
-        pools.capacity(ResourcePools.Pool.PRE_LOGIN, STAGED_N6 + 10);
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
+        pools.capacity(ResourcePools.Pool.PRE_LOGIN, STAGED_N5 + 10);
         assertEquals(PreLoginTracker.ChargeResult.WAIT, tracker.chargeDeclaredFrame(900_000, 0));
         assertEquals(PreLoginTracker.State.STAGED, tracker.state());
     }
@@ -132,7 +132,7 @@ class PreLoginTrackerTest {
     @Test
     void onlineLoginSuccessPromotesTheFullExposureFromTheNodeBudget() {
         FakePools pools = new FakePools();
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         tracker.onLoginSuccess();
         assertEquals(PreLoginTracker.State.PROMOTED, tracker.state());
         assertEquals(TransportConfig.V3_INITIAL_EXPOSURE_BYTES, pools.held(ResourcePools.Pool.NODE));
@@ -143,7 +143,7 @@ class PreLoginTrackerTest {
     @Test
     void offlineLoginSuccessStaysStagedUntilActivation() {
         FakePools pools = new FakePools();
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, false, new Clock());
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, false, new Clock());
         tracker.onLoginSuccess();
         assertEquals(PreLoginTracker.State.STAGED, tracker.state());
         tracker.onActivation();
@@ -157,8 +157,8 @@ class PreLoginTrackerTest {
         // staged charge is still held: 24 KiB in NODE plus the staged charge in PRE_LOGIN at once.
         FakePools pools = new FakePools()
                 .capacity(ResourcePools.Pool.NODE, TransportConfig.V3_INITIAL_EXPOSURE_BYTES)
-                .capacity(ResourcePools.Pool.PRE_LOGIN, STAGED_N6);
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+                .capacity(ResourcePools.Pool.PRE_LOGIN, STAGED_N5);
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         pools.log.clear();
         assertTrue(tracker.promote());
         assertEquals(PreLoginTracker.State.PROMOTED, tracker.state());
@@ -170,7 +170,7 @@ class PreLoginTrackerTest {
     void anExpiredStagedConnectionNeverPromotesEvenWhenTheNodeBudgetHasRoom() {
         FakePools pools = new FakePools().capacity(ResourcePools.Pool.NODE, 1000);
         Clock clock = new Clock();
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, clock);
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, clock);
         tracker.onLoginSuccess();
         assertEquals(PreLoginTracker.State.STAGED, tracker.state());
         clock.advance(TimeUnit.SECONDS.toNanos(31));
@@ -186,10 +186,10 @@ class PreLoginTrackerTest {
     @Test
     void aFullNodeBudgetLeavesTheConnectionStagedAndRetryable() {
         FakePools pools = new FakePools().capacity(ResourcePools.Pool.NODE, 1000);
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         tracker.onLoginSuccess();
         assertEquals(PreLoginTracker.State.STAGED, tracker.state(), "the caller waits non-fatally");
-        assertEquals(STAGED_N6, pools.held(ResourcePools.Pool.PRE_LOGIN));
+        assertEquals(STAGED_N5, pools.held(ResourcePools.Pool.PRE_LOGIN));
         pools.capacity(ResourcePools.Pool.NODE, TransportConfig.V3_INITIAL_EXPOSURE_BYTES);
         assertTrue(tracker.promote());
     }
@@ -197,18 +197,18 @@ class PreLoginTrackerTest {
     @Test
     void shedOnlyReleasesAStagedConnectionAndNeverAPromotedOne() {
         FakePools pools = new FakePools();
-        PreLoginTracker staged = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        PreLoginTracker staged = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         staged.onShed();
         // 12.13: a shed victim keeps its charge until its close is confirmed; the release is at close.
         assertEquals(PreLoginTracker.State.STAGED, staged.state());
         assertTrue(staged.isShedding());
-        assertEquals(PreLoginTracker.stagedShare(6),
+        assertEquals(PreLoginTracker.stagedShare(5),
                 pools.held(ResourcePools.Pool.PRE_LOGIN));
         staged.close();
         assertEquals(PreLoginTracker.State.CLOSED, staged.state());
         assertEquals(0, pools.held(ResourcePools.Pool.PRE_LOGIN));
 
-        PreLoginTracker promoted = PreLoginTracker.tryOpen(pools, "c2", 6, true, new Clock());
+        PreLoginTracker promoted = PreLoginTracker.tryOpen(pools, "c2", 5, true, new Clock());
         promoted.onLoginSuccess();
         promoted.onShed();
         assertEquals(PreLoginTracker.State.PROMOTED, promoted.state());
@@ -218,12 +218,12 @@ class PreLoginTrackerTest {
     @Test
     void closeReleasesTheHeldPoolExactlyOnce() {
         FakePools pools = new FakePools();
-        PreLoginTracker staged = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        PreLoginTracker staged = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         staged.close();
         staged.close();
         assertEquals(0, pools.held(ResourcePools.Pool.PRE_LOGIN));
 
-        PreLoginTracker promoted = PreLoginTracker.tryOpen(pools, "c2", 6, true, new Clock());
+        PreLoginTracker promoted = PreLoginTracker.tryOpen(pools, "c2", 5, true, new Clock());
         promoted.onLoginSuccess();
         promoted.close();
         promoted.close();
@@ -234,7 +234,7 @@ class PreLoginTrackerTest {
     @Test
     void aPromotionTheNodeBudgetRefusedIsRetriedUntilItSucceeds() {
         FakePools pools = new FakePools().capacity(ResourcePools.Pool.NODE, 1000);
-        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 6, true, new Clock());
+        PreLoginTracker tracker = PreLoginTracker.tryOpen(pools, "c1", 5, true, new Clock());
         assertFalse(tracker.retryPromotion(), "nothing requested yet");
         tracker.onLoginSuccess();
         assertFalse(tracker.retryPromotion(), "the node budget is still full");

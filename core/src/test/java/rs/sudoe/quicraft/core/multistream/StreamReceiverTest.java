@@ -18,7 +18,7 @@ class StreamReceiverTest {
     private static final int ACK_JOIN = 2;
     private static final int BATCH_JOIN = 3;
 
-    private static final class Fixture {
+    static final class Fixture {
         final AtomicLong now = new AtomicLong();
         final StreamReceiver receiver;
 
@@ -54,7 +54,8 @@ class StreamReceiverTest {
     }
 
     static StreamReceiver.Admission offer(StreamReceiver rx, Record record) {
-        return rx.offer(record, 100, 1);
+        // 50 wire bytes: under the 64-byte cap of the ACK stream (13.21), so any stream index can take it.
+        return rx.offer(record, 50, 1);
     }
 
     static void assertAdmitted(StreamReceiver rx, Record record) {
@@ -85,7 +86,7 @@ class StreamReceiverTest {
     }
 
     @Test void everyStreamHoldsOneHeadAndASecondIsRefusedNotViolated() {
-        Fixture f = new Fixture(6);
+        Fixture f = new Fixture(5);
         for (int stream = 0; stream < 8; stream++) {
             assertAdmitted(f.receiver, rec(stream, 1, 0));
         }
@@ -498,16 +499,18 @@ class StreamReceiverTest {
         }
     }
 
-    /** N=6, all eight streams at their slot limit; one dependent waits on prereq, which is withheld. */
+    /** N=5, all eight streams at their slot limit; one dependent waits on prereq, which is withheld. */
     private static void assertAcceptanceCase(int prereq, boolean locallyWithheld) {
         int blocked = (prereq + 1) % 8;
-        Fixture f = new Fixture(6);
+        Fixture f = new Fixture(5);
         long full = ReceiveSlots.BYTES_PER_STREAM;
         int records = ReceiveSlots.RECORDS_PER_STREAM;
         for (int s = 0; s < 8; s++) {
             Record r = s == blocked ? rec(s, 1, 0, dep(prereq, 1)) : rec(s, 1, 0);
+            // The ACK stream (7) has its own small slot, so it is "full" at one record of ACK_RECORD_MAX_BYTES (13.21).
+            long wire = s == 7 ? ReceiveSlots.ACK_RECORD_MAX_BYTES : full;
             assertEquals(StreamReceiver.Admission.Kind.ADMITTED,
-                    s == 0 ? f.receiver.offer(r, records, full, records).kind() : f.receiver.offer(r, 1, full, 1).kind(),
+                    s == 0 ? f.receiver.offer(r, records, full, records).kind() : f.receiver.offer(r, 1, wire, 1).kind(),
                     "stream " + s + " prereq " + prereq);
         }
         if (locallyWithheld) {

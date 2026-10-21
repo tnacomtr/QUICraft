@@ -33,7 +33,7 @@ public enum BindingFailure {
     EXPORTER_ERROR(12),
     /** A message arrived after the exchange had already settled (§12.9). */
     ALREADY_SETTLED(13),
-    /** Negotiated shard count was outside 1..6 or did not match the transcript. */
+    /** Negotiated shard count was outside 1..5 or did not match the transcript. */
     WRONG_SHARD_COUNT(14);
 
     private final int code;

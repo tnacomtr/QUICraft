@@ -158,15 +158,15 @@ final class SendRouteResolverTest {
             int expectedZ = i == 0 ? 3 : 11;
             assertEquals(expectedX, resolved.chunkX());
             assertEquals(expectedZ, resolved.chunkZ());
-            assertEquals(ShardHash.shardOf(expectedX, expectedZ, 0, 6),
-                    ShardHash.shardOf(resolved.chunkX(), resolved.chunkZ(), 0, 6));
+            assertEquals(ShardHash.shardOf(expectedX, expectedZ, 0, 5),
+                    ShardHash.shardOf(resolved.chunkX(), resolved.chunkZ(), 0, 5));
         }
         SendRouteResolver.Resolved first = SendRouteResolver.resolve(shipped::routeV2For, decoders,
                 775, Direction.CLIENTBOUND, ProtocolState.PLAY, 45, packets[0]);
         SendRouteResolver.Resolved second = SendRouteResolver.resolve(shipped::routeV2For, decoders,
                 775, Direction.CLIENTBOUND, ProtocolState.PLAY, 45, packets[1]);
-        assertNotEquals(ShardHash.shardOf(first.chunkX(), first.chunkZ(), 0, 6),
-                ShardHash.shardOf(second.chunkX(), second.chunkZ(), 0, 6));
+        assertNotEquals(ShardHash.shardOf(first.chunkX(), first.chunkZ(), 0, 5),
+                ShardHash.shardOf(second.chunkX(), second.chunkZ(), 0, 5));
     }
 
     @Test

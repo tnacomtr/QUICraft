@@ -29,7 +29,21 @@ public final class StreamSequencer {
         /** REALTIME: waits for the latest control fence C (13.9). */
         REALTIME,
         /** Ordinary CHUNK[i]: waits for the latest view gate V only (13.9). */
-        CHUNK
+        CHUNK,
+        /**
+         * ACK stream, trailing (13.21): waits for the latest record of every stream and advances no frontier,
+         * so no later record except an {@link #CHUNK_ACK} one, a global or a view gate waits for it.
+         */
+        ACK_TRAILING,
+        /** CHUNK[i] that must also not overtake the latest ACK-stream record (13.21 {@code ack} dependency). */
+        CHUNK_ACK,
+        /**
+         * A chunk install (45) with the {@code ack} dependency. Resolved by the send driver to CHUNK for a
+         * first install and to CHUNK_ACK otherwise; the sequencer itself refuses it (13.21).
+         */
+        CHUNK_INSTALL,
+        /** A chunk forget (37) with the {@code ack} dependency; the driver resolves it to CHUNK_ACK (13.21). */
+        CHUNK_FORGET
     }
 
     /** Maximum packets enclosed by one bundle, excluding delimiters (13.15). */
@@ -53,6 +67,8 @@ public final class StreamSequencer {
     private long globalFrontier;
     private long viewFrontier;
     private long controlFence;
+    /** Sequence of the latest ACK-stream record, or 0 (13.21). */
+    private long lastAck;
 
     /** Creates a clientbound sending direction for the negotiated shard count (13.9). */
     public StreamSequencer(int shardCount) {
@@ -62,7 +78,7 @@ public final class StreamSequencer {
     /** Creates one sending direction; serverbound directions can never change epoch (13.18). */
     public StreamSequencer(int shardCount, boolean serverbound) {
         LogicalStream.validateShardCount(shardCount);
-        this.streams = shardCount + 2;
+        this.streams = shardCount + 3;
         this.assigned = new long[streams];
         this.serverbound = serverbound;
     }
@@ -253,7 +269,9 @@ public final class StreamSequencer {
             if (member == null || member == Fence.REALTIME) {
                 throw new IllegalArgumentException("bundle member scope");
             }
-            if (member == Fence.CHUNK || member == Fence.GLOBAL) {
+            if (member == Fence.CHUNK || member == Fence.GLOBAL || member == Fence.ACK_TRAILING
+                    || member == Fence.CHUNK_ACK || member == Fence.CHUNK_INSTALL || member == Fence.CHUNK_FORGET) {
+                // 13.21: a bundle holding an ACK is placed whole on CONTROL as a global fence, never split.
                 promoted = true;
             } else if (member == Fence.VIEW) {
                 view = true;
@@ -283,6 +301,16 @@ public final class StreamSequencer {
     /** Returns the latest view gate sequence V, or 0 (13.9). */
     public long viewFrontier() {
         return viewFrontier;
+    }
+
+    /** Returns the latest ACK-stream record sequence, or 0 (13.21). */
+    public long lastAck() {
+        return lastAck;
+    }
+
+    /** The logical index of the ACK stream, N+2 (13.3). */
+    public int ackIndex() {
+        return streams - 1;
     }
 
     /** Returns the latest control fence sequence C, or 0 (13.9). */
@@ -415,6 +443,8 @@ public final class StreamSequencer {
         switch (fence) {
             case GLOBAL:
             case VIEW:
+            case ACK_TRAILING:
+                // 13.21: the ACK stream is included, so a global or view record waits for earlier ACKs.
                 for (int i = 0; i < streams; i++) {
                     deps[i] = Math.max(deps[i], assigned[i]);
                 }
@@ -428,6 +458,10 @@ public final class StreamSequencer {
                 break;
             case CHUNK:
                 deps[CONTROL] = Math.max(deps[CONTROL], viewFrontier);
+                break;
+            case CHUNK_ACK:
+                deps[CONTROL] = Math.max(deps[CONTROL], viewFrontier);
+                deps[ackIndex()] = Math.max(deps[ackIndex()], lastAck);
                 break;
             case ORDINARY_CONTROL:
                 if (interaction) {
@@ -449,6 +483,9 @@ public final class StreamSequencer {
             controlFence = sequence;
         } else if (fence == Fence.CONTROL_FENCE) {
             controlFence = sequence;
+        } else if (fence == Fence.ACK_TRAILING) {
+            // 13.21: no global, view or control frontier moves; only the CHUNK ack dependency reads this.
+            lastAck = sequence;
         }
     }
 
@@ -457,7 +494,8 @@ public final class StreamSequencer {
             throw new IllegalArgumentException("interaction route");
         }
         // Chunk routes and CHUNK fences exist only clientbound; there is no serverbound chunk scope (13.18).
-        if (serverbound && (fence == Fence.CHUNK || stream >= FIRST_CHUNK)) {
+        if (serverbound && (fence == Fence.CHUNK || fence == Fence.CHUNK_ACK || fence == Fence.ACK_TRAILING
+                || stream >= FIRST_CHUNK)) {
             throw new IllegalArgumentException("serverbound chunk route");
         }
         if (kind == RecordCodec.KIND_END) {
@@ -476,7 +514,12 @@ public final class StreamSequencer {
                 if (stream != REALTIME) throw new IllegalArgumentException("realtime route");
                 break;
             case CHUNK:
-                if (stream < FIRST_CHUNK) throw new IllegalArgumentException("chunk route");
+            case CHUNK_ACK:
+                // The ACK stream N+2 is never a CHUNK index (13.3).
+                if (stream < FIRST_CHUNK || stream >= ackIndex()) throw new IllegalArgumentException("chunk route");
+                break;
+            case ACK_TRAILING:
+                if (stream != ackIndex()) throw new IllegalArgumentException("ack route");
                 break;
             default:
                 throw new IllegalArgumentException("fence");

@@ -15,7 +15,7 @@ class ShardHashTest {
     private static final int[][] COORDS = {{0,0},{-1,-1},{Integer.MIN_VALUE,Integer.MAX_VALUE},{Integer.MAX_VALUE,Integer.MIN_VALUE}};
 
     @Test void matchesIndependentVectorsForShardCountsAndEpochs() {
-        for (int c=0;c<COORDS.length;c++) for (int e=0;e<3;e++) for(int n=1;n<=6;n++)
+        for (int c=0;c<COORDS.length;c++) for (int e=0;e<3;e++) for(int n=1;n<=5;n++)
             assertEquals(GOLDEN[c][e][n-1], ShardHash.shardOf(COORDS[c][0], COORDS[c][1], e, n),
                     "coordinate="+c+" epoch="+e+" N="+n);
     }

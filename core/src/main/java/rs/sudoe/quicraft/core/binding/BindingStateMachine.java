@@ -73,7 +73,7 @@ public final class BindingStateMachine {
         this.role = role;
         this.mode = mode;
         this.protocolNumber = protocolNumber;
-        if (shardCount < 1 || shardCount > 6) throw new IllegalArgumentException("shard count must be 1..6");
+        if (shardCount < 1 || shardCount > 5) throw new IllegalArgumentException("shard count must be 1..5");
         this.shardCount = shardCount;
         this.fingerprint = fingerprint.clone();
         this.routing = routing.clone();
@@ -174,8 +174,8 @@ public final class BindingStateMachine {
         }
         checkDigest(fingerprint, "fingerprint");
         checkDigest(routing, "routing");
-        if (shardCount < 1 || shardCount > 6) {
-            throw new IllegalArgumentException("shard count must be 1..6");
+        if (shardCount < 1 || shardCount > 5) {
+            throw new IllegalArgumentException("shard count must be 1..5");
         }
         if (mode == MODE_ONLINE && (minecraftSecret == null || minecraftSecret.length != 16)) {
             throw new IllegalArgumentException("online mode needs Minecraft's 16-byte shared secret");

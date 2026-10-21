@@ -52,7 +52,7 @@ class SessionReadPumpTest {
         }
     }
 
-    /** Byte source for N+2 streams: serves at most {@code chunk} bytes per read and counts reads per stream. */
+    /** Byte source for N+3 streams: serves at most {@code chunk} bytes per read and counts reads per stream. */
     static final class Streams implements SessionReadPump.ByteSource {
         final byte[][] data;
         final int[] pos;
@@ -213,7 +213,7 @@ class SessionReadPumpTest {
         byte[] over = gameWire(LogicalStream.REALTIME, 1, filled(505, 1));
         assertEquals(513, over.length, "two-byte record_length prefix plus 511 bytes");
         Source source = new Source(new byte[0], over);
-        SessionReadPump pump = pump(new ServerReadPartition(6), new Pools(1L << 20), false, source);
+        SessionReadPump pump = pump(new ServerReadPartition(5), new Pools(1L << 20), false, source);
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class, () -> nextUnit(pump));
         assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode());
         assertEquals(0, pump.frameAllocations(LogicalStream.REALTIME), "no body allocated for a refused declaration");
@@ -223,7 +223,7 @@ class SessionReadPumpTest {
         byte[] exact = gameWire(LogicalStream.REALTIME, 1, filled(504, 1));
         assertEquals(512, exact.length, "two-byte record_length prefix plus 510 bytes");
         Source ok = new Source(new byte[0], exact);
-        SessionReadPump accept = pump(new ServerReadPartition(6), new Pools(1L << 20), false, ok);
+        SessionReadPump accept = pump(new ServerReadPartition(5), new Pools(1L << 20), false, ok);
         try (SessionReadPump.Unit unit = nextUnit(accept)) {
             assertEquals(LogicalStream.REALTIME, unit.stream());
             assertArrayEquals(filled(504, 1), unit.decoded());
@@ -234,14 +234,14 @@ class SessionReadPumpTest {
     @Test void compressedDeclaredBoundIsCheckedBeforeInflation() throws Exception {
         // REALTIME: a declared Data Length of 1025 is refused at admission; 1024 is admitted and inflated on demand.
         byte[] tooBig = compressedWire(LogicalStream.REALTIME, 1, filled(1025, 2), 1025);
-        SessionReadPump refused = pump(new ServerReadPartition(6), new Pools(1L << 20), true,
+        SessionReadPump refused = pump(new ServerReadPartition(5), new Pools(1L << 20), true,
                 new Source(new byte[0], tooBig));
         assertThrows(MultistreamProtocolException.class, () -> nextUnit(refused));
         assertEquals(0, refused.inflations(), "refused before inflation");
 
         byte[] edge = compressedWire(LogicalStream.REALTIME, 1, filled(1024, 2), 1024);
         int recordLength = recordLengthOf(edge);
-        ServerReadPartition partition = new ServerReadPartition(6);
+        ServerReadPartition partition = new ServerReadPartition(5);
         SessionReadPump accept = pump(partition, new Pools(1L << 20), true, new Source(new byte[0], edge));
         SessionReadPump.Unit unit = nextUnit(accept);
         assertEquals(0, accept.inflations(), "a completed compressed unit is opaque");
@@ -257,14 +257,14 @@ class SessionReadPumpTest {
 
         // CONTROL: a declared Data Length above the route's decoded cap is refused at admission.
         byte[] control = compressedWire(LogicalStream.CONTROL, 1, filled(9000, 3), 9000);
-        SessionReadPump overCap = pump(new ServerReadPartition(6), new Pools(1L << 20), true,
+        SessionReadPump overCap = pump(new ServerReadPartition(5), new Pools(1L << 20), true,
                 new Source(control, new byte[0]));
         assertThrows(MultistreamProtocolException.class, () -> nextUnit(overCap));
         assertEquals(0, overCap.inflations());
 
         // A declared length that disagrees with the zlib stream is refused by the inflate call, not by step().
         byte[] liar = compressedWire(LogicalStream.CONTROL, 1, filled(200, 4), 100);
-        SessionReadPump mismatch = pump(new ServerReadPartition(6), new Pools(1L << 20), true,
+        SessionReadPump mismatch = pump(new ServerReadPartition(5), new Pools(1L << 20), true,
                 new Source(liar, new byte[0]));
         SessionReadPump.Unit opaque = nextUnit(mismatch);
         assertEquals(0, mismatch.inflations());
@@ -277,7 +277,7 @@ class SessionReadPumpTest {
     @Test void stepDoesNotInflateCompletedCompressedHeads() throws Exception {
         byte[] control = compressedWire(LogicalStream.CONTROL, 1, filled(300, 3), 300);
         byte[] realtime = compressedWire(LogicalStream.REALTIME, 1, filled(100, 4), 100);
-        SessionReadPump pump = pump(new ServerReadPartition(6), new Pools(1L << 20), true,
+        SessionReadPump pump = pump(new ServerReadPartition(5), new Pools(1L << 20), true,
                 new Source(control, realtime));
         List<SessionReadPump.Unit> units = new ArrayList<>();
         for (int i = 0; i < 100_000 && units.size() < 2; i++) units.addAll(pump.step());
@@ -301,7 +301,7 @@ class SessionReadPumpTest {
         byte[] exact = gameWire(LogicalStream.CONTROL, 1, filled(200, 1));
         int wire = exact.length;
         RouteV2.ServerboundLimits atLimit = new RouteV2.ServerboundLimits(wire, 510, 8192, 5459);
-        SessionReadPump accept = pump(new ServerReadPartition(6), new Pools(1L << 20), atLimit,
+        SessionReadPump accept = pump(new ServerReadPartition(5), new Pools(1L << 20), atLimit,
                 new Source(exact, new byte[0]));
         try (SessionReadPump.Unit unit = nextUnit(accept)) {
             assertEquals(200, unit.decoded().length, "wire size exactly at L is accepted");
@@ -309,7 +309,7 @@ class SessionReadPumpTest {
 
         byte[] over = gameWire(LogicalStream.CONTROL, 1, filled(201, 1));
         assertEquals(wire + 1, over.length, "one byte more is the L+1 wire record");
-        SessionReadPump refused = pump(new ServerReadPartition(6), new Pools(1L << 20), atLimit,
+        SessionReadPump refused = pump(new ServerReadPartition(5), new Pools(1L << 20), atLimit,
                 new Source(over, new byte[0]));
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class, () -> nextUnit(refused));
         assertEquals(MultistreamProtocolException.CLOSE_ORDERING, e.closeCode(), "L+1 is refused as ordering (0x11)");
@@ -320,7 +320,7 @@ class SessionReadPumpTest {
         RouteV2.ServerboundLimits wide = new RouteV2.ServerboundLimits(1 << 20, 510, 1 << 20, 5459);
         int atCap = contentFor(E);
         Pools pools = new Pools(1L << 20);
-        SessionReadPump pump = pump(new ServerReadPartition(6), pools, wide,
+        SessionReadPump pump = pump(new ServerReadPartition(5), pools, wide,
                 new Source(gameWire(LogicalStream.CONTROL, 1, filled(atCap, 1)), new byte[0]));
         // Admission accepts a footprint of exactly E; the held excess then drops the length prefix it no longer uses.
         long wireBody = recordLengthOf(gameWire(LogicalStream.CONTROL, 1, filled(atCap, 1)));
@@ -333,7 +333,7 @@ class SessionReadPumpTest {
 
         int overCap = contentFor(E) + 1;
         assertTrue(controlFootprint(overCap) > E, "one step past E");
-        SessionReadPump over = pump(new ServerReadPartition(6), new Pools(1L << 20), wide,
+        SessionReadPump over = pump(new ServerReadPartition(5), new Pools(1L << 20), wide,
                 new Source(gameWire(LogicalStream.CONTROL, 1, filled(overCap, 1)), new byte[0]));
         MultistreamProtocolException e = assertThrows(MultistreamProtocolException.class, () -> nextUnit(over));
         assertEquals(Protocol.CLOSE_RESOURCE, e.closeCode(), "a footprint over the cap is a resource close (0x12)");
@@ -341,13 +341,13 @@ class SessionReadPumpTest {
     }
 
     @Test void protectedShareEdgeAdmitsInShareThenSpillsToExcess() throws Exception {
-        int allowance = new ServerReadPartition(6).controlAllowance();
-        ServerReadPartition exactPartition = new ServerReadPartition(6);
+        int allowance = new ServerReadPartition(5).controlAllowance();
+        ServerReadPartition exactPartition = new ServerReadPartition(5);
         assertTrue(exactPartition.reserve(LogicalStream.CONTROL, allowance), "exactly the allowance fits in-share");
         assertFalse(exactPartition.reserve(LogicalStream.CONTROL, 1), "one byte more does not");
 
         RouteV2.ServerboundLimits wide = new RouteV2.ServerboundLimits(1 << 20, 510, 1 << 20, allowance);
-        ServerReadPartition partition = new ServerReadPartition(6);
+        ServerReadPartition partition = new ServerReadPartition(5);
         Pools pools = new Pools(1L << 20);
         // The largest record whose footprint still fits the allowance is admitted in-share.
         int inShare = contentAtMost(allowance);
@@ -365,10 +365,10 @@ class SessionReadPumpTest {
     }
 
     @Test void protectedShareSpillHoldsExcessOnlyForTheRecordAboveAllowance() throws Exception {
-        int allowance = new ServerReadPartition(6).controlAllowance();
+        int allowance = new ServerReadPartition(5).controlAllowance();
         RouteV2.ServerboundLimits wide = new RouteV2.ServerboundLimits(1 << 20, 510, 1 << 20, allowance);
         Pools pools = new Pools(1L << 20);
-        ServerReadPartition partition2 = new ServerReadPartition(6);
+        ServerReadPartition partition2 = new ServerReadPartition(5);
         int plusOne = contentAtMost(allowance) + 1;
         long footprint = controlFootprint(plusOne);
         assertTrue(footprint > allowance);
@@ -391,7 +391,7 @@ class SessionReadPumpTest {
         byte[] control = gameWire(LogicalStream.CONTROL, 1, filled(3000, 5));
         byte[] realtime = gameWire(LogicalStream.REALTIME, 1, filled(20, 6));
         Source source = new Source(control, realtime);
-        ServerReadPartition partition = new ServerReadPartition(6);
+        ServerReadPartition partition = new ServerReadPartition(5);
         SessionReadPump pump = pump(partition, pools, false, source);
 
         SessionReadPump.Unit first = nextUnit(pump);
@@ -432,7 +432,7 @@ class SessionReadPumpTest {
             fast.write(one, 0, one.length);
         }
         Source sourceA = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 1)), fast.toByteArray());
-        SessionReadPump a = new SessionReadPump(new ServerReadPartition(6), node, excess, "A", ipA, null, LIMITS,
+        SessionReadPump a = new SessionReadPump(new ServerReadPartition(5), node, excess, "A", ipA, null, LIMITS,
                 false, sourceA, ranking, clock);
         SessionReadPump.Unit heldA = null;
         for (int i = 0; i < 1000 && heldA == null; i++) {
@@ -443,7 +443,7 @@ class SessionReadPumpTest {
         assertNotNull(heldA);
         now[0] += 1_000_000_000L;
         Source sourceB = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 2)), new byte[0]);
-        SessionReadPump b = new SessionReadPump(new ServerReadPartition(6), node, excess, "B", ipB, null, LIMITS,
+        SessionReadPump b = new SessionReadPump(new ServerReadPartition(5), node, excess, "B", ipB, null, LIMITS,
                 false, sourceB, ranking, clock);
         SessionReadPump.Unit heldB = nextUnit(b);
         assertEquals(LogicalStream.CONTROL, heldB.stream());
@@ -479,7 +479,7 @@ class SessionReadPumpTest {
         InboundExcessPool excess = new InboundExcessPool(node, E, E, ranking.view(clock));
         assertTrue(excess.reserve("blocker", "ip-b", null, 8192, true));
         Source source = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 5)), new byte[0]);
-        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node, excess, "A",
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(5), node, excess, "A",
                 java.net.InetAddress.getByName("10.0.0.1"), null, LIMITS, false, source, ranking, clock);
         assertFalse(ranking.inRefusedWait("A"));
         for (int i = 0; i < 20; i++) {
@@ -510,7 +510,7 @@ class SessionReadPumpTest {
         SessionResources resources = new SessionResources(node, 1L << 20, 1L << 20, 1L << 20, E, E,
                 SessionResources.defaultProfile(), () -> now[0], SessionResources.Accounting.LEGACY);
         Source source = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 5)), new byte[0]);
-        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node, resources.inboundExcess(), "A",
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(5), node, resources.inboundExcess(), "A",
                 java.net.InetAddress.getByName("10.0.0.1"), null, LIMITS, false, source, resources.inboundRanking(),
                 () -> now[0], SessionResources.Accounting.LEGACY);
         SessionReadPump.Unit unit = nextUnit(pump);
@@ -531,7 +531,7 @@ class SessionReadPumpTest {
         assertTrue(pools.excess.reserve("blocker", "ip-b", null, 8192, true));
         byte[] control = gameWire(LogicalStream.CONTROL, 1, filled(3000, 7));
         Source source = new Source(control, new byte[0]);
-        ServerReadPartition partition = new ServerReadPartition(6);
+        ServerReadPartition partition = new ServerReadPartition(5);
         SessionReadPump pump = pump(partition, pools, false, source);
 
         for (int i = 0; i < 20; i++) pump.step();
@@ -553,7 +553,7 @@ class SessionReadPumpTest {
         // Cancellation while held returns every charge, the prefix slice included, and drops the queued request.
         assertTrue(pools.excess.reserve("blocker2", "ip-b", null, 8192, true));
         Source again = new Source(gameWire(LogicalStream.CONTROL, 2, filled(3000, 8)), new byte[0]);
-        ServerReadPartition heldPartition = new ServerReadPartition(6);
+        ServerReadPartition heldPartition = new ServerReadPartition(5);
         SessionReadPump held2 = pump(heldPartition, pools, false, again);
         for (int i = 0; i < 10; i++) held2.step();
         assertEquals(1, pools.excess.waitingCount());
@@ -566,13 +566,18 @@ class SessionReadPumpTest {
     }
 
     @Test void clientEveryStreamFinishesItsHeadWhenEverySiblingSlotIsFull() throws Exception {
-        for (int chunks = 1; chunks <= 6; chunks++) {
-            int streams = chunks + 2;
-            for (int finishing = 0; finishing < streams; finishing++) {
+        for (int chunks = 1; chunks <= 5; chunks++) {
+            int streams = chunks + 3;
+            // The ACK stream (the last one) takes only small records; it is covered by AckLaneReceiveTest.
+            for (int finishing = 0; finishing < streams - 1; finishing++) {
                 ReceiveSlots slots = new ReceiveSlots(chunks);
                 for (int other = 0; other < streams; other++) {
                     if (other == finishing) continue;
-                    assertTrue(slots.admitHead(other, ReceiveSlots.BYTES_PER_STREAM, ReceiveSlots.RECORDS_PER_STREAM));
+                    if (other == streams - 1) {
+                        assertTrue(slots.admitHead(other, ReceiveSlots.ACK_SLOT_BYTES, 1));
+                    } else {
+                        assertTrue(slots.admitHead(other, ReceiveSlots.BYTES_PER_STREAM, ReceiveSlots.RECORDS_PER_STREAM));
+                    }
                 }
                 // Fragmented reads of 3 bytes; two records, the second must wait for the first one's commit.
                 Streams source = new Streams(streams, 3);
@@ -608,13 +613,13 @@ class SessionReadPumpTest {
     }
 
     @Test void clientSingleLargeRecordFitsItsSlotAndReadsStopAtOneUnit() throws Exception {
-        int chunks = 6;
+        int chunks = 5;
         int chunkStream = 2;
         ReceiveSlots slots = new ReceiveSlots(chunks);
         byte[] packet = filled(1_500_000, 5);
         byte[] bundle = gameWire(chunkStream, 1, packet);
         assertTrue(bundle.length <= ReceiveSlots.BYTES_PER_STREAM, "a large record's wire size fits the slot");
-        Streams source = new Streams(chunks + 2, 16 * 1024);
+        Streams source = new Streams(chunks + 3, 16 * 1024);
         source.put(chunkStream, bundle);
         ClientReadPump pump = new ClientReadPump(chunks, slots, false, source);
 
@@ -651,7 +656,7 @@ class SessionReadPumpTest {
         byte[] first = gameWire(LogicalStream.CONTROL, 1, filled(40, 9));
         byte[] next = gameWire(LogicalStream.CONTROL, 2, filled(40, 10));
         Source source = new Source(concat(first, next), new byte[0]);
-        SessionReadPump pump = pump(new ServerReadPartition(6), new Pools(1L << 20), false, source);
+        SessionReadPump pump = pump(new ServerReadPartition(5), new Pools(1L << 20), false, source);
         SessionReadPump.Unit unit = nextUnit(pump);
         assertEquals(first.length, source.position(LogicalStream.CONTROL),
                 "the suffix belonging to the next record is not read");
@@ -670,7 +675,7 @@ class SessionReadPumpTest {
                 SessionResources.defaultProfile(), () -> now[0], SessionResources.Accounting.CUMULATIVE);
         byte[] packet = filled(300, 9);
         Source source = new Source(compressedWire(LogicalStream.CONTROL, 1, packet, packet.length), new byte[0]);
-        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node, resources.inboundExcess(),
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(5), node, resources.inboundExcess(),
                 "A", java.net.InetAddress.getByName("10.0.0.1"), null, LIMITS, true, source,
                 resources.inboundRanking(), () -> now[0], SessionResources.Accounting.CUMULATIVE);
         assertTrue(node.reserved(ResourcePools.Pool.INFLATER, "A") > 0);
@@ -694,7 +699,7 @@ class SessionReadPumpTest {
                 SessionResources.defaultProfile(), () -> now[0], SessionResources.Accounting.CUMULATIVE);
         assertTrue(resources.inboundExcess().reserve("blocker", "ip-b", null, 8192, true));
         Source source = new Source(gameWire(LogicalStream.CONTROL, 1, filled(3000, 5)), new byte[0]);
-        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node, resources.inboundExcess(),
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(5), node, resources.inboundExcess(),
                 "A", java.net.InetAddress.getByName("10.0.0.1"), null, LIMITS, false, source,
                 resources.inboundRanking(), () -> now[0], SessionResources.Accounting.CUMULATIVE);
         for (int i = 0; i < 20; i++) {
@@ -716,15 +721,15 @@ class SessionReadPumpTest {
         java.net.InetAddress ip = java.net.InetAddress.getByName("10.0.0.1");
         Source source = new Source(new byte[0], new byte[0]);
         InboundExcessPool excess = new InboundExcessPool(node, E, E, owner -> 0.0);
-        assertThrows(IllegalArgumentException.class, () -> new SessionReadPump(new ServerReadPartition(6), node,
+        assertThrows(IllegalArgumentException.class, () -> new SessionReadPump(new ServerReadPartition(5), node,
                 excess, "A", ip, null, LIMITS, true, source, null, null, SessionResources.Accounting.CUMULATIVE),
                 "a cumulative pump needs a ranking");
         assertEquals(0, node.reserved(ResourcePools.Pool.INFLATER, "A"), "rejected before the inflater charge");
-        assertThrows(NullPointerException.class, () -> new SessionReadPump(new ServerReadPartition(6), node,
+        assertThrows(NullPointerException.class, () -> new SessionReadPump(new ServerReadPartition(5), node,
                 excess, "A", ip, null, LIMITS, true, source, null, null, null), "a pump needs a stated mode");
         assertEquals(0, node.reserved(ResourcePools.Pool.INFLATER, "A"));
         // The old unranked legacy pump keeps working without a ranking or a clock.
-        SessionReadPump unranked = new SessionReadPump(new ServerReadPartition(6), node, excess, "B", ip, null,
+        SessionReadPump unranked = new SessionReadPump(new ServerReadPartition(5), node, excess, "B", ip, null,
                 LIMITS, true, source);
         assertTrue(node.reserved(ResourcePools.Pool.INFLATER, "B") > 0);
         unranked.cancel();
@@ -739,7 +744,7 @@ class SessionReadPumpTest {
         SessionResourcesTest.Scripted gone = new SessionResourcesTest.Scripted();
         gone.reading(0, 0, false);
         PressureRanking invalid = new PressureRanking(gone);
-        assertThrows(StallClock.UnavailableException.class, () -> new SessionReadPump(new ServerReadPartition(6),
+        assertThrows(StallClock.UnavailableException.class, () -> new SessionReadPump(new ServerReadPartition(5),
                 node, new InboundExcessPool(node, E, E, invalid.view()), "A", ip, null, LIMITS, true,
                 new Source(compressedWire(LogicalStream.CONTROL, 1, packet, packet.length), new byte[0]),
                 invalid, () -> 0, SessionResources.Accounting.CUMULATIVE));
@@ -750,7 +755,7 @@ class SessionReadPumpTest {
         // A cumulative ranking rejects a legacy pump's timestamped connect before it can take a reading.
         SessionResourcesTest.Scripted untouched = new SessionResourcesTest.Scripted();
         PressureRanking cumulative = new PressureRanking(untouched);
-        assertThrows(IllegalStateException.class, () -> new SessionReadPump(new ServerReadPartition(6), node,
+        assertThrows(IllegalStateException.class, () -> new SessionReadPump(new ServerReadPartition(5), node,
                 new InboundExcessPool(node, E, E, cumulative.view()), "B", ip, null, LIMITS, true,
                 new Source(compressedWire(LogicalStream.CONTROL, 1, packet, packet.length), new byte[0]),
                 cumulative, () -> 0, SessionResources.Accounting.LEGACY));
@@ -767,7 +772,7 @@ class SessionReadPumpTest {
         scripted.reading(0, 5, true);
         PressureRanking ranking = new PressureRanking(scripted);
         byte[] packet = filled(300, 9);
-        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(6), node,
+        SessionReadPump pump = new SessionReadPump(new ServerReadPartition(5), node,
                 new InboundExcessPool(node, E, E, ranking.view()), "A", ip, null, LIMITS, true,
                 new Source(compressedWire(LogicalStream.CONTROL, 1, packet, packet.length), new byte[0]),
                 ranking, () -> 0, SessionResources.Accounting.CUMULATIVE);

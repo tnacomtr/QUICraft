@@ -270,7 +270,7 @@ class StreamSequencerTest {
 
     @Test void randomizedGeneratedEdgesAlwaysPointBackward() {
         Random random = new Random(9137L);
-        int shards = 6;
+        int shards = 5;
         StreamSequencer sequencer = new StreamSequencer(shards);
         long[] assignedSoFar = new long[shards + 2];
         long expectedEpoch = 0;

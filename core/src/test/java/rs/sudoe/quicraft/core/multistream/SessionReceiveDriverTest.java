@@ -41,6 +41,8 @@ class SessionReceiveDriverTest {
         int decodes;
         /** When positive, every decode reserves this many bytes of decoded output before returning. */
         long reserveBytes;
+        /** When non-negative, the uncompressed size every decode reports (the ACK stream's inflated cap test). */
+        int inflatedOverride = -1;
 
         @Override
         public Decoded decodeInflated(rs.sudoe.quicraft.core.routing.Lane lane, long sequence, byte[] content,
@@ -55,7 +57,8 @@ class SessionReceiveDriverTest {
             if (reserveBytes > 0) reservation.reserve(reserveBytes, frame.length);
             int pid = frame[frame.length - 1] & 0xff;
             Envelope.Bundle marker = markers.containsKey(sequence) ? markers.get(sequence) : Envelope.Bundle.NONE;
-            return new Decoded("p" + sequence, ProtocolState.PLAY, pid, marker, false, 0, frame.length, frame);
+            return new Decoded("p" + sequence, ProtocolState.PLAY, pid, marker, false, 0,
+                    inflatedOverride >= 0 ? inflatedOverride : frame.length, frame);
         }
 
         @Override
@@ -101,7 +104,7 @@ class SessionReceiveDriverTest {
 
     /** One connection's pump, driver and the sinks the tests read. */
     static final class Harness {
-        final SessionReadPumpTest.Streams source = new SessionReadPumpTest.Streams(CHUNKS + 2, 1 << 20);
+        final SessionReadPumpTest.Streams source = new SessionReadPumpTest.Streams(CHUNKS + 3, 1 << 20);
         final long[] now = {0L};
         final CumulativeSource stalls = new CumulativeSource(now);
         final ReceiveSlots slots = new ReceiveSlots(CHUNKS);

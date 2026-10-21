@@ -410,9 +410,9 @@ final class NRig implements AutoCloseable {
         });
     }
 
-    /** Waits until each session has all N+2 streams attached. */
+    /** Waits until each session has all N+3 streams attached. */
     void awaitStreams() throws Exception {
-        int streams = config.shards + 2;
+        int streams = config.shards + 3;
         for (NStreamSession session : new NStreamSession[] {server, client}) {
             if (session == null) {
                 continue;

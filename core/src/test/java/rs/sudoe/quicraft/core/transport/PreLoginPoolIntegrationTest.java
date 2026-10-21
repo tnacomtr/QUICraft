@@ -22,7 +22,7 @@ import rs.sudoe.quicraft.core.resource.ResourcePools;
  * byte exactly once. Registry-level: the frame boundary is driven directly, not through a loopback stream.
  */
 class PreLoginPoolIntegrationTest {
-    private static final long STAGED = PreLoginTracker.stagedShare(6);
+    private static final long STAGED = PreLoginTracker.stagedShare(5);
     /** A declared charge of STAGED + 4 bytes: larger than the staged share, so it needs pool bytes. */
     private static final long DECLARED = STAGED + 3;
     private static final long TOTAL = DECLARED + 1;
@@ -43,7 +43,7 @@ class PreLoginPoolIntegrationTest {
     private static Conn admit(PreLoginRegistry registry, String address, boolean online, List<Conn> shedLog,
             LongSupplier clock) throws Exception {
         Conn conn = new Conn();
-        conn.entry = registry.admit(ip(address), conn, 6, online, clock, () -> shedLog.add(conn));
+        conn.entry = registry.admit(ip(address), conn, 5, online, clock, () -> shedLog.add(conn));
         return conn;
     }
 

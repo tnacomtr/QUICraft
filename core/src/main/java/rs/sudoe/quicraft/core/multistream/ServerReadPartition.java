@@ -46,11 +46,11 @@ public final class ServerReadPartition {
     /**
      * Builds the partition for negotiated chunk count N.
      *
-     * @param chunks negotiated chunk count N, 1..6
+     * @param chunks negotiated chunk count N, 1..5
      */
     public ServerReadPartition(int chunks) {
         LogicalStream.validateShardCount(chunks);
-        protectedBytes = SHARE - NATIVE_EXPOSURE - (2 * chunks + 1) - REALTIME_WIRE_CAP;
+        protectedBytes = SHARE - NATIVE_EXPOSURE - (2 * (chunks + 1) + 1) - REALTIME_WIRE_CAP;
         controlAllowance = protectedBytes - REALTIME_SLICE - PREFIX_SLICE;
         if (controlAllowance <= 0) {
             throw new IllegalStateException("read partition too small for N=" + chunks);

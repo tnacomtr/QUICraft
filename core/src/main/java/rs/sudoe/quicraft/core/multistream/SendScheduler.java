@@ -74,6 +74,9 @@ public final class SendScheduler {
     private static final int CLASS_CHUNK = 1;
     private static final int CLASS_CONTROL = 2;
 
+    /** The ACK stream (13.21), scheduled in the CONTROL class; -1 when the session has none. */
+    private final int ackStream;
+    private boolean ackServedLast;
     private final int realtimeWeight;
     private final int chunkWeight;
     private final int controlWeight;
@@ -146,6 +149,17 @@ public final class SendScheduler {
      * @throws IllegalArgumentException if the profile is null
      */
     public SendScheduler(ServerProfile profile) {
+        this(profile, -1);
+    }
+
+    /**
+     * As {@link #SendScheduler(ServerProfile)} for a session with an ACK stream (13.21). The ACK stream takes
+     * part in the CONTROL class, taking turns with stream 0 when both are ready; it is never a CHUNK stream and
+     * never REALTIME.
+     *
+     * @param ackStream the ACK stream's logical index N+2, or -1 for none
+     */
+    public SendScheduler(ServerProfile profile, int ackStream) {
         if (profile == null) {
             throw new IllegalArgumentException("profile");
         }
@@ -154,6 +168,11 @@ public final class SendScheduler {
         this.controlWeight = positive(profile.controlWeight);
         this.queuePacketLimit = profile.queuePacketLimit;
         this.queueByteLimit = profile.queueByteLimit;
+        this.ackStream = ackStream;
+    }
+
+    private boolean isChunk(int stream) {
+        return stream >= FIRST_CHUNK && stream != ackStream;
     }
 
     /**
@@ -234,7 +253,7 @@ public final class SendScheduler {
         for (Map.Entry<Integer, ArrayDeque<Item>> entry : queues.tailMap(FIRST_CHUNK, true).entrySet()) {
             int stream = entry.getKey();
             Item head = entry.getValue().peekFirst();
-            if (stream != picked && head != null && usable(head, writable)) {
+            if (isChunk(stream) && stream != picked && head != null && usable(head, writable)) {
                 chunkSkips.put(stream, skipsOf(stream) + 1);
             }
         }
@@ -301,11 +320,25 @@ public final class SendScheduler {
      */
     private Item agedControl(IntPredicate writable) {
         Item control = usableFront(CONTROL, writable);
-        return control != null && selections - control.headSince >= AGE_LIMIT ? control : null;
+        if (control != null && selections - control.headSince >= AGE_LIMIT) {
+            return control;
+        }
+        Item ack = ackStream < 0 ? null : usableFront(ackStream, writable);
+        return ack != null && selections - ack.headSince >= AGE_LIMIT ? ack : null;
+    }
+
+    /** The CONTROL-class candidate: stream 0 or the ACK stream, alternating when both are ready (13.21). */
+    private Item controlClassFront(IntPredicate writable) {
+        Item control = usableFront(CONTROL, writable);
+        Item ack = ackStream < 0 ? null : usableFront(ackStream, writable);
+        if (control == null || ack == null) {
+            return control != null ? control : ack;
+        }
+        return ackServedLast ? control : ack;
     }
 
     private Item choose(IntPredicate writable, Item chunk) {
-        Item control = usableFront(CONTROL, writable);
+        Item control = controlClassFront(writable);
         Item realtime = usableFront(REALTIME, writable);
         boolean others = chunk != null || control != null;
         List<Item> candidates = new ArrayList<Item>(3);
@@ -350,12 +383,12 @@ public final class SendScheduler {
     private List<Integer> chunkStreamsInRoundRobinOrder() {
         List<Integer> order = new ArrayList<Integer>();
         for (Integer stream : queues.tailMap(lastChunk, false).keySet()) {
-            if (stream >= FIRST_CHUNK) {
+            if (isChunk(stream)) {
                 order.add(stream);
             }
         }
         for (Integer stream : queues.headMap(lastChunk, true).keySet()) {
-            if (stream >= FIRST_CHUNK) {
+            if (isChunk(stream)) {
                 order.add(stream);
             }
         }
@@ -406,6 +439,9 @@ public final class SendScheduler {
             }
         }
         int cls = classOf(stream);
+        if (cls == CLASS_CONTROL) {
+            ackServedLast = stream == ackStream;
+        }
         long base = Math.max(classVirtualTime[cls], virtualTime);
         virtualTime = base;
         classVirtualTime[cls] = base + (long) Math.max(1, length) * 1024L / weightOf(cls);
@@ -475,8 +511,8 @@ public final class SendScheduler {
         return (long) head.record.streamIndex() * 4_294_967_296L + head.record.sequence();
     }
 
-    private static int classOf(int stream) {
-        if (stream == CONTROL) {
+    private int classOf(int stream) {
+        if (stream == CONTROL || stream == ackStream) {
             return CLASS_CONTROL;
         }
         return stream == REALTIME ? CLASS_REALTIME : CLASS_CHUNK;

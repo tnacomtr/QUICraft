@@ -40,7 +40,7 @@ public final class AckJoinTracker {
     /** Max live (unresolved) update tokens per scope; resolved tokens are dropped at once (U1, 13.19). */
     public static final int MAX_TOKENS_PER_SCOPE = 128;
     /** Frontier keys of a tracker that does not know its session shape (U1, 13.19). */
-    private static final int DEFAULT_MAX_FRONTIER_KEYS = LogicalStream.MAX_CHUNKS + 2;
+    private static final int DEFAULT_MAX_FRONTIER_KEYS = LogicalStream.MAX_CHUNKS + 3;
 
     /**
      * A bounded causal-scope resource is exhausted (U1, 13.19). Typed so the driver can map it to a
@@ -107,7 +107,7 @@ public final class AckJoinTracker {
     /** Monotonic token id allocator, never reused (U1, 13.19). */
     private long nextTokenId = 1;
 
-    /** A tracker for a session whose logical stream count is unknown: the /3 maximum, N+2 = 8. */
+    /** A tracker for a session whose logical stream count is unknown: the /3 maximum, N+3 = 8. */
     public AckJoinTracker() {
         this(DEFAULT_MAX_FRONTIER_KEYS);
     }
