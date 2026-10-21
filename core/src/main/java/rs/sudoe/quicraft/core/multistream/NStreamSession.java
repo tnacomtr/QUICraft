@@ -129,6 +129,12 @@ public final class NStreamSession implements MultistreamSession {
      * length prefix is issued in the same loop turn (measured: -0.16 ms clean-link ping, docs/benchmarks.md).
      * On by default; {@code -Dquicraft.v3.inlinePump=false} restores the queued pump.
      */
+    /**
+     * Whether the CHUNK streams pump inline as well. Off: under delay and loss an inline pump on every stream
+     * measured a higher median chunk load (3602 vs 3366 ms, n=8, not significant), so the chunk path keeps the
+     * queued pump and only CONTROL, REALTIME and ACK take the inline one ({@code -Dquicraft.v3.inlineChunks=true}).
+     */
+    private static final boolean INLINE_CHUNKS = Boolean.getBoolean("quicraft.v3.inlineChunks");
     private static final boolean INLINE_PUMP = !"false".equals(System.getProperty("quicraft.v3.inlinePump"));
     private static final byte[] NO_REASON = new byte[0];
 
@@ -402,6 +408,8 @@ public final class NStreamSession implements MultistreamSession {
     private boolean pumping;
     /** Per-session copy of {@link #INLINE_PUMP}; tests change it through {@link #configureForTests}. */
     private boolean inlinePump = INLINE_PUMP;
+    /** Whether CHUNK streams pump inline too; tests set it with {@link #configureForTests}. */
+    private boolean inlineChunks = INLINE_CHUNKS;
     /** Test seam: sees every receive step's entry and exit on the loop thread. Null in production. */
     private ReceiveObserver receiveObserver;
     /** Test seam: named events on the inline pump and drain paths (loop thread). Null in production. */
@@ -1332,6 +1340,7 @@ public final class NStreamSession implements MultistreamSession {
     /** Test seam: sets the inline-pump flag and the receive observer. Call on the loop before activation. */
     void configureForTests(boolean inlinePumpOn, ReceiveObserver observer) {
         this.inlinePump = inlinePumpOn;
+        this.inlineChunks = inlinePumpOn;
         this.receiveObserver = observer;
     }
 
@@ -2060,7 +2069,7 @@ public final class NStreamSession implements MultistreamSession {
         public void channelReadComplete(ChannelHandlerContext ctx) {
             ctx.fireChannelReadComplete();
             traceReceiveState();
-            if (inlinePump) {
+            if (inlinePump && (inlineChunks || !isChunk(index))) {
                 pumpInline();
             } else {
                 schedulePump();
@@ -2088,6 +2097,10 @@ public final class NStreamSession implements MultistreamSession {
                 guarded(() -> fail(CLOSE_ORDERING, NO_REASON, "logical stream " + index + " closed (13.14)", null));
             }
         }
+    }
+
+    private boolean isChunk(int index) {
+        return index >= 2 && index < streams - 1;
     }
 
     /** Turns any close of stream 0 after activation into END (13.14). */
