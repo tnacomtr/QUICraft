@@ -17,6 +17,11 @@ import rs.sudoe.quicraft.fabric.Hooks;
 public final class V3Hooks {
     private V3Hooks() {}
 
+    /** Whether this game connection is a {@code /3} one (false on TCP, {@code /2}). */
+    public static boolean isV3(Connection connection) {
+        return Transports.v3(connection) != null;
+    }
+
     /** Hello arrived. False cancels vanilla's handling: the {@code /3} attempt is over. */
     public static boolean hello(Connection connection, boolean shouldAuthenticate) {
         V3Client client = Transports.v3(connection);
