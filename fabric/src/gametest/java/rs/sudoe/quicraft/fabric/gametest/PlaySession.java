@@ -114,7 +114,7 @@ final class PlaySession {
         }
     }
 
-    private static void compareBlocks(ClientGameTestContext context, TestDedicatedServerContext server, BlockPos from,
+    static void compareBlocks(ClientGameTestContext context, TestDedicatedServerContext server, BlockPos from,
             BlockPos to) {
         int mismatches = 0;
         String first = null;

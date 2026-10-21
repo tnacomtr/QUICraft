@@ -20,6 +20,7 @@
       "rs.sudoe.quicraft.fabric.gametest.ServerMultistreamGameTest",
       "rs.sudoe.quicraft.fabric.gametest.ServerMultistreamOnlineGameTest",
       "rs.sudoe.quicraft.fabric.gametest.ServerMultistreamFaultGameTest",
+      "rs.sudoe.quicraft.fabric.gametest.RespawnLiveGameTest",
       "rs.sudoe.quicraft.fabric.gametest.JoinTimingGameTest",
       "rs.sudoe.quicraft.fabric.gametest.ExternalServerGameTest",
       "rs.sudoe.quicraft.fabric.gametest.RoutingTableGameTest",
