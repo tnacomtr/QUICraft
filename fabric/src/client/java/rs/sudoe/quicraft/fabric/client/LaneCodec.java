@@ -151,10 +151,6 @@ public final class LaneCodec implements GameLanes.Codec {
             // the id VarInt plus at most 8 bytes, and a whole copy would halve the largest packet the
             // 8 MiB workspace accepts. Charge it before allocating, separately from decode storage.
             int uncompressedSize = packetBytes.readableBytes();
-            if (decodedBytes != null) {
-                // The backlog bound counts what the decoded packet holds, not the (possibly compressed) wire size.
-                decodedBytes.accept(uncompressedSize + PER_PACKET_OVERHEAD_BYTES);
-            }
             int prefix = Math.min(uncompressedSize, ROUTING_PREFIX_BYTES);
             reservation.reserve(prefix, prefix);
             byte[] uncompressed = ByteBufUtil.getBytes(packetBytes, packetBytes.readerIndex(), prefix);
@@ -164,6 +160,10 @@ public final class LaneCodec implements GameLanes.Codec {
                 throw new IOException("the packet decoder produced " + out.size() + " objects");
             }
             Packet<?> packet = (Packet<?>) out.get(0);
+            if (decodedBytes != null) {
+                // Count only successful decodes: a refused routing-copy reservation is retried.
+                decodedBytes.accept(uncompressedSize + PER_PACKET_OVERHEAD_BYTES);
+            }
             return new LaneGame.Decoded(packet, state, packetId, bundleOf(packet), packet.isTerminal(),
                     prefix, uncompressedSize, uncompressed);
         } finally {

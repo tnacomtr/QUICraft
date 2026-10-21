@@ -167,7 +167,8 @@ class LaneCodecChunkPositionTest {
     @Test
     void routingCopyReservationRefusalPrecedesDestructiveGameDecode() throws Exception {
         EmbeddedChannel channel = pipeline(false);
-        LaneCodec codec = new LaneCodec(channel, null, null, access(false));
+        long[] counted = {0};
+        LaneCodec codec = new LaneCodec(channel, null, size -> counted[0] += size, access(false));
         byte[] packet = ByteBuffer.allocate(9).put((byte) 45).putInt(-7).putInt(8).array();
         ByteBuf frame = Unpooled.wrappedBuffer(FrameCodec.encode(packet, -1));
         int[] reservations = {0};
@@ -176,6 +177,7 @@ class LaneCodecChunkPositionTest {
                 if (++reservations[0] == 2) throw new IllegalStateException("routing copy budget refused");
             }));
             assertEquals(1, frame.readerIndex(), "only the framing prefix was consumed; game decode did not run");
+            assertEquals(0, counted[0], "a refused attempt must not inflate the next delivery's byte count");
         } finally {
             frame.release();
             channel.finishAndReleaseAll();
