@@ -44,7 +44,7 @@ import rs.sudoe.quicraft.fabric.server.ServerQuic;
  * Login and respawn are {@code /3} epoch transitions (docs/protocol.md 13.18). This joins the
  * in-process server over a real {@code quicraft/3} session and, on that one connection, dies and
  * respawns, travels to the nether and back, and respawns once more right after a client block
- * break (so a prediction acknowledgement is around the transition). After every step the session
+ * break. After every step the session
  * must still be the same open {@code /3} connection with no fallback, the client must have reached
  * the expected level and loaded its chunk, the server must still hold the same player connection,
  * and the client's receive epoch must have advanced by exactly one.
