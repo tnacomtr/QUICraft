@@ -491,7 +491,14 @@ public final class SessionSendDriver {
         }
         fence = effectiveFence(fence, chunkX, chunkZ);
         int stream = streamFor(fence, chunkX, chunkZ);
-        Record record = sequencer.assign(stream, fence, frame, interaction, semantic);
+        Record record;
+        try {
+            record = sequencer.assign(stream, fence, frame, interaction, semantic);
+        } catch (RuntimeException refused) {
+            // effectiveFence already updated the held set: stop trusting it (13.21), whatever the caller does next.
+            heldChunks.markUnknown();
+            throw refused;
+        }
         if (!enqueueRecord(record, false)) {
             return handle;
         }
@@ -575,7 +582,13 @@ public final class SessionSendDriver {
         // The sequencer validates the route shape before it moves any sequence or frontier. Once
         // StreamSequencer.assign returns, the sequence exists, so every later failure is covered
         // here: encoding, enqueue, pump and token resolution all close locally, never escape.
-        Record record = sequencer.assign(stream, fence, frame, interaction);
+        Record record;
+        try {
+            record = sequencer.assign(stream, fence, frame, interaction);
+        } catch (RuntimeException refused) {
+            heldChunks.markUnknown();
+            throw refused;
+        }
         try {
             if (!enqueueRecord(record, false)) {
                 if (closeCause == null) {
