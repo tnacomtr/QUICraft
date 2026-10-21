@@ -45,11 +45,10 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * <p>The table is schema 2 (13.7): 210 explicit routes, one per live play id. REALTIME is exactly
  * the 14 entity and animation updates 13.8 names; chunk_batch_start is the one VIEW route and
  * chunks_biomes the one listed-control route ({@code chunk_list}). Five chunk routes (45, 6, 8,
- * 37, 84) are CHUNK with their reviewed position layouts; 45 (install), 6 (block-entity data) and
- * 37 (forget) carry the 13.21 {@code ack} dependency, while 8 and 84 stay {@code lane}. The ACK
- * stream carries block_changed_ack (4) and chunk_batch_finished (11), {@code trailing}. 93
- * clientbound routes are ordinary CONTROL and eight are control fences (13.5, B1 minus
- * player_position 72). Every other clientbound route is CONTROL/global, no route carries an epoch
+ * 37, 84) are CHUNK with their reviewed position layouts, and all five carry the 13.21 {@code ack}
+ * dependency. The ACK stream carries block_changed_ack (4) and chunk_batch_finished (11),
+ * {@code trailing}. 92 clientbound routes are ordinary CONTROL and seven are control fences (13.5,
+ * B1 minus player_position 72 and teleport_entity 125; player_look_at 71 is global too). Every other clientbound route is CONTROL/global, no route carries an epoch
  * change, and every serverbound route is CONTROL/global with {@code ordinarySmall} false.
  * light_update and login/respawn stay CONTROL/global until their wiring lands. A future CHUNK,
  * ACK or epoch flip must deliberately revise these pins together with its wiring tests.
@@ -132,8 +131,8 @@ public class RoutingTableGameTest implements FabricClientGameTest {
     private static final String[] CHUNK = {
         "45 minecraft:level_chunk_with_light chunk_xz ack",
         "6 minecraft:block_entity_data block_position ack",
-        "8 minecraft:block_update block_position lane",
-        "84 minecraft:section_blocks_update section_position lane",
+        "8 minecraft:block_update block_position ack",
+        "84 minecraft:section_blocks_update section_position ack",
         "37 minecraft:forget_level_chunk chunk_pos_long ack",
     };
 
@@ -143,15 +142,15 @@ public class RoutingTableGameTest implements FabricClientGameTest {
         "11 minecraft:chunk_batch_finished",
     };
 
-    /** The 93 clientbound ordinary CONTROL ids (13.5): no chunk wait, no later-REALTIME fence. */
+    /** The 92 clientbound ordinary CONTROL ids (13.5): no chunk wait, no later-REALTIME fence. */
     private static final int[] ORDINARY = {3, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25,
         26, 27, 28, 29, 30, 31, 33, 34, 38, 39, 40, 41, 43, 44, 50, 51, 52, 58, 59, 61, 62, 63, 65,
-        66, 67, 68, 69, 70, 71, 73, 74, 75, 76, 78, 79, 80, 81, 85, 86, 87, 88, 89, 90, 91, 92, 93,
+        66, 67, 68, 69, 70, 73, 74, 75, 76, 78, 79, 80, 81, 85, 86, 87, 88, 89, 90, 91, 92, 93,
         96, 97, 98, 103, 104, 105, 106, 108, 109, 110, 112, 113, 114, 115, 117, 119, 120, 121, 122,
         123, 126, 127, 128, 130, 132, 133, 134, 135, 136, 137, 138, 139, 140};
 
-    /** The eight clientbound control fences (13.5, B1 minus player_position 72). */
-    private static final int[] CONTROL_FENCE = {1, 35, 64, 77, 100, 107, 124, 125};
+    /** The seven clientbound control fences (13.5, B1 minus player_position 72 and teleport_entity 125). */
+    private static final int[] CONTROL_FENCE = {1, 35, 64, 77, 100, 107, 124};
 
     /**
      * The 13.5 must-use-CONTROL keys, already enforced by the loader from

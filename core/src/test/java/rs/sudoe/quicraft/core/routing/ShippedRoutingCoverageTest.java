@@ -34,25 +34,28 @@ class ShippedRoutingCoverageTest {
     private static final Map<Integer, String> CHUNK = map(45, "chunk_xz", 6, "block_position", 8, "block_position",
             84, "section_position", 37, "chunk_pos_long");
     /**
-     * 13.21 {@code ack}: the CHUNK routes that also wait for the latest ACK-stream record. Install,
-     * block-entity data and forget must not overtake a pending prediction acknowledgement; the plain
-     * block-state updates (8, 84) stay {@code lane} and rely on the {@code trailing} order instead.
+     * 13.21 {@code ack}: every CHUNK route also waits for the latest ACK-stream record. Install,
+     * block-entity data, forget and the block-state updates (8, 84) must not overtake a pending
+     * prediction acknowledgement: the ACK restores the saved server state and collision-snaps, so a
+     * later block update applied first changes what the player sees (security review 2026-10-21).
      */
-    private static final Set<Integer> CHUNK_ACK = set(45, 6, 37);
+    private static final Set<Integer> CHUNK_ACK = set(45, 6, 37, 8, 84);
     /** 13.21: block_changed_ack (4) and chunk_batch_finished (11) ride the ACK stream. */
     private static final Set<Integer> ACK_LANE = set(4, 11);
     /** 13.8/13.19: chunk_batch_start uses the view scope. */
     private static final Set<Integer> VIEW = set(12);
     /** 13.5 control fences: no chunk wait, but later REALTIME waits for them (B1 minus 72). */
-    private static final Set<Integer> CONTROL_FENCE = set(1, 35, 64, 77, 100, 107, 124, 125);
+    private static final Set<Integer> CONTROL_FENCE = set(1, 35, 64, 77, 100, 107, 124);
     /** 13.5 ordinary CONTROL: own CONTROL predecessor and G only; no chunk wait, no REALTIME fence. */
     private static final Set<Integer> ORDINARY = set(3, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25,
             26, 27, 28, 29, 30, 31, 33, 34, 38, 39, 40, 41, 43, 44, 50, 51, 52, 58, 59, 61, 62, 63, 65,
-            66, 67, 68, 69, 70, 71, 73, 74, 75, 76, 78, 79, 80, 81, 85, 86, 87, 88, 89, 90, 91, 92, 93,
+            66, 67, 68, 69, 70, 73, 74, 75, 76, 78, 79, 80, 81, 85, 86, 87, 88, 89, 90, 91, 92, 93,
             96, 97, 98, 103, 104, 105, 106, 108, 109, 110, 112, 113, 114, 115, 117, 119, 120, 121, 122,
             123, 126, 127, 128, 130, 132, 133, 134, 135, 136, 137, 138, 139, 140);
     /** 13.8: a multi-chunk packet stays CONTROL/global with its reviewed list extractor. */
     private static final Map<Integer, String> LIST = map(13, "chunk_list");
+    // Position-dependent, kept global so they never overtake a pending ACK collision snap: player_look_at (71)
+    // and teleport_entity (125).
     // Deliberate global deferrals (CP1), all CONTROL/global: login (49) and respawn (82),
     // because epoch routes are not wired; light_update (48), with no reviewed layout; explode (36) and
     // level_event (46), kept global as a safe superset of 13.8.
@@ -99,7 +102,8 @@ class ShippedRoutingCoverageTest {
 
     /**
      * The narrowed clientbound classes are exact id sets, not merely "some routes are ordinary":
-     * 93 ordinary CONTROL ids and the eight control fences of 13.5 (B1 minus player_position 72).
+     * 92 ordinary CONTROL ids and the seven control fences of 13.5 (B1 minus player_position 72 and
+     * teleport_entity 125; player_look_at 71 is global too).
      * Every other clientbound route is global, view, list, realtime or CHUNK, and each of those is
      * pinned separately above.
      */
@@ -116,14 +120,13 @@ class ShippedRoutingCoverageTest {
         }
         assertEquals(ORDINARY, ordinary, "the clientbound ordinary CONTROL set");
         assertEquals(CONTROL_FENCE, control, "the clientbound control-fence set");
-        assertEquals(93, ordinary.size(), "93 ordinary ids (13.5)");
-        assertEquals(8, control.size(), "eight control fences (B1 minus 72)");
+        assertEquals(92, ordinary.size(), "92 ordinary ids (13.5)");
+        assertEquals(7, control.size(), "seven control fences (B1 minus 72 and 125)");
     }
 
     /**
      * 13.21: exactly block_changed_ack (4) and chunk_batch_finished (11) use the ACK lane, both
-     * {@code trailing}; exactly install (45), block-entity data (6) and forget (37) add the
-     * {@code ack} dependency to their CHUNK route.
+     * {@code trailing}; every CHUNK route (45, 6, 8, 84, 37) adds the {@code ack} dependency.
      */
     @Test
     void theAckStreamAndAckDependencySetsAreExactlyTheReviewedIds() throws IOException {

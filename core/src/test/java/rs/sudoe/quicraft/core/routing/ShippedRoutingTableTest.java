@@ -27,9 +27,9 @@ import rs.sudoe.quicraft.core.Faults;
 class ShippedRoutingTableTest {
     private static final int PROTOCOL = 775;
     private static final String RESOURCE = RoutingTableLoader.resourcePath(PROTOCOL);
-    /** 13.21: the CHUNK routes that add the {@code ack} dependency (6, 37, 45); 8 and 84 stay {@code lane}. */
+    /** 13.21: every CHUNK route adds the {@code ack} dependency (6, 8, 37, 45, 84). */
     private static final Set<Integer> CHUNK_ACK =
-            new HashSet<Integer>(Arrays.asList(45, 6, 37));
+            new HashSet<Integer>(Arrays.asList(45, 6, 8, 37, 84));
 
     @Test
     void theShippedTableParsesAsReviewedSchemaTwoAndIsTheRegistryAnswer() throws Exception {
@@ -82,8 +82,7 @@ class ShippedRoutingTableTest {
     /**
      * Every shipped route is one of the reviewed classes: CONTROL/global, the view gate,
      * REALTIME/lane, a CHUNK route (45, 6, 8, 37, 84), the ACK lane (4, 11), ordinary CONTROL, or a
-     * control fence. Install, block-entity data and forget carry the 13.21 {@code ack} dependency;
-     * the block-state updates 8/84 stay {@code lane}. An ACK-lane record is {@code trailing}: it
+     * control fence. Every CHUNK route carries the 13.21 {@code ack} dependency. An ACK-lane record is {@code trailing}: it
      * orders after every earlier record and advances no frontier. Ordinary routes wait for their
      * CONTROL predecessor and G only; control fences additionally order later REALTIME.
      */
@@ -105,7 +104,7 @@ class ShippedRoutingTableTest {
             boolean chunkRoute = clientboundPlay
                     && (id == 45 || id == 6 || id == 8 || id == 84 || id == 37)
                     && route.lane == RouteV2.StreamLane.CHUNK
-                    && route.dependency == (id == 8 || id == 84 ? Dependency.LANE : Dependency.ACK);
+                    && route.dependency == Dependency.ACK;
             assertTrue(global || realtime || view || ordinary || controlFence || ackLane || chunkRoute,
                     "unexpected relaxation: " + route.lane + "/" + route.dependency);
         }
