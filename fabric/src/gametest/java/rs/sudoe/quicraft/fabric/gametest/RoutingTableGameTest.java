@@ -48,10 +48,10 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * 37, 84) are CHUNK with their reviewed position layouts, and all five carry the 13.21 {@code ack}
  * dependency. The ACK stream carries block_changed_ack (4) and chunk_batch_finished (11),
  * {@code trailing}. 92 clientbound routes are ordinary CONTROL and six are control fences (13.5,
- * B1 minus player_position 72, move_vehicle 35 and teleport_entity 125; player_look_at 71 is global too). Every other clientbound route is CONTROL/global, no route carries an epoch
- * change, and every serverbound route is CONTROL/global with {@code ordinarySmall} false.
- * light_update and login/respawn stay CONTROL/global until their wiring lands. A future CHUNK,
- * ACK or epoch flip must deliberately revise these pins together with its wiring tests.
+ * B1 minus player_position 72, move_vehicle 35 and teleport_entity 125; player_look_at 71 is global too). Every other clientbound route is CONTROL/global, only login (49) and respawn (82)
+ * carry an epoch change (13.18), and every serverbound route is CONTROL/global with {@code ordinarySmall} false.
+ * light_update stays CONTROL/global until its layout is reviewed. A future CHUNK, ACK or epoch
+ * change must deliberately revise these pins together with its wiring tests.
  *
  * <p>The game classes are reached by reflection: this source set is shared with the 1.21.11 jar,
  * where the same names are obfuscated and the test has nothing to pin. It returns early there.
@@ -360,8 +360,11 @@ public class RoutingTableGameTest implements FabricClientGameTest {
                 + route.dependency + ", expected " + dependency);
         check(Objects.equals(route.position, position), "the shipped table gives " + name
                 + " position " + route.position + ", expected " + position);
-        check(!route.epochChange, "the shipped table marks " + name + " as an epoch change; epoch"
-                + " changes are a deliberate deferral (13.8-13.19)");
+        // 13.18: exactly the level-creating clientbound packets login and respawn change the epoch.
+        boolean epoch = direction == Direction.CLIENTBOUND
+                && (name.equals("minecraft:login") || name.equals("minecraft:respawn"));
+        check(route.epochChange == epoch, "the shipped table gives " + name + " epoch_change="
+                + route.epochChange + ", expected " + epoch + " (13.18)");
         return route;
     }
 
