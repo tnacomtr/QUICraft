@@ -16,7 +16,8 @@ import java.util.function.LongSupplier;
  *
  * <p>Busy timer (prototype, {@code -Dquicraft.v3.batchTimerBusy=true}, default off): instead of the wall time from
  * the batch's first chunk, the batch interval is the network-thread busy time the connection spent decoding and
- * firing its packets since that first chunk ({@link rs.sudoe.quicraft.bridge.GameLanes#busyNanos()}). Transport
+ * firing its packets since the start of the decode of that first chunk's delivery
+ * ({@link rs.sudoe.quicraft.bridge.GameLanes#busyMarkForCurrentDelivery()}). Transport
  * gating between units is then not counted. Empty batches and {@code /2} or TCP keep vanilla timing.
  *
  * <p>Only the network-thread pass of a chunk counts: vanilla's chunk handler runs once on the network thread and
@@ -79,7 +80,7 @@ public final class ChunkPacing {
             return;
         }
         if (busy) {
-            long mark = busyNanos.getAsLong();
+            long mark = readBusy(busyNanos);
             marked = mark >= 0;
             busyMark = mark;
         }
@@ -106,11 +107,23 @@ public final class ChunkPacing {
         if (!busy || !wasMarked) {
             return -1L;
         }
-        long now = busyNanos.getAsLong();
+        long now = readBusy(busyNanos);
         if (now < 0 || now < busyMark) {
             return -1L;
         }
         return now - busyMark;
+    }
+
+    /**
+     * Reads a busy counter for the batch timer. A throwing supplier counts as unavailable (-1), so the batch keeps
+     * vanilla timing and the wall restart still runs: a broken busy hook never changes the wall timer.
+     */
+    private static long readBusy(LongSupplier busyNanos) {
+        try {
+            return busyNanos.getAsLong();
+        } catch (Throwable t) {
+            return -1L;
+        }
     }
 
     /** One-shot per listener: true the first time it is asked while the busy timer is on (for the INFO log line). */

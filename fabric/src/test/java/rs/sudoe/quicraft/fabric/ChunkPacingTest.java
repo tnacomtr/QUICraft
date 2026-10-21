@@ -151,6 +151,37 @@ class ChunkPacingTest {
     }
 
     @Test
+    void theBusyMarkTakenAtTheFirstChunkIsTheBaseEvenWhenLaterChunksOfTheBatchReportMore() {
+        ChunkPacing pacing = new ChunkPacing(false, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(40));
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(90));
+        assertEquals(150 - 40, pacing.batchFinished(() -> busyAt(150)));
+    }
+
+    @Test
+    void aThrowingBusyCounterAtTheFirstChunkStillRestartsTheWallTimerAndGivesVanillaTiming() {
+        ChunkPacing pacing = new ChunkPacing(true, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> {
+            throw new IllegalStateException("busy hook broke");
+        });
+        assertEquals(1, restarts.get(), "the wall timer restart must not depend on the busy hook");
+        assertEquals(-1, pacing.batchFinished(() -> busyAt(500)));
+    }
+
+    @Test
+    void aThrowingBusyCounterAtTheFinishGivesVanillaTiming() {
+        ChunkPacing pacing = new ChunkPacing(true, true);
+        pacing.batchStarted();
+        pacing.chunk(true, () -> true, restarts::incrementAndGet, () -> busyAt(100));
+        assertEquals(-1, pacing.batchFinished(() -> {
+            throw new IllegalStateException("busy hook broke");
+        }));
+        assertEquals(1, restarts.get());
+    }
+
+    @Test
     void theBusyActivationIsLoggedOnce() {
         ChunkPacing pacing = new ChunkPacing(false, true);
         assertTrue(pacing.takeBusyActivation());

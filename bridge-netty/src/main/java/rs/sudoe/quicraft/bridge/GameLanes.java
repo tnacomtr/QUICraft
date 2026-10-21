@@ -13,6 +13,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
@@ -326,14 +327,30 @@ public final class GameLanes implements LaneGame {
     private volatile boolean closed;
     private volatile Session session;
     private final boolean traceWrites = ReceiveTrace.enabled();
+    /** Client chunk-batch busy timer switch ({@code -Dquicraft.v3.batchTimerBusy}), read once. */
+    static final boolean BUSY_TIMER_PROPERTY = Boolean.getBoolean("quicraft.v3.batchTimerBusy");
     /**
-     * Client chunk-batch busy timer ({@code -Dquicraft.v3.batchTimerBusy}, read once): nanoseconds spent in
-     * {@link #decode}, {@link #decodeInflated} and the synchronous fire of a delivery's packets. Decode runs on
-     * the session's receive path, which may be another thread than the game loop, and fire runs on the game
-     * loop, so this is an atomic sum and not a plain field. Untouched and free when the property is off.
+     * Whether the busy timer runs on this instance. When false nothing below reads the clock or writes a
+     * counter, so the off path costs nothing extra.
      */
-    static final boolean BUSY_TIMER = Boolean.getBoolean("quicraft.v3.batchTimerBusy");
+    private final boolean busyTimer;
+    private final LongSupplier clock;
+    /**
+     * Nanoseconds spent in {@link #decode}, {@link #decodeInflated} and the synchronous fire of a delivery's
+     * packets. Decode runs on the session's receive path, which may be another thread than the game loop, and
+     * fire runs on the game loop, so this is an atomic sum and not a plain field.
+     */
     private final AtomicLong busyNanos = new AtomicLong();
+    /**
+     * Decode nanoseconds accumulated since the last {@link #deliver}: the receive driver decodes every record of
+     * a delivery before it delivers, so this is exactly the decode time of the delivery being built.
+     */
+    private final AtomicLong pendingDecodeNanos = new AtomicLong();
+    /**
+     * The busy counter at the start of the decode of the delivery being fired, or -1 outside a fire. Set only
+     * when the busy timer is on, read by the client's first chunk handler on the game loop.
+     */
+    private volatile long deliveryMark = -1L;
 
     /**
      * Production: a game pipeline over the {@link NStreamSession} that activation creates. Build it
@@ -352,24 +369,36 @@ public final class GameLanes implements LaneGame {
      */
     public GameLanes(Channel game, Codec codec, Supplier<? extends MultistreamSession> session, ProtocolState state,
                      ChannelHandlerContext deliverFrom) {
-        this(game, codec, state, deliverFrom, laneSessionSource(session));
+        this(game, codec, state, deliverFrom, laneSessionSource(session), BUSY_TIMER_PROPERTY, System::nanoTime);
     }
 
     /** The test seam: the session as an interface supplied lazily, so no QUIC connection is needed. */
     static GameLanes forTest(Channel game, Codec codec, Session session, ProtocolState state,
             ChannelHandlerContext deliverFrom) {
-        return new GameLanes(game, codec, state, deliverFrom, () -> session);
+        return new GameLanes(game, codec, state, deliverFrom, () -> session, BUSY_TIMER_PROPERTY, System::nanoTime);
+    }
+
+    /**
+     * The test seam for the busy timer, independent of the property: with an injected clock, so tests can assert
+     * exact decode and fire accounting, and with the timer off so the disabled path can be checked.
+     */
+    static GameLanes forClockTest(Channel game, Codec codec, Session session, ProtocolState state,
+            ChannelHandlerContext deliverFrom, boolean busyTimer, LongSupplier clock) {
+        return new GameLanes(game, codec, state, deliverFrom, () -> session, busyTimer, clock);
     }
 
     /** Internal, with the session last so it does not clash with the public constructor's erasure. */
     private GameLanes(Channel game, Codec codec, ProtocolState state,
-                      ChannelHandlerContext deliverFrom, Supplier<Session> session) {
-        if (game == null || codec == null || session == null || state == null) {
-            throw new IllegalArgumentException("game, codec, session and state are all required");
+                      ChannelHandlerContext deliverFrom, Supplier<Session> session,
+                      boolean busyTimer, LongSupplier clock) {
+        if (game == null || codec == null || session == null || state == null || clock == null) {
+            throw new IllegalArgumentException("game, codec, session, state and clock are all required");
         }
         this.game = game;
         this.codec = codec;
         this.sessionSource = session;
+        this.busyTimer = busyTimer;
+        this.clock = clock;
         this.state = state;
         this.deliverFrom = deliverFrom;
     }
@@ -436,6 +465,37 @@ public final class GameLanes implements LaneGame {
         return busyNanos.get();
     }
 
+    /**
+     * The busy counter at the start of the decode of the delivery now being fired, so a chunk handler's
+     * batch interval starts before that delivery's own decode. Valid only inside the game's handling of the
+     * delivery (on the game loop); -1 otherwise, and always -1 when the busy timer is off. Every packet of a
+     * bundle delivery shares this mark, so it covers the decode of all the bundle's frames.
+     */
+    public long busyMarkForCurrentDelivery() {
+        return deliveryMark;
+    }
+
+    /** Busy-timer clock read: 0 when the timer is off, so the off path never reads the clock. */
+    private long busyStart() {
+        return busyTimer ? clock.getAsLong() : 0L;
+    }
+
+    /** Charges one decode to the busy sum and to the delivery being assembled. */
+    private void chargeDecode(long started) {
+        if (busyTimer) {
+            long spent = clock.getAsLong() - started;
+            busyNanos.addAndGet(spent);
+            pendingDecodeNanos.addAndGet(spent);
+        }
+    }
+
+    /** Charges one synchronous fire to the busy sum. */
+    private void chargeFire(long started) {
+        if (busyTimer) {
+            busyNanos.addAndGet(clock.getAsLong() - started);
+        }
+    }
+
     // --- LaneGame, inbound.
 
     @Override
@@ -445,14 +505,12 @@ public final class GameLanes implements LaneGame {
         try {
             // 13.12: the platform charges decoded output before it allocates it, so an over-budget
             // packet is refused before any decompression or object is created.
-            long started = BUSY_TIMER ? System.nanoTime() : 0L;
+            long started = busyStart();
             Decoded decoded;
             try {
                 decoded = codec.decode(body, state, reservation);
             } finally {
-                if (BUSY_TIMER) {
-                    busyNanos.addAndGet(System.nanoTime() - started);
-                }
+                chargeDecode(started);
             }
             if (decoded == null) {
                 throw new IllegalStateException("the codec decoded nothing for " + lane + " " + sequence);
@@ -468,14 +526,12 @@ public final class GameLanes implements LaneGame {
             Reservation reservation) throws Exception {
         ByteBuf body = Unpooled.wrappedBuffer(content);
         try {
-            long started = BUSY_TIMER ? System.nanoTime() : 0L;
+            long started = busyStart();
             Decoded decoded;
             try {
                 decoded = codec.decodeInflated(body, state, reservation);
             } finally {
-                if (BUSY_TIMER) {
-                    busyNanos.addAndGet(System.nanoTime() - started);
-                }
+                chargeDecode(started);
             }
             if (decoded == null) {
                 throw new IllegalStateException("the codec decoded nothing for " + lane + " " + sequence);
@@ -491,7 +547,8 @@ public final class GameLanes implements LaneGame {
         if (lane == null || packets == null || packets.isEmpty()) {
             throw new IllegalArgumentException("lane/packets");
         }
-        Delivery delivery = new Delivery(lane, sequence, new ArrayList<Object>(packets), bundle);
+        long decodeNanos = busyTimer ? pendingDecodeNanos.getAndSet(0L) : 0L;
+        Delivery delivery = new Delivery(lane, sequence, new ArrayList<Object>(packets), bundle, decodeNanos);
         EventLoop loop = game.eventLoop();
         boolean drainNow = false;
         synchronized (queued) {
@@ -531,7 +588,10 @@ public final class GameLanes implements LaneGame {
     /** Event loop only. */
     private void fire(Delivery delivery) {
         try {
-            long started = BUSY_TIMER ? System.nanoTime() : 0L;
+            if (busyTimer) {
+                deliveryMark = busyNanos.get() - delivery.decodeNanos;
+            }
+            long started = busyStart();
             try {
                 for (Object packet : delivery.packets) {
                     if (deliverFrom != null) {
@@ -541,8 +601,9 @@ public final class GameLanes implements LaneGame {
                     }
                 }
             } finally {
-                if (BUSY_TIMER) {
-                    busyNanos.addAndGet(System.nanoTime() - started);
+                chargeFire(started);
+                if (busyTimer) {
+                    deliveryMark = -1L;
                 }
             }
             Ack ack = new Ack(delivery.lane, delivery.sequence, delivery.bundle);
@@ -776,12 +837,15 @@ public final class GameLanes implements LaneGame {
         final long sequence;
         final List<Object> packets;
         final boolean bundle;
+        /** Busy nanoseconds of the decodes that produced this delivery (0 with the busy timer off). */
+        final long decodeNanos;
 
-        Delivery(Lane lane, long sequence, List<Object> packets, boolean bundle) {
+        Delivery(Lane lane, long sequence, List<Object> packets, boolean bundle, long decodeNanos) {
             this.lane = lane;
             this.sequence = sequence;
             this.packets = packets;
             this.bundle = bundle;
+            this.decodeNanos = decodeNanos;
         }
     }
 

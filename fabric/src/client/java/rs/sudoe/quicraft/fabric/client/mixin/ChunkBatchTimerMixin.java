@@ -64,7 +64,7 @@ abstract class ChunkBatchTimerMixin {
                         Hooks.enter("v3 batch timer");
                         chunkBatchSizeCalculator.onBatchStart();
                     },
-                    () -> V3Hooks.busyNanos(connection));
+                    () -> V3Hooks.busyMark(connection));
         } catch (Throwable t) {
             Hooks.failed("v3 batch timer", t);
         }
