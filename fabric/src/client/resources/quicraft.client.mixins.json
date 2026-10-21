@@ -9,6 +9,7 @@
     "ChunkBatchTimerMixin",
     "ClientPacketListenerMixin",
     "CompressionDecoderAccessor",
+    "ChunkBatchSizeCalculatorAccessor",
     "CompressionEncoderAccessor",
     "ConnectionEncryptionMixin",
     "ConnectScreenConnectorMixin",

@@ -12,6 +12,7 @@ import io.netty.util.ReferenceCountUtil;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
@@ -325,6 +326,14 @@ public final class GameLanes implements LaneGame {
     private volatile boolean closed;
     private volatile Session session;
     private final boolean traceWrites = ReceiveTrace.enabled();
+    /**
+     * Client chunk-batch busy timer ({@code -Dquicraft.v3.batchTimerBusy}, read once): nanoseconds spent in
+     * {@link #decode}, {@link #decodeInflated} and the synchronous fire of a delivery's packets. Decode runs on
+     * the session's receive path, which may be another thread than the game loop, and fire runs on the game
+     * loop, so this is an atomic sum and not a plain field. Untouched and free when the property is off.
+     */
+    static final boolean BUSY_TIMER = Boolean.getBoolean("quicraft.v3.batchTimerBusy");
+    private final AtomicLong busyNanos = new AtomicLong();
 
     /**
      * Production: a game pipeline over the {@link NStreamSession} that activation creates. Build it
@@ -419,6 +428,14 @@ public final class GameLanes implements LaneGame {
         return game;
     }
 
+    /**
+     * Cumulative busy nanoseconds on the inbound path (decode plus synchronous fire). Only moves when
+     * {@code -Dquicraft.v3.batchTimerBusy} is set; monotonic, read by the client's chunk batch timer.
+     */
+    public long busyNanos() {
+        return busyNanos.get();
+    }
+
     // --- LaneGame, inbound.
 
     @Override
@@ -428,7 +445,15 @@ public final class GameLanes implements LaneGame {
         try {
             // 13.12: the platform charges decoded output before it allocates it, so an over-budget
             // packet is refused before any decompression or object is created.
-            Decoded decoded = codec.decode(body, state, reservation);
+            long started = BUSY_TIMER ? System.nanoTime() : 0L;
+            Decoded decoded;
+            try {
+                decoded = codec.decode(body, state, reservation);
+            } finally {
+                if (BUSY_TIMER) {
+                    busyNanos.addAndGet(System.nanoTime() - started);
+                }
+            }
             if (decoded == null) {
                 throw new IllegalStateException("the codec decoded nothing for " + lane + " " + sequence);
             }
@@ -443,7 +468,15 @@ public final class GameLanes implements LaneGame {
             Reservation reservation) throws Exception {
         ByteBuf body = Unpooled.wrappedBuffer(content);
         try {
-            Decoded decoded = codec.decodeInflated(body, state, reservation);
+            long started = BUSY_TIMER ? System.nanoTime() : 0L;
+            Decoded decoded;
+            try {
+                decoded = codec.decodeInflated(body, state, reservation);
+            } finally {
+                if (BUSY_TIMER) {
+                    busyNanos.addAndGet(System.nanoTime() - started);
+                }
+            }
             if (decoded == null) {
                 throw new IllegalStateException("the codec decoded nothing for " + lane + " " + sequence);
             }
@@ -498,11 +531,18 @@ public final class GameLanes implements LaneGame {
     /** Event loop only. */
     private void fire(Delivery delivery) {
         try {
-            for (Object packet : delivery.packets) {
-                if (deliverFrom != null) {
-                    deliverFrom.fireChannelRead(packet);
-                } else {
-                    game.pipeline().fireChannelRead(packet);
+            long started = BUSY_TIMER ? System.nanoTime() : 0L;
+            try {
+                for (Object packet : delivery.packets) {
+                    if (deliverFrom != null) {
+                        deliverFrom.fireChannelRead(packet);
+                    } else {
+                        game.pipeline().fireChannelRead(packet);
+                    }
+                }
+            } finally {
+                if (BUSY_TIMER) {
+                    busyNanos.addAndGet(System.nanoTime() - started);
                 }
             }
             Ack ack = new Ack(delivery.lane, delivery.sequence, delivery.bundle);
