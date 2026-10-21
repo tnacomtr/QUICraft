@@ -402,13 +402,17 @@ public final class ServerReceiveDriver {
     }
 
     private void fail(ReceiveClose close) {
-        fail(close.errorCode(), closeReason(close));
+        fail(close.errorCode(), closeReason(close), close.diagnostic());
     }
 
     private void fail(int errorCode, byte[] reason) {
+        fail(errorCode, reason, null);
+    }
+
+    private void fail(int errorCode, byte[] reason, String diagnostic) {
         if (closed) return;
         terminate();
-        sink.close(errorCode, reason);
+        sink.close(errorCode, reason, diagnostic);
     }
 
     /**

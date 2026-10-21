@@ -226,6 +226,16 @@ public final class BlockedHeadTimer {
         return running && activeNanos() >= RETENTION_NANOS;
     }
 
+    /** Active time at the last renewal, 0 for the wait's start; diagnostics only. */
+    long renewedActiveNanos() {
+        return renewedActiveNanos;
+    }
+
+    /** Qualifying bytes credited since the last renewal, saturating at {@link #RENEWAL_BYTES}; diagnostics only. */
+    long creditBytes() {
+        return creditBytes;
+    }
+
     /** Stops the wait, for example when the head is enqueued (Q) or released. */
     public void stop() {
         running = false;
@@ -461,6 +471,16 @@ public final class BlockedHeadTimer {
         /** Reports whether any recorded stall time was excluded in this observation (blocks the phrase, 13.12). */
         public boolean stallConsumed() {
             return exclusionNanos > 0;
+        }
+
+        /** Elapsed transport time since the wait started, stall time included; diagnostics only. */
+        long elapsedNanos() {
+            return elapsedNanos;
+        }
+
+        /** Excluded stall time of this observation, capped at the allowance; diagnostics only. */
+        long exclusionNanos() {
+            return exclusionNanos;
         }
     }
 }

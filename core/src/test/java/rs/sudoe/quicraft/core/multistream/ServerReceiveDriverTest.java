@@ -32,6 +32,8 @@ class ServerReceiveDriverTest {
         final SessionReceiveDriverTest.FakeGame game = new SessionReceiveDriverTest.FakeGame();
         final List<Integer> codes = new ArrayList<Integer>();
         final List<String> reasons = new ArrayList<String>();
+        /** The local-only diagnostic of each close, null for closes that carry none. */
+        final List<String> details = new ArrayList<String>();
         final long[] now = {0L};
         final CumulativeSource stalls = new CumulativeSource(now);
         final ServerReceiveDriver driver;
@@ -48,9 +50,18 @@ class ServerReceiveDriverTest {
                     null, null, false, null, null, null));
             routes.put(PID_REALTIME, new RouteV2(RouteV2.StreamLane.REALTIME, Dependency.ORDINARY,
                     null, null, false, null, null, null));
-            SessionReceiveDriver.CloseSink sink = (code, reason) -> {
-                codes.add(code);
-                reasons.add(new String(reason, StandardCharsets.US_ASCII));
+            SessionReceiveDriver.CloseSink sink = new SessionReceiveDriver.CloseSink() {
+                @Override
+                public void close(int code, byte[] reason) {
+                    close(code, reason, null);
+                }
+
+                @Override
+                public void close(int code, byte[] reason, String diagnostic) {
+                    codes.add(code);
+                    reasons.add(new String(reason, StandardCharsets.US_ASCII));
+                    details.add(diagnostic);
+                }
             };
             driver = cumulative
                     ? new ServerReceiveDriver(2, pump, (s, r, route) -> true,
@@ -300,6 +311,7 @@ class ServerReceiveDriverTest {
         assertEquals(Collections.singletonList(0x12), h.codes, "exactly one close, at the 120 s retention");
         assertEquals(Collections.singletonList("resource"), h.reasons,
                 "absolute retention is generic: no unseen-prerequisite phrase");
+        assertTrue(h.details.get(0).startsWith("expiry=absolute lapsed=no head=0:1 "), h.details.get(0));
         assertEquals(0L, h.driver.receiver().slots().workspaceInUse(), "the close returns the workspace reservations");
         assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL), "the blocked head's slot is released");
     }
@@ -365,6 +377,47 @@ class ServerReceiveDriverTest {
         assertEquals(Collections.singletonList(0x12), h.codes, "a repeated close is harmless");
         assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.REALTIME));
         assertEquals(0L, h.driver.receiver().slots().workspaceInUse());
+    }
+
+    /**
+     * The local diagnostic of a no-progress expiry names the kind, the blocked head's stream and sequence, each
+     * unresolved dependency with its watermarks and the timer readings. The wire close is unchanged.
+     */
+    @Test void blockedExpiryDiagnosticNamesTheHeadDependencyAndExpiryKind() throws Exception {
+        Harness h = new Harness(false);
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(LogicalStream.REALTIME, 100000),
+                        PID_CONTROL));
+        h.rounds(30);
+        h.now[0] = TimeUnit.SECONDS.toNanos(11);
+        h.rounds(1);
+        assertEquals(Collections.singletonList(0x12), h.codes, "exactly one close");
+        assertEquals(1, h.details.size());
+        String detail = h.details.get(0);
+        assertTrue(detail.startsWith("expiry=no-progress lapsed=no head=0:1 "), detail);
+        assertTrue(detail.contains("stream=1 need=100000 applied=0 queued=0"), detail);
+        assertTrue(detail.contains("blocked-ms=11000 since-renewal-ms=11000 stall-consumed-ms=0 credit-bytes=0/65536"),
+                detail);
+    }
+
+    /**
+     * An expiry captured in settlement, before the executing unit's commit, is marked lapsed in its diagnostic. The
+     * diagnostic names the executing REALTIME dependency that was enqueued but not applied.
+     */
+    @Test void lapsedExpiryDiagnosticMarksTheCaptureAtAcknowledgement() throws Exception {
+        Harness h = new Harness(false);
+        h.source.put(LogicalStream.REALTIME,
+                SessionReceiveDriverTest.rec(1, 1, 0, Collections.<Record.Dependency>emptyList(), PID_REALTIME));
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(1, 1), PID_CONTROL));
+        h.rounds(30);
+        h.now[0] = TimeUnit.SECONDS.toNanos(11);
+        h.driver.acknowledged(LogicalStream.REALTIME, 1);
+        assertEquals(Collections.singletonList(0x12), h.codes);
+        String detail = h.details.get(0);
+        assertTrue(detail.startsWith("expiry=no-progress lapsed=yes head=0:1 "), detail);
+        assertTrue(detail.contains("stream=1 need=1 applied=0 queued=1"), detail);
+        assertTrue(detail.contains("blocked-ms=11000"), detail);
     }
 
     /** A cumulative source coherent with the harness's non-excluding transport clock. */

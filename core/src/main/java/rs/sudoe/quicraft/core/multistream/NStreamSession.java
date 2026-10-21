@@ -528,7 +528,17 @@ public final class NStreamSession implements MultistreamSession {
             this.sink = new QuicStreamWriteSink(sendDriver, streams, this::writeAllowed, this::onSettled);
             StreamReceiver.Validator validator = new ShardValidator(shards,
                     role == Role.SERVER ? Direction.SERVERBOUND : Direction.CLIENTBOUND);
-            SessionReceiveDriver.CloseSink closeSink = this::onReceiveClose;
+            SessionReceiveDriver.CloseSink closeSink = new SessionReceiveDriver.CloseSink() {
+                @Override
+                public void close(int code, byte[] reason) {
+                    onReceiveClose(code, reason, null);
+                }
+
+                @Override
+                public void close(int code, byte[] reason, String diagnostic) {
+                    onReceiveClose(code, reason, diagnostic);
+                }
+            };
             if (role == Role.SERVER) {
                 serverPump = new SessionReadPump(new ServerReadPartition(shards), resources.node(),
                         resources.inboundExcess(), this, ip, account, limits, compressed, preambles,
@@ -1447,12 +1457,17 @@ public final class NStreamSession implements MultistreamSession {
     }
 
     /** The receive drivers' one close: 0x0 after END, otherwise the code and reason go to the peer. */
-    private void onReceiveClose(int code, byte[] reason) {
+    /**
+     * The local diagnostic, when present, is appended to the local log and exception text only. The wire carries the
+     * code and reason exactly as before.
+     */
+    private void onReceiveClose(int code, byte[] reason, String diagnostic) {
         if (code == CLOSE_NORMAL) {
             closeNormally();
         } else {
-            fail(code, reason == null ? NO_REASON : reason, "receive driver closed with 0x"
-                    + Integer.toHexString(code), null);
+            String why = "receive driver closed with 0x" + Integer.toHexString(code);
+            fail(code, reason == null ? NO_REASON : reason,
+                    diagnostic == null ? why : why + " (" + diagnostic + ")", null);
         }
     }
 

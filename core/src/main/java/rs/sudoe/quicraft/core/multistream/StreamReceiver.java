@@ -590,15 +590,17 @@ public final class StreamReceiver {
      * with no phrase. A lapsed wait captured by {@link #applied} is returned first.
      */
     public ReceiveClose expiredWait() {
-        return lapsedWait != null ? lapsedWait : expiredClose();
+        return lapsedWait != null ? lapsedWait : expiredClose(false);
     }
 
     /**
      * The close of the first expired wait in the current state, or null. A no-progress expiry takes precedence
      * over an absolute-retention expiry on any other head (13.12, "Deadline precedence"). Takes one observation
      * per waiting head into {@link #readings}; a cumulative receiver reads its source once for the whole check.
+     *
+     * @param lapsed true when the check runs in settlement, so the close is captured before the commit (diagnostics)
      */
-    private ReceiveClose expiredClose() {
+    private ReceiveClose expiredClose(boolean lapsed) {
         ReceiveClose retention = null;
         StallClock.Sample sample = null;
         for (int stream = 0; stream < streams; stream++) {
@@ -614,13 +616,50 @@ public final class StreamReceiver {
             readings[stream] = now;
             if (unit.timer.expired(now)) {
                 boolean wasWithheld = unit.chainWasWithheld || chainWithheld(unit.record);
-                return ReceiveClose.blockedExpiry(now != null && now.stallConsumed(), wasWithheld);
+                return ReceiveClose.blockedExpiry(now != null && now.stallConsumed(), wasWithheld,
+                        describeExpiry("no-progress", lapsed, stream, unit, now));
             }
             if (retention == null && unit.timer.absoluteExpired(now)) {
-                retention = ReceiveClose.retentionExpiry();
+                retention = ReceiveClose.retentionExpiry(describeExpiry("absolute", lapsed, stream, unit, now));
             }
         }
         return retention;
+    }
+
+    /**
+     * Builds the local-only diagnostic of an expired blocked head. Runs only when the wait closes the connection, so
+     * the string is never built on the normal path. Lists the head, every unresolved dependency with its applied,
+     * queued and admitted watermarks, and the timer's readings: transport time since the wait started, active time
+     * since the last renewal, the stall time consumed and the credit toward the next renewal.
+     */
+    private String describeExpiry(String kind, boolean lapsed, int stream, Unit unit,
+                                  BlockedHeadTimer.Observation now) {
+        StringBuilder text = new StringBuilder(192);
+        text.append("expiry=").append(kind).append(" lapsed=").append(lapsed ? "yes" : "no")
+                .append(" head=").append(stream).append(':').append(unit.record.sequence())
+                .append(" unresolved=[");
+        boolean first = true;
+        for (Record.Dependency dependency : unit.record.dependencies()) {
+            int required = dependency.streamIndex();
+            if (Long.compareUnsigned(dependency.sequence(), applied[required]) <= 0) {
+                continue;
+            }
+            if (!first) {
+                text.append("; ");
+            }
+            first = false;
+            text.append("stream=").append(required).append(" need=").append(dependency.sequence())
+                    .append(" applied=").append(applied[required])
+                    .append(" queued=").append(enqueued[required])
+                    .append(" admitted=").append(admitted[required]);
+        }
+        text.append("] blocked-ms=").append(now.elapsedNanos() / 1_000_000L)
+                .append(" since-renewal-ms=")
+                .append((now.activeNanos() - unit.timer.renewedActiveNanos()) / 1_000_000L)
+                .append(" stall-consumed-ms=").append(now.exclusionNanos() / 1_000_000L)
+                .append(" credit-bytes=").append(unit.timer.creditBytes())
+                .append('/').append(BlockedHeadTimer.RENEWAL_BYTES);
+        return text.toString();
     }
 
     /**
@@ -637,7 +676,7 @@ public final class StreamReceiver {
             return false;
         }
         try {
-            ReceiveClose expired = expiredClose();
+            ReceiveClose expired = expiredClose(true);
             if (expired != null) {
                 lapsedWait = expired;
                 return false;
