@@ -692,7 +692,7 @@ single-socket listener: no dispatcher is installed and the connection id length 
    verifying CLIENT_PROOF; client sends CLIENT_SWITCH only after verifying SERVER_PROOF;
    server sends SERVER_SWITCH only after verifying CLIENT_SWITCH. Compare all 32 MAC bytes
    in constant time after exact-length validation. Every message echoes the same selected
-   `N`, in the client's preamble range and 1..6; a mismatch fails activation with `0x10`.
+   `N`, in the client's preamble range and 1..5; a mismatch fails activation with `0x10`.
    Unknown versions/kinds, duplicates,
    reflection, mismatched metadata, unsolicited payloads or invalid MACs terminate `/3`.
 
@@ -772,12 +772,12 @@ if the charge cannot be made it waits non-fatally under the deadline, never `0x1
 total-byte limit. `/3` 0-RTT tickets carry the listener limits; never reduce remembered 0-RTT limits.
 Staging changes nothing on the wire. Every `/3` connection gets the listener limits of §13.13
 from its first packet: 24 KiB connection credit, 8 KiB on client-opened bidi directions (CONTROL,
-REALTIME), one byte on reverse-CHUNK guards, uni limits zero. netty/0005 pins the connection
+REALTIME), one byte on reverse CHUNK and ACK guards, uni limits zero. netty/0005 pins the connection
 and CONTROL/REALTIME maxima equal to their initial windows, so quiche never grows them; the
-reverse-CHUNK guards stay at one byte because their first byte closes the connection before any
+reverse CHUNK and ACK guards stay at one byte because their first byte closes the connection before any
 replenishment (§13.13). Credit advances only as the server reads, and stream windows bound what
 quiche can buffer, so a staged connection's native
-exposure is at most `2*8 KiB + N` bytes whatever its connection credit; everything past that is
+exposure is at most `2*8 KiB + (N+1)` bytes whatever its connection credit; everything past that is
 bounded by stopping reads at the cap above. Charge that full native exposure (not a smaller
 staged credit) to the pre-login pool. Promotion (online mode: Login Success, after
 session-server authentication; offline mode: `/3` activation) only moves the connection's
@@ -1037,7 +1037,7 @@ activation, even after Login Success. A shed closes before Login Success and cli
 **Revised draft, 2026-10-16. This replaces the unshipped three-lane `/3` draft in place; no old-draft compatibility is required. Implementation remains disabled by default. Security review is required before release or enablement.**
 
 This is spec only. The 33-byte three-lane record codec and the three-lane session it belonged to
-are gone: `core/multistream` implements 13.4's compact header over the N+2 stream map (13.3).
+are gone: `core/multistream` implements 13.4's compact header over the N+3 stream map (13.3).
 `core/routing` still uses schema 1 without position extraction, so the implementation must change
 before this revision can run.
 
@@ -1046,7 +1046,7 @@ before this revision can run.
 1. **Large packets first.** Chunk install, updates and forget share one of N position-sharded chunk streams (13.3, 13.8, 13.18). Scoped fences and chunk joins replace full fences on every CONTROL packet (13.5, 13.9, 13.19). Entity storage does not require chunk install before spawn.
 2. **Send priority.** Multiplayer-feel packets first, chunks second, other small packets third, with chunk progress guaranteed by dependency-aware sender scheduling (13.20), not by QUIC priority alone.
 3. **Streams versus CPU.** Routing remains reviewed data (13.7). Measure CPU per player as streams are added, rather than assuming more streams are free (see `docs/benchmarks.md`, "Planned Phase 5 measurements").
-4. **Chunk stream count.** Negotiated per connection (13.2), benchmarked from 1 to 6, with a draft hard cap of 6 justified by dedicated receive reservations (13.12/13.13). Compact headers are in 13.4. Cap/default confirmation is listed below.
+4. **Chunk stream count.** Negotiated per connection (13.2), benchmarked from 1 to 5, with a hard cap of 5 justified by dedicated receive reservations (13.12/13.13) and the client's six server-opened bidirectional stream allowance (at N=5 the five chunk shards plus the ACK stream, 13.3/13.13). Compact headers are in 13.4. Cap/default confirmation is listed below.
 5. **Server profiles (planned).** Built-in profiles keyed on the server's hardware: memory given to Java and CPU cores it may use. Each profile sets how many players may connect over `/3` and the maximum number of parallel streams. Every profile value is pushed to the highest the hardware sustains, measured with all of the profile's values running together (they share CPU and memory), taken from `docs/benchmarks.md` runs, not a cautious guess. Custom values are range-checked and checked against each other, and are applied all at once or not at all. Admins may create a custom profile with `/quicraft value set <VARIABLE> <int>` and restore with `/quicraft value restore default` or `/quicraft value restore <profile>`. The first time an admin changes a value, the command warns that changing these values is risky and asks them to proceed with caution. The hard stream cap in item 4 still applies to custom values.
 
 ### Negotiation and stream map
@@ -1076,29 +1076,42 @@ before this revision can run.
 2. **13.2 Preamble and shard negotiation.** Under `/3` only, stream 0 starts in each direction
    with `VarInt(length) || u8(version=2) || u8(token_length) || token || u8(min_shards) ||
    u8(max_shards)`. Token length is 0 or 16, length exactly 4 or 20. Retain §8's token
-   semantics; malformed version, length or range closes with `0x1`. The client offers
-   `1 <= min_shards <= max_shards <= 6`; the server replies with its selected `N` in both
+   semantics; malformed version, length or range closes with `0x1`. The offered and selected
+   shard count `N` is 1..5: a preamble whose range has a maximum above 5, a minimum below 1 or a
+   minimum above the maximum is a parser error (close `0x1`). The client offers
+   `1 <= min_shards <= max_shards <= 5`; the server replies with its selected `N` in both
    range fields, within that offer and its configured maximum. An empty intersection fails the
    connection (`0x10`), never clamps silently outside the offer. The draft client offer is
-   1..6; both the configured maximum and preference must be within 1..6.
+   1..5; both the configured maximum and preference must be within 1..5.
    Select N by clamping the configured preference to the intersection of the client's range
    and 1..configured_max; the draft preference is 3. Selection is immutable for the
    connection and echoed/authenticated in §12's exchange.
-   Hardware profiles are local policy, not wire fields; no administrator setting overrides 6.
+   Hardware profiles are local policy, not wire fields; no administrator setting overrides 5.
+   The server's configured maximum is capped at 5. An operator profile value of 6 (the earlier
+   cap) is read as 5; larger values stay invalid.
    Following bytes use ordinary Minecraft login/configuration framing until §12 cutover.
    This preamble does not alter `/2` or its version-1 parser. Never negotiate through a game
    plugin message on `/2`.
-3. **13.3 Stream identities.** There are exactly N+2 bidirectional streams: CONTROL on QUIC
+3. **13.3 Stream identities.** There are exactly N+3 bidirectional streams: CONTROL on QUIC
    id 0 and REALTIME on id 4, both client-opened; CHUNK[i] on id `1+4*i`, server-opened,
-   for `0 <= i < N`. Logical stream indices used in dependencies are CONTROL=0, REALTIME=1,
-   CHUNK[i]=2+i (not QUIC ids). Serverbound REALTIME (client-to-server on client-opened
-   QUIC id 4) carries reviewed, latency-sensitive, order-tolerant input after its preamble
-   and activation; all other serverbound packets use CONTROL. Reverse CHUNK[i] directions send
-   no preamble and no records: their one byte of guard credit exists only to detect a
-   violation. The server has a protected application receive slot for serverbound REALTIME (13.12); reverse CHUNK directions need none.
+   for `0 <= i < N`; and the ACK stream on id `1+4N`, server-opened. Logical stream indices
+   used in dependencies are CONTROL=0, REALTIME=1, CHUNK[i]=2+i (not QUIC ids), and ACK=N+2.
+   The server opens the ACK stream after the shards, so it is the last server-opened
+   bidirectional stream and the server opens N+1 streams; with N=5 that is six, and the
+   client's `initial_max_streams_bidi` for the server (6) is unchanged. Serverbound REALTIME
+   (client-to-server on client-opened QUIC id 4) carries reviewed, latency-sensitive,
+   order-tolerant input after its preamble and activation; all other serverbound packets use
+   CONTROL. Reverse CHUNK[i] and reverse ACK directions send no preamble and no records: their
+   one byte of guard credit exists only to detect a violation. The server has a protected
+   application receive slot for serverbound REALTIME (13.12); reverse CHUNK and ACK directions
+   need none.
    Auxiliary streams open only after the opener activates under §12; each used direction starts
-   `u8(version=2) || u8(logical_stream_index)`. CONTROL has no second preamble. No other
-   stream ids, replacements, unidirectional streams or datagrams are allowed.
+   `u8(version=2) || u8(logical_stream_index)`; the ACK stream starts with `u8(2) || u8(N+2)`.
+   CONTROL has no second preamble. The ACK index N+2 is never a CHUNK index, and every
+   per-stream structure (sequence arrays, receive slots, dependency validators, schedulers) is
+   sized N+3; loops over CHUNK shards stop at N+1. No other stream ids, replacements,
+   unidirectional streams or datagrams are allowed. A second stream with the ACK index, a
+   stream id beyond `1+4N`, or a preamble naming another index closes `0x11`.
 
    **Serverbound lane policy (owner decision, 2026-10-16).** REALTIME is limited to
    player movement/rotation/on-ground state, vehicle movement, player input state,
@@ -1137,7 +1150,7 @@ before this revision can run.
    `VarInt(record_length) || u8(kind) || VarInt(sequence) || VarInt(epoch) ||
    VarInt(dependency_count) || dependency_entries || body`. Each entry is
    `u8(logical_stream_index) || VarInt(required_sequence)`. Entries are strictly increasing
-   by index, positive sequences, at most N+1 entries, and never name the record's own stream.
+   by index, positive sequences, at most N+2 entries, and never name the record's own stream.
    Own-stream `sequence-1` is implicit. Omit zero components; do not encode duplicate indices.
    All new VarInts are minimal nonnegative signed-31-bit values (0..2147483647), at most
    five bytes; sequence starts at 1, increases exactly by one per stream/direction and never
@@ -1211,8 +1224,9 @@ before this revision can run.
 7. **13.7 Data resource.** Store routing as UTF-8 JSON, one resource per protocol number,
    with `schema:2`, `protocol:<number>`, `default:"global"`, `extractors`, and `routes`.
    Each route has `state`, `direction` (`clientbound`/`serverbound`), `packet_id`, `lane`
-   (`control`/`realtime`/`chunk`), `dependency` (`global`/`view`/`control`/`interaction`/`ordinary`/
-   `lane`/`ack_join`/`batch_join`), `position`, and `epoch_change` (boolean).
+   (`control`/`realtime`/`chunk`/`ack`), `dependency` (`global`/`view`/`control`/`interaction`/
+   `ordinary`/`lane`/`trailing`/`ack`/`ack_join`/`batch_join`), `position`, and `epoch_change`
+   (boolean).
    Position is `null` or the name of a reviewed per-version extractor. `extractors` maps
    names to versioned adapter decoder identifiers; these are a closed allowlist, not executable
    scripts or heuristic offsets. Identifiers come in two families: `primitive.*` names are
@@ -1242,9 +1256,15 @@ before this revision can run.
    2097208 bytes cannot carry more than 233023 entries (eight bytes of position plus at least
    one byte of length each), and a larger count is refused before anything is allocated for
    it. Multi-chunk packets use CONTROL/global, not single-shard guessing.
-   Require a single-position extractor for ordinary chunk routes, `join` for chunk joins,
-   null for other routes except globally routed multi-chunk packets. `lane` is REALTIME or
-   chunk only; global/view/control/interaction/ordinary are CONTROL only; joins are chunk only.
+   Require a single-position extractor for ordinary chunk routes and for chunk `ack` routes,
+   `join` for chunk joins, null for other routes except globally routed multi-chunk packets.
+   `lane` is REALTIME, chunk or ack only; `trailing` is ack-lane only; `ack` is chunk-only with
+   a single-position extractor; global/view/control/interaction/ordinary are CONTROL only;
+   joins are chunk only. Lane `ack` is legal only for clientbound PLAY packets 4
+   (`block_changed_ack`) and 11 (`chunk_batch_finished`), with dependency `trailing`, no
+   position extractor and `epoch_change:false`; dependency `trailing` is legal only on lane
+   `ack`; dependency `ack` is legal only on lane `chunk`. A table that uses these values has a
+   new digest; both peers must ship the same table (a mismatch falls back to TCP, as today).
    Resources also carry `serverboundLimits`, keyed by protocol state. Each entry specifies
    positive integer `maxServerboundRecord` (CONTROL record_length, excluding its prefix),
     positive integer `maxServerboundRealtimeRecord` (REALTIME record_length, excluding its
@@ -1267,7 +1287,8 @@ before this revision can run.
     decoded footprint <= 8 MiB, and REALTIME declared decoded size <= 1024 bytes. The fixed
     2 KiB REALTIME slice includes parsing and output copies only, not inflater state/scratch.
     A 510-byte REALTIME record_length plus its two-byte VarInt prefix fills the 512-byte wire
-    cap. At N=6 require `P + 16 KiB + 2*6 + 1 + 512 <= 24 KiB`, so P <= 7667 bytes and the
+    cap. At N=5 require `P + 16 KiB + 2*(N+1) + 1 + 512 <= 24 KiB` (the reverse guard
+    bytes are `2*(N+1)+1` = 13), so P <= 7667 bytes and the
     CONTROL ordinary allowance <= 5619 bytes. Missing/unreviewed limits or a CONTROL ordinary
     footprint that cannot fit its allowance disable `/3`.
     Reject a CONTROL play record exceeding its state's `maxServerboundRecord`, or a REALTIME
@@ -1282,8 +1303,9 @@ before this revision can run.
    `epoch_change:true` is clientbound CONTROL/global only and matches reviewed level replacement packets.
    Non-play routes are CONTROL/global. Allowed (direction, lane, dependency) tuples are:
    (clientbound, control, global/view/control/ordinary), (clientbound, realtime, lane),
-   (clientbound, chunk, lane/ack_join/batch_join), (serverbound, control,
-   global/view/control/interaction/ordinary), and (serverbound, realtime, lane). A serverbound
+   (clientbound, chunk, lane/ack/ack_join/batch_join), (clientbound, ack, trailing),
+   (serverbound, control, global/view/control/interaction/ordinary), and (serverbound,
+   realtime, lane). A serverbound
     REALTIME `lane` entry is max(G,C), latest global/control fence; its referenced CONTROL
     route must be global, view or control fence. `interaction` is serverbound CONTROL-only:
     ordinary plus latest preceding REALTIME, not a fence; its referenced route must be a
@@ -1335,18 +1357,22 @@ before this revision can run.
     vectors, shipped-table coverage and ordering tests pass; the ordering argument and
     remaining deferrals are below.
     Shipped routing, ordering argument (26.1.2). **DRAFT pending security review.** `level_chunk_with_light`
-    (45) uses CHUNK with `mc775.chunk_xz.v1`. `block_update` (8) and `block_entity_data` (6) use CHUNK
-    with `mc775.block_position.v1`, `section_blocks_update` (84) uses CHUNK with
-    `mc775.section_position.v1`, and `forget_level_chunk` (37) uses CHUNK with
-    `mc775.chunk_pos_long.v1`. They hash the same chunk column as `level_chunk_with_light`, so one
-    chunk's install, updates, block-entity data and forget keep game order in one lane. `block_changed_ack` (4)
-    and `chunk_batch_finished` (11) stay CONTROL/global. A global record depends on the assigned maximum
-    of every stream, and every later record depends on it through G. Each ack therefore executes after
-    every update the game emitted before it and before every update emitted after it. This is the game's
-    emission order, i.e. TCP parity. It includes the rare case where the game emits an ack before an
+    (45) uses CHUNK with `mc775.chunk_xz.v1` and the 13.21 `ack` dependency; `block_update` (8) uses CHUNK
+    with `mc775.block_position.v1` and `lane`; `block_entity_data` (6) uses CHUNK with
+    `mc775.block_position.v1` and `ack`; `section_blocks_update` (84) uses CHUNK with
+    `mc775.section_position.v1` and `lane`; and `forget_level_chunk` (37) uses CHUNK with
+    `mc775.chunk_pos_long.v1` and `ack`. They hash the same chunk column as `level_chunk_with_light`, so one
+    chunk's install, updates, block-entity data and forget keep game order in one lane.
+    `block_changed_ack` (4) and `chunk_batch_finished` (11) use the ACK stream (13.21) with `trailing`: a
+    trailing record depends on the assigned maximum of every stream, ACK included, and advances no frontier.
+    Each ack therefore executes after every update the game emitted before it, while later block-state updates
+    (8, 84) may overtake it: while a prediction is open the client only refreshes its stored server state, and
+    the ack then writes the newest stored state, the same final state as TCP. That is the game's emission order
+    on the dangerous side, i.e. TCP parity. It includes the rare case where the game emits an ack before an
     update it covers (26.1.2: tasks run inside a tick by `reloadResources`); vanilla TCP shows the same
-    transient there. ACK_JOIN/BATCH_JOIN (13.19) are an unshipped latency optimisation, not a safety
-    requirement. `block_event` (7) is CONTROL/global, because the client applies it to its current block
+    transient there. Block-entity data (6), forget (37) and a replacing install (45) must not overtake a
+    pending ack, so they carry `ack` (13.9, 13.21). ACK_JOIN/BATCH_JOIN (13.19) remain unshipped; the ACK
+    stream replaces them. `block_event` (7) is CONTROL/global, because the client applies it to its current block
     state and a piston event run against a reordered state can leave a permanent ghost block.
     Clientbound CONTROL dependencies are narrowed (13.5): the 93 ordinary CONTROL ids are 3, 9,
     10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29, 30, 31, 33, 34, 38, 39, 40,
@@ -1364,8 +1390,9 @@ before this revision can run.
     fence for later REALTIME; ordinary CONTROL records do not fence later REALTIME.
     `ShippedRoutingTableTest` pins this reviewed relaxation.
 
-   Deferrals, all CONTROL/global, with the reason for each:
-   - The reviewed `mc775.join.v1` layout stays unbound until ACK_JOIN is shipped as an optimisation.
+   Deferrals, with the reason for each:
+   - The reviewed `mc775.join.v1` layout stays unbound: packets 4 and 11 use the ACK stream with
+     `trailing` (13.21), so no join route ships. ACK_JOIN/BATCH_JOIN remain unshipped options (13.19).
    - `login` (49) and `respawn` (82): `epoch_change` is `false`. RELEASE BLOCKER: 13.18 requires
      level replacement to advance the epoch and clear epoch-keyed frontiers, and `epoch_change:false`
      breaks that invariant. The send path fails closed on epoch routes until `submitEpochTransition`
@@ -1392,11 +1419,11 @@ before this revision can run.
    | Identifier | Packet(s) | Route in the shipped table | Capture and vector |
    | --- | --- | --- | --- |
    | `mc775.chunk_list.v1` | `chunks_biomes` (13) | CONTROL/global, list extractor | `captured-775-vectors.txt` |
-   | `mc775.chunk_xz.v1` | `level_chunk_with_light` (45) | CHUNK/lane install | `captured-775-vectors.txt` |
-   | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | CHUNK/lane block and block-entity update (13.7) | `captured-775-vectors.txt` |
+   | `mc775.chunk_xz.v1` | `level_chunk_with_light` (45) | CHUNK install with `ack` (13.9, 13.21) | `captured-775-vectors.txt` |
+   | `mc775.block_position.v1` | `block_update` (8), `block_entity_data` (6) | CHUNK/lane block update (8); CHUNK/`ack` block-entity update (6) | `captured-775-vectors.txt` |
    | `mc775.section_position.v1` | `section_blocks_update` (84) | CHUNK/lane section update (13.7) | `captured-775-vectors.txt` |
-   | `mc775.chunk_pos_long.v1` | `forget_level_chunk` (37) | CHUNK/lane forget (13.8) | `ForgetLevelChunkGameCodecTest`: the game's own play-packet encoder |
-   | `mc775.join.v1` | `block_changed_ack` (4), `chunk_batch_finished` (11) | none: joins deferred | `captured-775-vectors.txt` |
+   | `mc775.chunk_pos_long.v1` | `forget_level_chunk` (37) | CHUNK forget with `ack` (13.9, 13.21) | `ForgetLevelChunkGameCodecTest`: the game's own play-packet encoder |
+   | `mc775.join.v1` | `block_changed_ack` (4), `chunk_batch_finished` (11) | none: the ACK stream (13.21) replaces joins | `captured-775-vectors.txt` |
    | `mc775.raw_copies.v1` | footprint accounting for every state's serverbound limits | `decodeFootprintBound` | 13.12 boundary vectors in `ExtractorGoldenTest` |
 
    The captured-pair rule of 13.7 applies to packet layouts. `mc775.raw_copies.v1` is the
@@ -1435,12 +1462,12 @@ before this revision can run.
 
    | Identifier | Layout after the packet id | Real 775 packet(s) | Route(s) that may use it | Captured |
    | --- | --- | --- | --- | --- |
-   | `mc775.chunk_xz.v1` | big-endian int32 chunk x, int32 chunk z | `level_chunk_with_light` | CHUNK/lane install (13.8) | `level_chunk_with_light` |
-   | `mc775.block_position.v1` | packed BlockPos long: x in bits 38..63, z in 12..37, y in 0..11 (unread); chunk = `x/16`, `z/16` floor | `block_update`, `block_entity_data` | CHUNK/lane block and block-entity update (13.8) | `block_update`, `block_entity_data` |
+   | `mc775.chunk_xz.v1` | big-endian int32 chunk x, int32 chunk z | `level_chunk_with_light` | CHUNK install with conditional `ack` (13.9, 13.21) | `level_chunk_with_light` |
+   | `mc775.block_position.v1` | packed BlockPos long: x in bits 38..63, z in 12..37, y in 0..11 (unread); chunk = `x/16`, `z/16` floor | `block_update`, `block_entity_data` | CHUNK/lane block update (8); CHUNK/`ack` block-entity update (6) | `block_update`, `block_entity_data` |
    | `mc775.section_position.v1` | packed SectionPos long: x in bits 42..63, z in 20..41, y in 0..19 (unread); already chunk coordinates | `section_blocks_update` | CHUNK/lane section update (13.8) | `section_blocks_update` |
-   | `mc775.chunk_pos_long.v1` | one big-endian packed ChunkPos long: x low 32 bits, z high 32 (`ChunkPos.pack`, `FriendlyByteBuf.writeChunkPos`) | `forget_level_chunk` | CHUNK/lane forget (13.8) | `ForgetLevelChunkGameCodecTest` (game encoder) |
+   | `mc775.chunk_pos_long.v1` | one big-endian packed ChunkPos long: x low 32 bits, z high 32 (`ChunkPos.pack`, `FriendlyByteBuf.writeChunkPos`) | `forget_level_chunk` | CHUNK forget with `ack` (13.9, 13.21) | `ForgetLevelChunkGameCodecTest` (game encoder) |
    | `mc775.chunk_list.v1` | VarInt count, then per entry a packed ChunkPos long (x low 32 bits, z high 32), a VarInt payload length and that many payload bytes | `chunks_biomes` | CONTROL/global only (13.8) | `chunks_biomes` |
-   | `mc775.join.v1` | the packet id alone; the body is never read | `chunk_batch_finished`, `block_changed_ack` | chunk join (13.19) | `chunk_batch_finished`, `block_changed_ack` |
+   | `mc775.join.v1` | the packet id alone; the body is never read | `chunk_batch_finished`, `block_changed_ack` | none: the ACK stream (13.21) replaces joins | `chunk_batch_finished`, `block_changed_ack` |
 
    One 13.8 CHUNK-set packet has no reviewed layout here, so at `/3` it stays CONTROL/global
    and is deliberately not shard-routable until a follow-up unit captures and reviews a layout
@@ -1453,10 +1480,11 @@ before this revision can run.
      packet observed with leading VarInt x/z, but it is a view packet, not a CHUNK-lane one, so
      it does not justify a production identifier for that layout.
    `block_update` (8) and `block_entity_data` (6) (CHUNK with `mc775.block_position.v1`), and
-   `section_blocks_update` (84) (CHUNK with `mc775.section_position.v1`) ship in this release.
-   `block_changed_ack` (4) and `chunk_batch_finished` (11) stay CONTROL/global; no ACK_JOIN/BATCH_JOIN
-   is needed because the global fence gives TCP order. Joins (4/11) and `light_update` (48) remain
-   unchanged; the latter lacks a reviewed production layout.
+   `section_blocks_update` (84) (CHUNK with `mc775.section_position.v1`) ship in this release;
+   6 carries the `ack` dependency and 8 does not (13.9). `block_changed_ack` (4) and
+   `chunk_batch_finished` (11) ship on the ACK stream with `trailing` (13.21); no ACK_JOIN or
+   BATCH_JOIN route ships. `light_update` (48) remains unchanged and lacks a reviewed
+   production layout.
 
    Regenerate the checked-in vectors with (runs the whole client gametest suite, protocol 775):
 
@@ -1489,24 +1517,44 @@ before this revision can run.
 
 ### Sequence barriers, bounds and delivery
 
-9. **13.9 Dependency construction.** Maintain A[0..N+1] (last assigned), latest global G,
-   view V and control fence C (CONTROL sequences), independently per sending direction.
-   At one logical game-send ordering point, before parallel encoding/scheduling, start with
-   the implicit own predecessor and the latest G. Add the following component maxima:
-   - Global: all of previous A; then set G to this record.
+9. **13.9 Dependency construction.** Maintain A[0..N+2] (last assigned), latest global G,
+   view V and control fence C (CONTROL sequences), independently per sending direction, and
+   `lastAck`, the sequence of the latest record assigned on the ACK stream, or 0. At one
+   logical game-send ordering point, before parallel encoding/scheduling, start with the
+   implicit own predecessor and the latest G. Add the following component maxima:
+   - Global: all of previous A; then set G to this record. The ACK stream is one of them, so
+     login, respawn, configuration changes and chunk_batch_start wait for earlier ACKs.
    - View: all previous A; then set V and C to this record. For chunk_batch_start also
      include the previous BATCH_JOIN frontier as an explicit semantic dependency (13.19).
    - Control fence: previous A[CONTROL,REALTIME]; then set C to this record.
    - Ordinary CONTROL: nothing further (the shipped clientbound set is in 13.7; an unlisted
-     CONTROL route stays global).
+     CONTROL route stays global). Ordinary CONTROL, REALTIME and plain `lane` records have no
+     dependency on the ACK stream.
     - Serverbound interaction CONTROL (`interaction`): latest serverbound REALTIME A[1],
       in addition to G and implicit own predecessor; ordinary CONTROL omits this edge.
     - REALTIME: latest C; serverbound REALTIME explicitly encodes max(G,C), the latest global
       or control fence.
    - Ordinary chunk: latest V only. It never waits for unrelated CONTROL or REALTIME.
-   - Chunk join: latest V and the semantic frontier in 13.19.
+   - Chunk `ack` (6, 37 and a replacing 45; 13.21): the ordinary chunk dependencies plus
+     `lastAck` on the ACK stream when non-zero.
+   - ACK `trailing` (4, 11; 13.21): the componentwise maximum of everything assigned on every
+     stream, the global footprint with the ACK stream included. The record advances no
+     frontier: not G, not C, not V. It sets `lastAck`.
+   - Chunk join: latest V and the semantic frontier in 13.19 (unshipped).
+   First-install exemption for `ack`: for packet 45 (level_chunk_with_light) the sender keeps
+   per session the set of HELD chunk positions (add on a 45, remove on a 37; both carry the
+   position) and a ring of the last 256 forgotten positions. A 45 omits the `ack` dependency
+   only when its position is neither held nor in the ring: a first install cannot meet a pending
+   block prediction (the client cannot predict in an unloaded chunk), while a replacement or a
+   re-install after a forget can, because a forget does not clear the client's prediction map.
+   Packets 6 (block_entity_data) and 37 (forget_level_chunk) always carry `ack`. Held-set cap
+   4096: above the cap the sender stops tracking and every 45 carries `ack` until the next epoch
+   change. A 45 or 37 sent inside a bundle is not tracked; from then on every 45 carries `ack`
+   until the next epoch change. Every epoch change (a route with `epoch_change:true`) clears
+   both the held set and the ring, since the client drops all chunks there. A sender that cannot
+   tell uses `ack`.
    Encode only nonzero cross-stream maxima; own predecessor remains implicit. All edges
-   MUST point to previously assigned records, including joins and bundle units. Never queue
+   MUST point to previously assigned records, including joins, ACK records and bundle units. Never queue
    a join behind a record that depends on it on its own stream. No post-scheduling discovery
    of new predecessors is allowed. G/V/C start at zero. Required dependencies may be
    transitively satisfied by larger same-stream frontiers, but may not be omitted unsafely.
@@ -1526,8 +1574,9 @@ before this revision can run.
      references, treating implicit own-stream predecessors as known edges; detect any provable
      cycle immediately and close `0x11`, then enforce the blocked-head deadline for acyclic waits.
     Validate the decoded packet's required fence/route before execution; a header cannot
-    downgrade an unknown id from global. No speculative game execution or blocked-body
-    decompression. Commit dependency watermarks D only after actual serial handler application
+    downgrade an unknown id from global. The ACK stream is one more lane for D, Q, cycle and
+    blocked-head accounting; 13.21 adds its body-kind, packet-id and size caps. No speculative
+    game execution or blocked-body decompression. Commit dependency watermarks D only after actual serial handler application
     completes. Separately track FIFO-enqueued watermark Q for timeout accounting only:
     successful enqueue of a validated eligible unit commits it for the application timer,
     but Q MUST NOT release dependencies, reuse receive/workspace capacity or change epochs.
@@ -1568,20 +1617,24 @@ before this revision can run.
     records wait for respawn execution. Independently withhold every predecessor in tests.
 12. **13.12 Direction-specific memory, reservations and progress.**
     **Clientbound (client receives):** give every active stream a non-borrowable
-    receive slot of B = 2 MiB + 128 bytes and 128 record slots. Admit at most one head
-    scheduling unit (one record or one complete bundle) per stream into application buffering;
-    stop reading that stream until its unit commits. A bundle's total wire size, headers
-    included, must fit B. Parser prefixes, partial records, pre-activation bytes and staged
-    bundle bytes all occupy that stream's slot; no stream can consume another's reserve.
-    At N=6 the six chunks need 12 MiB + 768 bytes; CONTROL and REALTIME reserve another
-    4 MiB + 256 bytes. Thus the old 16 MiB wire target needs 1 KiB explicit framing headroom:
-    aggregate wire ceiling `(N+2)*B <= 16 MiB + 1 KiB`, not a misleading exact 16 MiB claim.
-    A seventh chunk would require at least 18 MiB with the same progress reserves: hard cap 6.
-    At most `128*(N+2) <= 1024` records, including delimiters and partials, are retained.
+    receive slot and 128 record slots; each CHUNK shard, CONTROL and REALTIME get
+    B = 2 MiB + 128 bytes, and the ACK stream gets a protected slot of
+    max(64, prefix staging) = 79 bytes and one record, outside the shard pool and counted
+    in the connection's receive reservation. Admit at most one head scheduling unit (one
+    record or one complete bundle) per stream into application buffering; stop reading that
+    stream until its unit commits. A bundle's total wire size, headers included, must fit B.
+    The ACK stream carries only single records capped at 64 wire bytes (13.21). Parser
+    prefixes, partial records, pre-activation bytes and staged bundle bytes all occupy that
+    stream's slot; no stream can consume another's reserve. At N=5 the five chunks need
+    10 MiB + 640 bytes; CONTROL and REALTIME reserve another 4 MiB + 256 bytes, and the ACK
+    slot 79 bytes, so the stream slots total 14 MiB + 975 bytes, within the 16 MiB + 1 KiB
+    wire target. A sixth chunk shard would add another 2 MiB + 128 bytes and break that
+    target: hard cap 5. At most `128*(N+3) <= 1024` records, including delimiters and
+    partials, are retained.
     Separately reserve one connection-wide 8 MiB execution workspace for decompression and
     retained decoded packet/bundle data (or stricter game limits). Only one unit decodes/
     applies at a time; all copies and decoder scratch must fit this workspace or fail closed.
-    Worst application-held data is therefore 24 MiB + 1 KiB, not 16 MiB; allocations are lazy.
+    Worst application-held data is therefore 22 MiB + 975 bytes, not 16 MiB; allocations are lazy.
     Do not decompress other heads while the execution workspace is occupied.
     A bundle opener (kind 4, 13.4) is admitted as a whole unit from its own declaration: its
     unit_wire_bytes and unit_records are charged to the CONTROL slot at the opener, and the
@@ -1609,7 +1662,7 @@ before this revision can run.
     state/window is about 40 KiB, separately charged as connection memory outside the 24 KiB
     receive share. Vanilla already pays this cost per compressed connection. These two
      reservations total about 64 KiB per logged-in compressed connection. The staged
-     pre-login reservation must cover native stream exposure (at most `2*8 KiB + N`, which the
+     pre-login reservation must cover native stream exposure (at most `2*8 KiB + (N+1)`, which the
      stream windows bound below the 24 KiB connection credit; 12.13), read buffers, and measured
      QUIC/TLS state, crypto and 0-RTT buffering; its cost is unknown until measured. Benchmark 50,000 staged
      connections on top of 50,000 logged-in players, including churn. At 50,000 logged-in compressed connections the
@@ -1628,8 +1681,8 @@ before this revision can run.
       `/3` is offered. A REALTIME record with record_length > 510 (complete wire size above
       512 bytes including its two-byte prefix) is
      peer misconduct and closes `0x11`, like other inbound self-cap violations. Neither another connection nor this connection's
-    outbound queue may borrow it. Native exposure is bounded by 16 KiB + N guard bytes,
-    plus at most N+1 one-byte guard-read copies: hence `16 KiB + 2*N + 1 + P + 512 <= 24 KiB`.
+    outbound queue may borrow it. Native exposure is bounded by 16 KiB + (N+1) guard bytes,
+    plus at most N+2 one-byte guard-read copies: hence `16 KiB + 2*(N+1) + 1 + P + 512 <= 24 KiB`.
      This partition requires the asymmetric auxiliary credit in 13.13; simply reserving
     24 KiB of native credit AND calling that same memory a protected read allowance is invalid.
     Read calls grant at most `min(16 KiB, remaining charged capacity, remaining unit bytes)`;
@@ -1975,18 +2028,19 @@ before this revision can run.
 13. **13.13 Transport limits.** Listener parameters are fixed before N is known. The server
     allows two client-opened bidi streams, the client six server-opened bidi streams; both
     uni limits are zero. Never increase MAX_STREAMS. Application validation rejects any
-    server stream index >= N even though transport permits six. The client initially
+    server-opened stream above index N (the ACK stream) even though transport permits six;
+    at N=5 the six are exactly the five chunk shards and the ACK stream. The client initially
     advertises 256 KiB per bidi stream and 2 MiB connection credit; the server advertises
     24 KiB connection credit from the first packet (staging, 12.13, changes accounting only), preserving the existing per-connection credit and admission
     share. Server stream credit is asymmetric: 8 KiB on client-opened bidi directions
     (CONTROL and REALTIME), but only one byte on server-opened bidi directions (reverse
-    CHUNK streams, which carry no valid bytes). Pin server stream maximum windows at
+    CHUNK and ACK streams, which carry no valid bytes). Pin server stream maximum windows at
     8 KiB and its connection maximum at 24 KiB; client maxima equal its initial windows.
-    No reverse-CHUNK guard read may replenish credit: its first byte closes the connection
-    on the event loop before any further credit/send work. Thus the reverse chunk windows
+    No reverse guard read may replenish credit: its first byte closes the connection
+    on the event loop before any further credit/send work. Thus the reverse CHUNK and ACK windows
     never grow beyond one byte on a live connection; the valid serverbound native exposure
-    is at most `2*8 KiB + N`, leaving P, the 512-byte REALTIME record slot and guard-read capacity inside the 24 KiB share.
-    This is a least-privilege change to UNUSED chunk directions, not a reduction of CONTROL's
+    is at most `2*8 KiB + (N+1)`, leaving P, the 512-byte REALTIME record slot and guard-read capacity inside the 24 KiB share.
+    This is a least-privilege change to UNUSED chunk and ACK directions, not a reduction of CONTROL's
     8 KiB or the server's 24 KiB connection credit. Test initial and rolling exposure,
     including invalid bytes coalesced on all guards, before enablement. As the application
     reads into client-reserved or server-node-charged buffering, rolling flow control can
@@ -1997,7 +2051,7 @@ before this revision can run.
     24 KiB share as derived above; neither is an additional admission charge.
     Client: count one at-most-16-KiB unparsed read chunk per stream separately, at most
     128 KiB more. Server: at most one 16 KiB CONTROL read suffix charged under E, one 512-byte
-     REALTIME slot, and N+1 one-byte CHUNK guard reads inside the protected share; in-share CONTROL grants
+     REALTIME slot, and N+2 one-byte reverse guard reads (N+1 CHUNK and the ACK stream) inside the protected share; in-share CONTROL grants
      shrink to the pre-reserved footprint within remaining P rather than requiring an
      excess-pool allocation. Before classification, read only bounded prefixes as in 13.12. Include
     suffixes beyond a unit boundary. Native transport and read charges may overlap conservatively,
@@ -2009,8 +2063,8 @@ before this revision can run.
     one byte at a time from reserved capacity, validating and releasing each byte before
     the next read. After activation, receive serverbound REALTIME records within its
     512-byte protected slot (including framing); oversized records close `0x11` before
-    body allocation. Keep a one-byte pending guard read on every reverse CHUNK direction
-    (no CHUNK preamble), charge before read, and close `0x11` on any CHUNK byte. Keep the respective exposure reserved
+    body allocation. Keep a one-byte pending guard read on every reverse CHUNK and ACK direction
+    (no preamble), charge before read, and close `0x11` on any byte. Keep the respective exposure reserved
     until connection close; unused streams do not multiply the server's 24 KiB aggregate.
     Maximum-window pins are provided by the project's existing, tested Netty patch
     `natives/patches/netty/0005-max-flow-control-windows.patch` (netty/0005), which sets them per
@@ -2041,9 +2095,10 @@ before this revision can run.
     game sends. A spawn/entity-data bundle is a control fence, not a chunk/global fence.
     Use the strongest member scope (global > view > control > ordinary), with at least
     control scope for any bundle. If any member requires global scope, is unknown or is a
-    chunk packet, promote the whole bundle to global; bundle context is the only exception
-    to individual chunk routing. It MUST NOT mix state, epoch, activation or compression
-    changes into a bundle.
+    chunk or ACK-stream packet, promote the whole bundle to global; bundle context is the only
+    exception to individual chunk or ACK routing. A bundle is never split across lanes, and
+    the ACK stream carries only single records. It MUST NOT mix state, epoch, activation or
+    compression changes into a bundle.
     Buffer completely before assigning sequences; validate total encoded size <= B, at most
     126 members plus delimiters (128 records), and total decoded/scratch storage <= 8 MiB
     or stricter game limits. These tighter limits replace the old draft's 1022-member bound;
@@ -2057,7 +2112,8 @@ before this revision can run.
     Scope mapping for the strongest-member rule: GLOBAL and FENCE map to global, VIEW to view, INTERACTION to
     interaction, CONTROL to control and ORDINARY to ordinary. Global beats all; global beats interaction and
     control; view beats control; view and interaction are incomparable, so a bundle holding both is global. The floor
-    is control. LANE and any unknown dependency promote to global, and a CHUNK member does too. ACK_JOIN and
+    is control. LANE and any unknown dependency promote to global, and a CHUNK or ACK member does too
+    (a bundle holding 4 or 11 goes whole to CONTROL/global). ACK_JOIN and
     BATCH_JOIN members, epoch changes and state changes inside a bundle close `0x11`.
     The clientbound opener is kind 4 (13.4), so the receiver knows the bundle's record count and
     total wire size from the opener itself, before any member arrives; that declaration is what
@@ -2175,8 +2231,10 @@ before this revision can run.
     Sender advances its assignment epoch immediately after assigning that fence; subsequent
     records carry the new epoch and depend on it. Start-configuration alone does not create
     a level or increment epoch. Sequences remain connection-scoped, never restart at epoch
-    boundaries; positions, installed-chunk tracking and batch/update frontiers are keyed by
-    epoch and cleared at level replacement. No old-epoch record can execute after that fence.
+    boundaries; positions, installed-chunk tracking, batch/update frontiers and the 13.9
+    first-install held set and 256-entry forget ring are keyed by epoch and cleared at level
+    replacement. No old-epoch record can execute after that fence. Epoch drain counts a record
+    as applied (D), not queued (Q), on every stream, the ACK stream included (13.10).
     New-epoch envelopes may arrive early, but remain opaque until their transition dependency
     executes; reject stale epochs or a future epoch without the corresponding transition
     once prerequisites are available. Epoch exhaustion closes with `0x11`, never wraps.
@@ -2194,23 +2252,25 @@ before this revision can run.
     int or a runtime-selected hash. It need not be cryptographic. No coordinate bytes are
     duplicated in the header: extract them from the eligible packet and validate its stream
     before executing it. Invalid coordinates/extraction, wrong shard and invalid epoch are
-    `0x11`. Supply cross-language golden vectors for all N=1..6, negative/extreme coordinates
+    `0x11`. Supply cross-language golden vectors for all N=1..5, negative/extreme coordinates
     and successive epochs before implementation is accepted. The owner approved this hash
     (answered question 2); it is not an implementation choice.
 
-19. **13.19 Join records. DRAFT pending security review.** No ACK_JOIN or BATCH_JOIN is needed:
-    the global fence gives TCP order. `MinecraftServer.tickChildren` broadcasts block updates
+19. **13.19 Join records. DRAFT pending security review. Not shipped; superseded by 13.21.**
+    The ACK_JOIN and BATCH_JOIN optimisation below stays defined until a later unit deletes it,
+    but no join route ships: packets 4 and 11 use the ACK stream with `trailing` (13.21), whose
+    records wait for the global footprint and therefore also cannot overtake an earlier covered
+    update. `MinecraftServer.tickChildren` broadcasts block updates
     (through `ServerChunkCache.tick` -> `chunkHolder.broadcastChanges`) before `tickConnection()`
     (`MinecraftServer` line 1081+, 26.1.2 source) sends `ClientboundBlockChangedAckPacket`
     (`ServerGamePacketListenerImpl.tick`, lines 291-293). So in vanilla's stream covered updates
-    precede their ACK; the global fence equals TCP order exactly, so the ACK stays
-    CONTROL/global with no coverage metadata required. `chunk_batch_finished` (11) also stays
-    CONTROL/global for the same reason. Joins live on CHUNK[0] only when a verified adapter
+    precede their ACK; the global footprint equals TCP order exactly, with no coverage metadata
+    required. Joins live on CHUNK[0] only when a verified adapter
     implements exact causal coverage; they have explicit dependencies on covered frontiers,
     not estimates based on packet size or sequence. Their own-stream predecessor is implicit.
     They never become CONTROL/view/global frontiers merely because they are joins; unrelated
     CONTROL and REALTIME continue.
-    An adapter MAY instead route block_changed_ack and chunk_batch_finished as CONTROL/global. That reproduces game emission order against every stream without coverage tracking, and makes every ack wait behind every earlier shard record (head-of-line blocking). The guarantees below, including ordering covered updates before an ack the game emitted first, apply only when ACK_JOIN is used.
+    The unshipped CONTROL/global alternative would reproduce game emission order against every stream without coverage tracking, at the cost of making every ack wait behind every earlier shard record (head-of-line blocking); 13.21 reaches the same global footprint on the ACK stream. The guarantees below, including ordering covered updates before an ack the game emitted first, apply only when ACK_JOIN is used.
     - **ACK_JOIN (block_changed_ack):** the adapter tracks the causal set of authoritative
       block/section/block-entity updates covered by the game prediction sequence. At the ack's
       logical send point, take the maximum sequence of every covered update on each chunk
@@ -2291,7 +2351,8 @@ before this revision can run.
     REALTIME bursts, guarantee chunk streams a positive minimum byte share whenever runnable,
     round-robin among chunk shards, and age other traffic so it also progresses. Promote
     unsent prerequisites of urgent records, including view/global fences and chunk heads
-    needed by a join, instead of filling QUIC with dependents whose prerequisite is unsent.
+    needed by an `ack`-dependent record, instead of filling QUIC with dependents whose
+    prerequisite is unsent.
     This policy MUST NOT alter stream order, dependency construction, bundle atomicity or
     the progress reservations. Backpressure at stream/connection writability must stop
     unbounded enqueueing into QUIC; cap write quanta at 64 KiB and account for queued bytes.
@@ -2304,12 +2365,21 @@ before this revision can run.
     starvation guarantee may rely on QUIC priority, and it cannot undo already queued bytes.
     Weight/burst/default tuning is benchmark policy, not negotiated wire data.
 
-    Extend 13.17's acceptance gate with all N=1..6 and offer/range/selected-N transcript
+    The ACK stream is scheduled in the CONTROL class: it takes turns with stream 0 when both
+    are ready, ages like a CONTROL head, is never subject to the chunk skip counters or the
+    REALTIME burst limit, and is never on REALTIME. Its records are a few bytes, so they never
+    wait behind chunk grant waits; they wait only for the records they depend on being written.
+
+    Extend 13.17's acceptance gate with all N=1..5 and offer/range/selected-N transcript
     tampering; compact-header boundaries/duplicates/excess deps/sequence exhaustion;
     hash/epoch vectors and late old-dimension data; withheld view gates and chunk installs;
     missing block/light/forget ordering; chunk-independent spawn/remove; unknown ids promoted
-    to global at both ends; multi-chunk biomes; covered updates across all shards before ack;
-    batch installs before finished/rate feedback; join-cycle rejection; bundle promotion;
+    to global at both ends; multi-chunk biomes; ACK-stream records after every earlier record
+    on every stream and before later global/view records, the 45 first-install held-set and
+    256-entry forget-ring exemption, ACK 64-byte wire/inflated caps, ids other than 4/11 and
+    bundles on the ACK stream closing `0x11`, and ACK/stream-0 alternation under the chunk skip
+    counters; batch installs before finished/rate feedback for the unshipped BATCH_JOIN;
+    join-cycle rejection; bundle promotion;
     all slots simultaneously full with each missing prerequisite withheld independently;
     serial handler delayed after receipt; native-window pins and node admission pressure;
     serverbound dual-lane routing/dependencies, 512-byte REALTIME wire/1024-byte decoded caps, 2 KiB fixed REALTIME slices, 24 KiB idle server receive shares, non-fatal node-budget
@@ -2323,7 +2393,7 @@ before this revision can run.
     with non-reading clients: protected REALTIME keepalives must still read/decode, only excess/queued
     consumers are pressure victims, and inbound/outbound caps cannot borrow across pools.
     Assert reviewed length rejection at the prefix, per-call precharging/adaptive grants,
-    guard-byte close without credit growth, and all share/footprint inequalities at N=1..6.
+    guard-byte close without credit growth, and all share/footprint inequalities at N=1..5.
     Stall each game's executor for >10 seconds, including after FIFO enqueue and while a
     dependent head waits: Q may advance, D/epochs may not, timers exclude the stall, no
      connection closes solely for the executor stall, and ordered application resumes.
@@ -2435,6 +2505,52 @@ before this revision can run.
     exposure, CPU per player, priority fairness, join latency and chunk-load throughput,
     comparing TCP and single-stream under every netem profile. No measurements are claimed.
 
+21. **13.21 The ACK stream. DRAFT pending security review.** The ACK stream is logical stream
+    index N+2 and QUIC id 1+4N, server-opened after the chunk shards with the auxiliary
+    preamble `u8(2) || u8(N+2)` (13.3). It carries only single GAME records for lane `ack`:
+    clientbound PLAY packets 4 (`block_changed_ack`) and 11 (`chunk_batch_finished`), routed
+    with dependency `trailing`, no position extractor and `epoch_change:false` (13.7). It
+    replaces the unshipped ACK_JOIN/BATCH_JOIN optimisation (13.19). The reverse direction
+    carries the same one-byte guard credit as reverse CHUNK; any byte closes `0x11` (13.12,
+    13.13).
+    - Sender dependencies: `trailing` is the componentwise maximum of everything assigned on
+      every stream, the global footprint with the ACK stream included. It advances no frontier
+      (not G, not C, not V) and sets `lastAck`. Chunk records routed `ack` (6, 37 and a
+      replacing 45) take their usual chunk dependencies plus `lastAck` when non-zero (13.9).
+      Global and view records take the maximum over every stream, so login, respawn,
+      configuration changes and chunk_batch_start wait for earlier ACKs.
+    - Why: an ACK before an earlier block update would write stale state, so `trailing`
+      forbids exactly that. Block updates after an ACK may overtake it: the client only
+      refreshes its stored server state while a prediction is open, and the ACK then writes
+      the newest stored state, the same final state as TCP. Data that must not overtake a
+      pending ACK (6, 37, a replacing 45) carries the `ack` dependency.
+    - First install: a 45 omits `ack` only when its position is neither held nor in the last
+      256 forgotten positions. Held positions are added on a 45 and removed on a 37, cap 4096;
+      above the cap tracking stops and every 45 carries `ack` until the next epoch change. A
+      45 or 37 sent inside a bundle is not tracked, and from then on every 45 carries `ack`
+      until the next epoch change. Every epoch change clears the held set and the ring (13.9,
+      13.18). A sender that cannot tell uses `ack`.
+    - Bundles: a bundle containing 4 or 11 is promoted whole to CONTROL/global, like a CHUNK
+      member; the ACK stream carries only single records (13.15).
+    - Receiver: a record must be kind GAME, a single record (no bundle, END or join), and match
+      an `ack` route (ids 4 and 11 only). Any other id or kind, a route of another lane, or an
+      `ack` route on another stream closes `0x11`. The record is capped at 64 bytes on the wire,
+      length prefix included, and 64 bytes inflated; above either cap closes `0x11`, before a
+      body is read where the length is known. A self-dependency or any byte beyond the reverse
+      guard closes `0x11`. An unseen cross-stream sequence is waited for, never rejected; cycle
+      rejection is unchanged (13.10), and the blocked-head deadline applies as for shards
+      (13.12).
+    - Resources: a protected receive slot of `max(64, prefix staging)` bytes (79) and one
+      record, outside the shard pool and counted in the connection's receive reservation;
+      partial records are bounded by that slot (13.12).
+    - Epoch drain counts ACK records as applied (D), not queued (Q), on every stream including
+      the ACK stream (13.18).
+    - Sender priority: the ACK stream is scheduled in the CONTROL class. It takes turns with
+      stream 0 when both are ready, ages like a CONTROL head, is never subject to the chunk
+      skip counters or the REALTIME burst limit, and is never on REALTIME. Its records are a
+      few bytes, so they never wait behind chunk grant waits; they wait only for the records
+      they depend on being written (13.20).
+
 ### DECIDED QUESTIONS (historical user approval, 2026-10-15; revisions noted)
 
 1. Approve `/3`, the configuration-stage four-proof/switch exchange after OFFER, and the
@@ -2451,19 +2567,21 @@ before this revision can run.
 
 The owner accepted all five recommendations:
 
-1. Chunk lanes: hard cap 6, client offers 1..6, draft server preference 3, selection immutable
-   per connection (13.2). The default is set after benchmarking 1..6.
+1. Chunk lanes: hard cap 5, client offers 1..5, draft server preference 3, selection immutable
+   per connection (13.2). The default is set after benchmarking 1..5. Revised 2026-10-21 from
+   the original cap 6: the ACK stream takes the sixth server-opened stream (13.3, 13.21).
 2. Lane assignment uses the fixed epoch-mixed 32-bit position hash of 13.18; golden vectors
    follow.
-3. Receive policy as specified in 13.12/13.13 and 12.13. Client: up to 16 MiB + 1 KiB wire,
-   8 MiB execution, 2 MiB native exposure, at most 128 KiB unparsed reads. Server, logged in:
+3. Receive policy as specified in 13.12/13.13 and 12.13. Client: stream slots 14 MiB + 975
+   bytes within the 16 MiB + 1 KiB wire target, 8 MiB execution, 2 MiB native exposure, at most
+   128 KiB unparsed reads. Server, logged in:
    24 KiB share plus the 40 KiB inflater once compression is enabled (about 64 KiB, about
    3.05 GiB at 50,000 connections). Server, pre-login (`/3` only): native exposure (at most
-   `2*8 KiB + N`), read buffers and measured QUIC/TLS state, charged to a pool capped at 10% of
+   `2*8 KiB + (N+1)`), read buffers and measured QUIC/TLS state, charged to a pool capped at 10% of
    the node budget, moved to the node budget at promotion (online: Login Success; offline:
-   `/3` activation). Protected area P <= 7667 bytes at N=6 (CONTROL allowance <= 5619 bytes),
+   `/3` activation). Protected area P <= 7667 bytes at N=5 (CONTROL allowance <= 5619 bytes),
    2 KiB REALTIME slice, 512-byte REALTIME wire cap and 1024-byte decoded cap, one-byte
-   reverse-CHUNK guards. Still to measure: pre-login cost, 50,000 staged connections on top of
+   reverse CHUNK and ACK guards. Still to measure: pre-login cost, 50,000 staged connections on top of
    50,000 logged-in players, inflater memory under forced compression, and outbound Deflater
    memory (about 256 KiB each at zlib defaults, about 12.2 GiB at 50,000; a reduced
    window/memLevel is a candidate profile value).
