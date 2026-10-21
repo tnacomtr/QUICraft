@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.core.profile;
 
+import rs.sudoe.quicraft.core.multistream.LogicalStream;
 import rs.sudoe.quicraft.core.transport.PreLoginTracker;
 
 /**
@@ -16,7 +17,7 @@ public final class ServerProfile {
     /**
      * The total protected read and decode area P inside each connection's 24 KiB share (13.12). It
      * covers the fixed 2 KiB REALTIME slice and the CONTROL allowance. UNMEASURED profile default:
-     * 6 KiB satisfies the 13.12 inequality for every N up to 6 and leaves room for prefix staging.
+     * 6 KiB satisfies the 13.12 inequality for every N up to 5 and leaves room for prefix staging.
      */
     public static final long PROTECTED_READ_BYTES = 6L << 10;
     /** The per-connection receive share the inequality is checked against (13.12). */
@@ -82,8 +83,8 @@ public final class ServerProfile {
         if (maxConnections < 1) {
             throw new IllegalArgumentException("maxConnections must be positive");
         }
-        if (maxLanes < 1 || maxLanes > 6) {
-            throw new IllegalArgumentException("maxLanes must be in 1..6, was " + maxLanes);
+        if (maxLanes < 1 || maxLanes > LogicalStream.MAX_CHUNKS) {
+            throw new IllegalArgumentException("maxLanes must be in 1..5, was " + maxLanes);
         }
         if (nodeBudgetBytes < 1) {
             throw new IllegalArgumentException("nodeBudgetBytes must be positive");
@@ -95,8 +96,8 @@ public final class ServerProfile {
             throw new IllegalArgumentException("the pre-login pool holds no staged /3 connection: raise "
                     + "nodeBudgetBytes or preLoginPoolFraction");
         }
-        // 13.12: 16 KiB + 2*N + 1 + P + 512 <= 24 KiB.
-        long native16 = 16L * 1024 + 2L * maxLanes + 1 + PROTECTED_READ_BYTES + 512;
+        // 13.12: 16 KiB + 2*(N+1) + 1 + P + 512 <= 24 KiB.
+        long native16 = 16L * 1024 + 2L * (maxLanes + 1) + 1 + PROTECTED_READ_BYTES + 512;
         if (native16 > RECEIVE_SHARE_BYTES) {
             throw new IllegalArgumentException("maxLanes " + maxLanes + " with protected reads of "
                     + PROTECTED_READ_BYTES + " bytes exceeds the 24 KiB receive share (13.12)");

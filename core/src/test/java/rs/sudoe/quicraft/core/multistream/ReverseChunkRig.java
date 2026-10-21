@@ -13,7 +13,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Test-only access to a real N+2 server, with guard reads held outside the transport. */
+/** Test-only access to a real N+3 server, with guard reads held outside the transport. */
 public final class ReverseChunkRig implements AutoCloseable {
     private final NRig rig;
     private final List<ChannelHandlerContext> held = new ArrayList<>();
@@ -21,10 +21,12 @@ public final class ReverseChunkRig implements AutoCloseable {
     public final AtomicInteger bytes = new AtomicInteger();
     public final AtomicInteger workBeforeClose = new AtomicInteger();
     public final AtomicInteger synchronousCloses = new AtomicInteger();
+    private final int shards;
     private boolean received;
     private boolean transportClosed;
 
     public ReverseChunkRig(int n) throws Exception {
+        shards = n;
         rig = NRig.start(n);
         NRig.onLoop(rig.server, () -> {
             rig.serverConnection.pipeline().addFirst(new ChannelOutboundHandlerAdapter() {
@@ -69,9 +71,26 @@ public final class ReverseChunkRig implements AutoCloseable {
         return NRig.channel(rig.client, shard + 2);
     }
 
+    /** The client's side of the server-opened ACK stream, logical index N+2 (13.21). */
+    public QuicStreamChannel clientAck() throws Exception {
+        return NRig.channel(rig.client, shards + 2);
+    }
+
+    /** Native send capacity of the reverse direction of the ACK stream. */
+    public long ackCapacity() throws Exception {
+        return capacityOf(clientAck());
+    }
+
+    public io.netty.channel.ChannelFuture writeAck(int value) throws Exception {
+        return clientAck().writeAndFlush(Unpooled.wrappedBuffer(new byte[] {(byte) value}));
+    }
+
     /** Native send capacity, not a Java write-queue or connection-close proxy for credit. */
     public long capacity(int shard) throws Exception {
-        QuicStreamChannel stream = clientChunk(shard);
+        return capacityOf(clientChunk(shard));
+    }
+
+    private long capacityOf(QuicStreamChannel stream) throws Exception {
         return stream.eventLoop().submit(() -> ((Long) NStreamSession.findStreamCapacity(stream.parent().getClass())
                 .invoke(stream.parent(), stream.streamId())).longValue()).get(5, TimeUnit.SECONDS);
     }

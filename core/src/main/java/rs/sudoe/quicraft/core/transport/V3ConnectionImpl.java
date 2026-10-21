@@ -571,7 +571,7 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     private void onPreamble(byte[] token) {
         if (role == NStreamSession.Role.CLIENT) {
             try {
-                // 13.2: the reply must name exactly one N inside this client's offer (1..6).
+                // 13.2: the reply must name exactly one N inside this client's offer (1..5).
                 context = SessionContext.accept(parser.minShards(), parser.maxShards(),
                         LogicalStream.MIN_CHUNKS, LogicalStream.MAX_CHUNKS);
             } catch (MultistreamProtocolException e) {

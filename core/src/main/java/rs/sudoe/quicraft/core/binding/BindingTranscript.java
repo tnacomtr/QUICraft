@@ -29,7 +29,7 @@ public final class BindingTranscript {
 
     /** Computes T including the selected shard count (12.7). */
     public static byte[] compute(int protocolNumber, int mode, byte[] fingerprint, byte[] routing, int n) {
-        if (n < 1 || n > 6) throw new IllegalArgumentException("shard count must be 1..6");
+        if (n < 1 || n > 5) throw new IllegalArgumentException("shard count must be 1..5");
         checkMode(mode);
         checkDigest(fingerprint, "fingerprint");
         checkDigest(routing, "routing");

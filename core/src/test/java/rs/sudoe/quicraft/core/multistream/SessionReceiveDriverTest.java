@@ -101,7 +101,7 @@ class SessionReceiveDriverTest {
 
     /** One connection's pump, driver and the sinks the tests read. */
     static final class Harness {
-        final SessionReadPumpTest.Streams source = new SessionReadPumpTest.Streams(CHUNKS + 2, 1 << 20);
+        final SessionReadPumpTest.Streams source = new SessionReadPumpTest.Streams(CHUNKS + 3, 1 << 20);
         final long[] now = {0L};
         final CumulativeSource stalls = new CumulativeSource(now);
         final ReceiveSlots slots = new ReceiveSlots(CHUNKS);

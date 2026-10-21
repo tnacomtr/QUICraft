@@ -338,6 +338,7 @@ public final class RoutingTableLoader {
             if ("control".equals(laneText)) lane = RouteV2.StreamLane.CONTROL;
             else if ("realtime".equals(laneText)) lane = RouteV2.StreamLane.REALTIME;
             else if ("chunk".equals(laneText)) lane = RouteV2.StreamLane.CHUNK;
+            else if ("ack".equals(laneText)) lane = RouteV2.StreamLane.ACK;
             else throw new RoutingTableException("13.7: unknown lane");
             boolean control = lane == RouteV2.StreamLane.CONTROL;
             Set<String> fields = new HashSet<>(unmodifiableSet("state", "direction", "packet_id", "lane",
@@ -351,11 +352,19 @@ public final class RoutingTableLoader {
             boolean valid = control ? dependency == Dependency.GLOBAL || dependency == Dependency.VIEW
                     || dependency == Dependency.CONTROL || dependency == Dependency.ORDINARY
                     || (serverbound && dependency == Dependency.INTERACTION)
-                    : dependency == Dependency.LANE || (lane == RouteV2.StreamLane.CHUNK && join);
-            if (!valid || (serverbound && lane == RouteV2.StreamLane.CHUNK)
+                    : lane == RouteV2.StreamLane.ACK ? dependency == Dependency.TRAILING
+                    : dependency == Dependency.LANE
+                            || (lane == RouteV2.StreamLane.CHUNK && (join || dependency == Dependency.ACK));
+            boolean ackLane = lane == RouteV2.StreamLane.ACK;
+            int packetId = intField(value, "packet_id", "route");
+            // 13.21: the ACK lane carries only clientbound PLAY block_changed_ack (4) and chunk_batch_finished (11).
+            if (ackLane && (serverbound || state != ProtocolState.PLAY || (packetId != 4 && packetId != 11)))
+                throw new RoutingTableException("13.21: the ACK lane is for clientbound play packets 4 and 11 only");
+            if (!valid || (serverbound && (lane == RouteV2.StreamLane.CHUNK || ackLane))
                     || (!state.isPlay() && (!control || dependency != Dependency.GLOBAL)))
                 throw new RoutingTableException("13.7: forbidden route tuple");
             boolean epoch = bool(value, "epoch_change");
+            if (epoch && ackLane) throw new RoutingTableException("13.21: an ACK lane route cannot change the epoch");
             if (epoch && (serverbound || !control || dependency != Dependency.GLOBAL))
                 throw new RoutingTableException("13.7: epoch_change requires clientbound CONTROL/global");
             Object positionValue = value.get("position");
@@ -372,6 +381,8 @@ public final class RoutingTableLoader {
             if (lane == RouteV2.StreamLane.CHUNK) {
                 if (kind != (join ? Kind.JOIN : Kind.SINGLE))
                     throw new RoutingTableException("13.7: chunk route requires single position or join");
+            } else if (ackLane) {
+                if (kind != null) throw new RoutingTableException("13.21: an ACK lane route has no position");
             } else if (kind != null && !(control && dependency == Dependency.GLOBAL
                     && kind == Kind.LIST)) {
                 throw new RoutingTableException("13.7: unexpected position extractor");
@@ -385,7 +396,7 @@ public final class RoutingTableLoader {
                     bound.decodeFootprintBound, bound.maxServerboundRecord + 5,
                     bound.maxDecodedFootprint, false) > bound.ordinaryReadAllowance)
                 throw new RoutingTableException("13.7: ordinarySmall guarantee exceeds allowance");
-            RouteKey key = new RouteKey(protocol, state, direction, intField(value, "packet_id", "route"));
+            RouteKey key = new RouteKey(protocol, state, direction, packetId);
             if (mandatory.contains(key) && (!control || dependency != Dependency.GLOBAL))
                 throw new RoutingTableException("13.7: mandatory CONTROL requires global fence");
             RouteV2 route = new RouteV2(lane, dependency, identifier, position, epoch, bound,

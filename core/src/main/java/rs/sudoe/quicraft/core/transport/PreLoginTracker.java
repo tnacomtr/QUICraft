@@ -93,7 +93,7 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
      * Charges the staged share for a connection at its first accepted Initial (12.13). Returns null
      * when the pre-login pool cannot take it right now; the caller then sheds or refuses.
      *
-     * @param shards the negotiated chunk-stream count N, 1..6
+     * @param shards the negotiated chunk-stream count N, 1..5
      * @param online true for online mode, where Login Success promotes; false for offline mode, which
      *     promotes only at activation
      * @param clock a monotonic nanosecond clock (tests inject one)
@@ -119,13 +119,13 @@ public final class PreLoginTracker implements PreLoginStage, AutoCloseable {
 
     /**
      * The staged reservation for a connection with {@code shards} chunk streams:
-     * {@code 2*8 KiB + N + 4 KiB read buffer + TLS estimate} (12.13).
+     * {@code 2*8 KiB + N + 1 (ACK guard) + 4 KiB read buffer + TLS estimate} (12.13).
      */
     public static long stagedShare(int shards) {
-        if (shards < 1 || shards > 6) {
-            throw new IllegalArgumentException("shards must be in 1..6");
+        if (shards < 1 || shards > 5) {
+            throw new IllegalArgumentException("shards must be in 1..5");
         }
-        return NATIVE_BYTES + shards + READ_BUFFER_BYTES + TLS_ESTIMATE_BYTES;
+        return NATIVE_BYTES + shards + 1 + READ_BUFFER_BYTES + TLS_ESTIMATE_BYTES;
     }
 
     /** The staged share this connection was opened with. */

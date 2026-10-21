@@ -9,7 +9,7 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
 
 /**
  * The activated {@code /3} session of one connection, as the transport and the game bridge see it
- * (docs/protocol.md 13). The N+2 {@link NStreamSession} is the implementation; callers use only
+ * (docs/protocol.md 13). The N+3 {@link NStreamSession} is the implementation; callers use only
  * this interface.
  *
  * <p>Threading and lifecycle are those of {@link NStreamSession}: {@link #acceptStream} runs on the

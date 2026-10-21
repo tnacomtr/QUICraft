@@ -85,7 +85,7 @@ public final class ClientReadPump {
     private boolean open = true;
 
     /**
-     * @param chunks negotiated chunk count N, 1..6
+     * @param chunks negotiated chunk count N, 1..5
      * @param slots the connection's clientbound receive slots for the same N
      * @param compressed true when compression is enabled for the session
      * @param source the byte source, indexed by logical stream
@@ -109,7 +109,7 @@ public final class ClientReadPump {
         this.compressed = compressed;
         this.source = source;
         this.clock = clock;
-        this.lanes = new Lane[chunks + 2];
+        this.lanes = new Lane[chunks + 3];
         for (int s = 0; s < lanes.length; s++) lanes[s] = new Lane(s);
     }
 
@@ -252,6 +252,12 @@ public final class ClientReadPump {
             throws MultistreamProtocolException {
         RecordCodec.Declarations d = RecordCodec.inspectPrefix(prefix, prefixLength, recordLength, compressed);
         long wire = (long) lane.decoder.lengthPrefixBytes() + recordLength;
+        if (lane.stream == lanes.length - 1 && (wire > ReceiveSlots.ACK_RECORD_MAX_BYTES
+                || d.kind != RecordCodec.KIND_GAME)) {
+            // 13.21: the ACK stream carries only small GAME records; anything else is a violation, not a resource issue.
+            throw new MultistreamProtocolException(MultistreamProtocolException.CLOSE_ORDERING, "13.21",
+                    "ACK stream record of " + wire + " wire bytes and kind " + d.kind);
+        }
         if (lane.pending != null) return declareMember(lane, d, wire);
         if (d.kind == RecordCodec.KIND_BUNDLE_OPEN) return declareOpener(lane, d, wire);
         slots.releaseHead(lane.stream);

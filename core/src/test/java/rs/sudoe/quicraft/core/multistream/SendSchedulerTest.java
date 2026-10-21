@@ -390,7 +390,7 @@ class SendSchedulerTest {
                     continues.add(m < bundle.size() - 1);
                 }
             } else {
-                StreamSequencer.Fence[] fences = StreamSequencer.Fence.values();
+                StreamSequencer.Fence[] fences = java.util.Arrays.copyOf(StreamSequencer.Fence.values(), 6);
                 StreamSequencer.Fence fence = fences[random.nextInt(fences.length)];
                 int stream = fence == StreamSequencer.Fence.REALTIME ? 1
                         : fence == StreamSequencer.Fence.CHUNK ? 2 + random.nextInt(3) : 0;

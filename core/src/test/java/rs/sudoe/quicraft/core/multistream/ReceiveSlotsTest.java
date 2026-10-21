@@ -7,11 +7,17 @@ import org.junit.jupiter.api.Test;
 
 class ReceiveSlotsTest {
     @Test void eachStreamHoldsOneHeadAndSlotsAreIndependent() {
-        ReceiveSlots slots = new ReceiveSlots(6);
-        for (int stream = 0; stream < 8; stream++) {
+        ReceiveSlots slots = new ReceiveSlots(5);
+        for (int stream = 0; stream < 7; stream++) {
             assertTrue(slots.admitHead(stream, ReceiveSlots.BYTES_PER_STREAM, ReceiveSlots.RECORDS_PER_STREAM));
             assertFalse(slots.admitHead(stream, 1, 1), "second head on stream " + stream);
         }
+        // The ACK stream N+2 has its own small protected slot, never a shard-sized one (13.21).
+        assertEquals(7, slots.ackStream());
+        assertFalse(slots.admitHead(7, ReceiveSlots.ACK_SLOT_BYTES + 1, 1));
+        assertFalse(slots.admitHead(7, 1, 2));
+        assertTrue(slots.admitHead(7, ReceiveSlots.ACK_SLOT_BYTES, 1));
+        assertFalse(slots.admitHead(7, 1, 1));
         slots.releaseHead(3);
         assertFalse(slots.holdsHead(3));
         assertTrue(slots.holdsHead(4), "releasing one stream must not free another");
@@ -51,9 +57,11 @@ class ReceiveSlotsTest {
         assertFalse(slots.reserveWorkspace(1));
     }
 
-    @Test void aggregateWireCeilingAtSixChunksIsSixteenMebibytesPlusOneKibibyte() {
-        long total = (6 + 2) * ReceiveSlots.BYTES_PER_STREAM;
-        assertEquals(16L * 1024 * 1024 + 1024, total);
+    @Test void aggregateWireCeilingAtFiveChunksCountsTheSmallAckSlot() {
+        // N=5: CONTROL, REALTIME and five shards hold B each; the ACK slot is small and counted besides (13.21).
+        long streams = (5 + 2) * ReceiveSlots.BYTES_PER_STREAM + ReceiveSlots.ACK_SLOT_BYTES;
+        assertEquals(streams + ReceiveSlots.EXECUTION_WORKSPACE, new ReceiveSlots(5).connectionBytes());
+        assertTrue(streams < 16L * 1024 * 1024 + 1024, "below the ceiling of the former six-shard design");
     }
 
     @Test void executionWorkspaceIsSharedAndFailsClosed() {

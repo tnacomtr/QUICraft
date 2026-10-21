@@ -160,7 +160,7 @@ public final class StreamReceiver {
     /**
      * Clientbound receiver, kept for existing callers (legacy boundary mode).
      *
-     * @param chunks negotiated chunk count N, 1..6
+     * @param chunks negotiated chunk count N, 1..5
      * @param validator injected shard, fence and join checks
      * @param clock monotonic nanosecond transport clock
      */
@@ -172,7 +172,7 @@ public final class StreamReceiver {
      * Legacy boundary-mode receiver: its timers are driven by {@link #stallStarted(long)} and
      * {@link #stallEnded(long)} notifications on {@code clock}.
      *
-     * @param chunks negotiated chunk count N, 1..6
+     * @param chunks negotiated chunk count N, 1..5
      * @param direction sending direction this receiver serves; serverbound allows epoch 0 only (13.18)
      * @param validator injected shard, fence and join checks
      * @param clock monotonic nanosecond transport clock
@@ -186,7 +186,7 @@ public final class StreamReceiver {
      * excludes exactly what a timely one would have (13.10). {@code source} is required and is not
      * replaced for the life of the receiver.
      *
-     * @param chunks negotiated chunk count N, 1..6
+     * @param chunks negotiated chunk count N, 1..5
      * @param direction sending direction this receiver serves; serverbound allows epoch 0 only (13.18)
      * @param validator injected shard, fence and join checks
      * @param source the stall accounting source of the executor incarnation
@@ -202,7 +202,7 @@ public final class StreamReceiver {
      * releases the slot once, by committing the pump unit after {@link #applied}; this receiver does not
      * release it.
      *
-     * @param chunks negotiated chunk count N, 1..6, equal to the pump's
+     * @param chunks negotiated chunk count N, 1..5, equal to the pump's
      * @param slots the pump's clientbound slots, the single owner of the head charge
      * @param validator injected shard, fence and join checks
      * @param clock monotonic nanosecond transport clock
@@ -215,7 +215,7 @@ public final class StreamReceiver {
      * Cumulative pump-slot receiver: as {@link #StreamReceiver(int, ReceiveSlots, Validator, LongSupplier)},
      * but every blocked-head timer reads {@code source} (13.10). {@code source} is required.
      *
-     * @param chunks negotiated chunk count N, 1..6, equal to the pump's
+     * @param chunks negotiated chunk count N, 1..5, equal to the pump's
      * @param slots the pump's clientbound slots, the single owner of the head charge
      * @param validator injected shard, fence and join checks
      * @param source the stall accounting source of the executor incarnation
@@ -234,7 +234,7 @@ public final class StreamReceiver {
             throw new IllegalArgumentException("exactly one of the boundary clock and the stall source is required");
         }
         this.direction = direction;
-        streams = chunks + 2;
+        streams = chunks + 3;
         admitted = new long[streams];
         enqueued = new long[streams];
         applied = new long[streams];
@@ -296,6 +296,15 @@ public final class StreamReceiver {
         int stream = record.streamIndex();
         if (stream < 0 || stream >= streams) {
             return Admission.violation("stream index " + stream + " outside 0.." + (streams - 1));
+        }
+        if (stream == ackIndex()) {
+            // 13.21: one small GAME record at a time; never a bundle, join, END or other kind.
+            if (record.kind() != RecordCodec.KIND_GAME) {
+                return Admission.violation("record kind " + record.kind() + " on the ACK stream (13.21)");
+            }
+            if (wireBytes > ReceiveSlots.ACK_RECORD_MAX_BYTES) {
+                return Admission.violation("ACK stream record of " + wireBytes + " wire bytes (13.21)");
+            }
         }
         if (direction == Direction.SERVERBOUND && stream >= 2) {
             return Admission.violation("serverbound record on CHUNK stream " + stream + " (13.3)");
@@ -764,10 +773,21 @@ public final class StreamReceiver {
         return null;
     }
 
+    /** The ACK stream's logical index, N+2 (13.21). */
+    private int ackIndex() {
+        return streams - 1;
+    }
+
     private ReceiveClose checkRoute(int stream, ReceiveRoute route) {
         boolean control = stream == LogicalStream.CONTROL;
         boolean realtime = stream == LogicalStream.REALTIME;
+        boolean ack = stream == ackIndex();
         switch (route.lane()) {
+            case ACK:
+                if (!ack) {
+                    return ReceiveClose.peerViolation("ACK route on stream " + stream);
+                }
+                break;
             case CONTROL:
                 if (!control) {
                     return ReceiveClose.peerViolation("CONTROL route on stream " + stream);
@@ -779,7 +799,7 @@ public final class StreamReceiver {
                 }
                 break;
             default:
-                if (control || realtime) {
+                if (control || realtime || ack) {
                     return ReceiveClose.peerViolation("CHUNK route on stream " + stream);
                 }
                 break;

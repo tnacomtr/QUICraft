@@ -24,7 +24,7 @@ public final class PreambleV2 {
 
     /** {@code token} null or empty for none, otherwise exactly 16 bytes. */
     public static byte[] encode(byte[] token) {
-        return encode(token, 1, 6);
+        return encode(token, 1, 5);
     }
 
     /** Encodes a client shard offer (13.2). */
@@ -100,7 +100,7 @@ public final class PreambleV2 {
                         MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION, "13.2",
                         "preamble token length " + tokenLength + " in " + bodyLength);
             }
-            if (minShards() < 1 || maxShards() > 6 || minShards() > maxShards()) {
+            if (minShards() < 1 || maxShards() > 5 || minShards() > maxShards()) {
                 throw new MultistreamProtocolException(
                         MultistreamProtocolException.CLOSE_PROTOCOL_VIOLATION, "13.2",
                         "shard range " + minShards() + ".." + maxShards());
@@ -136,8 +136,8 @@ public final class PreambleV2 {
          * outside the offer. Local misuse (bad configuration) throws IllegalArgumentException.
          */
         public int select(int configuredMax, int preference) throws MultistreamProtocolException {
-            if (configuredMax < 1 || configuredMax > 6) throw new IllegalArgumentException("configured max 1..6");
-            if (preference < 1 || preference > 6) throw new IllegalArgumentException("preference 1..6");
+            if (configuredMax < 1 || configuredMax > 5) throw new IllegalArgumentException("configured max 1..5");
+            if (preference < 1 || preference > 5) throw new IllegalArgumentException("preference 1..5");
             int low = minShards(), high = Math.min(maxShards(), configuredMax);
             if (low > high) {
                 throw new MultistreamProtocolException(MultistreamProtocolException.CLOSE_NO_COMMON_SHARDS,
@@ -153,6 +153,6 @@ public final class PreambleV2 {
     }
 
     private static void validateRange(int min, int max) {
-        if (min < 1 || max > 6 || min > max) throw new IllegalArgumentException("shard range");
+        if (min < 1 || max > 5 || min > max) throw new IllegalArgumentException("shard range");
     }
 }

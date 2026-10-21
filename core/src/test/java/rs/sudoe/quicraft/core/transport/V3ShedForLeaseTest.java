@@ -42,7 +42,7 @@ class V3ShedForLeaseTest {
         List<V3Connection> accepted = Collections.synchronizedList(new ArrayList<V3Connection>());
         // One open connection in total, and a pre-login pool with room for exactly one staged connection.
         ResourcePools pools = new PreLoginTrackerTest.FakePools()
-                .capacity(ResourcePools.Pool.PRE_LOGIN, PreLoginTracker.stagedShare(6));
+                .capacity(ResourcePools.Pool.PRE_LOGIN, PreLoginTracker.stagedShare(5));
         TransportConfig config = TransportConfig.builder().maxOpen(1).resourcePools(pools).build();
         try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity, config,
                 stream -> accepted.add((V3Connection) stream), protocol -> V3ConnectionTest.TABLE)) {

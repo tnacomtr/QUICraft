@@ -237,7 +237,7 @@ public final class NStreamSession implements MultistreamSession {
             this.shards = shards;
             this.cap = cap;
             this.direction = direction;
-            references = new long[direction == Direction.SERVERBOUND ? 2 : shards + 2][Kind.values().length];
+            references = new long[direction == Direction.SERVERBOUND ? 2 : shards + 3][Kind.values().length];
         }
 
         @Override
@@ -888,7 +888,7 @@ public final class NStreamSession implements MultistreamSession {
             throw new IllegalArgumentException("state");
         }
         RouteV2 route = table.routeV2For(new RouteKey(protocolNumber, state, sendDirection, packetId));
-        if (route == null || route.lane == RouteV2.StreamLane.CONTROL) {
+        if (route == null || route.lane == RouteV2.StreamLane.CONTROL || route.lane == RouteV2.StreamLane.ACK) {
             return Lane.CONTROL;
         }
         return route.lane == RouteV2.StreamLane.REALTIME ? Lane.REALTIME : Lane.WORLD;
@@ -1181,7 +1181,7 @@ public final class NStreamSession implements MultistreamSession {
     }
 
     /**
-     * One guard copy per CHUNK is charged by ServerReadPartition's fixed 2N+1 admission reservation.
+     * One guard copy per CHUNK is charged by ServerReadPartition's fixed 2(N+1)+1 admission reservation (the ACK stream carries one guard copy too).
      * Never rearm: reading the first byte must close quiche in this call stack, before Netty can send
      * replenished credit or execute another queued send. There is no reverse preamble (13.13).
      */
@@ -1669,8 +1669,8 @@ public final class NStreamSession implements MultistreamSession {
         return copy;
     }
 
-    private static Lane laneOf(int stream) {
-        if (stream == LogicalStream.CONTROL) {
+    private Lane laneOf(int stream) {
+        if (stream == LogicalStream.CONTROL || stream == context.ackIndex()) {
             return Lane.CONTROL;
         }
         return stream == LogicalStream.REALTIME ? Lane.REALTIME : Lane.WORLD;

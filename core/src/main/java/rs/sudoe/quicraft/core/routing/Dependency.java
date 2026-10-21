@@ -25,6 +25,10 @@ public enum Dependency {
     CONTROL("control"),
     /** CONTROL/view frontier semantics (13.7). */
     GLOBAL("global"),
+    /** ACK lane only: waits for every stream's latest record, advances no frontier (13.7, 13.21). */
+    TRAILING("trailing"),
+    /** CHUNK lane only: lane order plus the last ACK-lane record, except a first chunk install (13.7, 13.21). */
+    ACK("ack"),
     /** Chunk join dependency class (13.7, 13.19). */
     ACK_JOIN("ack_join"),
     /** Batched chunk join dependency class (13.7, 13.19). */

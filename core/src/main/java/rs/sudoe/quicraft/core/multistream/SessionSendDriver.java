@@ -205,6 +205,8 @@ public final class SessionSendDriver {
     private final LongSupplier clock;
     private final SessionResources.Accounting accounting;
     private final StreamSequencer sequencer;
+    /** Chunk positions the client holds, for the first-install exemption of the ack dependency (13.21). */
+    private final HeldChunkSet heldChunks = new HeldChunkSet();
     private final SendScheduler scheduler;
     private final AckJoinTracker acks;
     private final BatchJoinTracker batches = new BatchJoinTracker();
@@ -357,7 +359,7 @@ public final class SessionSendDriver {
         this.accounting = accounting;
         this.acks = new AckJoinTracker(context.logicalStreamCount());
         this.sequencer = new StreamSequencer(context.shardCount(), serverbound);
-        this.scheduler = new SendScheduler(profile);
+        this.scheduler = new SendScheduler(profile, context.ackIndex());
         boolean registered = false;
         try {
             connectRanking();
@@ -487,6 +489,7 @@ public final class SessionSendDriver {
             closeWith(CLOSE_RESOURCE);
             return handle;
         }
+        fence = effectiveFence(fence, chunkX, chunkZ);
         int stream = streamFor(fence, chunkX, chunkZ);
         Record record = sequencer.assign(stream, fence, frame, interaction, semantic);
         if (!enqueueRecord(record, false)) {
@@ -567,6 +570,7 @@ public final class SessionSendDriver {
             closeWith(CLOSE_RESOURCE);
             return handle;
         }
+        fence = effectiveFence(fence, chunkX, chunkZ);
         int stream = streamFor(fence, chunkX, chunkZ);
         // The sequencer validates the route shape before it moves any sequence or frontier. Once
         // StreamSequencer.assign returns, the sequence exists, so every later failure is covered
@@ -632,6 +636,8 @@ public final class SessionSendDriver {
         settleAcksLocked();
         batches.abort();
         Record record = sequencer.assignEpochTransition(packet.frame());
+        // 13.21: the client drops every chunk at an epoch change, so no install can meet a pending prediction.
+        heldChunks.clear();
         if (!enqueueRecord(record, false)) {
             return handle;
         }
@@ -1006,6 +1012,7 @@ public final class SessionSendDriver {
         if (unitBytes > maxRecordBytes) {
             throw new IllegalArgumentException("bundle run larger than maxRecordBytes");
         }
+        noteBundleScopes(scopes);
         List<Record> records;
         try {
             records = sequencer.assignBundle(openingFrame, frames, scopes, closingFrame, external);
@@ -1122,6 +1129,7 @@ public final class SessionSendDriver {
         }
         // Run shape, scopes, dependencies and encoded aggregate are all checked before assignment.
         StreamSequencer.Fence bundleFence = StreamSequencer.bundleScope(scopes);
+        noteBundleScopes(scopes);
         long unitBytes = sequencer.bundleWireBytes(openingFrame, frames, scopes, closingFrame);
         if (sequencer.assigned()[CONTROL] + (long) count + 2 > StreamSequencer.MAX_SEQUENCE) {
             throw new IllegalArgumentException("sequence exhausted");
@@ -1634,10 +1642,38 @@ public final class SessionSendDriver {
         return now - pending.createdNanos >= AckJoinTracker.DEADLINE_NANOS;
     }
 
+    /**
+     * Resolves the lifecycle fences of 13.21 to the sequencer's CHUNK or CHUNK_ACK, and keeps the held-chunk set:
+     * an install skips the ack dependency only for a first install, a forget never does.
+     */
+    private StreamSequencer.Fence effectiveFence(StreamSequencer.Fence fence, int chunkX, int chunkZ) {
+        if (fence == StreamSequencer.Fence.CHUNK_INSTALL) {
+            return heldChunks.install(chunkX, chunkZ) ? StreamSequencer.Fence.CHUNK_ACK : StreamSequencer.Fence.CHUNK;
+        }
+        if (fence == StreamSequencer.Fence.CHUNK_FORGET) {
+            heldChunks.forget(chunkX, chunkZ);
+            return StreamSequencer.Fence.CHUNK_ACK;
+        }
+        return fence;
+    }
+
+    /** A chunk install or forget inside a bundle is not tracked, so installs need the ack dependency (13.21). */
+    private void noteBundleScopes(StreamSequencer.Fence[] scopes) {
+        for (StreamSequencer.Fence scope : scopes) {
+            if (scope == StreamSequencer.Fence.CHUNK_INSTALL || scope == StreamSequencer.Fence.CHUNK_FORGET) {
+                heldChunks.markUnknown();
+                return;
+            }
+        }
+    }
+
     private int streamFor(StreamSequencer.Fence fence, int chunkX, int chunkZ) {
         switch (fence) {
             case REALTIME:
                 return REALTIME;
+            case ACK_TRAILING:
+                return sequencer.ackIndex();
+            case CHUNK_ACK:
             case CHUNK:
                 return FIRST_CHUNK + ShardHash.shardOf(chunkX, chunkZ, sequencer.epoch(), context.shardCount());
             default:
@@ -1645,8 +1681,11 @@ public final class SessionSendDriver {
         }
     }
 
-    private static Lane laneOf(int stream) {
+    private Lane laneOf(int stream) {
         if (stream == CONTROL) {
+            return Lane.CONTROL;
+        }
+        if (stream == sequencer.ackIndex()) {
             return Lane.CONTROL;
         }
         return stream == REALTIME ? Lane.REALTIME : Lane.WORLD;

@@ -54,9 +54,9 @@ public final class TransportConfig {
     public static final long MULTISTREAM_SERVERBOUND_INITIAL_MAX_DATA = 24L << 10;
     /**
      * /3 (13.2): the server's configured maximum shard count. Local policy, never a wire field; no
-     * administrator setting overrides the draft hard cap of 6.
+     * administrator setting overrides the draft hard cap of 5.
      */
-    public static final int MULTISTREAM_MAX_SHARDS = 6;
+    public static final int MULTISTREAM_MAX_SHARDS = 5;
     /** /3 (13.2): the server's preferred shard count, clamped into the client's offer and the maximum. */
     public static final int MULTISTREAM_PREFERRED_SHARDS = 3;
     /** /3: the server lets the client open streams 0 and 4. */

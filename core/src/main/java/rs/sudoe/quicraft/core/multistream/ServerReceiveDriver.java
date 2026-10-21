@@ -75,7 +75,7 @@ public final class ServerReceiveDriver {
      * Legacy boundary mode: the blocked-head timer is driven by {@link #stallStarted(long)} and
      * {@link #stallEnded(long)} notifications on {@code clock}.
      *
-     * @param chunks negotiated chunk count N, 1..6; the receiver keeps the N+2 stream indices
+     * @param chunks negotiated chunk count N, 1..5; the receiver keeps the N+3 stream indices
      * @param pump the serverbound read pump for the same session
      * @param validator injected shard, fence and join checks
      * @param routes route lookup for the connection's protocol
@@ -96,7 +96,7 @@ public final class ServerReceiveDriver {
         this.protocolNumber = protocolNumber;
         this.game = game;
         this.sink = sink;
-        this.held = new Entry[chunks + 2];
+        this.held = new Entry[chunks + 3];
     }
 
     /**
@@ -105,7 +105,7 @@ public final class ServerReceiveDriver {
      * non-excluding transport clock, kept for deadlines outside stall accounting; it must not be null.
      * Boundary stall notifications forwarded through this driver throw in this mode.
      *
-     * @param chunks negotiated chunk count N, 1..6; the receiver keeps the N+2 stream indices
+     * @param chunks negotiated chunk count N, 1..5; the receiver keeps the N+3 stream indices
      * @param pump the serverbound read pump for the same session
      * @param validator injected shard, fence and join checks
      * @param routes route lookup for the connection's protocol
@@ -128,7 +128,7 @@ public final class ServerReceiveDriver {
         this.protocolNumber = protocolNumber;
         this.game = game;
         this.sink = sink;
-        this.held = new Entry[chunks + 2];
+        this.held = new Entry[chunks + 3];
     }
 
     /** Returns true once the driver has closed the connection. */

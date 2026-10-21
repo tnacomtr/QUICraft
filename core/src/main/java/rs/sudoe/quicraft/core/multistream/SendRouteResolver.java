@@ -63,8 +63,8 @@ public final class SendRouteResolver {
             return new Resolved(fence, interaction, 0, 0, null);
         }
 
-        private static Resolved chunk(int x, int z) {
-            return new Resolved(StreamSequencer.Fence.CHUNK, false, x, z, null);
+        private static Resolved chunk(StreamSequencer.Fence fence, int x, int z) {
+            return new Resolved(fence, false, x, z, null);
         }
 
         private static Resolved failClosed(String why) {
@@ -92,7 +92,27 @@ public final class SendRouteResolver {
         public String failure() { return failure; }
     }
 
+    /** The protocol whose chunk lifecycle packets are known (13.21). */
+    static final int LIFECYCLE_PROTOCOL = 775;
+    /** level_chunk_with_light (13.21, protocol 775). */
+    static final int CHUNK_INSTALL_ID = 45;
+    /** forget_level_chunk (13.21, protocol 775). */
+    static final int CHUNK_FORGET_ID = 37;
+
     private SendRouteResolver() {
+    }
+
+    /**
+     * The fence of a CHUNK route that carries the {@code ack} dependency. Install and forget are resolved by the send
+     * driver against its held-chunk set; every other packet always carries the dependency (13.21). A protocol without
+     * a known lifecycle fails safe to the always-ack fence.
+     */
+    private static StreamSequencer.Fence chunkAckFence(int protocolNumber, int packetId) {
+        if (protocolNumber == LIFECYCLE_PROTOCOL) {
+            if (packetId == CHUNK_INSTALL_ID) return StreamSequencer.Fence.CHUNK_INSTALL;
+            if (packetId == CHUNK_FORGET_ID) return StreamSequencer.Fence.CHUNK_FORGET;
+        }
+        return StreamSequencer.Fence.CHUNK_ACK;
     }
 
     /**
@@ -128,7 +148,10 @@ public final class SendRouteResolver {
                         + ") changes the epoch (13.15)");
             }
             if (v2.lane == RouteV2.StreamLane.CHUNK) {
-                scopes[i] = StreamSequencer.Fence.CHUNK;
+                // Promoted to global either way; the marker tells the driver an untracked chunk lifecycle record
+                // rides this bundle (13.21).
+                scopes[i] = v2.dependency == Dependency.ACK ? chunkAckFence(protocolNumber, packetIds[i])
+                        : StreamSequencer.Fence.CHUNK;
                 continue;
             }
             if (v2.lane != RouteV2.StreamLane.CONTROL) {
@@ -188,8 +211,14 @@ public final class SendRouteResolver {
         if (v2.lane == RouteV2.StreamLane.REALTIME) {
             return Resolved.of(StreamSequencer.Fence.REALTIME, false);
         }
+        if (v2.lane == RouteV2.StreamLane.ACK) {
+            // 13.21: sequencer places it on the ACK stream; no position.
+            return Resolved.of(StreamSequencer.Fence.ACK_TRAILING, false);
+        }
         if (v2.lane == RouteV2.StreamLane.CHUNK) {
-            return resolveChunk(extractors, v2, uncompressed);
+            return resolveChunk(extractors, v2, uncompressed,
+                    v2.dependency == Dependency.ACK ? chunkAckFence(protocolNumber, packetId)
+                            : StreamSequencer.Fence.CHUNK);
         }
         switch (v2.dependency) {
             case GLOBAL:
@@ -209,7 +238,8 @@ public final class SendRouteResolver {
         }
     }
 
-    private static Resolved resolveChunk(Map<String, Extractor> extractors, RouteV2 v2, byte[] uncompressed) {
+    private static Resolved resolveChunk(Map<String, Extractor> extractors, RouteV2 v2, byte[] uncompressed,
+            StreamSequencer.Fence fence) {
         if (uncompressed == null) {
             return Resolved.failClosed("CHUNK route without uncompressed bytes (13.8)");
         }
@@ -226,6 +256,6 @@ public final class SendRouteResolver {
         if (position == null) {
             return Resolved.failClosed("CHUNK extractor returned no position (13.8)");
         }
-        return Resolved.chunk(position.chunkX, position.chunkZ);
+        return Resolved.chunk(fence, position.chunkX, position.chunkZ);
     }
 }

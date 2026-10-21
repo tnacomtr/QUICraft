@@ -141,15 +141,15 @@ public final class BindingSession implements BindingDriver {
      * (13.2). Use this form on {@code /3}: the binding must carry the same N the preambles agreed on,
      * so a peer that binds a different N fails the exchange (12.7).
      *
-     * @param shardCount N, 1..6, from {@link rs.sudoe.quicraft.core.multistream.SessionContext#shardCount()}
-     * @throws IllegalArgumentException for local misuse, including an N outside 1..6
+     * @param shardCount N, 1..5, from {@link rs.sudoe.quicraft.core.multistream.SessionContext#shardCount()}
+     * @throws IllegalArgumentException for local misuse, including an N outside 1..5
      */
     public BindingSession(Role role, ExporterSource exporter, byte[] sharedSecret, int mode, int protocol,
             int shardCount, byte[] advertisedFingerprint, byte[] routingDigest, LongSupplier clock,
             long offerWaitNanos, Callbacks callbacks, ScheduledExecutorService scheduler,
             BooleanSupplier inEventLoop) {
-        if (shardCount < 1 || shardCount > 6) {
-            throw new IllegalArgumentException("shard count must be 1..6, got " + shardCount);
+        if (shardCount < 1 || shardCount > 5) {
+            throw new IllegalArgumentException("shard count must be 1..5, got " + shardCount);
         }
         this.shardCount = shardCount;
         this.role = Objects.requireNonNull(role, "role");

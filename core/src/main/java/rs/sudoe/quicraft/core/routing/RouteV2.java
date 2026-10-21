@@ -3,7 +3,7 @@ package rs.sudoe.quicraft.core.routing;
 
 /** Additive schema-2 route shape; existing Route callers remain schema-1 compatible (13.7). */
 public final class RouteV2 {
-    public enum StreamLane { CONTROL, REALTIME, CHUNK }
+    public enum StreamLane { CONTROL, REALTIME, CHUNK, ACK }
     public final StreamLane lane;
     public final Dependency dependency;
     public final Boolean ordinarySmall;

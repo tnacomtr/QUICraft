@@ -918,13 +918,13 @@ public final class QuicClient {
                                 return; // stream 0 is created with its own handler below
                             }
                             rs.sudoe.quicraft.core.multistream.ReadGrantAllocator.install(stream);
-                            // /3 server-created CHUNK streams are 1+4i for the negotiated N (13.3).
+                            // /3 server-created streams are 1+4i: N CHUNK shards, then the ACK stream (13.3).
                             V3ConnectionImpl current = v3;
                             long id = stream.streamId();
                             if (current == null || !current.preambleRead()
                                     || stream.type() != QuicStreamType.BIDIRECTIONAL
                                     || id < 1 || (id - 1) % 4 != 0
-                                    || (id - 1) / 4 >= current.sessionContext().shardCount()) {
+                                    || (id - 1) / 4 >= current.sessionContext().shardCount() + 1) {
                                 Codecs.closeLater(stream.parent(), true,
                                         MultistreamProtocolException.CLOSE_ORDERING);
                                 return;

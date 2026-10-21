@@ -18,7 +18,7 @@ import rs.sudoe.quicraft.core.resource.ResourcePools;
 
 /** docs/protocol.md 12.13: shedding order, fair share, session-call caps and promotion out of the set. */
 class PreLoginRegistryTest {
-    private static final long STAGED = PreLoginTracker.stagedShare(6);
+    private static final long STAGED = PreLoginTracker.stagedShare(5);
 
     /** Pool with room for exactly {@code connections} staged connections. */
     private static PreLoginTrackerTest.FakePools poolFor(int connections) {
@@ -43,7 +43,7 @@ class PreLoginRegistryTest {
     private static Conn admit(PreLoginRegistry registry, String name, String address, boolean online,
             List<Conn> shedLog) throws Exception {
         Conn conn = new Conn(name);
-        conn.entry = registry.admit(ip(address), conn, 6, online, System::nanoTime, () -> {
+        conn.entry = registry.admit(ip(address), conn, 5, online, System::nanoTime, () -> {
             conn.closed = true;
             shedLog.add(conn);
         });
@@ -54,7 +54,7 @@ class PreLoginRegistryTest {
             if (victim.entry != null) {
                 victim.entry.close();
             }
-            conn.entry = registry.admit(ip(address), conn, 6, online, System::nanoTime, () -> {
+            conn.entry = registry.admit(ip(address), conn, 5, online, System::nanoTime, () -> {
                 conn.closed = true;
                 shedLog.add(conn);
             });
@@ -372,7 +372,7 @@ class PreLoginRegistryTest {
         List<Conn> shed = new ArrayList<>();
         Conn idle = admit(registry, "idle", "192.0.2.1", false, shed);
 
-        assertTrue(registry.shedForLease(ip("198.51.100.1"), 6), "12.13: an idle staged victim frees a slot");
+        assertTrue(registry.shedForLease(ip("198.51.100.1"), 5), "12.13: an idle staged victim frees a slot");
         assertTrue(idle.closed, "the victim is closed");
         assertEquals(0, registry.stagedCount());
     }
@@ -380,14 +380,14 @@ class PreLoginRegistryTest {
     @Test
     void aNewcomerWithNothingSheddableOrOverItsShareGetsNoSlot() throws Exception {
         PreLoginRegistry registry = new PreLoginRegistry(poolFor(3), 4, new Random(1));
-        assertFalse(registry.shedForLease(ip("198.51.100.1"), 6), "nothing is staged, so nothing is sheddable");
+        assertFalse(registry.shedForLease(ip("198.51.100.1"), 5), "nothing is staged, so nothing is sheddable");
 
         List<Conn> shed = new ArrayList<>();
         Conn a1 = admit(registry, "a1", "192.0.2.1", false, shed);
         Conn a2 = admit(registry, "a2", "192.0.2.2", false, shed);
         Conn b1 = admit(registry, "b1", "198.51.100.1", false, shed);
         // 192.0.2.x holds two of three shares, so a newcomer from it is over its fair share and is refused.
-        assertFalse(registry.shedForLease(ip("192.0.2.3"), 6), "an over-share newcomer sheds no one");
+        assertFalse(registry.shedForLease(ip("192.0.2.3"), 5), "an over-share newcomer sheds no one");
         assertFalse(a1.closed || a2.closed || b1.closed, "no staged connection was shed");
         assertEquals(3, registry.stagedCount());
     }
@@ -454,7 +454,7 @@ class PreLoginRegistryTest {
         admit(registry, "busy2", "198.51.100.2", true, shed);
         assertEquals(PreLoginTracker.ChargeResult.WAIT, quiet.entry.chargeDeclaredFrame(STAGED, 100));
 
-        assertTrue(registry.shedForLease(ip("192.0.2.1"), 6));
+        assertTrue(registry.shedForLease(ip("192.0.2.1"), 5));
         Conn newcomer = admit(registry, "newcomer", "192.0.2.1", true, shed);
         assertNotNull(newcomer.entry, "the newcomer is admitted");
         assertEquals(1, shed.size(), "one shed frees both the slot and the newcomer's room");
@@ -532,9 +532,9 @@ class PreLoginRegistryTest {
                 .capacity(ResourcePools.Pool.PRE_LOGIN, capacity);
         PreLoginRegistry registry = new PreLoginRegistry(pools, 4, new Random(1));
         Conn filler = new Conn("filler");
-        filler.entry = registry.admit(ip("192.0.2.1"), filler, 6, true, now::get, () -> filler.closed = true);
+        filler.entry = registry.admit(ip("192.0.2.1"), filler, 5, true, now::get, () -> filler.closed = true);
         Conn waiter = new Conn("waiter");
-        waiter.entry = registry.admit(ip("198.51.100.1"), waiter, 6, true, now::get, () -> waiter.closed = true);
+        waiter.entry = registry.admit(ip("198.51.100.1"), waiter, 5, true, now::get, () -> waiter.closed = true);
 
         assertTrue(filler.entry.chargeEarlyData(950_000));
         assertEquals(PreLoginTracker.ChargeResult.WAIT, waiter.entry.chargeDeclaredFrame(900_000, 100));
@@ -560,7 +560,7 @@ class PreLoginRegistryTest {
         Conn victim = admit(registry, "victim", "192.0.2.1", false, shed);
         List<String> woken = new ArrayList<>();
 
-        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 5, false,
                 System::nanoTime, () -> victim.closed = true, () -> woken.add("newcomer"));
         assertTrue(first.pending, "the victim's bytes are still charged, so the newcomer waits");
         assertNull(first.entry, "pending is not an admission");
@@ -570,7 +570,7 @@ class PreLoginRegistryTest {
         victim.entry.close();
         assertEquals(Arrays.asList("newcomer"), woken, "the confirmed close wakes the pending newcomer once");
 
-        PreLoginRegistry.Admission second = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+        PreLoginRegistry.Admission second = registry.attempt(ip("198.51.100.1"), "newcomer", 5, false,
                 System::nanoTime, () -> { }, () -> woken.add("again"));
         assertFalse(second.pending, "after the confirmation the retry is decided");
         assertNotNull(second.entry, "the newcomer is admitted, not refused");
@@ -589,13 +589,13 @@ class PreLoginRegistryTest {
         Conn other = admit(registry, "other", "192.0.2.2", false, shed);
         List<String> woken = new ArrayList<>();
 
-        PreLoginRegistry.Admission lease = registry.shedForLease(ip("198.51.100.1"), 6, "lease", () -> woken.add("lease"));
+        PreLoginRegistry.Admission lease = registry.shedForLease(ip("198.51.100.1"), 5, "lease", () -> woken.add("lease"));
         assertTrue(lease.pending, "the newcomer waits for the victim's lease to come back");
         assertTrue(victim.closed || other.closed, "one victim was shed");
         Conn shedOne = victim.closed ? victim : other;
         Conn kept = shedOne == victim ? other : victim;
 
-        PreLoginRegistry.Admission again = registry.shedForLease(ip("198.51.100.1"), 6, "again", () -> woken.add("again"));
+        PreLoginRegistry.Admission again = registry.shedForLease(ip("198.51.100.1"), 5, "again", () -> woken.add("again"));
         assertTrue(again.pending, "a second newcomer also waits");
         assertFalse(kept.closed, "no second victim is shed while the first close is unconfirmed");
         assertTrue(woken.isEmpty(), "nothing is woken before the victim's close is confirmed");
@@ -624,7 +624,7 @@ class PreLoginRegistryTest {
         assertEquals(2 * STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN));
 
         List<String> woken = new ArrayList<>();
-        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 5, false,
                 System::nanoTime, () -> { }, () -> woken.add("newcomer"));
         assertTrue(first.pending, "the newcomer waits for the victim's close");
         assertTrue(victim.closed, "the least-progressed victim was shed");
@@ -638,7 +638,7 @@ class PreLoginRegistryTest {
         other.entry.releaseExtra(0);
         assertEquals(STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN), "no declared bytes were granted");
 
-        PreLoginRegistry.Admission second = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+        PreLoginRegistry.Admission second = registry.attempt(ip("198.51.100.1"), "newcomer", 5, false,
                 System::nanoTime, () -> { }, () -> woken.add("again"));
         assertNotNull(second.entry, "the newcomer is admitted on its retry");
         assertFalse(second.pending);
@@ -659,7 +659,7 @@ class PreLoginRegistryTest {
         other.entry.recordProgress(1);
 
         List<String> woken = new ArrayList<>();
-        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 5, false,
                 System::nanoTime, () -> { }, () -> woken.add("newcomer"));
         assertTrue(first.pending, "the newcomer waits for the victim's close");
         assertTrue(victim.closed, "the least-progressed victim was shed");
@@ -670,7 +670,7 @@ class PreLoginRegistryTest {
                 "a fresh declared charge is not granted the bytes owed to the newcomer");
         assertEquals(STAGED, pools.held(ResourcePools.Pool.PRE_LOGIN), "no declared bytes were granted");
 
-        PreLoginRegistry.Admission second = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false,
+        PreLoginRegistry.Admission second = registry.attempt(ip("198.51.100.1"), "newcomer", 5, false,
                 System::nanoTime, () -> { }, () -> woken.add("again"));
         assertNotNull(second.entry, "the newcomer is admitted on its retry");
         assertFalse(other.closed, "no second victim is shed for the newcomer");
@@ -690,7 +690,7 @@ class PreLoginRegistryTest {
         List<Conn> shed = new ArrayList<>();
         Conn victim = admit(registry, "victim", "192.0.2.1", false, shed);
         List<Integer> openWhenWoken = new ArrayList<>();
-        PreLoginRegistry.Admission lease = registry.shedForLease(ip("198.51.100.1"), 6, "newcomer",
+        PreLoginRegistry.Admission lease = registry.shedForLease(ip("198.51.100.1"), 5, "newcomer",
                 () -> openWhenWoken.add(admission.openConnections()));
         assertTrue(lease.pending, "the newcomer waits for the slot");
         assertTrue(victim.closed, "the victim was shed");
@@ -708,14 +708,14 @@ class PreLoginRegistryTest {
         List<Conn> shed = new ArrayList<>();
         Conn victim = admit(registry, "victim", "192.0.2.1", false, shed);
         long accepted = now.get();
-        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false, now::get,
+        PreLoginRegistry.Admission first = registry.attempt(ip("198.51.100.1"), "newcomer", 5, false, now::get,
                 accepted, () -> { }, () -> { });
         assertTrue(first.pending, "the newcomer waits for the victim's close");
 
         now.set(accepted + PreLoginTracker.HARD_CAP_NANOS - 1_000_000_000L);
         victim.entry.close();
         now.set(accepted + PreLoginTracker.HARD_CAP_NANOS);
-        PreLoginRegistry.Admission retry = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false, now::get,
+        PreLoginRegistry.Admission retry = registry.attempt(ip("198.51.100.1"), "newcomer", 5, false, now::get,
                 accepted, () -> { }, () -> { });
         assertNull(retry.entry, "an expired newcomer is refused, not admitted");
         assertFalse(retry.pending, "an expired newcomer is refused, not kept pending");
@@ -733,7 +733,7 @@ class PreLoginRegistryTest {
         // Granted at 9 s, inside the 10 s client-wait deadline. Its platform wait then pauses the client-wait clock,
         // so only the 30 s hard cap (from the first acceptance, not from the grant) can expire it.
         now.set(accepted + 9_000_000_000L);
-        PreLoginRegistry.Admission grant = registry.attempt(ip("198.51.100.1"), "newcomer", 6, false, now::get,
+        PreLoginRegistry.Admission grant = registry.attempt(ip("198.51.100.1"), "newcomer", 5, false, now::get,
                 accepted, () -> { }, () -> { });
         assertNotNull(grant.entry, "the newcomer is granted at 9 s");
         assertFalse(grant.entry.expired(), "at 9 s it is alive");
