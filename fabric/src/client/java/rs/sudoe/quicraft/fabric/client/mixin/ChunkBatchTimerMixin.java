@@ -3,7 +3,6 @@ package rs.sudoe.quicraft.fabric.client.mixin;
 
 import net.minecraft.client.multiplayer.ChunkBatchSizeCalculator;
 import net.minecraft.client.multiplayer.ClientPacketListener;
-import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchStartPacket;
 import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
@@ -30,10 +29,6 @@ abstract class ChunkBatchTimerMixin {
     @Final
     private ChunkBatchSizeCalculator chunkBatchSizeCalculator;
 
-    @Shadow
-    @Final
-    protected Connection connection;
-
     @Unique
     private volatile boolean quicraft$awaitingFirstChunk;
 
@@ -51,7 +46,7 @@ abstract class ChunkBatchTimerMixin {
         }
         try {
             Hooks.enter("v3 batch timer");
-            boolean v3 = V3Hooks.isV3(connection);
+            boolean v3 = V3Hooks.isV3(((ClientPacketListener) (Object) this).getConnection());
             if (ChunkPacing.restartTimer(true, v3, true)) {
                 chunkBatchSizeCalculator.onBatchStart();
             }
