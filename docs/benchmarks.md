@@ -1171,3 +1171,20 @@ Production defaults (coalescing on, timer fix on), commit ce9b9e1, same real-Fab
 Against the coalescing table above (clean /3 3296 ms, delayloss /3 4699-5190 ms) the clean-link chunk load halves
 and delayloss improves, with RTT still at TCP parity under loss. Open: clean /3 still trails TCP (1497 vs 753 ms
 chunk load, 1.50 vs 0.59 ms RTT); join is ~0.2-0.6 s slower.
+
+### /3 on a slow link (2026-10-21, n=2 per arm, interleaved TCP)
+
+New `slow` netem profile: `delay 75ms loss 2% rate 2mbit` each way (delayloss plus a bandwidth cap, so a server
+that out-produces the link builds a queue). Production defaults at 4b10c7d (coalescing on, first-chunk batch timer
+on). Cap confirmed in the netem status (`rate 2Mbit` on both qdiscs). Per run:
+
+| arm | run | join ms | chunk load ms | rtt median ms | rtt p95 ms | disconnected |
+|---|---|---|---|---|---|---|
+| tcp | 0 | 2069 | 28833 | 151.36 | 303.39 | no |
+| tcp | 1 | 2085 | 39376 | 151.32 | 303.31 | no |
+| /3 | 0 | 2944 | 6401 | 152.32 | 322.35 | no |
+| /3 | 1 | 2673 | 6191 | 152.38 | 319.70 | no |
+
+With vanilla pacing (no server-side rate floor) /3 does not hit the blocked-head deadline (0x12) on this link, and
+loads chunks about 5x faster than TCP. The 0x12 seen with the rejected server floor stays a risk for any change
+that makes the server send faster than the client's measured rate.
