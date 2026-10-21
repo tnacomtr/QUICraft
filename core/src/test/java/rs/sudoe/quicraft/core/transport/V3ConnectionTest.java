@@ -895,6 +895,8 @@ class V3ConnectionTest {
 
     /** As above, with the platform's compression state at activation (13.4). */
     static void activate(V3Connection connection, Game game, int protocol, boolean compressed) throws Exception {
+        // 13.2: activation needs the negotiated N; on a slow runner the preamble exchange can still be in flight.
+        assertTrue(await(() -> negotiated(connection) != null, 10_000), "the preamble exchange negotiated N");
         connection.detachForActivation(leftover -> { });
         if (protocol >= 0) {
             connection.activate(game, protocol, compressed, null);

@@ -449,15 +449,31 @@ class GameLanesV3LoopbackTest {
                 Thread.sleep(10);
             }
             assertTrue(serverSide.handshakeComplete(), "12.7: the server must see its own handshake");
+            awaitNegotiated(serverSide);
             serverSide.detachForActivation(ignored -> { });
             serverSide.activate(serverLanes, PROTOCOL, false, leftover);
             awaitSession(serverSide);
         }
 
         void activateClient(ByteBuffer leftover) throws Exception {
+            awaitNegotiated(client);
             client.detachForActivation(ignored -> { });
             client.activate(clientLanes, false, leftover);
             awaitSession(client);
+        }
+
+        /** 13.2: activation needs the negotiated N; on a slow runner the preamble exchange can still be in flight. */
+        private static void awaitNegotiated(V3Connection connection) throws Exception {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (System.nanoTime() < deadline) {
+                try {
+                    connection.sessionContext();
+                    return;
+                } catch (IllegalStateException notYet) {
+                    Thread.sleep(5);
+                }
+            }
+            connection.sessionContext();
         }
 
         private static void awaitSession(V3Connection connection) throws Exception {
