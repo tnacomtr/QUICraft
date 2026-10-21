@@ -1684,11 +1684,18 @@ before this revision can run.
       qualified progress renews the no-progress deadline: a validated unit committing D on an
       unresolved prerequisite's stream, including a transitive prerequisite, whose opening sequence
       is at or below that prerequisite's required sequence, judged on the head's pre-commit chain.
-      It renews only when (a) that commit reaches the required sequence, or (b) qualifying commits
-      since the previous renewal total at least 64 KiB of encoded wire bytes. Renewal discards
-      surplus credit, and each commit counts once per waiting head. Raw arrivals, partial records,
+      It renews only when (a) that commit reaches the head's OWN direct dependency entry on that
+      stream while the entry is still unresolved, or (b) qualifying commits since the previous
+      renewal total at least 64 KiB of encoded wire bytes. Arm (a) applies only to the waiting
+      head's own direct dependency entries: a commit on a transitive-only prerequisite earns byte
+      credit under (b) and never renews under (a), so a chain of tiny records cannot re-arm the
+      deadline through an intermediate head. The expiry decision and the renewal of one commit
+      use one observation of the transport clock and stall source, so an expiry reached at that
+      observation is never renewed. Renewal discards surplus credit, and each commit counts once
+      per waiting head. Raw arrivals, partial records,
       Q advancement, transport acknowledgments and unrelated commits earn no credit. An expiry
-      already reached in the pre-commit state cannot be rescued by a later commit. These numbers
+      already reached in the pre-commit state cannot be rescued by a later commit; that commit is
+      not applied, and the expiry closes ahead of any 0x11 the commit would otherwise raise. These numbers
       are proposed operational defaults, not measured guarantees. The
       receiver cannot distinguish an honestly lost prerequisite from a forged future one.
       Dependency chains are bounded by composition: cycles close immediately, and every
@@ -2151,8 +2158,8 @@ before this revision can run.
       receiver cannot distinguish honest loss from a forged dependency. When a no-progress
       expiry and an absolute-retention expiry are both reached, the no-progress expiry applies.
       Absolute-retention expiry closes generic resource `0x12`, without the `unseen-prerequisite`
-      phrase or its counted failure-cache event. The sender of that
-      close puts the fixed ASCII reason phrase `unseen-prerequisite` in the CONNECTION_CLOSE
+      phrase or its counted failure-cache event. The sender of a no-progress expiry close puts the
+      fixed ASCII reason phrase `unseen-prerequisite` in the CONNECTION_CLOSE
       frame (authenticated after the handshake). Any other reason phrase, or none, on a
       local/resource-code close means generic shedding or refusal. A server MUST NOT send the
       phrase, and closes as generic resource instead, when the expired wait consumed any
