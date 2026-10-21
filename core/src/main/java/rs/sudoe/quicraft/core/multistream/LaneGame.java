@@ -93,6 +93,13 @@ public interface LaneGame {
      */
     void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle);
 
+    /** As above, with decoded bytes attached to this exact delivery, not a decode-order FIFO.
+     * Dropped/invalid decodes never create delivery metadata. Additive for existing game adapters.
+     */
+    default void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle, long decodedBytes) {
+        deliver(lane, sequence, packets, bundle);
+    }
+
     /**
      * The unsent-queue backpressure flag changed (13.12). While false, a game that honours it
      * submits nothing more; a producer that exceeds the cap anyway disconnects with 0x11.

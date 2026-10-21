@@ -124,7 +124,6 @@ public final class V3Join implements BindingDecodeContext.Gate {
     private boolean sinkActive;
     private OutboundHold outHold;
     private AckBacklog backlog;
-    private final java.util.ArrayDeque<Long> decodedSizes = new java.util.ArrayDeque<>();
     private boolean retryScheduled;
     private OutboundFilter filter;
     private ChannelFuture lastBindingWrite;
@@ -509,7 +508,6 @@ public final class V3Join implements BindingDecodeContext.Gate {
         }
         ChannelPipeline pipeline = channel.pipeline();
         codec = new PacketLaneCodec(pipeline);
-        codec.onDecoded(size -> decodedSizes.add(Long.valueOf(size)));
         // Inbound: decoded records re-enter the game's pipeline right behind the frame splitter, as
         // the frames TCP would have delivered, so every handler after it runs as usual.
         ChannelHandlerContext deliverFrom = pipeline.context(SPLITTER);
@@ -1007,8 +1005,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
                     ctx.executor().schedule(() -> acknowledge(ctx, ack), 1, TimeUnit.MILLISECONDS);
                     return;
                 }
-                Long size = decodedSizes.poll();
-                backlog.delivered(ack.lane(), ack.sequence(), 1, size == null ? 0 : size.longValue());
+                backlog.delivered(ack.lane(), ack.sequence(), 1, ack.decodedBytes());
                 scheduleRetry(ctx);
             } catch (Throwable t) {
                 fail("binding ack: " + describe(t), t);

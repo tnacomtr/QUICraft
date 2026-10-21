@@ -309,7 +309,7 @@ public final class ServerReceiveDriver {
         List<Object> packets = new ArrayList<Object>(1);
         packets.add(decoded.packet());
         game.onEnqueued(lane, stream, entry.sequence);
-        game.deliver(lane, entry.sequence, packets, false);
+        game.deliver(lane, entry.sequence, packets, false, decoded.uncompressedBytes());
         return true;
     }
 

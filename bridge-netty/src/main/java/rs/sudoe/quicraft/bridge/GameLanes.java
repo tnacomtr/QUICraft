@@ -137,11 +137,17 @@ public final class GameLanes implements LaneGame {
         private final Lane lane;
         private final long sequence;
         private final boolean bundle;
+        private final long decodedBytes;
 
         Ack(Lane lane, long sequence, boolean bundle) {
+            this(lane, sequence, bundle, 0);
+        }
+
+        Ack(Lane lane, long sequence, boolean bundle, long decodedBytes) {
             this.lane = lane;
             this.sequence = sequence;
             this.bundle = bundle;
+            this.decodedBytes = decodedBytes;
         }
 
         public Lane lane() {
@@ -155,6 +161,11 @@ public final class GameLanes implements LaneGame {
 
         public boolean bundle() {
             return bundle;
+        }
+
+        /** Decoded bytes of this delivery only; never paired by position with another decode. */
+        public long decodedBytes() {
+            return decodedBytes;
         }
     }
 
@@ -455,10 +466,15 @@ public final class GameLanes implements LaneGame {
 
     @Override
     public void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle) {
+        deliver(lane, sequence, packets, bundle, 0);
+    }
+
+    @Override
+    public void deliver(Lane lane, long sequence, List<Object> packets, boolean bundle, long decodedBytes) {
         if (lane == null || packets == null || packets.isEmpty()) {
             throw new IllegalArgumentException("lane/packets");
         }
-        Delivery delivery = new Delivery(lane, sequence, new ArrayList<Object>(packets), bundle);
+        Delivery delivery = new Delivery(lane, sequence, new ArrayList<Object>(packets), bundle, decodedBytes);
         EventLoop loop = game.eventLoop();
         boolean drainNow = false;
         synchronized (queued) {
@@ -505,7 +521,7 @@ public final class GameLanes implements LaneGame {
                     game.pipeline().fireChannelRead(packet);
                 }
             }
-            Ack ack = new Ack(delivery.lane, delivery.sequence, delivery.bundle);
+            Ack ack = new Ack(delivery.lane, delivery.sequence, delivery.bundle, delivery.decodedBytes);
             if (deliverFrom != null) {
                 deliverFrom.fireChannelRead(ack);
             } else {
@@ -736,12 +752,14 @@ public final class GameLanes implements LaneGame {
         final long sequence;
         final List<Object> packets;
         final boolean bundle;
+        final long decodedBytes;
 
-        Delivery(Lane lane, long sequence, List<Object> packets, boolean bundle) {
+        Delivery(Lane lane, long sequence, List<Object> packets, boolean bundle, long decodedBytes) {
             this.lane = lane;
             this.sequence = sequence;
             this.packets = packets;
             this.bundle = bundle;
+            this.decodedBytes = decodedBytes;
         }
     }
 
