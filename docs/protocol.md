@@ -1652,9 +1652,12 @@ before this revision can run.
        these are the server maxima for this draft, with lower local policy allowed. Apply the
        same FIFO, eligibility, equality, held-commit and completion-accounting requirements.
        A listener refusing markers holds commits (and retries in order); a refused backlog
-       charge holds the commit for local retry and never closes the connection. Backlog takes
-       over the unit's existing decode reservation, with no second charge. A backlog sub-cap
-       inside the node budget defaults to 25% and MUST NOT starve read admission. A commit held
+       charge holds the commit for local retry, in delivery order, and never closes the
+       connection; until its charge succeeds the unit keeps its read/decode charge and stream.
+       The backlog charge (node budget plus a node-wide backlog sub-cap, default 25% of the node
+       budget, so backlogs can never starve read admission) is a separate ledger from the
+       per-connection decode partition: each retained unit is charged once to each ledger,
+       never twice to the node budget. A commit held
        for backlog marks the executing unit locally withheld, never peer blame. A pending inbound
        protocol swap waits for actual completion. Queued bytes additionally remain charged
        against the node receive budget until the marker runs; refusal is a local wait, not
@@ -1788,10 +1791,11 @@ before this revision can run.
     state/window is about 40 KiB, separately charged as connection memory outside the 24 KiB
     receive share. Vanilla already pays this cost per compressed connection. Server accepted
     backlog (13.10) is capped at 2 MiB/2,048 committed-but-unexecuted packets per connection,
-    allocated lazily and charged to the node receive budget until completion. It takes over
-    the unit's existing decode reservation, never a second charge. The node-budget sub-cap
-    defaults to 25% and may not starve read admission. A refused charge holds the commit for
-    local retry, not connection close. One over-threshold uncommitted unit retains its existing
+    allocated lazily and charged to the node receive budget until completion, never twice: the
+    per-connection decode partition is a separate ledger, released at commit only after the
+    backlog charge succeeds. All backlogs together stay within a node-wide sub-cap (default 25%
+    of the node budget), so they may not starve read admission. A refused charge holds the
+    commit for local retry in delivery order, not connection close. One over-threshold uncommitted unit retains its existing
     read/decode charge until release; accepted commit MUST NOT release that live data charge.
     This backlog is NOT covered by the 24 KiB admission share or inflater reservation. These two
      reservations total about 64 KiB per logged-in compressed connection. The staged
@@ -2379,7 +2383,7 @@ before this revision can run.
      enabled-features, reset-chat) and server chat/commands via FutureChain. Require completion-
      only commit for handlers QUICraft moves off-queue or routing dependencies; never accept a
      marker on another executor. Test terminal client units holding commit through inbound
-     decoder installation, backlog charge transfer/refusal and local-withheld attribution,
+     decoder installation, backlog charge refusal/ordered retry and local-withheld attribution,
      uncompressed bytes plus 64-byte packet overhead, sub-cap read-admission protection, and
      bounded off-FIFO work after marker retirement.
      Stall the FIFO until the bound holds D: no further delivery, bounded reserved head reads,
