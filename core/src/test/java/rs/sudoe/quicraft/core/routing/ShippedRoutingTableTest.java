@@ -72,28 +72,29 @@ class ShippedRoutingTableTest {
     }
 
     /**
-     * Covered block updates and block_changed_ack remain global until 13.19 is wired. The chunk install
-     * is safe on CHUNK because later block updates, forget and light remain global, and the global fence
-     * orders them after every shard record. Every other route is either global CONTROL (ordered
-     * against all records), the view gate, or REALTIME whose send waits for the latest CONTROL fence. The
-     * only relaxations are REALTIME against REALTIME, REALTIME against non-global control, and install
-     * records against global records; global records wait for every shard record.
+     * Every shipped route is one of the reviewed classes: CONTROL/global, the view gate,
+     * REALTIME/lane, a CHUNK route (45, 6, 8, 37, 84), ordinary CONTROL, or a control fence.
+     * block_changed_ack (4) and chunk_batch_finished (11) stay global until 13.19 is wired, so a
+     * global record still orders them after every shard record. Ordinary routes wait for their
+     * CONTROL predecessor and G only; control fences additionally order later REALTIME.
      */
     @Test
-    void everyShippedRelaxationPreservesGlobalFencesAroundChunkInstall() throws Exception {
+    void everyShippedRelaxationIsOneOfTheReviewedClasses() throws Exception {
         Faults.set();
         for (Map.Entry<RouteKey, RouteV2> entry : RoutingTableLoader.loadResource(PROTOCOL).routesV2().entrySet()) {
             RouteV2 route = entry.getValue();
             boolean global = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.GLOBAL;
             boolean realtime = route.lane == RouteV2.StreamLane.REALTIME && route.dependency == Dependency.LANE;
             boolean view = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.VIEW;
+            boolean ordinary = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.ORDINARY;
+            boolean controlFence = route.lane == RouteV2.StreamLane.CONTROL && route.dependency == Dependency.CONTROL;
             boolean chunkRoute = entry.getKey().direction() == Direction.CLIENTBOUND
                     && entry.getKey().state() == ProtocolState.PLAY
                     && (entry.getKey().packetId() == 45 || entry.getKey().packetId() == 6
                             || entry.getKey().packetId() == 8 || entry.getKey().packetId() == 84
                             || entry.getKey().packetId() == 37)
                     && route.lane == RouteV2.StreamLane.CHUNK && route.dependency == Dependency.LANE;
-            assertTrue(global || realtime || view || chunkRoute,
+            assertTrue(global || realtime || view || ordinary || controlFence || chunkRoute,
                     "unexpected relaxation: " + route.lane + "/" + route.dependency);
         }
     }
