@@ -118,7 +118,7 @@ failure; no image, host qdisc, route or firewall is touched. The run succeeds on
 `<out-dir>/<arm>-<netem>-run<N>.json` exists, parses, and `runs[0].ok` is true.
 
 Options/knobs: `--port` (must be 25565, the port the server advertises), `--play-seconds` (default 20),
-`--netem` (`clean loss delay delayloss reorder jitter`, applied to the server container by
+`--netem` (`clean loss delay delayloss reorder jitter slow`, applied to the server container by
 `testkit/netem-attach.sh`),
 `QUICRAFT_ARM_READY_TIMEOUT` (180 s) and `QUICRAFT_ARM_MOD_JSON` (the entrypoint file; tests use a
 copy). Needs Docker Compose v2, JDK 25, `python3`, `git`, `flock`, and a display or `xvfb-run`.

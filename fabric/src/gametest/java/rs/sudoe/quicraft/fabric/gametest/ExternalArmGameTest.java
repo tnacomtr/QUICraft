@@ -45,7 +45,7 @@ import rs.sudoe.quicraft.fabric.client.Screens;
  */
 public class ExternalArmGameTest implements FabricClientGameTest {
     private static final Pattern COMMIT = Pattern.compile("[0-9a-f]{40}");
-    private static final Set<String> NETEM = Set.of("clean", "loss", "delay", "delayloss", "reorder", "jitter");
+    private static final Set<String> NETEM = Set.of("clean", "loss", "delay", "delayloss", "reorder", "jitter", "slow");
     private static final int PING_EVERY_TICKS = 5;
     private static final long QUIET_NANOS = 2_000_000_000L;
     private static final int JOIN_TIMEOUT_TICKS = 20 * 90;

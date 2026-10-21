@@ -79,7 +79,7 @@ command -v tc >/dev/null 2>&1 || refuse "tc (iproute2) is not installed"
 [ -r "$profiles_file" ] || refuse "trusted profile file $profiles_file is not readable"
 # shellcheck source=/dev/null
 . "$profiles_file"
-args="$(netem_args "$profile")" || refuse "unknown PROFILE '$profile' (allowed: clean loss delay delayloss reorder jitter)"
+args="$(netem_args "$profile")" || refuse "unknown PROFILE '$profile' (allowed: clean loss delay delayloss reorder jitter slow)"
 
 netns="$(readlink /proc/self/ns/net)" || refuse "cannot read the current network namespace identity"
 route="$(ip -4 route show default)" || refuse "cannot read IPv4 default routes"

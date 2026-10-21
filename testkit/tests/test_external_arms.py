@@ -287,7 +287,7 @@ class RunnerArgumentsTest(Fixture):
              "--play-seconds must be a positive integer"),
             ("unknown_netem", ["--arm", "tcp", "--run", "0", "--out-dir", "out",
                                "--netem", "lossy"],
-             "--netem must be clean, loss, delay, delayloss, reorder or jitter"),
+             "--netem must be clean, loss, delay, delayloss, reorder, jitter or slow"),
             ("wrong_port", ["--arm", "tcp", "--run", "0", "--out-dir", "out",
                             "--port", "25575"],
              "--port must be 25565"),

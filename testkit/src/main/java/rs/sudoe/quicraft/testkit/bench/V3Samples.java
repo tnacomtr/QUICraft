@@ -73,7 +73,7 @@ public final class V3Samples {
             + " provenance self-reported, live measurement not verified.";
 
     private static final Set<String> NETEM_PROFILES =
-            Set.of("clean", "loss", "delay", "delayloss", "reorder", "jitter");
+            Set.of("clean", "loss", "delay", "delayloss", "reorder", "jitter", "slow");
 
     /** Row fields the validator never requires and only type-checks when present. */
     private static final Set<String> OPTIONAL_COMPONENTS = Set.of("error", "net", "quic");

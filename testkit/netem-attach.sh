@@ -9,7 +9,7 @@
 #   testkit/netem-attach.sh apply  --project quicraft-arm-<id> --profile <p> [--port 25565]
 #   testkit/netem-attach.sh status --project quicraft-arm-<id> [--profile <p>] [--port 25565]
 #
-# Profiles: clean loss delay delayloss reorder jitter.
+# Profiles: clean loss delay delayloss reorder jitter slow.
 # status defaults to --profile delay because that is the layout that carries the egress and
 # ingress filters (the profile name only decides whether an IFB is expected; the counters
 # are read from the namespace). Pass --profile clean after a clean attach.
@@ -37,7 +37,7 @@ helper_script=/usr/local/bin/server-netem.sh
 usage() {
     echo "usage: $prog apply --project <name> --profile <profile> [--port <port>]" >&2
     echo "       $prog status --project <name> [--profile <profile>] [--port <port>]" >&2
-    echo "profile: clean loss delay delayloss reorder jitter" >&2
+    echo "profile: clean loss delay delayloss reorder jitter slow" >&2
     echo "port: internal game port, default 25565" >&2
     exit 2
 }
@@ -87,8 +87,8 @@ case "$mode" in
 esac
 
 case "$profile" in
-    clean | loss | delay | delayloss | reorder | jitter) ;;
-    *) refuse "unknown profile '$profile' (allowed: clean loss delay delayloss reorder jitter)" ;;
+    clean | loss | delay | delayloss | reorder | jitter | slow) ;;
+    *) refuse "unknown profile '$profile' (allowed: clean loss delay delayloss reorder jitter slow)" ;;
 esac
 
 case "$port" in
