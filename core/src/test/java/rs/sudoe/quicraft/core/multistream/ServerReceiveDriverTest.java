@@ -231,6 +231,79 @@ class ServerReceiveDriverTest {
         assertEquals(0L, h.driver.receiver().slots().workspaceInUse());
     }
 
+    /** A REALTIME GAME record of about 515 wire bytes (near the REALTIME cap); its packet id is the last byte. */
+    static byte[] realtimeRecSized(long seq) {
+        byte[] payload = new byte[500];
+        payload[499] = (byte) PID_REALTIME;
+        return RecordCodec.encodeRecord(new Record(LogicalStream.REALTIME, seq, 0,
+                Collections.<Record.Dependency>emptyList(), RecordCodec.KIND_GAME, SessionReadPumpTest.inner(payload)));
+    }
+
+    /**
+     * Commits {@code count} REALTIME records from sequence {@code from} at {@code second}, each applied through the
+     * driver. Returns the next unused sequence. Each commit is qualifying progress for a CONTROL head that waits on
+     * a far REALTIME sequence, so about 128 of them (64 KiB) renew that head's base deadline.
+     */
+    private static long commitRealtime(Harness h, long second, long from, int count) throws Exception {
+        h.now[0] = TimeUnit.SECONDS.toNanos(second);
+        long seq = from;
+        for (int i = 0; i < count; i++, seq++) {
+            // put() replaces the bytes but not the read position; the previous record was fully consumed.
+            h.source.put(LogicalStream.REALTIME, realtimeRecSized(seq));
+            h.source.pos[LogicalStream.REALTIME] = 0;
+            String enqueued = "enqueued " + LogicalStream.REALTIME + ":" + seq;
+            for (int r = 0; r < 100 && !h.game.log.contains(enqueued); r++) {
+                h.rounds(1);
+            }
+            assertTrue(h.game.log.contains(enqueued), enqueued);
+            h.driver.acknowledged(LogicalStream.REALTIME, seq);
+        }
+        return seq;
+    }
+
+    @Test void renewalThroughTheServerDriverThenSilenceClosesOnceAtTheNoProgressDeadline() throws Exception {
+        Harness h = new Harness(false, true);
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(LogicalStream.REALTIME, 100000),
+                        PID_CONTROL));
+        h.rounds(30);
+        assertNotNull(h.driver.receiver().head(LogicalStream.CONTROL), "the blocked head owns the wait");
+        commitRealtime(h, 5, 1, 140);
+        assertTrue(h.codes.isEmpty(), "about 70 KiB of qualifying commits renewed the base at 5 s");
+        h.now[0] = TimeUnit.SECONDS.toNanos(14);
+        h.rounds(1);
+        assertTrue(h.codes.isEmpty(), "the renewed base runs to 15 s, not 10 s");
+        h.now[0] = TimeUnit.SECONDS.toNanos(15);
+        h.rounds(5);
+        h.rounds(5);
+        assertEquals(Collections.singletonList(0x12), h.codes, "exactly one close");
+        // Every renewing REALTIME commit was an executor-held prerequisite (13.12): generic, and never counted.
+        assertEquals(Collections.singletonList("resource"), h.reasons);
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse(), "the close returns the workspace reservations");
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL), "the blocked head's slot is released");
+    }
+
+    @Test void absoluteRetentionClosesOnceGenericWhileRenewalsContinueOnTheServerDriver() throws Exception {
+        Harness h = new Harness(false, true);
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(LogicalStream.REALTIME, 100000),
+                        PID_CONTROL));
+        h.rounds(30);
+        long seq = 1;
+        for (int second = 5; second <= 115; second += 5) {
+            seq = commitRealtime(h, second, seq, 140);
+            assertTrue(h.codes.isEmpty(), "qualifying commits renewed the base at " + second + " s");
+        }
+        h.now[0] = TimeUnit.SECONDS.toNanos(120);
+        h.rounds(5);
+        h.rounds(5);
+        assertEquals(Collections.singletonList(0x12), h.codes, "exactly one close, at the 120 s retention");
+        assertEquals(Collections.singletonList("resource"), h.reasons,
+                "absolute retention is generic: no unseen-prerequisite phrase");
+        assertEquals(0L, h.driver.receiver().slots().workspaceInUse(), "the close returns the workspace reservations");
+        assertFalse(h.driver.receiver().slots().holdsHead(LogicalStream.CONTROL), "the blocked head's slot is released");
+    }
+
     /** A cumulative source coherent with the harness's non-excluding transport clock. */
     private static final class CumulativeSource implements StallClock {
         private final long[] now;

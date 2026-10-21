@@ -408,13 +408,21 @@ class StreamReceiverTest {
         assertEquals(1, f.receiver.enqueuedWatermark(2));
         assertEquals(0, f.receiver.appliedWatermark(2));
         assertEquals(-1, f.receiver.nextToEnqueue(), "Q must not release the dependent");
-        f.now.set(100 * SEC);
-        ReceiveClose waiting = f.receiver.expiredWait();
-        assertNotNull(waiting, "the dependent stays blocked until D, so its own wait expires");
-        assertEquals(0x12, waiting.errorCode());
         f.receiver.applied(2, 1);
         assertEquals(1, f.receiver.appliedWatermark(2));
         assertEquals(3, f.receiver.nextToEnqueue());
+
+        Fixture late = new Fixture(2);
+        assertAdmitted(late.receiver, rec(2, 1, 0));
+        assertAdmitted(late.receiver, rec(3, 1, 0, dep(2, 1)));
+        enqueue(late.receiver, 2, 1);
+        late.now.set(100 * SEC);
+        ReceiveClose waiting = late.receiver.expiredWait();
+        assertNotNull(waiting, "the dependent stays blocked until D, so its own wait expires");
+        assertEquals(0x12, waiting.errorCode());
+        late.receiver.applied(2, 1);
+        assertEquals(0, late.receiver.appliedWatermark(2), "a lapsed wait is terminal: the commit is not applied");
+        assertEquals(0x12, late.receiver.pendingViolation().errorCode());
     }
 
     @Test void headAdmittedDuringAStallStartsExcludedUntilTheStallEnds() {
@@ -558,6 +566,62 @@ class StreamReceiverTest {
         assertEquals(1, f.receiver.epoch());
         assertNull(f.receiver.pendingViolation());
         assertEquals(2, f.receiver.nextToEnqueue(), "the chunk head is released normally");
+    }
+
+    @Test void lapsedExpiryClosesBeforeAPostCommitOrderingViolation() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 1, dep(1, 1)));
+        assertAdmitted(f.receiver, rec(1, 1, 0));
+        enqueue(f.receiver, 1, 1);
+        // Without the lapsed wait, this apply would raise 0x11 (no transition path to epoch 1, 13.18).
+        f.now.set(10 * SEC);
+        f.receiver.applied(1, 1);
+        assertUnseen(f.receiver.pendingViolation());
+        assertNotNull(f.receiver.head(1), "the lapsed commit changed no state");
+        assertNotNull(f.receiver.head(2), "the waiting head is still held for the close");
+    }
+
+    @Test void settlementReadsTheSourceOnceAndRenewsFromThatReading() {
+        SteppingSource source = new SteppingSource(0, 9 * SEC, 20 * SEC);
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1000)));
+        int before = source.samples;
+        commit(rx, rec(3, 1, 0), 64 * KIB, route(3));
+        assertEquals(before + 1, source.samples, "one source reading for the whole settlement");
+        // The renewal used the 9 s settlement reading. The next reading (20 s) is 11 s past it, so the base has
+        // expired. Had the renewal taken its own reading at 20 s, the base would still be live here.
+        assertUnseen(rx.expiredWait());
+    }
+
+    @Test void expiryAtTheSettlementReadingIsNeverRenewed() {
+        SteppingSource source = new SteppingSource(0, 20 * SEC);
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1000)));
+        assertAdmitted(rx, rec(3, 1, 0));
+        enqueue(rx, 3, 1, route(3));
+        rx.applied(3, 1);
+        assertUnseen(rx.pendingViolation());
+        assertNotNull(rx.head(3), "the lapsed commit changed no state");
+    }
+
+    @Test void unavailableSourceDuringSettlementClosesGenericWithNoStateChange() {
+        ScriptedSource source = new ScriptedSource().set(0, 0);
+        int[] validatorCalls = new int[1];
+        StreamReceiver rx = new StreamReceiver(2, Direction.CLIENTBOUND,
+                (s, r, route) -> { validatorCalls[0]++; return true; }, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1000)));
+        assertAdmitted(rx, rec(3, 1, 0));
+        enqueue(rx, 3, 1, route(3));
+        int callsBefore = validatorCalls[0];
+        source.valid = false;
+        rx.applied(3, 1);
+        ReceiveClose close = rx.pendingViolation();
+        assertNotNull(close, "the unavailable source must close the connection");
+        assertEquals(0x12, close.errorCode());
+        assertNull(close.reason(), "an unavailable source is a generic resource close, no phrase");
+        assertEquals(callsBefore, validatorCalls[0], "the commit made no callback");
+        assertNotNull(rx.head(3), "the commit did not run");
+        assertNotNull(rx.head(2), "the waiting head is untouched");
     }
 
     @Test void cumulativeConstructorsRejectANullSource() {
@@ -838,16 +902,49 @@ class StreamReceiverTest {
         assertUnseen(f.receiver.expiredWait());
     }
 
-    @Test void transitivePrerequisiteProgressRenewsTheWait() {
+    @Test void transitivePrerequisiteProgressRenewsOnlyByByteCredit() {
         Fixture f = new Fixture(2);
         assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 1)));
         assertAdmitted(f.receiver, rec(3, 1, 0, dep(0, 1)));
         f.now.set(9 * SEC);
-        commit(f.receiver, rec(0, 1, 0), 1, route(0));
+        commit(f.receiver, rec(0, 1, 0), 64 * KIB, route(0));
         f.now.set(10 * SEC);
-        assertNull(f.receiver.expiredWait(), "CONTROL 1 is transitive progress for the head on CHUNK 3 1");
+        assertNull(f.receiver.expiredWait(), "CONTROL 1 is transitive progress worth 64 KiB for the head on CHUNK 3 1");
         f.now.set(19 * SEC);
         assertUnseen(f.receiver.expiredWait());
+    }
+
+    @Test void tinyRecordsOnATransitivePrerequisiteCannotRenewThroughAnIntermediateHead() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 100)));
+        assertAdmitted(f.receiver, rec(3, 1, 0, dep(0, 2)));
+        f.now.set(4 * SEC);
+        commit(f.receiver, rec(0, 1, 0), 1, route(0));
+        f.now.set(9 * SEC);
+        // This 1-byte commit reaches the transitive watermark CONTROL 2, which must not renew (13.10 arm a).
+        commit(f.receiver, rec(0, 2, 0), 1, route(0));
+        f.now.set(10 * SEC);
+        assertUnseen(f.receiver.expiredWait());
+    }
+
+    @Test void directEntryRenewsOnlyWhenTheCommitReachesItsOwnSequence() {
+        Fixture unreached = new Fixture(2);
+        assertAdmitted(unreached.receiver, rec(2, 1, 0, dep(0, 2), dep(3, 100)));
+        unreached.now.set(9 * SEC);
+        commit(unreached.receiver, rec(0, 1, 0), 1, route(0));
+        unreached.now.set(10 * SEC);
+        assertUnseen(unreached.receiver.expiredWait());
+
+        Fixture reached = new Fixture(2);
+        assertAdmitted(reached.receiver, rec(2, 1, 0, dep(0, 2), dep(3, 100)));
+        reached.now.set(9 * SEC);
+        commit(reached.receiver, rec(0, 1, 0), 1, route(0));
+        reached.now.set(9 * SEC + SEC / 2);
+        commit(reached.receiver, rec(0, 2, 0), 1, route(0));
+        reached.now.set(19 * SEC);
+        assertNull(reached.receiver.expiredWait(), "CONTROL 2 reaches the direct entry, so the base renewed at 9.5 s");
+        reached.now.set(19 * SEC + SEC / 2);
+        assertUnseen(reached.receiver.expiredWait());
     }
 
     @Test void aOneByteEveryNineSecondsTrickleIsClosedAndCannotBeRescued() {
@@ -962,6 +1059,26 @@ class StreamReceiverTest {
         assertNull(rx.expiredWait(), "renewed at 9 s");
         source.set(19 * SEC, 0);
         assertUnseen(rx.expiredWait());
+    }
+
+    /** A cumulative source that returns its scripted clock readings in order, then repeats the last one. */
+    private static final class SteppingSource implements StallClock {
+        private final long[] nows;
+        int samples;
+
+        SteppingSource(long... nows) {
+            this.nows = nows;
+        }
+
+        @Override public Sample sample() {
+            final long now = nows[Math.min(samples, nows.length - 1)];
+            samples++;
+            return new Sample() {
+                @Override public long nowNanos() { return now; }
+                @Override public long excludedNanos() { return 0; }
+                @Override public boolean valid() { return true; }
+            };
+        }
     }
 
     private static final class ScriptedSource implements StallClock {

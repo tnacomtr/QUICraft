@@ -181,6 +181,28 @@ public final class BlockedHeadTimer {
     }
 
     /**
+     * As {@link #renew()}, from a given observation, so a renewal and the expiry decision that preceded it use the
+     * same reading. A null observation (a stopped timer) is a no-op.
+     */
+    public void renew(Observation now) {
+        if (now == null) {
+            return;
+        }
+        renewedActiveNanos = now.activeNanos();
+        creditBytes = 0;
+    }
+
+    /** As {@link #expired()}, from a given observation (null, for a stopped timer, is not expired). */
+    public boolean expired(Observation now) {
+        return now != null && now.activeNanos() - renewedActiveNanos >= TIMEOUT_NANOS;
+    }
+
+    /** As {@link #absoluteExpired()}, from a given observation (null, for a stopped timer, is not expired). */
+    public boolean absoluteExpired(Observation now) {
+        return now != null && now.activeNanos() >= RETENTION_NANOS;
+    }
+
+    /**
      * Reports whether the base deadline has been reached: 10 seconds of active time since the wait's start or
      * its last renewal. A resource wait is never renewed, so for it this is the 10 second base from the start.
      */
@@ -296,16 +318,38 @@ public final class BlockedHeadTimer {
     }
 
     /**
-     * One cumulative observation: exactly one sample of the source, validated against the last accepted
-     * reading and reduced to the wait-relative elapsed time and excluded stall time. Returns null while
-     * the wait is not running, so a stopped timer neither reads its source nor throws.
+     * One coherent observation of this running wait: the active time and the excluded stall time derived from
+     * one reading of the clock (boundary mode) or of one source sample (cumulative mode). Returns null while the
+     * wait is not running, so a stopped timer reads nothing and throws nothing. A cumulative timer takes exactly
+     * one new sample here.
      */
-    private Observation observe() {
+    public Observation observe() {
+        if (!running) {
+            return null;
+        }
+        if (source == null) {
+            long offset = waitOffset(clock.getAsLong());
+            return new Observation(offset, excludeStalls ? exclusionAt(offset) : 0);
+        }
+        return observe(source.sample());
+    }
+
+    /**
+     * Reduces one given cumulative sample to an observation, validated against the last accepted reading of this
+     * timer (13.10). A receiver that settles several waits in one step passes the same sample to each timer, so
+     * every decision of that step is taken from one reading. Returns null while the wait is not running; throws
+     * {@link StallClock.UnavailableException} for an invalid or malformed sample, leaving this timer unchanged.
+     *
+     * @throws IllegalStateException on a boundary timer, which has no cumulative samples
+     */
+    public Observation observe(StallClock.Sample sample) {
+        if (source == null) {
+            throw new IllegalStateException("a boundary timer has no cumulative sample");
+        }
         if (!running || !initialized) {
             return null;
         }
-        StallClock.Sample sample = source.sample();
-        if (!sample.valid()) {
+        if (sample == null || !sample.valid()) {
             throw new StallClock.UnavailableException("stall source is not valid");
         }
         long now = sample.nowNanos();
@@ -323,6 +367,15 @@ public final class BlockedHeadTimer {
             exclusion = Math.min(STALL_ALLOWANCE_NANOS, total - baseExcludedNanos);
         }
         return new Observation(elapsed, exclusion);
+    }
+
+    /** Excluded stall time at {@code nowOffset} of a running boundary timer, capped at the allowance. */
+    private long exclusionAt(long nowOffset) {
+        long total = excluded;
+        if (inStall) {
+            total = addCapped(total, coverage(nowOffset));
+        }
+        return total;
     }
 
     /** A rejected cumulative timer boundary notification. */
@@ -387,10 +440,13 @@ public final class BlockedHeadTimer {
         return total + delta;
     }
 
-    /** One coherent cumulative observation: both fields come from the same single sample. */
-    private static final class Observation {
-        final long elapsedNanos;
-        final long exclusionNanos;
+    /**
+     * One coherent observation of a wait: every field comes from the same single reading. Decisions made from one
+     * observation (expiry, phrase classification, renewal) therefore never disagree with each other.
+     */
+    public static final class Observation {
+        private final long elapsedNanos;
+        private final long exclusionNanos;
 
         Observation(long elapsedNanos, long exclusionNanos) {
             this.elapsedNanos = elapsedNanos;
@@ -398,8 +454,13 @@ public final class BlockedHeadTimer {
         }
 
         /** Active time of this observation: elapsed minus excluded, never negative. */
-        long activeNanos() {
+        public long activeNanos() {
             return Math.max(0, elapsedNanos - exclusionNanos);
+        }
+
+        /** Reports whether any recorded stall time was excluded in this observation (blocks the phrase, 13.12). */
+        public boolean stallConsumed() {
+            return exclusionNanos > 0;
         }
     }
 }
