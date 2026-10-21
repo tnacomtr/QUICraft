@@ -29,14 +29,16 @@ import java.util.function.IntPredicate;
  * re-poll runs there too. The driver's methods are synchronized, so the sink never holds a driver lock while it
  * writes.
  *
- * <p>When the system property {@code quicraft.coalesceWrites} is {@code true}, the sink gathers slices per logical
- * stream during a single {@link #drain()} call and writes one combined buffer per stream. The cap is soft: a stream
- * stops being polled once it gathered 64 KiB, so one buffer is at most 64 KiB plus one slice. A drain re-entered
- * from a write completion only makes the running drain go round again, so a stream's bytes stay in order. Otherwise each slice is written individually with the behavior unchanged.
+ * <p>Coalescing (default on; {@code -Dquicraft.coalesceWrites=false} turns it off): the sink gathers slices per
+ * logical stream during one {@link #drain()} round and writes one combined buffer per stream, so many small records
+ * become few QUIC packets. The cap is soft: a stream stops being polled once it gathered 64 KiB, so one buffer is at
+ * most 64 KiB plus one slice. A drain re-entered from a write completion only makes the running drain go round
+ * again, so a stream's bytes stay in order. With coalescing off each slice is written on its own.
  */
 public final class QuicStreamWriteSink {
+    /** On unless {@code -Dquicraft.coalesceWrites=false}: restores movement-RTT parity under loss (benchmarks.md). */
     private static final boolean COALESCE_DEFAULT = Boolean.parseBoolean(
-            System.getProperty("quicraft.coalesceWrites", "false"));
+            System.getProperty("quicraft.coalesceWrites", "true"));
     /** Soft per-stream cap of one combined write; experiment knob {@code quicraft.coalesceMaxBytes}. */
     private static final int COALESCE_MAX_BYTES = Math.max(1, Integer.getInteger("quicraft.coalesceMaxBytes", 64 * 1024));
 

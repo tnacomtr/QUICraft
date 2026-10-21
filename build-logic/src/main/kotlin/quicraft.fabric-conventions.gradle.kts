@@ -118,9 +118,9 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
             property("quicraft.multistream.offlineTest", "true")
         }
         // Experiment: -Pquicraft.armCoalesce=true turns on opt-in write coalescing in the client.
-        if (providers.gradleProperty("quicraft.armCoalesce").orNull == "true") {
-            property("quicraft.coalesceWrites", "true")
-        }
+        // Explicit either way: /3 coalesces by default, /2 does not.
+        property("quicraft.coalesceWrites",
+            if (providers.gradleProperty("quicraft.armCoalesce").orNull == "true") "true" else "false")
         providers.gradleProperty("quicraft.armCoalesceMax").orNull?.let { property("quicraft.coalesceMaxBytes", it) }
     }
     // Opt-in: online-mode login against the testkit's mock session server. The real client reads

@@ -1124,3 +1124,27 @@ penalty came from one QUIC packet per small write (the pinned Netty QUIC sends o
 load got slower and noisier (median 2964 -> 4852 ms), still far ahead of TCP. An earlier round without the
 drain flush (n=3) gave the same RTT gain (151.2 ms) with chunk load 5567 ms. Not yet the default; /3 has
 the same 262 ms RTT penalty under delayloss (six-profile table above) and gets its own experiment.
+
+### /3 write coalescing (2026-10-21, n=3 per arm, interleaved TCP)
+
+`QuicStreamWriteSink` gathers the slices of one drain round per logical stream and writes one buffer per stream
+(soft cap 64 KiB), instead of one QUIC packet per record slice. Same real-Fabric method as above; build includes the
+universal ACK rule (protocol.md 13.21). Three sessions, each with its own TCP arm. Medians, ranges in brackets.
+
+| session | profile | arm | join ms | chunk load ms | rtt median ms | rtt p95 ms |
+|---|---|---|---|---|---|---|
+| A | delayloss | tcp | 2104 | 18429 (12633-28940) | 150.8 | 309.1 |
+| A | delayloss | /3 off | 2761 | 4192 (3879-4609) | 235.3 | 364.3 |
+| A | delayloss | /3 on, 64 KiB | 3257 | 5190 (3710-5805) | 151.7 | 311.5 |
+| B | delayloss | tcp | 2060 | 33116 (11717-36751) | 150.7 | 333.3 |
+| B | delayloss | /3 on, 64 KiB | 2741 | 4699 (3950-4787) | 151.6 | 278.8 |
+| B | delayloss | /3 on, 1200 B | 2848 | 4353 (3218-7783) | 151.5 | 322.6 |
+| C | clean | tcp | 1323 | 1251 (900-1321) | 0.58 | 0.90 |
+| C | clean | /3 off | 1684 | 3286 (2059-3420) | 1.33 | 1.73 |
+| C | clean | /3 on, 64 KiB | 1730 | 3296 (3121-4240) | 1.37 | 1.81 |
+
+Coalescing brings the /3 movement RTT under loss to TCP parity (235.3 -> 151.7 / 151.6 ms, TCP 150.8 / 150.7) and
+is neutral on a clean link. Its chunk-load cost under loss is within run-to-run noise at n=3 (on-arm ranges overlap
+the off arm). A 1200 B cap is not better than 64 KiB. Decision: /3 coalesces by default (`-Dquicraft.coalesceWrites=false`
+turns it off); /2 keeps it opt-in because its chunk-load cost was larger (2964 -> 4852 ms). Open: /3 on a clean link
+still trails TCP on chunk load (3296 vs 1251 ms) and RTT (1.37 vs 0.58 ms).
