@@ -2259,10 +2259,11 @@ before this revision can run.
     Sender advances its assignment epoch immediately after assigning that fence; subsequent
     records carry the new epoch and depend on it. Start-configuration alone does not create
     a level or increment epoch. Sequences remain connection-scoped, never restart at epoch
-    boundaries; positions, installed-chunk tracking, batch/update frontiers and the 13.9
-    first-install held set and 256-entry forget ring are keyed by epoch; an epoch change
-    marks them unknown (`markUnknown()`), never clears them (`clear()`), because a same-dimension
-    respawn keeps the client's level and prediction map (13.9, 13.18). No old-epoch record can execute after that fence. Epoch drain counts a record
+    boundaries; positions, installed-chunk tracking and batch/update frontiers are keyed by
+    epoch and cleared at level replacement. The 13.9 first-install held set and 256-entry
+    forget ring are not cleared: an epoch change marks them unknown (`markUnknown()`), because
+    a same-dimension respawn keeps the client's level and prediction map (13.9). No old-epoch
+    record can execute after that fence. Epoch drain counts a record
     as applied (D), not queued (Q), on every stream, the ACK stream included (13.10).
     New-epoch envelopes may arrive early, but remain opaque until their transition dependency
     executes; reject stale epochs or a future epoch without the corresponding transition
