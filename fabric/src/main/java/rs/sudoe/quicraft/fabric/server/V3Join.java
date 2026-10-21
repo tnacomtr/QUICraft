@@ -582,7 +582,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
                 submitUnit(unit);
             } catch (Throwable t) {
                 // Also covers hold/drain callers: unsupported coverage always ends the core owner.
-                fail("causal outbound admission: " + describe(t), t);
+                fail("causal outbound admission: " + describe(t) + coreSendCloseSuffix(), t);
                 throw t instanceof RuntimeException ? (RuntimeException) t : new IllegalStateException(t);
             }
         }
@@ -657,6 +657,17 @@ public final class V3Join implements BindingDecodeContext.Gate {
             return FrameCodec.packetId(packet);
         } catch (java.io.IOException e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    /** The core's send-close reason as a message suffix, or empty when there is none. Diagnostics; never throws. */
+    private String coreSendCloseSuffix() {
+        try {
+            MultistreamSession core = connection.session();
+            String reason = core == null ? null : core.sendCloseReason();
+            return reason == null ? "" : "; core send close: " + reason;
+        } catch (RuntimeException e) {
+            return "";
         }
     }
 

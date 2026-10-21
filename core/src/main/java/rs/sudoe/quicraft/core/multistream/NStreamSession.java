@@ -87,6 +87,8 @@ import rs.sudoe.quicraft.core.time.StallClock;
  */
 public final class NStreamSession implements MultistreamSession {
     private static final Logger LOG = Logger.getLogger("QUICraft");
+    /** The effective /3 profile is logged once per process, at the first server connection (diagnostics). */
+    private static final AtomicBoolean PROFILE_LOGGED = new AtomicBoolean();
 
     /** Which end of the connection this session is. */
     public enum Role {
@@ -528,6 +530,11 @@ public final class NStreamSession implements MultistreamSession {
             // Submissions run on callers' threads; a close they trigger only stops the driver, and its charges are
             // returned by release() on the loop, serialized with polling and writes (13.12).
             sendDriver.releaseOnOwnerClose();
+            if (role == Role.SERVER && PROFILE_LOGGED.compareAndSet(false, true)) {
+                LOG.info("QUICraft v3 profile: queuePacketLimit=" + resources.profile().queuePacketLimit
+                        + " queueByteLimit=" + resources.profile().queueByteLimit
+                        + " nodeBudget=" + resources.profile().nodeBudgetBytes);
+            }
             this.sink = new QuicStreamWriteSink(sendDriver, streams, this::writeAllowed, this::onSettled);
             StreamReceiver.Validator validator = new ShardValidator(shards,
                     role == Role.SERVER ? Direction.SERVERBOUND : Direction.CLIENTBOUND);
@@ -934,6 +941,12 @@ public final class NStreamSession implements MultistreamSession {
     @Override
     public boolean isWritable() {
         return writable;
+    }
+
+    @Override
+    public String sendCloseReason() {
+        SessionSendDriver driver = sendDriver;
+        return driver == null ? null : driver.lastCloseReason();
     }
 
     @Override

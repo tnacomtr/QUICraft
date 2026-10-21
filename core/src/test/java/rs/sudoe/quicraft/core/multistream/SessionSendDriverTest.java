@@ -589,6 +589,76 @@ class SessionSendDriverTest {
     }
 
     @Test
+    void overflowPacketsReasonNamesTheQueuePacketLimitAndKeepsTheFirstReason() throws Exception {
+        Rig rig = new Rig(1, 2);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertTrue(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertNull(driver.lastCloseReason(), "no reason before a refusal");
+        assertFalse(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        String reason = driver.lastCloseReason();
+        assertTrue(reason.startsWith("check=queue-packet-limit stream=-1 queuedRecords=2 "), reason);
+        assertTrue(reason.contains(" queuePacketLimit=2 "), reason);
+        assertTrue(reason.endsWith(" recordBytes=" + frame(2).frame().length), reason);
+        // A later refusal on the closed driver is passive and must not replace the first reason.
+        assertFalse(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertEquals(reason, driver.lastCloseReason());
+    }
+
+    @Test
+    void overflowBytesReasonNamesTheQueueByteLimit() throws Exception {
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        PressureRanking ranking = new PressureRanking();
+        AtomicLong now = new AtomicLong(1);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 1L << 40, ranking.view(now::get));
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(2),
+                new ServerProfile(1, 1, 1024, .5, 100, 10, 4, 4, 4), pool, ranking, new Object(),
+                InetAddress.getLoopbackAddress(), null, now::get, true);
+        int size = frame(40).frame().length;
+        assertTrue(size > 10, "the record must exceed the 10-byte queue limit");
+        assertFalse(driver.submit(frame(40), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertTrue(driver.isClosed());
+        String reason = driver.lastCloseReason();
+        assertTrue(reason.startsWith("check=queue-byte-limit stream=-1 queuedRecords=0 queuedBytes=0 "), reason);
+        assertTrue(reason.contains(" queueByteLimit=10 "), reason);
+        assertTrue(reason.endsWith(" recordBytes=" + size), reason);
+    }
+
+    @Test
+    void inadmissibleRecordReasonNamesThePoolCheck() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, 1L << 40, 100 + TEST_SLICE, ranking.view(now::get));
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
+                new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, new Object(),
+                InetAddress.getLoopbackAddress(), null, now::get, 75, 25, TEST_SLICE);
+        assertNull(driver.lastCloseReason());
+        // A record larger than the connection cap can never be admitted, so the driver closes 0x12 (13.12).
+        assertFalse(driver.submit(frame(300), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertTrue(driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        String reason = driver.lastCloseReason();
+        assertTrue(reason.startsWith("check=pool-inadmissible stream="), reason);
+        assertTrue(reason.contains(" queuePacketLimit=1000 queueByteLimit=" + (1L << 40) + " "), reason);
+        long recordBytes = Long.parseLong(reason.substring(reason.lastIndexOf(" recordBytes=") + " recordBytes=".length()));
+        assertTrue(recordBytes > 100 + TEST_SLICE, "the refused record is larger than the cap: " + reason);
+    }
+
+    @Test
+    void sealedRefusalReasonIsPassiveAndNeverClosesTheDriver() throws Exception {
+        Rig rig = new Rig(1, 100);
+        SessionSendDriver driver = rig.driver;
+        driver.seal();
+        assertFalse(driver.submit(frame(3), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertFalse(driver.isClosed(), "a sealed refusal is not a close");
+        assertEquals(0, driver.closeCode());
+        String reason = driver.lastCloseReason();
+        assertTrue(reason.startsWith("check=sealed stream=-1 queuedRecords=0 queuedBytes=0 "), reason);
+        assertTrue(reason.contains(" queuePacketLimit=100 "), reason);
+    }
+
+    @Test
     void producerOverflowIsResourceNotPeerViolation() throws Exception {
         Rig rig = new Rig(1, 2);
         SessionSendDriver driver = rig.driver;

@@ -110,6 +110,14 @@ public interface MultistreamSession {
         throw new UnsupportedOperationException("executor stall reporting");
     }
 
+    /**
+     * Why the send side last refused on a queue limit or pool admission, or closed 0x12, for diagnostics; null while it
+     * has not. Never affects the wire.
+     */
+    default String sendCloseReason() {
+        return null;
+    }
+
     // Additive ACK_JOIN and BATCH_JOIN passthroughs (13.19), mirroring SessionSendDriver.
 
     default boolean createAck(long id, byte[] payload, int chargedBytes) {
