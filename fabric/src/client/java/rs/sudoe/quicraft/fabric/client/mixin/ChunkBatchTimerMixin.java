@@ -18,9 +18,10 @@ import rs.sudoe.quicraft.fabric.Hooks;
 import rs.sudoe.quicraft.fabric.client.V3Hooks;
 
 /**
- * Opt-in ({@code -Dquicraft.v3.batchTimerFromFirstChunk=true}), {@code /3} only: the chunk batch
- * timer restarts when the batch's first chunk arrives instead of at chunk_batch_start, because on
- * {@code /3} the start record outruns the chunk lanes (see {@link ChunkPacing}). An empty batch
+ * {@code /3} only (default on, {@code -Dquicraft.v3.batchTimerFromFirstChunk=false} turns it off): the chunk batch
+ * timer restarts when the batch's first chunk arrives instead of at chunk_batch_start, because on {@code /3} the
+ * start record outruns the chunk streams (see {@link ChunkPacing}). Like vanilla's own timer it runs on the network
+ * thread: the HEAD call before {@code ensureRunningOnSameThread} hands the packet to the main thread. An empty batch
  * keeps vanilla timing. Any throw continues as vanilla.
  */
 @Mixin(ClientPacketListener.class)

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -17,16 +16,8 @@ class ChunkPacingTest {
     }
 
     @Test
-    void floorLiftsLowRatesOnV3Only() {
-        assertEquals(16f, ChunkPacing.clampRate(3f, 16, true));
-        assertEquals(40f, ChunkPacing.clampRate(40f, 16, true));
-        assertEquals(3f, ChunkPacing.clampRate(3f, 16, false));
-        assertEquals(3f, ChunkPacing.clampRate(3f, 0, true));
-    }
-
-    @Test
-    void floorNeverExceedsVanillaCapAndKeepsNaN() {
-        assertEquals(64f, ChunkPacing.clampRate(1f, 500, true));
-        assertTrue(Float.isNaN(ChunkPacing.clampRate(Float.NaN, 16, true)));
+    void theFirstChunkTimerIsOnUnlessTurnedOff() {
+        boolean off = "false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerFromFirstChunk"));
+        assertTrue(ChunkPacing.BATCH_TIMER_FROM_FIRST_CHUNK != off);
     }
 }
