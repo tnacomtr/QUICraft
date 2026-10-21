@@ -118,6 +118,41 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                 PlaySession.compareBlocks(context, server, home.offset(-8, -3, -8), home.offset(8, 3, 8));
                 QuicraftFabricTestLog.info("respawn-live: blocks around spawn agree after the ring overflow");
 
+                // 0b. Overflow the held-chunk forget ring (256 entries): each far hop forgets about 81 chunks
+                // (view distance 4), so four hops on top of the play session pass it. Then return to the
+                // play session's far target, whose chunks are reinstalled after the overflow.
+                Boolean untrustedBefore = rig.heldChunksUntrusted();
+                QuicraftFabricTestLog.info("respawn-live: server HeldChunkSet untrusted before the hops: "
+                        + untrustedBefore);
+                check(Boolean.FALSE.equals(untrustedBefore),
+                        "the held set is still trusted before the hops: " + untrustedBefore);
+                int[][] hops = {{-3000, 0}, {0, 3000}, {4000, 4000}, {-4000, -4000}};
+                for (int[] hop : hops) {
+                    server.runCommand("tp @a " + (home.getX() + hop[0]) + " " + (home.getY() + 1) + " "
+                            + (home.getZ() + hop[1]));
+                    context.waitTicks(20);
+                    GameTests.waitForChunks(join);
+                }
+                rig.assertLive("after four far hops", Level.OVERWORLD, epoch);
+                Boolean untrustedAfter = rig.heldChunksUntrusted();
+                QuicraftFabricTestLog.info("respawn-live: server HeldChunkSet untrusted after the hops: "
+                        + untrustedAfter);
+                check(Boolean.TRUE.equals(untrustedAfter),
+                        "the forget ring overflowed and the held set is untrusted: " + untrustedAfter);
+                int fx = home.getX() + 2000;
+                int fz = home.getZ() + 3 - 1500; // PlaySession's far target
+                server.runCommand("tp @a " + fx + " " + (home.getY() + 1) + " " + fz);
+                context.waitTicks(20);
+                GameTests.waitForChunks(join);
+                rig.assertLive("after returning to the play session's far area", Level.OVERWORLD, epoch);
+                PlaySession.compareBlocks(context, server, new BlockPos(fx - 8, home.getY() - 3, fz - 8),
+                        new BlockPos(fx + 8, home.getY() + 3, fz + 8));
+                QuicraftFabricTestLog.info("respawn-live: blocks agree in the reinstalled far area");
+                server.runCommand("tp @a " + home.getX() + " " + home.getY() + " " + home.getZ());
+                context.waitTicks(20);
+                GameTests.waitForChunks(join);
+                rig.assertLive("back at spawn after the overflow", Level.OVERWORLD, epoch);
+
                 // 1. Death respawn: same dimension, chunks held.
                 server.runCommand("kill @a");
                 context.waitForScreen(DeathScreen.class);
@@ -193,6 +228,27 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
             controller = transportEntry("v3", connection);
             check(controller != null && "ACTIVE".equals(String.valueOf(transportEntry("v3State", connection))),
                     "the /3 controller is ACTIVE: " + transportEntry("v3State", connection));
+        }
+
+        /** Server-side HeldChunkSet.untrusted() by reflection, or null when the path is not reachable. */
+        Boolean heldChunksUntrusted() {
+            return server.computeOnServer(s -> {
+                try {
+                    Object join = rs.sudoe.quicraft.fabric.server.V3Join.of(serverConnection);
+                    V3Connection v3 = (V3Connection) read(join, "connection");
+                    Object session = v3.session();
+                    Method driverGetter = session.getClass().getDeclaredMethod("sendDriver");
+                    driverGetter.setAccessible(true);
+                    Object driver = driverGetter.invoke(session);
+                    Object held = read(driver, "heldChunks");
+                    Method untrusted = held.getClass().getDeclaredMethod("untrusted");
+                    untrusted.setAccessible(true);
+                    return (Boolean) untrusted.invoke(held);
+                } catch (Throwable t) {
+                    QuicraftFabricTestLog.info("respawn-live: HeldChunkSet not reachable: " + t);
+                    return null;
+                }
+            });
         }
 
         ResourceKey<Level> clientDimension() {
