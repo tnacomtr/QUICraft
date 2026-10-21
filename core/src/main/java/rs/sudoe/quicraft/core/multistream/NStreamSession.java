@@ -124,6 +124,8 @@ public final class NStreamSession implements MultistreamSession {
     public static final int MAX_KEPT_AFTER_DETACH = MAX_ACTIVATION_LEFTOVER / 2;
     /** Receive steps per pump task before it yields the loop. */
     private static final int MAX_STEPS = 64;
+    /** Experiment: run the receive pump at a stream's read-complete instead of a queued loop task. */
+    private static final boolean INLINE_PUMP = Boolean.getBoolean("quicraft.v3.inlinePump");
     private static final byte[] NO_REASON = new byte[0];
 
     /** Clocks and periods; tests shorten them, production uses {@link #defaults(SessionResources)}. */
@@ -393,6 +395,7 @@ public final class NStreamSession implements MultistreamSession {
     private boolean activated;
     private long activatedAt;
     private boolean pumpScheduled;
+    private boolean pumping;
     private boolean closeNotified;
     private boolean executing;
     private int executingStream = -1;
@@ -1238,8 +1241,30 @@ public final class NStreamSession implements MultistreamSession {
         loop.execute(() -> guarded(this::pumpNow));
     }
 
+    /** Pumps now, unless a pump is already on the stack (a read it issued completed): then queue one. */
+    private void pumpInline() {
+        if (pumping || closed) {
+            schedulePump();
+            return;
+        }
+        guarded(this::pumpNow);
+    }
+
     private void pumpNow() {
         pumpScheduled = false;
+        if (pumping) {
+            schedulePump();
+            return;
+        }
+        pumping = true;
+        try {
+            pumpSteps();
+        } finally {
+            pumping = false;
+        }
+    }
+
+    private void pumpSteps() {
         if (closed || !activated || game == null) {
             return;
         }
@@ -1933,7 +1958,11 @@ public final class NStreamSession implements MultistreamSession {
         public void channelReadComplete(ChannelHandlerContext ctx) {
             ctx.fireChannelReadComplete();
             traceReceiveState();
-            schedulePump();
+            if (INLINE_PUMP) {
+                pumpInline();
+            } else {
+                schedulePump();
+            }
         }
 
         @Override
