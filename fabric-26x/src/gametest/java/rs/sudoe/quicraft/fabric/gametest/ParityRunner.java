@@ -79,7 +79,60 @@ public final class ParityRunner {
         int[] illegalOrder(int items) {
             return null;
         }
+
+        /**
+         * The specific hazard outcome of the illegal order: snapshot lines whose value the TCP order and the
+         * illegal order must each have exactly. Read from the section the mode inspects (right after
+         * delivery in the same-tick mode, after the settle ticks in the tick-spread mode). Required for every
+         * case that names an illegal order, so "any difference" cannot pass.
+         */
+        List<Hazard> hazards(ParityFixture f, boolean spread) {
+            return List.of();
+        }
+
+        /** Snapshot lines the TCP order must contain, with explicit expected values (late section). */
+        List<String> expectedTcpLines(ParityFixture f) {
+            return List.of();
+        }
+
+        /** True when {@link #setupControl} gives a no-prediction control for the illegal order. */
+        boolean hasControl() {
+            return false;
+        }
+
+        /** The same fixture without the pending prediction; the hazard lines must not appear under it. */
+        void setupControl(Minecraft client, ParityFixture f) {}
+
+        /** Lines the illegal order's snapshot must NOT contain in the control run (the rollback outcome). */
+        List<Check> controlForbidden(ParityFixture f, boolean spread) {
+            return List.of();
+        }
+
+        /** Non-null for a case that only proves repeatability: the reason the hazard cannot be shown. */
+        String structuralOnlyReason() {
+            return null;
+        }
     }
+
+    /** A condition on the value of the first snapshot line that starts with {@code prefix}. */
+    record Check(String prefix, String description, java.util.function.Predicate<String> accepts) {
+        static Check exact(String prefix, String value) {
+            return new Check(prefix, "== " + value, value::equals);
+        }
+
+        /** True when the line exists and its value (the text after the prefix) is accepted. */
+        boolean holds(String section) {
+            String line = lineWith(section, prefix);
+            return line.startsWith(prefix) && accepts.test(line.substring(prefix.length()));
+        }
+
+        String seen(String section) {
+            return lineWith(section, prefix);
+        }
+    }
+
+    /** The outcome the hazard has under the TCP order and under the illegal order. */
+    record Hazard(Check tcp, Check illegal) {}
 
     private ParityRunner() {}
 
@@ -87,11 +140,34 @@ public final class ParityRunner {
         Set<String> known = csv(System.getProperty("quicraft.gametest.parity.knownFailures"));
         Set<String> only = csv(System.getProperty("quicraft.gametest.parity.only"));
         List<String> failures = new ArrayList<>();
+        Set<String> names = new HashSet<>();
+        for (ParityCase c : ParityCases.all()) {
+            names.add(c.name());
+        }
+        for (String name : only) {
+            if (!names.contains(name)) {
+                throw new AssertionError("quicraft.gametest.parity.only names an unknown case `" + name
+                        + "`; the cases are " + names);
+            }
+        }
+        for (String name : known) {
+            if (!names.contains(name)) {
+                throw new AssertionError("quicraft.gametest.parity.knownFailures names an unknown case `" + name + "`");
+            }
+        }
+        int selected = 0;
+        List<String> differential = ParityReplicaDifferential.check();
+        if (!differential.isEmpty()) {
+            throw new AssertionError("ParitySendReplica has drifted from SessionSendDriver:\n"
+                    + String.join("\n", differential));
+        }
+        QuicraftFabricTestLog.info("[QUICraft parity] send-replica differential: PASS");
         try (ParityFixture fixture = ParityFixture.open(context)) {
             for (ParityCase c : ParityCases.all()) {
                 if (!only.isEmpty() && !only.contains(c.name())) {
                     continue;
                 }
+                selected++;
                 List<String> problems = new ArrayList<>();
                 try {
                     runCase(fixture, c, problems);
@@ -107,6 +183,9 @@ public final class ParityRunner {
                     failures.add(c.name() + ": " + String.join("\n", problems));
                 }
             }
+        }
+        if (selected == 0) {
+            throw new AssertionError("no parity case was selected");
         }
         if (!failures.isEmpty()) {
             throw new AssertionError("parity failures:\n" + String.join("\n\n", failures));
@@ -139,8 +218,8 @@ public final class ParityRunner {
         }
         for (boolean spread : c.spread() ? new boolean[] {false, true} : new boolean[] {false}) {
             String mode = spread ? "tick-spread" : "same-tick";
-            String reference = once(f, c, items, tcp, spread);
-            String second = once(f, c, items, tcp, spread);
+            String reference = once(f, c, items, tcp, spread, false);
+            String second = once(f, c, items, tcp, spread, false);
             if (!reference.equals(second)) {
                 problems.add(mode + ": the TCP order gave two different snapshots (unstable fixture or leaky reset): "
                         + firstDiff(reference, second));
@@ -150,7 +229,7 @@ public final class ParityRunner {
                 if (Arrays.equals(order, tcp)) {
                     continue;
                 }
-                String got = once(f, c, items, order, spread);
+                String got = once(f, c, items, order, spread, false);
                 if (!got.equals(reference)) {
                     problems.add(mode + " order " + labels(items, order) + " differs from TCP: "
                             + firstDiff(reference, got));
@@ -158,22 +237,67 @@ public final class ParityRunner {
             }
             int[] illegal = c.illegalOrder(n);
             if (illegal != null && (spread ? c.illegalChecksSpread() : !c.illegalNeedsSpread())) {
-                String got = once(f, c, items, illegal, spread);
+                String got = once(f, c, items, illegal, spread, false);
                 if (got.equals(reference)) {
                     problems.add(mode + ": the deliberately illegal order " + labels(items, illegal)
                             + " gave the same snapshot as TCP, so this case cannot see its hazard; snapshot was:\n" + got);
                 } else {
-                    log(c, mode + " sensitivity ok: illegal order " + labels(items, illegal) + " differs: "
-                            + firstDiff(reference, got));
+                    log(c, mode + " illegal order " + labels(items, illegal) + " differs:\n" + allDiffs(reference, got));
+                    List<Hazard> hazards = c.hazards(f, spread);
+                    if (hazards.isEmpty() && c.structuralOnlyReason() == null) {
+                        problems.add(mode + ": the case names an illegal order but no targeted hazard outcome");
+                    }
+                    String tcpSection = section(reference, !spread);
+                    String gotSection = section(got, !spread);
+                    for (Hazard h : hazards) {
+                        if (!h.tcp().holds(tcpSection) || !h.illegal().holds(gotSection)) {
+                            problems.add(mode + ": hazard expected TCP `" + h.tcp().prefix() + "` " + h.tcp().description()
+                                    + " and illegal `" + h.illegal().prefix() + "` " + h.illegal().description()
+                                    + " but saw TCP `" + h.tcp().seen(tcpSection) + "` and illegal `"
+                                    + h.illegal().seen(gotSection) + "`");
+                        }
+                    }
+                    if (!hazards.isEmpty()) {
+                        log(c, mode + " hazard ok: " + hazards.size() + " targeted line(s) match");
+                    }
+                    if (c.hasControl()) {
+                        String cRef = once(f, c, items, tcp, spread, true);
+                        String cGot = once(f, c, items, illegal, spread, true);
+                        String cSection = section(cGot, !spread);
+                        for (Check forbidden : c.controlForbidden(f, spread)) {
+                            if (forbidden.holds(cSection)) {
+                                problems.add(mode + ": without the pending prediction `" + forbidden.seen(cSection)
+                                        + "` still satisfies " + forbidden.description()
+                                        + ", so it is not the ACK rollback");
+                            }
+                        }
+                        log(c, mode + " no-prediction control ok (differences without a prediction, motion timing only):\n"
+                                + allDiffs(cRef, cGot));
+                    }
                 }
             }
+        }
+        for (String expected : c.expectedTcpLines(f)) {
+            String late = section(once(f, c, items, tcp, false, false), false);
+            if (!late.contains(expected + "\n")) {
+                problems.add("the TCP snapshot lacks the expected line `" + expected + "`; late section was:\n" + late);
+            }
+        }
+        if (c.structuralOnlyReason() != null) {
+            log(c, "STRUCTURAL COVERAGE ONLY (repeatability of the TCP order; no hazard shown): " + c.structuralOnlyReason());
         }
     }
 
     private static String once(ParityFixture f, ParityCase c, List<ParityPlanner.Item> items, int[] order,
-            boolean spread) {
+            boolean spread, boolean control) {
         f.reset();
-        f.context.runOnClient(client -> c.setup(client, f));
+        f.context.runOnClient(client -> {
+            if (control) {
+                c.setupControl(client, f);
+            } else {
+                c.setup(client, f);
+            }
+        });
         byte[][] frames = new byte[order.length][];
         for (int i = 0; i < order.length; i++) {
             frames[i] = items.get(order[i]).frame();
@@ -191,6 +315,37 @@ public final class ParityRunner {
         f.context.waitTicks(SETTLE_TICKS);
         return "[right after delivery]\n" + early + "[after " + SETTLE_TICKS + " ticks]\n"
                 + f.snapshot(c.watchBlocks(f), c.watchChunks(f));
+    }
+
+    /** The early (right after delivery) or late (after the settle ticks) half of a snapshot. */
+    static String section(String snapshot, boolean early) {
+        int late = snapshot.indexOf("[after ");
+        return early ? snapshot.substring(0, late) : snapshot.substring(late);
+    }
+
+    /** The first line starting with {@code prefix}, or "<absent>". */
+    static String lineWith(String section, String prefix) {
+        for (String line : section.split("\n")) {
+            if (line.startsWith(prefix)) {
+                return line;
+            }
+        }
+        return "<absent>";
+    }
+
+    /** Every differing line pair, for the log. */
+    static String allDiffs(String a, String b) {
+        StringBuilder sb = new StringBuilder();
+        String[] x = a.split("\n");
+        String[] y = b.split("\n");
+        for (int i = 0; i < Math.max(x.length, y.length); i++) {
+            String l = i < x.length ? x[i] : "<absent>";
+            String r = i < y.length ? y[i] : "<absent>";
+            if (!l.equals(r)) {
+                sb.append("    TCP `").append(l).append("` vs `").append(r).append("`\n");
+            }
+        }
+        return sb.toString();
     }
 
     private static String labels(List<ParityPlanner.Item> items, int[] order) {

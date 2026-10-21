@@ -12,6 +12,7 @@ import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import java.lang.reflect.Field;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -249,6 +250,10 @@ final class ParityFixture implements AutoCloseable {
             // A respawn copies the old player's base attribute values (handleRespawn), so a case that
             // changed SCALE would leak into the next run. The self-check on the TCP order found it.
             player.getAttribute(Attributes.SCALE).setBaseValue(1.0);
+            // The renderer's destruction progress survives a respawn; clear it so runs do not leak into each other.
+            Object renderer = getField(c, "levelRenderer");
+            ((Int2ObjectMap<?>) getField(renderer, "destroyingBlocks")).clear();
+            ((Long2ObjectMap<?>) getField(renderer, "destructionProgress")).clear();
         });
         for (int i = 0; i < 60 && !context.computeOnClient(c -> c.getConnection().hasClientLoaded()); i++) {
             context.waitTick();
@@ -269,6 +274,15 @@ final class ParityFixture implements AutoCloseable {
             Field f = findField(target.getClass(), name);
             f.setAccessible(true);
             return f.get(target);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    static Object invoke(Object target, String method) {
+        try {
+            Method m = target.getClass().getMethod(method);
+            return m.invoke(target);
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
         }
@@ -361,6 +375,21 @@ final class ParityFixture implements AutoCloseable {
         sb.append('\n');
         for (EquipmentSlot slot : EquipmentSlot.values()) {
             sb.append("equip.").append(slot).append('=').append(p.getItemBySlot(slot)).append('\n');
+        }
+        net.minecraft.world.entity.player.Inventory inventory = p.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            if (!inventory.getItem(slot).isEmpty()) {
+                sb.append("inv.").append(slot).append('=').append(inventory.getItem(slot)).append('\n');
+            }
+        }
+        // The renderer's block-destruction progress (block_destruction, 5), by breaker id.
+        Int2ObjectMap<?> destroying = (Int2ObjectMap<?>) getField(getField(c, "levelRenderer"), "destroyingBlocks");
+        List<Integer> destroyers = new ArrayList<>(destroying.keySet());
+        destroyers.sort(Comparator.naturalOrder());
+        for (Integer id : destroyers) {
+            Object progress = destroying.get((int) id);
+            sb.append("destroy.").append(id).append('=').append(invoke(progress, "getPos")).append(" progress=")
+                    .append(invoke(progress, "getProgress")).append('\n');
         }
         Object handler = predictionHandler(level);
         sb.append("prediction.sequence=").append(getField(handler, "currentSequenceNr")).append(" predicting=")

@@ -90,6 +90,33 @@ final class ParityCases {
         return new ClientboundBlockChangedAckPacket(sequence);
     }
 
+    // ---- hazard checks -------------------------------------------------------------------------------
+
+    private static double xOf(String value) {
+        return Double.parseDouble(value.substring(0, value.indexOf(',')));
+    }
+
+    /** The player's x is within 0.05 of {@code x} (player.pos=x,y,z). */
+    static ParityRunner.Check playerXNear(double x) {
+        return new ParityRunner.Check("player.pos=", "x within 0.05 of " + x, v -> Math.abs(xOf(v) - x) < 0.05);
+    }
+
+    /** The player's x is below {@code x}. */
+    static ParityRunner.Check playerXBelow(double x) {
+        return new ParityRunner.Check("player.pos=", "x below " + x, v -> xOf(v) < x);
+    }
+
+    /** The player's x is above {@code x}. */
+    static ParityRunner.Check playerXAbove(double x) {
+        return new ParityRunner.Check("player.pos=", "x above " + x, v -> xOf(v) > x);
+    }
+
+    /** The watched block at {@code pos} is {@code name} (air or stone). */
+    static ParityRunner.Check blockIs(BlockPos pos, String name) {
+        return new ParityRunner.Check("block." + pos.toShortString() + "=", "is " + name,
+                v -> v.startsWith("Block{minecraft:" + name + "}"));
+    }
+
     // ---- case 10: control sanity ----------------------------------------------------------------
 
     /**
@@ -124,6 +151,12 @@ final class ParityCases {
 
         @Override List<BlockPos> watchBlocks(ParityFixture f) {
             return List.of(f.base.offset(1, 0, 1));
+        }
+
+        /** The state the control case changes: both inventory slots and the renderer's destruction progress. */
+        @Override List<String> expectedTcpLines(ParityFixture f) {
+            return List.of("inv.2=" + new ItemStack(Items.DIAMOND, 3), "inv.5=" + new ItemStack(Items.TORCH, 7),
+                    "destroy." + (ENTITY + 1) + "=" + f.base.offset(1, 0, 1) + " progress=3");
         }
     }
 
@@ -185,6 +218,13 @@ final class ParityCases {
         }
 
         /** The ACK first: the order the universal ACK rule exists to forbid. */
+        @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
+            double px = f.basePos.x;
+            // Observed: P is air in both orders (84 lands after the ACK either way); the hazard is the player,
+            // which the early ACK snaps back to the spawn.
+            return List.of(new ParityRunner.Hazard(playerXNear(p(f).getX() + 0.5), playerXNear(px)));
+        }
+
         @Override int[] illegalOrder(int items) {
             return new int[] {2, 0, 1, 3};
         }
@@ -266,6 +306,10 @@ final class ParityCases {
         }
 
         /** Forget and reinstall before the ACK: the ACK then restores stone over the fresh chunk. */
+        @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
+            return List.of(new ParityRunner.Hazard(blockIs(inNeighbour(f), "air"), blockIs(inNeighbour(f), "stone")));
+        }
+
         @Override int[] illegalOrder(int items) {
             return new int[] {3, 4, 2, 0, 1};
         }
@@ -319,6 +363,10 @@ final class ParityCases {
         }
 
         /** The reinstall before the ACK. */
+        @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
+            return List.of(new ParityRunner.Hazard(blockIs(inNeighbour(f), "air"), blockIs(inNeighbour(f), "stone")));
+        }
+
         @Override int[] illegalOrder(int items) {
             int[] order = new int[items];
             for (int i = 0; i < items; i++) {
@@ -386,6 +434,12 @@ final class ParityCases {
         @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(p(f)); }
 
         /** The relative teleport before the ACK. */
+        @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
+            // TCP: the ACK snaps the player to the spawn, then the relative teleport moves it from there.
+            // Illegal: the teleport starts inside P and marks a teleport, which stops the snap.
+            return List.of(new ParityRunner.Hazard(playerXNear(f.basePos.x), playerXNear(p(f).getX() + 0.5)));
+        }
+
         @Override int[] illegalOrder(int items) { return new int[] {1, 0, 2, 3}; }
     }
 
@@ -433,16 +487,25 @@ final class ParityCases {
         @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(p(f)); }
 
         /** The ACK before the sleeping position. */
+        @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
+            // TCP: sleeping in P, then the ACK snaps the player back to the spawn. Illegal: the ACK finds the
+            // player at the spawn, nothing to snap, and the player then sleeps in P.
+            // Observed: same-tick the player sleeps at P's centre (3.5); after the settle ticks it has been pushed
+            // on to x about 4.3, still beside P and far from the spawn.
+            return List.of(new ParityRunner.Hazard(playerXNear(f.basePos.x),
+                    spread ? playerXAbove(3.0) : playerXNear(p(f).getX() + 0.5)));
+        }
+
         @Override int[] illegalOrder(int items) { return new int[] {1, 0, 2, 3}; }
     }
 
     /**
      * The player rides an armor stand it does not control; 35 moves the vehicle into the block broken by
      * prediction, the ACK restores the stone, 2 follows. The rider is repositioned every tick, so a snap
-     * is not observable and this case has no illegal-order check; it is a parity run only (reported).
+     * is not observable: this case is structural coverage only (the TCP order's repeatability), not hazard coverage.
      */
     static final class RiderPositionSync extends ParityCase {
-        @Override String name() { return "global-35-rider"; }
+        @Override String name() { return "global-35-rider-structural"; }
 
         @Override Expect expect() { return Expect.TCP_ONLY; }
 
@@ -466,6 +529,15 @@ final class ParityCases {
         }
 
         @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(p(f)); }
+
+        /**
+         * Tried and not feasible: the vehicle moves by interpolation and the rider is repositioned every tick,
+         * and the snapshot right after delivery is identical for ACK-first and TCP order (player stays at the
+         * spawn). So this is repeatability only, and the log says so.
+         */
+        @Override String structuralOnlyReason() {
+            return "a rider's position is derived from its vehicle each tick, so the ACK snap cannot be observed";
+        }
     }
 
     // ---- case 4: epoch changes (same-dimension respawn, login) --------------------------------------
@@ -536,6 +608,10 @@ final class ParityCases {
             List<int[]> chunks = new ArrayList<>(f.standardChunks());
             chunks.add(fresh);
             return chunks;
+        }
+
+        @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
+            return List.of(new ParityRunner.Hazard(blockIs(inNeighbour(f), "air"), blockIs(inNeighbour(f), "stone")));
         }
 
         @Override int[] illegalOrder(int items) { return new int[] {0, 2, 3, 1}; }
@@ -643,6 +719,12 @@ final class ParityCases {
         /** The mounted player is repositioned every tick, which erases the snap. */
         @Override boolean illegalChecksSpread() { return false; }
 
+        @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
+            // TCP: the crawling player is not touching the restored block. Illegal: mounted first (standing),
+            // the ACK snaps it back to the spawn.
+            return List.of(new ParityRunner.Hazard(playerXNear(broken(f).getX()), playerXNear(f.basePos.x)));
+        }
+
         @Override int[] illegalOrder(int items) { return new int[] {1, 0}; }
     }
 
@@ -683,6 +765,14 @@ final class ParityCases {
         }
 
         @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(t(f)); }
+
+        /** Observed: after the settle ticks both orders end in the powder snow (3.5, -61, 0.5), so only the same-tick snap is a hazard. */
+        @Override boolean illegalChecksSpread() { return false; }
+
+        @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
+            // TCP: bare feet at the ACK, powder snow not solid, no snap. Illegal: boots on first, solid, snap to spawn.
+            return List.of(new ParityRunner.Hazard(playerXNear(t(f).getX() + 0.5), playerXNear(f.basePos.x)));
+        }
 
         @Override int[] illegalOrder(int items) { return new int[] {1, 2, 0}; }
     }
@@ -725,6 +815,27 @@ final class ParityCases {
 
         @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(t(f)); }
 
+        @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
+            // Observed in the tick-spread run: TCP leaves the player near the block (x about 2.4); the illegal
+            // order lets the scaled player overlap the restored block, so the ACK snaps it to the spawn
+            // (x 0.5) and the remaining motion carries it a little further (about 0.9).
+            return List.of(new ParityRunner.Hazard(playerXAbove(1.5), playerXBelow(1.2)));
+        }
+
         @Override int[] illegalOrder(int items) { return new int[] {1, 2, 0}; }
+
+        /** Without a prediction the ACK has no rollback, so the player must not end near the spawn. */
+        @Override List<ParityRunner.Check> controlForbidden(ParityFixture f, boolean spread) {
+            return List.of(playerXBelow(1.2));
+        }
+
+        @Override boolean hasControl() { return true; }
+
+        /** The same block and player, but the break was never predicted: the ACK has nothing to roll back. */
+        @Override void setupControl(Minecraft client, ParityFixture f) {
+            client.level.setBlock(t(f), Blocks.STONE.defaultBlockState(), 3);
+            ParityFixture.predict(client.level, f.base.offset(0, 0, -6), client.level.getBlockState(f.base.offset(0, 0, -6)));
+            client.player.absSnapTo(t(f).getX() - 0.35, f.base.getY(), t(f).getZ() + 0.5, 0.0F, 0.0F);
+        }
     }
 }
