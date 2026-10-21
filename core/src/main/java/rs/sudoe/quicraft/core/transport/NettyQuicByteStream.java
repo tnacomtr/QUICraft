@@ -20,6 +20,10 @@ import rs.sudoe.quicraft.core.Protocol;
  * yet accepted by quiche) and becomes writable again below {@link #LOW_WATER}.
  */
 final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements QuicByteStream {
+    private static boolean COALESCE = Boolean.parseBoolean(
+            System.getProperty("quicraft.coalesceWrites", "false"));
+    private static int COALESCE_TARGET = 1200;
+
     static final long HIGH_WATER = 1L << 20;
     static final long LOW_WATER = 256L << 10;
 
@@ -39,6 +43,10 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     /** Something was written: a close must not drop it. */
     private volatile boolean wroteAny;
     private volatile Listener listener;
+
+    /** Coalesced bytes not yet handed to quiche; touched only on the stream's event loop. */
+    private ByteBuf pendingBuffer;
+    private boolean drainScheduled;
 
     NettyQuicByteStream(QuicStreamChannel channel) {
         this.channel = channel;
@@ -68,11 +76,103 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     @Override
     public void write(ByteBuffer data) {
         int length = data.remaining();
+        if (!COALESCE) {
+            ByteBuf copy = channel.alloc().buffer(length);
+            copy.writeBytes(data.duplicate());
+            inFlight.addAndGet(length);
+            wroteAny = true;
+            channel.write(copy).addListener(f -> {
+                long left = inFlight.addAndGet(-length);
+                if (!f.isSuccess()) {
+                    channel.pipeline().fireExceptionCaught(f.cause());
+                }
+                if (left == 0 && finWhenWritten) {
+                    sendFin();
+                }
+                if (throttled && left <= LOW_WATER) {
+                    throttled = false;
+                    notifyWritable();
+                }
+            });
+            return;
+        }
+
+        // Coalescing path. The caller may be another event loop (the bridge's), so copy here and do
+        // every buffer operation on the stream's own loop; tasks run in submission order.
         ByteBuf copy = channel.alloc().buffer(length);
         copy.writeBytes(data.duplicate());
         inFlight.addAndGet(length);
         wroteAny = true;
-        channel.write(copy).addListener(f -> {
+        if (channel.eventLoop().inEventLoop()) {
+            append(copy);
+        } else {
+            channel.eventLoop().execute(() -> append(copy));
+        }
+    }
+
+    /** Appends one caller write to the bounded buffer, never reordering bytes (event loop only). */
+    private void append(ByteBuf copy) {
+        int length = copy.readableBytes();
+        if (length >= COALESCE_TARGET) {
+            writePending();
+            writeOut(copy);
+            scheduleDrain();
+            return;
+        }
+        if (pendingBuffer != null && pendingBuffer.readableBytes() + length > COALESCE_TARGET) {
+            writePending();
+        }
+        if (pendingBuffer == null) {
+            pendingBuffer = channel.alloc().buffer(COALESCE_TARGET);
+        }
+        pendingBuffer.writeBytes(copy);
+        copy.release();
+        scheduleDrain();
+    }
+
+    /** One drain per loop turn: every write of this turn reaches quiche with a single flush. */
+    private void scheduleDrain() {
+        if (!drainScheduled) {
+            drainScheduled = true;
+            channel.eventLoop().execute(this::drainPending);
+        }
+    }
+
+    @Override
+    public void flush() {
+        if (!COALESCE) {
+            channel.flush();
+        }
+        // Coalescing: the scheduled drain writes and flushes on the next loop turn.
+    }
+
+    /**
+     * Writes the coalesced bytes and flushes (event loop only). A stream channel only hands queued writes to
+     * quiche on flush, so a drain without one leaves them waiting for an unrelated flush.
+     */
+    private void drainPending() {
+        drainScheduled = false;
+        writePending();
+        channel.flush();
+    }
+
+    /** Queues the coalesced bytes on the channel without flushing (event loop only). */
+    private void writePending() {
+        ByteBuf coalesced = pendingBuffer;
+        pendingBuffer = null;
+        if (coalesced == null) {
+            return;
+        }
+        if (!coalesced.isReadable()) {
+            coalesced.release();
+            return;
+        }
+        writeOut(coalesced);
+    }
+
+    private void writeOut(ByteBuf bytes) {
+        int length = bytes.readableBytes();
+        channel.write(bytes).addListener(f -> {
             long left = inFlight.addAndGet(-length);
             if (!f.isSuccess()) {
                 channel.pipeline().fireExceptionCaught(f.cause());
@@ -85,11 +185,6 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
                 notifyWritable();
             }
         });
-    }
-
-    @Override
-    public void flush() {
-        channel.flush();
     }
 
     @Override
@@ -154,6 +249,10 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
     private void close0() {
         if (!channel.parent().isOpen()) {
             return;
+        }
+        // Deliver any coalesced pending data before deciding to close (close0 runs on the loop).
+        if (COALESCE) {
+            drainPending();
         }
         if (inputShutdown || !wroteAny || !channel.isActive()) {
             // Nothing of ours to deliver (or the peer is already done): close now.

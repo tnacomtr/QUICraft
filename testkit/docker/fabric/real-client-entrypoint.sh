@@ -71,6 +71,14 @@ if ! (set -C; printf 'multistream=%s\n' "$multistream" > "$config_file"); then
     fail "refusing to overwrite $config_file"
 fi
 
+coalesce="${REAL_FABRIC_COALESCE:-false}"
+case "$coalesce" in
+    true) JAVA_OPTS="-Dquicraft.coalesceWrites=true${JAVA_OPTS:+ $JAVA_OPTS}"; export JAVA_OPTS
+          echo "real-client-entrypoint: write coalescing experiment on" >&2 ;;
+    false) ;;
+    *) fail "REAL_FABRIC_COALESCE must be true or false, got '$coalesce'" ;;
+esac
+
 if [ "$online" = false ] && [ "$multistream" = true ]; then
     JAVA_OPTS="-Dquicraft.multistream.offlineTest=true${JAVA_OPTS:+ $JAVA_OPTS}"
     export JAVA_OPTS
