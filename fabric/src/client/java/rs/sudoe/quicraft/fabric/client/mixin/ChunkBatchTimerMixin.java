@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.client.mixin;
 
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ChunkBatchSizeCalculator;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket;
@@ -21,8 +22,8 @@ import rs.sudoe.quicraft.fabric.client.V3Hooks;
  * {@code /3} only (default on, {@code -Dquicraft.v3.batchTimerFromFirstChunk=false} turns it off): the chunk batch
  * timer restarts when the batch's first chunk arrives instead of at chunk_batch_start, because on {@code /3} the
  * start record outruns the chunk streams (see {@link ChunkPacing}). Like vanilla's own timer it runs on the network
- * thread: the HEAD call before {@code ensureRunningOnSameThread} hands the packet to the main thread. An empty batch
- * keeps vanilla timing. Any throw continues as vanilla.
+ * thread: the chunk handler's HEAD runs there before {@code ensureRunningOnSameThread} hands the packet to the main
+ * thread, and the main-thread replay is skipped. An empty batch keeps vanilla timing. Any throw continues as vanilla.
  */
 @Mixin(ClientPacketListener.class)
 abstract class ChunkBatchTimerMixin {
@@ -31,35 +32,37 @@ abstract class ChunkBatchTimerMixin {
     private ChunkBatchSizeCalculator chunkBatchSizeCalculator;
 
     @Unique
-    private volatile boolean quicraft$awaitingFirstChunk;
+    private final ChunkPacing quicraft$pacing = new ChunkPacing();
 
     @Inject(method = "handleChunkBatchStart", at = @At("TAIL"))
     private void quicraft$batchStart(ClientboundChunkBatchStartPacket packet, CallbackInfo ci) {
-        if (ChunkPacing.BATCH_TIMER_FROM_FIRST_CHUNK) {
-            quicraft$awaitingFirstChunk = true;
+        try {
+            quicraft$pacing.batchStarted();
+        } catch (Throwable t) {
+            Hooks.failed("v3 batch timer", t);
         }
     }
 
     @Inject(method = "handleLevelChunkWithLight", at = @At("HEAD"))
     private void quicraft$firstChunk(ClientboundLevelChunkWithLightPacket packet, CallbackInfo ci) {
-        if (!ChunkPacing.BATCH_TIMER_FROM_FIRST_CHUNK || !quicraft$awaitingFirstChunk) {
-            return;
-        }
         try {
-            Hooks.enter("v3 batch timer");
-            boolean v3 = V3Hooks.isV3(((ClientPacketListener) (Object) this).getConnection());
-            if (ChunkPacing.restartTimer(true, v3, true)) {
-                chunkBatchSizeCalculator.onBatchStart();
-            }
-            quicraft$awaitingFirstChunk = false;
+            quicraft$pacing.chunk(!Minecraft.getInstance().isSameThread(),
+                    () -> V3Hooks.isV3(((ClientPacketListener) (Object) this).getConnection()),
+                    () -> {
+                        Hooks.enter("v3 batch timer");
+                        chunkBatchSizeCalculator.onBatchStart();
+                    });
         } catch (Throwable t) {
-            quicraft$awaitingFirstChunk = false;
             Hooks.failed("v3 batch timer", t);
         }
     }
 
     @Inject(method = "handleChunkBatchFinished", at = @At("HEAD"))
     private void quicraft$batchFinished(ClientboundChunkBatchFinishedPacket packet, CallbackInfo ci) {
-        quicraft$awaitingFirstChunk = false;
+        try {
+            quicraft$pacing.batchFinished();
+        } catch (Throwable t) {
+            Hooks.failed("v3 batch timer", t);
+        }
     }
 }
