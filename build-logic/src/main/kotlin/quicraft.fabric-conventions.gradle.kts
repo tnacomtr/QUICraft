@@ -95,6 +95,12 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
     providers.gradleProperty("quicraft.emitExtractorVectors").orNull?.let {
         property("quicraft.gametest.emitExtractorVectors", it)
     }
+    // Parity test (ParityGameTest): cases whose real-handler diff is a reported, route-owner decision
+    // run but do not fail the gate: -Pquicraft.parity.knownFailures=case1,case2. -Pquicraft.parity.only
+    // narrows a development run to some cases.
+    for (name in listOf("parity.knownFailures", "parity.only")) {
+        providers.gradleProperty("quicraft.$name").orNull?.let { property("quicraft.gametest.$name", it) }
+    }
     // Whether this module is built for its own game version (no -P<module>.minecraft override).
     // RoutingTableGameTest then treats a protocol change as a stale fixture and fails; matrix rows
     // that test the same jar on another release skip visibly.
@@ -137,7 +143,9 @@ tasks.withType<JavaExec>().matching { it.name == "runClientGameTest" }.configure
     environment("LIBGL_ALWAYS_SOFTWARE", "1")
 }
 sourceSets.named("gametest") {
-    java.setSrcDirs(listOf(shared.dir("gametest/java")))
+    // Plus the module's own src/gametest/java: the real-handler parity test (ParityRunner) reads
+    // 26.x-only game classes, so it lives in fabric-26x and ParityGameTest loads it by name.
+    java.setSrcDirs(listOf(shared.dir("gametest/java"), layout.projectDirectory.dir("src/gametest/java")))
     resources.setSrcDirs(listOf(shared.dir("gametest/resources")))
     compileClasspath += sourceSets.main.get().output + sourceSets.getByName("client").output
     runtimeClasspath += sourceSets.main.get().output + sourceSets.getByName("client").output

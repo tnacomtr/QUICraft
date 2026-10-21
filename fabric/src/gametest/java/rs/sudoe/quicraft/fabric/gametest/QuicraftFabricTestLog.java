@@ -12,4 +12,8 @@ final class QuicraftFabricTestLog {
     static void info(String message) {
         LOG.info(message);
     }
+
+    static void warn(String message) {
+        LOG.warn(message);
+    }
 }
