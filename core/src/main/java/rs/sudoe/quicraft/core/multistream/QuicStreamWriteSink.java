@@ -7,6 +7,7 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.codec.quic.QuicStreamChannel;
+import java.util.Arrays;
 import java.util.function.IntPredicate;
 
 /**
@@ -27,8 +28,16 @@ import java.util.function.IntPredicate;
  * <p>Event-loop confined. {@link #attach} and {@link #drain} run on the channels' event loop, and the writability
  * re-poll runs there too. The driver's methods are synchronized, so the sink never holds a driver lock while it
  * writes.
+ *
+ * <p>When the system property {@code quicraft.coalesceWrites} is {@code true}, the sink gathers slices per logical
+ * stream during a single {@link #drain()} call and writes one combined buffer per stream, capped at 64 KiB per
+ * stream. Otherwise each slice is written individually with the behavior unchanged.
  */
 public final class QuicStreamWriteSink {
+    private static final boolean COALESCE_DEFAULT = Boolean.parseBoolean(
+            System.getProperty("quicraft.coalesceWrites", "false"));
+    private static final int COALESCE_MAX_BYTES = 64 * 1024;
+
     private final SessionSendDriver driver;
     private final QuicStreamChannel[] channels;
     private final IntPredicate writable = this::isWritable;
@@ -36,6 +45,12 @@ public final class QuicStreamWriteSink {
     private final Settled settled;
     /** Test hook: runs on the loop after each poll returned a slice and before that slice is written. */
     private volatile Runnable beforeWrite;
+    private boolean coalesce;
+    private final int[] gatheredBytes;
+    private final byte[][] coalesceByteArrays;
+    private final int[] coalesceByteCounts;
+    private final long[][] coalesceTokenArrays;
+    private final int[] coalesceTokenCounts;
 
     /** Told after each slice's write future completed and the driver was told; on the event loop. */
     interface Settled {
@@ -61,11 +76,17 @@ public final class QuicStreamWriteSink {
      * @param settled told after each write future completed and the driver was told
      */
     QuicStreamWriteSink(SessionSendDriver driver, int streams, IntPredicate gate, Settled settled) {
+        this(driver, streams, gate, settled, COALESCE_DEFAULT);
+    }
+
+    QuicStreamWriteSink(SessionSendDriver driver, int streams, IntPredicate gate, Settled settled,
+            boolean coalesce) {
         if (gate == null || settled == null) {
             throw new NullPointerException("gate/settled");
         }
         this.gate = gate;
         this.settled = settled;
+        this.coalesce = coalesce;
         if (driver == null) {
             throw new NullPointerException("driver");
         }
@@ -74,6 +95,11 @@ public final class QuicStreamWriteSink {
         }
         this.driver = driver;
         this.channels = new QuicStreamChannel[streams];
+        this.gatheredBytes = new int[streams];
+        this.coalesceByteArrays = new byte[streams][];
+        this.coalesceByteCounts = new int[streams];
+        this.coalesceTokenArrays = new long[streams][];
+        this.coalesceTokenCounts = new int[streams];
     }
 
     /**
@@ -99,16 +125,46 @@ public final class QuicStreamWriteSink {
      */
     public void drain() {
         traceWritability();
+        if (!coalesce) {
+            for (;;) {
+                SessionSendDriver.Write write = driver.poll(writable);
+                if (write == null) {
+                    return;
+                }
+                Runnable hook = beforeWrite;
+                if (hook != null) {
+                    hook.run();
+                }
+                write(write);
+            }
+        }
+        Arrays.fill(gatheredBytes, 0);
+        Arrays.fill(coalesceByteCounts, 0);
+        Arrays.fill(coalesceTokenCounts, 0);
         for (;;) {
             SessionSendDriver.Write write = driver.poll(writable);
             if (write == null) {
+                flushCoalesced();
                 return;
             }
             Runnable hook = beforeWrite;
             if (hook != null) {
                 hook.run();
             }
-            write(write);
+            int stream = write.stream();
+            QuicStreamChannel channel = stream >= 0 && stream < channels.length ? channels[stream] : null;
+            if (channel == null) {
+                driver.failed(write.token());
+                continue;
+            }
+            byte[] bytes = write.bytes();
+            if (driver.trace() != null) {
+                driver.trace().written(stream, bytes.length, write.traceSelectedNanos,
+                        write.traceStartedNanos, System.nanoTime());
+            }
+            gatherBytes(stream, bytes);
+            gatherToken(stream, write.token());
+            gatheredBytes[stream] += bytes.length;
         }
     }
 
@@ -155,12 +211,93 @@ public final class QuicStreamWriteSink {
         beforeWrite = hook;
     }
 
+    /** Package-private: forces coalescing on or off for tests, overriding the system property. */
+    void setCoalesce(boolean coalesce) {
+        this.coalesce = coalesce;
+    }
+
     private boolean isWritable(int stream) {
         if (stream < 0 || stream >= channels.length) {
             return false;
         }
+        if (coalesce && gatheredBytes[stream] >= COALESCE_MAX_BYTES) {
+            return false;
+        }
         QuicStreamChannel channel = channels[stream];
         return channel != null && channel.isActive() && channel.isWritable() && gate.test(stream);
+    }
+
+    private void gatherBytes(int stream, byte[] bytes) {
+        byte[] arr = coalesceByteArrays[stream];
+        int count = coalesceByteCounts[stream];
+        int needed = count + bytes.length;
+        if (arr == null || arr.length < needed) {
+            int newSize = arr == null ? Math.max(bytes.length, 4) : Math.max(arr.length * 2, needed);
+            byte[] newArr = new byte[newSize];
+            if (arr != null) {
+                System.arraycopy(arr, 0, newArr, 0, count);
+            }
+            coalesceByteArrays[stream] = newArr;
+            arr = newArr;
+        }
+        System.arraycopy(bytes, 0, arr, count, bytes.length);
+        coalesceByteCounts[stream] = needed;
+    }
+
+    private void gatherToken(int stream, long token) {
+        long[] arr = coalesceTokenArrays[stream];
+        int count = coalesceTokenCounts[stream];
+        int needed = count + 1;
+        if (arr == null || arr.length < needed) {
+            int newSize = arr == null ? 4 : arr.length * 2;
+            long[] newArr = new long[newSize];
+            if (arr != null) {
+                System.arraycopy(arr, 0, newArr, 0, count);
+            }
+            coalesceTokenArrays[stream] = newArr;
+            arr = newArr;
+        }
+        arr[count] = token;
+        coalesceTokenCounts[stream] = needed;
+    }
+
+    private void flushCoalesced() {
+        for (int stream = 0; stream < channels.length; stream++) {
+            int byteCount = coalesceByteCounts[stream];
+            int tokenCount = coalesceTokenCounts[stream];
+            if (byteCount == 0 || tokenCount == 0) {
+                continue;
+            }
+            QuicStreamChannel channel = stream >= 0 && stream < channels.length ? channels[stream] : null;
+            byte[] flatArray = coalesceByteArrays[stream];
+            byte[] combinedBytes = new byte[byteCount];
+            System.arraycopy(flatArray, 0, combinedBytes, 0, byteCount);
+            ByteBuf buf = Unpooled.buffer(byteCount);
+            buf.writeBytes(combinedBytes);
+            long[] tokens = coalesceTokenArrays[stream];
+            if (channel != null) {
+                channel.writeAndFlush(buf).addListener((ChannelFutureListener) future -> {
+                    boolean success = future.isSuccess();
+                    for (int i = 0; i < tokenCount; i++) {
+                        if (success) {
+                            driver.released(tokens[i]);
+                        } else {
+                            driver.failed(tokens[i]);
+                        }
+                        settled.settled(success);
+                    }
+                });
+            } else {
+                for (int i = 0; i < tokenCount; i++) {
+                    driver.failed(tokens[i]);
+                    settled.settled(false);
+                }
+                // Release the buffer manually since it wasn't written
+                buf.release();
+            }
+            coalesceByteCounts[stream] = 0;
+            coalesceTokenCounts[stream] = 0;
+        }
     }
 
     private void checkIndex(int stream) {
