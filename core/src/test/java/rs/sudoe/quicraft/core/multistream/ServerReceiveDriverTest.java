@@ -118,6 +118,21 @@ class ServerReceiveDriverTest {
         assertTrue(h.codes.isEmpty(), h.codes.toString());
     }
 
+    @Test void heldCommitPastBlockedHeadDeadlineNeverBlamesPeer() throws Exception {
+        Harness h = new Harness(false);
+        h.source.put(LogicalStream.REALTIME,
+                SessionReceiveDriverTest.rec(1, 1, 0, Collections.<Record.Dependency>emptyList(), PID_REALTIME));
+        h.source.put(LogicalStream.CONTROL,
+                SessionReceiveDriverTest.rec(0, 1, 0, SessionReceiveDriverTest.dep(1, 1), PID_CONTROL));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("deliver REALTIME 1s 1"));
+        h.now[0] = TimeUnit.SECONDS.toNanos(11);
+        h.rounds(1);
+        assertEquals(Collections.singletonList(0x12), h.codes);
+        assertEquals(Collections.singletonList("resource"), h.reasons,
+                "our held commit must not emit unseen-prerequisite");
+    }
+
     @Test void routeViolationClosesAndReleasesTheSlot() throws Exception {
         Harness h = new Harness(false);
         // A REALTIME route on the CONTROL stream fails the route check before enqueue.

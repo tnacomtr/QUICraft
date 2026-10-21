@@ -300,6 +300,10 @@ public final class ServerReceiveDriver {
             return false;
         }
         receiver.enqueued(stream, entry.sequence);
+        // From Q until D the peer has done its part. Any delay (including an acceptance
+        // backlog or a protocol swap) is ours, not an unseen prerequisite at the peer.
+        // StreamReceiver.applied clears this mark, including transitive dependent heads.
+        receiver.markLocallyWithheld(stream, entry.sequence);
         entry.enqueued = true;
         executing = entry;
         List<Object> packets = new ArrayList<Object>(1);
