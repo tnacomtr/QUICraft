@@ -23,6 +23,17 @@ record ServerSettings(boolean enabled, int port, int alternativePort, String udp
      */
     static final long MULTISTREAM_NODE_BUDGET_DEFAULT = 256L * 1024 * 1024;
 
+    /**
+     * The share of the node budget that accepted-but-unrun backlogs (13.10) may hold together, in
+     * percent: the rest always stays for reading and decoding, so backlog can never starve admission.
+     */
+    static final int MULTISTREAM_BACKLOG_SHARE_PERCENT = 25;
+
+    /** The backlog sub-cap in bytes for this node budget. */
+    long multistreamBacklogShareBytes() {
+        return multistreamNodeBudgetBytes / 100 * MULTISTREAM_BACKLOG_SHARE_PERCENT;
+    }
+
     private static final String TEMPLATE = """
             # QUICraft dedicated server. TCP is never affected by anything here.
             # Players with the QUICraft mod connect over QUIC (UDP) when this server advertises it.

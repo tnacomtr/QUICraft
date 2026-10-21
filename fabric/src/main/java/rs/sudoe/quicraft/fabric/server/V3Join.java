@@ -98,6 +98,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
     private final byte[] fingerprint;
     private final BindingHold hold = new BindingHold();
     private final ReceiveBudget node;
+    private final ReceiveBudget backlogShare;
     private final JoinState state = new JoinState();
     private final SecretHolder secrets = new SecretHolder();
 
@@ -125,13 +126,21 @@ public final class V3Join implements BindingDecodeContext.Gate {
     private OutboundHold outHold;
     private AckBacklog backlog;
     private boolean retryScheduled;
+    /** Backoff of the held-acknowledgement retry, 1 ms doubling to 64 ms; back to 1 ms once nothing waits. */
+    private long retryDelayMs = 1;
     private OutboundFilter filter;
     private ChannelFuture lastBindingWrite;
     private ByteBuf remainder;
 
     private V3Join(QuicBridgeChannel channel, V3Connection connection, MinecraftServer server, byte[] fingerprint,
             ReceiveBudget node) {
+        this(channel, connection, server, fingerprint, node, ReceiveBudget.unlimited());
+    }
+
+    private V3Join(QuicBridgeChannel channel, V3Connection connection, MinecraftServer server, byte[] fingerprint,
+            ReceiveBudget node, ReceiveBudget backlogShare) {
         this.node = node;
+        this.backlogShare = backlogShare;
         this.channel = channel;
         this.connection = connection;
         this.server = server;
@@ -142,10 +151,10 @@ public final class V3Join implements BindingDecodeContext.Gate {
 
     /** Hook (listener accept): marks a bridge channel as a {@code /3} connection. Never throws. */
     static void attach(QuicBridgeChannel channel, V3Connection connection, MinecraftServer server,
-            byte[] fingerprint, ReceiveBudget node) {
+            byte[] fingerprint, ReceiveBudget node, ReceiveBudget backlogShare) {
         V3Join join = null;
         try {
-            V3Join attached = new V3Join(channel, connection, server, fingerprint, node);
+            V3Join attached = new V3Join(channel, connection, server, fingerprint, node, backlogShare);
             join = attached;
             // Every way a join ends, a held secret, the binding session and a taken-over buffer go.
             channel.closeFuture().addListener(f -> attached.teardown());
@@ -529,7 +538,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
         outHold = new OutboundHold(new LaneSender(), NStreamSession.MAX_UNSENT_PACKETS, NStreamSession.MAX_UNSENT_BYTES,
                 node);
         backlog = new AckBacklog((lane, sequence) -> lanes.applied(lane, sequence), this::offerBehindHandlers, node,
-                AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
+                backlogShare, AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
         // 13.4: the platform reads the live compression state once, here, and the session keeps it.
         connection.activate(lanes, protocol, PacketLaneCodec.compressionEnabled(pipeline), account, control);
         causalContext().bindSession(connection, connection.session());
@@ -1012,12 +1021,21 @@ public final class V3Join implements BindingDecodeContext.Gate {
             }
         }
 
-        /** While a not-accepting listener holds acknowledgements back, try its queue again shortly. */
+        /**
+         * While a not-accepting listener or a full backlog share holds acknowledgements back, try again
+         * shortly, backing off to 64 ms so a node-wide full share does not spin every connection.
+         */
         private void scheduleRetry(ChannelHandlerContext ctx) {
-            if (retryScheduled || !backlog.hasBlocked()) {
+            if (retryScheduled) {
+                return;
+            }
+            if (!backlog.hasBlocked()) {
+                retryDelayMs = 1;
                 return;
             }
             retryScheduled = true;
+            long delay = retryDelayMs;
+            retryDelayMs = Math.min(64, retryDelayMs * 2);
             ctx.executor().schedule(() -> {
                 retryScheduled = false;
                 try {
@@ -1028,7 +1046,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
                 } catch (Throwable t) {
                     fail("binding ack retry: " + describe(t), t);
                 }
-            }, 1, TimeUnit.MILLISECONDS);
+            }, delay, TimeUnit.MILLISECONDS);
         }
     }
 

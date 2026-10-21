@@ -49,6 +49,8 @@ public final class ServerQuic {
     private static volatile byte @Nullable [] fingerprintDigest;
     /** The node's receive budget (13.12), shared by the listener's lane sessions and this platform's send-side queues. */
     private static volatile @Nullable ReceiveBudget nodeBudget;
+    /** The node-wide sub-cap of the accepted backlogs (13.10), inside {@link #nodeBudget}. */
+    private static volatile @Nullable ReceiveBudget backlogShare;
 
     private final QuicServer server;
     private final Advertisement advertisement;
@@ -204,6 +206,7 @@ public final class ServerQuic {
             // 13.12: the node-wide pending-bytes budget of the owner's setting; /2 has none.
             ReceiveBudget budget = ReceiveBudget.bounded(settings.multistreamNodeBudgetBytes());
             nodeBudget = budget;
+            backlogShare = ReceiveBudget.bounded(settings.multistreamBacklogShareBytes());
             TransportConfig config = TransportConfig.builder().nodeBudget(budget).build();
             return QuicServer.bind(sockets.hostLoops(), sockets.hostSockets(), identity,
                     config, stream -> accept(stream, init, sockets.acceptingLoop()),
@@ -226,8 +229,10 @@ public final class ServerQuic {
             MinecraftServer server = minecraft;
             byte[] digest = fingerprintDigest;
             ReceiveBudget budget = nodeBudget;
+            ReceiveBudget share = backlogShare;
             if (server != null && digest != null) {
-                V3Join.attach(channel, v3, server, digest, budget != null ? budget : ReceiveBudget.unlimited());
+                V3Join.attach(channel, v3, server, digest, budget != null ? budget : ReceiveBudget.unlimited(),
+                        share != null ? share : ReceiveBudget.unlimited());
             } else {
                 v3.abort(Protocol.CLOSE_BINDING_FAILURE);
             }
@@ -248,6 +253,7 @@ public final class ServerQuic {
         minecraft = null;
         fingerprintDigest = null;
         nodeBudget = null;
+        backlogShare = null;
         if (s != null) {
             try {
                 s.server.close();
