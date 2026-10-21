@@ -11,7 +11,7 @@ import rs.sudoe.quicraft.core.routing.Direction;
 import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
- * Receiver-side ordering policy for the N+2 streams of one direction (protocol.md 13.10, 13.12,
+ * Receiver-side ordering policy for the N+3 streams of one direction (protocol.md 13.10, 13.12,
  * 13.18, 13.19). It holds at most one head unit per stream and decides which head may be enqueued
  * to the game executor. It never decodes game bodies and never runs game code.
  *

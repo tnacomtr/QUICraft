@@ -11,7 +11,7 @@ import java.io.IOException;
 import java.util.ArrayDeque;
 
 /**
- * The receive side of an N+2 session: a {@link SessionReadPump.ByteSource} over Netty QUIC stream channels
+ * The receive side of an N+3 session: a {@link SessionReadPump.ByteSource} over Netty QUIC stream channels
  * (protocol.md 13.12).
  *
  * <p>Each attached channel runs with autoRead off. Netty delivers bytes only when {@link QuicStreamChannel#read()}
@@ -136,7 +136,7 @@ public final class QuicStreamByteSource implements SessionReadPump.ByteSource {
     }
 
     /**
-     * Creates a source for {@code streams} logical streams (N+2), none attached yet.
+     * Creates a source for {@code streams} logical streams (N+3), none attached yet.
      *
      * @param streams the number of logical streams; indexes run from 0 to {@code streams - 1}
      */

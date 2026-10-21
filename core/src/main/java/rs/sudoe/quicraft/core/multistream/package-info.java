@@ -5,7 +5,7 @@
  * networking and no routing table. The ordering core ({@link
  * rs.sudoe.quicraft.core.multistream.StreamSequencer}, {@link
  * rs.sudoe.quicraft.core.multistream.StreamReceiver}) is transport independent as well.
- * {@link rs.sudoe.quicraft.core.multistream.NStreamSession} runs the N+2 QUIC streams of 13.3 over
+ * {@link rs.sudoe.quicraft.core.multistream.NStreamSession} runs the N+3 QUIC streams of 13.3 over
  * Netty QUIC and connects them to those parts and to the game through {@link
  * rs.sudoe.quicraft.core.multistream.LaneGame}, which has no Minecraft classes. It compiles to
  * Java 8 bytecode. Every failure carries the QUIC application close code the spec names for it.

@@ -11,7 +11,7 @@ import java.util.function.LongSupplier;
 import rs.sudoe.quicraft.core.Protocol;
 
 /**
- * Clientbound read pump over the N+2 streams: CONTROL, REALTIME and CHUNK[0..N-1] (protocol.md 13.12).
+ * Clientbound read pump over the N+3 streams: CONTROL, REALTIME, CHUNK[0..N-1] and ACK (protocol.md 13.12).
  *
  * <p>Each stream reads only into its own {@link ReceiveSlots} slot. Before a stream's first byte, a
  * provisional head of {@link SessionReadPump#PREFIX_STAGE} bytes is admitted for it, so early bytes (the

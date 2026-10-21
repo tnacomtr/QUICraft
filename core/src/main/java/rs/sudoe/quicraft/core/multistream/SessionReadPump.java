@@ -18,7 +18,7 @@ import rs.sudoe.quicraft.core.resource.ResourcePools;
 import rs.sudoe.quicraft.core.routing.RouteV2;
 
 /**
- * Bounded serverbound read pump for one N+2 session (protocol.md 13.12).
+ * Bounded serverbound read pump for one N+3 session (protocol.md 13.12).
  *
  * <p>The pump reads the CONTROL and REALTIME streams one record at a time. Before a record's body is
  * read, its bounded prefix is staged in a fixed 74-byte slice of the protected area, inspected and its

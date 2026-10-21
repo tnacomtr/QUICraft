@@ -43,8 +43,8 @@ import rs.sudoe.quicraft.core.routing.extract.ExtractorRegistry;
 import rs.sudoe.quicraft.core.time.StallClock;
 
 /**
- * The N+2 {@code /3} session of one connection (docs/protocol.md 13.3-13.20): CONTROL on QUIC stream 0,
- * REALTIME on stream 4 and CHUNK[i] on stream {@code 1+4i}, for the negotiated N.
+ * The N+3 {@code /3} session of one connection (docs/protocol.md 13.3-13.21): CONTROL on QUIC stream 0,
+ * REALTIME on stream 4, CHUNK[i] on stream {@code 1+4i} and the ACK stream on {@code 1+4N}, for the negotiated N.
  *
  * <p>Assembly. The send side is a {@link SessionSendDriver} drained into the streams by a
  * {@link QuicStreamWriteSink}; every outbound packet is routed by {@link SendRouteResolver} from the reviewed
@@ -450,7 +450,7 @@ public final class NStreamSession implements MultistreamSession {
             throw new IllegalArgumentException("account key must be null or non-empty");
         }
         if (!resources.cumulative()) {
-            throw new IllegalArgumentException("the N+2 session needs cumulative session resources (13.10)");
+            throw new IllegalArgumentException("the N+3 session needs cumulative session resources (13.10)");
         }
         if (timing.clock != resources.clock()) {
             throw new IllegalArgumentException("the session timing clock must be the resources' owner clock (13.10)");
@@ -460,7 +460,7 @@ public final class NStreamSession implements MultistreamSession {
             throw new IllegalArgumentException("CONTROL must be bidirectional stream 0");
         }
         if (table.schema() != 2) {
-            throw new IllegalArgumentException("the N+2 session needs a reviewed schema-2 routing table (13.7)");
+            throw new IllegalArgumentException("the N+3 session needs a reviewed schema-2 routing table (13.7)");
         }
         this.connection = connection;
         this.role = role;
@@ -1544,7 +1544,7 @@ public final class NStreamSession implements MultistreamSession {
         if (closed) {
             return;
         }
-        LOG.log(Level.FINE, "closing N+2 connection with 0x{0}: {1}", new Object[] {Integer.toHexString(code), why});
+        LOG.log(Level.FINE, "closing N+3 connection with 0x{0}: {1}", new Object[] {Integer.toHexString(code), why});
         closed = true;
         // A 0x12 without a classified phrase carries the generic "resource" (13.12).
         final byte[] phrase = reason != null && reason.length > 0 ? reason
@@ -1790,7 +1790,7 @@ public final class NStreamSession implements MultistreamSession {
         @Override
         public int read(int stream, byte[] into, int offset, int max) throws IOException {
             if (stream < 0 || stream >= streams) {
-                throw new IOException("logical stream " + stream + " is outside N+2");
+                throw new IOException("logical stream " + stream + " is outside N+3");
             }
             if (!attached[stream] || max == 0) {
                 return 0;
