@@ -124,8 +124,12 @@ public final class NStreamSession implements MultistreamSession {
     public static final int MAX_KEPT_AFTER_DETACH = MAX_ACTIVATION_LEFTOVER / 2;
     /** Receive steps per pump task before it yields the loop. */
     private static final int MAX_STEPS = 64;
-    /** Experiment: run the receive pump at a stream's read-complete instead of a queued loop task. */
-    private static final boolean INLINE_PUMP = Boolean.getBoolean("quicraft.v3.inlinePump");
+    /**
+     * Run the receive pump at a stream's read-complete instead of a queued loop task, so the body grant after a
+     * length prefix is issued in the same loop turn (measured: -0.16 ms clean-link ping, docs/benchmarks.md).
+     * On by default; {@code -Dquicraft.v3.inlinePump=false} restores the queued pump.
+     */
+    private static final boolean INLINE_PUMP = !"false".equals(System.getProperty("quicraft.v3.inlinePump"));
     private static final byte[] NO_REASON = new byte[0];
 
     /** Clocks and periods; tests shorten them, production uses {@link #defaults(SessionResources)}. */

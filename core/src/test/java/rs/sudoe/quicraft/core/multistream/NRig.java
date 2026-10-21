@@ -431,7 +431,7 @@ final class NRig implements AutoCloseable {
 
     /** The explicit override, else the production default (the same system property NStreamSession reads). */
     private static boolean inlinePumpFlag(Config config) {
-        return config.inlinePump != null ? config.inlinePump : Boolean.getBoolean("quicraft.v3.inlinePump");
+        return config.inlinePump != null ? config.inlinePump : !"false".equals(System.getProperty("quicraft.v3.inlinePump"));
     }
 
     private static void raw(QuicStreamChannel stream, BlockingQueue<QuicStreamChannel> streams,
