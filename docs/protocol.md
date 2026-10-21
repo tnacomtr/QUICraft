@@ -1365,7 +1365,8 @@ before this revision can run.
     update (6, 8, 84) applied before the ACK would change the client's saved server state before
     the ACK restores it, and would alter the collision-snap outcome; the dependency is not
     ACK-commutative. They hash the same chunk column as `level_chunk_with_light`, so one chunk's
-    install, updates, block-entity data and forget stay ordered by `ack`.
+    install, updates, block-entity data and forget keep game order in one lane, and each also waits
+    for the latest ACK-stream record.
     `block_changed_ack` (4) and `chunk_batch_finished` (11) use the ACK stream (13.21) with `trailing`: a
     trailing record depends on the assigned maximum of every stream, ACK included, and advances no frontier.
     Each ack executes after every earlier assigned record, including any chunk update (6, 8, 84) that
