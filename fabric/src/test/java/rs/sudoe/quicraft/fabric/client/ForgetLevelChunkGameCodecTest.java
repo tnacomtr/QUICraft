@@ -32,7 +32,7 @@ class ForgetLevelChunkGameCodecTest {
     }
 
     @Test
-    void gameEncoderProducesThePackedLongTheExtractorReads() {
+    void gameEncoderProducesThePackedLongTheExtractorReads() throws ReflectiveOperationException {
         // The captured-vector file has no 37 frame (forget packets are rare in a capture run), so the
         // game's own encoder is the evidence: protocol 775 writes this id plus ChunkPos.pack().
         int[][] chunks = {
@@ -46,12 +46,12 @@ class ForgetLevelChunkGameCodecTest {
             assertEquals(chunk[0], position.chunkX, "game-encoded x for " + chunk[0] + "," + chunk[1]);
             assertEquals(chunk[1], position.chunkZ, "game-encoded z for " + chunk[0] + "," + chunk[1]);
             // The layout is the game's ChunkPos.pack, so the wire also matches it byte for byte.
-            assertEquals(ChunkPos.pack(chunk[0], chunk[1]),
+            assertEquals(packChunkPos(chunk[0], chunk[1]),
                     ((long) (wire[1] & 255) << 56) | ((long) (wire[2] & 255) << 48)
                             | ((long) (wire[3] & 255) << 40) | ((long) (wire[4] & 255) << 32)
                             | ((long) (wire[5] & 255) << 24) | ((long) (wire[6] & 255) << 16)
                             | ((long) (wire[7] & 255) << 8) | (wire[8] & 255),
-                    "wire long is ChunkPos.pack: " + chunk[0] + "," + chunk[1]);
+                    "wire long is the game's packed ChunkPos: " + chunk[0] + "," + chunk[1]);
         }
     }
 
@@ -66,5 +66,16 @@ class ForgetLevelChunkGameCodecTest {
         } finally {
             buffer.release();
         }
+    }
+
+    /** The game's packed ChunkPos long: {@code ChunkPos.pack} on 26.x, {@code ChunkPos.asLong} on 1.21.11. */
+    private static long packChunkPos(int x, int z) throws ReflectiveOperationException {
+        java.lang.reflect.Method m;
+        try {
+            m = ChunkPos.class.getMethod("pack", int.class, int.class);
+        } catch (NoSuchMethodException e) {
+            m = ChunkPos.class.getMethod("asLong", int.class, int.class);
+        }
+        return (Long) m.invoke(null, x, z);
     }
 }
