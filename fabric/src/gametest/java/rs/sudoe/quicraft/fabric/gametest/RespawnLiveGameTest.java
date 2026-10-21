@@ -193,7 +193,39 @@ public final class RespawnLiveGameTest implements FabricClientGameTest {
                 // Leave the world as the later tests expect it.
                 server.runCommand("gamemode survival @a");
                 context.waitTicks(10);
-                QuicraftFabricTestLog.info("respawn-live: PASS, final receive epoch " + epoch);
+                QuicraftFabricTestLog.info("respawn-live: phase 1 PASS, final receive epoch " + epoch);
+            }
+
+            // Phase 2, fresh connection: a respawn while the held set is trusted and holds chunks.
+            context.waitTicks(20);
+            try (var join = server.connect()) {
+                GameTests.waitForChunks(join);
+                Rig rig = new Rig(context, server);
+                rig.capture();
+                long epoch = rig.receiveEpoch();
+                Boolean untrustedAtJoin = rig.heldChunksUntrusted();
+                QuicraftFabricTestLog.info("respawn-live: phase 2 joined again over /3, receive epoch " + epoch
+                        + ", HeldChunkSet untrusted " + untrustedAtJoin);
+                check(Boolean.FALSE.equals(untrustedAtJoin),
+                        "login must keep the first-install exemption: untrusted=" + untrustedAtJoin);
+                rig.assertLive("phase 2 after join", Level.OVERWORLD, epoch);
+                server.runCommand("kill @a");
+                context.waitForScreen(DeathScreen.class);
+                context.waitTicks(30);
+                context.clickScreenButton("deathScreen.respawn");
+                epoch = rig.settle("phase 2 respawn with held chunks", Level.OVERWORLD, epoch + 1);
+                Boolean untrustedAfter = rig.heldChunksUntrusted();
+                QuicraftFabricTestLog.info("respawn-live: phase 2 HeldChunkSet untrusted after the respawn: "
+                        + untrustedAfter);
+                check(Boolean.TRUE.equals(untrustedAfter),
+                        "a respawn over held chunks must mark the set unknown: untrusted=" + untrustedAfter);
+                BlockPos here = rig.clientBlockPos();
+                server.runCommand("fill " + (here.getX() - 3) + " " + here.getY() + " " + (here.getZ() + 3) + " "
+                        + (here.getX() + 3) + " " + (here.getY() + 2) + " " + (here.getZ() + 5)
+                        + " minecraft:bricks");
+                context.waitTicks(20);
+                PlaySession.compareBlocks(context, server, here.offset(-8, -3, -8), here.offset(8, 3, 8));
+                QuicraftFabricTestLog.info("respawn-live: PASS, phase 2 final receive epoch " + epoch);
             }
         }
     }
