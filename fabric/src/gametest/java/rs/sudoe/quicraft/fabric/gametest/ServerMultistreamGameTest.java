@@ -98,7 +98,7 @@ public class ServerMultistreamGameTest implements FabricClientGameTest {
                     }
                     wrongProof = join.result;
                     for (int tick = 0; tick < 300
-                            && ServerMultistreamOnlineGameTest.bindingObserverEvidence() == null; tick++) {
+                            && ServerMultistreamOnlineGameTest.bindingObserverEvidence(wrongProof.clientPort) == null; tick++) {
                         context.waitTick();
                     }
                 }
@@ -113,13 +113,13 @@ public class ServerMultistreamGameTest implements FabricClientGameTest {
                 check(!wrongProof.activated, "no activation on the client: " + wrongProof);
                 check(!wrongProof.switchSent && !wrongProof.switchVerified, "no switch ran: " + wrongProof);
 
-                check(ServerMultistreamOnlineGameTest.bindingObserverInvocations() == 1,
+                check(ServerMultistreamOnlineGameTest.bindingObserverInvocations(wrongProof.clientPort) == 1,
                         "the server's V3Join.fail ran exactly once for the armed attempt, saw "
-                                + ServerMultistreamOnlineGameTest.bindingObserverInvocations());
-                check(!ServerMultistreamOnlineGameTest.bindingObserverDivergentChannel(),
+                                + ServerMultistreamOnlineGameTest.bindingObserverInvocations(wrongProof.clientPort));
+                check(!ServerMultistreamOnlineGameTest.bindingObserverDivergentChannel(wrongProof.clientPort),
                         "the observed failure came from a single connection");
                 ServerMultistreamOnlineGameTest.BindingFailureEvidence observed =
-                        ServerMultistreamOnlineGameTest.bindingObserverEvidence();
+                        ServerMultistreamOnlineGameTest.bindingObserverEvidence(wrongProof.clientPort);
                 check(observed != null, "the server-side observer captured the armed failure");
                 check(observed.reflectionError == null, "the observer's reflection ran: " + observed);
                 check(observed.onChannelEventLoop, "the failure ran on the channel's event loop: " + observed);

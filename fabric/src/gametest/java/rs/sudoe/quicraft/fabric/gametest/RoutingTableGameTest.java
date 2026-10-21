@@ -54,13 +54,14 @@ import rs.sudoe.quicraft.core.routing.RoutingTable;
  * change must deliberately revise these pins together with its wiring tests.
  *
  * <p>The game classes are reached by reflection: this source set is shared with the 1.21.11 jar,
- * where the same names are obfuscated and the test has nothing to pin. It returns early there.
+ * which uses protocol 774 and has no shipped /3 table. It returns early there.
  *
- * <p>On the module's own game version it also compares the complete live play protocol, both
+ * <p>On protocol 775 it also compares the complete live play protocol, both
  * directions and every id, against the checked-in {@code play-ids-775.txt} (core's routing test
  * resources). A new, removed or renamed packet therefore fails here until the fixture is refreshed;
- * a module version bump to another protocol fails loudly too. Rows that test the same jar on another
- * release through a {@code -P<module>.minecraft} override skip visibly instead.
+ * a module version bump to another protocol fails loudly. 1.21.11 (774) and rows that test the same
+ * jar on another release through a {@code -P<module>.minecraft} override skip visibly instead. The route counts, classifications, ids and
+ * epoch-change pins below are all specific to 775, not just the inventory resource.
  *
  * <p>A refresh run ({@code -Pquicraft.emitPlayIds}) emits even when the live protocol differs from
  * {@link #PROTOCOL}, so a protocol bump can be captured before the constant, the routing resource
@@ -91,6 +92,9 @@ public class RoutingTableGameTest implements FabricClientGameTest {
      * {@code -P<module>.minecraft} override. True means a protocol change is a stale fixture.
      */
     private static final String PINNED_PROPERTY = "quicraft.gametest.pinnedVersion";
+
+    /** 1.21.11's play protocol: it shares this source set but has no shipped /3 table. */
+    private static final int PROTOCOL_1_21_11 = 774;
 
     /** The live play inventory on the pinned version: 141 clientbound and 69 serverbound ids. */
     private static final int CLIENTBOUND_ROUTES = 141;
@@ -159,31 +163,35 @@ public class RoutingTableGameTest implements FabricClientGameTest {
 
     @Override
     public void runTest(ClientGameTestContext context) {
+        int liveProtocol = SharedConstants.getProtocolVersion();
+        boolean refresh = System.getProperty(EMIT_PROPERTY) != null;
+        // Named classes are available in the 1.21.11 development runtime too; class availability
+        // does not make its protocol 774 use the protocol-775 routing table or inventory.
+        if (liveProtocol != PROTOCOL && !refresh) {
+            boolean pinned = Boolean.parseBoolean(System.getProperty(PINNED_PROPERTY, "true"));
+            if (pinned && liveProtocol != PROTOCOL_1_21_11) {
+                throw new AssertionError("the live game is PLAY protocol " + liveProtocol
+                        + ", but the checked-in inventory pins " + PROTOCOL + " (" + INVENTORY_RESOURCE
+                        + "). Refresh the fixture: " + refreshCommand(liveProtocol));
+            }
+            System.out.println("[QUICraft] live PLAY protocol " + liveProtocol + "; skipping protocol-"
+                    + PROTOCOL + " route counts, lane/dependency/epoch pins and play-ids-" + PROTOCOL
+                    + " inventory comparison: these fixtures apply only to " + PROTOCOL);
+            return;
+        }
         if (!liveProtocolAvailable()) {
             System.out.println("[QUICraft] the play protocol classes are obfuscated in this jar"
                     + " (1.21.11); the protocol-" + PROTOCOL + " inventory check does not apply");
             return;
         }
-        int liveProtocol = SharedConstants.getProtocolVersion();
-        boolean refresh = System.getProperty(EMIT_PROPERTY) != null;
         try {
             Map<String, Integer> clientbound = liveIds("CLIENTBOUND_TEMPLATE");
             Map<String, Integer> serverbound = liveIds("SERVERBOUND_TEMPLATE");
             if (liveProtocol != PROTOCOL) {
-                if (refresh) {
-                    emit(liveProtocol, clientbound, serverbound);
-                    System.out.println("[QUICraft] captured protocol " + liveProtocol + "; update PROTOCOL,"
-                            + " protocol-" + liveProtocol + ".json and its pins, and core's"
-                            + " PlayIdInventoryTest, then re-run without -Pquicraft.emitPlayIds");
-                    return;
-                }
-                String message = "the live game is PLAY protocol " + liveProtocol
-                        + ", but the checked-in inventory pins " + PROTOCOL + " (" + INVENTORY_RESOURCE + ")";
-                if (Boolean.parseBoolean(System.getProperty(PINNED_PROPERTY, "true"))) {
-                    throw new AssertionError(message + ". Refresh the fixture: " + refreshCommand(liveProtocol));
-                }
-                System.out.println("[QUICraft] " + message + "; this row tests another release"
-                        + " (a -P<module>.minecraft override), skipping");
+                emit(liveProtocol, clientbound, serverbound);
+                System.out.println("[QUICraft] captured protocol " + liveProtocol + "; update PROTOCOL,"
+                        + " protocol-" + liveProtocol + ".json and its pins, and core's"
+                        + " PlayIdInventoryTest, then re-run without -Pquicraft.emitPlayIds");
                 return;
             }
             if (refresh) {

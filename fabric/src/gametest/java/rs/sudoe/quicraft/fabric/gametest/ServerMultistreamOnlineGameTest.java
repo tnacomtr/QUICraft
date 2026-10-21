@@ -12,6 +12,8 @@ import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Properties;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
@@ -136,7 +138,7 @@ public class ServerMultistreamOnlineGameTest implements FabricClientGameTest {
                             context.waitTick();
                         }
                         wrongProof = join.result;
-                        for (int tick = 0; tick < 300 && bindingObserverEvidence() == null; tick++) {
+                        for (int tick = 0; tick < 300 && bindingObserverEvidence(wrongProof.clientPort) == null; tick++) {
                             context.waitTick();
                         }
                     }
@@ -152,12 +154,12 @@ public class ServerMultistreamOnlineGameTest implements FabricClientGameTest {
                     check(!wrongProof.activated, "no activation on the client: " + wrongProof);
                     check(!wrongProof.switchSent && !wrongProof.switchVerified, "no switch ran: " + wrongProof);
 
-                    check(bindingObserverInvocations() == 1,
+                    check(bindingObserverInvocations(wrongProof.clientPort) == 1,
                             "the server's V3Join.fail ran exactly once for the armed attempt, saw "
-                                    + bindingObserverInvocations());
-                    check(!bindingObserverDivergentChannel(),
+                                    + bindingObserverInvocations(wrongProof.clientPort));
+                    check(!bindingObserverDivergentChannel(wrongProof.clientPort),
                             "the observed failure came from a single connection");
-                    BindingFailureEvidence observed = bindingObserverEvidence();
+                    BindingFailureEvidence observed = bindingObserverEvidence(wrongProof.clientPort);
                     check(observed != null, "the server-side observer captured the armed failure");
                     check(observed.reflectionError == null, "the observer's reflection ran: " + observed);
                     check(observed.onChannelEventLoop, "the failure ran on the channel's event loop: " + observed);
@@ -193,7 +195,7 @@ public class ServerMultistreamOnlineGameTest implements FabricClientGameTest {
                         mismatch = join.result;
                         // Keep the raw client connected: the server's 10 second activation deadline
                         // (12.14) is what ends this join, and the observer must see that failure.
-                        for (int tick = 0; tick < 900 && bindingObserverEvidence() == null; tick++) {
+                        for (int tick = 0; tick < 900 && bindingObserverEvidence(mismatch.clientPort) == null; tick++) {
                             context.waitTick();
                         }
                     }
@@ -208,12 +210,12 @@ public class ServerMultistreamOnlineGameTest implements FabricClientGameTest {
                     check(mismatch.outboundCipherRetained && mismatch.inboundCipherRetained,
                             "the failure left Minecraft's cipher on the client: " + mismatch);
 
-                    check(bindingObserverInvocations() == 1,
+                    check(bindingObserverInvocations(mismatch.clientPort) == 1,
                             "the server's V3Join.fail ran exactly once for the armed attempt, saw "
-                                    + bindingObserverInvocations());
-                    check(!bindingObserverDivergentChannel(),
+                                    + bindingObserverInvocations(mismatch.clientPort));
+                    check(!bindingObserverDivergentChannel(mismatch.clientPort),
                             "the observed failure came from a single connection");
-                    BindingFailureEvidence observed = bindingObserverEvidence();
+                    BindingFailureEvidence observed = bindingObserverEvidence(mismatch.clientPort);
                     check(observed != null, "the server-side observer captured the armed failure");
                     check(observed.reflectionError == null, "the observer's reflection ran: " + observed);
                     check(observed.onChannelEventLoop, "the failure ran on the channel's event loop: " + observed);
@@ -292,9 +294,18 @@ public class ServerMultistreamOnlineGameTest implements FabricClientGameTest {
 
     private static final Object OBSERVER_LOCK = new Object();
     private static boolean observerArmed;
-    private static BindingFailureEvidence observerEvidence;
-    private static int observerInvocations;
-    private static boolean observerDivergentChannel;
+    private static final Map<Integer, BindingObservation> observerByPort = new HashMap<>();
+    private static boolean observerOverflow;
+
+    private static final class BindingObservation {
+        final BindingFailureEvidence first;
+        int invocations;
+        boolean divergentChannel;
+
+        BindingObservation(BindingFailureEvidence first) {
+            this.first = first;
+        }
+    }
 
     /**
      * Called by the gametest-only {@code V3JoinBindingObserverMixin} at the head of the production
@@ -308,49 +319,69 @@ public class ServerMultistreamOnlineGameTest implements FabricClientGameTest {
             if (!observerArmed) {
                 return;
             }
-            observerInvocations++;
-            if (observerEvidence == null) {
-                observerEvidence = captured;
-            } else if (observerEvidence.channelIdentity != captured.channelIdentity
-                    || observerEvidence.connectionIdentity != captured.connectionIdentity) {
-                observerDivergentChannel = true;
+            // Closing the previous successful raw client can still trigger idempotent fail calls
+            // after this window is armed (26.1 CI: old port 42500, wrong-proof port 45459).
+            // Retain by client port so only the armed attempt satisfies/counts its assertions.
+            BindingObservation observation = observerByPort.get(captured.remotePort);
+            if (observation == null) {
+                if (observerByPort.size() == 16) {
+                    observerOverflow = true;
+                    return;
+                }
+                observation = new BindingObservation(captured);
+                observerByPort.put(captured.remotePort, observation);
             }
+            observation.invocations++;
+            observation.divergentChannel |= observation.first.channelIdentity != captured.channelIdentity
+                    || observation.first.connectionIdentity != captured.connectionIdentity;
+            QuicraftFabricTestLog.info("binding observer: port=" + captured.remotePort + " invocation="
+                    + observation.invocations + " " + captured);
         }
     }
 
     static void armBindingObserver() {
         synchronized (OBSERVER_LOCK) {
             observerArmed = true;
-            observerEvidence = null;
-            observerInvocations = 0;
-            observerDivergentChannel = false;
+            observerByPort.clear();
+            observerOverflow = false;
         }
     }
 
     static void clearBindingObserver() {
         synchronized (OBSERVER_LOCK) {
             observerArmed = false;
-            observerEvidence = null;
-            observerInvocations = 0;
-            observerDivergentChannel = false;
+            observerByPort.clear();
+            observerOverflow = false;
         }
     }
 
-    static BindingFailureEvidence bindingObserverEvidence() {
+    private static BindingObservation observation(int clientPort) {
+        check(clientPort > 0, "the armed client has a local UDP port: " + clientPort);
+        check(!observerOverflow, "binding observer exceeded its 16-connection evidence limit");
+        BindingObservation unreadable = observerByPort.get(-1);
+        check(unreadable == null, "binding observer could not identify a connection: "
+                + (unreadable == null ? "" : unreadable.first));
+        return observerByPort.get(clientPort);
+    }
+
+    static BindingFailureEvidence bindingObserverEvidence(int clientPort) {
         synchronized (OBSERVER_LOCK) {
-            return observerEvidence;
+            BindingObservation observation = observation(clientPort);
+            return observation == null ? null : observation.first;
         }
     }
 
-    static int bindingObserverInvocations() {
+    static int bindingObserverInvocations(int clientPort) {
         synchronized (OBSERVER_LOCK) {
-            return observerInvocations;
+            BindingObservation observation = observation(clientPort);
+            return observation == null ? 0 : observation.invocations;
         }
     }
 
-    static boolean bindingObserverDivergentChannel() {
+    static boolean bindingObserverDivergentChannel(int clientPort) {
         synchronized (OBSERVER_LOCK) {
-            return observerDivergentChannel;
+            BindingObservation observation = observation(clientPort);
+            return observation != null && observation.divergentChannel;
         }
     }
 

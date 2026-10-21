@@ -16,6 +16,7 @@ import net.minecraft.client.gui.components.debug.DebugEntryTps;
 import net.minecraft.client.gui.components.debug.DebugScreenDisplayer;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.ServerStatusPinger;
+import net.minecraft.network.Connection;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.network.EventLoopGroupHolder;
 import rs.sudoe.quicraft.fabric.client.Transports;
@@ -93,6 +94,23 @@ final class GameTests {
         }
     }
 
+    /**
+     * The open screen, or null: 26.1.x keeps it in {@code Minecraft.screen}, 26.2+ behind {@code gui.screen()}.
+     * Reflection keeps one gametest source compiling for every 26.x build.
+     */
+    static Object screen(Object minecraft) {
+        try {
+            try {
+                return minecraft.getClass().getField("screen").get(minecraft);
+            } catch (NoSuchFieldException e) {
+                Object gui = minecraft.getClass().getField("gui").get(minecraft);
+                return gui.getClass().getMethod("screen").invoke(gui);
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("no screen accessor on " + minecraft.getClass().getName(), e);
+        }
+    }
+
     static boolean connectedOverQuic(ClientGameTestContext context) {
         return context.computeOnClient(c -> c.getConnection() != null
                 && Transports.isQuic(c.getConnection().getConnection()));
@@ -144,12 +162,44 @@ final class GameTests {
                 throw new AssertionError(e);
             }
         });
+        // A successful Netty connect future can wake pingServer() before channelActive has run.
+        // Fault-injection logging at channelActive HEAD makes that window particularly visible.
+        // Vanilla pinger.tick() removes any !isConnected() entry, including one whose channel is
+        // still null, so ticking immediately can discard a perfectly good pending TCP ping.
+        // Wait for activation, not a guessed sleep; keep the actual status/pong check below intact.
+        Connection connection = context.computeOnClient(c -> pingConnection(pinger));
+        QuicraftFabricTestLog.info("server-list ping: waiting for TCP channelActive "
+                + "(Connection.isConnecting() == false) before the first pinger.tick()");
+        int activationTicks = 0;
+        while (activationTicks < 200 && context.computeOnClient(c -> connection.isConnecting())) {
+            context.waitTick();
+            activationTicks++;
+        }
+        boolean activated = context.computeOnClient(c -> !connection.isConnecting());
+        QuicraftFabricTestLog.info("server-list ping: TCP channelActive ready=" + activated
+                + " after " + activationTicks + " ticks");
+        check(activated, "server-list ping TCP channelActive did not complete within 200 ticks");
         for (int i = 0; i < 200 && !pong.get(); i++) {
             context.runOnClient(c -> pinger.tick());
             context.waitTick();
         }
         context.runOnClient(c -> pinger.removeAll());
         return pong.get();
+    }
+
+    /** Named development-game field, identical on 1.21.11 and 26.x; no release code uses this. */
+    private static Connection pingConnection(ServerStatusPinger pinger) {
+        try {
+            java.lang.reflect.Field field = ServerStatusPinger.class.getDeclaredField("connections");
+            field.setAccessible(true);
+            List<?> connections = (List<?>) field.get(pinger);
+            synchronized (connections) {
+                check(connections.size() == 1, "server-list ping created one TCP connection: " + connections.size());
+                return (Connection) connections.get(0);
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("cannot inspect server-list ping activation", e);
+        }
     }
 
     static String address(TestDedicatedServerContext server) {

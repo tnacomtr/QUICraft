@@ -394,7 +394,7 @@ final class ExtractorVectorCapture {
                 return "JOIN";
             case COORDINATES:
                 if (packet instanceof ClientboundLevelChunkWithLightPacket chunk) {
-                    return coords(chunk.getX(), chunk.getZ());
+                    return coords(chunkAxis(chunk, "x", "getX"), chunkAxis(chunk, "z", "getZ"));
                 }
                 throw unexpected(packet);
             case BLOCK_POSITION: {
@@ -503,6 +503,22 @@ final class ExtractorVectorCapture {
             }
         }
         throw new IllegalStateException("frame does not start with a packet id");
+    }
+
+    /**
+     * A chunk packet's coordinate: {@code x()}/{@code z()} from 26.3, {@code getX()}/{@code getZ()} before (26.1.x,
+     * 26.2). Reflection keeps one source compiling on every build.
+     */
+    private static int chunkAxis(ClientboundLevelChunkWithLightPacket chunk, String record, String getter) {
+        try {
+            try {
+                return (int) chunk.getClass().getMethod(record).invoke(chunk);
+            } catch (NoSuchMethodException e) {
+                return (int) chunk.getClass().getMethod(getter).invoke(chunk);
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("no " + record + " accessor on the chunk packet", e);
+        }
     }
 
     private static String coords(int x, int z) {

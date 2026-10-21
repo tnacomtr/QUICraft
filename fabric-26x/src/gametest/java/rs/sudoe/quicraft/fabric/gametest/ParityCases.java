@@ -41,6 +41,7 @@ import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.world.entity.PositionMoveRotation;
 import net.minecraft.world.entity.Relative;
 import net.minecraft.world.level.block.entity.SignBlockEntity;
+import net.minecraft.world.level.block.entity.SignText;
 import java.util.Optional;
 import java.util.Set;
 import rs.sudoe.quicraft.fabric.gametest.ParityRunner.Expect;
@@ -49,6 +50,74 @@ import rs.sudoe.quicraft.fabric.gametest.ParityRunner.ParityCase;
 /** The parity cases, in the order of the work plan: control sanity, then the r2 list, then the r3 additions. */
 final class ParityCases {
     private ParityCases() {}
+
+    /*
+     * Version-portable accessors for the 26.x API that moved between builds: ARMOR_STAND lives in EntityTypes from
+     * 26.2, the move packet takes a VecDelta from 26.3, and the sign text API changed in 26.2 and 26.3. Reflection
+     * keeps one gametest source compiling and exercising the same packets on every 26.x build.
+     */
+
+    static EntityType<?> armorStandType() {
+        try {
+            try {
+                return (EntityType<?>) Class.forName("net.minecraft.world.entity.EntityType").getField("ARMOR_STAND").get(null);
+            } catch (NoSuchFieldException e) {
+                return (EntityType<?>) Class.forName("net.minecraft.world.entity.EntityTypes").getField("ARMOR_STAND").get(null);
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("no ARMOR_STAND entity type", e);
+        }
+    }
+
+    /** A relative move packet of (dx, dy, dz) in 1/4096 block units: a VecDelta.Linear from 26.3, plain shorts before. */
+    static ClientboundMoveEntityPacket.Pos movePos(int id, short dx, short dy, short dz, boolean onGround) {
+        try {
+            Class<?> vecDelta;
+            try {
+                vecDelta = Class.forName("net.minecraft.network.protocol.game.VecDelta");
+            } catch (ClassNotFoundException e) {
+                return ClientboundMoveEntityPacket.Pos.class
+                        .getConstructor(int.class, short.class, short.class, short.class, boolean.class)
+                        .newInstance(id, dx, dy, dz, onGround);
+            }
+            Object delta = Class.forName("net.minecraft.network.protocol.game.VecDelta$Linear")
+                    .getConstructor(short.class, short.class, short.class).newInstance(dx, dy, dz);
+            return ClientboundMoveEntityPacket.Pos.class.getConstructor(int.class, vecDelta, boolean.class)
+                    .newInstance(id, delta, onGround);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("no usable ClientboundMoveEntityPacket.Pos constructor", e);
+        }
+    }
+
+    /** Sets line 0 of the front text: getFrontText/setText(text, bool) before 26.3, the slot API from 26.3. */
+    static void setFrontLine(SignBlockEntity entity, Component line) {
+        try {
+            if (hasMethod(SignBlockEntity.class, "getFrontText")) {
+                Object text = SignBlockEntity.class.getMethod("getFrontText").invoke(entity);
+                Object updated = text.getClass().getMethod("setMessage", int.class, Component.class).invoke(text, 0, line);
+                SignBlockEntity.class.getMethod("setText", SignText.class, boolean.class).invoke(entity, updated, true);
+                return;
+            }
+            Class<?> slot = Class.forName("net.minecraft.world.level.block.entity.SignTextSlot");
+            Object front = slot.getField("FRONT").get(null);
+            Object text = SignBlockEntity.class.getMethod("getText", slot).invoke(entity, front);
+            Object mutable = SignText.class.getMethod("asMutable").invoke(text);
+            mutable = mutable.getClass().getMethod("setLine", int.class, Component.class).invoke(mutable, 0, line);
+            Object immutable = mutable.getClass().getMethod("asImmutable").invoke(mutable);
+            SignBlockEntity.class.getMethod("setText", SignText.class, slot).invoke(entity, immutable, front);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("no usable sign text API on " + SignBlockEntity.class.getName(), e);
+        }
+    }
+
+    private static boolean hasMethod(Class<?> type, String name) {
+        for (java.lang.reflect.Method m : type.getMethods()) {
+            if (m.getName().equals(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     static List<ParityCase> all() {
         List<ParityCase> cases = new ArrayList<>();
@@ -135,8 +204,8 @@ final class ParityCases {
             List<ParityPlanner.Item> items = new ArrayList<>();
             items.add(item(f, "add_entity(1)", new ClientboundAddEntityPacket(ENTITY, UUID.nameUUIDFromBytes(
                     "parity".getBytes()), at.getX() + 0.5, at.getY(), at.getZ() + 0.5, 0.0F, 0.0F,
-                    EntityType.ARMOR_STAND, 0, Vec3.ZERO, 0.0)));
-            items.add(item(f, "move_entity_pos(53)", new ClientboundMoveEntityPacket.Pos(ENTITY, (short) 512,
+                    armorStandType(), 0, Vec3.ZERO, 0.0)));
+            items.add(item(f, "move_entity_pos(53)", movePos(ENTITY, (short) 512,
                     (short) 0, (short) 0, true)));
             items.add(item(f, "block_destruction(5)", new ClientboundBlockDestructionPacket(ENTITY + 1,
                     f.base.offset(1, 0, 1), 3)));
@@ -279,7 +348,7 @@ final class ParityCases {
                 net.minecraft.server.level.ServerLevel level = s.overworld();
                 level.setBlock(b, sign, 3);
                 SignBlockEntity entity = (SignBlockEntity) level.getBlockEntity(b);
-                entity.setText(entity.getFrontText().setMessage(0, Component.literal("parity")), true);
+                setFrontLine(entity, Component.literal("parity"));
                 Packet<ClientGamePacketListener> packet = ClientboundBlockEntityDataPacket.create(entity);
                 level.setBlock(b, Blocks.AIR.defaultBlockState(), 3);
                 return packet;
@@ -385,7 +454,7 @@ final class ParityCases {
     /** An armor stand at the spawn side, added by the real handler. */
     static void addVehicle(Minecraft client, ParityFixture f) {
         ParityFixture.handle(client, new ClientboundAddEntityPacket(VEHICLE, UUID.nameUUIDFromBytes("vehicle".getBytes()),
-                f.basePos.x - 2.0, f.basePos.y, f.basePos.z, 0.0F, 0.0F, EntityType.ARMOR_STAND, 0, Vec3.ZERO, 0.0));
+                f.basePos.x - 2.0, f.basePos.y, f.basePos.z, 0.0F, 0.0F, armorStandType(), 0, Vec3.ZERO, 0.0));
     }
 
     /** Stone at P with a predicted break (recorded player position: the spawn), then the player standing in P. */
@@ -397,6 +466,30 @@ final class ParityCases {
 
     static PositionMoveRotation into(BlockPos p) {
         return new PositionMoveRotation(new Vec3(p.getX() + 0.5, p.getY(), p.getZ() + 0.5), Vec3.ZERO, 0.0F, 0.0F);
+    }
+
+    /**
+     * An entity position sync to block P (centre x/z, rotation 0): the constructor takes a PositionMoveRotation before
+     * 26.3 and a PositionPath plus yRot and xRot from 26.3. Reflection keeps one source compiling on every 26.x build.
+     */
+    static ClientboundEntityPositionSyncPacket positionSync(int id, BlockPos p, boolean onGround) {
+        Vec3 at = new Vec3(p.getX() + 0.5, p.getY(), p.getZ() + 0.5);
+        try {
+            Class<?> pathType;
+            try {
+                pathType = Class.forName("net.minecraft.world.entity.PositionPath");
+            } catch (ClassNotFoundException e) {
+                return ClientboundEntityPositionSyncPacket.class
+                        .getConstructor(int.class, PositionMoveRotation.class, boolean.class)
+                        .newInstance(id, into(p), onGround);
+            }
+            Object path = pathType.getMethod("of", Vec3.class).invoke(null, at);
+            return ClientboundEntityPositionSyncPacket.class
+                    .getConstructor(int.class, pathType, float.class, float.class, boolean.class)
+                    .newInstance(id, path, 0.0F, 0.0F, onGround);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("no usable ClientboundEntityPositionSyncPacket constructor", e);
+        }
     }
 
     /**
@@ -471,8 +564,7 @@ final class ParityCases {
                             net.minecraft.network.syncher.SynchedEntityData.DataValue.create(sleeping,
                                     Optional.of(p(f)))))));
             items.add(item(f, "block_changed_ack(4)", ack(1)));
-            items.add(item(f, "entity_position_sync(35)", new ClientboundEntityPositionSyncPacket(VEHICLE,
-                    into(f.base.offset(0, 0, -3)), true)));
+            items.add(item(f, "entity_position_sync(35)", positionSync(VEHICLE, f.base.offset(0, 0, -3), true)));
             items.add(item(f, "animate(2) wake up", new ClientboundAnimatePacket(f.context.computeOnClient(
                     c -> c.player), ClientboundAnimatePacket.WAKE_UP)));
             return items;
@@ -490,10 +582,11 @@ final class ParityCases {
         @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
             // TCP: sleeping in P, then the ACK snaps the player back to the spawn. Illegal: the ACK finds the
             // player at the spawn, nothing to snap, and the player then sleeps in P.
-            // Observed: same-tick the player sleeps at P's centre (3.5); after the settle ticks it has been pushed
-            // on to x about 4.3, still beside P and far from the spawn.
+            // Same-tick the player sleeps at P's centre; after settling it is pushed about 3.8
+            // blocks east of basePos. CI 26.1: -4.5 -> -0.7; 26.1.1: -5.5 -> -1.7.
+            // The original threshold 3.0 assumed basePos.x=0.5, not a fixed world origin.
             return List.of(new ParityRunner.Hazard(playerXNear(f.basePos.x),
-                    spread ? playerXAbove(3.0) : playerXNear(p(f).getX() + 0.5)));
+                    spread ? playerXAbove(f.basePos.x + 2.5) : playerXNear(p(f).getX() + 0.5)));
         }
 
         @Override int[] illegalOrder(int items) { return new int[] {1, 0, 2, 3}; }
@@ -513,8 +606,7 @@ final class ParityCases {
 
         @Override List<ParityPlanner.Item> items(ParityFixture f) {
             List<ParityPlanner.Item> items = new ArrayList<>();
-            items.add(item(f, "entity_position_sync(35) vehicle into P", new ClientboundEntityPositionSyncPacket(VEHICLE,
-                    into(p(f)), true)));
+            items.add(item(f, "entity_position_sync(35) vehicle into P", positionSync(VEHICLE, p(f), true)));
             items.add(item(f, "block_changed_ack(4)", ack(1)));
             items.add(item(f, "animate(2) wake up", new ClientboundAnimatePacket(f.context.computeOnClient(
                     c -> c.player), ClientboundAnimatePacket.WAKE_UP)));
@@ -816,17 +908,18 @@ final class ParityCases {
         @Override List<BlockPos> watchBlocks(ParityFixture f) { return List.of(t(f)); }
 
         @Override List<ParityRunner.Hazard> hazards(ParityFixture f, boolean spread) {
-            // Observed in the tick-spread run: TCP leaves the player near the block (x about 2.4); the illegal
-            // order lets the scaled player overlap the restored block, so the ACK snaps it to the spawn
-            // (x 0.5) and the remaining motion carries it a little further (about 0.9).
-            return List.of(new ParityRunner.Hazard(playerXAbove(1.5), playerXBelow(1.2)));
+            // TCP ends about basePos.x+1.896; illegal order overlaps the restored block, so the ACK
+            // snaps to basePos and remaining motion ends about basePos.x+0.397. Both offsets occur
+            // on 26.1 (-4.5 base) and 26.1.1 (-5.5 base), as on 26.1.2 (0.5 base).
+            return List.of(new ParityRunner.Hazard(playerXAbove(f.basePos.x + 1.0),
+                    playerXBelow(f.basePos.x + 0.7)));
         }
 
         @Override int[] illegalOrder(int items) { return new int[] {1, 2, 0}; }
 
         /** Without a prediction the ACK has no rollback, so the player must not end near the spawn. */
         @Override List<ParityRunner.Check> controlForbidden(ParityFixture f, boolean spread) {
-            return List.of(playerXBelow(1.2));
+            return List.of(playerXBelow(f.basePos.x + 0.7));
         }
 
         @Override boolean hasControl() { return true; }

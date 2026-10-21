@@ -12,6 +12,8 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
@@ -135,6 +137,7 @@ class InboundExcessPoolTest {
         final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
         final AtomicInteger grants = new AtomicInteger();
         final AtomicInteger refusals = new AtomicInteger();
+        final CountDownLatch firstRequests = new CountDownLatch(6);
         final List<Thread> threads = new ArrayList<Thread>();
         for (int n = 0; n < 6; n++) {
             final String owner = "owner" + n;
@@ -155,10 +158,19 @@ class InboundExcessPoolTest {
                             // Shed victims are closed as the integration does, so every release stays legal.
                             for (Object victim : pool.drainShedOwners()) pool.confirmClosed(victim);
                             if (node.reserved(ResourcePools.Pool.INBOUND_EXCESS) > 200) throw new AssertionError("over cap");
+                            if (node.reserved(ResourcePools.Pool.INBOUND_EXCESS) < 0) throw new AssertionError("negative reservation");
+                        }
+                        if (i == 0) {
+                            // No worker may release its first grant until all six have asked. Without
+                            // this rendezvous an unfair scheduler can run each worker's entire loop
+                            // in isolation, producing zero refusals despite correct pool accounting.
+                            firstRequests.countDown();
+                            assertTrue(firstRequests.await(30, TimeUnit.SECONDS), "all six first requests completed");
                         }
                     }
                 } catch (Throwable e) {
                     failure.compareAndSet(null, e);
+                    firstRequests.countDown(); // do not strand peers if a first request fails
                 }
             });
             threads.add(t);
