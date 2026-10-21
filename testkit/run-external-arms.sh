@@ -410,7 +410,7 @@ if [[ -z "${DISPLAY:-}" ]]; then
     xvfb=(xvfb-run -a -s "-screen 0 1280x720x24")
 fi
 client=(
-    "$root/gradlew" -p "$root" --no-daemon --console=plain
+    "$root/gradlew" -p "$root" --no-daemon --no-configuration-cache --console=plain
     "-Pquicraft.arm=$arm"
     "-Pquicraft.armServer=127.0.0.1:$port"
     "-Pquicraft.armOut=$out"
