@@ -1964,7 +1964,9 @@ before this revision can run.
     quiescence bytes and bytes accepted by the transport write path but not yet released
     by it; bytes QUIC holds after accepting them are bounded by its congestion and
     flow-control windows and are not counted. `queueByteLimit` MUST be at least the
-    footprint of a maximum-size record plus 64 KiB; a profile below that is rejected.
+    footprint of a maximum-size record (2 MiB + 128 encoded bytes, 4,195,584) plus 64 KiB
+    (4,261,120); a profile below that is rejected. A bundle run whose footprint exceeds that
+    of one maximum-size record is refused whole (`0x12`, nothing written).
     The constants are provisional; retained heap per record is not yet measured.
     **Producer pause.** At 8 MiB of footprint (high watermark) the connection reports
     outbound pressure, and stays under pressure until it drains to 4 MiB (low watermark).
