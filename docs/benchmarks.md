@@ -1424,3 +1424,46 @@ heap per record is not measured. A vanilla bundle whose encoded size exceeds abo
 0x12 instead of 2.10 MB before. A peer that keeps releasing a trickle of bytes keeps its backlog pinned below the hard
 caps; that is bounded by the caps and pool shedding. The busy timer stays off by default until the seven-profile matrix
 passes on this build.
+
+## /3 seven-profile matrix with the busy batch timer, and the clean-link join gap (2026-10-22)
+
+Real Fabric client against the external Fabric server, loopback with netem, idle client (no walking), commit
+`c944278a`, n=2 per cell, runs interleaved. Chunk-load medians in ms; "busy" is `-Dquicraft.v3.batchTimerBusy=true`.
+
+| Profile | TCP | /3 plain | /3 busy |
+| --- | --- | --- | --- |
+| clean | 939 | 1393 | 1149 |
+| loss | 979 | 1783 | 1074 |
+| delay | 2149 | 2290 | 1381 |
+| delayloss | 30840 | 3539 | 2180 |
+| jitter | 7793 | 1980 | 1261 |
+| reorder | 2658 | 1831 | 1288 |
+| slow | 36014 | 5989 | 5715 |
+
+0 disconnects in every cell. n=2 means the ranges overlap on the clean and loss rows; only the large gaps (delayloss,
+jitter, slow) are conclusive. Play RTT on the clean link: TCP 0.60 ms, /3 about 1.4 ms. The busy timer stays off by
+default pending the maintainer's go-ahead.
+
+### Clean-link join: where the extra time goes
+
+`-Dquicraft.v3.joindiag=true` records off-wire phase marks (one INFO line per connection per side). Clean loopback,
+n=3, after the configuration wake (the server thread is woken through `MinecraftServer.execute` when the hold is
+released, so configuration no longer waits for the next tick): TCP 1342 ms, /3 1506 ms (+164 ms; the same comparison
+before the wake was +480 ms in the matrix above). Per phase, /3 costs about +85 ms from connect to login and about
++115 ms from login to the first configuration packet; configuration to play is about equal. The vanilla spawn
+preparation task (about 330-400 ms between the tags build and Finish Configuration) is paid by TCP too.
+
+### QUIC client warm-up (branch `agent/p5-warmup`, not merged)
+
+A daemon thread at client start builds a throwaway TLS context and engine so the natives, event loop and TLS stack
+are initialised before the first connect (`-Dquicraft.warmup=false` disables it). Clean link, n=5 per arm, interleaved
+(display mode of this run was not recorded, so absolute values are not comparable with the headless rows below):
+
+| Arm | join ms median (min-max) | chunk load ms median (min-max) | RTT median ms |
+| --- | --- | --- | --- |
+| TCP | 1331 (1217-1551) | 857 (665-1442) | 0.59 |
+| /3 warm-up off | 1603 (1536-2078) | 918 (764-1192) | 1.42 |
+| /3 warm-up on | 1541 (1477-1803) | 758 (752-1163) | 1.35 |
+
+The warm-up saves about 60 ms of join, inside the run-to-run spread; /3 is still about 210 ms behind TCP on join and
+more than twice TCP's RTT. No claim beyond that.
