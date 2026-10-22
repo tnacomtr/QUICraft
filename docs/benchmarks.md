@@ -1424,3 +1424,95 @@ heap per record is not measured. A vanilla bundle whose encoded size exceeds abo
 0x12 instead of 2.10 MB before. A peer that keeps releasing a trickle of bytes keeps its backlog pinned below the hard
 caps; that is bounded by the caps and pool shedding. The busy timer stays off by default until the seven-profile matrix
 passes on this build.
+
+## /3 seven-profile matrix with the busy batch timer, and the clean-link join gap (2026-10-22)
+
+Real Fabric client against the external Fabric server, loopback with netem, idle client (no walking), commit
+`c944278a`, n=2 per cell, runs interleaved. Chunk-load medians in ms; "busy" is `-Dquicraft.v3.batchTimerBusy=true`.
+
+| Profile | TCP | /3 plain | /3 busy |
+| --- | --- | --- | --- |
+| clean | 939 | 1393 | 1149 |
+| loss | 979 | 1783 | 1074 |
+| delay | 2149 | 2290 | 1381 |
+| delayloss | 30840 | 3539 | 2180 |
+| jitter | 7793 | 1980 | 1261 |
+| reorder | 2658 | 1831 | 1288 |
+| slow | 36014 | 5989 | 5715 |
+
+0 disconnects in every cell. n=2 means the ranges overlap on the clean and loss rows; only the large gaps (delayloss,
+jitter, slow) are conclusive. Play RTT on the clean link: TCP 0.60 ms, /3 about 1.4 ms. The busy timer stays off by
+default pending the maintainer's go-ahead.
+
+### Clean-link join: where the extra time goes
+
+`-Dquicraft.v3.joindiag=true` records off-wire phase marks (one INFO line per connection per side). Clean loopback,
+n=3, after the configuration wake (the server thread is woken through `MinecraftServer.execute` when the hold is
+released, so configuration no longer waits for the next tick): TCP 1342 ms, /3 1506 ms (+164 ms; the same comparison
+before the wake was +480 ms in the matrix above). Per phase, /3 costs about +85 ms from connect to login and about
++115 ms from login to the first configuration packet; configuration to play is about equal. The vanilla spawn
+preparation task (about 330-400 ms between the tags build and Finish Configuration) is paid by TCP too.
+
+### QUIC client warm-up (branch `agent/p5-warmup`, not merged)
+
+A daemon thread at client start builds a throwaway TLS context and engine so the natives, event loop and TLS stack
+are initialised before the first connect (`-Dquicraft.warmup=false` disables it). Clean link, n=5 per arm, interleaved
+(display mode of this run was not recorded, so absolute values are not comparable with the headless rows in the next sections):
+
+| Arm | join ms median (min-max) | chunk load ms median (min-max) | RTT median ms |
+| --- | --- | --- | --- |
+| TCP | 1331 (1217-1551) | 857 (665-1442) | 0.59 |
+| /3 warm-up off | 1603 (1536-2078) | 918 (764-1192) | 1.42 |
+| /3 warm-up on | 1541 (1477-1803) | 758 (752-1163) | 1.35 |
+
+The warm-up saves about 60 ms of join, inside the run-to-run spread; /3 is still about 210 ms behind TCP on join and
+more than twice TCP's RTT. No claim beyond that.
+
+The warm-up was peer-reviewed (BLOCK: it builds TLS state before discovery, beyond the approved native and event-loop
+warm-up; launch failures escape the silent boundary; the tests do not show it does anything) and is not merged.
+
+## /3 moving-player matrix: TCP vs /3 plain vs /3 busy, seven profiles (2026-10-22, n=3 rounds)
+
+Real Fabric client headless under Xvfb, external Fabric server, client sprinting for 60 s per run, arms interleaved
+per profile and round (tcp, plain, busy), commit `938cea65` build, 63 runs planned. Rows are in
+`testkit/results/moving-proof-1` (not committed); the manifest gate reads INCOMPLETE because 6 runs failed.
+
+Failed runs: 6 of 63 (1 TCP, 5 /3), all "the moving window proved no movement" (6.9-22.8 m moved in 60 s instead of
+about 220 m, 0 or 26 chunks). Each had 1200/1200 client ticks, 0 stalls and 0 disconnects, so the player was blocked
+by terrain on its fixed walk, not by the network. They are excluded from the medians, which leaves n=2 in those cells;
+the gate stays INCOMPLETE until they are rerun or the walk path avoids obstacles. The 1-versus-5 split is not
+statistically distinguishable at these counts.
+
+Movement metrics of the successful runs (medians; chunks/s range in parentheses): every cell shows 0 stall ticks.
+
+| Profile | TCP chunks/s | /3 plain chunks/s | /3 busy chunks/s |
+| --- | --- | --- | --- |
+| clean | 3.7 (3.5-3.9) | 2.4 (0.6-4.1) | 4.1 (3.9-4.1) |
+| loss | 3.9 (3.7-3.9) | 4.1 (3.7-4.5) | 2.3 (0.7-3.9) |
+| delay | 4.0 (3.9-4.1) | 3.8 (3.7-4.1) | 3.7 (3.7-5.5) |
+| delayloss | 3.6 (3.5-3.7) | 4.1 (3.9-4.5) | 3.8 (3.5-4.1) |
+| reorder | 3.9 (3.9-4.1) | 5.4 (5.1-5.7) | 3.7 (3.7-4.1) |
+| jitter | 4.0 (3.6-5.7) | 4.1 (3.9-4.1) | 4.1 (3.9-5.6) |
+| slow | 3.2 (3.2-3.3) | 4.0 (3.8-4.1) | 3.9 (3.9-5.8) |
+
+The sprint, not the network, sets the chunk rate on most profiles, so the rates agree within the walk's own variation
+(the low minima in the clean-plain and loss-busy cells come from runs where the walk was partly blocked but still
+passed the movement threshold). In the moving window "chunk load" is dominated by the 60 s walk and is not a
+meaningful comparison except where TCP is slower than the window: slow, TCP 95.0 s against /3 plain 66.4 s and busy
+65.8 s; delayloss, TCP 72.4 s against 64.4 s and 61.9 s. Play RTT: clean TCP 0.5 ms against /3 1.2 ms; loss 0.6 against
+1.1; delay 150.6 against 151.3; delayloss 156.9 against 151.6; slow 162.0 against 154.4 (plain) and 155.3 (busy).
+Join: /3 was slower than TCP in every profile (clean 2.63/2.65 s against 2.10 s; delay 3.37/3.35 against 2.43;
+delayloss 3.52/3.25 against 2.64; slow 2.89/3.47 against 2.51).
+
+## No-desync PlaySession under every netem profile (2026-10-22, 1 round)
+
+`testkit/run-desync-sessions.sh`: one full PlaySession (about 22 s) per cell in a fresh client JVM with the in-process
+dedicated server, inside a private user and network namespace whose loopback carries the profile. Rows record the
+negotiated `quicraft/3`, 5 streams and routing table `quicraft-routing-p775-s2` for /3.
+
+| Profile | TCP | /3 plain | /3 busy |
+| --- | --- | --- | --- |
+| clean, loss, delay, delayloss, reorder, jitter, slow | pass | pass | pass |
+
+21 of 21 runs passed, 0 disconnects, 0 mismatches (commit `e6e2ea20`). One round is a smoke-level proof; more rounds
+and longer sessions are still open.
