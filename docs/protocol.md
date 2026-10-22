@@ -1958,9 +1958,13 @@ before this revision can run.
     shares. Each connection is limited to 16384 queued records or 16 MiB of charged
     footprint, whichever is reached first. A queued record's footprint is
     `2 * encodedBytes + 1024` (the encoded copy, the retained payload copy and a per-record
-    allowance for the bookkeeping objects the byte count does not see); the node and
-    identity pools below keep charging encoded bytes. The footprint covers binding
-    quiescence bytes and bytes handed to QUIC but not yet released from its send buffers.
+    allowance for the bookkeeping objects the byte count does not see). The node and
+    identity pools below charge the same footprint, so a connection that holds many tiny
+    records cannot pin memory the pools do not see. The footprint covers binding
+    quiescence bytes and bytes accepted by the transport write path but not yet released
+    by it; bytes QUIC holds after accepting them are bounded by its congestion and
+    flow-control windows and are not counted. `queueByteLimit` MUST be at least the
+    footprint of a maximum-size record plus 64 KiB; a profile below that is rejected.
     The constants are provisional; retained heap per record is not yet measured.
     **Producer pause.** At 8 MiB of footprint (high watermark) the connection reports
     outbound pressure, and stays under pressure until it drains to 4 MiB (low watermark).
@@ -1969,9 +1973,14 @@ before this revision can run.
     still hold: a submission that would exceed either cap, from a producer that cannot
     pause, fails `0x12` as before.
     **Release deadline.** While under pressure, the connection closes `0x12` if the
-    transport releases no outbound bytes for 10 seconds on the local monotonic clock;
-    any released byte renews the deadline. Selecting, enqueueing and unrelated ACKs do
-    not count. A slow but progressing peer is never closed for queue depth alone.
+    transport releases no outbound bytes for 30 seconds (not shorter than the QUIC idle
+    timeout, so a short network outage that TCP would survive does not close it) on the
+    local monotonic clock; any released byte renews the deadline. Selecting, enqueueing and
+    unrelated ACKs do not count. A slow but progressing peer is never closed for queue depth
+    alone. Residual, stated honestly: a peer that keeps releasing a trickle of bytes (for
+    example on REALTIME only) renews the deadline, so its backlog stays pinned below the
+    hard caps; that memory is bounded by the per-connection caps and by the
+    footprint-charged node and identity pools, which shed outbound holders under pressure.
       Provisional outbound defaults: 256 MiB node, 32 MiB per source IP and 32 MiB per
       authenticated account, enforcing all applicable caps, including queued binding bytes.
       Pre-authentication uses IP; account caps supplement, not replace, IP caps. Measure then
