@@ -171,11 +171,10 @@ public final class StreamReceiver {
     /** Count of enqueues on this receiver; stamps each head's {@link Unit#enqueueSerial} (diagnostics only). */
     private long enqueueCount;
     /**
-     * The cumulative sample taken by the latest expiry check of the current step, reused by the apply that follows so one
-     * operation takes one reading (13.10). Cleared at the start of every {@link #applied} call.
+     * Transport nanos of the last successful apply on any stream, valid only when {@link #appliedOnce}. Diagnostics only;
+     * it is read from the boundary clock, or from {@link System#nanoTime()} in cumulative mode, so an apply never reads
+     * the stall source.
      */
-    private StallClock.Sample lastCheckSample;
-    /** Transport nanos of the last successful apply on any stream, valid only when {@link #appliedOnce} (diagnostics only). */
     private long lastAppliedNanos;
     private boolean appliedOnce;
     /** Stream of the commit that caused the last renewal, -1 when none (diagnostics only). */
@@ -549,7 +548,6 @@ public final class StreamReceiver {
         if (!unit.enqueued) {
             throw new IllegalStateException("applied before enqueued on stream " + stream);
         }
-        lastCheckSample = null;
         if (!settleWaitsBeforeCommit(stream, unit)) {
             // A lapsed wait is terminal (13.10): this commit changes no state, makes no callback and raises no
             // violation of its own; pendingViolation() now reports the captured close.
@@ -630,17 +628,16 @@ public final class StreamReceiver {
             }
             if (source != null && sample == null) {
                 sample = source.sample();
-                lastCheckSample = sample;
             }
             BlockedHeadTimer.Observation now = source == null ? unit.timer.observe() : unit.timer.observe(sample);
             readings[stream] = now;
             if (unit.timer.expired(now)) {
                 boolean wasWithheld = unit.chainWasWithheld || chainWithheld(unit.record);
                 return ReceiveClose.blockedExpiry(now != null && now.stallConsumed(), wasWithheld,
-                        describeExpiry("no-progress", lapsed, stream, unit, now, sample));
+                        describeExpiry("no-progress", lapsed, stream, unit, now));
             }
             if (retention == null && unit.timer.absoluteExpired(now)) {
-                retention = ReceiveClose.retentionExpiry(describeExpiry("absolute", lapsed, stream, unit, now, sample));
+                retention = ReceiveClose.retentionExpiry(describeExpiry("absolute", lapsed, stream, unit, now));
             }
         }
         return retention;
@@ -654,10 +651,19 @@ public final class StreamReceiver {
      * time consumed and the credit toward the next renewal. Ends with the receiver's global state: the executing head,
      * the executor queue depth, the time since any apply and the source of the last renewal.
      *
-     * @param sample the cumulative sample of this check, or null in boundary mode
+     * Never throws: a failing diagnostic yields null, which leaves the close exactly as without a diagnostic.
      */
     private String describeExpiry(String kind, boolean lapsed, int stream, Unit unit,
-                                  BlockedHeadTimer.Observation now, StallClock.Sample sample) {
+                                  BlockedHeadTimer.Observation now) {
+        try {
+            return expiryText(kind, lapsed, stream, unit, now);
+        } catch (Throwable diagnostic) {
+            return null;
+        }
+    }
+
+    private String expiryText(String kind, boolean lapsed, int stream, Unit unit,
+                              BlockedHeadTimer.Observation now) {
         StringBuilder text = new StringBuilder(256);
         text.append("expiry=").append(kind).append(" lapsed=").append(lapsed ? "yes" : "no")
                 .append(" head=").append(stream).append(':').append(unit.record.sequence())
@@ -688,7 +694,7 @@ public final class StreamReceiver {
                 .append(" executor-queued-units=").append(queuedUnits())
                 .append(" ms-since-last-apply-any-stream=");
         if (appliedOnce) {
-            text.append((diagnosticNanos(sample) - lastAppliedNanos) / 1_000_000L);
+            text.append((diagnosticNanos() - lastAppliedNanos) / 1_000_000L);
         } else {
             text.append("none");
         }
@@ -773,27 +779,25 @@ public final class StreamReceiver {
         return text.toString();
     }
 
-    /** Transport reading for diagnostics: the boundary clock, or the sample taken for the current check. */
-    private long diagnosticNanos(StallClock.Sample sample) {
-        return source == null ? clock.getAsLong() : sample.nowNanos();
+    /**
+     * Transport reading for the apply diagnostic: the boundary clock, or {@link System#nanoTime()} in cumulative mode.
+     * Matches the timebase {@link #noteApplied()} records in the same mode.
+     */
+    private long diagnosticNanos() {
+        return source == null ? clock.getAsLong() : System.nanoTime();
     }
 
     /**
-     * Records the transport time of an apply (O(1)). A cumulative apply reuses the reading of its own settlement when that
-     * step took one, so an apply takes at most one reading of the source; a source that is no longer valid records nothing,
-     * so a dead incarnation never fails a commit for a diagnostic.
+     * Records the transport time of an apply (O(1)) for the expiry diagnostic. Reads no stall source, takes no lock and
+     * allocates nothing. It runs after the watermark changes, so it never throws: a failing clock only clears the
+     * diagnostic.
      */
     private void noteApplied() {
-        if (source == null) {
-            lastAppliedNanos = clock.getAsLong();
+        try {
+            lastAppliedNanos = diagnosticNanos();
             appliedOnce = true;
-            return;
-        }
-        StallClock.Sample sample = lastCheckSample != null ? lastCheckSample : source.sample();
-        lastCheckSample = null;
-        if (sample.valid()) {
-            lastAppliedNanos = sample.nowNanos();
-            appliedOnce = true;
+        } catch (Throwable diagnostic) {
+            appliedOnce = false;
         }
     }
 

@@ -666,7 +666,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
             MultistreamSession core = connection.session();
             String reason = core == null ? null : core.sendCloseReason();
             return reason == null ? "" : "; core send close: " + reason;
-        } catch (RuntimeException e) {
+        } catch (Throwable diagnostic) {
             return "";
         }
     }

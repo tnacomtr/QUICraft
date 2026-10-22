@@ -20,9 +20,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
+import java.util.logging.Filter;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import org.junit.jupiter.api.Test;
@@ -656,6 +662,65 @@ class SessionSendDriverTest {
         String reason = driver.lastCloseReason();
         assertTrue(reason.startsWith("check=sealed stream=-1 queuedRecords=0 queuedBytes=0 "), reason);
         assertTrue(reason.contains(" queuePacketLimit=100 "), reason);
+    }
+
+    @Test
+    void aThrowingLogHandlerDoesNotStopAResourceCloseOrItsRelease() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        Handler broken = new Handler() {
+            @Override public void publish(LogRecord record) {
+                attempts.incrementAndGet();
+                throw new IllegalStateException("broken log handler");
+            }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        assertOverflowCloseCompletesUnderLogging(broken, null, attempts);
+    }
+
+    @Test
+    void aThrowingLogFilterDoesNotStopAResourceCloseOrItsRelease() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        Filter broken = record -> {
+            attempts.incrementAndGet();
+            throw new IllegalStateException("broken log filter");
+        };
+        assertOverflowCloseCompletesUnderLogging(null, broken, attempts);
+    }
+
+    /**
+     * One queue-overflow 0x12 close with a failing handler or filter on the QUICraft logger. The close must complete
+     * exactly as without logging: the driver is closed, the code is 0x12 and every charge is released. The failing hook
+     * must have run, or the test would prove nothing.
+     */
+    private static void assertOverflowCloseCompletesUnderLogging(Handler handler, Filter filter, AtomicInteger attempts)
+            throws Exception {
+        Logger quicraft = Logger.getLogger("QUICraft");
+        Level priorLevel = quicraft.getLevel();
+        Filter priorFilter = quicraft.getFilter();
+        quicraft.setLevel(Level.INFO);
+        quicraft.setFilter(filter);
+        if (handler != null) {
+            quicraft.addHandler(handler);
+        }
+        try {
+            Rig rig = new Rig(1, 2);
+            SessionSendDriver driver = rig.driver;
+            assertTrue(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+            assertTrue(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+            assertFalse(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+            assertTrue(driver.isClosed(), "the overflow closed the driver");
+            assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+            assertEquals(0, rig.pool.reserved(rig.owner), "close releases every outstanding charge");
+            assertTrue(driver.lastCloseReason().startsWith("check=queue-packet-limit "), driver.lastCloseReason());
+            assertTrue(attempts.get() > 0, "the failing log hook ran during the close");
+        } finally {
+            if (handler != null) {
+                quicraft.removeHandler(handler);
+            }
+            quicraft.setFilter(priorFilter);
+            quicraft.setLevel(priorLevel);
+        }
     }
 
     @Test

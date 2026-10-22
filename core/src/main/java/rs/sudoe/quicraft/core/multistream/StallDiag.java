@@ -37,6 +37,8 @@ final class StallDiag {
     private long lastEventNanos;
     private boolean eventLogged;
     private int lines;
+    /** Set after any failure of the clock, the detail supplier or the sink; the watchdog then stays silent. */
+    private boolean disabled;
 
     /**
      * @param clock the session's owner clock, in nanoseconds
@@ -45,17 +47,29 @@ final class StallDiag {
     StallDiag(LongSupplier clock, Consumer<String> sink) {
         this.clock = clock;
         this.sink = sink;
-        this.lastProgressNanos = clock.getAsLong();
+        try {
+            this.lastProgressNanos = clock.getAsLong();
+        } catch (Throwable diagnostic) {
+            disabled = true;
+        }
     }
 
-    /** Records that a unit was applied (committed) now. Cheap: one clock read. */
+    /** Records that a unit was applied (committed) now. Cheap: one clock read. Never throws. */
     void progress() {
-        lastProgressNanos = clock.getAsLong();
+        if (disabled) {
+            return;
+        }
+        try {
+            lastProgressNanos = clock.getAsLong();
+        } catch (Throwable diagnostic) {
+            disabled = true;
+        }
     }
 
     /**
      * Called from the session's periodic tick. {@code details} is only invoked when an event is actually logged, so
-     * the detail strings are built on the rare path.
+     * the detail strings are built on the rare path. Never throws: any failure of the clock, the detail supplier or
+     * the sink disables the watchdog for this connection, and the session carries on exactly as without diagnostics.
      *
      * @param side {@code client} or {@code server}
      * @param receiverBlocked the receiver holds a head that is not yet enqueued (dependency or slot blocked)
@@ -63,19 +77,31 @@ final class StallDiag {
      * @param details the detail lines (per stream and connection level), without the prefix
      */
     void tick(String side, boolean receiverBlocked, boolean senderQueued, Supplier<List<String>> details) {
-        long now = clock.getAsLong();
-        if (!due(now, receiverBlocked, senderQueued)) {
+        if (disabled) {
             return;
         }
-        eventLogged = true;
-        lastEventNanos = now;
-        long idleMillis = (now - lastProgressNanos) / 1_000_000L;
-        emit(PREFIX + side + " idleMs=" + idleMillis + " receiverBlocked=" + receiverBlocked
-                + " senderQueued=" + senderQueued);
-        List<String> extra = details.get();
-        for (int i = 0; i < extra.size() && lines < MAX_LINES; i++) {
-            emit(PREFIX + side + " " + extra.get(i));
+        try {
+            long now = clock.getAsLong();
+            if (!due(now, receiverBlocked, senderQueued)) {
+                return;
+            }
+            eventLogged = true;
+            lastEventNanos = now;
+            long idleMillis = (now - lastProgressNanos) / 1_000_000L;
+            emit(PREFIX + side + " idleMs=" + idleMillis + " receiverBlocked=" + receiverBlocked
+                    + " senderQueued=" + senderQueued);
+            List<String> extra = details.get();
+            for (int i = 0; i < extra.size() && lines < MAX_LINES; i++) {
+                emit(PREFIX + side + " " + extra.get(i));
+            }
+        } catch (Throwable diagnostic) {
+            disabled = true;
         }
+    }
+
+    /** Stops the watchdog for this connection; used when the caller's own diagnostic reads fail. */
+    void disable() {
+        disabled = true;
     }
 
     /** Whether a stall event should be logged at {@code now}. Package-private for tests. */

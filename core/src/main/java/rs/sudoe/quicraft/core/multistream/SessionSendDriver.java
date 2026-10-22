@@ -1424,26 +1424,38 @@ public final class SessionSendDriver {
         return lastCloseReason;
     }
 
-    private void logCloseOnce() {
-        if (!closeLogged) {
-            closeLogged = true;
-            LOG.info("QUICraft v3 send close: " + lastCloseReason);
+    private void closeWith(int code) {
+        closeCode = code;
+        try {
+            if (deferRelease) {
+                // Stops at once; the owner's close() returns the charges on its writing thread.
+                closed = true;
+            } else {
+                close();
+            }
+        } finally {
+            // Diagnostics run only after the close has stopped the driver and released its resources.
+            if (code == CLOSE_RESOURCE) {
+                recordLocalClose();
+            }
         }
     }
 
-    private void closeWith(int code) {
-        closeCode = code;
-        if (code == CLOSE_RESOURCE) {
-            // A limit refusal named its check before it closed; any other 0x12 close is a local failure.
+    /**
+     * Records a 0x12 close for diagnostics and logs it once per connection. A limit refusal named its check before it
+     * closed; any other 0x12 close is a local failure. Never throws: a failing logger or handler must not change how
+     * the connection closes.
+     */
+    private void recordLocalClose() {
+        try {
             noteRefusal(closeCause != null ? "local-failure" : "local-close", -1, 0);
-            logCloseOnce();
+            if (!closeLogged) {
+                closeLogged = true;
+                LOG.info("QUICraft v3 send close: " + lastCloseReason);
+            }
+        } catch (Throwable diagnostic) {
+            // Diagnostics only: the close is already complete.
         }
-        if (deferRelease) {
-            // Stops at once; the owner's close() returns the charges on its writing thread.
-            closed = true;
-            return;
-        }
-        close();
     }
 
     /**

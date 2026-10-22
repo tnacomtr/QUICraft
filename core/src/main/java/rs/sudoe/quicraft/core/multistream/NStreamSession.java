@@ -531,9 +531,13 @@ public final class NStreamSession implements MultistreamSession {
             // returned by release() on the loop, serialized with polling and writes (13.12).
             sendDriver.releaseOnOwnerClose();
             if (role == Role.SERVER && PROFILE_LOGGED.compareAndSet(false, true)) {
-                LOG.info("QUICraft v3 profile: queuePacketLimit=" + resources.profile().queuePacketLimit
-                        + " queueByteLimit=" + resources.profile().queueByteLimit
-                        + " nodeBudget=" + resources.profile().nodeBudgetBytes);
+                try {
+                    LOG.info("QUICraft v3 profile: queuePacketLimit=" + resources.profile().queuePacketLimit
+                            + " queueByteLimit=" + resources.profile().queueByteLimit
+                            + " nodeBudget=" + resources.profile().nodeBudgetBytes);
+                } catch (Throwable diagnostic) {
+                    // Diagnostics only: a failing logger must not fail the session.
+                }
             }
             this.sink = new QuicStreamWriteSink(sendDriver, streams, this::writeAllowed, this::onSettled);
             StreamReceiver.Validator validator = new ShardValidator(shards,
@@ -1605,14 +1609,21 @@ public final class NStreamSession implements MultistreamSession {
         }
     }
 
-    /** Stall watchdog step (diagnostics only): gathers state for a due event and never changes it. */
+    /**
+     * Stall watchdog step (diagnostics only): gathers state for a due event and never changes it. A failure of any
+     * read here disables the watchdog for this connection and nothing else.
+     */
     private void stallCheck() {
-        StreamReceiver receiver = clientDriver != null ? clientDriver.receiver()
-                : serverDriver != null ? serverDriver.receiver() : null;
-        boolean receiverBlocked = receiver != null && receiver.hasBlockedHead();
-        boolean senderQueued = sendDriver.queuedRecords() > 0;
-        String side = serverDriver != null ? "server" : "client";
-        stallDiag.tick(side, receiverBlocked, senderQueued, () -> stallLines(receiver));
+        try {
+            StreamReceiver receiver = clientDriver != null ? clientDriver.receiver()
+                    : serverDriver != null ? serverDriver.receiver() : null;
+            boolean receiverBlocked = receiver != null && receiver.hasBlockedHead();
+            boolean senderQueued = sendDriver.queuedRecords() > 0;
+            String side = serverDriver != null ? "server" : "client";
+            stallDiag.tick(side, receiverBlocked, senderQueued, () -> stallLines(receiver));
+        } catch (Throwable diagnostic) {
+            stallDiag.disable();
+        }
     }
 
     private List<String> stallLines(StreamReceiver receiver) {

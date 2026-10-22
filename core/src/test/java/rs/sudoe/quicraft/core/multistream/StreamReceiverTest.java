@@ -450,7 +450,7 @@ class StreamReceiverTest {
                 + " last-renewal-source=3:1"), detail);
     }
 
-    @Test void cumulativeReceiverTimesTheLastApplyFromItsOwnSample() {
+    @Test void cumulativeReceiverTimesTheLastApplyWithoutTheStallSource() {
         final AtomicLong clock = new AtomicLong();
         StallClock source = new StallClock() {
             @Override public Sample sample() {
@@ -469,9 +469,49 @@ class StreamReceiverTest {
         clock.set(4 * SEC);
         rx.applied(3, 1);
         clock.set(10 * SEC);
+        // The apply's time comes from System.nanoTime(), a different timebase from the stall source, so only the
+        // format and the absence of "none" are fixed here.
         String detail = diagnosticOf(rx.expiredWait());
-        assertTrue(detail.endsWith(" executing=none executor-queued-units=0 ms-since-last-apply-any-stream=6000"
-                + " last-renewal-source=none"), detail);
+        assertTrue(detail.matches("(?s).*ms-since-last-apply-any-stream=\\d+ last-renewal-source=none"), detail);
+    }
+
+    @Test void applyWithoutADependencyBlockedHeadReadsNoSourceEvenWhenReadsFail() {
+        FailingSource source = new FailingSource();
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(3, 1, 0));
+        enqueue(rx, 3, 1);
+        int before = source.reads;
+        source.failing = true;
+        rx.applied(3, 1);
+        assertEquals(before, source.reads, "an apply with no blocked head takes no stall-source reading");
+        assertNull(rx.head(3), "the apply committed");
+        assertNull(rx.pendingViolation());
+    }
+
+    @Test void expiryCloseIsUnchangedUnderAThrowingLogHandler() {
+        java.util.logging.Logger quicraft = java.util.logging.Logger.getLogger("QUICraft");
+        java.util.logging.Level priorLevel = quicraft.getLevel();
+        java.util.logging.Handler broken = new java.util.logging.Handler() {
+            @Override public void publish(java.util.logging.LogRecord record) {
+                throw new IllegalStateException("broken log handler");
+            }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        quicraft.setLevel(java.util.logging.Level.INFO);
+        quicraft.addHandler(broken);
+        try {
+            Fixture f = new Fixture(2);
+            assertAdmitted(f.receiver, rec(0, 1, 0, dep(1, 1)));
+            f.now.set(10 * SEC);
+            ReceiveClose close = f.receiver.expiredWait();
+            assertNotNull(close, "the expiry still closes the receiver");
+            assertEquals(ReceiveClose.RESOURCE, close.errorCode());
+            assertTrue(close.diagnostic() != null, "the local diagnostic is still built");
+        } finally {
+            quicraft.removeHandler(broken);
+            quicraft.setLevel(priorLevel);
+        }
     }
 
     @Test void enqueueStopsTheTimerAndOnlyApplyReleasesDependencies() {
@@ -1133,6 +1173,24 @@ class StreamReceiverTest {
         assertNull(rx.expiredWait(), "renewed at 9 s");
         source.set(19 * SEC, 0);
         assertUnseen(rx.expiredWait());
+    }
+
+    /** A cumulative source that counts its reads and, once {@link #failing} is set, throws on every read. */
+    private static final class FailingSource implements StallClock {
+        int reads;
+        boolean failing;
+
+        @Override public Sample sample() {
+            reads++;
+            if (failing) {
+                throw new IllegalStateException("stall source read during an apply");
+            }
+            return new Sample() {
+                @Override public long nowNanos() { return 0; }
+                @Override public long excludedNanos() { return 0; }
+                @Override public boolean valid() { return true; }
+            };
+        }
     }
 
     /** A cumulative source that returns its scripted clock readings in order, then repeats the last one. */

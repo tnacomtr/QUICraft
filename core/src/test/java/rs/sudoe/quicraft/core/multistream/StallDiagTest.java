@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
@@ -117,5 +118,55 @@ class StallDiagTest {
         String cut = sink.get(1);
         assertEquals(StallDiag.MAX_LINE_CHARS, cut.length());
         assertTrue(cut.endsWith("..."));
+    }
+
+    @Test
+    void aThrowingClockNeverPropagatesAndSilencesTheConnection() {
+        AtomicBoolean broken = new AtomicBoolean();
+        StallDiag diag = new StallDiag(() -> {
+            if (broken.get()) {
+                throw new IllegalStateException("clock");
+            }
+            return now.get();
+        }, sink::add);
+        broken.set(true);
+        diag.progress();
+        diag.tick("client", true, true, () -> details("never"));
+        broken.set(false);
+        tickAt(diag, 10 * SECOND, true, true, "after the failure");
+        assertTrue(sink.isEmpty(), "a failed watchdog stays silent for the connection");
+        assertEquals(0, detailCalls.get());
+    }
+
+    @Test
+    void aThrowingSinkNeverPropagatesAndIsNotRetried() {
+        AtomicInteger attempts = new AtomicInteger();
+        StallDiag diag = new StallDiag(now::get, line -> {
+            attempts.incrementAndGet();
+            throw new IllegalStateException("sink");
+        });
+        tickAt(diag, 3 * SECOND, true, true, "a");
+        tickAt(diag, 10 * SECOND, true, true, "b");
+        assertEquals(1, attempts.get(), "the failing sink is called once and then the watchdog stops");
+    }
+
+    @Test
+    void aThrowingDetailSupplierNeverPropagates() {
+        StallDiag diag = diag();
+        now.set(3 * SECOND);
+        diag.tick("client", true, true, () -> {
+            throw new IllegalStateException("detail");
+        });
+        int linesAfterFailure = sink.size();
+        tickAt(diag, 10 * SECOND, true, true, "after the failure");
+        assertEquals(linesAfterFailure, sink.size(), "no line is written after a failing detail supplier");
+    }
+
+    @Test
+    void disableStopsTheWatchdogWithoutThrowing() {
+        StallDiag diag = diag();
+        diag.disable();
+        tickAt(diag, 3 * SECOND, true, true, "silenced");
+        assertTrue(sink.isEmpty());
     }
 }
