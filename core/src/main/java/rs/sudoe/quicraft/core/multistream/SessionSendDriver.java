@@ -1175,6 +1175,12 @@ public final class SessionSendDriver {
         if (unitBytes > maxRecordBytes) {
             throw new IllegalArgumentException("bundle run larger than maxRecordBytes");
         }
+        // Headroom invariant (13.20): every admitted unit fits beside the ACK and slice bytes once they are released.
+        // The constructor's headroom check bounds one maximum record's footprint, so a larger run is refused whole here.
+        if (unitFootprint > footprintOf(maxRecordBytes)) {
+            closeBundleTooLarge(CONTROL, unitFootprint);
+            return result;
+        }
         noteBundleScopes(scopes);
         List<Record> records;
         try {
@@ -1315,6 +1321,11 @@ public final class SessionSendDriver {
         }
         if (unitBytes > maxRecordBytes) {
             throw new IllegalArgumentException("bundle run larger than maxRecordBytes");
+        }
+        // Headroom invariant (13.20), as in submitBundle: a run above one maximum record's footprint is refused whole.
+        if (unitFootprint > footprintOf(maxRecordBytes)) {
+            closeBundleTooLarge(CONTROL, unitFootprint);
+            return result;
         }
         // Assignment is the one point of no return inside this call. From here on, sequences are consumed
         // internally (the CONTROL sequence and the scope frontiers move) and the caller still gets no handle
@@ -1541,6 +1552,16 @@ public final class SessionSendDriver {
     /** Closes 0x12 for a record the pool cannot admit, recording that check. */
     private void closeInadmissible(int stream, long bytes) {
         noteRefusal("pool-inadmissible", stream, bytes);
+        closeWith(CLOSE_RESOURCE);
+    }
+
+    /**
+     * Closes 0x12 for a bundle run whose footprint exceeds {@link #footprintOf} of {@code maxRecordBytes} (13.20). The
+     * headroom check bounds only one maximum record beside the ACK bytes and slice, so such a run is refused whole,
+     * before anything is assigned, rather than admitted and left waiting behind its own headroom.
+     */
+    private void closeBundleTooLarge(int stream, long bytes) {
+        noteRefusal("bundle-footprint", stream, bytes);
         closeWith(CLOSE_RESOURCE);
     }
 

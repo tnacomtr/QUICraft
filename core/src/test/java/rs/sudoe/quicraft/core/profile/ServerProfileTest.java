@@ -6,8 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
-import rs.sudoe.quicraft.core.multistream.RecordCodec;
 import rs.sudoe.quicraft.core.multistream.SessionSendDriver;
+import rs.sudoe.quicraft.core.multistream.StreamSequencer;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
 
 /** docs/protocol.md 12.13 and 13.12: profile ranges, cross-field rules and the maxOpen invariant. */
@@ -89,8 +89,8 @@ class ServerProfileTest {
      */
     @Test
     void queueByteLimitMustHoldOneMaximumRecordFootprintPlusHeadroom() {
-        long floor = SessionSendDriver.footprintOf(RecordCodec.COMPACT_MAX_RECORD_LENGTH) + 64L * 1024;
-        assertEquals(4_260_976L, floor);
+        long floor = SessionSendDriver.footprintOf(StreamSequencer.MAX_BUNDLE_ENCODED_BYTES) + 64L * 1024;
+        assertEquals(4_261_120L, floor);
         ServerProfile below = new ServerProfile(50_000, 5, MIB256, 0.10, 4096, floor - 1, 8, 4, 2);
         IllegalArgumentException refused = assertThrows(IllegalArgumentException.class, below::validate);
         assertTrue(refused.getMessage().contains("queueByteLimit"), refused.getMessage());

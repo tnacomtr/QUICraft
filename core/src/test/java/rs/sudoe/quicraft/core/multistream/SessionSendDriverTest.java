@@ -154,6 +154,26 @@ class SessionSendDriverTest {
         }
     }
 
+    /**
+     * A rig whose pool cap is exactly {@code poolCap}, for footprint-tight tests: the cap is not derived from a raw
+     * budget, so the test states the footprints it leaves room for.
+     */
+    private static final class ExactCapRig {
+        final AtomicLong now = new AtomicLong(1_000_000_000L);
+        final PressureRanking ranking = new PressureRanking();
+        final OutboundPool pool;
+        final Object owner = new Object();
+        final SessionSendDriver driver;
+
+        ExactCapRig(long poolCap, long maxRecordBytes, long ackByteLimit) throws Exception {
+            NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+            pool = new OutboundPool(node, 1L << 40, 1L << 40, poolCap, ranking.view(now::get));
+            ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
+            driver = new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner,
+                    InetAddress.getLoopbackAddress(), null, now::get, maxRecordBytes, ackByteLimit, TEST_SLICE);
+        }
+    }
+
     /** One written slice, grouped by stream in write order. */
     private static final class Drain {
         final List<SessionSendDriver.Write> writes = new ArrayList<SessionSendDriver.Write>();
@@ -1064,7 +1084,9 @@ class SessionSendDriverTest {
      */
     @Test
     void openBundleWaitsForOneChargeAndNeverStallsAnEarlierChunk() throws Exception {
-        HeadroomRig rig = new HeadroomRig(1000, 86, 14);
+        // maxRecordBytes 1500 bounds the admissible run at footprintOf(1500) = 4024, which fits the 4080 pool cap beside
+        // the 14-byte ACK and the slice (13.20); the 3-record run is then admitted by its bound and waits for its charge.
+        HeadroomRig rig = new HeadroomRig(1000, 1500, 14);
         SessionSendDriver driver = rig.driver;
         assertTrue(driver.submit(frame(40), StreamSequencer.Fence.CHUNK, 0, 0).isAssigned());
         List<OutboundPacket> members = new ArrayList<OutboundPacket>();
@@ -1329,7 +1351,10 @@ class SessionSendDriverTest {
      */
     @Test
     void pendingAckDoesNotReorderFenceAndCoveredUpdateUnderPressure() throws Exception {
-        HeadroomRig rig = new HeadroomRig(1000, 86, 16);
+        // The cap is the footprint-tight minimum for one maximum record (86 bytes) beside the 16-byte ACK and the
+        // slice: footprintOf(86) + 16 + 32. The fence (about 1 KiB of footprint) and the update (about 1.2 KiB) cannot
+        // both be charged, so the update must wait for the fence to release, while the ACK stays pending.
+        ExactCapRig rig = new ExactCapRig(SessionSendDriver.footprintOf(86) + 16 + TEST_SLICE, 86, 16);
         SessionSendDriver driver = rig.driver;
         assertTrue(driver.createAck(1, frame(2).frame(), 16));
         SentPacket fence = driver.submit(frame(1), StreamSequencer.Fence.VIEW, 0, 0);
@@ -1340,6 +1365,11 @@ class SessionSendDriverTest {
                 nonzeroShardX(2), 0);
         assertTrue(update.isAssigned(), "the covered update assigns while its ACK is pending");
         assertFalse(update.logicalStream() == LogicalStream.CONTROL, "the update uses a chunk stream");
+        SessionSendDriver.Write fenceWrite = driver.poll(stream -> stream == fence.logicalStream());
+        assertNotNull(fenceWrite, "the fence is offered first");
+        assertNull(driver.poll(stream -> stream == update.logicalStream()),
+                "the covered update is not admitted while the fence still holds its footprint");
+        driver.released(fenceWrite.token());
         driver.completeScope(scope);
         driver.coverScope(1, scope);
         driver.sealAckCoverage(1);
@@ -2709,7 +2739,8 @@ class SessionSendDriverTest {
      */
     @Test
     void coveredBundleWaitsBehindAnEarlierRecordAndNeverStallsIt() throws Exception {
-        HeadroomRig rig = new HeadroomRig(1000, 86, 14);
+        // maxRecordBytes 1500: the run's footprint bound is footprintOf(1500) (see openBundleWaitsForOneChargeAndNeverStalls).
+        HeadroomRig rig = new HeadroomRig(1000, 1500, 14);
         SessionSendDriver driver = rig.driver;
         // Large enough that the early record keeps its charge, so the run's aggregate cannot fit beside it.
         SentPacket early = driver.submit(frame(70), StreamSequencer.Fence.CHUNK, 0, 0);
@@ -2734,7 +2765,7 @@ class SessionSendDriverTest {
     /** ACK headroom stays outside the ordinary FIFO: a pending ACK never blocks a covered bundle. */
     @Test
     void coveredBundleIsAdmittedUnderPendingAckHeadroom() throws Exception {
-        HeadroomRig rig = new HeadroomRig(1000, 86, 16);
+        HeadroomRig rig = new HeadroomRig(1000, 1500, 16);
         SessionSendDriver driver = rig.driver;
         assertTrue(driver.createAck(1, frame(2).frame(), 16));
         MultistreamSession.CausalScope scope = driver.openScope();
@@ -2753,6 +2784,56 @@ class SessionSendDriverTest {
         assertTrue(drain.writes.size() >= 4, "the bundle and the ACK join were written");
         assertEquals(rig.slice, rig.pool.reserved(rig.owner));
         driver.close();
+    }
+
+    /**
+     * Bundle stall regression (13.20). A run at the maximum member count behind a pre-charged ACK, under the
+     * footprint-tight cap {@code footprintOf(maxRecordBytes) + ack + slice}, completes; it never waits on bytes that
+     * only the ACK's own release could free. The clock is driven past the release deadline and nothing closes.
+     */
+    @Test
+    void maximumBundleBehindPrechargedAckCompletesUnderATightCapWithoutStalling() throws Exception {
+        long maxRecordBytes = 70_000;
+        long ackBytes = 16;
+        ExactCapRig rig = new ExactCapRig(SessionSendDriver.footprintOf(maxRecordBytes) + ackBytes + TEST_SLICE,
+                maxRecordBytes, ackBytes);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(1, frame(2).frame(), 16), "the ACK is charged first");
+        List<OutboundPacket> members = new ArrayList<OutboundPacket>();
+        StreamSequencer.Fence[] scopes = new StreamSequencer.Fence[StreamSequencer.MAX_BUNDLE_MEMBERS];
+        for (int i = 0; i < scopes.length; i++) {
+            members.add(frame(8));
+            scopes[i] = StreamSequencer.Fence.ORDINARY_CONTROL;
+        }
+        List<SentPacket> unit = driver.submitBundle(frame(1), members, scopes, frame(1));
+        assertEquals(StreamSequencer.MAX_BUNDLE_MEMBERS + 2, unit.size(), "the whole run is admitted");
+        Drain drain = drainAndRelease(driver);
+        assertEquals(StreamSequencer.MAX_BUNDLE_MEMBERS + 2, drain.writes.size(), "the whole run is written");
+        rig.now.addAndGet(SessionSendDriver.RELEASE_DEADLINE_NANOS + 1);
+        assertFalse(driver.checkReleaseDeadline(), "no stall: nothing waits on bytes once the run has drained");
+        assertFalse(driver.isClosed(), "the connection is not closed by a stall");
+    }
+
+    /**
+     * A run whose footprint exceeds one maximum record's footprint is refused whole (13.20), even though the pool
+     * could admit it: nothing is written and the connection closes 0x12, so no unit ever waits behind its own headroom.
+     */
+    @Test
+    void bundleAboveOneMaximumRecordFootprintIsRefusedWhole() throws Exception {
+        long maxRecordBytes = 70_000;
+        ExactCapRig rig = new ExactCapRig(1L << 30, maxRecordBytes, 16);
+        SessionSendDriver driver = rig.driver;
+        List<OutboundPacket> members = new ArrayList<OutboundPacket>();
+        StreamSequencer.Fence[] scopes = new StreamSequencer.Fence[StreamSequencer.MAX_BUNDLE_MEMBERS];
+        for (int i = 0; i < scopes.length; i++) {
+            members.add(frame(120));
+            scopes[i] = StreamSequencer.Fence.ORDINARY_CONTROL;
+        }
+        List<SentPacket> unit = driver.submitBundle(frame(1), members, scopes, frame(1));
+        assertTrue(unit.isEmpty(), "the run is refused whole");
+        assertTrue(driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertTrue(drainAndRelease(driver).writes.isEmpty(), "nothing is written after the refusal");
     }
 
     /** If the rollback's own disconnect fails, the original constructor failure is still the one reported. */

@@ -2,8 +2,8 @@
 package rs.sudoe.quicraft.core.profile;
 
 import rs.sudoe.quicraft.core.multistream.LogicalStream;
-import rs.sudoe.quicraft.core.multistream.RecordCodec;
 import rs.sudoe.quicraft.core.multistream.SessionSendDriver;
+import rs.sudoe.quicraft.core.multistream.StreamSequencer;
 import rs.sudoe.quicraft.core.transport.PreLoginTracker;
 
 /**
@@ -113,9 +113,11 @@ public final class ServerProfile {
         if (queuePacketLimit < 1 || queueByteLimit < 1) {
             throw new IllegalArgumentException("queue limits must be positive");
         }
-        // queueByteLimit counts pool footprints (13.20). A connection must hold one maximum record plus 64 KiB of
-        // headroom (ACKs and the REALTIME slice), or the largest record could never be queued.
-        long maxRecordFootprint = SessionSendDriver.footprintOf(RecordCodec.COMPACT_MAX_RECORD_LENGTH);
+        // queueByteLimit counts pool footprints (13.20). A connection must hold one maximum record's footprint plus 64 KiB
+        // of headroom (ACKs and the REALTIME slice), or the largest admissible unit could never be queued beside them.
+        // Production's record bound is StreamSequencer.MAX_BUNDLE_ENCODED_BYTES (ReceiveSlots); a bundle run above that
+        // footprint is refused at admission (SessionSendDriver), so this floor covers every unit that can be admitted.
+        long maxRecordFootprint = SessionSendDriver.footprintOf(StreamSequencer.MAX_BUNDLE_ENCODED_BYTES);
         if (queueByteLimit < maxRecordFootprint + QUEUE_HEADROOM_BYTES) {
             throw new IllegalArgumentException("queueByteLimit " + queueByteLimit + " is below one maximum record's"
                     + " footprint " + maxRecordFootprint + " plus " + QUEUE_HEADROOM_BYTES + " bytes of headroom; raise it"
