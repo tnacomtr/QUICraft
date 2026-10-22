@@ -1391,3 +1391,36 @@ earlier gains came from over-subtraction (7-13 chunks/tick), which floods slow l
 New diagnostics, all off the wire: the local close detail (`receive driver closed with 0x12 (expiry=... head=...
 unresolved=[... held= ready= enq=...] ...)`), `QUICraft v3 send close: check=...` (once per connection, INFO),
 `QUICraft v3 profile: ...` (once per process), and `-Dquicraft.v3.stalldiag=true` (stall watchdog, off by default).
+
+### Outbound queue footprint accounting: the slow-link disconnect is gone (2026-10-22, n=3 per arm, interleaved TCP)
+
+Spec 13.20 and `SessionSendDriver` changed (user-approved, peer- and security-reviewed). A queued record now costs
+`2 * encodedBytes + 1024` against a 16 MiB connection allowance and the node/IP/account pools charge the same
+footprint; the record-count cap is 16384 instead of 1024. At 8 MiB of footprint a connection reports pressure and the
+server stops starting new chunk batches (`PlayerChunkSender.sendNextChunks` mixin) until it drains to 4 MiB; a
+connection under pressure closes 0x12 only after 30 s with no outbound bytes released by the transport. A bundle run
+whose footprint exceeds one maximum record's is refused whole (0x12).
+
+Slow profile (2 Mbit, 75 ms, 2% loss), commit cbdb8f95 (the bundle refusal in e5df0fc8 came after this run), chunk load ms, three rounds interleaved
+(`diag/qc1` in the job scratch, not committed). Lagging client = 40 ms per tick plus a 1 s stall per 100 ticks:
+
+| Arm | Chunk load ms | Disconnected |
+|---|---|---|
+| TCP | 33901, 32438, 32448 | 0 of 3 |
+| TCP, lagging client | 33687, 30976, 31423 | 0 of 3 |
+| /3 plain | 5905, 5904, 5992 | 0 of 3 |
+| /3 busy batch timer | 5545, 5486, 5676 | 0 of 3 |
+| /3 busy batch timer, lagging client | 5573, 5534, 5543 | 0 of 3 |
+
+Before the change the busy timer with a lagging client closed 14 of 14 runs (the 1024-record cap, see the previous
+section). The server logged no `send close` and no chunk pause in these runs: the queue never reached the 8 MiB
+pressure mark. What removed the disconnects here is the record cap and the footprint accounting; the chunk pause and
+the 30 s release deadline are covered by unit tests only, not yet exercised under load. On this link the busy timer is
+about 6% faster than plain /3 (5.5 s against 5.9 s); /3 is about 5.6 times faster than TCP.
+
+Costs and open items: the pools now charge footprint, which roughly halves how many encoded bytes the provisional
+256 MiB node and 32 MiB IP/account pools hold; the constants (2x, 1024, 8/4 MiB, 30 s) are provisional and retained
+heap per record is not measured. A vanilla bundle whose encoded size exceeds about 2.03 MB (126 members) now closes
+0x12 instead of 2.10 MB before. A peer that keeps releasing a trickle of bytes keeps its backlog pinned below the hard
+caps; that is bounded by the caps and pool shedding. The busy timer stays off by default until the seven-profile matrix
+passes on this build.
