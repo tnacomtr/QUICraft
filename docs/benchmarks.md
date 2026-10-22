@@ -1441,8 +1441,9 @@ Real Fabric client against the external Fabric server, loopback with netem, idle
 | slow | 36014 | 5989 | 5715 |
 
 0 disconnects in every cell. n=2 means the ranges overlap on the clean and loss rows; only the large gaps (delayloss,
-jitter, slow) are conclusive. Play RTT on the clean link: TCP 0.60 ms, /3 about 1.4 ms. The busy timer stays off by
-default pending the maintainer's go-ahead.
+jitter, slow) are conclusive. Play RTT on the clean link: TCP 0.60 ms, /3 about 1.4 ms. On 2026-10-23 the maintainer
+approved making the busy timer the default (`-Dquicraft.v3.batchTimerBusy=false` restores the wall-time timer); the
+`plain` benchmark variant now sets it to false explicitly.
 
 ### Clean-link join: where the extra time goes
 
