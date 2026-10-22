@@ -694,12 +694,12 @@ public final class MatrixSummarize {
             new String[] {"hopFillMsP95", "hop fill p95 (ms)"});
 
     /**
-     * Flight-hop table: per arm and profile, the per-run fill median and p95 over the six legs with
+     * Teleport-hop table: per arm and profile, the per-run fill median and p95 over the six legs with
      * their min-max, and paired round-by-round deltas against TCP. Complete hop runs only.
      */
     private static void appendHopStats(StringBuilder md, List<String> profiles,
             Map<String, List<ParsedRun>> byProfile, List<String> variants) {
-        md.append("Flight-hop table: each run's fill median and p95 over its six legs (ms, from a leg's first")
+        md.append("Teleport-hop table: each run's fill median and p95 over its six legs (ms, from a leg's first")
                 .append(" tick until 90% of the columns around its final position are loaded). Complete hop")
                 .append(" runs only; a pair needs both arms in the same round.\n\n");
         md.append("| Profile | Arm | Metric | Median | Min | Max | n |\n");

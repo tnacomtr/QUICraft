@@ -83,7 +83,7 @@ class MatrixSummarizeTest {
         Path markdown = dir.resolve("summary.md");
         assertEquals(1, summarize(markdown, "clean"));
         String text = Files.readString(markdown, StandardCharsets.UTF_8);
-        assertTrue(text.contains("Flight-hop table"), text);
+        assertTrue(text.contains("Teleport-hop table"), text);
         assertTrue(text.contains("| clean | TCP | hop fill median (ms) | 310.0 | 300.0 | 320.0 | 2 |"), text);
         assertTrue(text.contains("| clean | QUIC /3 | hop fill median (ms) | 200.0 | 200.0 | 200.0 | 1 |"), text);
         assertTrue(text.contains("| clean | TCP | hop fill p95 (ms) | 340.0 | 330.0 | 350.0 | 2 |"), text);
@@ -96,10 +96,10 @@ class MatrixSummarizeTest {
         write("clean-quic3.json", "clean", "clean", RunFixtures.quic3(20, 200, 2));
         Path markdown = dir.resolve("summary.md");
         summarize(markdown, "clean");
-        assertFalse(Files.readString(markdown, StandardCharsets.UTF_8).contains("Flight-hop table"));
+        assertFalse(Files.readString(markdown, StandardCharsets.UTF_8).contains("Teleport-hop table"));
     }
 
-    /** A real fixture row with the flight-hop fields the external arm writer adds. */
+    /** A real fixture row with the teleport-hop fields the external arm writer adds. */
     private static JsonObject hopRow(RunResult fixture, int runIndex, double median, double p95, int legs, String error) {
         JsonObject row = GSON.toJsonTree(fixture).getAsJsonObject();
         row.addProperty("run", runIndex);

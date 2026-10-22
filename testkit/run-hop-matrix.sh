@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Flight-hop matrix over the external Fabric server: TCP vs /3 plain vs /3 with the busy batch
+# Teleport-hop matrix over the external Fabric server: TCP vs /3 plain vs /3 with the busy batch
 # timer, interleaved per netem profile and round. Every cell is one run-external-arms.sh
 # invocation with --hop (fresh server container, fresh client JVM): after the initial view fill the
-# client makes six 240 m flight legs (ping-pong), and each leg's fill time is recorded.
+# client makes six 240 m teleport legs (ping-pong), and each leg's fill time is recorded.
 # The arms run in the same order each round: tcp, plain, busy. Same conventions as
 # run-moving-matrix.sh (manifest, deadlines, Xvfb, refusal of a dirty tree).
 #

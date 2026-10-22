@@ -23,6 +23,8 @@ services:
       REAL_FABRIC_MULTISTREAM: ${REAL_FABRIC_MULTISTREAM:-false}
       REAL_FABRIC_COALESCE: ${REAL_FABRIC_COALESCE:-}
       REAL_FABRIC_COALESCE_MAX: ${REAL_FABRIC_COALESCE_MAX:-}
+      # ops.json for the offline hop client (set by run-external-arms.sh --hop only; empty = none).
+      QUICRAFT_OPS_JSON: ${QUICRAFT_OPS_JSON:-}
       # Keep the base service's switch: the mod is needed for QUIC and multistream.
       QUICRAFT_PLUGIN: ${QUICRAFT_PLUGIN:-true}
     volumes:

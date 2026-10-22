@@ -5,7 +5,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 /**
- * The flight-hop fields of a row written by ExternalArmGameTest with -Pquicraft.armHop=true: six
+ * The teleport-hop fields of a row written by ExternalArmGameTest with -Pquicraft.armHop=true: six
  * legs, each with a fill time in milliseconds (from the leg's first tick until 90% of the columns
  * around its final position are loaded). Reading only; a row is complete when every requested leg
  * completed and the row reports no error, anything else is not hop evidence.

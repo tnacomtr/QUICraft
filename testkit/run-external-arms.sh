@@ -67,7 +67,7 @@ usage() {
         echo "  --netem         clean (default) | loss | delay | delayloss | reorder | jitter | slow"
         echo "  --move          sprint in a wide arc during the play window (default: idle)"
         echo "  --move-seconds  moving window length (default: 60); only with --move"
-        echo "  --hop           six flight legs of 240 m after the initial view fill (mutually exclusive with --move)"
+        echo "  --hop           six teleport legs of 240 m after the initial view fill (tp @s, offline user Player0 with an ops entry) (mutually exclusive with --move)"
         echo "  --busy-timer    /3 only: the client-side busy batch timer variant (default: plain)"
         echo "  --stall-diag    turn on core's /3 stall watchdog for this client JVM"
         echo "  --coalesce      -Dquicraft.coalesceWrites=true on server and client"
@@ -414,6 +414,13 @@ if [[ "$arm" == quic2 ]]; then
     server_multistream=false
 fi
 export REAL_FABRIC_MULTISTREAM="$server_multistream" REAL_FABRIC_PORT="$port" REAL_FABRIC_COALESCE="$coalesce" REAL_FABRIC_COALESCE_MAX="$coalesce_max"
+# --hop: the offline client (user Player0) needs op level 4 to run `tp`; every other run gets no ops file.
+if [[ "$hop" == true ]]; then
+    ops_json="$(python3 -I "$here/offline-ops.py" Player0)" || die "could not build the ops.json entry for --hop"
+    export QUICRAFT_OPS_JSON="$ops_json"
+else
+    export QUICRAFT_OPS_JSON=""
+fi
 echo "== compose up ($project): fabric mocksession"
 project_started=true
 if ! bounded 1200 "${compose[@]}" up -d --build fabric mocksession; then
