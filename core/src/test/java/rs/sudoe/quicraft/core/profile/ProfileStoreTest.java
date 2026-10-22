@@ -97,20 +97,20 @@ class ProfileStoreTest {
     }
 
     /**
-     * The record cap default was 1024 before 13.20. An override still holding exactly 1024 loads as the current
-     * default, while any other value, including a deliberate one, loads unchanged.
+     * /3 is unreleased, so no file predates the 16384 default. An explicit queuePacketLimit, including 1024, loads
+     * exactly as written and never falls back to the default.
      */
     @Test
-    void aLegacyQueueRecordDefaultLoadsAsTheCurrentDefault() throws IOException {
+    void anExplicitQueuePacketLimitLoadsAsWritten() throws IOException {
         Path file = dir.resolve("profile.properties");
-        String legacy = "maxConnections=40000\nmaxLanes=3\nnodeBudgetBytes=134217728\npreLoginPoolFraction=0.05\n"
+        String text = "maxConnections=40000\nmaxLanes=3\nnodeBudgetBytes=134217728\npreLoginPoolFraction=0.05\n"
                 + "queuePacketLimit=1024\nqueueByteLimit=4194304\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n";
-        Files.write(file, legacy.getBytes(StandardCharsets.UTF_8));
+        Files.write(file, text.getBytes(StandardCharsets.UTF_8));
         ServerProfile defaults = new ServerProfile(50_000, 5, 256L << 20, 0.10, 16384, 16L << 20, 8, 4, 2);
 
-        assertEquals(16384, new ProfileStore(file, defaults).load().queuePacketLimit);
+        assertEquals(1024, new ProfileStore(file, defaults).load().queuePacketLimit);
 
-        Files.write(file, legacy.replace("queuePacketLimit=1024", "queuePacketLimit=2048")
+        Files.write(file, text.replace("queuePacketLimit=1024", "queuePacketLimit=2048")
                 .getBytes(StandardCharsets.UTF_8));
         assertEquals(2048, new ProfileStore(file, defaults).load().queuePacketLimit);
     }
