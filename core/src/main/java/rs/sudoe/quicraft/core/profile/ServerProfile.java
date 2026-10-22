@@ -2,6 +2,8 @@
 package rs.sudoe.quicraft.core.profile;
 
 import rs.sudoe.quicraft.core.multistream.LogicalStream;
+import rs.sudoe.quicraft.core.multistream.RecordCodec;
+import rs.sudoe.quicraft.core.multistream.SessionSendDriver;
 import rs.sudoe.quicraft.core.transport.PreLoginTracker;
 
 /**
@@ -20,6 +22,12 @@ public final class ServerProfile {
      * 6 KiB satisfies the 13.12 inequality for every N up to 5 and leaves room for prefix staging.
      */
     public static final long PROTECTED_READ_BYTES = 6L << 10;
+
+    /**
+     * Headroom beside one maximum record in {@code queueByteLimit}: 64 KiB, which covers the pending ACK bytes (at most
+     * {@code AckJoinTracker.MAX_BYTES}) and the 2 KiB REALTIME slice (13.19, 13.12). {@link #validate()} requires it.
+     */
+    static final long QUEUE_HEADROOM_BYTES = 64L << 10;
     /** The per-connection receive share the inequality is checked against (13.12). */
     static final long RECEIVE_SHARE_BYTES = 24L << 10;
 
@@ -104,6 +112,14 @@ public final class ServerProfile {
         }
         if (queuePacketLimit < 1 || queueByteLimit < 1) {
             throw new IllegalArgumentException("queue limits must be positive");
+        }
+        // queueByteLimit counts pool footprints (13.20). A connection must hold one maximum record plus 64 KiB of
+        // headroom (ACKs and the REALTIME slice), or the largest record could never be queued.
+        long maxRecordFootprint = SessionSendDriver.footprintOf(RecordCodec.COMPACT_MAX_RECORD_LENGTH);
+        if (queueByteLimit < maxRecordFootprint + QUEUE_HEADROOM_BYTES) {
+            throw new IllegalArgumentException("queueByteLimit " + queueByteLimit + " is below one maximum record's"
+                    + " footprint " + maxRecordFootprint + " plus " + QUEUE_HEADROOM_BYTES + " bytes of headroom; raise it"
+                    + " to at least " + (maxRecordFootprint + QUEUE_HEADROOM_BYTES));
         }
         if (controlWeight < 1 || realtimeWeight < 1 || chunkWeight < 1) {
             throw new IllegalArgumentException("queue weights must be positive");

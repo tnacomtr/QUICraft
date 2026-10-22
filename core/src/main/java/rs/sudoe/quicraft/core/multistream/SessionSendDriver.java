@@ -145,20 +145,38 @@ public final class SessionSendDriver {
      */
     static final long RECORD_BOOKKEEPING = 1024L;
 
-    /** The queue footprint of one record of {@code encodedBytes} (13.20). */
-    static long footprintOf(long encodedBytes) {
+    /**
+     * The queue footprint of one record of {@code encodedBytes} (13.20). The same footprint is what a record charges the
+     * outbound pools (node, IP, account) and what its connection's queue byte limit counts, so one helper serves both.
+     */
+    public static long footprintOf(long encodedBytes) {
         return 2L * encodedBytes + RECORD_BOOKKEEPING;
     }
 
     /**
-     * How long the connection may stay under outbound pressure with no released outbound bytes before it closes
-     * 0x12 (13.20). Pressure starts at half the byte limit and clears at a quarter of it, so it does not flap.
+     * The queue footprint of a bundle run of {@code records} members whose encodings total {@code encodedBytes}: the sum
+     * of {@link #footprintOf} over the members, which is exact (13.15, 13.20).
      */
-    private static final long RELEASE_DEADLINE_NANOS = 10_000_000_000L;
+    static long runFootprintOf(long encodedBytes, int records) {
+        return 2L * encodedBytes + RECORD_BOOKKEEPING * records;
+    }
+
+    /**
+     * How long the connection may stay under outbound pressure with no released outbound bytes before it closes
+     * 0x12 (13.20). Pressure starts at half the byte limit and clears at a quarter of it, so it does not flap. It is
+     * 30 s, longer than QUIC's idle timeout and the vanilla keepalive, so a healthy but slow peer is not closed early.
+     */
+    static final long RELEASE_DEADLINE_NANOS = 30_000_000_000L;
 
     /** One outbound charge: a sequenced record, or a pending ACK_JOIN that will become one. */
     private static final class Charge {
+        /** Encoded bytes: the REALTIME slice and the progress report use these (13.12). */
         final long bytes;
+        /**
+         * Bytes this charge holds in the outbound pools: the footprint of a record or run (13.20), the raw size of the
+         * REALTIME slice or of a pending ACK. Requested, admitted and released with the pool, never with {@link #bytes}.
+         */
+        final long poolBytes;
         Record record;
         byte[] encoded;
         /** The queue footprint this charge counts while queued, released once its last slice is released (13.20). */
@@ -190,7 +208,16 @@ public final class SessionSendDriver {
         long traceGrantWaitNanos;
 
         Charge(long bytes) {
+            this(bytes, bytes);
+        }
+
+        /**
+         * A charge whose pool bytes differ from its encoded bytes: a record charges its footprint, while its encoded
+         * bytes still drive the REALTIME slice and the progress report (13.12, 13.20).
+         */
+        Charge(long bytes, long poolBytes) {
             this.bytes = bytes;
+            this.poolBytes = poolBytes;
             this.progress = bytes;
         }
 
@@ -268,8 +295,11 @@ public final class SessionSendDriver {
     private final SendTrace trace = ReceiveTrace.enabled() ? new SendTrace() : null;
     /** The queue footprint (13.20) of every sequenced or pending record not yet fully released by the transport. */
     private long queuedBytes;
-    /** True from footprint {@code >= limit/2} until footprint {@code <= limit/4} (13.20). */
-    private boolean pressured;
+    /**
+     * True from footprint {@code >= limit/2} until footprint {@code <= limit/4} (13.20). Written only under this driver's
+     * monitor, and volatile so {@link #underPressure()} reads it without taking the monitor on the game thread.
+     */
+    private volatile boolean pressured;
     /** The start of the release deadline: the later of the last released byte and the moment pressure began. */
     private long releaseMarkNanos;
     private boolean closed;
@@ -314,7 +344,8 @@ public final class SessionSendDriver {
      * its bytes until the transport releases it. The bytes of all such ACKs, pending or sequenced but unreleased,
      * are bounded by {@code ackByteLimit}, and {@link #createAck} backpressures at that limit. The smallest cap that
      * applies to the connection (owner, IP, account or node, see {@link OutboundPool#smallestCap}) must hold one
-     * maximum record beside every ACK byte, so {@code maxRecordBytes + ackByteLimit <= smallest cap}. A bundle run
+     * maximum record beside every ACK byte, so {@code footprintOf(maxRecordBytes) + ackByteLimit <= smallest cap}, the
+     * maximum record counted at its pool footprint (13.20). A bundle run
      * is at most {@link StreamSequencer#MAX_BUNDLE_ENCODED_BYTES}, which production sets as {@code maxRecordBytes}.
      * Then a record the ACKs wait on always fits beside them once earlier granted records release, and no ACK
      * can deadlock the connection. A cap below that sum throws.
@@ -385,8 +416,9 @@ public final class SessionSendDriver {
             throw new IllegalArgumentException("send driver");
         }
         // The headroom must fit under the smallest cap that applies to this connection: owner, IP, account or node.
+        // The pools charge a record its footprint (13.20), so one maximum record counts footprintOf(maxRecordBytes).
         if (maxRecordBytes <= 0 || ackByteLimit <= 0 || realtimeSliceBytes <= 0
-                || maxRecordBytes + ackByteLimit + realtimeSliceBytes > pool.smallestCap(account)) {
+                || footprintOf(maxRecordBytes) + ackByteLimit + realtimeSliceBytes > pool.smallestCap(account)) {
             throw new IllegalArgumentException("smallest cap cannot hold a maximum record beside pending ACK bytes");
         }
         this.realtimeSliceBytes = realtimeSliceBytes;
@@ -512,7 +544,8 @@ public final class SessionSendDriver {
      * True while the connection is under outbound pressure (13.20): the producers must not start deferrable bulk
      * units. Thread-safe and cheap; the server thread reads it before it encodes a batch.
      */
-    public synchronized boolean underPressure() {
+    public boolean underPressure() {
+        // Lock-free: the flag is volatile and written only under this driver's monitor (13.20).
         return pressured;
     }
 
@@ -1134,8 +1167,9 @@ public final class SessionSendDriver {
             return result;
         }
         // A run no cap can admit closes 0x12 as before; a run that fits the caps but not one maximum record is refused.
-        if (!pool.admissible(account, unitBytes)) {
-            closeInadmissible(CONTROL, unitBytes);
+        long unitFootprint = runFootprintOf(unitBytes, units);
+        if (!pool.admissible(account, unitFootprint)) {
+            closeInadmissible(CONTROL, unitFootprint);
             return result;
         }
         if (unitBytes > maxRecordBytes) {
@@ -1162,8 +1196,9 @@ public final class SessionSendDriver {
             closeOverflow(records.size(), runBytes, CONTROL);
             return result;
         }
-        if (!pool.admissible(account, runBytes)) {
-            closeInadmissible(CONTROL, runBytes);
+        long runFootprint = runFootprintOf(runBytes, records.size());
+        if (!pool.admissible(account, runFootprint)) {
+            closeInadmissible(CONTROL, runFootprint);
             return result;
         }
         enqueueRun(records, encodings);
@@ -1273,8 +1308,9 @@ public final class SessionSendDriver {
             closeOverflow(count + 2, rawBytes, CONTROL);
             return result;
         }
-        if (!pool.admissible(account, unitBytes)) {
-            closeInadmissible(CONTROL, unitBytes);
+        long unitFootprint = runFootprintOf(unitBytes, count + 2);
+        if (!pool.admissible(account, unitFootprint)) {
+            closeInadmissible(CONTROL, unitFootprint);
             return result;
         }
         if (unitBytes > maxRecordBytes) {
@@ -1304,9 +1340,10 @@ public final class SessionSendDriver {
                 closeOverflow(records.size(), runBytes, CONTROL);
                 return result;
             }
-            if (!pool.admissible(account, runBytes)) {
+            long runFootprint = runFootprintOf(runBytes, records.size());
+            if (!pool.admissible(account, runFootprint)) {
                 closeCause = new IllegalStateException("covered bundle exceeds every applicable cap");
-                closeInadmissible(CONTROL, runBytes);
+                closeInadmissible(CONTROL, runFootprint);
                 return result;
             }
             enqueueRun(records, encodings);
@@ -1625,7 +1662,7 @@ public final class SessionSendDriver {
         }
         Charge group = charge.group();
         if (--group.unreleased == 0) {
-            pool.release(owner, group.bytes);
+            pool.release(owner, group.poolBytes);
         }
         if (charge.ack) {
             ackBytesHeld -= charge.bytes;
@@ -1649,8 +1686,10 @@ public final class SessionSendDriver {
             closeOverflow(1, encoded.length, record.streamIndex());
             return false;
         }
-        if (!pool.admissible(account, encoded.length)) {
-            closeInadmissible(record.streamIndex(), encoded.length);
+        // The pools charge the record its footprint, so admissibility is judged on that (13.20).
+        long footprint = footprintOf(encoded.length);
+        if (!pool.admissible(account, footprint)) {
+            closeInadmissible(record.streamIndex(), footprint);
             return false;
         }
         enqueueEncoded(record, encoded, continues);
@@ -1658,7 +1697,8 @@ public final class SessionSendDriver {
     }
 
     private void enqueueEncoded(Record record, byte[] encoded, boolean continues) {
-        Charge charge = new Charge(encoded.length);
+        // The pool charge is the footprint; the encoded length alone still decides the REALTIME slice (13.12).
+        Charge charge = new Charge(encoded.length, footprintOf(encoded.length));
         charge.record = record;
         charge.encoded = encoded;
         charge.continues = continues;
@@ -1691,9 +1731,11 @@ public final class SessionSendDriver {
         for (byte[] encoded : encodings) {
             runBytes += encoded.length;
         }
+        // The head holds the pool charge of the whole run: the footprint of every member (13.20).
+        long runFootprint = runFootprintOf(runBytes, records.size());
         Charge first = null;
         for (int i = 0; i < records.size(); i++) {
-            Charge charge = new Charge(first == null ? runBytes : 0);
+            Charge charge = new Charge(first == null ? runBytes : 0, first == null ? runFootprint : 0);
             charge.record = records.get(i);
             charge.encoded = encodings.get(i);
             charge.continues = i < records.size() - 1;
@@ -1719,8 +1761,8 @@ public final class SessionSendDriver {
     private void request(Charge charge) {
         charge.requested = true;
         // The slice is protected: a connection holding only its slice is never a shed victim (13.12).
-        charge.ticket = charge == slice ? pool.reserveProtectedTicket(owner, ip, account, charge.bytes)
-                : pool.reserveTicket(owner, ip, account, charge.bytes);
+        charge.ticket = charge == slice ? pool.reserveProtectedTicket(owner, ip, account, charge.poolBytes)
+                : pool.reserveTicket(owner, ip, account, charge.poolBytes);
         if (pool.takeGrant(charge.ticket)) {
             charge.granted = true;
             return;
@@ -1878,6 +1920,10 @@ public final class SessionSendDriver {
     }
 
     private void sequenceAckById(AckJoinTracker.Ready ready) {
+        // A driver closed mid-settle (an earlier ACK's sequencing closed it) must not assign or queue later ACKs.
+        if (closed) {
+            return;
+        }
         PendingAck pending = pendingAcks.get(ready.id());
         if (pending != null) {
             sequenceAck(ready.id(), pending, ready);

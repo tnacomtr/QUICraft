@@ -3,8 +3,11 @@ package rs.sudoe.quicraft.core.profile;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
+import rs.sudoe.quicraft.core.multistream.RecordCodec;
+import rs.sudoe.quicraft.core.multistream.SessionSendDriver;
 import rs.sudoe.quicraft.core.transport.TransportConfig;
 
 /** docs/protocol.md 12.13 and 13.12: profile ranges, cross-field rules and the maxOpen invariant. */
@@ -78,5 +81,21 @@ class ServerProfileTest {
                 () -> TransportConfig.builder().maxOpen(50_000).serverProfile(profile).build());
         assertEquals(true, refused.getMessage().contains("raise maxOpen"));
         assertEquals(65_536, TransportConfig.builder().maxOpen(65_536).serverProfile(profile).build().maxOpen());
+    }
+
+    /**
+     * queueByteLimit counts pool footprints (13.20): it must hold one maximum record plus 64 KiB of headroom. The
+     * boundary is exact, and the rejection names the floor so an operator can raise the value.
+     */
+    @Test
+    void queueByteLimitMustHoldOneMaximumRecordFootprintPlusHeadroom() {
+        long floor = SessionSendDriver.footprintOf(RecordCodec.COMPACT_MAX_RECORD_LENGTH) + 64L * 1024;
+        assertEquals(4_260_976L, floor);
+        ServerProfile below = new ServerProfile(50_000, 5, MIB256, 0.10, 4096, floor - 1, 8, 4, 2);
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class, below::validate);
+        assertTrue(refused.getMessage().contains("queueByteLimit"), refused.getMessage());
+        assertTrue(refused.getMessage().contains(Long.toString(floor)), refused.getMessage());
+        new ServerProfile(50_000, 5, MIB256, 0.10, 4096, floor, 8, 4, 2).validate();
+        valid().validate();
     }
 }

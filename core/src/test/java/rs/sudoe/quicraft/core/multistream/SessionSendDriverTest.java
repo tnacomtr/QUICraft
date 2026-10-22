@@ -78,6 +78,19 @@ class SessionSendDriverTest {
     /** The REALTIME slice used by small-cap rigs; caps in those rigs are raised by this amount (13.12). */
     private static final long TEST_SLICE = 32;
 
+    /**
+     * The pool cap of a small rig with raw budget {@code connectionCap}: twice the budget (a record costs 2e), two
+     * bookkeeping allowances, and the REALTIME slice (13.12, 13.20).
+     */
+    static long smallPoolCap(long connectionCap) {
+        return 2 * connectionCap + 2 * SessionSendDriver.RECORD_BOOKKEEPING + TEST_SLICE;
+    }
+
+    /** The footprint a record of {@code encodedBytes} charges the pools (13.20). */
+    static long fp(long encodedBytes) {
+        return SessionSendDriver.footprintOf(encodedBytes);
+    }
+
     /** A rig with generous pools, a manual clock and the given profile limits. */
     private static final class Rig {
         final AtomicLong now = new AtomicLong(1_000_000_000L);
@@ -105,7 +118,9 @@ class SessionSendDriverTest {
             boolean large = connectionCap >= ReceiveSlots.BYTES_PER_STREAM + AckJoinTracker.MAX_BYTES;
             slice = large ? SessionSendDriver.DEFAULT_REALTIME_SLICE_BYTES : TEST_SLICE;
             NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
-            pool = new OutboundPool(node, 1L << 40, 1L << 40, large ? connectionCap : connectionCap + TEST_SLICE,
+            // Small caps are footprint budgets (13.20): a record of e encoded bytes costs 2e + 1 KiB, so the pool holds
+            // twice the old raw budget plus two bookkeeping allowances, and the slice.
+            pool = new OutboundPool(node, 1L << 40, 1L << 40, large ? connectionCap : smallPoolCap(connectionCap),
                     ranking.view(now::get));
             ServerProfile profile = new ServerProfile(1, 1, 1024, .5, queuePackets, queueBytes, 4, 4, 4);
             if (large) {
@@ -132,7 +147,7 @@ class SessionSendDriverTest {
 
         HeadroomRig(long connectionCap, long maxRecordBytes, long ackByteLimit) throws Exception {
             NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
-            pool = new OutboundPool(node, 1L << 40, 1L << 40, connectionCap + TEST_SLICE, ranking.view(now::get));
+            pool = new OutboundPool(node, 1L << 40, 1L << 40, smallPoolCap(connectionCap), ranking.view(now::get));
             ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
             driver = new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner,
                     InetAddress.getLoopbackAddress(), null, now::get, maxRecordBytes, ackByteLimit, TEST_SLICE);
@@ -576,9 +591,11 @@ class SessionSendDriverTest {
     void recordIsNotWrittenBeforeItsChargeIsGranted() throws Exception {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
-        // A per-connection cap of 100 bytes: the second record's reservation waits for the first release.
+        // A per-connection cap of 100 raw bytes (2280 footprint, 13.20): the second record's reservation waits for the
+        // first release. frame(40) encodes to 46 bytes and frame(80) to 86: fp(46) + fp(86) = 2312 exceeds the 2248
+        // the records may share beside the slice, while fp(46) alone fits.
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                1L << 40, 1L << 40, 100 + TEST_SLICE, ranking.view(now::get));
+                1L << 40, 1L << 40, smallPoolCap(100), ranking.view(now::get));
         Object owner = new Object();
         SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
                 new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
@@ -586,7 +603,7 @@ class SessionSendDriverTest {
         SentPacket first = driver.submit(frame(40), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
         SentPacket second = driver.submit(frame(80), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
         assertTrue(first.isAssigned() && second.isAssigned());
-        assertTrue(pool.reserved(owner) <= 100 + TEST_SLICE, "only the first reservation is granted");
+        assertEquals(TEST_SLICE + fp(46), pool.reserved(owner), "only the first reservation is granted");
 
         SessionSendDriver.Write written = driver.poll(stream -> true);
         assertNotNull(written);
@@ -641,20 +658,20 @@ class SessionSendDriverTest {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                1L << 40, 1L << 40, 100 + TEST_SLICE, ranking.view(now::get));
+                1L << 40, 1L << 40, smallPoolCap(100), ranking.view(now::get));
         SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
                 new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, new Object(),
                 InetAddress.getLoopbackAddress(), null, now::get, 75, 25, TEST_SLICE);
         assertNull(driver.lastCloseReason());
-        // A record larger than the connection cap can never be admitted, so the driver closes 0x12 (13.12).
-        assertFalse(driver.submit(frame(300), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        // A record whose footprint exceeds the connection cap can never be admitted, so the driver closes 0x12 (13.12).
+        assertFalse(driver.submit(frame(1200), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
         assertTrue(driver.isClosed());
         assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
         String reason = driver.lastCloseReason();
         assertTrue(reason.startsWith("check=pool-inadmissible stream="), reason);
         assertTrue(reason.contains(" queuePacketLimit=1000 queueByteLimit=" + (1L << 40) + " "), reason);
         long recordBytes = Long.parseLong(reason.substring(reason.lastIndexOf(" recordBytes=") + " recordBytes=".length()));
-        assertTrue(recordBytes > 100 + TEST_SLICE, "the refused record is larger than the cap: " + reason);
+        assertTrue(recordBytes > smallPoolCap(100), "the refused record's footprint is larger than the cap: " + reason);
     }
 
     @Test
@@ -817,7 +834,7 @@ class SessionSendDriverTest {
         assertNotNull(first);
         assertEquals(LogicalStream.REALTIME, first.stream());
         assertNull(driver.poll(stream -> true), "the 86-byte chunk waits for its grant; nothing after it is granted");
-        assertEquals(rig.slice + 46, rig.pool.reserved(rig.owner), "only the granted realtime record is charged");
+        assertEquals(rig.slice + fp(46), rig.pool.reserved(rig.owner), "only the granted realtime record is charged");
         driver.released(first.token());
 
         Drain rest = drainAndRelease(driver);
@@ -837,7 +854,7 @@ class SessionSendDriverTest {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                1L << 40, 1L << 40, 100 + TEST_SLICE, ranking.view(now::get));
+                1L << 40, 1L << 40, smallPoolCap(100), ranking.view(now::get));
         Object owner = new Object();
         SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
                 new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
@@ -871,7 +888,7 @@ class SessionSendDriverTest {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                1L << 40, 1L << 40, 102 + TEST_SLICE, ranking.view(now::get));
+                1L << 40, 1L << 40, smallPoolCap(102), ranking.view(now::get));
         Object owner = new Object();
         SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
                 new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
@@ -903,11 +920,15 @@ class SessionSendDriverTest {
     void connectionCapWithoutRecordAndAckHeadroomIsRefused() throws Exception {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
-        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                1L << 40, 1L << 40, 100 + TEST_SLICE, ranking.view(now::get));
+        // One maximum record of 86 bytes (footprint fp(86)) beside 16 ACK bytes and the slice: exact at the edge.
+        long exact = fp(86) + 16 + TEST_SLICE;
         ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
+        OutboundPool short1 = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, 1L << 40, exact - 1, ranking.view(now::get));
         assertThrows(IllegalArgumentException.class, () -> new SessionSendDriver(SessionContext.of(1), profile,
-                pool, ranking, new Object(), InetAddress.getLoopbackAddress(), null, now::get, 86, 16, TEST_SLICE));
+                short1, ranking, new Object(), InetAddress.getLoopbackAddress(), null, now::get, 86, 16, TEST_SLICE));
+        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, 1L << 40, exact, ranking.view(now::get));
         assertNotNull(new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, new Object(),
                 InetAddress.getLoopbackAddress(), null, now::get, 84, 16, TEST_SLICE));
     }
@@ -923,7 +944,7 @@ class SessionSendDriverTest {
         PressureRanking ranking = new PressureRanking();
         // The IP cap holds the two REALTIME slices beside the 100-byte budget.
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                100 + 2 * TEST_SLICE, 1L << 40, 1L << 40, ranking.view(now::get));
+                smallPoolCap(100) + TEST_SLICE, 1L << 40, 1L << 40, ranking.view(now::get));
         InetAddress ip = InetAddress.getLoopbackAddress();
         ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
         Object ownerA = new Object();
@@ -1010,7 +1031,8 @@ class SessionSendDriverTest {
     void recordLargerThanConnectionCapClosesWithoutAGap() throws Exception {
         Rig rig = new Rig(1, 1000, 100);
         SessionSendDriver driver = rig.driver;
-        SentPacket oversize = driver.submit(frame(200), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        // frame(1200) encodes to 1206 bytes, footprint 3436, beyond the 2280 footprint cap of raw 100.
+        SentPacket oversize = driver.submit(frame(1200), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
         assertFalse(oversize.isAssigned());
         assertTrue(driver.isClosed());
         assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
@@ -1042,7 +1064,7 @@ class SessionSendDriverTest {
      */
     @Test
     void openBundleWaitsForOneChargeAndNeverStallsAnEarlierChunk() throws Exception {
-        HeadroomRig rig = new HeadroomRig(100, 86, 14);
+        HeadroomRig rig = new HeadroomRig(1000, 86, 14);
         SessionSendDriver driver = rig.driver;
         assertTrue(driver.submit(frame(40), StreamSequencer.Fence.CHUNK, 0, 0).isAssigned());
         List<OutboundPacket> members = new ArrayList<OutboundPacket>();
@@ -1307,7 +1329,7 @@ class SessionSendDriverTest {
      */
     @Test
     void pendingAckDoesNotReorderFenceAndCoveredUpdateUnderPressure() throws Exception {
-        HeadroomRig rig = new HeadroomRig(102, 86, 16);
+        HeadroomRig rig = new HeadroomRig(1000, 86, 16);
         SessionSendDriver driver = rig.driver;
         assertTrue(driver.createAck(1, frame(2).frame(), 16));
         SentPacket fence = driver.submit(frame(1), StreamSequencer.Fence.VIEW, 0, 0);
@@ -1527,7 +1549,7 @@ class SessionSendDriverTest {
         AtomicLong now = new AtomicLong(1_000_000_000L);
         PressureRanking ranking = new PressureRanking();
         OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
-                100 + 2 * TEST_SLICE, 1L << 40, 1L << 40, ranking.view(now::get));
+                smallPoolCap(100) + TEST_SLICE, 1L << 40, 1L << 40, ranking.view(now::get));
         InetAddress ip = InetAddress.getLoopbackAddress();
         ServerProfile profile = new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4);
         SessionSendDriver a = new SessionSendDriver(SessionContext.of(1), profile, pool, ranking, new Object(),
@@ -1635,7 +1657,7 @@ class SessionSendDriverTest {
      */
     @Test
     void bundleRunLargerThanMaxRecordBytesIsRejectedBeforeQueueing() throws Exception {
-        HeadroomRig rig = new HeadroomRig(1000, 200, 50);
+        HeadroomRig rig = new HeadroomRig(4000, 200, 50);
         SessionSendDriver driver = rig.driver;
         List<OutboundPacket> members = new ArrayList<OutboundPacket>();
         members.add(frame(100));
@@ -1723,8 +1745,9 @@ class SessionSendDriverTest {
         SessionSendDriver existing = new SessionSendDriver(SessionContext.of(2), profile, pool, ranking, owner, ip,
                 null, now::get, 64, 64, 2048);
         assertEquals(2048, pool.reserved(owner), "the existing driver holds its slice");
-        // A record beyond the owner's free bytes waits, so the existing driver also owns a queued request.
-        assertTrue(existing.submit(frame(3000), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        // A record beyond the owner's free bytes waits, so the existing driver also owns a queued request. frame(1000) is
+        // 1006 encoded bytes, footprint 3036: above the 2048 free bytes and within the 4096 cap, so it waits, not refused.
+        assertTrue(existing.submit(frame(1000), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
         assertEquals(1, pool.waitingCount(), "the existing driver's record waits");
 
         // The same owner key cannot register twice; the failed construction owns neither the slice nor a request.
@@ -2304,7 +2327,7 @@ class SessionSendDriverTest {
     void coveredBundleOversizeCapAndQueueRefusalsAssignNothing() throws Exception {
         StreamSequencer.Fence ordinary = StreamSequencer.Fence.ORDINARY_CONTROL;
 
-        HeadroomRig oversized = new HeadroomRig(1000, 200, 50);
+        HeadroomRig oversized = new HeadroomRig(4000, 200, 50);
         MultistreamSession.UpdateToken token = oversized.driver.registerUpdate(oversized.driver.openScope());
         assertThrows(IllegalArgumentException.class, () -> oversized.driver.submitCoveredBundle(frame(1),
                 packets(100, 100), new StreamSequencer.Fence[] {ordinary, ordinary}, frame(1),
@@ -2647,7 +2670,8 @@ class SessionSendDriverTest {
         Rig rig = new Rig(2, 1000, 100);
         SessionSendDriver driver = rig.driver;
         assertTrue(driver.beginBatch(1, frame(2)).isAssigned());
-        SentPacket join = driver.finishBatch(1, frame(200));
+        // frame(1200) encodes to 1206 bytes: footprint 3436, beyond the 2280 footprint cap of raw 100 (13.20).
+        SentPacket join = driver.finishBatch(1, frame(1200));
         assertFalse(join.isAssigned(), "the join no cap can admit is not assigned to the caller");
         assertTrue(driver.isClosed(), "a refused enqueue after assignment is a terminal 0x12 close");
         assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
@@ -2685,7 +2709,7 @@ class SessionSendDriverTest {
      */
     @Test
     void coveredBundleWaitsBehindAnEarlierRecordAndNeverStallsIt() throws Exception {
-        HeadroomRig rig = new HeadroomRig(100, 86, 14);
+        HeadroomRig rig = new HeadroomRig(1000, 86, 14);
         SessionSendDriver driver = rig.driver;
         // Large enough that the early record keeps its charge, so the run's aggregate cannot fit beside it.
         SentPacket early = driver.submit(frame(70), StreamSequencer.Fence.CHUNK, 0, 0);
@@ -2710,7 +2734,7 @@ class SessionSendDriverTest {
     /** ACK headroom stays outside the ordinary FIFO: a pending ACK never blocks a covered bundle. */
     @Test
     void coveredBundleIsAdmittedUnderPendingAckHeadroom() throws Exception {
-        HeadroomRig rig = new HeadroomRig(102, 86, 16);
+        HeadroomRig rig = new HeadroomRig(1000, 86, 16);
         SessionSendDriver driver = rig.driver;
         assertTrue(driver.createAck(1, frame(2).frame(), 16));
         MultistreamSession.CausalScope scope = driver.openScope();
@@ -2764,7 +2788,7 @@ class SessionSendDriverTest {
     private static final int ONE_MIB_CONTENT = 1 << 20;
     /** The default record and byte caps (13.20). */
     private static final long DEFAULT_QUEUE_BYTES = 16L << 20;
-    private static final long RELEASE_DEADLINE = 10_000_000_000L;
+    private static final long RELEASE_DEADLINE = SessionSendDriver.RELEASE_DEADLINE_NANOS;
 
     /** Polls and settles every slice of the next record, in order (13.20). */
     private static void releaseNextRecord(SessionSendDriver driver) {
@@ -2858,7 +2882,7 @@ class SessionSendDriverTest {
         assertFalse(driver.checkReleaseDeadline(), "a release at nine seconds renews the deadline");
         assertFalse(driver.isClosed());
         rig.now.addAndGet(200_000_000L);
-        assertTrue(driver.checkReleaseDeadline(), "ten seconds after the last release closes the connection");
+        assertTrue(driver.checkReleaseDeadline(), "the release deadline after the last release closes the connection");
         assertTrue(driver.isClosed());
         assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
         assertTrue(driver.lastCloseReason().startsWith("check=release-deadline stream=-1 "), driver.lastCloseReason());
@@ -3097,8 +3121,8 @@ class SessionSendDriverTest {
             assertTrue(driver.underPressure(), "the footprint stays above the clear line");
         }
         assertEquals(20 * footprintOfMiB() - 6 * footprintOfMiB(), driver.queuedFootprint(), "six records released");
-        rig.now.addAndGet(10_000_000_000L);
-        assertTrue(driver.checkReleaseDeadline(), "ten seconds with no release closes the connection");
+        rig.now.addAndGet(RELEASE_DEADLINE);
+        assertTrue(driver.checkReleaseDeadline(), "the release deadline with no release closes the connection");
         assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
     }
 
@@ -3113,7 +3137,7 @@ class SessionSendDriverTest {
         Rig rig = pressuredRig();
         SessionSendDriver driver = rig.driver;
         long before = driver.queuedFootprint();
-        rig.now.addAndGet(9_000_000_000L);
+        rig.now.addAndGet(RELEASE_DEADLINE - 1_000_000_000L);
         SessionSendDriver.Write write = driver.poll(stream -> true);
         assertNotNull(write);
         assertFalse(write.last(), "a one-MiB record spans several 64 KiB slices");
@@ -3216,5 +3240,91 @@ class SessionSendDriverTest {
         assertEquals(0, driver.queuedRecords());
         assertEquals(SessionSendDriver.DEFAULT_REALTIME_SLICE_BYTES, rig.pool.reserved(rig.owner),
                 "the run's single pool charge is released once; only the REALTIME slice stays charged");
+    }
+
+    /**
+     * The pools charge a queued record its footprint, 2 * encoded + 1 KiB (13.20), not its encoded length. The charge is
+     * held while the record is queued and returned exactly once when it settles; close returns the rest.
+     */
+    @Test
+    void poolChargesAQueuedRecordItsFootprintAndReleasesItOnce() throws Exception {
+        Rig rig = new Rig(1, 1000);
+        SessionSendDriver driver = rig.driver;
+        SentPacket record = driver.submit(frame(40), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        assertTrue(record.isAssigned());
+        assertEquals(rig.slice + fp(encodedLengthOf(frame(40))), rig.pool.reserved(rig.owner),
+                "the pool holds the record's footprint, not its encoded length");
+        drainAndRelease(driver);
+        assertEquals(rig.slice, rig.pool.reserved(rig.owner), "settled: only the slice remains");
+        driver.close();
+        assertEquals(0, rig.pool.reserved(rig.owner), "close returns every byte");
+    }
+
+    /**
+     * A record whose encoding fits the account cap is still inadmissible when its footprint does not: the account is
+     * judged on footprints (13.20), so the driver closes 0x12 before anything is retained.
+     */
+    @Test
+    void aRecordWhoseFootprintExceedsTheAccountCapIsInadmissibleEvenWhenItsEncodingFits() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        long cap = smallPoolCap(100);
+        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, cap, 1L << 40, ranking.view(now::get));
+        Object owner = new Object();
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
+                new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, owner,
+                InetAddress.getLoopbackAddress(), "alice", now::get, 86, 14, TEST_SLICE);
+        long encoded = encodedLengthOf(frame(1200));
+        assertTrue(encoded <= cap, "the encoding alone fits the account cap");
+        assertTrue(fp(encoded) > cap, "its footprint does not");
+        assertFalse(driver.submit(frame(1200), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertTrue(driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertTrue(driver.lastCloseReason().startsWith("check=pool-inadmissible"), driver.lastCloseReason());
+        assertEquals(0, pool.reserved(owner), "no charge is retained for a refused record");
+    }
+
+    /**
+     * underPressure is read on the game thread every tick, so it must not wait for the driver monitor (13.20). The test
+     * holds the monitor on this thread and requires a second thread to read the flag while it is held.
+     */
+    @Test
+    void underPressureReadDoesNotWaitForTheDriverMonitor() throws Exception {
+        Rig rig = pressuredRig();
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.underPressure(), "the rig starts under pressure");
+        AtomicReference<Boolean> seen = new AtomicReference<Boolean>();
+        Thread reader = new Thread(() -> seen.set(driver.underPressure()));
+        boolean finished;
+        synchronized (driver) {
+            reader.start();
+            reader.join(5_000);
+            finished = !reader.isAlive();
+        }
+        assertTrue(finished, "underPressure() blocked on the driver monitor");
+        assertEquals(Boolean.TRUE, seen.get());
+        driver.close();
+    }
+
+    /**
+     * Once the driver is closed, settling pending ACKs must not assign or queue any of them (13.19). A close that keeps
+     * the pending ACK entries (the deferred-release close) leaves them for the settle loop, so the guard is what stops
+     * them. The settle loop is reached through reflection because public entry points return early on a closed driver.
+     */
+    @Test
+    void aClosedDriverAssignsNoPendingAckWhenItSettles() throws Exception {
+        Rig rig = new Rig(1, 1000);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(7, frame(2).frame(), 16));
+        driver.sealAckCoverage(7);
+        long before = driver.assignedSequence(2);  // joins are CHUNK[0]
+        java.lang.reflect.Field closedField = SessionSendDriver.class.getDeclaredField("closed");
+        closedField.setAccessible(true);
+        closedField.setBoolean(driver, true);
+        java.lang.reflect.Method settle = SessionSendDriver.class.getDeclaredMethod("settleAcksLocked");
+        settle.setAccessible(true);
+        settle.invoke(driver);
+        assertEquals(before, driver.assignedSequence(2), "a closed driver assigns no ACK_JOIN");
     }
 }
