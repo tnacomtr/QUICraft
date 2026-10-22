@@ -1352,3 +1352,42 @@ cross-stream dependency waited past the 10 s blocked-head timer (13.10/13.12). T
   unexplained or no-local-bytes wait.
 - The blocked-head timer turns deep queueing into a disconnect where TCP only lags. That is a spec question for the
   13.10/13.12 timer design.
+
+### Blocked-head timer: progress-based deadline, and why the busy timer still stays off (2026-10-22)
+
+13.10/13.12 changed (user-approved, security-reviewed): a dependency-blocked head now closes 0x12 after 10 s with
+no qualified progress (a validated commit on an unresolved prerequisite's stream: the head's own direct dependency
+reaching its required sequence, or 64 KiB of qualifying wire bytes), not after a flat 10 s, with a nonrenewable 120 s
+active cap (180 s retention with the 60 s stall allowance). The numbers are proposed defaults.
+
+Slow profile (2 Mbit, 75 ms, 2% loss), busy batch timer (the prototype that floods: 8-13 chunks/tick), chunk load ms,
+interleaved TCP and plain /3 (`diag/pt1`, `pt2`, `pt3` in the job scratch; not committed):
+
+| Arm | Before (587ea286, n=2) | After, n=3 | After, second matrix, n=2 |
+|---|---|---|---|
+| /3 busy | closed 0x12, closed 0x12 | 5535, 5327, 5566 | 5443, closed 0x12 |
+| /3 plain | 5962, 5948 | 6572, 5946, 6014 | 6459, 5692 |
+| TCP | 41246, 29653 | 36355, 32221, 37791 | 32041, 25728 |
+
+The busy timer is not safe to turn on: one of eight post-change flooded runs without a lagging client still closed
+0x12 (pt2; no server log was collected for it, so its cause is not established; pt3 added 3 more clean runs at 5479, 5514
+and 5493 ms), and with a lagging client (40 ms/tick + 1 s stall per 100 ticks) 14 of 14 closed (pt2 to pt7; pt4 to pt7 only add diagnostics).
+
+Root cause of the lagging-client closes (server log, `-Dquicraft.v3.trace=true`): the SERVER drops the connection
+about 3 s after join with `send close: check=queue-packet-limit queuedRecords=1024 queuedBytes=299113
+queuePacketLimit=1024 queueByteLimit=16777216`. Mostly small REALTIME records (peak 915 queued) plus a few chunks
+reach the 1024-record cap long before the 16 MiB byte cap, while a flooded 2 Mbit link drains about 250 KB/s. The
+client then sees a silent connection and its own 10 s no-progress deadline fires, so that 0x12 was a symptom. A second
+run hit the sibling bound, `the outbound hold is over its cap (13.12)`. The record-count cap exists because byte
+accounting does not see per-record object overhead; raising it needs the overhead charged. Open design item, not
+changed here. TCP in the same situation only buffers.
+
+Also measured, negative: the local-gating batch timer (`-Dquicraft.v3.batchTimerGating`, branch
+`agent/p5-gating-timer`, not merged). With only locally caused waits subtracted it matches plain /3 within noise on
+clean, delayloss, slow and slow with a lagging client (n=2; chunks/tick on slow 1.9-2.3 vs 2.0-2.1 for plain /3). The
+earlier gains came from over-subtraction (7-13 chunks/tick), which floods slow links. Details in
+`.agents/plans/result-p5-gating-timer.md`.
+
+New diagnostics, all off the wire: the local close detail (`receive driver closed with 0x12 (expiry=... head=...
+unresolved=[... held= ready= enq=...] ...)`), `QUICraft v3 send close: check=...` (once per connection, INFO),
+`QUICraft v3 profile: ...` (once per process), and `-Dquicraft.v3.stalldiag=true` (stall watchdog, off by default).
