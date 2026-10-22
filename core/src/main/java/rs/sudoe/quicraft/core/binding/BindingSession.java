@@ -12,6 +12,7 @@ import java.util.function.LongSupplier;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine.Role;
+import rs.sudoe.quicraft.core.multistream.JoinDiag;
 
 /**
  * The binding session of one {@code /3} connection: it drives {@link BindingStateMachine} through
@@ -88,6 +89,8 @@ public final class BindingSession implements BindingDriver {
     private final ScheduledExecutorService scheduler;
     /** Optional: whether the caller is on the connection's event loop, for the self-tick check. */
     private final BooleanSupplier inEventLoop;
+    /** Optional join marks of the connection this session binds; null means the diagnostics are off. */
+    private final JoinDiag diag;
 
     private final List<Object> queued = new ArrayList<Object>();
     private long queuedBytes;
@@ -148,6 +151,22 @@ public final class BindingSession implements BindingDriver {
             int shardCount, byte[] advertisedFingerprint, byte[] routingDigest, LongSupplier clock,
             long offerWaitNanos, Callbacks callbacks, ScheduledExecutorService scheduler,
             BooleanSupplier inEventLoop) {
+        this(role, exporter, sharedSecret, mode, protocol, shardCount, advertisedFingerprint, routingDigest,
+                clock, offerWaitNanos, callbacks, scheduler, inEventLoop, null);
+    }
+
+    /**
+     * As the constructor above, with the connection's join marks: every binding message this session
+     * sends or verifies is recorded there as {@code KIND sent} / {@code KIND received}. The marks never
+     * change the order, the queueing or the deadlines of the exchange, and a null {@code diag} (the
+     * diagnostics being off, which is the default) records nothing.
+     *
+     * @param diag the connection's join marks, or null
+     */
+    public BindingSession(Role role, ExporterSource exporter, byte[] sharedSecret, int mode, int protocol,
+            int shardCount, byte[] advertisedFingerprint, byte[] routingDigest, LongSupplier clock,
+            long offerWaitNanos, Callbacks callbacks, ScheduledExecutorService scheduler,
+            BooleanSupplier inEventLoop, JoinDiag diag) {
         if (shardCount < 1 || shardCount > 5) {
             throw new IllegalArgumentException("shard count must be 1..5, got " + shardCount);
         }
@@ -181,6 +200,7 @@ public final class BindingSession implements BindingDriver {
         this.offerWaitNanos = offerWaitNanos;
         this.scheduler = scheduler;
         this.inEventLoop = inEventLoop;
+        this.diag = diag;
     }
 
     /** Whether the exchange finished with activation (12.9). */
@@ -256,11 +276,15 @@ public final class BindingSession implements BindingDriver {
                 fail("binding: unsolicited payload");
                 return;
             }
+            BindingKind expected = expectedKindForMarks();
             Faults.check(Faults.BINDING_STEP);
             BindingResult result = machine.receive(payload);
             if (result.isFailed()) {
                 fail("binding: " + result.failure().name());
                 return;
+            }
+            if (expected != null) {
+                JoinDiag.mark(diag, expected.name() + " received");
             }
             if (result.isSend()) {
                 step(result.message());
@@ -500,6 +524,24 @@ public final class BindingSession implements BindingDriver {
 
     private void send(BindingMessage message) {
         callbacks.send(message.encode());
+        if (diag != null) {
+            JoinDiag.mark(diag, message.kind().name() + " sent");
+        }
+    }
+
+    /**
+     * The kind the next payload answers, or null when the marks are off. The marks must never turn a
+     * diagnostics problem into a binding failure, so a broken read here only loses the mark.
+     */
+    private BindingKind expectedKindForMarks() {
+        if (diag == null || machine == null) {
+            return null;
+        }
+        try {
+            return machine.expectedKind();
+        } catch (Throwable diagnostic) {
+            return null;
+        }
     }
 
     /**

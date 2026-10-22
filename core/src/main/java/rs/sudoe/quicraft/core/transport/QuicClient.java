@@ -31,12 +31,14 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.net.ssl.SSLEngine;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.multistream.JoinDiag;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
 import rs.sudoe.quicraft.core.multistream.PreambleV2;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
@@ -64,6 +66,7 @@ public final class QuicClient {
     private static volatile long testGraceFloorNanos;
     /** Tests only: pauses immediately before a successful connect future is completed. */
     private static volatile Runnable testBeforeConnectCompletion;
+    private static volatile Supplier<JoinDiag> testJoinDiagSource;
     private static volatile EventLoopGroup group;
 
     private QuicClient() {}
@@ -533,6 +536,20 @@ public final class QuicClient {
         testBeforeConnectCompletion = hook;
     }
 
+    /**
+     * Tests only: where an attempt's join marks come from, so a test can hand the attempt one
+     * instance and see that the adapter receives exactly that one. {@code null} restores the
+     * property-gated factory.
+     */
+    static void setJoinDiagSourceForTests(Supplier<JoinDiag> source) {
+        testJoinDiagSource = source;
+    }
+
+    private static Supplier<JoinDiag> joinDiagSource() {
+        Supplier<JoinDiag> source = testJoinDiagSource;
+        return source == null ? () -> JoinDiag.create(JoinDiag.Side.CLIENT) : source;
+    }
+
     private static void beforeConnectCompletionForTests() {
         Runnable hook = testBeforeConnectCompletion;
         if (hook != null) {
@@ -869,6 +886,8 @@ public final class QuicClient {
         private volatile boolean retrying;
         /** Nanos at which the first connect started; the handshake time is measured from it. */
         private volatile long connectStart;
+        /** This attempt's join marks, or null when {@code -Dquicraft.v3.joindiag} is off. */
+        private JoinDiag diag;
 
         V3Attempt(Channel udp, InetSocketAddress remote, List<Object> server, EarlyFlight early,
                 CompletableFuture<V3Connection> result, V3Dial dial) {
@@ -884,12 +903,20 @@ public final class QuicClient {
         void start() {
             result.whenComplete((stream, error) -> {
                 if (result.isCancelled() || error != null) {
+                    // No join follows a failed attempt, so its one line is written here.
+                    JoinDiag.finish(diag);
                     abandon();
                 }
             });
             if (result.isDone()) {
                 return; // cancelled while the socket opened
             }
+            try {
+                diag = joinDiagSource().get();
+            } catch (Throwable ignored) {
+                diag = null; // diagnostics never touch a join
+            }
+            JoinDiag.mark(diag, "connect start");
             connectStart = System.nanoTime();
             connect();
         }
@@ -900,7 +927,9 @@ public final class QuicClient {
                     .handler(new ChannelInboundHandlerAdapter() {
                         @Override
                         public void handlerAdded(ChannelHandlerContext ctx) {
-                            quic.set((QuicChannel) ctx.channel());
+                            QuicChannel channel = (QuicChannel) ctx.channel();
+                            quic.set(channel);
+                            JoinDiag.attach(channel, diag);
                         }
 
                         @Override
@@ -947,6 +976,7 @@ public final class QuicClient {
                 }
                 long handshake = System.nanoTime() - connectStart;
                 QuicChannel connection = (QuicChannel) f.getNow();
+                JoinDiag.mark(diag, "QUIC handshake done");
                 // The abandoned connection shares the socket with the retry: it must not close it.
                 connection.closeFuture().addListener(closed -> {
                     if (connection != abandoned) {
@@ -1092,6 +1122,7 @@ public final class QuicClient {
                             stream.start();
                             raw.write(out);
                             raw.flush();
+                            JoinDiag.mark(diag, "preamble+handshake flight written");
                             early.markSent();
                             lastEarly = "sent";
                             sent.complete(stream);
@@ -1126,6 +1157,7 @@ public final class QuicClient {
                         stream.start();
                         raw.write(ByteBuffer.wrap(PreambleV2.encode(null)));
                         raw.flush();
+                        JoinDiag.mark(diag, "preamble+handshake flight written");
                         beforeConnectCompletionForTests();
                         if (!result.complete(stream)) {
                             stream.close(); // cancelled meanwhile

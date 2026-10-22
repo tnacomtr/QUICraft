@@ -35,6 +35,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.multistream.JoinDiag;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
 import rs.sudoe.quicraft.core.multistream.ReceiveBudget;
 import rs.sudoe.quicraft.core.multistream.SessionResources;
@@ -946,6 +947,13 @@ public final class QuicServer implements Closeable {
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
+                        if (shared.v3 != null) {
+                            // One marks instance per /3 connection: attached before anything of the
+                            // connection runs, so the game's side finds it once it has the channel.
+                            JoinDiag diag = JoinDiag.create(JoinDiag.Side.SERVER);
+                            JoinDiag.attach(connection, diag);
+                            JoinDiag.mark(diag, "connection accepted");
+                        }
                         Runnable install = () -> {
                             if (shared.accepted != null) {
                                 // Written only by this socket's own loop, so no synchronization.
@@ -1322,6 +1330,7 @@ public final class QuicServer implements Closeable {
                     && !handshakeDone) {
                 handshakeDone = true;
                 handshakeEvent = (SslHandshakeCompletionEvent) evt;
+                JoinDiag.mark(JoinDiag.of(ctx.channel()), "QUIC handshake done");
                 if (deadline != null) {
                     deadline.cancel(false);
                 }
