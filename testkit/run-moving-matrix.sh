@@ -166,7 +166,8 @@ mkdir -p "$out_dir" || die "cannot create $out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
 
 echo "== moving matrix: $total_runs runs ($rounds round(s) x $profile_count profile(s) x $arm_count arms)"
-echo "== worst-case: $total_runs x 5400s = $((total_runs * 5400))s (+30s kill grace/run); each client has a 600s deadline, build/cleanup included in outer budget"
+run_budget=$(matrix_run_budget "$move_seconds")
+echo "== worst-case: $total_runs x ${run_budget}s = $((total_runs * run_budget))s (+${DEADLINE_OUTER_GRACE}s kill grace/run); client deadline $(client_run_budget "$move_seconds")s (window + ${CLIENT_RUN_ALLOWANCE}s), build/cleanup included"
 echo "== estimated wall time: $((estimated / 3600))h$(printf '%02d' $(((estimated % 3600) / 60)))m"
 echo "==   (${total_runs} runs x ${estimate_seconds}s; the first arm may also build the server image)"
 {
@@ -220,7 +221,7 @@ for ((round = 0; round < rounds; round++)); do
             fi
             echo "== [$index/$total_runs] $stem ($(date -u +%H:%M:%SZ))"
             run_status=0
-            bounded 5400 "$here/run-external-arms.sh" "${arm_args[@]}" "${common_args[@]}" \
+            bounded_outer "$run_budget" "$here/run-external-arms.sh" "${arm_args[@]}" "${common_args[@]}" \
                 >"$out_dir/$stem.runner.log" 2>&1 || run_status=$?
             if ((run_status == 0)); then
                 printf '%s\t%s\t%s\tok\t%s.json\n' "$profile" "$token" "$round" "$stem" >>"$status_file"

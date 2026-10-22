@@ -459,6 +459,27 @@ class MatrixSummarizeTest {
         Files.writeString(dir.resolve(file), GSON.toJson(doc), StandardCharsets.UTF_8);
     }
 
+    @Test
+    void movingSummaryWithoutAManifestIsRefused() throws IOException {
+        write("tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, 1));
+        write("q3.json", "clean-quic3", "clean", RunFixtures.quic3(30, 300, 3));
+        Path markdown = dir.resolve("summary.md");
+        int status = MatrixSummarize.run(Args.parse(new String[] {
+                "--dir", dir.toString(), "--profiles", "clean", "--markdown", markdown.toString(), "--moving",
+        }));
+        assertEquals(1, status);
+        assertFalse(Files.exists(markdown), "no summary may be written for an unverifiable moving run");
+    }
+
+    @Test
+    void legacyDirectoryDiscoveryIsLabelledNonGating() throws IOException {
+        write("tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, 1));
+        write("q3.json", "clean-quic3", "clean", RunFixtures.quic3(30, 300, 3));
+        Path markdown = dir.resolve("summary.md");
+        summarize(markdown, "clean");
+        assertTrue(Files.readString(markdown).contains("NON-GATING"));
+    }
+
     private int summarize(Path markdown, String profiles) throws IOException {
         return MatrixSummarize.run(Args.parse(new String[] {
                 "--dir", dir.toString(),

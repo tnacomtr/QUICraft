@@ -114,6 +114,10 @@ public final class MatrixSummarize {
         boolean moving = args.flag("moving");
         String manifestPath = args.string("manifest", Files.exists(dir.resolve("runs.tsv"))
                 ? dir.resolve("runs.tsv").toString() : null);
+        if ((moving || args.flag("proof")) && manifestPath == null) {
+            System.err.println("moving/proof summary requires a run manifest (--manifest or runs.tsv); refusing to verify directory discovery");
+            return 1;
+        }
         List<String> arms = new ArrayList<>(List.of("tcp"));
         if (variantMode) {
             for (String variant : variants) arms.add(variant.equals("busy") ? "quic3-busy" : "quic3");
@@ -313,6 +317,7 @@ public final class MatrixSummarize {
 
         StringBuilder md = new StringBuilder();
         if (manifest != null) manifest.append(md);
+        else md.append("NON-GATING: legacy directory discovery cannot establish expected runs or missing rounds.\n\n");
         if (variantMode) {
             md.append("Variant comparison rows (/3 ").append(String.join(", ", variants))
                     .append("). Medians are computed from existing run artifacts, not from new")

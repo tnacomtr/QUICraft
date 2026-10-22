@@ -59,6 +59,13 @@ public class ExternalArmGameTest implements FabricClientGameTest {
     private static final int JUMP_EVERY_TICKS = 40;
     // Sustained-load evidence: at least 0.5 horizontal metres/second and one new chunk/5 seconds.
     private static final double MIN_MOVE_METRES_PER_SECOND = 0.5;
+    /**
+     * The moving path must start in the same place for every arm. The testkit server is a fixed-seed
+     * world whose spawn is at the origin and the vanilla spawn radius is 10 blocks, so a start more
+     * than this far from the origin means the world is not the expected one: the row fails closed
+     * instead of comparing arms that walked over different terrain. The start is recorded either way.
+     */
+    private static final double START_AREA_METRES = 32.0;
     private static final double MIN_MOVE_CHUNKS_PER_SECOND = 0.2;
     private static final long QUIET_NANOS = 2_000_000_000L;
     private static final int JOIN_TIMEOUT_TICKS = 20 * 90;
@@ -211,8 +218,13 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         JsonObject row = baseRow(o);
         boolean movedOk = !o.move || (window.distance >= MIN_MOVE_METRES_PER_SECOND * window.seconds
                 && window.chunks >= Math.ceil(MIN_MOVE_CHUNKS_PER_SECOND * window.seconds));
-        boolean ok = mismatch == null && sorted.length > 0 && movedOk;
-        if (mismatch == null && !movedOk) {
+        boolean startOk = !o.move || (Math.abs(window.start.x) <= START_AREA_METRES
+                && Math.abs(window.start.z) <= START_AREA_METRES);
+        boolean ok = mismatch == null && sorted.length > 0 && movedOk && startOk;
+        if (mismatch == null && !startOk) {
+            mismatch = String.format(Locale.ROOT, "the moving window started outside the fixed spawn area: %.1f, %.1f",
+                    window.start.x, window.start.z);
+        } else if (mismatch == null && !movedOk) {
             mismatch = String.format(Locale.ROOT, "the moving window proved no movement: %.2f m, %d chunks",
                     window.distance, window.chunks);
         }
