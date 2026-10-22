@@ -464,9 +464,9 @@ public class ExternalArmGameTest implements FabricClientGameTest {
      * A leg that does not get there within HOP_TIMEOUT_NANOS stops the run (fail-closed).
      */
     private static HopRun hopRun(ClientGameTestContext context) {
-        int view = HOP_VIEW_CHUNKS;
-        int side = 2 * view + 1;
-        int need = (int) Math.ceil(HOP_FILL_SHARE * side * side);
+        int view = effectiveViewChunks(context);
+        int expected = circleColumns(view);
+        int need = (int) Math.ceil(HOP_FILL_SHARE * expected);
         long startChunks = ArmClock.chunks.get();
         long runStart = System.nanoTime();
         Pacer pacer = new Pacer();
@@ -477,7 +477,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         long deadline = System.nanoTime() + HOP_TIMEOUT_NANOS;
         while (loadedColumns(context, (int) Math.floor(at.x) >> 4, (int) Math.floor(at.z) >> 4, view) < need) {
             if (System.nanoTime() > deadline) {
-                error = "initial view below 90% of " + side + "x" + side + " columns after 30 s";
+                error = "initial view below 90% of " + expected + " columns in the view circle after 30 s";
                 break;
             }
             at = pacer.tick(context, null);
@@ -498,7 +498,9 @@ public class ExternalArmGameTest implements FabricClientGameTest {
                     c.player.onUpdateAbilities();
                 }
             });
-            // Not timed: the climb from the start altitude to the flight altitude, in leg-speed steps.
+            // Not timed, and not a leg: the climb from the start altitude to the flight altitude in
+            // leg-speed steps (20 blocks = 3 ticks), so the first leg starts at the flight altitude.
+            // Only the legs are measured; the climb's own ticks are excluded from every fill time.
             for (int t = 0; error == null && at.y < flyY - 1e-6; t++) {
                 if (t >= HOP_CLIMB_TICKS_MAX) {
                     error = "climb to the flight altitude did not finish in " + HOP_CLIMB_TICKS_MAX + " ticks";
@@ -549,8 +551,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
                     break;
                 }
                 if (fillMs < 0 && System.nanoTime() - legStart > HOP_TIMEOUT_NANOS) {
-                    error = String.format(Locale.ROOT, "leg %d did not reach 90%% of %dx%d columns within 30 s",
-                            leg, side, side);
+                    error = String.format(Locale.ROOT, "leg %d did not reach 90%% of %d columns in the view circle"
+                            + " within 30 s", leg, expected);
                     break;
                 }
             }
@@ -563,7 +565,32 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         return new HopRun(window, legs, error, view, need);
     }
 
-    /** Loaded client columns in the square of radius {@code view} around a chunk column. */
+    /**
+     * The effective view distance: the client's render distance, capped at the fixture server's view
+     * distance (vanilla sends only the chunks the smaller of the two allows).
+     */
+    private static int effectiveViewChunks(ClientGameTestContext context) {
+        int rendered = context.computeOnClient(c -> c.options.renderDistance().get());
+        return Math.min(rendered, HOP_VIEW_CHUNKS);
+    }
+
+    /**
+     * Integer columns (dx, dz) with dx^2 + dz^2 <= view^2: the circle vanilla streams around the
+     * player (197 for view 8). A square of (2v+1)^2 is never fully loaded, so the circle is counted.
+     */
+    static int circleColumns(int view) {
+        int count = 0;
+        for (int dx = -view; dx <= view; dx++) {
+            for (int dz = -view; dz <= view; dz++) {
+                if (dx * dx + dz * dz <= view * view) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    /** Loaded client columns inside the view circle around a chunk column. */
     private static int loadedColumns(ClientGameTestContext context, int cx, int cz, int view) {
         return context.computeOnClient(c -> {
             if (c.level == null) {
@@ -572,7 +599,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             int loaded = 0;
             for (int dx = -view; dx <= view; dx++) {
                 for (int dz = -view; dz <= view; dz++) {
-                    if (c.level.getChunkSource().hasChunk(cx + dx, cz + dz)) {
+                    if (dx * dx + dz * dz <= view * view && c.level.getChunkSource().hasChunk(cx + dx, cz + dz)) {
                         loaded++;
                     }
                 }
@@ -591,7 +618,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         row.addProperty("hopLegTicks", HOP_LEG_TICKS);
         row.addProperty("hopRequested", HOP_LEGS);
         row.addProperty("hopCount", hop.legs().size());
-        row.addProperty("hopViewChunks", hop.view());
+        row.addProperty("hopViewDistance", hop.view());
+        row.addProperty("hopExpectedColumns", circleColumns(hop.view()));
         row.addProperty("hopNeedColumns", hop.need());
         add(row, "hopFillMs", fill);
         row.addProperty("hopFillMsMedian", percentile(sorted, 0.5));
