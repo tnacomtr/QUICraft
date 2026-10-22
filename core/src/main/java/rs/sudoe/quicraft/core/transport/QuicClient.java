@@ -911,7 +911,11 @@ public final class QuicClient {
             if (result.isDone()) {
                 return; // cancelled while the socket opened
             }
-            diag = joinDiagSource().get();
+            try {
+                diag = joinDiagSource().get();
+            } catch (Throwable ignored) {
+                diag = null; // diagnostics never touch a join
+            }
             JoinDiag.mark(diag, "connect start");
             connectStart = System.nanoTime();
             connect();

@@ -28,13 +28,21 @@ abstract class TagNetworkSerializationMixin {
     private static void quicraft$tagsBuildStart(LayeredRegistryAccess<RegistryLayer> registries,
             CallbackInfoReturnable<Map<ResourceKey<? extends Registry<?>>,
                     TagNetworkSerialization.NetworkPayload>> cir) {
-        JoinDiagScope.mark("tags build start");
+        try {
+            JoinDiagScope.mark("tags build start");
+        } catch (Throwable ignored) {
+            // diagnostics never touch the build (this runs for TCP joins too)
+        }
     }
 
     @Inject(method = "serializeTagsToNetwork", at = @At("RETURN"))
     private static void quicraft$tagsBuildEnd(LayeredRegistryAccess<RegistryLayer> registries,
             CallbackInfoReturnable<Map<ResourceKey<? extends Registry<?>>,
                     TagNetworkSerialization.NetworkPayload>> cir) {
-        JoinDiagScope.mark("tags build end");
+        try {
+            JoinDiagScope.mark("tags build end");
+        } catch (Throwable ignored) {
+            // diagnostics never touch the build (this runs for TCP joins too)
+        }
     }
 }

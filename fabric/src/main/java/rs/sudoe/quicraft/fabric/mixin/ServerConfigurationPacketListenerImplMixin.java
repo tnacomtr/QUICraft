@@ -76,11 +76,22 @@ abstract class ServerConfigurationPacketListenerImplMixin {
                     + "(Ljava/util/List;Ljava/util/function/Consumer;)V"))
     private void quicraft$registryBuildScope(SynchronizeRegistriesTask task, List<KnownPack> packs,
             Consumer<Packet<?>> sender, Operation<Void> original) {
-        JoinDiagScope.Scope scope = JoinDiagScope.open(quicraft$joinDiag());
+        JoinDiagScope.Scope scope = null;
+        try {
+            scope = JoinDiagScope.open(quicraft$joinDiag());
+        } catch (Throwable ignored) {
+            // diagnostics never touch the join (the build below runs for TCP joins too)
+        }
         try {
             original.call(task, packs, sender);
         } finally {
-            scope.close();
+            if (scope != null) {
+                try {
+                    scope.close();
+                } catch (Throwable ignored) {
+                    // see above
+                }
+            }
         }
     }
 

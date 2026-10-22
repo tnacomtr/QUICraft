@@ -29,13 +29,21 @@ abstract class RegistrySynchronizationMixin {
     private static void quicraft$registryBuildStart(DynamicOps<Tag> ops, RegistryAccess registries,
             Set<KnownPack> clientKnownPacks,
             BiConsumer<ResourceKey<? extends Registry<?>>, List<PackedRegistryEntry>> output, CallbackInfo ci) {
-        JoinDiagScope.mark("registry data build start");
+        try {
+            JoinDiagScope.mark("registry data build start");
+        } catch (Throwable ignored) {
+            // diagnostics never touch the build (this runs for TCP joins too)
+        }
     }
 
     @Inject(method = "packRegistries", at = @At("RETURN"))
     private static void quicraft$registryBuildEnd(DynamicOps<Tag> ops, RegistryAccess registries,
             Set<KnownPack> clientKnownPacks,
             BiConsumer<ResourceKey<? extends Registry<?>>, List<PackedRegistryEntry>> output, CallbackInfo ci) {
-        JoinDiagScope.mark("registry data build end");
+        try {
+            JoinDiagScope.mark("registry data build end");
+        } catch (Throwable ignored) {
+            // diagnostics never touch the build (this runs for TCP joins too)
+        }
     }
 }
