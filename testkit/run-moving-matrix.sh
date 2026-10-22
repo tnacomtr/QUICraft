@@ -236,9 +236,10 @@ for ((round = 0; round < rounds; round++)); do
 done
 
 bin="$root/testkit/build/install/quicraft-testkit/bin/quicraft-testkit"
-if [[ ! -x "$bin" ]]; then
-    bounded 1200 "$root/gradlew" -p "$root" -q :testkit:installDist
-fi
+# Always rebuild: a stale installed summarizer from an older commit would ignore the manifest and
+# variant flags and summarize the wrong thing (gradle no-ops when it is current).
+bounded 1200 "$root/gradlew" -p "$root" --no-configuration-cache -q :testkit:installDist \
+    || die "could not build the matrix summarizer"
 
 summary_status=0
 bounded 120 "$bin" matrix-summarize --dir "$out_dir" --manifest "$status_file" --profiles "$profiles" \
