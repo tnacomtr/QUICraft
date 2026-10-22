@@ -488,6 +488,39 @@ public final class QuicClient {
         return tls;
     }
 
+    private static final java.util.concurrent.atomic.AtomicBoolean WARMED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Warms the parts of a first QUIC dial that cost time but carry no state: the native library,
+     * the client event loop and the TLS stack (a throwaway context and engine, built for a made-up
+     * fingerprint and never cached). It opens no socket, starts no handshake, writes no pin and
+     * offers or stores no session ticket, so it cannot change what a later dial does; it only moves
+     * the one-time initialisation off the join. Once per process, never throws, and a failure
+     * leaves every later dial exactly as it would have been without the call.
+     */
+    public static void warmUp() {
+        if (!WARMED.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            if (!QuicSupport.isAvailable()) {
+                return;
+            }
+            group();
+            Tls tls = new Tls(Fingerprint.of(new byte[] {0}), false, Protocol.ALPN_V3);
+            io.netty.handler.codec.quic.QuicSslEngine engine = tls.context.newEngine(
+                    io.netty.buffer.ByteBufAllocator.DEFAULT, "warmup.invalid", 1);
+            try {
+                engine.getSession();
+            } finally {
+                io.netty.util.ReferenceCountUtil.release(engine);
+            }
+        } catch (Throwable ignored) {
+            // warming only: the first real dial pays the cost it would have paid anyway
+        }
+    }
+
     /**
      * Drops every session ticket, early token and recorded first flight: the next connect to each
      * server is a full handshake without 0-RTT.
