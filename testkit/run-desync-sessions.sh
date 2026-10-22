@@ -161,8 +161,8 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required"
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v flock >/dev/null 2>&1 || die "flock is required to serialize gametest runners"
 command -v unshare >/dev/null 2>&1 || die "unshare is required (util-linux)"
-if ! command -v xvfb-run >/dev/null 2>&1 && [[ -z "${DISPLAY:-}" ]]; then
-    die "no DISPLAY and no xvfb-run; the client gametest needs a display"
+if ! command -v xvfb-run >/dev/null 2>&1; then
+    die "no xvfb-run; the client gametest runs headless under Xvfb"
 fi
 [[ -f "$mod" ]] || die "no gametest entrypoint file at $mod"
 
@@ -306,9 +306,11 @@ if listed != [entrypoint]:
 PY
 fi
 
-xvfb=()
-if [[ -z "${DISPLAY:-}" ]]; then
-    xvfb=(xvfb-run -a -s "-screen 0 1280x720x24")
+# Always headless: the client runs under its own Xvfb, never on the operator's display
+# (QUICRAFT_USE_DISPLAY=1 opts out for local debugging).
+xvfb=(env -u DISPLAY -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1280x720x24")
+if [[ "${QUICRAFT_USE_DISPLAY:-}" == 1 && -n "${DISPLAY:-}" ]]; then
+    xvfb=()
 fi
 
 status_file="$out_dir/runs.tsv"

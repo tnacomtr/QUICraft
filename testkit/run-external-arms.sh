@@ -224,8 +224,8 @@ for file in "${compose_files[@]}"; do
     [[ -f "$file" ]] || die "missing compose file $file"
 done
 [[ -f "$mod" ]] || die "no gametest entrypoint file at $mod"
-if ! command -v xvfb-run >/dev/null 2>&1 && [[ -z "${DISPLAY:-}" ]]; then
-    die "no DISPLAY and no xvfb-run; the client gametest needs a display"
+if ! command -v xvfb-run >/dev/null 2>&1; then
+    die "no xvfb-run; the client gametest runs headless under Xvfb"
 fi
 
 # A build provenance commit only means something when the tracked tree is the commit it names.
@@ -468,9 +468,11 @@ fi
 
 client_log="$out_dir/$file_stem.client.log"
 keep_client_log=true
-xvfb=()
-if [[ -z "${DISPLAY:-}" ]]; then
-    xvfb=(xvfb-run -a -s "-screen 0 1280x720x24")
+# Always headless: the client runs under its own Xvfb, never on the operator's display
+# (QUICRAFT_USE_DISPLAY=1 opts out for local debugging).
+xvfb=(env -u DISPLAY -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1280x720x24")
+if [[ "${QUICRAFT_USE_DISPLAY:-}" == 1 && -n "${DISPLAY:-}" ]]; then
+    xvfb=()
 fi
 client=(
     "$root/gradlew" -p "$root" --no-daemon --no-configuration-cache --console=plain

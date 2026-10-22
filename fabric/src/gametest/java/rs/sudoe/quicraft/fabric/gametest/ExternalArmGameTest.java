@@ -61,12 +61,15 @@ public class ExternalArmGameTest implements FabricClientGameTest {
     private static final double MIN_MOVE_METRES_PER_SECOND = 0.5;
     /**
      * A bound on where the moving path may start, not an exact start. The testkit server is a
-     * fixed-seed world whose spawn is at the origin and the vanilla spawn radius is 10 blocks, so a
-     * start further from the origin than this means the world is not the expected one and the row
-     * fails closed. Accepted starts can still differ by tens of blocks (and in terrain), so arms are
-     * comparable only as statistics over rounds; the start is recorded in every row.
+     * fixed-seed world whose spawn was measured at about (36, -63) (three starts spread over x 31-41,
+     * z -66 to -60; the vanilla spawn radius is 10 blocks), so a start further from that point than
+     * this means the world is not the expected one and the row fails closed. Accepted starts can
+     * still differ by tens of blocks (and in terrain), so arms are comparable only as statistics
+     * over rounds; the start is recorded in every row.
      */
     private static final double START_AREA_METRES = 32.0;
+    private static final double START_CENTER_X = 36.0;
+    private static final double START_CENTER_Z = -63.0;
     private static final double MIN_MOVE_CHUNKS_PER_SECOND = 0.2;
     private static final long QUIET_NANOS = 2_000_000_000L;
     private static final int JOIN_TIMEOUT_TICKS = 20 * 90;
@@ -219,8 +222,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         JsonObject row = baseRow(o);
         boolean movedOk = !o.move || (window.distance >= MIN_MOVE_METRES_PER_SECOND * window.seconds
                 && window.chunks >= Math.ceil(MIN_MOVE_CHUNKS_PER_SECOND * window.seconds));
-        boolean startOk = !o.move || (Math.abs(window.start.x) <= START_AREA_METRES
-                && Math.abs(window.start.z) <= START_AREA_METRES);
+        boolean startOk = !o.move || (Math.abs(window.start.x - START_CENTER_X) <= START_AREA_METRES
+                && Math.abs(window.start.z - START_CENTER_Z) <= START_AREA_METRES);
         boolean ok = mismatch == null && sorted.length > 0 && movedOk && startOk;
         if (mismatch == null && !startOk) {
             mismatch = String.format(Locale.ROOT, "the moving window started outside the fixed spawn area: %.1f, %.1f",
