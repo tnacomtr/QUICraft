@@ -120,18 +120,23 @@ public final class StreamReceiver {
         final Record record;
         /** Sequence of the last record of the unit; equals the opener's for a single record. */
         final long closing;
+        /** Total wire size of the unit, prefixes included; credited toward renewal when it commits (13.10). */
+        final long wireBytes;
         final BlockedHeadTimer timer;
         /** Route from the body, known only once the head is eligible and validated (null before). */
         ReceiveRoute route;
         /** True once {@link StreamReceiver#validateEligible} accepted the head; the validator ran once. */
         boolean validated;
         boolean enqueued;
+        /** Enqueue order of this head, from {@link StreamReceiver#enqueueCount}; diagnostics only. */
+        long enqueueSerial;
         /** Sticky for the current wait: some prerequisite on the chain was withheld locally (13.12). */
         boolean chainWasWithheld;
 
-        Unit(Record record, long closing, BlockedHeadTimer timer) {
+        Unit(Record record, long closing, long wireBytes, BlockedHeadTimer timer) {
             this.record = record;
             this.closing = closing;
+            this.wireBytes = wireBytes;
             this.timer = timer;
         }
     }
@@ -142,6 +147,8 @@ public final class StreamReceiver {
     private final long[] enqueued;
     private final long[] applied;
     private final Unit[] head;
+    /** Scratch: one observation per waiting head for the current step, indexed by stream (no per-commit allocation). */
+    private final BlockedHeadTimer.Observation[] readings;
     private final ReceiveSlots slots;
     /** True when the connection's read pump owns the slot charge (see the pump-slot constructor). */
     private final boolean slotsHeldByPump;
@@ -156,6 +163,24 @@ public final class StreamReceiver {
     private boolean stalled;
     /** First 0x11 found by a re-check after an apply; sticky, every later offer returns it (13.18). */
     private ReceiveClose violation;
+    /**
+     * A blocked-head expiry reached before a commit, sticky: a later commit cannot rescue it (13.10). Captured
+     * from the pre-commit state in {@link #applied}, returned by {@link #expiredWait} until the connection closes.
+     */
+    private ReceiveClose lapsedWait;
+    /** Count of enqueues on this receiver; stamps each head's {@link Unit#enqueueSerial} (diagnostics only). */
+    private long enqueueCount;
+    /**
+     * Transport nanos of the last successful apply on any stream, valid only when {@link #appliedOnce}. Diagnostics only;
+     * it is read from the boundary clock, or from {@link System#nanoTime()} in cumulative mode, so an apply never reads
+     * the stall source.
+     */
+    private long lastAppliedNanos;
+    private boolean appliedOnce;
+    /** Stream of the commit that caused the last renewal, -1 when none (diagnostics only). */
+    private int lastRenewalStream = -1;
+    /** Opening sequence of the commit that caused the last renewal (diagnostics only). */
+    private long lastRenewalSequence;
 
     /**
      * Clientbound receiver, kept for existing callers (legacy boundary mode).
@@ -239,6 +264,7 @@ public final class StreamReceiver {
         enqueued = new long[streams];
         applied = new long[streams];
         head = new Unit[streams];
+        readings = new BlockedHeadTimer.Observation[streams];
         this.slots = slots;
         this.slotsHeldByPump = slotsHeldByPump;
         this.validator = validator;
@@ -372,7 +398,7 @@ public final class StreamReceiver {
         if (!slotsHeldByPump && !slots.admitHead(stream, wireBytes, recordCount)) {
             return Admission.busy();
         }
-        Unit unit = new Unit(record, closingSequence, new BlockedHeadTimer(clock, true));
+        Unit unit = new Unit(record, closingSequence, wireBytes, new BlockedHeadTimer(clock, true));
         head[stream] = unit;
         admitted[stream] = closingSequence;
         if (!ready(unit)) {
@@ -507,6 +533,7 @@ public final class StreamReceiver {
             throw new IllegalStateException("enqueued before its prerequisites were applied");
         }
         unit.enqueued = true;
+        unit.enqueueSerial = ++enqueueCount;
         unit.timer.stop();
         enqueued[stream] = unit.closing;
     }
@@ -521,9 +548,15 @@ public final class StreamReceiver {
         if (!unit.enqueued) {
             throw new IllegalStateException("applied before enqueued on stream " + stream);
         }
+        if (!settleWaitsBeforeCommit(stream, unit)) {
+            // A lapsed wait is terminal (13.10): this commit changes no state, makes no callback and raises no
+            // violation of its own; pendingViolation() now reports the captured close.
+            return;
+        }
         rememberWithheldChains();
         head[stream] = null;
         applied[stream] = unit.closing;
+        noteApplied();
         validator.applied(stream, sequence, unit.closing, unit.route);
         if (!slotsHeldByPump) {
             slots.releaseHead(stream);
@@ -558,26 +591,280 @@ public final class StreamReceiver {
     }
 
     /**
-     * Returns the 0x11 found when an apply left a held epoch+1 head without a path to its transition,
-     * or null. Stays set until the connection closes; the caller must act on it (13.18).
+     * Returns the close the caller must act on, or null: a lapsed blocked-head wait captured before a commit
+     * (13.10, sticky, 0x12) takes precedence over any post-commit 0x11, so the expiry closes first. Otherwise the
+     * 0x11 found when an apply left a held epoch+1 head without a path to its transition (13.18). Both stay set
+     * until the connection closes.
      */
     public ReceiveClose pendingViolation() {
-        return violation;
+        return lapsedWait != null ? lapsedWait : violation;
     }
 
     /**
-     * Checks every held head that is dependency-blocked and not yet at Q whose timer has expired
-     * (13.10, 13.12). Returns the 0x12 close to send, or null. A ready head never expires.
+     * Checks every held head that is dependency-blocked and not yet at Q (13.10, 13.12). Returns the 0x12 close
+     * to send, or null. A ready head never expires. A no-progress expiry closes with the phrase rules of
+     * {@link ReceiveClose#blockedExpiry}; with no such expiry, an absolute-retention expiry closes generic 0x12
+     * with no phrase. A lapsed wait captured by {@link #applied} is returned first.
      */
     public ReceiveClose expiredWait() {
+        return lapsedWait != null ? lapsedWait : expiredClose(false);
+    }
+
+    /**
+     * The close of the first expired wait in the current state, or null. A no-progress expiry takes precedence
+     * over an absolute-retention expiry on any other head (13.12, "Deadline precedence"). Takes one observation
+     * per waiting head into {@link #readings}; a cumulative receiver reads its source once for the whole check.
+     *
+     * @param lapsed true when the check runs in settlement, so the close is captured before the commit (diagnostics)
+     */
+    private ReceiveClose expiredClose(boolean lapsed) {
+        ReceiveClose retention = null;
+        StallClock.Sample sample = null;
         for (int stream = 0; stream < streams; stream++) {
+            readings[stream] = null;
             Unit unit = head[stream];
-            if (unit != null && !unit.enqueued && !ready(unit) && unit.timer.expired()) {
+            if (unit == null || unit.enqueued || ready(unit)) {
+                continue;
+            }
+            if (source != null && sample == null) {
+                sample = source.sample();
+            }
+            BlockedHeadTimer.Observation now = source == null ? unit.timer.observe() : unit.timer.observe(sample);
+            readings[stream] = now;
+            if (unit.timer.expired(now)) {
                 boolean wasWithheld = unit.chainWasWithheld || chainWithheld(unit.record);
-                return ReceiveClose.blockedExpiry(unit.timer.stallConsumed(), wasWithheld);
+                return ReceiveClose.blockedExpiry(now != null && now.stallConsumed(), wasWithheld,
+                        describeExpiry("no-progress", lapsed, stream, unit, now));
+            }
+            if (retention == null && unit.timer.absoluteExpired(now)) {
+                retention = ReceiveClose.retentionExpiry(describeExpiry("absolute", lapsed, stream, unit, now));
             }
         }
-        return null;
+        return retention;
+    }
+
+    /**
+     * Builds the local-only diagnostic of an expired blocked head. Runs only when the wait closes the connection, so
+     * the string is never built on the normal path. Lists the head, every unresolved dependency with its applied,
+     * queued and admitted watermarks and whether the receiver holds its prerequisite unit (held, ready, enq, seq),
+     * then the timer's readings: transport time since the wait started, active time since the last renewal, the stall
+     * time consumed and the credit toward the next renewal. Ends with the receiver's global state: the executing head,
+     * the executor queue depth, the time since any apply and the source of the last renewal.
+     *
+     * Never throws: a failing diagnostic yields null, which leaves the close exactly as without a diagnostic.
+     */
+    private String describeExpiry(String kind, boolean lapsed, int stream, Unit unit,
+                                  BlockedHeadTimer.Observation now) {
+        try {
+            return expiryText(kind, lapsed, stream, unit, now);
+        } catch (Throwable diagnostic) {
+            return null;
+        }
+    }
+
+    private String expiryText(String kind, boolean lapsed, int stream, Unit unit,
+                              BlockedHeadTimer.Observation now) {
+        StringBuilder text = new StringBuilder(256);
+        text.append("expiry=").append(kind).append(" lapsed=").append(lapsed ? "yes" : "no")
+                .append(" head=").append(stream).append(':').append(unit.record.sequence())
+                .append(" unresolved=[");
+        boolean first = true;
+        for (Record.Dependency dependency : unit.record.dependencies()) {
+            int required = dependency.streamIndex();
+            if (Long.compareUnsigned(dependency.sequence(), applied[required]) <= 0) {
+                continue;
+            }
+            if (!first) {
+                text.append("; ");
+            }
+            first = false;
+            text.append("stream=").append(required).append(" need=").append(dependency.sequence())
+                    .append(" applied=").append(applied[required])
+                    .append(" queued=").append(enqueued[required])
+                    .append(" admitted=").append(admitted[required]);
+            appendHeldState(text, required);
+        }
+        text.append("] blocked-ms=").append(now.elapsedNanos() / 1_000_000L)
+                .append(" since-renewal-ms=")
+                .append((now.activeNanos() - unit.timer.renewedActiveNanos()) / 1_000_000L)
+                .append(" stall-consumed-ms=").append(now.exclusionNanos() / 1_000_000L)
+                .append(" credit-bytes=").append(unit.timer.creditBytes())
+                .append('/').append(BlockedHeadTimer.RENEWAL_BYTES);
+        text.append(" executing=").append(executingHead())
+                .append(" executor-queued-units=").append(queuedUnits())
+                .append(" ms-since-last-apply-any-stream=");
+        if (appliedOnce) {
+            text.append((diagnosticNanos() - lastAppliedNanos) / 1_000_000L);
+        } else {
+            text.append("none");
+        }
+        text.append(" last-renewal-source=");
+        if (lastRenewalStream < 0) {
+            text.append("none");
+        } else {
+            text.append(lastRenewalStream).append(':').append(lastRenewalSequence);
+        }
+        return text.toString();
+    }
+
+    /**
+     * Appends whether the receiver holds the unit at applied+1 on a prerequisite stream: held (a unit is there at
+     * that sequence), ready (it is dependency-ready), enq (it is enqueued) and its record sequence, or none.
+     */
+    private void appendHeldState(StringBuilder text, int stream) {
+        Unit held = head[stream];
+        boolean holds = held != null && held.record.sequence() == applied[stream] + 1;
+        text.append(" held=").append(holds ? "yes" : "no");
+        text.append(" ready=").append(holds && ready(held) ? "yes" : "no");
+        text.append(" enq=").append(holds && held.enqueued ? "yes" : "no");
+        text.append(" seq=").append(holds ? String.valueOf(held.record.sequence()) : "none");
+    }
+
+    /** The oldest enqueued, unapplied head ("stream:seq"), which the serial executor runs first; "none" if none. */
+    private String executingHead() {
+        int oldest = -1;
+        for (int stream = 0; stream < streams; stream++) {
+            Unit unit = head[stream];
+            if (unit != null && unit.enqueued
+                    && (oldest < 0 || unit.enqueueSerial < head[oldest].enqueueSerial)) {
+                oldest = stream;
+            }
+        }
+        return oldest < 0 ? "none" : oldest + ":" + head[oldest].record.sequence();
+    }
+
+    /** Number of heads enqueued to the executor and not yet applied. */
+    private int queuedUnits() {
+        int queued = 0;
+        for (Unit unit : head) {
+            if (unit != null && unit.enqueued) {
+                queued++;
+            }
+        }
+        return queued;
+    }
+
+    /**
+     * Stall diagnostics only: whether some stream holds a head that is not enqueued yet, that is, a head waiting on
+     * its dependencies or on a slot. Reads state; changes nothing.
+     */
+    public boolean hasBlockedHead() {
+        for (Unit unit : head) {
+            if (unit != null && !unit.enqueued) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Stall diagnostics only: the executing head, the queued count and, per stream, the applied sequence and the held
+     * head (sequence, enqueued, dependency-ready). Reads state; changes nothing.
+     */
+    public String stallSummary() {
+        StringBuilder text = new StringBuilder("recv executing=").append(executingHead())
+                .append(" queuedUnits=").append(queuedUnits());
+        for (int stream = 0; stream < streams; stream++) {
+            Unit unit = head[stream];
+            text.append(" | s").append(stream).append(" applied=").append(applied[stream]);
+            if (unit == null) {
+                text.append(" head=none");
+            } else {
+                text.append(" head=").append(unit.record.sequence())
+                        .append(" enq=").append(unit.enqueued ? "yes" : "no")
+                        .append(" ready=").append(ready(unit) ? "yes" : "no")
+                        .append(" closing=").append(unit.closing);
+            }
+        }
+        return text.toString();
+    }
+
+    /**
+     * Transport reading for the apply diagnostic: the boundary clock, or {@link System#nanoTime()} in cumulative mode.
+     * Matches the timebase {@link #noteApplied()} records in the same mode.
+     */
+    private long diagnosticNanos() {
+        return source == null ? clock.getAsLong() : System.nanoTime();
+    }
+
+    /**
+     * Records the transport time of an apply (O(1)) for the expiry diagnostic. Reads no stall source, takes no lock and
+     * allocates nothing. It runs after the watermark changes, so it never throws: a failing clock only clears the
+     * diagnostic.
+     */
+    private void noteApplied() {
+        try {
+            lastAppliedNanos = diagnosticNanos();
+            appliedOnce = true;
+        } catch (Throwable diagnostic) {
+            appliedOnce = false;
+        }
+    }
+
+    /**
+     * Runs before a commit changes any state (13.10) and returns false when the commit must not proceed. The expiry
+     * decision and the renewal of every waiting head use one reading per head taken in this step, so an expiry
+     * reached at the renewal observation is never renewed. An expiry in the pre-commit state is captured as a
+     * sticky, terminal close that this commit cannot rescue. An unavailable source during settlement is the same:
+     * a generic 0x12 with no state changed. Otherwise each waiting head is credited with this commit when it
+     * qualifies, and renews at once on its own direct-dependency watermark or when the credit reaches
+     * {@link BlockedHeadTimer#RENEWAL_BYTES}.
+     */
+    private boolean settleWaitsBeforeCommit(int stream, Unit committing) {
+        if (lapsedWait != null) {
+            return false;
+        }
+        try {
+            ReceiveClose expired = expiredClose(true);
+            if (expired != null) {
+                lapsedWait = expired;
+                return false;
+            }
+        } catch (StallClock.UnavailableException e) {
+            lapsedWait = ReceiveClose.resourceWait("stall source unavailable during settlement");
+            return false;
+        }
+        for (int waitingStream = 0; waitingStream < streams; waitingStream++) {
+            Unit waiting = head[waitingStream];
+            if (waiting != null && !waiting.enqueued && !ready(waiting)) {
+                creditQualifyingCommit(waiting, readings[waitingStream], stream, committing);
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Credits a commit to one waiting head when it qualifies (13.10): the stream is an unresolved prerequisite of
+     * the head's pre-commit chain (transitive included) and the unit opens at or below that prerequisite's required
+     * sequence. The head renews at once (a) when this commit reaches the head's OWN direct dependency entry on the
+     * stream, or (b) when its qualifying credit reaches 64 KiB. A commit on a transitive-only prerequisite earns
+     * byte credit (b) and never arm (a), so tiny records chained through an intermediate head cannot keep renewing.
+     * Raw arrivals, Q, ACKs, unrelated commits and changes of prerequisite earn nothing. O(streams).
+     */
+    private void creditQualifyingCommit(Unit waiting, BlockedHeadTimer.Observation now, int stream, Unit committing) {
+        long required = chainReach(waiting.record)[stream];
+        if (required <= applied[stream] || committing.record.sequence() > required) {
+            return;
+        }
+        waiting.timer.addCredit(committing.wireBytes);
+        if (reachesDirectDependency(waiting.record, stream, committing.closing) || waiting.timer.creditReached()) {
+            waiting.timer.renew(now);
+            lastRenewalStream = committing.record.streamIndex();
+            lastRenewalSequence = committing.record.sequence();
+        }
+    }
+
+    /**
+     * Reports whether a commit ending at {@code closing} reaches the record's own direct dependency entry on
+     * {@code stream} while that entry is still unresolved (13.10, arm a). A record has at most one entry per stream.
+     */
+    private boolean reachesDirectDependency(Record record, int stream, long closing) {
+        for (Record.Dependency dependency : record.dependencies()) {
+            if (dependency.streamIndex() == stream) {
+                return dependency.sequence() > applied[stream] && closing >= dependency.sequence();
+            }
+        }
+        return false;
     }
 
     /**
@@ -978,7 +1265,7 @@ public final class StreamReceiver {
      */
     private Admission admitCumulative(int stream, Record record, long closingSequence, long wireBytes,
                                       int recordCount) {
-        Unit unit = new Unit(record, closingSequence, new BlockedHeadTimer(source, true));
+        Unit unit = new Unit(record, closingSequence, wireBytes, new BlockedHeadTimer(source, true));
         if (!ready(unit)) {
             unit.timer.start();
         }

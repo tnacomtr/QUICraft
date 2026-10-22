@@ -20,9 +20,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
+import java.util.logging.Filter;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import org.junit.jupiter.api.Test;
@@ -586,6 +592,135 @@ class SessionSendDriverTest {
         assertEquals(second.sequence(), RecordCodec.decodeRecord(next.bytes(), 0).sequence());
         driver.close();
         assertEquals(0, pool.reserved(owner));
+    }
+
+    @Test
+    void overflowPacketsReasonNamesTheQueuePacketLimitAndKeepsTheFirstReason() throws Exception {
+        Rig rig = new Rig(1, 2);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertTrue(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertNull(driver.lastCloseReason(), "no reason before a refusal");
+        assertFalse(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        String reason = driver.lastCloseReason();
+        assertTrue(reason.startsWith("check=queue-packet-limit stream=-1 queuedRecords=2 "), reason);
+        assertTrue(reason.contains(" queuePacketLimit=2 "), reason);
+        assertTrue(reason.endsWith(" recordBytes=" + frame(2).frame().length), reason);
+        // A later refusal on the closed driver is passive and must not replace the first reason.
+        assertFalse(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertEquals(reason, driver.lastCloseReason());
+    }
+
+    @Test
+    void overflowBytesReasonNamesTheQueueByteLimit() throws Exception {
+        NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
+        PressureRanking ranking = new PressureRanking();
+        AtomicLong now = new AtomicLong(1);
+        OutboundPool pool = new OutboundPool(node, 1L << 40, 1L << 40, 1L << 40, ranking.view(now::get));
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(2),
+                new ServerProfile(1, 1, 1024, .5, 100, 10, 4, 4, 4), pool, ranking, new Object(),
+                InetAddress.getLoopbackAddress(), null, now::get, true);
+        int size = frame(40).frame().length;
+        assertTrue(size > 10, "the record must exceed the 10-byte queue limit");
+        assertFalse(driver.submit(frame(40), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertTrue(driver.isClosed());
+        String reason = driver.lastCloseReason();
+        assertTrue(reason.startsWith("check=queue-byte-limit stream=-1 queuedRecords=0 queuedBytes=0 "), reason);
+        assertTrue(reason.contains(" queueByteLimit=10 "), reason);
+        assertTrue(reason.endsWith(" recordBytes=" + size), reason);
+    }
+
+    @Test
+    void inadmissibleRecordReasonNamesThePoolCheck() throws Exception {
+        AtomicLong now = new AtomicLong(1_000_000_000L);
+        PressureRanking ranking = new PressureRanking();
+        OutboundPool pool = new OutboundPool(new NodePools(1L << 40, 0, 1L << 40, 10, false, 0),
+                1L << 40, 1L << 40, 100 + TEST_SLICE, ranking.view(now::get));
+        SessionSendDriver driver = new SessionSendDriver(SessionContext.of(1),
+                new ServerProfile(1, 1, 1024, .5, 1000, 1L << 40, 4, 4, 4), pool, ranking, new Object(),
+                InetAddress.getLoopbackAddress(), null, now::get, 75, 25, TEST_SLICE);
+        assertNull(driver.lastCloseReason());
+        // A record larger than the connection cap can never be admitted, so the driver closes 0x12 (13.12).
+        assertFalse(driver.submit(frame(300), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertTrue(driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        String reason = driver.lastCloseReason();
+        assertTrue(reason.startsWith("check=pool-inadmissible stream="), reason);
+        assertTrue(reason.contains(" queuePacketLimit=1000 queueByteLimit=" + (1L << 40) + " "), reason);
+        long recordBytes = Long.parseLong(reason.substring(reason.lastIndexOf(" recordBytes=") + " recordBytes=".length()));
+        assertTrue(recordBytes > 100 + TEST_SLICE, "the refused record is larger than the cap: " + reason);
+    }
+
+    @Test
+    void sealedRefusalReasonIsPassiveAndNeverClosesTheDriver() throws Exception {
+        Rig rig = new Rig(1, 100);
+        SessionSendDriver driver = rig.driver;
+        driver.seal();
+        assertFalse(driver.submit(frame(3), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertFalse(driver.isClosed(), "a sealed refusal is not a close");
+        assertEquals(0, driver.closeCode());
+        String reason = driver.lastCloseReason();
+        assertTrue(reason.startsWith("check=sealed stream=-1 queuedRecords=0 queuedBytes=0 "), reason);
+        assertTrue(reason.contains(" queuePacketLimit=100 "), reason);
+    }
+
+    @Test
+    void aThrowingLogHandlerDoesNotStopAResourceCloseOrItsRelease() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        Handler broken = new Handler() {
+            @Override public void publish(LogRecord record) {
+                attempts.incrementAndGet();
+                throw new IllegalStateException("broken log handler");
+            }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        assertOverflowCloseCompletesUnderLogging(broken, null, attempts);
+    }
+
+    @Test
+    void aThrowingLogFilterDoesNotStopAResourceCloseOrItsRelease() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        Filter broken = record -> {
+            attempts.incrementAndGet();
+            throw new IllegalStateException("broken log filter");
+        };
+        assertOverflowCloseCompletesUnderLogging(null, broken, attempts);
+    }
+
+    /**
+     * One queue-overflow 0x12 close with a failing handler or filter on the QUICraft logger. The close must complete
+     * exactly as without logging: the driver is closed, the code is 0x12 and every charge is released. The failing hook
+     * must have run, or the test would prove nothing.
+     */
+    private static void assertOverflowCloseCompletesUnderLogging(Handler handler, Filter filter, AtomicInteger attempts)
+            throws Exception {
+        Logger quicraft = Logger.getLogger("QUICraft");
+        Level priorLevel = quicraft.getLevel();
+        Filter priorFilter = quicraft.getFilter();
+        quicraft.setLevel(Level.INFO);
+        quicraft.setFilter(filter);
+        if (handler != null) {
+            quicraft.addHandler(handler);
+        }
+        try {
+            Rig rig = new Rig(1, 2);
+            SessionSendDriver driver = rig.driver;
+            assertTrue(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+            assertTrue(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+            assertFalse(driver.submit(frame(2), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+            assertTrue(driver.isClosed(), "the overflow closed the driver");
+            assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+            assertEquals(0, rig.pool.reserved(rig.owner), "close releases every outstanding charge");
+            assertTrue(driver.lastCloseReason().startsWith("check=queue-packet-limit "), driver.lastCloseReason());
+            assertTrue(attempts.get() > 0, "the failing log hook ran during the close");
+        } finally {
+            if (handler != null) {
+                quicraft.removeHandler(handler);
+            }
+            quicraft.setFilter(priorFilter);
+            quicraft.setLevel(priorLevel);
+        }
     }
 
     @Test

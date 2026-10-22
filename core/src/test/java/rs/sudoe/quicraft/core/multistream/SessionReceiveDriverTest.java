@@ -666,6 +666,88 @@ class SessionReceiveDriverTest {
         assertEquals(0L, h.slots.workspaceInUse());
     }
 
+    @Test void lapsedWaitClosesBeforeAPostCommitOrderingViolation() throws Exception {
+        Harness h = new Harness();
+        // An epoch-1 CHUNK head with no transition: applying REALTIME 1 would raise 0x11 (13.18) if its wait were alive.
+        h.source.put(2, rec(2, 1, 1, dep(LogicalStream.REALTIME, 1), PID_CHUNK));
+        h.source.put(LogicalStream.REALTIME,
+                rec(LogicalStream.REALTIME, 1, 0, Collections.<Record.Dependency>emptyList(), PID_REALTIME));
+        h.rounds(30);
+        assertTrue(h.game.log.contains("enqueued " + LogicalStream.REALTIME + ":1"), h.game.log.toString());
+        h.now[0] = TimeUnit.SECONDS.toNanos(10);
+        h.driver.acknowledged(LogicalStream.REALTIME, 1);
+        assertEquals(Collections.singletonList(CLOSE_RESOURCE), h.codes, "the lapsed expiry is the only close, not 0x11");
+        // The head's chain includes the executor-held REALTIME commit (13.12), so the close is generic.
+        assertEquals(Collections.singletonList("resource"), h.reasons);
+        assertFalse(h.game.log.contains("applied " + LogicalStream.REALTIME + ":1"),
+                "the lapsed commit was not completed to the game");
+        assertEquals(0L, h.slots.workspaceInUse(), "the close returns the workspace reservations");
+    }
+
+    /** A CONTROL GAME record with no dependencies and a {@code size}-byte payload; the packet id is its last byte. */
+    static byte[] controlRecSized(long seq, int size) {
+        byte[] payload = new byte[size];
+        payload[size - 1] = (byte) PID_CONTROL;
+        return RecordCodec.encodeRecord(new Record(LogicalStream.CONTROL, seq, 0,
+                Collections.<Record.Dependency>emptyList(), RecordCodec.KIND_GAME, SessionReadPumpTest.inner(payload)));
+    }
+
+    /** Delivers CONTROL {@code seq} (40 KiB) at {@code second}, applies it through the driver and lets it settle. */
+    private static void commitControl(Harness h, long second, long seq) throws Exception {
+        h.now[0] = TimeUnit.SECONDS.toNanos(second);
+        // put() replaces the stream's bytes but not its read position: the previous record was fully consumed.
+        h.source.put(LogicalStream.CONTROL, controlRecSized(seq, 40 * 1024));
+        h.source.pos[LogicalStream.CONTROL] = 0;
+        for (int i = 0; i < 2000 && !h.game.log.contains("enqueued 0:" + seq); i++) {
+            h.rounds(1);
+        }
+        assertTrue(h.game.log.contains("enqueued 0:" + seq), "CONTROL " + seq + " must be enqueued");
+        h.driver.acknowledged(LogicalStream.CONTROL, seq);
+        h.rounds(30);
+    }
+
+    @Test void renewalThroughTheDriverThenSilenceClosesOnceAtTheNoProgressDeadline() throws Exception {
+        Harness h = new Harness(true);
+        // The chunk head waits on a CONTROL sequence far ahead, so every CONTROL commit before it qualifies.
+        h.source.put(2, rec(2, 1, 0, dep(LogicalStream.CONTROL, 1000), PID_CHUNK));
+        h.rounds(30);
+        assertNotNull(h.driver.receiver().head(2), "the blocked head owns the wait");
+        commitControl(h, 8, 1);
+        commitControl(h, 9, 2);
+        assertTrue(h.codes.isEmpty(), "80 KiB of qualifying commits renewed the base at 9 s");
+        h.now[0] = TimeUnit.SECONDS.toNanos(18);
+        h.rounds(1);
+        assertTrue(h.codes.isEmpty(), "the renewed base runs to 19 s, not 10 s");
+        h.now[0] = TimeUnit.SECONDS.toNanos(19);
+        h.rounds(5);
+        h.rounds(5);
+        assertEquals(Collections.singletonList(CLOSE_RESOURCE), h.codes, "exactly one close");
+        // Each renewing CONTROL commit was an executor-held prerequisite while its D was pending (13.12), which
+        // makes this wait local/resource: generic, no phrase, and never a counted unseen-prerequisite event.
+        assertEquals(Collections.singletonList("resource"), h.reasons,
+                "renewing commits were executor-held, so the expiry is generic and not counted");
+        assertEquals(0L, h.slots.workspaceInUse(), "the close returns the workspace reservations");
+        assertFalse(h.slots.holdsHead(2), "the blocked head's slot is released");
+    }
+
+    @Test void absoluteRetentionClosesOnceGenericEvenWhileQualifyingTrafficRenews() throws Exception {
+        Harness h = new Harness(true);
+        h.source.put(2, rec(2, 1, 0, dep(LogicalStream.CONTROL, 1000), PID_CHUNK));
+        h.rounds(30);
+        for (long second = 1; second <= 119; second++) {
+            commitControl(h, second, second);
+        }
+        assertTrue(h.codes.isEmpty(), "qualifying traffic renewed the base through 119 s");
+        h.now[0] = TimeUnit.SECONDS.toNanos(120);
+        h.rounds(5);
+        h.rounds(5);
+        assertEquals(Collections.singletonList(CLOSE_RESOURCE), h.codes, "exactly one close, at the 120 s retention");
+        assertEquals(Collections.singletonList("resource"), h.reasons,
+                "absolute retention is generic: no unseen-prerequisite phrase");
+        assertEquals(0L, h.slots.workspaceInUse(), "the close returns the workspace reservations");
+        assertFalse(h.slots.holdsHead(2), "the blocked head's slot is released");
+    }
+
     /** A cumulative source coherent with the harness's non-excluding transport clock. */
     private static final class CumulativeSource implements StallClock {
         private final long[] now;

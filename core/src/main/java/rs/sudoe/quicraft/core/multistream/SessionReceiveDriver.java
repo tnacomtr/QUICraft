@@ -68,6 +68,14 @@ public final class SessionReceiveDriver {
     /** Receives the single connection close the driver decides on: an error code and its reason bytes. */
     public interface CloseSink {
         void close(int errorCode, byte[] reason);
+
+        /**
+         * Receives the close with a local-only diagnostic (never sent on the wire), or null when the close has none.
+         * The default ignores the diagnostic.
+         */
+        default void close(int errorCode, byte[] reason, String diagnostic) {
+            close(errorCode, reason);
+        }
     }
 
     /** Records the driver held for one admitted unit. */
@@ -646,13 +654,17 @@ public final class SessionReceiveDriver {
 
     /** Terminal close: one close, then the driver stops. */
     private void fail(ReceiveClose close) {
-        fail(close.errorCode(), closeReason(close));
+        fail(close.errorCode(), closeReason(close), close.diagnostic());
     }
 
     private void fail(int errorCode, byte[] reason) {
+        fail(errorCode, reason, null);
+    }
+
+    private void fail(int errorCode, byte[] reason, String diagnostic) {
         if (closed) return;
         terminate();
-        sink.close(errorCode, reason);
+        sink.close(errorCode, reason, diagnostic);
     }
 
     /**

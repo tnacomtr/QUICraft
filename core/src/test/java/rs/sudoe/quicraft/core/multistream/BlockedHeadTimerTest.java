@@ -10,6 +10,44 @@ import rs.sudoe.quicraft.core.time.StallClock;
 class BlockedHeadTimerTest {
     private static final long SEC = 1_000_000_000L;
 
+    @Test void renewalMovesTheBaseDeadlineToTheCurrentActiveTimeAndDiscardsCredit() {
+        AtomicLong now = new AtomicLong();
+        BlockedHeadTimer timer = new BlockedHeadTimer(now::get, true);
+        timer.start();
+        now.set(8 * SEC);
+        timer.addCredit(BlockedHeadTimer.RENEWAL_BYTES);
+        assertTrue(timer.creditReached());
+        timer.renew();
+        assertFalse(timer.creditReached(), "renewal discards the credit");
+        now.set(17 * SEC);
+        assertFalse(timer.expired(), "9 s of active time since the renewal");
+        now.set(18 * SEC);
+        assertTrue(timer.expired(), "10 s since the renewal");
+    }
+
+    @Test void renewalNeverDelaysTheAbsoluteRetentionDeadline() {
+        AtomicLong now = new AtomicLong();
+        BlockedHeadTimer timer = new BlockedHeadTimer(now::get, true);
+        timer.start();
+        now.set(119 * SEC);
+        timer.renew();
+        now.set(120 * SEC);
+        assertTrue(timer.absoluteExpired(), "120 s of active time since the start");
+        assertFalse(timer.expired(), "only 1 s of active time since the renewal");
+    }
+
+    @Test void creditSaturatesAtTheRenewalThreshold() {
+        AtomicLong now = new AtomicLong();
+        BlockedHeadTimer timer = new BlockedHeadTimer(now::get, true);
+        timer.start();
+        timer.addCredit(BlockedHeadTimer.RENEWAL_BYTES - 1);
+        assertFalse(timer.creditReached());
+        timer.addCredit(1);
+        assertTrue(timer.creditReached());
+        timer.addCredit(Long.MAX_VALUE);
+        assertTrue(timer.creditReached(), "saturating add never overflows");
+    }
+
     @Test void expiresAfterTenSecondsOfTransportTimeWithoutStalls() {
         AtomicLong now = new AtomicLong();
         BlockedHeadTimer timer = new BlockedHeadTimer(now::get, true);

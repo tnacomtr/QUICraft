@@ -400,6 +400,120 @@ class StreamReceiverTest {
         assertNull(local.reason(), "local withholding blocks the phrase");
     }
 
+    /** The local diagnostic of an expiry, which every expiry close carries. */
+    private static String diagnosticOf(ReceiveClose close) {
+        assertNotNull(close, "expected an expiry");
+        assertNotNull(close.diagnostic(), "an expiry carries the local diagnostic");
+        return close.diagnostic();
+    }
+
+    @Test void expiryDiagnosticReportsAHeldReadyEnqueuedPrerequisiteAndTheExecutingHead() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(1, 1, 0));
+        enqueue(f.receiver, 1, 1);
+        assertAdmitted(f.receiver, rec(0, 1, 0, dep(1, 1)));
+        f.now.set(10 * SEC);
+        String detail = diagnosticOf(f.receiver.expiredWait());
+        assertTrue(detail.contains("unresolved=[stream=1 need=1 applied=0 queued=1 admitted=1 held=yes ready=yes enq=yes seq=1]"),
+                detail);
+        assertTrue(detail.endsWith(" executing=1:1 executor-queued-units=1 ms-since-last-apply-any-stream=none"
+                + " last-renewal-source=none"), detail);
+    }
+
+    @Test void expiryDiagnosticTellsAHeldUnitThatIsNotReadyFromAMissingOne() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(1, 1, 0, dep(3, 1)));
+        assertAdmitted(f.receiver, rec(0, 1, 0, dep(1, 1), dep(2, 1)));
+        f.now.set(10 * SEC);
+        String detail = diagnosticOf(f.receiver.expiredWait());
+        assertTrue(detail.startsWith("expiry=no-progress lapsed=no head=0:1 "), detail);
+        assertTrue(detail.contains("stream=1 need=1 applied=0 queued=0 admitted=1 held=yes ready=no enq=no seq=1"), detail);
+        assertTrue(detail.contains("stream=2 need=1 applied=0 queued=0 admitted=0 held=no ready=no enq=no seq=none"),
+                detail);
+        assertTrue(detail.endsWith(" executing=none executor-queued-units=0 ms-since-last-apply-any-stream=none"
+                + " last-renewal-source=none"), detail);
+    }
+
+    @Test void expiryDiagnosticNamesTheLastApplyAndTheCommitThatRenewedTheWait() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(1, 1), dep(3, 1)));
+        assertAdmitted(f.receiver, rec(3, 1, 0));
+        enqueue(f.receiver, 3, 1);
+        f.now.set(5 * SEC);
+        f.receiver.applied(3, 1);
+        f.now.set(15 * SEC);
+        String detail = diagnosticOf(f.receiver.expiredWait());
+        assertTrue(detail.contains("unresolved=[stream=1 need=1 applied=0 queued=0 admitted=0 held=no ready=no enq=no"
+                + " seq=none]"), detail);
+        assertTrue(detail.contains("blocked-ms=15000 since-renewal-ms=10000"), detail);
+        assertTrue(detail.endsWith(" executing=none executor-queued-units=0 ms-since-last-apply-any-stream=10000"
+                + " last-renewal-source=3:1"), detail);
+    }
+
+    @Test void cumulativeReceiverTimesTheLastApplyWithoutTheStallSource() {
+        final AtomicLong clock = new AtomicLong();
+        StallClock source = new StallClock() {
+            @Override public Sample sample() {
+                final long reading = clock.get();
+                return new Sample() {
+                    @Override public long nowNanos() { return reading; }
+                    @Override public long excludedNanos() { return 0; }
+                    @Override public boolean valid() { return true; }
+                };
+            }
+        };
+        StreamReceiver rx = new StreamReceiver(2, Direction.CLIENTBOUND, (s, r, route) -> true, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(1, 1)));
+        assertAdmitted(rx, rec(3, 1, 0));
+        enqueue(rx, 3, 1);
+        clock.set(4 * SEC);
+        rx.applied(3, 1);
+        clock.set(10 * SEC);
+        // The apply's time comes from System.nanoTime(), a different timebase from the stall source, so only the
+        // format and the absence of "none" are fixed here.
+        String detail = diagnosticOf(rx.expiredWait());
+        assertTrue(detail.matches("(?s).*ms-since-last-apply-any-stream=\\d+ last-renewal-source=none"), detail);
+    }
+
+    @Test void applyWithoutADependencyBlockedHeadReadsNoSourceEvenWhenReadsFail() {
+        FailingSource source = new FailingSource();
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(3, 1, 0));
+        enqueue(rx, 3, 1);
+        int before = source.reads;
+        source.failing = true;
+        rx.applied(3, 1);
+        assertEquals(before, source.reads, "an apply with no blocked head takes no stall-source reading");
+        assertNull(rx.head(3), "the apply committed");
+        assertNull(rx.pendingViolation());
+    }
+
+    @Test void expiryCloseIsUnchangedUnderAThrowingLogHandler() {
+        java.util.logging.Logger quicraft = java.util.logging.Logger.getLogger("QUICraft");
+        java.util.logging.Level priorLevel = quicraft.getLevel();
+        java.util.logging.Handler broken = new java.util.logging.Handler() {
+            @Override public void publish(java.util.logging.LogRecord record) {
+                throw new IllegalStateException("broken log handler");
+            }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        quicraft.setLevel(java.util.logging.Level.INFO);
+        quicraft.addHandler(broken);
+        try {
+            Fixture f = new Fixture(2);
+            assertAdmitted(f.receiver, rec(0, 1, 0, dep(1, 1)));
+            f.now.set(10 * SEC);
+            ReceiveClose close = f.receiver.expiredWait();
+            assertNotNull(close, "the expiry still closes the receiver");
+            assertEquals(ReceiveClose.RESOURCE, close.errorCode());
+            assertTrue(close.diagnostic() != null, "the local diagnostic is still built");
+        } finally {
+            quicraft.removeHandler(broken);
+            quicraft.setLevel(priorLevel);
+        }
+    }
+
     @Test void enqueueStopsTheTimerAndOnlyApplyReleasesDependencies() {
         Fixture f = new Fixture(2);
         assertAdmitted(f.receiver, rec(2, 1, 0));
@@ -408,13 +522,21 @@ class StreamReceiverTest {
         assertEquals(1, f.receiver.enqueuedWatermark(2));
         assertEquals(0, f.receiver.appliedWatermark(2));
         assertEquals(-1, f.receiver.nextToEnqueue(), "Q must not release the dependent");
-        f.now.set(100 * SEC);
-        ReceiveClose waiting = f.receiver.expiredWait();
-        assertNotNull(waiting, "the dependent stays blocked until D, so its own wait expires");
-        assertEquals(0x12, waiting.errorCode());
         f.receiver.applied(2, 1);
         assertEquals(1, f.receiver.appliedWatermark(2));
         assertEquals(3, f.receiver.nextToEnqueue());
+
+        Fixture late = new Fixture(2);
+        assertAdmitted(late.receiver, rec(2, 1, 0));
+        assertAdmitted(late.receiver, rec(3, 1, 0, dep(2, 1)));
+        enqueue(late.receiver, 2, 1);
+        late.now.set(100 * SEC);
+        ReceiveClose waiting = late.receiver.expiredWait();
+        assertNotNull(waiting, "the dependent stays blocked until D, so its own wait expires");
+        assertEquals(0x12, waiting.errorCode());
+        late.receiver.applied(2, 1);
+        assertEquals(0, late.receiver.appliedWatermark(2), "a lapsed wait is terminal: the commit is not applied");
+        assertEquals(0x12, late.receiver.pendingViolation().errorCode());
     }
 
     @Test void headAdmittedDuringAStallStartsExcludedUntilTheStallEnds() {
@@ -558,6 +680,62 @@ class StreamReceiverTest {
         assertEquals(1, f.receiver.epoch());
         assertNull(f.receiver.pendingViolation());
         assertEquals(2, f.receiver.nextToEnqueue(), "the chunk head is released normally");
+    }
+
+    @Test void lapsedExpiryClosesBeforeAPostCommitOrderingViolation() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 1, dep(1, 1)));
+        assertAdmitted(f.receiver, rec(1, 1, 0));
+        enqueue(f.receiver, 1, 1);
+        // Without the lapsed wait, this apply would raise 0x11 (no transition path to epoch 1, 13.18).
+        f.now.set(10 * SEC);
+        f.receiver.applied(1, 1);
+        assertUnseen(f.receiver.pendingViolation());
+        assertNotNull(f.receiver.head(1), "the lapsed commit changed no state");
+        assertNotNull(f.receiver.head(2), "the waiting head is still held for the close");
+    }
+
+    @Test void settlementReadsTheSourceOnceAndRenewsFromThatReading() {
+        SteppingSource source = new SteppingSource(0, 9 * SEC, 20 * SEC);
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1000)));
+        int before = source.samples;
+        commit(rx, rec(3, 1, 0), 64 * KIB, route(3));
+        assertEquals(before + 1, source.samples, "one source reading for the whole settlement");
+        // The renewal used the 9 s settlement reading. The next reading (20 s) is 11 s past it, so the base has
+        // expired. Had the renewal taken its own reading at 20 s, the base would still be live here.
+        assertUnseen(rx.expiredWait());
+    }
+
+    @Test void expiryAtTheSettlementReadingIsNeverRenewed() {
+        SteppingSource source = new SteppingSource(0, 20 * SEC);
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1000)));
+        assertAdmitted(rx, rec(3, 1, 0));
+        enqueue(rx, 3, 1, route(3));
+        rx.applied(3, 1);
+        assertUnseen(rx.pendingViolation());
+        assertNotNull(rx.head(3), "the lapsed commit changed no state");
+    }
+
+    @Test void unavailableSourceDuringSettlementClosesGenericWithNoStateChange() {
+        ScriptedSource source = new ScriptedSource().set(0, 0);
+        int[] validatorCalls = new int[1];
+        StreamReceiver rx = new StreamReceiver(2, Direction.CLIENTBOUND,
+                (s, r, route) -> { validatorCalls[0]++; return true; }, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1000)));
+        assertAdmitted(rx, rec(3, 1, 0));
+        enqueue(rx, 3, 1, route(3));
+        int callsBefore = validatorCalls[0];
+        source.valid = false;
+        rx.applied(3, 1);
+        ReceiveClose close = rx.pendingViolation();
+        assertNotNull(close, "the unavailable source must close the connection");
+        assertEquals(0x12, close.errorCode());
+        assertNull(close.reason(), "an unavailable source is a generic resource close, no phrase");
+        assertEquals(callsBefore, validatorCalls[0], "the commit made no callback");
+        assertNotNull(rx.head(3), "the commit did not run");
+        assertNotNull(rx.head(2), "the waiting head is untouched");
     }
 
     @Test void cumulativeConstructorsRejectANullSource() {
@@ -786,6 +964,255 @@ class StreamReceiverTest {
     }
 
     /** A scripted cumulative source whose every reading is one coherent pair. */
+    private static final long KIB = 1024L;
+
+    /** The ACK stream's route (13.21); ACK records are one small GAME record at a time. */
+    private static ReceiveRoute ackRoute() {
+        return new ReceiveRoute(ReceiveRoute.Lane.ACK, Dependency.ORDINARY, null, false, false);
+    }
+
+    /** Admits, validates, enqueues and applies one single-record unit: a commit (D) of wireBytes. */
+    private static void commit(StreamReceiver rx, Record record, long wireBytes, ReceiveRoute route) {
+        StreamReceiver.Admission admission = rx.offer(record, wireBytes, 1);
+        assertEquals(StreamReceiver.Admission.Kind.ADMITTED, admission.kind(),
+                () -> "commit of stream " + record.streamIndex() + " seq " + record.sequence());
+        enqueue(rx, record.streamIndex(), record.sequence(), route);
+        rx.applied(record.streamIndex(), record.sequence());
+    }
+
+    private static void assertUnseen(ReceiveClose close) {
+        assertNotNull(close, "the no-progress deadline must expire");
+        assertEquals(0x12, close.errorCode());
+        assertEquals("unseen-prerequisite", new String(close.reason(), java.nio.charset.StandardCharsets.US_ASCII));
+    }
+
+    private static void assertGenericRetention(ReceiveClose close) {
+        assertNotNull(close, "the absolute retention deadline must expire");
+        assertEquals(0x12, close.errorCode());
+        assertNull(close.reason(), "absolute retention carries no phrase");
+        assertFalse(close.unseenPrerequisite());
+    }
+
+    @Test void honestRelevantCommitsSustainAWaitPastTheTenSecondBase() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 100)));
+        for (int k = 1; k <= 10; k++) {
+            f.now.set(4L * k * SEC);
+            commit(f.receiver, rec(3, k, 0), 40 * KIB, route(3));
+            assertNull(f.receiver.expiredWait(), "two 40 KiB commits renew, t=" + 4 * k + " s");
+        }
+        f.now.set(45 * SEC);
+        assertNull(f.receiver.expiredWait(), "the last renewal at 40 s leaves 5 s of base");
+    }
+
+    @Test void completingTheRequiredSequenceRenewsTheBaseDeadline() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(0, 1), dep(3, 1)));
+        f.now.set(9 * SEC);
+        commit(f.receiver, rec(3, 1, 0), 1, route(3));
+        f.now.set(18 * SEC + SEC - 1);
+        assertNull(f.receiver.expiredWait(), "the watermark commit renewed the base at 9 s");
+        f.now.set(19 * SEC);
+        assertUnseen(f.receiver.expiredWait());
+    }
+
+    @Test void transitivePrerequisiteProgressRenewsOnlyByByteCredit() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 1)));
+        assertAdmitted(f.receiver, rec(3, 1, 0, dep(0, 1)));
+        f.now.set(9 * SEC);
+        commit(f.receiver, rec(0, 1, 0), 64 * KIB, route(0));
+        f.now.set(10 * SEC);
+        assertNull(f.receiver.expiredWait(), "CONTROL 1 is transitive progress worth 64 KiB for the head on CHUNK 3 1");
+        f.now.set(19 * SEC);
+        assertUnseen(f.receiver.expiredWait());
+    }
+
+    @Test void tinyRecordsOnATransitivePrerequisiteCannotRenewThroughAnIntermediateHead() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 100)));
+        assertAdmitted(f.receiver, rec(3, 1, 0, dep(0, 2)));
+        f.now.set(4 * SEC);
+        commit(f.receiver, rec(0, 1, 0), 1, route(0));
+        f.now.set(9 * SEC);
+        // This 1-byte commit reaches the transitive watermark CONTROL 2, which must not renew (13.10 arm a).
+        commit(f.receiver, rec(0, 2, 0), 1, route(0));
+        f.now.set(10 * SEC);
+        assertUnseen(f.receiver.expiredWait());
+    }
+
+    @Test void directEntryRenewsOnlyWhenTheCommitReachesItsOwnSequence() {
+        Fixture unreached = new Fixture(2);
+        assertAdmitted(unreached.receiver, rec(2, 1, 0, dep(0, 2), dep(3, 100)));
+        unreached.now.set(9 * SEC);
+        commit(unreached.receiver, rec(0, 1, 0), 1, route(0));
+        unreached.now.set(10 * SEC);
+        assertUnseen(unreached.receiver.expiredWait());
+
+        Fixture reached = new Fixture(2);
+        assertAdmitted(reached.receiver, rec(2, 1, 0, dep(0, 2), dep(3, 100)));
+        reached.now.set(9 * SEC);
+        commit(reached.receiver, rec(0, 1, 0), 1, route(0));
+        reached.now.set(9 * SEC + SEC / 2);
+        commit(reached.receiver, rec(0, 2, 0), 1, route(0));
+        reached.now.set(19 * SEC);
+        assertNull(reached.receiver.expiredWait(), "CONTROL 2 reaches the direct entry, so the base renewed at 9.5 s");
+        reached.now.set(19 * SEC + SEC / 2);
+        assertUnseen(reached.receiver.expiredWait());
+    }
+
+    @Test void aOneByteEveryNineSecondsTrickleIsClosedAndCannotBeRescued() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 100)));
+        f.now.set(9 * SEC);
+        commit(f.receiver, rec(3, 1, 0), 1, route(3));
+        f.now.set(9 * SEC + 1);
+        assertNull(f.receiver.expiredWait(), "a 1-byte commit earns no renewal, the base is not reached yet");
+        f.now.set(10 * SEC);
+        assertUnseen(f.receiver.expiredWait());
+        f.now.set(18 * SEC);
+        commit(f.receiver, rec(3, 2, 0), 1, route(3));
+        assertUnseen(f.receiver.expiredWait());
+    }
+
+    @Test void unrelatedAndAckTrafficEarnsNoCredit() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 100)));
+        for (int k = 1; k <= 9; k++) {
+            f.now.set(k * SEC);
+            commit(f.receiver, rec(4, k, 0), 50, ackRoute());
+        }
+        f.now.set(9 * SEC + SEC / 2);
+        commit(f.receiver, rec(0, 1, 0), 100 * KIB, route(0));
+        f.now.set(10 * SEC);
+        assertUnseen(f.receiver.expiredWait());
+    }
+
+    @Test void repeatedTinyValidPredecessorsBelowTheThresholdDoNotRenew() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 100)));
+        for (int k = 1; k <= 4; k++) {
+            f.now.set(2L * k * SEC);
+            commit(f.receiver, rec(3, k, 0), KIB, route(3));
+        }
+        f.now.set(9 * SEC);
+        assertNull(f.receiver.expiredWait());
+        f.now.set(10 * SEC);
+        assertUnseen(f.receiver.expiredWait());
+    }
+
+    @Test void renewalDiscardsTheSurplusCredit() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 100)));
+        f.now.set(1 * SEC);
+        commit(f.receiver, rec(3, 1, 0), 60 * KIB, route(3));
+        f.now.set(2 * SEC);
+        commit(f.receiver, rec(3, 2, 0), 60 * KIB, route(3));
+        f.now.set(3 * SEC);
+        commit(f.receiver, rec(3, 3, 0), 10 * KIB, route(3));
+        f.now.set(11 * SEC);
+        assertNull(f.receiver.expiredWait(), "renewed at 2 s, so the base runs to 12 s");
+        f.now.set(12 * SEC);
+        assertUnseen(f.receiver.expiredWait());
+    }
+
+    @Test void absoluteRetentionClosesGenericEvenWhileQualifyingTrafficRenews() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 1000)));
+        for (int k = 1; k <= 14; k++) {
+            f.now.set(8L * k * SEC);
+            commit(f.receiver, rec(3, k, 0), 70 * KIB, route(3));
+            assertNull(f.receiver.expiredWait(), "each 70 KiB commit renews, t=" + 8 * k + " s");
+        }
+        f.now.set(120 * SEC - 1);
+        assertNull(f.receiver.expiredWait(), "119.999 s of active time is inside the retention bound");
+        f.now.set(120 * SEC);
+        commit(f.receiver, rec(3, 15, 0), 70 * KIB, route(3));
+        assertGenericRetention(f.receiver.expiredWait());
+    }
+
+    @Test void commitBeforeTheBoundaryRenewsAndAtTheBoundaryCannotRescue() {
+        Fixture early = new Fixture(2);
+        assertAdmitted(early.receiver, rec(2, 1, 0, dep(0, 1), dep(3, 1)));
+        early.now.set(10 * SEC - 1);
+        commit(early.receiver, rec(3, 1, 0), 1, route(3));
+        early.now.set(10 * SEC);
+        assertNull(early.receiver.expiredWait(), "one nanosecond before the deadline the watermark renews");
+
+        Fixture exact = new Fixture(2);
+        assertAdmitted(exact.receiver, rec(2, 1, 0, dep(0, 1), dep(3, 1)));
+        exact.now.set(10 * SEC);
+        commit(exact.receiver, rec(3, 1, 0), 1, route(3));
+        assertUnseen(exact.receiver.expiredWait());
+    }
+
+    @Test void theSixtySecondStallAllowanceIsNotReplenishedByRenewal() {
+        Fixture f = new Fixture(2);
+        assertAdmitted(f.receiver, rec(2, 1, 0, dep(3, 1000)));
+        f.receiver.stallStarted();
+        f.now.set(60 * SEC);
+        f.receiver.stallEnded();
+        commit(f.receiver, rec(3, 1, 0), 70 * KIB, route(3));
+        f.receiver.stallStarted();
+        f.now.set(69 * SEC);
+        assertNull(f.receiver.expiredWait(), "the allowance is spent: 9 s of active time since the renewal");
+        f.now.set(70 * SEC);
+        ReceiveClose close = f.receiver.expiredWait();
+        assertNotNull(close, "a second stall beyond the spent allowance counts");
+        assertEquals(0x12, close.errorCode());
+        assertNull(close.reason(), "consumed stall time blocks the phrase");
+    }
+
+    @Test void cumulativeQualifyingProgressRenewsTheBaseDeadline() {
+        ScriptedSource source = new ScriptedSource().set(0, 0);
+        StreamReceiver rx = cumulative(Direction.CLIENTBOUND, source);
+        assertAdmitted(rx, rec(2, 1, 0, dep(3, 1000)));
+        source.set(9 * SEC, 0);
+        commit(rx, rec(3, 1, 0), 70 * KIB, route(3));
+        source.set(18 * SEC, 0);
+        assertNull(rx.expiredWait(), "renewed at 9 s");
+        source.set(19 * SEC, 0);
+        assertUnseen(rx.expiredWait());
+    }
+
+    /** A cumulative source that counts its reads and, once {@link #failing} is set, throws on every read. */
+    private static final class FailingSource implements StallClock {
+        int reads;
+        boolean failing;
+
+        @Override public Sample sample() {
+            reads++;
+            if (failing) {
+                throw new IllegalStateException("stall source read during an apply");
+            }
+            return new Sample() {
+                @Override public long nowNanos() { return 0; }
+                @Override public long excludedNanos() { return 0; }
+                @Override public boolean valid() { return true; }
+            };
+        }
+    }
+
+    /** A cumulative source that returns its scripted clock readings in order, then repeats the last one. */
+    private static final class SteppingSource implements StallClock {
+        private final long[] nows;
+        int samples;
+
+        SteppingSource(long... nows) {
+            this.nows = nows;
+        }
+
+        @Override public Sample sample() {
+            final long now = nows[Math.min(samples, nows.length - 1)];
+            samples++;
+            return new Sample() {
+                @Override public long nowNanos() { return now; }
+                @Override public long excludedNanos() { return 0; }
+                @Override public boolean valid() { return true; }
+            };
+        }
+    }
+
     private static final class ScriptedSource implements StallClock {
         long nowNanos;
         long excludedNanos;

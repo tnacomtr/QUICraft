@@ -526,7 +526,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                 return "";
             }
             String text = cause.getClass().getSimpleName() + ": " + cause.getMessage();
-            return " (local cause: " + (text.length() > 200 ? text.substring(0, 200) : text) + ")";
+            return " (local cause: " + (text.length() > 900 ? text.substring(0, 900) : text) + ")";
         } catch (Throwable t) {
             return "";
         }

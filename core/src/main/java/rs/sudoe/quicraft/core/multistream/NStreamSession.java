@@ -87,6 +87,8 @@ import rs.sudoe.quicraft.core.time.StallClock;
  */
 public final class NStreamSession implements MultistreamSession {
     private static final Logger LOG = Logger.getLogger("QUICraft");
+    /** The effective /3 profile is logged once per process, at the first server connection (diagnostics). */
+    private static final AtomicBoolean PROFILE_LOGGED = new AtomicBoolean();
 
     /** Which end of the connection this session is. */
     public enum Role {
@@ -379,6 +381,8 @@ public final class NStreamSession implements MultistreamSession {
     private SessionSendDriver sendDriver;
     private final QuicStreamWriteSink sink;
     private final QuicStreamByteSource source;
+    /** Stall watchdog ({@code -Dquicraft.v3.stalldiag=true}); null when off, so the tick pays one null test. */
+    private final StallDiag stallDiag;
     private final PreambleFilter preambles;
     private final QuicStreamChannel[] channels;
     /** Logical indexes ever attached, so a replacement stream for an index is refused (13.3). */
@@ -492,6 +496,7 @@ public final class NStreamSession implements MultistreamSession {
         this.table = table;
         this.context = context;
         this.resources = resources;
+        this.stallDiag = StallDiag.ENABLED ? new StallDiag(resources.clock(), msg -> LOG.info(msg)) : null;
         this.timing = timing;
         this.compressed = compressed;
         this.loop = connection.eventLoop();
@@ -525,10 +530,29 @@ public final class NStreamSession implements MultistreamSession {
             // Submissions run on callers' threads; a close they trigger only stops the driver, and its charges are
             // returned by release() on the loop, serialized with polling and writes (13.12).
             sendDriver.releaseOnOwnerClose();
+            if (role == Role.SERVER && PROFILE_LOGGED.compareAndSet(false, true)) {
+                try {
+                    LOG.info("QUICraft v3 profile: queuePacketLimit=" + resources.profile().queuePacketLimit
+                            + " queueByteLimit=" + resources.profile().queueByteLimit
+                            + " nodeBudget=" + resources.profile().nodeBudgetBytes);
+                } catch (Throwable diagnostic) {
+                    // Diagnostics only: a failing logger must not fail the session.
+                }
+            }
             this.sink = new QuicStreamWriteSink(sendDriver, streams, this::writeAllowed, this::onSettled);
             StreamReceiver.Validator validator = new ShardValidator(shards,
                     role == Role.SERVER ? Direction.SERVERBOUND : Direction.CLIENTBOUND);
-            SessionReceiveDriver.CloseSink closeSink = this::onReceiveClose;
+            SessionReceiveDriver.CloseSink closeSink = new SessionReceiveDriver.CloseSink() {
+                @Override
+                public void close(int code, byte[] reason) {
+                    onReceiveClose(code, reason, null);
+                }
+
+                @Override
+                public void close(int code, byte[] reason, String diagnostic) {
+                    onReceiveClose(code, reason, diagnostic);
+                }
+            };
             if (role == Role.SERVER) {
                 serverPump = new SessionReadPump(new ServerReadPartition(shards), resources.node(),
                         resources.inboundExcess(), this, ip, account, limits, compressed, preambles,
@@ -921,6 +945,12 @@ public final class NStreamSession implements MultistreamSession {
     @Override
     public boolean isWritable() {
         return writable;
+    }
+
+    @Override
+    public String sendCloseReason() {
+        SessionSendDriver driver = sendDriver;
+        return driver == null ? null : driver.lastCloseReason();
     }
 
     @Override
@@ -1442,17 +1472,25 @@ public final class NStreamSession implements MultistreamSession {
             fail(CLOSE_ORDERING, NO_REASON, "acknowledgement refused: " + e.getMessage(), e);
             return;
         }
+        if (stallDiag != null) {
+            stallDiag.progress();
+        }
         afterWork();
         schedulePump();
     }
 
     /** The receive drivers' one close: 0x0 after END, otherwise the code and reason go to the peer. */
-    private void onReceiveClose(int code, byte[] reason) {
+    /**
+     * The local diagnostic, when present, is appended to the local log and exception text only. The wire carries the
+     * code and reason exactly as before.
+     */
+    private void onReceiveClose(int code, byte[] reason, String diagnostic) {
         if (code == CLOSE_NORMAL) {
             closeNormally();
         } else {
-            fail(code, reason == null ? NO_REASON : reason, "receive driver closed with 0x"
-                    + Integer.toHexString(code), null);
+            String why = "receive driver closed with 0x" + Integer.toHexString(code);
+            fail(code, reason == null ? NO_REASON : reason,
+                    diagnostic == null ? why : why + " (" + diagnostic + ")", null);
         }
     }
 
@@ -1566,6 +1604,50 @@ public final class NStreamSession implements MultistreamSession {
         } finally {
             if (trace != null) trace.tick(beforeWrites, sendDriver.awaitingGrant());
         }
+        if (stallDiag != null && !closed) {
+            stallCheck();
+        }
+    }
+
+    /**
+     * Stall watchdog step (diagnostics only): gathers state for a due event and never changes it. A failure of any
+     * read here disables the watchdog for this connection and nothing else.
+     */
+    private void stallCheck() {
+        try {
+            StreamReceiver receiver = clientDriver != null ? clientDriver.receiver()
+                    : serverDriver != null ? serverDriver.receiver() : null;
+            boolean receiverBlocked = receiver != null && receiver.hasBlockedHead();
+            boolean senderQueued = sendDriver.queuedRecords() > 0;
+            String side = serverDriver != null ? "server" : "client";
+            stallDiag.tick(side, receiverBlocked, senderQueued, () -> stallLines(receiver));
+        } catch (Throwable diagnostic) {
+            stallDiag.disable();
+        }
+    }
+
+    private List<String> stallLines(StreamReceiver receiver) {
+        List<String> lines = new ArrayList<String>();
+        if (receiver != null) {
+            lines.add(receiver.stallSummary());
+        }
+        for (int stream = 0; stream < channels.length; stream++) {
+            QuicStreamChannel channel = channels[stream];
+            if (channel == null) {
+                lines.add("chan s" + stream + " attached=no");
+                continue;
+            }
+            lines.add("chan s" + stream + " attached=yes streamId=" + channel.streamId()
+                    + " active=" + channel.isActive() + " autoRead=" + channel.config().isAutoRead()
+                    + " buffered=" + (source == null ? -1 : source.buffered(stream)));
+        }
+        lines.add("send queuedRecords=" + sendDriver.queuedRecords() + " awaitingGrant=" + sendDriver.awaitingGrant());
+        lines.add("session executing=" + executing + " executingSequence=" + executingSequence
+                + " pumping=" + pumping + " pumpHeld=" + pumpHeld);
+        if (source != null) {
+            lines.add("source " + source.traceSummary());
+        }
+        return lines;
     }
 
     private void tickNow() {

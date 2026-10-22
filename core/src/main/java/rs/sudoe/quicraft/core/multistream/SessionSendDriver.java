@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.IntPredicate;
 import java.util.function.LongSupplier;
+import java.util.logging.Logger;
 
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.profile.ServerProfile;
@@ -91,6 +92,8 @@ public final class SessionSendDriver {
 
     /** The REALTIME outbound slice per play connection, 2 KiB (13.12 provisional default). */
     public static final long DEFAULT_REALTIME_SLICE_BYTES = 2048;
+
+    private static final Logger LOG = Logger.getLogger("QUICraft");
 
     /** One slice to write now. Report its completion with {@link #released(long)} or {@link #failed(long)}. */
     public static final class Write {
@@ -243,6 +246,12 @@ public final class SessionSendDriver {
     private int closeCode;
     /** The typed local failure that caused a 0x12 close, kept for diagnostics; null for other closes. */
     private Throwable closeCause;
+    /** Why the driver last refused on a limit or closed 0x12; the first real reason wins (diagnostics). */
+    private String lastCloseReason;
+    /** True when {@link #lastCloseReason} came from a sealed or closed refusal, which a real reason replaces. */
+    private boolean passiveReason;
+    /** True once this driver logged its first CLOSE_RESOURCE, so the log is once per connection. */
+    private boolean closeLogged;
 
     /**
      * Creates the sender for one connection direction and registers the connection with the ranking.
@@ -482,11 +491,12 @@ public final class SessionSendDriver {
             int chunkX, int chunkZ, Record.Dependency... semantic) {
         SentPacket handle = new SentPacket();
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return handle;
         }
         byte[] frame = packet.frame();
         if (overflows(1, frame.length)) {
-            closeWith(CLOSE_RESOURCE);
+            closeOverflow(1, frame.length, -1);
             return handle;
         }
         fence = effectiveFence(fence, chunkX, chunkZ);
@@ -514,6 +524,7 @@ public final class SessionSendDriver {
     public synchronized SentPacket submitEnd() {
         SentPacket handle = new SentPacket();
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return handle;
         }
         settleAcksLocked();
@@ -548,6 +559,7 @@ public final class SessionSendDriver {
             StreamSequencer.Fence fence, boolean interaction, int chunkX, int chunkZ) {
         SentPacket handle = new SentPacket();
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return handle;
         }
         requireCoveredToken(token);
@@ -563,6 +575,7 @@ public final class SessionSendDriver {
             StreamSequencer.Fence fence, boolean interaction, int chunkX, int chunkZ) {
         SentPacket handle = new SentPacket();
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return handle;
         }
         byte[] frame = packet.frame();
@@ -574,7 +587,7 @@ public final class SessionSendDriver {
             // nothing, only that the connection and its scope state are gone together.
             assert !handle.isAssigned() : "pre-assignment overflow closed an assigned handle";
             closeCause = new IllegalStateException("covered submission overflows the queue");
-            closeWith(CLOSE_RESOURCE);
+            closeOverflow(1, frame.length, -1);
             return handle;
         }
         fence = effectiveFence(fence, chunkX, chunkZ);
@@ -645,10 +658,11 @@ public final class SessionSendDriver {
     public synchronized SentPacket submitEpochTransition(OutboundPacket packet) {
         SentPacket handle = new SentPacket();
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return handle;
         }
         if (overflows(1, packet.frame().length)) {
-            closeWith(CLOSE_RESOURCE);
+            closeOverflow(1, packet.frame().length, -1);
             return handle;
         }
         settleAcksLocked();
@@ -675,13 +689,21 @@ public final class SessionSendDriver {
      * A queue limit or a charge no cap can admit closes the driver with 0x12 instead.
      */
     public synchronized boolean createAck(long id, byte[] payload, int chargedBytes) {
-        if (closed || sealed || payload == null) {
+        if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
+            return false;
+        }
+        if (payload == null) {
             return false;
         }
         long now = clock.getAsLong();
         long queued = payload.length + RECORD_OVERHEAD;
-        if (overflows(1, queued) || !pool.admissible(account, chargedBytes)) {
-            closeWith(CLOSE_RESOURCE);
+        if (overflows(1, queued)) {
+            closeOverflow(1, queued, -1);
+            return false;
+        }
+        if (!pool.admissible(account, chargedBytes)) {
+            closeInadmissible(-1, chargedBytes);
             return false;
         }
         // Granted orphans (dropped ACKs) give their headroom back first. Headroom backpressure (13.19): the
@@ -786,6 +808,7 @@ public final class SessionSendDriver {
     /** Starts a batch: its CONTROL/view-gate start waits for the previous BATCH_JOIN (13.19). */
     public synchronized SentPacket beginBatch(long batchId, OutboundPacket start) {
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return new SentPacket();
         }
         // The marker and its packet are validated before the start takes a sequence; the batch
@@ -794,7 +817,7 @@ public final class SessionSendDriver {
         batches.validateBegin(batchId, epoch);
         byte[] frame = snapshotFrame(start, "batch start");
         if (overflows(1, frame.length)) {
-            closeWith(CLOSE_RESOURCE);
+            closeOverflow(1, frame.length, -1);
             return new SentPacket();
         }
         Record.Dependency previous = batches.previousJoinDependency();
@@ -809,6 +832,7 @@ public final class SessionSendDriver {
     /** Assigns one install of the active batch on its hashed CHUNK stream (13.19). */
     public synchronized SentPacket batchInstall(long batchId, OutboundPacket install, int chunkX, int chunkZ) {
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return new SentPacket();
         }
         long epoch = sequencer.epoch();
@@ -816,7 +840,7 @@ public final class SessionSendDriver {
         batches.validateInstall(batchId, predicted, epoch, context.logicalStreamCount());
         byte[] frame = snapshotFrame(install, "batch install");
         if (overflows(1, frame.length)) {
-            closeWith(CLOSE_RESOURCE);
+            closeOverflow(1, frame.length, -1);
             return new SentPacket();
         }
         // A batch install is not tracked by the held set, so later installs can no longer be proven first
@@ -842,6 +866,7 @@ public final class SessionSendDriver {
     public synchronized SentPacket finishBatch(long batchId, OutboundPacket join) {
         SentPacket handle = new SentPacket();
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return handle;
         }
         // Validate the marker and compute its dependencies before assigning the join; the batch is
@@ -850,7 +875,7 @@ public final class SessionSendDriver {
         Record.Dependency[] deps = batches.previewFinish(batchId, epoch);
         byte[] frame = snapshotFrame(join, "batch join");
         if (overflows(1, frame.length)) {
-            closeWith(CLOSE_RESOURCE);
+            closeOverflow(1, frame.length, -1);
             return handle;
         }
         Record record = sequencer.assignJoin(3, frame, deps);
@@ -1000,6 +1025,7 @@ public final class SessionSendDriver {
             StreamSequencer.Fence[] scopes, OutboundPacket closing, Record.Dependency... external) {
         List<SentPacket> result = new ArrayList<SentPacket>();
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return result;
         }
         int units = members.size() + 2;
@@ -1019,7 +1045,7 @@ public final class SessionSendDriver {
             bytes += frame.length;
         }
         if (overflows(units, bytes)) {
-            closeWith(CLOSE_RESOURCE);
+            closeOverflow(units, bytes, CONTROL);
             return result;
         }
         // The exact unit total is computed without assigning anything, so a refused run leaves the sequencer unchanged.
@@ -1032,7 +1058,7 @@ public final class SessionSendDriver {
         }
         // A run no cap can admit closes 0x12 as before; a run that fits the caps but not one maximum record is refused.
         if (!pool.admissible(account, unitBytes)) {
-            closeWith(CLOSE_RESOURCE);
+            closeInadmissible(CONTROL, unitBytes);
             return result;
         }
         if (unitBytes > maxRecordBytes) {
@@ -1055,7 +1081,7 @@ public final class SessionSendDriver {
             encodings.add(encoded);
         }
         if (!pool.admissible(account, runBytes)) {
-            closeWith(CLOSE_RESOURCE);
+            closeInadmissible(CONTROL, runBytes);
             return result;
         }
         enqueueRun(records, encodings);
@@ -1099,6 +1125,7 @@ public final class SessionSendDriver {
             List<List<MultistreamSession.UpdateToken>> memberCoverage) {
         List<SentPacket> result = new ArrayList<SentPacket>();
         if (closed || sealed) {
+            notePassive(closed ? "closed" : "sealed");
             return result;
         }
         if (opening == null || closing == null || members == null || memberScopes == null
@@ -1161,11 +1188,11 @@ public final class SessionSendDriver {
             throw new IllegalArgumentException("sequence exhausted");
         }
         if (overflows(count + 2, rawBytes)) {
-            closeWith(CLOSE_RESOURCE);
+            closeOverflow(count + 2, rawBytes, CONTROL);
             return result;
         }
         if (!pool.admissible(account, unitBytes)) {
-            closeWith(CLOSE_RESOURCE);
+            closeInadmissible(CONTROL, unitBytes);
             return result;
         }
         if (unitBytes > maxRecordBytes) {
@@ -1192,7 +1219,7 @@ public final class SessionSendDriver {
             // node limit holds still. It is kept as a defensive 0x12 close and no test claims to cover it.
             if (!pool.admissible(account, runBytes)) {
                 closeCause = new IllegalStateException("covered bundle exceeds every applicable cap");
-                closeWith(CLOSE_RESOURCE);
+                closeInadmissible(CONTROL, runBytes);
                 return result;
             }
             enqueueRun(records, encodings);
@@ -1355,14 +1382,80 @@ public final class SessionSendDriver {
         disconnectRanking();
     }
 
+    /**
+     * Records why the driver refused a submission on a limit, before the caller closes. The first real
+     * reason wins, and a passive one (sealed or closed) never blocks it. Diagnostics only.
+     */
+    private void noteRefusal(String check, int stream, long recordBytes) {
+        if (lastCloseReason == null || passiveReason) {
+            lastCloseReason = describeRefusal(check, stream, recordBytes);
+            passiveReason = false;
+        }
+    }
+
+    /** Records a sealed or closed refusal when no reason is known yet; a later real reason replaces it. */
+    private void notePassive(String check) {
+        if (lastCloseReason == null) {
+            lastCloseReason = describeRefusal(check, -1, 0);
+            passiveReason = true;
+        }
+    }
+
+    private String describeRefusal(String check, int stream, long recordBytes) {
+        return "check=" + check + " stream=" + stream + " queuedRecords=" + queuedRecords
+                + " queuedBytes=" + queuedBytes + " queuePacketLimit=" + profile.queuePacketLimit
+                + " queueByteLimit=" + profile.queueByteLimit + " recordBytes=" + recordBytes;
+    }
+
+    /** Closes 0x12 for a producer overflow, recording the queue limit it exceeded. */
+    private void closeOverflow(int records, long bytes, int stream) {
+        noteRefusal(overflowCheck(records, bytes), stream, bytes);
+        closeWith(CLOSE_RESOURCE);
+    }
+
+    /** Closes 0x12 for a record the pool cannot admit, recording that check. */
+    private void closeInadmissible(int stream, long bytes) {
+        noteRefusal("pool-inadmissible", stream, bytes);
+        closeWith(CLOSE_RESOURCE);
+    }
+
+    /** The reason of the first limit refusal or 0x12 close, or null while there is none (diagnostics). */
+    synchronized String lastCloseReason() {
+        return lastCloseReason;
+    }
+
     private void closeWith(int code) {
         closeCode = code;
-        if (deferRelease) {
-            // Stops at once; the owner's close() returns the charges on its writing thread.
-            closed = true;
-            return;
+        try {
+            if (deferRelease) {
+                // Stops at once; the owner's close() returns the charges on its writing thread.
+                closed = true;
+            } else {
+                close();
+            }
+        } finally {
+            // Diagnostics run only after the close has stopped the driver and released its resources.
+            if (code == CLOSE_RESOURCE) {
+                recordLocalClose();
+            }
         }
-        close();
+    }
+
+    /**
+     * Records a 0x12 close for diagnostics and logs it once per connection. A limit refusal named its check before it
+     * closed; any other 0x12 close is a local failure. Never throws: a failing logger or handler must not change how
+     * the connection closes.
+     */
+    private void recordLocalClose() {
+        try {
+            noteRefusal(closeCause != null ? "local-failure" : "local-close", -1, 0);
+            if (!closeLogged) {
+                closeLogged = true;
+                LOG.info("QUICraft v3 send close: " + lastCloseReason);
+            }
+        } catch (Throwable diagnostic) {
+            // Diagnostics only: the close is already complete.
+        }
     }
 
     /**
@@ -1422,7 +1515,7 @@ public final class SessionSendDriver {
     private boolean enqueueRecord(Record record, boolean continues) {
         byte[] encoded = RecordCodec.encodeRecord(record);
         if (!pool.admissible(account, encoded.length)) {
-            closeWith(CLOSE_RESOURCE);
+            closeInadmissible(record.streamIndex(), encoded.length);
             return false;
         }
         enqueueEncoded(record, encoded, continues);
@@ -1610,14 +1703,23 @@ public final class SessionSendDriver {
     /** Takes this owner's shed notice, if any. Other owners' notices stay in the pool for their drivers. */
     private boolean checkShed() {
         if (pool.takeShed(owner)) {
+            noteRefusal("pool-shed", -1, 0);
             closeWith(CLOSE_RESOURCE);
             return true;
         }
         return false;
     }
 
+    /** The queue limit that a producer overflow of {@code records} and {@code bytes} would exceed, or null. */
+    private String overflowCheck(int records, long bytes) {
+        if (queuedRecords + records > profile.queuePacketLimit) {
+            return "queue-packet-limit";
+        }
+        return queuedBytes + bytes > profile.queueByteLimit ? "queue-byte-limit" : null;
+    }
+
     private boolean overflows(int records, long bytes) {
-        return queuedRecords + records > profile.queuePacketLimit || queuedBytes + bytes > profile.queueByteLimit;
+        return overflowCheck(records, bytes) != null;
     }
 
 

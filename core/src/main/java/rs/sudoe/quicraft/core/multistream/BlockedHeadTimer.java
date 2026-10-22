@@ -10,11 +10,15 @@ import rs.sudoe.quicraft.core.time.StallClock;
  * (protocol.md 13.10 and 13.12).
  *
  * <p>The wait starts once and is never reset when prerequisites change: {@link #start()} while the timer
- * is already running is ignored. The base is 10 seconds of transport time. A blocked head additionally
- * excludes recorded game-executor tick stalls, but only up to {@link #STALL_ALLOWANCE_NANOS} in total per
- * wait; after that allowance is used up, further stall time counts and the timer expires. The 10 second
- * base and 60 second allowance give a retention of at most 70 seconds. Local resource waits construct the
- * timer with {@code excludeStalls=false}, so executor stalls never pause them.
+ * is already running is ignored. The base is 10 seconds of transport time, measured from the wait's start
+ * or from its last renewal. A blocked head additionally excludes recorded game-executor tick stalls, but
+ * only up to {@link #STALL_ALLOWANCE_NANOS} in total per wait; after that allowance is used up, further
+ * stall time counts. A blocked head also has a nonrenewable {@link #RETENTION_NANOS} active-time deadline
+ * from the wait's start, so its retention is at most 120 seconds of active time plus the 60 second
+ * allowance, 180 seconds. Qualified progress renews only the 10 second base, through {@link #renew()}, and
+ * only when the owning receiver decides so (see {@link #addCredit(long)}). Local resource waits construct
+ * the timer with {@code excludeStalls=false}, so executor stalls never pause them, and they are never
+ * renewed.
  *
  * <p>The timer has two modes and never mixes them. A timer constructed with a {@link LongSupplier} is
  * boundary-driven: stall intervals are reported with {@link #stallStarted} and {@link #stallEnded} and
@@ -53,6 +57,10 @@ public final class BlockedHeadTimer {
     public static final long TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(10);
     /** Total recorded tick-stall time excluded per wait, 60 seconds (13.10). */
     public static final long STALL_ALLOWANCE_NANOS = TimeUnit.SECONDS.toNanos(60);
+    /** Nonrenewable active-time retention of a blocked head, 120 seconds (13.10, 13.12). */
+    public static final long RETENTION_NANOS = TimeUnit.SECONDS.toNanos(120);
+    /** Qualifying encoded wire bytes that renew the base deadline, 64 KiB (13.10). */
+    public static final long RENEWAL_BYTES = 64L * 1024L;
 
     /** The boundary clock; null in cumulative mode. */
     private final LongSupplier clock;
@@ -68,6 +76,11 @@ public final class BlockedHeadTimer {
     private long coveredEndOffset;
     private boolean inStall;
     private long stallBeganOffset;
+
+    // Renewal state, shared by both modes: active time at the last renewal (0 for the wait's start) and the
+    // qualifying bytes credited since then, saturating at RENEWAL_BYTES.
+    private long renewedActiveNanos;
+    private long creditBytes;
 
     // Cumulative mode state: an explicit initialization flag, never a negative sentinel.
     private boolean initialized;
@@ -119,6 +132,8 @@ public final class BlockedHeadTimer {
             coveredEndOffset = 0;
             inStall = false;
             stallBeganOffset = 0;
+            renewedActiveNanos = 0;
+            creditBytes = 0;
             return;
         }
         StallClock.Sample sample = source.sample();
@@ -130,7 +145,95 @@ public final class BlockedHeadTimer {
         lastNowNanos = baseNowNanos;
         lastExcludedNanos = baseExcludedNanos;
         initialized = true;
+        renewedActiveNanos = 0;
+        creditBytes = 0;
         running = true;
+    }
+
+    /**
+     * Credits qualifying encoded wire bytes toward the next renewal (13.10). The receiver calls this once per
+     * waiting head for each qualifying commit. Credit saturates at {@link #RENEWAL_BYTES} and is discarded by
+     * {@link #renew()}.
+     */
+    public void addCredit(long bytes) {
+        if (bytes <= 0) {
+            return;
+        }
+        creditBytes = bytes >= RENEWAL_BYTES - creditBytes ? RENEWAL_BYTES : creditBytes + bytes;
+    }
+
+    /** Reports whether the credit since the last renewal reached {@link #RENEWAL_BYTES}. */
+    public boolean creditReached() {
+        return creditBytes >= RENEWAL_BYTES;
+    }
+
+    /**
+     * Renews the 10 second base from the current active time and discards any surplus credit (13.10). The
+     * receiver calls it only for an unexpired wait that has qualified progress; it is a no-op on a stopped
+     * timer. The absolute retention deadline is unaffected.
+     */
+    public void renew() {
+        if (!running) {
+            return;
+        }
+        renewedActiveNanos = activeNanos();
+        creditBytes = 0;
+    }
+
+    /**
+     * As {@link #renew()}, from a given observation, so a renewal and the expiry decision that preceded it use the
+     * same reading. A null observation (a stopped timer) is a no-op.
+     */
+    public void renew(Observation now) {
+        if (now == null) {
+            return;
+        }
+        renewedActiveNanos = now.activeNanos();
+        creditBytes = 0;
+    }
+
+    /** As {@link #expired()}, from a given observation (null, for a stopped timer, is not expired). */
+    public boolean expired(Observation now) {
+        return now != null && now.activeNanos() - renewedActiveNanos >= TIMEOUT_NANOS;
+    }
+
+    /** As {@link #absoluteExpired()}, from a given observation (null, for a stopped timer, is not expired). */
+    public boolean absoluteExpired(Observation now) {
+        return now != null && now.activeNanos() >= RETENTION_NANOS;
+    }
+
+    /**
+     * Reports whether the base deadline has been reached: 10 seconds of active time since the wait's start or
+     * its last renewal. A resource wait is never renewed, so for it this is the 10 second base from the start.
+     */
+    public boolean expired() {
+        if (source != null) {
+            Observation observation = observe();
+            return observation != null && observation.activeNanos() - renewedActiveNanos >= TIMEOUT_NANOS;
+        }
+        return running && activeNanos() - renewedActiveNanos >= TIMEOUT_NANOS;
+    }
+
+    /**
+     * Reports whether the nonrenewable retention deadline has been reached: {@link #RETENTION_NANOS} of active
+     * time since the wait's start, independent of renewals (13.10, 13.12).
+     */
+    public boolean absoluteExpired() {
+        if (source != null) {
+            Observation observation = observe();
+            return observation != null && observation.activeNanos() >= RETENTION_NANOS;
+        }
+        return running && activeNanos() >= RETENTION_NANOS;
+    }
+
+    /** Active time at the last renewal, 0 for the wait's start; diagnostics only. */
+    long renewedActiveNanos() {
+        return renewedActiveNanos;
+    }
+
+    /** Qualifying bytes credited since the last renewal, saturating at {@link #RENEWAL_BYTES}; diagnostics only. */
+    long creditBytes() {
+        return creditBytes;
     }
 
     /** Stops the wait, for example when the head is enqueued (Q) or released. */
@@ -224,26 +327,39 @@ public final class BlockedHeadTimer {
         return Math.max(0, elapsed - excludedNanos());
     }
 
-    /** Reports whether the wait has reached its 10 second base. */
-    public boolean expired() {
-        if (source != null) {
-            Observation observation = observe();
-            return observation != null && observation.elapsedNanos - observation.exclusionNanos >= TIMEOUT_NANOS;
+    /**
+     * One coherent observation of this running wait: the active time and the excluded stall time derived from
+     * one reading of the clock (boundary mode) or of one source sample (cumulative mode). Returns null while the
+     * wait is not running, so a stopped timer reads nothing and throws nothing. A cumulative timer takes exactly
+     * one new sample here.
+     */
+    public Observation observe() {
+        if (!running) {
+            return null;
         }
-        return running && activeNanos() >= TIMEOUT_NANOS;
+        if (source == null) {
+            long offset = waitOffset(clock.getAsLong());
+            return new Observation(offset, excludeStalls ? exclusionAt(offset) : 0);
+        }
+        return observe(source.sample());
     }
 
     /**
-     * One cumulative observation: exactly one sample of the source, validated against the last accepted
-     * reading and reduced to the wait-relative elapsed time and excluded stall time. Returns null while
-     * the wait is not running, so a stopped timer neither reads its source nor throws.
+     * Reduces one given cumulative sample to an observation, validated against the last accepted reading of this
+     * timer (13.10). A receiver that settles several waits in one step passes the same sample to each timer, so
+     * every decision of that step is taken from one reading. Returns null while the wait is not running; throws
+     * {@link StallClock.UnavailableException} for an invalid or malformed sample, leaving this timer unchanged.
+     *
+     * @throws IllegalStateException on a boundary timer, which has no cumulative samples
      */
-    private Observation observe() {
+    public Observation observe(StallClock.Sample sample) {
+        if (source == null) {
+            throw new IllegalStateException("a boundary timer has no cumulative sample");
+        }
         if (!running || !initialized) {
             return null;
         }
-        StallClock.Sample sample = source.sample();
-        if (!sample.valid()) {
+        if (sample == null || !sample.valid()) {
             throw new StallClock.UnavailableException("stall source is not valid");
         }
         long now = sample.nowNanos();
@@ -261,6 +377,15 @@ public final class BlockedHeadTimer {
             exclusion = Math.min(STALL_ALLOWANCE_NANOS, total - baseExcludedNanos);
         }
         return new Observation(elapsed, exclusion);
+    }
+
+    /** Excluded stall time at {@code nowOffset} of a running boundary timer, capped at the allowance. */
+    private long exclusionAt(long nowOffset) {
+        long total = excluded;
+        if (inStall) {
+            total = addCapped(total, coverage(nowOffset));
+        }
+        return total;
     }
 
     /** A rejected cumulative timer boundary notification. */
@@ -325,14 +450,37 @@ public final class BlockedHeadTimer {
         return total + delta;
     }
 
-    /** One coherent cumulative observation: both fields come from the same single sample. */
-    private static final class Observation {
-        final long elapsedNanos;
-        final long exclusionNanos;
+    /**
+     * One coherent observation of a wait: every field comes from the same single reading. Decisions made from one
+     * observation (expiry, phrase classification, renewal) therefore never disagree with each other.
+     */
+    public static final class Observation {
+        private final long elapsedNanos;
+        private final long exclusionNanos;
 
         Observation(long elapsedNanos, long exclusionNanos) {
             this.elapsedNanos = elapsedNanos;
             this.exclusionNanos = exclusionNanos;
+        }
+
+        /** Active time of this observation: elapsed minus excluded, never negative. */
+        public long activeNanos() {
+            return Math.max(0, elapsedNanos - exclusionNanos);
+        }
+
+        /** Reports whether any recorded stall time was excluded in this observation (blocks the phrase, 13.12). */
+        public boolean stallConsumed() {
+            return exclusionNanos > 0;
+        }
+
+        /** Elapsed transport time since the wait started, stall time included; diagnostics only. */
+        long elapsedNanos() {
+            return elapsedNanos;
+        }
+
+        /** Excluded stall time of this observation, capped at the allowance; diagnostics only. */
+        long exclusionNanos() {
+            return exclusionNanos;
         }
     }
 }

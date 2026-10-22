@@ -1673,13 +1673,30 @@ before this revision can run.
      only under the bounded accepted-commit rule above; over-threshold units have Q but not D.
      Each endpoint uses its local monotonic transport clock for network/incomplete/resource
       waits (only the incomplete-read pause expressly specified in 13.12 applies), and its
-      local executor-active clock for decode/application work. A blocked-head timer starts
-      once when the record becomes a dependency-blocked lane head and never resets when
-      prerequisites change or partly resolve. It uses the transport clock and never pauses for
-      ordinary FIFO queueing; exclude only recorded executor tick-stall intervals, up to 60
-      seconds total per wait. After that allowance is consumed, the timer runs through any
-      further stall and expires; classify its expiry under 13.12. Thus retention is at most
-      10 seconds plus 60 seconds. The
+      local executor-active clock for decode/application work. A blocked-head wait starts once
+      when the record becomes a dependency-blocked lane head. It has two deadlines on the local
+      monotonic transport clock, neither paused for ordinary FIFO queueing: a no-qualified-progress
+      deadline of 10 seconds of active time, and a nonrenewable absolute-retention deadline of 120
+      seconds of active time from the wait's start. Active time excludes recorded executor
+      tick-stall intervals, up to 60 seconds TOTAL per head; that allowance is never replenished,
+      and stall time beyond it counts. Maximum retention is therefore 180 seconds. Classify each
+      expiry under 13.12. Changing or partly resolving prerequisites does not reset the wait. Only
+      qualified progress renews the no-progress deadline: a validated unit committing D on an
+      unresolved prerequisite's stream, including a transitive prerequisite, whose opening sequence
+      is at or below that prerequisite's required sequence, judged on the head's pre-commit chain.
+      It renews only when (a) that commit reaches the head's OWN direct dependency entry on that
+      stream while the entry is still unresolved, or (b) qualifying commits since the previous
+      renewal total at least 64 KiB of encoded wire bytes. Arm (a) applies only to the waiting
+      head's own direct dependency entries: a commit on a transitive-only prerequisite earns byte
+      credit under (b) and never renews under (a), so a chain of tiny records cannot re-arm the
+      deadline through an intermediate head. The expiry decision and the renewal of one commit
+      use one observation of the transport clock and stall source, so an expiry reached at that
+      observation is never renewed. Renewal discards surplus credit, and each commit counts once
+      per waiting head. Raw arrivals, partial records,
+      Q advancement, transport acknowledgments and unrelated commits earn no credit. An expiry
+      already reached in the pre-commit state cannot be rescued by a later commit; that commit is
+      not applied, and the expiry closes ahead of any 0x11 the commit would otherwise raise. These numbers
+      are proposed operational defaults, not measured guarantees. The
       receiver cannot distinguish an honestly lost prerequisite from a forged future one.
       Dependency chains are bounded by composition: cycles close immediately, and every
       seen-but-blocked chain ends at an unseen record, one being executed, or a queued unit
@@ -1706,9 +1723,10 @@ before this revision can run.
      stalled executor eventually fills the bound and holds D, stopping further delivery and
      reads on the held stream; other streams can only fill their reserved head slots. No
      post-Q application timeout applies to the held unit, and no resource timer starts solely
-     for this executor wait. Dependency-blocked heads still expire after 10 seconds of counted
-     transport time with at most 60 seconds of recorded tick-stall exclusion (13.12); an
-     executor-held prerequisite makes that a local/resource close, not peer misconduct.
+     for this executor wait. Dependency-blocked heads still expire under their no-progress and
+     absolute-retention deadlines (13.10, 13.12), with at most 60 seconds of recorded tick-stall
+     exclusion per head; an executor-held prerequisite makes that a local/resource close, not
+     peer misconduct.
      Incomplete-read timers retain their same-lane pause rule; transport idle/dead-path rules
      remain independent. Never advance D over the bound merely to evade a stall.
 11. **13.11 Barrier example.** CONTROL spawn 5 precedes REALTIME move 9, whose explicit
@@ -2066,11 +2084,11 @@ before this revision can run.
      among several live identities inherit its bad score; a lone newcomer's residual is stated above). Scores only choose among eligible holders, never protected shares.
     Incomplete record/bundle: 10 seconds from first byte on the local monotonic transport
      clock. Only that same lane's own executor-held unit pauses its incomplete-read timer;
-     REALTIME occupancy never pauses CONTROL's timer, and vice versa. A blocked-head timer
-     starts once when the record becomes a dependency-blocked lane head and runs for 10 seconds
-     of transport time. It never pauses for ordinary FIFO queueing and never resets as
-     prerequisites change or partly resolve. Subtract recorded executor tick-stall intervals,
-     up to 60 seconds total per wait; retention is at most 70 seconds. The receiver cannot
+     REALTIME occupancy never pauses CONTROL's timer, and vice versa. A blocked-head wait (13.10)
+     starts once when the record becomes a dependency-blocked lane head. Its 10-second
+     no-qualified-progress deadline renews only on qualified progress; its 120-second
+     absolute-retention deadline never renews. Executor tick-stall exclusion is capped at 60
+     seconds TOTAL per head, so retention is at most 180 seconds. The receiver cannot
      distinguish an honestly lost prerequisite from a forged future dependency. A prerequisite
      is locally withheld while a tick stall is recorded, while that lane has unread
      bytes in our native receive window that we are not reading, or while its FIFO-accepted
@@ -2135,10 +2153,13 @@ before this revision can run.
      12.14 join-retry limiter's non-resource exponential schedule; this split is deliberate:
      the asymmetric case's shortest step applies to the failure cache only, never to the limiter. Shared-pool `0x12`
      aborts on a live path never do this.
-     **Deadline precedence:** Any unseen-prerequisite expiry closes the connection with the
+     **Deadline precedence:** A no-qualified-progress unseen-prerequisite expiry closes the connection with the
       current local/resource code (`0x12`), never `0x11`, because the
-      receiver cannot distinguish honest loss from a forged dependency. The sender of that
-      close puts the fixed ASCII reason phrase `unseen-prerequisite` in the CONNECTION_CLOSE
+      receiver cannot distinguish honest loss from a forged dependency. When a no-progress
+      expiry and an absolute-retention expiry are both reached, the no-progress expiry applies.
+      Absolute-retention expiry closes generic resource `0x12`, without the `unseen-prerequisite`
+      phrase or its counted failure-cache event. The sender of a no-progress expiry close puts the
+      fixed ASCII reason phrase `unseen-prerequisite` in the CONNECTION_CLOSE
       frame (authenticated after the handshake). Any other reason phrase, or none, on a
       local/resource-code close means generic shedding or refusal. A server MUST NOT send the
       phrase, and closes as generic resource instead, when the expired wait consumed any
@@ -2154,14 +2175,15 @@ before this revision can run.
        all of these is not counted and keeps its normal classification; only a peer resource
        close before SERVER_SWITCH verifies uses 12.14's bounded pre-verification allowance), and (b) its own blocked-head timer expiries under the same conditions
        (no recorded stall time consumed, nothing locally withheld). Generic resource closes,
-       pool refusals and shedding never count and never write the cache. After two counted
+       absolute-retention expiries (13.12, "Deadline precedence"), pool refusals and shedding
+       never count and never write the cache. After two counted
        events within 10 minutes the client writes a failure-cache entry at the SHORTEST
        backoff step, so the next join uses TCP until it expires. This entry never shortens or
        resets an existing longer non-resource backoff window and never changes its exponent.
        An individual close writes no entry, except through 12.14's existing client-local
        zero-progress rule. The server logs a rate-limited warning per IP under the existing
        warning limits. Residual: an attacker forging future dependencies gets a resource close
-       rather than `0x11`; memory remains bounded by 70 seconds, and it ranks with zero lane
+       rather than `0x11`; memory remains bounded by 180 seconds, and it ranks with zero lane
        progress and remains eligible for shedding under the existing ranking. Pressure from
        other clients or a long server stall cannot produce a counted event, so shedding never
        moves honest clients to TCP.
