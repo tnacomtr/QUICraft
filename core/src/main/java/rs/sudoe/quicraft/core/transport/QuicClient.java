@@ -11,6 +11,7 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.quic.QuicChannel;
+import io.netty.handler.codec.quic.QuicChannelBootstrap;
 import io.netty.handler.codec.quic.QuicClientCodecBuilder;
 import io.netty.handler.codec.quic.QuicSslContext;
 import io.netty.handler.codec.quic.QuicSslContextBuilder;
@@ -18,6 +19,7 @@ import io.netty.handler.codec.quic.QuicSslEngine;
 import io.netty.handler.codec.quic.QuicStreamChannel;
 import io.netty.handler.codec.quic.QuicStreamType;
 import io.netty.handler.codec.quic.SslEarlyDataReadyEvent;
+import io.netty.handler.ssl.SslHandshakeCompletionEvent;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.ScheduledFuture;
 import java.net.InetSocketAddress;
@@ -212,6 +214,8 @@ public final class QuicClient {
         if (config == null) {
             throw new NullPointerException("config");
         }
+        JoinDiag diag = newJoinDiag();
+        JoinDiag.mark(diag, "dial start");
         if (!QuicSupport.hasMaxFlowControlWindows()) {
             CompletableFuture<V3Connection> unavailable = new CompletableFuture<V3Connection>();
             unavailable.completeExceptionally(new V3UnavailableException(
@@ -219,9 +223,11 @@ public final class QuicClient {
                             + " fall back to /2 or TCP"));
             return unavailable;
         }
+        JoinDiag.mark(diag, "native checked");
         TransportConfig effective = config.withMultistream();
-        return connectV3(codec -> new Bootstrap().group(group()).channel(NioDatagramChannel.class).handler(codec)
-                .bind(0), remote, fingerprint, table, effective, early, bypassResumption);
+        return connectV3(codec -> new Bootstrap().group(group()).channel(NioDatagramChannel.class)
+                .handler(JoinDatagramProbe.wrap(codec, diag)).bind(0),
+                remote, fingerprint, table, effective, early, bypassResumption, diag);
     }
 
     /**
@@ -238,6 +244,8 @@ public final class QuicClient {
         // Every path below closes the socket through this one guard, so it is closed at most once
         // (the channel's close and the failed-attempt hook can both reach it).
         OnceClosingSocket guarded = socket == null ? null : new OnceClosingSocket(socket);
+        JoinDiag diag = newJoinDiag();
+        JoinDiag.mark(diag, "dial start");
         try {
             if (table == null) {
                 throw new NullPointerException("table");
@@ -256,10 +264,14 @@ public final class QuicClient {
                                 + " fall back to /2 or TCP"));
                 return unavailable;
             }
+            JoinDiag.mark(diag, "native checked");
             CompletableFuture<V3Connection> result = connectV3(codec -> {
                 HostedDatagramChannel udp = null;
                 try {
                     udp = new HostedDatagramChannel(guarded);
+                    if (diag != null) {
+                        udp.pipeline().addLast(new JoinDatagramProbe(diag));
+                    }
                     udp.pipeline().addLast(codec);
                     return new HostedEventLoop(loop).register(udp);
                 } catch (RuntimeException | Error setupFailure) {
@@ -270,7 +282,7 @@ public final class QuicClient {
                     }
                     throw setupFailure;
                 }
-            }, remote, fingerprint, table, config.withMultistream(), early, bypassResumption);
+            }, remote, fingerprint, table, config.withMultistream(), early, bypassResumption, diag);
             // The hosted socket becomes channel-owned on registration, but a failed/cancelled
             // attempt may fail before the channel factory ever takes ownership of it.
             result.whenComplete((connection, error) -> {
@@ -343,13 +355,14 @@ public final class QuicClient {
 
     private static CompletableFuture<V3Connection> connectV3(UdpFactory udpFactory, InetSocketAddress remote,
             Fingerprint fingerprint, RoutingTable table, TransportConfig config, EarlyFlight early,
-            boolean bypassResumption) {
+            boolean bypassResumption, JoinDiag diag) {
         CompletableFuture<V3Connection> result = new CompletableFuture<V3Connection>();
         try {
             // bypassResumption: a context cached nowhere, so the stored tickets stay untouched and
             // the next ordinary dial still resumes (12.16).
             Tls tls = bypassResumption ? new Tls(fingerprint, config.earlyData, Protocol.ALPN_V3)
                     : tls(fingerprint, config, Protocol.ALPN_V3);
+            JoinDiag.mark(diag, "TLS context ready");
             V3Dial dial = new V3Dial(fingerprint, config, table, tls);
             String peerHost = remote.getAddress().getHostAddress();
             int peerPort = remote.getPort();
@@ -357,18 +370,21 @@ public final class QuicClient {
                     .sslEngineProvider(q -> {
                         QuicSslEngine e = dial.tls.get().context.newEngine(q.alloc(), peerHost, peerPort);
                         dial.engine.set(e);
+                        JoinDiag.mark(diag, "TLS engine created");
                         return e;
                     })
                     .build();
+            JoinDiag.mark(diag, "codec built");
             udpFactory.open(codec).addListener((ChannelFuture opened) -> {
                 if (!opened.isSuccess()) {
                     opened.channel().close();
                     result.completeExceptionally(opened.cause());
                     return;
                 }
+                JoinDiag.mark(diag, "UDP socket open");
                 V3Attempt attempt = new V3Attempt(opened.channel(), remote,
                         EarlyCache.server(remote, fingerprint, Protocol.ALPN_V3),
-                        config.earlyData && config.sessionResumption ? early : null, result, dial);
+                        config.earlyData && config.sessionResumption ? early : null, result, dial, diag);
                 attempt.start();
             });
         } catch (Throwable t) {
@@ -548,6 +564,15 @@ public final class QuicClient {
     private static Supplier<JoinDiag> joinDiagSource() {
         Supplier<JoinDiag> source = testJoinDiagSource;
         return source == null ? () -> JoinDiag.create(JoinDiag.Side.CLIENT) : source;
+    }
+
+    /** One attempt's join marks, or null when they are off or cannot be made; never throws. */
+    private static JoinDiag newJoinDiag() {
+        try {
+            return joinDiagSource().get();
+        } catch (Throwable ignored) {
+            return null; // diagnostics never touch a join
+        }
     }
 
     private static void beforeConnectCompletionForTests() {
@@ -887,10 +912,10 @@ public final class QuicClient {
         /** Nanos at which the first connect started; the handshake time is measured from it. */
         private volatile long connectStart;
         /** This attempt's join marks, or null when {@code -Dquicraft.v3.joindiag} is off. */
-        private JoinDiag diag;
+        private final JoinDiag diag;
 
         V3Attempt(Channel udp, InetSocketAddress remote, List<Object> server, EarlyFlight early,
-                CompletableFuture<V3Connection> result, V3Dial dial) {
+                CompletableFuture<V3Connection> result, V3Dial dial, JoinDiag diag) {
             this.udp = udp;
             this.remote = remote;
             this.server = server;
@@ -898,6 +923,7 @@ public final class QuicClient {
             lastEarly = early == null ? "not requested" : "no early-data event";
             this.result = result;
             this.dial = dial;
+            this.diag = diag;
         }
 
         void start() {
@@ -911,18 +937,13 @@ public final class QuicClient {
             if (result.isDone()) {
                 return; // cancelled while the socket opened
             }
-            try {
-                diag = joinDiagSource().get();
-            } catch (Throwable ignored) {
-                diag = null; // diagnostics never touch a join
-            }
             JoinDiag.mark(diag, "connect start");
             connectStart = System.nanoTime();
             connect();
         }
 
         private void connect() {
-            Future<QuicChannel> connecting = QuicChannel.newBootstrap(udp)
+            QuicChannelBootstrap bootstrap = QuicChannel.newBootstrap(udp)
                     .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MILLIS)
                     .handler(new ChannelInboundHandlerAdapter() {
                         @Override
@@ -930,12 +951,17 @@ public final class QuicClient {
                             QuicChannel channel = (QuicChannel) ctx.channel();
                             quic.set(channel);
                             JoinDiag.attach(channel, diag);
+                            JoinDiag.mark(diag, "QUIC channel added");
                         }
 
                         @Override
                         public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
                             if (evt instanceof SslEarlyDataReadyEvent) {
                                 sendEarly((QuicChannel) ctx.channel());
+                            }
+                            if (evt instanceof SslHandshakeCompletionEvent
+                                    && ((SslHandshakeCompletionEvent) evt).isSuccess()) {
+                                JoinDiag.mark(diag, "TLS handshake complete");
                             }
                             ctx.fireUserEventTriggered(evt);
                         }
@@ -961,8 +987,10 @@ public final class QuicClient {
                             current.acceptPeerStream(stream);
                         }
                     })
-                    .remoteAddress(remote)
-                    .connect();
+                    .remoteAddress(remote);
+            JoinDiag.mark(diag, "bootstrap built");
+            Future<QuicChannel> connecting = bootstrap.connect();
+            JoinDiag.mark(diag, "connect called");
             connecting.addListener(f -> {
                 if (!f.isSuccess()) {
                     Throwable cause = f.cause();
