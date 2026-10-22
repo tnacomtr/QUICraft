@@ -454,7 +454,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         });
         row.addProperty("buildCommit", o.commit);
         row.addProperty("variant", o.variant);
-        row.addProperty("busyTimer", Boolean.getBoolean("quicraft.v3.batchTimerBusy"));
+        row.addProperty("busyTimer", !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")));
         row.add("net", JsonNull.INSTANCE);
         row.add("quic", JsonNull.INSTANCE);
         return row;
@@ -572,10 +572,10 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             String variant = System.getProperty("quicraft.gametest.armVariant", "plain");
             check(variant.equals("plain") || variant.equals("busy"),
                     "quicraft.gametest.armVariant must be plain or busy, got " + variant);
-            check(!variant.equals("busy") || Boolean.getBoolean("quicraft.v3.batchTimerBusy"),
+            check(!variant.equals("busy") || !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")),
                     "the busy variant needs -Dquicraft.v3.batchTimerBusy=true on the client");
-            check(variant.equals("busy") || !Boolean.getBoolean("quicraft.v3.batchTimerBusy"),
-                    "the plain variant must not run with -Dquicraft.v3.batchTimerBusy=true");
+            check(variant.equals("busy") || !!"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")),
+                    "the plain variant needs -Dquicraft.v3.batchTimerBusy=false");
             check(!variant.equals("busy") || arm.equals("quic3"), "only the quic3 arm has a busy-timer variant");
             if (arm.equals("quic3")) {
                 check(Boolean.getBoolean("quicraft.multistream.offlineTest"),
