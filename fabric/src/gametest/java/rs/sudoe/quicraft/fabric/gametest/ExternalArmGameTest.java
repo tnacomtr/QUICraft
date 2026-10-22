@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package rs.sudoe.quicraft.fabric.gametest;
 
-import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
@@ -9,9 +8,7 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -26,6 +23,7 @@ import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.ping.ServerboundPingRequestPacket;
+import net.minecraft.world.phys.Vec3;
 import rs.sudoe.quicraft.core.connect.ClientConnector;
 import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
@@ -38,15 +36,38 @@ import rs.sudoe.quicraft.fabric.client.Screens;
  * Opt-in benchmark sample (-Pquicraft.arm=tcp|quic2|quic3 with -Pquicraft.armServer=host:port and
  * the other -Pquicraft.arm* properties, see testkit/run-external-arms.sh): ONE join of the real
  * client to an outside server per JVM, over exactly the arm's transport (no fallback), timed at
- * the events BenchSession uses, then a fixed idle play window with a play ping every 5 ticks.
- * Writes one RunResult row in the arm document envelope. The row's transport identity is what the
- * live connection negotiated (ExternalArmObserver), never just the arm's label; a mismatch fails
- * the row. Keep it out of the default entrypoint list: the runner narrows to this class.
+ * the events BenchSession uses, then a fixed play window with a play ping every 5 ticks. The window
+ * is idle by default; {@code -Pquicraft.armMove=true} makes the client sprint forward in a long arc
+ * for {@code -Pquicraft.armMoveSeconds} seconds (default 60), so the server keeps streaming new
+ * chunks. Writes one RunResult row in the arm document envelope. The row's transport identity is
+ * what the live connection negotiated (ExternalArmObserver), never just the arm's label; a mismatch
+ * fails the row. Keep it out of the default entrypoint list: the runner narrows to this class.
  */
 public class ExternalArmGameTest implements FabricClientGameTest {
     private static final Pattern COMMIT = Pattern.compile("[0-9a-f]{40}");
     private static final Set<String> NETEM = Set.of("clean", "loss", "delay", "delayloss", "reorder", "jitter", "slow");
     private static final int PING_EVERY_TICKS = 5;
+    /** A play-window tick whose wall time exceeds this is counted as a client stall. */
+    private static final double STALL_TICK_MS = 250.0;
+    /**
+     * Moving mode: the client holds forward and sprint, turns this many degrees this often (a wide
+     * arc, radius ~320 blocks at sprint speed, so a 60 s walk stays inside the testkit's
+     * pre-generated 384-block square) and presses jump every so often to climb small steps.
+     */
+    private static final int TURN_EVERY_TICKS = 20;
+    private static final float TURN_DEGREES = 1.0f;
+    private static final int JUMP_EVERY_TICKS = 40;
+    // Sustained-load evidence: at least 0.5 horizontal metres/second and one new chunk/5 seconds.
+    private static final double MIN_MOVE_METRES_PER_SECOND = 0.5;
+    /**
+     * A bound on where the moving path may start, not an exact start. The testkit server is a
+     * fixed-seed world whose spawn is at the origin and the vanilla spawn radius is 10 blocks, so a
+     * start further from the origin than this means the world is not the expected one and the row
+     * fails closed. Accepted starts can still differ by tens of blocks (and in terrain), so arms are
+     * comparable only as statistics over rounds; the start is recorded in every row.
+     */
+    private static final double START_AREA_METRES = 32.0;
+    private static final double MIN_MOVE_CHUNKS_PER_SECOND = 0.2;
     private static final long QUIET_NANOS = 2_000_000_000L;
     private static final int JOIN_TIMEOUT_TICKS = 20 * 90;
     private static final int CHUNK_TIMEOUT_TICKS = 20 * 60;
@@ -109,6 +130,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             check(client.connector().advertisements().fresh(key).isPresent(), "advertisement not cached for " + key);
         }
         ArmClock.reset();
+        StallLog.reset();
         SENT.clear();
         // Any status query inside the timed window throws at its hook (so it cannot succeed quietly)
         // and is recorded; the row then fails below.
@@ -155,28 +177,13 @@ public class ExternalArmGameTest implements FabricClientGameTest {
                 ExternalArmObserver.traceChunkLoadFinished(c.getConnection().getConnection());
             }
         });
-        // Idle play window: a play ping every 5 ticks, identical in every arm.
-        int sent = 0;
-        int ticks = o.playSeconds * 20;
-        for (int t = 0; t < ticks; t++) {
-            if (t % PING_EVERY_TICKS == 0) {
-                boolean ok = context.computeOnClient(c -> {
-                    if (c.getConnection() == null) {
-                        return false;
-                    }
-                    long now = System.nanoTime();
-                    SENT.add(now);
-                    c.getConnection().send(new ServerboundPingRequestPacket(now));
-                    return true;
-                });
-                if (!ok) {
-                    return failedRow(o, "disconnected during play");
-                }
-                sent++;
-            }
-            context.waitTick();
+        // Play window: idle, or moving with -Pquicraft.armMove=true. A play ping every 5 ticks in
+        // both, so the RTT samples are comparable.
+        Window window = playWindow(context, o);
+        if (window == null) {
+            return failedRow(o, "disconnected during play");
         }
-        for (int t = 0; ArmClock.rtts.size() < sent && t < 40; t++) {
+        for (int t = 0; ArmClock.rtts.size() < window.sent && t < 40; t++) {
             context.waitTick(); // 2 s grace for the last pongs
         }
         // Still armed through chunk load and play; the finally in runTest disarms it.
@@ -210,7 +217,18 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         }
         double[] sorted = rtt.stream().mapToDouble(Double::doubleValue).sorted().toArray();
         JsonObject row = baseRow(o);
-        boolean ok = mismatch == null && sorted.length > 0;
+        boolean movedOk = !o.move || (window.distance >= MIN_MOVE_METRES_PER_SECOND * window.seconds
+                && window.chunks >= Math.ceil(MIN_MOVE_CHUNKS_PER_SECOND * window.seconds));
+        boolean startOk = !o.move || (Math.abs(window.start.x) <= START_AREA_METRES
+                && Math.abs(window.start.z) <= START_AREA_METRES);
+        boolean ok = mismatch == null && sorted.length > 0 && movedOk && startOk;
+        if (mismatch == null && !startOk) {
+            mismatch = String.format(Locale.ROOT, "the moving window started outside the fixed spawn area: %.1f, %.1f",
+                    window.start.x, window.start.z);
+        } else if (mismatch == null && !movedOk) {
+            mismatch = String.format(Locale.ROOT, "the moving window proved no movement: %.2f m, %d chunks",
+                    window.distance, window.chunks);
+        }
         row.addProperty("ok", ok);
         add(row, "phasesMs", phases);
         row.addProperty("joinMs", phases[3]);
@@ -220,7 +238,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         row.addProperty("rttMedianMs", percentile(sorted, 0.5));
         row.addProperty("rttP95Ms", percentile(sorted, 0.95));
         row.addProperty("rttSamples", sorted.length);
-        row.addProperty("rttLost", sent - sorted.length);
+        row.addProperty("rttLost", window.sent - sorted.length);
         row.addProperty("disconnected", false);
         row.add("error", mismatch != null ? new com.google.gson.JsonPrimitive(mismatch)
                 : sorted.length == 0 ? new com.google.gson.JsonPrimitive("no pong received") : JsonNull.INSTANCE);
@@ -230,11 +248,130 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         row.addProperty("routingTableSchema", seen.tableSchema());
         row.addProperty("negotiatedAlpn", seen.alpn());
         row.addProperty("negotiatedTransportVerified", mismatch == null);
+        // Play-window detail (extra fields; the arm validators ignore them). moved=false and zero
+        // move values for an idle run, never invented numbers.
+        row.addProperty("moved", o.move);
+        row.addProperty("moveSeconds", window.seconds);
+        row.addProperty("moveDistanceM", window.distance);
+        row.addProperty("moveChunks", window.chunks);
+        row.addProperty("moveChunkRate", window.seconds > 0 ? window.chunks / window.seconds : 0.0);
+        row.addProperty("moveTicks", window.ticks);
+        row.addProperty("moveStallTicks", window.stallTicks);
+        row.addProperty("moveMaxTickMs", window.maxTickMs);
+        if (o.move) {
+            row.addProperty("moveStartX", window.start.x);
+            row.addProperty("moveStartY", window.start.y);
+            row.addProperty("moveStartZ", window.start.z);
+            row.addProperty("moveStartYaw", 0);
+            row.addProperty("moveStartPitch", 0);
+        }
+        row.addProperty("stallDiagEnabled", Boolean.getBoolean("quicraft.v3.stalldiag"));
+        row.addProperty("stallDiagEvents", StallLog.events());
         QuicraftFabricTestLog.info(String.format(Locale.ROOT, "arm %s run %d: join %.1f ms, chunks %d in %.1f ms,"
-                + " rtt median %.2f ms p95 %.2f ms (%d/%d), seen %s, ok %s", o.arm, o.run, phases[3],
+                + " rtt median %.2f ms p95 %.2f ms (%d/%d), moved %s %.1f m %d chunks %.2f/s,"
+                + " stalls %d/%d max %.1f ms, seen %s, ok %s", o.arm, o.run, phases[3],
                 ArmClock.chunks.get(), millis(ArmClock.lastChunkAt.get() - ArmClock.playLoginAt.get()), percentile(sorted, 0.5),
-                percentile(sorted, 0.95), sorted.length, sent, seen, ok));
+                percentile(sorted, 0.95), sorted.length, window.sent, o.move ? "yes" : "no", window.distance,
+                window.chunks, row.get("moveChunkRate").getAsDouble(), window.stallTicks, window.ticks,
+                window.maxTickMs, seen, ok));
         return row;
+    }
+
+    /** One play window's measurements; never a value the run did not observe. */
+    private record Window(int sent, int ticks, long chunks, double seconds, double distance, int stallTicks,
+            double maxTickMs, Vec3 start) {}
+
+    /**
+     * The play window: a ping every {@link #PING_EVERY_TICKS} ticks, and in moving mode the client
+     * holds forward and sprint, turns a degree a second and jumps periodically. Returns null when
+     * the connection was lost.
+     */
+    private static Window playWindow(ClientGameTestContext context, Options o) {
+        int ticks = (o.move ? o.moveSeconds : o.playSeconds) * 20;
+        int sent = 0;
+        // Fresh seeded server per arm; remove client orientation differences before the same path.
+        Vec3 start = context.computeOnClient(c -> {
+            if (o.move) {
+                c.player.setYRot(0);
+                c.player.setYHeadRot(0);
+                c.player.setXRot(0);
+            }
+            return c.player.position();
+        });
+        long startChunks = ArmClock.chunks.get();
+        long startNanos = System.nanoTime();
+        double distance = 0;
+        Vec3 last = start;
+        int stallTicks = 0;
+        double maxTickMs = 0;
+        if (o.move) {
+            context.getInput().holdKey(options -> options.keyUp);
+            context.getInput().holdKey(options -> options.keySprint);
+        }
+        long loopStart = System.nanoTime();
+        boolean jumpHeld = false;
+        try {
+            for (int t = 0; t < ticks; t++) {
+                if (o.move && t > 0 && t % TURN_EVERY_TICKS == 0) {
+                    context.runOnClient(c -> {
+                        float yaw = c.player.getYRot() + TURN_DEGREES;
+                        c.player.setYRot(yaw);
+                        c.player.setYHeadRot(yaw);
+                    });
+                }
+                if (o.move && t > 0 && t % JUMP_EVERY_TICKS == 0) {
+                    // holdKey, not pressKey: pressKey waits a tick itself, which would stretch the
+                    // window past the tick count the row reports.
+                    context.getInput().holdKey(options -> options.keyJump);
+                    jumpHeld = true;
+                }
+                boolean ping = t % PING_EVERY_TICKS == 0;
+                Vec3 position = context.computeOnClient(c -> {
+                    if (c.getConnection() == null || c.player == null) {
+                        return null;
+                    }
+                    if (ping) {
+                        long now = System.nanoTime();
+                        SENT.add(now);
+                        c.getConnection().send(new ServerboundPingRequestPacket(now));
+                    }
+                    return c.player.position();
+                });
+                if (position == null) {
+                    return null;
+                }
+                if (ping) {
+                    sent++;
+                }
+                if (o.move) {
+                    if (last != null) {
+                        distance += Math.hypot(position.x - last.x, position.z - last.z);
+                    }
+                    last = position;
+                }
+                context.waitTick();
+                if (jumpHeld) {
+                    context.getInput().releaseKey(options -> options.keyJump);
+                    jumpHeld = false;
+                }
+                double tickMs = (System.nanoTime() - loopStart) / 1_000_000.0;
+                if (tickMs > STALL_TICK_MS) {
+                    stallTicks++;
+                }
+                maxTickMs = Math.max(maxTickMs, tickMs);
+                loopStart = System.nanoTime();
+            }
+        } finally {
+            if (o.move) {
+                context.getInput().releaseKey(options -> options.keyUp);
+                context.getInput().releaseKey(options -> options.keySprint);
+                if (jumpHeld) {
+                    context.getInput().releaseKey(options -> options.keyJump);
+                }
+            }
+        }
+        return new Window(sent, ticks, ArmClock.chunks.get() - startChunks,
+                (System.nanoTime() - startNanos) / 1_000_000_000.0, distance, stallTicks, maxTickMs, start);
     }
 
     /** One status request over TCP (handshake, request, response); returns the status JSON. */
@@ -288,8 +425,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         throw new IOException("varint too long");
     }
 
-    /** Why the live transport is not the arm's, or null when it is. */
-    private static String mismatch(String arm, ExternalArmObserver.Seen seen) {
+    /** Why the live transport is not the arm's, or null when it is. Shared with the desync sessions. */
+    static String mismatch(String arm, ExternalArmObserver.Seen seen) {
         return switch (arm) {
             case "tcp" -> !seen.quic() && seen.alpn().isEmpty() ? null : "tcp arm negotiated " + seen;
             case "quic2" -> seen.quic() && "quicraft/2".equals(seen.alpn()) && seen.streamCount() == 1
@@ -313,6 +450,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             default -> "QUIC_3";
         });
         row.addProperty("buildCommit", o.commit);
+        row.addProperty("variant", o.variant);
+        row.addProperty("busyTimer", Boolean.getBoolean("quicraft.v3.batchTimerBusy"));
         row.add("net", JsonNull.INSTANCE);
         row.add("quic", JsonNull.INSTANCE);
         return row;
@@ -339,6 +478,16 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         row.addProperty("routingTableSchema", 0);
         row.addProperty("negotiatedAlpn", "");
         row.addProperty("negotiatedTransportVerified", false);
+        row.addProperty("moved", o.move);
+        row.addProperty("moveSeconds", 0.0);
+        row.addProperty("moveDistanceM", 0.0);
+        row.addProperty("moveChunks", 0);
+        row.addProperty("moveChunkRate", 0.0);
+        row.addProperty("moveTicks", 0);
+        row.addProperty("moveStallTicks", 0);
+        row.addProperty("moveMaxTickMs", 0.0);
+        row.addProperty("stallDiagEnabled", Boolean.getBoolean("quicraft.v3.stalldiag"));
+        row.addProperty("stallDiagEvents", StallLog.events());
         return row;
     }
 
@@ -346,6 +495,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         JsonObject doc = new JsonObject();
         doc.addProperty("clientType", "fabric");
         doc.addProperty("arm", o.arm);
+        doc.addProperty("variant", o.variant);
         doc.addProperty("netemProfile", o.netem);
         doc.addProperty("profile", o.netem + switch (o.arm) {
             case "tcp" -> "-tcp";
@@ -356,35 +506,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         JsonArray runs = new JsonArray();
         runs.add(row);
         doc.add("runs", runs);
-        String json = new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(doc) + "\n";
-        check(!Files.exists(o.out), "refusing to overwrite " + o.out);
-        Path tmp = o.out.resolveSibling(o.out.getFileName() + ".tmp");
-        boolean ownsTmp = false;
-        try {
-            // One O_EXCL handle: fails if the name exists (symlink included), so ownership starts here
-            // and the bytes go to the file this call created.
-            try (java.nio.channels.SeekableByteChannel ch = Files.newByteChannel(tmp,
-                    StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
-                ownsTmp = true;
-                java.nio.ByteBuffer bytes = java.nio.ByteBuffer.wrap(json.getBytes(StandardCharsets.UTF_8));
-                while (bytes.hasRemaining()) {
-                    ch.write(bytes);
-                }
-            }
-            // A hard link publishes the complete file atomically and fails if the name exists,
-            // unlike a rename, which would replace a file created after the check above.
-            Files.createLink(o.out, tmp);
-        } catch (IOException e) {
-            throw new AssertionError("could not write " + o.out, e);
-        } finally {
-            try {
-                if (ownsTmp) { // never remove a temp file someone else left there
-                    Files.deleteIfExists(tmp);
-                }
-            } catch (IOException ignored) {
-                // the runner reports a leftover side file
-            }
-        }
+        GameTestJson.write(o.out, doc);
         QuicraftFabricTestLog.info("arm sample written to " + o.out);
     }
 
@@ -418,7 +540,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
     }
 
     private record Options(String arm, String server, String host, int port, Path out, String netem, int run,
-            boolean warmup, String commit, int playSeconds) {
+            boolean warmup, String commit, int playSeconds, boolean move, int moveSeconds, String variant) {
         static Options read(String arm) {
             check(Set.of("tcp", "quic2", "quic3").contains(arm), "quicraft.gametest.arm must be tcp, quic2 or quic3");
             String server = System.getProperty("quicraft.gametest.armServer", "");
@@ -438,12 +560,26 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             check(COMMIT.matcher(commit).matches(), "quicraft.gametest.armCommit must be a 40-hex commit");
             int play = Integer.parseInt(System.getProperty("quicraft.gametest.armPlaySeconds", "20"));
             check(play >= 1 && play <= 120, "quicraft.gametest.armPlaySeconds must be 1..120");
+            String move = System.getProperty("quicraft.gametest.armMove", "false");
+            check(move.equals("true") || move.equals("false"),
+                    "quicraft.gametest.armMove must be true or false, got " + move);
+            int moveSeconds = Integer.parseInt(System.getProperty("quicraft.gametest.armMoveSeconds", "60"));
+            check(moveSeconds >= 1 && moveSeconds <= 600,
+                    "quicraft.gametest.armMoveSeconds must be 1..600");
+            String variant = System.getProperty("quicraft.gametest.armVariant", "plain");
+            check(variant.equals("plain") || variant.equals("busy"),
+                    "quicraft.gametest.armVariant must be plain or busy, got " + variant);
+            check(!variant.equals("busy") || Boolean.getBoolean("quicraft.v3.batchTimerBusy"),
+                    "the busy variant needs -Dquicraft.v3.batchTimerBusy=true on the client");
+            check(variant.equals("busy") || !Boolean.getBoolean("quicraft.v3.batchTimerBusy"),
+                    "the plain variant must not run with -Dquicraft.v3.batchTimerBusy=true");
+            check(!variant.equals("busy") || arm.equals("quic3"), "only the quic3 arm has a busy-timer variant");
             if (arm.equals("quic3")) {
                 check(Boolean.getBoolean("quicraft.multistream.offlineTest"),
                         "quic3 needs -Dquicraft.multistream.offlineTest=true on the client");
             }
             return new Options(arm, server, server.substring(0, colon), port, Path.of(out), netem, run,
-                    Boolean.parseBoolean(warmup), commit, play);
+                    Boolean.parseBoolean(warmup), commit, play, Boolean.parseBoolean(move), moveSeconds, variant);
         }
 
         Mode mode() {

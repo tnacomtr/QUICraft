@@ -6,6 +6,8 @@
 #
 #   testkit/run-external-arms.sh --arm quic3 --run 0 --out-dir /tmp/opencode/arms
 #   testkit/run-external-arms.sh --arm tcp --run 0 --warmup --port 25565 --out-dir ./arms
+#   testkit/run-external-arms.sh --arm quic3 --run 0 --move --move-seconds 60 --stall-diag --out-dir ./arms
+#   testkit/run-external-arms.sh --arm quic3 --run 0 --busy-timer --out-dir ./arms
 #
 # Each invocation:
 #   1. refuses a dirty git tree and records HEAD as the 40-hex build commit;
@@ -37,6 +39,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+. "$here/lib/deadline.sh"
 root="$(cd "$here/.." && pwd)"
 mod="${QUICRAFT_ARM_MOD_JSON:-$root/fabric/src/gametest/resources/fabric.mod.json}"
 entrypoint="rs.sudoe.quicraft.fabric.gametest.ExternalArmGameTest"
@@ -50,15 +53,20 @@ usage() {
     {
         echo "usage: run-external-arms.sh --arm tcp|quic2|quic3 --run N [--warmup] --out-dir DIR"
         echo "                              [--port 25565] [--play-seconds S] [--netem PROFILE]"
+        echo "                              [--move [--move-seconds S]] [--busy-timer] [--stall-diag]"
         echo
         echo "One fresh Fabric server container and one fresh client JVM per invocation."
         echo "  --arm           tcp | quic2 | quic3 (required)"
         echo "  --run           run index, integer >= 0 (required)"
         echo "  --warmup        mark this run as a warm-up (default: false)"
-        echo "  --out-dir       directory for <arm>-<netem>-run<N>.json (required, must not exist yet)"
+        echo "  --out-dir       directory for <arm>-<netem>[-move][-busy]-run<N>.json (required, must not exist yet)"
         echo "  --port          loopback TCP+UDP port; must be 25565, the port the server advertises"
-        echo "  --play-seconds  measured play time (default: 20)"
+        echo "  --play-seconds  measured idle play time (default: 20)"
         echo "  --netem         clean (default) | loss | delay | delayloss | reorder | jitter | slow"
+        echo "  --move          sprint in a wide arc during the play window (default: idle)"
+        echo "  --move-seconds  moving window length (default: 60); only with --move"
+        echo "  --busy-timer    /3 only: the client-side busy batch timer variant (default: plain)"
+        echo "  --stall-diag    turn on core's /3 stall watchdog for this client JVM"
         echo "  --coalesce      -Dquicraft.coalesceWrites=true on server and client"
         echo "  --no-coalesce   -Dquicraft.coalesceWrites=false (without either flag each side uses its default: /3 on, /2 off)"
         echo "  --coalesce-max N  experiment: -Dquicraft.coalesceMaxBytes=N (soft per-stream cap, default 65536)"
@@ -85,6 +93,10 @@ play_seconds="20"
 netem="clean"
 coalesce=""
 coalesce_max=""
+move=false
+move_seconds="60"
+variant="plain"
+stall_diag=false
 
 while (($# > 0)); do
     case "$1" in
@@ -100,6 +112,23 @@ while (($# > 0)); do
             ;;
         --warmup)
             warmup=true
+            shift
+            ;;
+        --move)
+            move=true
+            shift
+            ;;
+        --move-seconds)
+            (($# >= 2)) || refuse "missing value for --move-seconds"
+            move_seconds="$2"
+            shift 2
+            ;;
+        --busy-timer)
+            variant="busy"
+            shift
+            ;;
+        --stall-diag)
+            stall_diag=true
             shift
             ;;
         --coalesce)
@@ -161,10 +190,19 @@ fi
 if ! [[ "$play_seconds" =~ ^[1-9][0-9]{0,6}$ ]]; then
     refuse "--play-seconds must be a positive integer, got '$play_seconds'"
 fi
+if ! [[ "$move_seconds" =~ ^[1-9][0-9]{0,3}$ ]] || ((10#$move_seconds > 600)); then
+    refuse "--move-seconds must be an integer in 1..600, got '$move_seconds'"
+fi
+if [[ "$move" != true && "$move_seconds" != 60 ]]; then
+    refuse "--move-seconds only applies with --move"
+fi
 case "$netem" in
     clean | loss | delay | delayloss | reorder | jitter | slow) ;;
     *) refuse "--netem must be clean, loss, delay, delayloss, reorder, jitter or slow, got '$netem'" ;;
 esac
+if [[ "$variant" == busy && "$arm" != quic3 ]]; then
+    refuse "--busy-timer only applies to the quic3 arm (the batch timer is /3's)"
+fi
 # The container advertises its internal port 25565 for QUIC; the client dials the advertised port
 # on the host it resolved, so the host mapping must be the same number.
 if [[ "$port" != 25565 ]]; then
@@ -213,10 +251,20 @@ if [[ -e "$out_dir" && ! -d "$out_dir" ]]; then
 fi
 mkdir -p "$out_dir" || die "cannot create --out-dir $out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
-out="$out_dir/$arm-$netem-run$run_index.json"
+# The file stem carries the move mode and the /3 variant, so a matrix run of the same arm and
+# round never collides with another variant's evidence.
+file_stem="$arm-$netem"
+if [[ "$move" == true ]]; then
+    file_stem="$file_stem-move"
+fi
+if [[ "$variant" == busy ]]; then
+    file_stem="$file_stem-busy"
+fi
+file_stem="$file_stem-run$run_index"
+out="$out_dir/$file_stem.json"
 # Every side file of this run (status, netem, client log, moved config) shares the prefix: refuse
 # when any of them already exists, so evidence is never overwritten or nested into.
-for existing in "$out_dir/$arm-$netem-run$run_index".*; do
+for existing in "$out_dir/$file_stem".*; do
     if [[ -e "$existing" || -L "$existing" ]]; then
         die "refusing to overwrite existing $existing"
     fi
@@ -263,6 +311,7 @@ cleanup() {
     cleanup_status=$?
     trap - EXIT
     trap '' INT TERM
+    stop_child
     if ! restore_mod; then
         cleanup_status=1
     fi
@@ -270,15 +319,15 @@ cleanup() {
         if [[ "$server_trace" == true ]]; then
             # Opt-in diagnostics only. Stop this invocation's owned Fabric service gracefully before
             # collecting logs, so its final session-disconnect summary survives the later down.
-            "${compose[@]}" stop fabric >/dev/null 2>&1 || echo "WARNING: trace server stop failed" >&2
-            server_log="$out_dir/$arm-$netem-run$run_index.server.log"
-            if "${compose[@]}" logs --no-color fabric >>"$server_log" 2>&1; then
+            timeout --kill-after=30 120 "${compose[@]}" stop fabric >/dev/null 2>&1 || echo "WARNING: trace server stop failed" >&2
+            server_log="$out_dir/$file_stem.server.log"
+            if timeout --kill-after=30 120 "${compose[@]}" logs --no-color fabric >>"$server_log" 2>&1; then
                 echo "server trace log kept at $server_log" >&2
             else
                 echo "WARNING: could not collect server trace log at $server_log" >&2
             fi
         fi
-        if "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1; then
+        if timeout --kill-after=30 120 "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1; then
             echo "removed Compose project $project"
         else
             echo "ERROR: could not remove Compose project $project; run: docker compose -f ${compose_files[0]} -f ${compose_files[1]} -p $project down -v --remove-orphans" >&2
@@ -336,7 +385,8 @@ fi
 echo "narrowed $mod to $entrypoint (original sha256 $backup_sha)"
 
 echo "== build :fabric-26x:testkitMod (image build context, commit $commit)"
-"$root/gradlew" -p "$root" --no-daemon -q :fabric-26x:testkitMod --console=plain \
+echo "== budgets: client 600s (+30s kill grace), builds 3 x 1200s, cleanup commands 120s each"
+bounded 1200 "$root/gradlew" -p "$root" --no-daemon -q :fabric-26x:testkitMod --console=plain \
     || die "the :fabric-26x:testkitMod build failed"
 
 # The base service reads FABRIC_ONLINE_MODE; the real-fabric overlay templates
@@ -352,7 +402,7 @@ fi
 export REAL_FABRIC_MULTISTREAM="$server_multistream" REAL_FABRIC_PORT="$port" REAL_FABRIC_COALESCE="$coalesce" REAL_FABRIC_COALESCE_MAX="$coalesce_max"
 echo "== compose up ($project): fabric mocksession"
 project_started=true
-if ! "${compose[@]}" up -d --build fabric mocksession; then
+if ! bounded 1200 "${compose[@]}" up -d --build fabric mocksession; then
     die "compose up failed for project $project"
 fi
 
@@ -376,26 +426,26 @@ if [[ "$ready" != true ]]; then
     exit 1
 fi
 echo "server is ready: $status_json"
-printf '%s\n' "$status_json" >"$out_dir/$arm-$netem-run$run_index.status.json"
+printf '%s\n' "$status_json" >"$out_dir/$file_stem.status.json"
 
 # netem on the server's own namespace. netem-attach runs for every profile, but clean installs no
 # qdisc, IFB or filter (its status says so); shaped profiles' filter counters prove the game flows
 # were classified.
 echo "== netem $netem on $project"
-"$here/netem-attach.sh" apply --project "$project" --profile "$netem" \
-    >"$out_dir/$arm-$netem-run$run_index.netem-apply.txt" 2>&1 \
-    || { cat "$out_dir/$arm-$netem-run$run_index.netem-apply.txt" >&2; die "netem-attach apply failed"; }
+bounded 120 "$here/netem-attach.sh" apply --project "$project" --profile "$netem" \
+    >"$out_dir/$file_stem.netem-apply.txt" 2>&1 \
+    || { cat "$out_dir/$file_stem.netem-apply.txt" >&2; die "netem-attach apply failed"; }
 
 # A fresh container has a fresh certificate: an old pin would read as CHANGED and /3 offline
 # refuses that. Move the client's previous config aside into the evidence (never delete it).
 client_config="$root/fabric-26x/build/run/clientGameTest/config/quicraft"
 if [[ -e "$client_config" ]]; then
-    mv -T -n "$client_config" "$out_dir/$arm-$netem-run$run_index.client-config-before" \
+    mv -T -n "$client_config" "$out_dir/$file_stem.client-config-before" \
         || die "cannot move the previous client config aside"
 fi
 
 echo "== :fabric-26x:processGametestResources (forced, so the narrowed entrypoint list is used)"
-if ! "$root/gradlew" -p "$root" --no-daemon :fabric-26x:processGametestResources --rerun-tasks --console=plain; then
+if ! bounded 1200 "$root/gradlew" -p "$root" --no-daemon :fabric-26x:processGametestResources --rerun-tasks --console=plain; then
     die "the forced :fabric-26x:processGametestResources build failed"
 fi
 if [[ -f "$processed" ]]; then
@@ -416,7 +466,7 @@ PY
     fi
 fi
 
-client_log="$out_dir/$arm-$netem-run$run_index.client.log"
+client_log="$out_dir/$file_stem.client.log"
 keep_client_log=true
 xvfb=()
 if [[ -z "${DISPLAY:-}" ]]; then
@@ -432,6 +482,10 @@ client=(
     "-Pquicraft.armWarmup=$warmup_value"
     "-Pquicraft.armCommit=$commit"
     "-Pquicraft.armPlaySeconds=$play_seconds"
+    "-Pquicraft.armMove=$move"
+    "-Pquicraft.armMoveSeconds=$move_seconds"
+    "-Pquicraft.armVariant=$variant"
+    "-Pquicraft.armStallDiag=$stall_diag"
     ${coalesce:+"-Pquicraft.armCoalesce=$coalesce"}
     ${coalesce_max:+"-Pquicraft.armCoalesceMax=$coalesce_max"}
     "$module:runClientGameTest"
@@ -439,15 +493,17 @@ client=(
 echo "== client: ${client[*]}"
 echo "== client: ${client[*]}" >>"$client_log"
 client_status=0
-ALSOFT_DRIVERS=null "${xvfb[@]}" "${client[@]}" >>"$client_log" 2>&1 || client_status=$?
+window_seconds=$play_seconds
+[[ "$move" == true ]] && window_seconds=$move_seconds
+bounded "$(client_run_budget "$window_seconds")" env ALSOFT_DRIVERS=null "${xvfb[@]}" "${client[@]}" >>"$client_log" 2>&1 || client_status=$?
 if ((client_status != 0)); then
     keep_client_log=true
-    echo "WARNING: runClientGameTest exited with status $client_status; checking the emitted row anyway (log: $client_log)" >&2
+    die "runClientGameTest exited with status $client_status (log: $client_log); row is not passing evidence"
 fi
 
-"$here/netem-attach.sh" status --project "$project" --profile "$netem" \
-    >"$out_dir/$arm-$netem-run$run_index.netem-status.txt" 2>&1 \
-    || echo "WARNING: netem-attach status failed; see $out_dir/$arm-$netem-run$run_index.netem-status.txt" >&2
+bounded 120 "$here/netem-attach.sh" status --project "$project" --profile "$netem" \
+    >"$out_dir/$file_stem.netem-status.txt" 2>&1 \
+    || echo "WARNING: netem-attach status failed; see $out_dir/$file_stem.netem-status.txt" >&2
 
 if [[ ! -f "$out" ]]; then
     echo "error: the client wrote no sample at $out (runClientGameTest status $client_status)" >&2
@@ -485,7 +541,4 @@ then
     exit 1
 fi
 
-if ((client_status != 0)); then
-    echo "WARNING: accepted the row although runClientGameTest exited with status $client_status (shutdown hang)" >&2
-fi
 echo "OK: $arm run $run_index wrote $out"

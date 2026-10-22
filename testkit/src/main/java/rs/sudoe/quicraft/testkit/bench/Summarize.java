@@ -111,6 +111,51 @@ public final class Summarize {
             pass &= ok;
             md.append(String.format(Locale.ROOT, "| %s | disconnects / failed runs | %s | %d / %d of %d runs | | 0 | %s |%n",
                     profile.getKey(), String.join(", ", perBatch), disconnects, failures, runs, ok ? "pass" : "**FAIL**"));
+            // Moving runs (-Pquicraft.armMove=true) carry their own window numbers. Report them
+            // without folding them into the Phase 0 tolerance gate, which is about join timings.
+            List<JsonObject> moving = new ArrayList<>();
+            for (List<JsonObject> batch : batches.values()) {
+                for (JsonObject r : batch) {
+                    if (r.has("moved") && r.get("moved").isJsonPrimitive() && r.get("moved").getAsBoolean()) {
+                        moving.add(r);
+                    }
+                }
+            }
+            if (!moving.isEmpty()) {
+                List<Double> distances = new ArrayList<>();
+                List<Double> rates = new ArrayList<>();
+                int stalls = 0;
+                double maxTick = 0;
+                boolean sane = true;
+                for (JsonObject r : moving) {
+                    if (!r.get("ok").getAsBoolean()) {
+                        continue;
+                    }
+                    double distance = number(r, "moveDistanceM", 0);
+                    double chunks = number(r, "moveChunks", 0);
+                    if (distance < 1.0 || chunks <= 0) {
+                        sane = false;
+                    }
+                    distances.add(distance);
+                    rates.add(number(r, "moveChunkRate", 0));
+                    stalls += (int) number(r, "moveStallTicks", 0);
+                    maxTick = Math.max(maxTick, number(r, "moveMaxTickMs", 0));
+                }
+                double[] sortedDistances = distances.stream().mapToDouble(Double::doubleValue).sorted().toArray();
+                double[] sortedRates = rates.stream().mapToDouble(Double::doubleValue).sorted().toArray();
+                double medianDistance = sortedDistances.length == 0
+                        ? 0 : BenchClient.median(sortedDistances);
+                double medianRate = sortedRates.length == 0 ? 0 : BenchClient.median(sortedRates);
+                String range = sortedDistances.length == 0 ? "-"
+                        : String.format(Locale.ROOT, "%.1f", sortedDistances[0]) + ".."
+                                + String.format(Locale.ROOT, "%.1f", sortedDistances[sortedDistances.length - 1]);
+                pass &= sane;
+                md.append(String.format(Locale.ROOT,
+                        "| %s | moving window (%d runs) | %.1f m median (%s), %.2f chunks/s median |"
+                                + " %d stalls, max tick %.0f ms | | a moving success moved | %s |%n",
+                        profile.getKey(), distances.size(), medianDistance, range, medianRate,
+                        stalls, maxTick, sane ? "pass" : "**FAIL**"));
+            }
         }
         md.append(String.format(Locale.ROOT, "%nGate: %s%n", pass ? "PASS" : "FAIL"));
         System.out.print(md);
@@ -127,5 +172,14 @@ public final class Summarize {
             parts.add(String.format(Locale.ROOT, "%.1f", v));
         }
         return String.join(", ", parts);
+    }
+
+    /** A moving-window field; rows written before it existed report the fallback, never a guess. */
+    private static double number(JsonObject run, String field, double fallback) {
+        if (!run.has(field) || !run.get(field).isJsonPrimitive() || !run.get(field).getAsJsonPrimitive().isNumber()) {
+            return fallback;
+        }
+        double value = run.get(field).getAsDouble();
+        return Double.isFinite(value) ? value : fallback;
     }
 }

@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import rs.sudoe.quicraft.testkit.Args;
@@ -22,6 +23,68 @@ class MatrixSummarizeTest {
 
     @TempDir
     Path dir;
+
+    @Test
+    void manifestIgnoresStatusAndArchivedConfigArtifacts() throws IOException {
+        write("tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, 1));
+        write("q2.json", "clean-quic", "clean", RunFixtures.quic2(20, 200, 2));
+        write("q3.json", "clean-quic3", "clean", RunFixtures.quic3(30, 300, 3));
+        writeManifest(1, "ok", true);
+        Files.writeString(dir.resolve("tcp.status.json"), "{}");
+        Files.createDirectory(dir.resolve("client-config-before"));
+        Files.writeString(dir.resolve("client-config-before/config.json"), "{}");
+        Path markdown = dir.resolve("summary.md");
+        assertEquals(0, summarize(markdown, "clean"));
+        assertTrue(Files.readString(markdown).contains("| clean | quic3 | 1 | 1 | 1 | 0 | 0 | COMPLETE |"));
+    }
+
+    @Test
+    void missingRoundCannotVerifySurvivingSamples() throws IOException {
+        write("tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, 1));
+        write("q2.json", "clean-quic", "clean", RunFixtures.quic2(20, 200, 2));
+        write("q3.json", "clean-quic3", "clean", RunFixtures.quic3(30, 300, 3));
+        writeManifest(2, "ok", true);
+        Path markdown = dir.resolve("summary.md");
+        assertEquals(2, summarize(markdown, "clean"));
+        String text = Files.readString(markdown);
+        assertTrue(text.contains("| clean | quic3 | 2 | 1 | 1 | 0 | 1 | INCOMPLETE |"), text);
+        assertTrue(text.contains("Matrix /3 gate: INCOMPLETE"), text);
+    }
+
+    @Test
+    void failedProcessWithSuccessfulRowStillFailsExpectedCell() throws IOException {
+        write("tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, 1));
+        write("q2.json", "clean-quic", "clean", RunFixtures.quic2(20, 200, 2));
+        write("q3.json", "clean-quic3", "clean", RunFixtures.quic3(30, 300, 3));
+        writeManifest(1, "failed", true);
+        Path markdown = dir.resolve("summary.md");
+        assertEquals(2, summarize(markdown, "clean"));
+        assertTrue(Files.readString(markdown).contains("| clean | quic3 | 1 | 1 | 0 | 1 | 0 | INCOMPLETE |"));
+    }
+
+    @Test
+    void missingArtifactAndEntirelyUnattemptedCellsArePrinted() throws IOException {
+        writeManifest(1, "ok", false);
+        Path markdown = dir.resolve("summary.md");
+        assertEquals(2, summarize(markdown, "clean"));
+        String text = Files.readString(markdown);
+        assertTrue(text.contains("| clean | tcp | 1 | 0 | 0 | 0 | 1 | INCOMPLETE |"), text);
+        assertTrue(text.contains("| clean | quic3 | 1 | 1 | 0 | 0 | 1 | INCOMPLETE |"), text);
+    }
+
+    private void writeManifest(int rounds, String status, boolean all) throws IOException {
+        // Fixtures currently use round zero; keep manifest identities tied to the row, not filenames.
+        for (String file : List.of("tcp.json", "q2.json", "q3.json")) {
+            if (!Files.exists(dir.resolve(file))) continue;
+            JsonObject doc = com.google.gson.JsonParser.parseString(Files.readString(dir.resolve(file))).getAsJsonObject();
+            for (var run : doc.getAsJsonArray("runs")) run.getAsJsonObject().addProperty("run", 0);
+            Files.writeString(dir.resolve(file), GSON.toJson(doc));
+        }
+        Files.writeString(dir.resolve("runs.tsv"), "#rounds\t" + rounds
+                + "\n#profiles\tclean\n#arms\ttcp quic2 quic3\n"
+                + (all ? "clean\ttcp\t0\tok\ttcp.json\nclean\tquic2\t0\tok\tq2.json\n" : "")
+                + "clean\tquic3\t0\t" + status + "\tq3.json\n");
+    }
 
     @Test
     void quic2RowsNeverSatisfyQuic3EvenWithQuic3LookingFields() throws IOException {
@@ -394,6 +457,27 @@ class MatrixSummarizeTest {
         }
         doc.add("runs", array);
         Files.writeString(dir.resolve(file), GSON.toJson(doc), StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void movingSummaryWithoutAManifestIsRefused() throws IOException {
+        write("tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, 1));
+        write("q3.json", "clean-quic3", "clean", RunFixtures.quic3(30, 300, 3));
+        Path markdown = dir.resolve("summary.md");
+        int status = MatrixSummarize.run(Args.parse(new String[] {
+                "--dir", dir.toString(), "--profiles", "clean", "--markdown", markdown.toString(), "--moving",
+        }));
+        assertEquals(1, status);
+        assertFalse(Files.exists(markdown), "no summary may be written for an unverifiable moving run");
+    }
+
+    @Test
+    void legacyDirectoryDiscoveryIsLabelledNonGating() throws IOException {
+        write("tcp.json", "clean-tcp", "clean", RunFixtures.tcp(10, 100, 1));
+        write("q3.json", "clean-quic3", "clean", RunFixtures.quic3(30, 300, 3));
+        Path markdown = dir.resolve("summary.md");
+        summarize(markdown, "clean");
+        assertTrue(Files.readString(markdown).contains("NON-GATING"));
     }
 
     private int summarize(Path markdown, String profiles) throws IOException {

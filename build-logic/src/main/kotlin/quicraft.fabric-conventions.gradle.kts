@@ -113,19 +113,44 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
     }
     // Opt-in: one real-Fabric benchmark sample per JVM (ExternalArmGameTest), driven by
     // testkit/run-external-arms.sh: -Pquicraft.arm=tcp|quic2|quic3 plus -Pquicraft.armServer,
-    // armOut, armNetem, armRun, armWarmup, armCommit and optionally armPlaySeconds.
+    // armOut, armNetem, armRun, armWarmup, armCommit, optionally armPlaySeconds, armMove,
+    // armMoveSeconds, armVariant (plain|busy) and armStallDiag.
     providers.gradleProperty("quicraft.arm").orNull?.let { arm ->
         property("quicraft.gametest.arm", arm)
-        for (name in listOf("armServer", "armOut", "armNetem", "armRun", "armWarmup", "armCommit", "armPlaySeconds")) {
+        for (name in listOf("armServer", "armOut", "armNetem", "armRun", "armWarmup", "armCommit",
+                "armPlaySeconds", "armMove", "armMoveSeconds", "armVariant")) {
             providers.gradleProperty("quicraft.$name").orNull?.let { property("quicraft.gametest.$name", it) }
         }
         // The offline /3 test profile; the server side gets it from the container fixture.
         if (arm == "quic3") {
             property("quicraft.multistream.offlineTest", "true")
         }
+        // -Pquicraft.armStallDiag=true turns on core's stall watchdog for this client JVM.
+        providers.gradleProperty("quicraft.armStallDiag").orNull?.let { property("quicraft.v3.stalldiag", it) }
+        // The busy-timer variant (-Pquicraft.armVariant=busy) is the same arm with the client-side
+        // prototype timer on; the row then says busyTimer=true and needs it, so both are set here.
+        if (providers.gradleProperty("quicraft.armVariant").orNull == "busy") {
+            property("quicraft.v3.batchTimerBusy", "true")
+        }
         // -Pquicraft.armCoalesce=true|false forces write coalescing; unset keeps the default (/3 on, /2 off).
         providers.gradleProperty("quicraft.armCoalesce").orNull?.let { property("quicraft.coalesceWrites", it) }
         providers.gradleProperty("quicraft.armCoalesceMax").orNull?.let { property("quicraft.coalesceMaxBytes", it) }
+    }
+    // Opt-in: no-desync PlaySession sessions for testkit/run-desync-sessions.sh
+    // (DesyncSessionGameTest): -Pquicraft.desync=true plus desyncOut, desyncTransport (tcp|quic3),
+    // desyncVariant (plain|busy), desyncNetem, desyncRun, desyncCommit. The runner puts the whole
+    // client JVM in a private netns whose loopback carries the netem profile.
+    providers.gradleProperty("quicraft.desync").orNull?.let {
+        for (name in listOf("desyncOut", "desyncTransport", "desyncVariant", "desyncNetem",
+                "desyncRun", "desyncCommit")) {
+            providers.gradleProperty("quicraft.$name").orNull?.let { property("quicraft.gametest.$name", it) }
+        }
+        if (providers.gradleProperty("quicraft.desyncTransport").orNull == "quic3") {
+            property("quicraft.multistream.offlineTest", "true")
+        }
+        if (providers.gradleProperty("quicraft.desyncVariant").orNull == "busy") {
+            property("quicraft.v3.batchTimerBusy", "true")
+        }
     }
     // Opt-in: online-mode login against the testkit's mock session server. The real client reads
     // its session/services/profiles hosts only when all three are set:
