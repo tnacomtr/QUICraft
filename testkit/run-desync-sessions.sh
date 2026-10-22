@@ -342,7 +342,10 @@ for ((round = 0; round < rounds; round++)); do
                 "-Pquicraft.desyncCommit=$commit"
             )
             run_status=0
-            bounded 900 env ALSOFT_DRIVERS=null "${xvfb[@]}" \
+            # The private user namespace maps the caller to uid 0, so tools that resolve the home
+            # from the passwd entry would look in /root; pin the real caches explicitly.
+            bounded 900 env ALSOFT_DRIVERS=null GRADLE_USER_HOME="${GRADLE_USER_HOME:-$HOME/.gradle}" \
+                JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:+$JAVA_TOOL_OPTIONS }-Duser.home=$HOME" "${xvfb[@]}" \
                 "$here/netem/loopback-session.sh" --profile "$profile" -- \
                 "$root/gradlew" -p "$root" --no-daemon --offline --no-configuration-cache --console=plain \
                 "${props[@]}" "$module:runClientGameTest" \
