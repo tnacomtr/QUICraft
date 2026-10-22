@@ -112,6 +112,16 @@ public final class MatrixSummarize {
         Set<String> wantedVariants = Set.copyOf(variants);
         // --moving: every successful run must prove the moving window actually moved.
         boolean moving = args.flag("moving");
+        String manifestPath = args.string("manifest", Files.exists(dir.resolve("runs.tsv"))
+                ? dir.resolve("runs.tsv").toString() : null);
+        List<String> arms = new ArrayList<>(List.of("tcp"));
+        if (variantMode) {
+            for (String variant : variants) arms.add(variant.equals("busy") ? "quic3-busy" : "quic3");
+        } else {
+            arms.addAll(List.of("quic2", "quic3"));
+        }
+        RunManifest manifest = manifestPath == null ? null
+                : RunManifest.read(Path.of(manifestPath), dir, profiles, arms);
 
         Map<String, List<ParsedRun>> byProfile = new LinkedHashMap<>();
         for (String profile : profiles) {
@@ -127,12 +137,14 @@ public final class MatrixSummarize {
         int unclassifiedFiles = 0;
         List<RunResult> all = new ArrayList<>();
 
-        try (Stream<Path> files = Files.walk(dir)) {
+        // Legacy summaries without a manifest retain their old directory input contract.
+        // Matrix runners always provide a manifest: no status/config/archive file is discovered.
+        try (Stream<Path> files = manifest == null ? Files.walk(dir) : manifest.files.keySet().stream()) {
             for (Path file : files.filter(f -> f.toString().endsWith(".json")).sorted().toList()) {
                 JsonObject doc;
                 try {
                     doc = JsonParser.parseString(Files.readString(file, StandardCharsets.UTF_8)).getAsJsonObject();
-                } catch (RuntimeException e) {
+                } catch (RuntimeException | IOException e) {
                     invalidFiles++;
                     continue;
                 }
@@ -150,6 +162,10 @@ public final class MatrixSummarize {
                 }
                 if (!wanted.contains(profile)) {
                     // A known profile the caller did not request makes no claim here.
+                    continue;
+                }
+                if (manifest != null && doc.getAsJsonArray("runs").size() != 1) {
+                    invalidFiles++;
                     continue;
                 }
                 for (JsonElement element : doc.getAsJsonArray("runs")) {
@@ -173,6 +189,10 @@ public final class MatrixSummarize {
                         continue;
                     }
                     String variant = variantOf(raw);
+                    if (manifest != null && !manifest.matches(file, profile, run, variant)) {
+                        malformedRuns++;
+                        continue;
+                    }
                     if (variantMode) {
                         if (!wantedVariants.contains(variant)) {
                             if (KNOWN_VARIANTS.contains(variant)) {
@@ -206,10 +226,15 @@ public final class MatrixSummarize {
                     }
                     byProfile.get(profile).add(new ParsedRun(run, variant));
                     all.add(run);
+                    if (manifest != null && run.ok() && !run.disconnected()
+                            && (run.transportVersion() != TransportVersion.QUIC_3
+                                || NegotiatedTransportCheck.check(TransportVersion.QUIC_3, run).verified())) {
+                        manifest.passed.add(manifest.files.get(file).key());
+                    }
                 }
             }
         }
-        if (all.isEmpty()) {
+        if (all.isEmpty() && manifest == null) {
             System.err.println("no usable measured runs under " + dir);
             if (incompatibleRuns + malformedRuns + invalidMetricRuns + invalidFiles
                     + unclassifiedFiles + variantRuns + mislabeledRuns + invalidMovingRuns > 0) {
@@ -228,7 +253,7 @@ public final class MatrixSummarize {
         // stream count) must hold across every requested variant, not just within each one.
         List<String[]> tableRows = new ArrayList<>();
         List<ComparisonRow> rows = new ArrayList<>();
-        boolean complete = true;
+        boolean complete = manifest == null || manifest.complete();
         boolean anyFailClosed = false;
         for (String profile : profiles) {
             List<ParsedRun> runs = byProfile.get(profile);
@@ -249,9 +274,11 @@ public final class MatrixSummarize {
                     String[] row = new String[4 + cells.size()];
                     row[0] = profile;
                     row[1] = metric.label();
-                    row[2] = tcp.render();
+                    row[2] = manifest == null ? tcp.render() : manifest.render(profile, "tcp", tcp.render());
                     for (int i = 0; i < cells.size(); i++) {
-                        row[3 + i] = cells.get(i).render();
+                        String arm = variants.get(i).equals("busy") ? "quic3-busy" : "quic3";
+                        row[3 + i] = manifest == null ? cells.get(i).render()
+                                : manifest.render(profile, arm, cells.get(i).render());
                     }
                     row[3 + cells.size()] = String.join("; ", evidence);
                     tableRows.add(row);
@@ -285,6 +312,7 @@ public final class MatrixSummarize {
         String gate = anyFailClosed || rejected ? "FAIL-CLOSED" : complete ? "PASS" : "INCOMPLETE";
 
         StringBuilder md = new StringBuilder();
+        if (manifest != null) manifest.append(md);
         if (variantMode) {
             md.append("Variant comparison rows (/3 ").append(String.join(", ", variants))
                     .append("). Medians are computed from existing run artifacts, not from new")
@@ -313,8 +341,11 @@ public final class MatrixSummarize {
             md.append("| --- | --- | --- | --- | --- | --- |\n");
             for (ComparisonRow row : rows) {
                 md.append(String.format(Locale.ROOT, "| %s | %s | %s | %s | %s | %s |%n",
-                        row.profile(), row.metric(), row.tcp().render(), row.quic2().render(),
-                        row.quic3().render(), row.quic3().detail()));
+                        row.profile(), row.metric(),
+                        manifest == null ? row.tcp().render() : manifest.render(row.profile(), "tcp", row.tcp().render()),
+                        manifest == null ? row.quic2().render() : manifest.render(row.profile(), "quic2", row.quic2().render()),
+                        manifest == null ? row.quic3().render() : manifest.render(row.profile(), "quic3", row.quic3().render()),
+                        row.quic3().detail()));
             }
         }
         md.append('\n');
@@ -437,7 +468,7 @@ public final class MatrixSummarize {
                 && run.get("busyTimer").getAsJsonPrimitive().isBoolean() && run.get("busyTimer").getAsBoolean();
     }
 
-    /** Whether an ok row proves its moving window moved: at least one chunk and a metre walked. */
+    /** Same sustained-load thresholds as ExternalArmGameTest: 0.5 m/s, one new chunk/5 s. */
     private static boolean moved(JsonObject run) {
         if (!run.has("moved") || !run.get("moved").isJsonPrimitive()
                 || !run.get("moved").getAsJsonPrimitive().isBoolean() || !run.get("moved").getAsBoolean()) {
@@ -445,7 +476,8 @@ public final class MatrixSummarize {
         }
         double distance = finite(run, "moveDistanceM", -1);
         double chunks = finite(run, "moveChunks", 0);
-        return distance >= 1.0 && chunks > 0;
+        double seconds = finite(run, "moveSeconds", -1);
+        return seconds > 0 && distance >= 0.5 * seconds && chunks >= Math.ceil(seconds / 5.0);
     }
 
     private static double finite(JsonObject run, String field, double fallback) {

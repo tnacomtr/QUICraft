@@ -4,7 +4,7 @@
 # Moving-player matrix over the external Fabric server: TCP vs /3 plain vs /3 with the busy batch
 # timer, interleaved per netem profile and round. Every cell is one run-external-arms.sh
 # invocation (fresh server container, fresh client JVM, client sprinting for --move-seconds); the
-# arms rotate inside a round so no arm always runs first.
+# arms run in the same order each round: tcp, plain, busy.
 #
 #   testkit/run-moving-matrix.sh --rounds 5
 #   testkit/run-moving-matrix.sh --rounds 1 --profiles "clean delayloss" --name smoke
@@ -24,6 +24,10 @@ root="$(cd "$here/.." && pwd)"
 . "$here/lib/git-state.sh"
 # shellcheck source=netem/profiles.sh
 . "$here/netem/profiles.sh"
+. "$here/lib/deadline.sh"
+trap 'stop_child' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 usage() {
     {
@@ -125,7 +129,11 @@ fi
 if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
     refuse "--name must be [A-Za-z0-9._-]+, got '$name'"
 fi
+[[ -n "${profiles//[[:space:]]/}" ]] || refuse "empty profile list"
+declare -A seen_profiles=()
 for profile in $profiles; do
+    [[ ! -v seen_profiles[$profile] ]] || refuse "duplicate profile '$profile'"
+    seen_profiles[$profile]=1
     netem_args "$profile" >/dev/null || refuse "unknown netem profile '$profile'"
 done
 profile_count=0
@@ -158,6 +166,7 @@ mkdir -p "$out_dir" || die "cannot create $out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
 
 echo "== moving matrix: $total_runs runs ($rounds round(s) x $profile_count profile(s) x $arm_count arms)"
+echo "== worst-case: $total_runs x 5400s = $((total_runs * 5400))s (+30s kill grace/run); each client has a 600s deadline, build/cleanup included in outer budget"
 echo "== estimated wall time: $((estimated / 3600))h$(printf '%02d' $(((estimated % 3600) / 60)))m"
 echo "==   (${total_runs} runs x ${estimate_seconds}s; the first arm may also build the server image)"
 {
@@ -176,14 +185,14 @@ echo "==   (${total_runs} runs x ${estimate_seconds}s; the first arm may also bu
 
 arm_tokens=(tcp quic3 quic3-busy)
 status_file="$out_dir/runs.tsv"
-: >"$status_file"
+printf '#rounds\t%s\n#profiles\t%s\n#arms\ttcp quic3 quic3-busy\n' "$rounds" "$profiles" >"$status_file"
 failed=0
 index=0
 for ((round = 0; round < rounds; round++)); do
     for profile in $profiles; do
         for ((k = 0; k < arm_count; k++)); do
             index=$((index + 1))
-            token="${arm_tokens[$(((round + k) % arm_count))]}"
+            token="${arm_tokens[$k]}"
             case "$token" in
                 tcp)
                     arm_args=(--arm tcp)
@@ -211,13 +220,13 @@ for ((round = 0; round < rounds; round++)); do
             fi
             echo "== [$index/$total_runs] $stem ($(date -u +%H:%M:%SZ))"
             run_status=0
-            "$here/run-external-arms.sh" "${arm_args[@]}" "${common_args[@]}" \
+            bounded 5400 "$here/run-external-arms.sh" "${arm_args[@]}" "${common_args[@]}" \
                 >"$out_dir/$stem.runner.log" 2>&1 || run_status=$?
             if ((run_status == 0)); then
-                printf '%s\t%s\t%s\tok\n' "$round" "$profile" "$token" >>"$status_file"
+                printf '%s\t%s\t%s\tok\t%s.json\n' "$profile" "$token" "$round" "$stem" >>"$status_file"
             else
                 failed=$((failed + 1))
-                printf '%s\t%s\t%s\tfailed\n' "$round" "$profile" "$token" >>"$status_file"
+                printf '%s\t%s\t%s\tfailed\t%s.json\n' "$profile" "$token" "$round" "$stem" >>"$status_file"
                 echo "==   failed (status $run_status); runner log: $out_dir/$stem.runner.log" >&2
             fi
         done
@@ -226,11 +235,11 @@ done
 
 bin="$root/testkit/build/install/quicraft-testkit/bin/quicraft-testkit"
 if [[ ! -x "$bin" ]]; then
-    "$root/gradlew" -p "$root" -q :testkit:installDist
+    bounded 1200 "$root/gradlew" -p "$root" -q :testkit:installDist
 fi
 
 summary_status=0
-"$bin" matrix-summarize --dir "$out_dir" --profiles "$profiles" \
+bounded 120 "$bin" matrix-summarize --dir "$out_dir" --manifest "$status_file" --profiles "$profiles" \
     --variants plain,busy --moving --markdown "$out_dir/matrix-summary.md" \
     || summary_status=$?
 

@@ -39,6 +39,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+. "$here/lib/deadline.sh"
 root="$(cd "$here/.." && pwd)"
 mod="${QUICRAFT_ARM_MOD_JSON:-$root/fabric/src/gametest/resources/fabric.mod.json}"
 entrypoint="rs.sudoe.quicraft.fabric.gametest.ExternalArmGameTest"
@@ -310,6 +311,7 @@ cleanup() {
     cleanup_status=$?
     trap - EXIT
     trap '' INT TERM
+    stop_child
     if ! restore_mod; then
         cleanup_status=1
     fi
@@ -317,15 +319,15 @@ cleanup() {
         if [[ "$server_trace" == true ]]; then
             # Opt-in diagnostics only. Stop this invocation's owned Fabric service gracefully before
             # collecting logs, so its final session-disconnect summary survives the later down.
-            "${compose[@]}" stop fabric >/dev/null 2>&1 || echo "WARNING: trace server stop failed" >&2
+            timeout --kill-after=30 120 "${compose[@]}" stop fabric >/dev/null 2>&1 || echo "WARNING: trace server stop failed" >&2
             server_log="$out_dir/$file_stem.server.log"
-            if "${compose[@]}" logs --no-color fabric >>"$server_log" 2>&1; then
+            if timeout --kill-after=30 120 "${compose[@]}" logs --no-color fabric >>"$server_log" 2>&1; then
                 echo "server trace log kept at $server_log" >&2
             else
                 echo "WARNING: could not collect server trace log at $server_log" >&2
             fi
         fi
-        if "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1; then
+        if timeout --kill-after=30 120 "${compose[@]}" down -v --remove-orphans >/dev/null 2>&1; then
             echo "removed Compose project $project"
         else
             echo "ERROR: could not remove Compose project $project; run: docker compose -f ${compose_files[0]} -f ${compose_files[1]} -p $project down -v --remove-orphans" >&2
@@ -383,7 +385,8 @@ fi
 echo "narrowed $mod to $entrypoint (original sha256 $backup_sha)"
 
 echo "== build :fabric-26x:testkitMod (image build context, commit $commit)"
-"$root/gradlew" -p "$root" --no-daemon -q :fabric-26x:testkitMod --console=plain \
+echo "== budgets: client 600s (+30s kill grace), builds 3 x 1200s, cleanup commands 120s each"
+bounded 1200 "$root/gradlew" -p "$root" --no-daemon -q :fabric-26x:testkitMod --console=plain \
     || die "the :fabric-26x:testkitMod build failed"
 
 # The base service reads FABRIC_ONLINE_MODE; the real-fabric overlay templates
@@ -399,7 +402,7 @@ fi
 export REAL_FABRIC_MULTISTREAM="$server_multistream" REAL_FABRIC_PORT="$port" REAL_FABRIC_COALESCE="$coalesce" REAL_FABRIC_COALESCE_MAX="$coalesce_max"
 echo "== compose up ($project): fabric mocksession"
 project_started=true
-if ! "${compose[@]}" up -d --build fabric mocksession; then
+if ! bounded 1200 "${compose[@]}" up -d --build fabric mocksession; then
     die "compose up failed for project $project"
 fi
 
@@ -429,7 +432,7 @@ printf '%s\n' "$status_json" >"$out_dir/$file_stem.status.json"
 # qdisc, IFB or filter (its status says so); shaped profiles' filter counters prove the game flows
 # were classified.
 echo "== netem $netem on $project"
-"$here/netem-attach.sh" apply --project "$project" --profile "$netem" \
+bounded 120 "$here/netem-attach.sh" apply --project "$project" --profile "$netem" \
     >"$out_dir/$file_stem.netem-apply.txt" 2>&1 \
     || { cat "$out_dir/$file_stem.netem-apply.txt" >&2; die "netem-attach apply failed"; }
 
@@ -442,7 +445,7 @@ if [[ -e "$client_config" ]]; then
 fi
 
 echo "== :fabric-26x:processGametestResources (forced, so the narrowed entrypoint list is used)"
-if ! "$root/gradlew" -p "$root" --no-daemon :fabric-26x:processGametestResources --rerun-tasks --console=plain; then
+if ! bounded 1200 "$root/gradlew" -p "$root" --no-daemon :fabric-26x:processGametestResources --rerun-tasks --console=plain; then
     die "the forced :fabric-26x:processGametestResources build failed"
 fi
 if [[ -f "$processed" ]]; then
@@ -490,13 +493,13 @@ client=(
 echo "== client: ${client[*]}"
 echo "== client: ${client[*]}" >>"$client_log"
 client_status=0
-ALSOFT_DRIVERS=null "${xvfb[@]}" "${client[@]}" >>"$client_log" 2>&1 || client_status=$?
+bounded 600 env ALSOFT_DRIVERS=null "${xvfb[@]}" "${client[@]}" >>"$client_log" 2>&1 || client_status=$?
 if ((client_status != 0)); then
     keep_client_log=true
-    echo "WARNING: runClientGameTest exited with status $client_status; checking the emitted row anyway (log: $client_log)" >&2
+    die "runClientGameTest exited with status $client_status (log: $client_log); row is not passing evidence"
 fi
 
-"$here/netem-attach.sh" status --project "$project" --profile "$netem" \
+bounded 120 "$here/netem-attach.sh" status --project "$project" --profile "$netem" \
     >"$out_dir/$file_stem.netem-status.txt" 2>&1 \
     || echo "WARNING: netem-attach status failed; see $out_dir/$file_stem.netem-status.txt" >&2
 
@@ -536,7 +539,4 @@ then
     exit 1
 fi
 
-if ((client_status != 0)); then
-    echo "WARNING: accepted the row although runClientGameTest exited with status $client_status (shutdown hang)" >&2
-fi
 echo "OK: $arm run $run_index wrote $out"

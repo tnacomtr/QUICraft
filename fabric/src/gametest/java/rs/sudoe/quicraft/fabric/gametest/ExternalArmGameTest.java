@@ -57,6 +57,9 @@ public class ExternalArmGameTest implements FabricClientGameTest {
     private static final int TURN_EVERY_TICKS = 20;
     private static final float TURN_DEGREES = 1.0f;
     private static final int JUMP_EVERY_TICKS = 40;
+    // Sustained-load evidence: at least 0.5 horizontal metres/second and one new chunk/5 seconds.
+    private static final double MIN_MOVE_METRES_PER_SECOND = 0.5;
+    private static final double MIN_MOVE_CHUNKS_PER_SECOND = 0.2;
     private static final long QUIET_NANOS = 2_000_000_000L;
     private static final int JOIN_TIMEOUT_TICKS = 20 * 90;
     private static final int CHUNK_TIMEOUT_TICKS = 20 * 60;
@@ -206,7 +209,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         }
         double[] sorted = rtt.stream().mapToDouble(Double::doubleValue).sorted().toArray();
         JsonObject row = baseRow(o);
-        boolean movedOk = !o.move || (window.distance >= 1.0 && window.chunks > 0);
+        boolean movedOk = !o.move || (window.distance >= MIN_MOVE_METRES_PER_SECOND * window.seconds
+                && window.chunks >= Math.ceil(MIN_MOVE_CHUNKS_PER_SECOND * window.seconds));
         boolean ok = mismatch == null && sorted.length > 0 && movedOk;
         if (mismatch == null && !movedOk) {
             mismatch = String.format(Locale.ROOT, "the moving window proved no movement: %.2f m, %d chunks",
@@ -241,6 +245,13 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         row.addProperty("moveTicks", window.ticks);
         row.addProperty("moveStallTicks", window.stallTicks);
         row.addProperty("moveMaxTickMs", window.maxTickMs);
+        if (o.move) {
+            row.addProperty("moveStartX", window.start.x);
+            row.addProperty("moveStartY", window.start.y);
+            row.addProperty("moveStartZ", window.start.z);
+            row.addProperty("moveStartYaw", 0);
+            row.addProperty("moveStartPitch", 0);
+        }
         row.addProperty("stallDiagEnabled", Boolean.getBoolean("quicraft.v3.stalldiag"));
         row.addProperty("stallDiagEvents", StallLog.events());
         QuicraftFabricTestLog.info(String.format(Locale.ROOT, "arm %s run %d: join %.1f ms, chunks %d in %.1f ms,"
@@ -255,7 +266,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
 
     /** One play window's measurements; never a value the run did not observe. */
     private record Window(int sent, int ticks, long chunks, double seconds, double distance, int stallTicks,
-            double maxTickMs) {}
+            double maxTickMs, Vec3 start) {}
 
     /**
      * The play window: a ping every {@link #PING_EVERY_TICKS} ticks, and in moving mode the client
@@ -265,10 +276,19 @@ public class ExternalArmGameTest implements FabricClientGameTest {
     private static Window playWindow(ClientGameTestContext context, Options o) {
         int ticks = (o.move ? o.moveSeconds : o.playSeconds) * 20;
         int sent = 0;
+        // Fresh seeded server per arm; remove client orientation differences before the same path.
+        Vec3 start = context.computeOnClient(c -> {
+            if (o.move) {
+                c.player.setYRot(0);
+                c.player.setYHeadRot(0);
+                c.player.setXRot(0);
+            }
+            return c.player.position();
+        });
         long startChunks = ArmClock.chunks.get();
         long startNanos = System.nanoTime();
         double distance = 0;
-        Vec3 last = null;
+        Vec3 last = start;
         int stallTicks = 0;
         double maxTickMs = 0;
         if (o.move) {
@@ -338,7 +358,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             }
         }
         return new Window(sent, ticks, ArmClock.chunks.get() - startChunks,
-                (System.nanoTime() - startNanos) / 1_000_000_000.0, distance, stallTicks, maxTickMs);
+                (System.nanoTime() - startNanos) / 1_000_000_000.0, distance, stallTicks, maxTickMs, start);
     }
 
     /** One status request over TCP (handshake, request, response); returns the status JSON. */

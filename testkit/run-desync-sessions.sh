@@ -30,6 +30,7 @@ root="$(cd "$here/.." && pwd)"
 . "$here/lib/git-state.sh"
 # shellcheck source=netem/profiles.sh
 . "$here/netem/profiles.sh"
+. "$here/lib/deadline.sh"
 
 entrypoint="rs.sudoe.quicraft.fabric.gametest.DesyncSessionGameTest"
 module=":fabric-26x"
@@ -122,7 +123,11 @@ fi
 if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
     refuse "--name must be [A-Za-z0-9._-]+, got '$name'"
 fi
+[[ -n "${profiles//[[:space:]]/}" ]] || refuse "empty profile list"
+declare -A seen_profiles=() seen_variants=()
 for profile in $profiles; do
+    [[ ! -v seen_profiles[$profile] ]] || refuse "duplicate profile '$profile'"
+    seen_profiles[$profile]=1
     netem_args "$profile" >/dev/null || refuse "unknown netem profile '$profile'"
 done
 case ",$variants," in
@@ -130,7 +135,10 @@ case ",$variants," in
     *) refuse "--variants must name plain and/or busy, got '$variants'" ;;
 esac
 variant_list="${variants//,/ }"
+[[ "$variants" != ,* && "$variants" != *, && "$variants" != *,,* ]] || refuse "empty variant"
 for variant in $variant_list; do
+    [[ ! -v seen_variants[$variant] ]] || refuse "duplicate variant '$variant'"
+    seen_variants[$variant]=1
     case "$variant" in
         plain | busy) ;;
         *) refuse "--variants must be plain,busy or plain, got '$variant'" ;;
@@ -189,6 +197,7 @@ mkdir -p "$out_dir" || die "cannot create $out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
 
 echo "== desync sessions: $total_runs runs ($rounds round(s) x $profile_count profile(s) x $arm_count arms)"
+echo "== worst-case run budget: $total_runs x 900s = $((total_runs * 900))s (+30s kill grace/run; three 1200s builds)"
 echo "== estimated wall time: $((estimated / 3600))h$(printf '%02d' $(((estimated % 3600) / 60)))m"
 echo "==   (${total_runs} runs x ${estimate_seconds}s; the real time depends on join and world generation)"
 {
@@ -227,6 +236,7 @@ cleanup() {
     cleanup_status=$?
     trap - EXIT
     trap '' INT TERM
+    stop_child
     if ! restore_mod; then
         cleanup_status=1
     fi
@@ -264,19 +274,19 @@ echo "narrowed $mod to $entrypoint (original sha256 $backup_sha)"
 # Everything the offline runs need must already be in the Gradle caches: inside the netns only
 # loopback exists, so a missing artifact would fail every run after the first.
 echo "== pre-building (online) and resolving the gametest runtime classpath"
-if ! "$root/gradlew" -p "$root" --no-daemon -q --console=plain \
+if ! bounded 1200 "$root/gradlew" -p "$root" --no-daemon -q --console=plain \
     :fabric-26x:downloadAssets :fabric-26x:compileClientJava :fabric-26x:compileGametestJava \
     :testkit:installDist >"$out_dir/build.log" 2>&1; then
     tail -n 40 "$out_dir/build.log" >&2 || true
     die "the pre-build failed (log: $out_dir/build.log)"
 fi
-if ! "$root/gradlew" -p "$root" --no-daemon --console=plain \
+if ! bounded 1200 "$root/gradlew" -p "$root" --no-daemon --console=plain \
     :fabric-26x:dependencies --configuration gametestRuntimeClasspath \
     >"$out_dir/dependencies.log" 2>&1; then
     tail -n 40 "$out_dir/dependencies.log" >&2 || true
     die "could not resolve the gametest runtime classpath (log: $out_dir/dependencies.log)"
 fi
-if ! "$root/gradlew" -p "$root" --no-daemon -q --console=plain \
+if ! bounded 1200 "$root/gradlew" -p "$root" --no-daemon -q --console=plain \
     :fabric-26x:processGametestResources --rerun-tasks >>"$out_dir/build.log" 2>&1; then
     tail -n 40 "$out_dir/build.log" >&2 || true
     die "the forced :fabric-26x:processGametestResources build failed"
@@ -330,7 +340,7 @@ for ((round = 0; round < rounds; round++)); do
                 "-Pquicraft.desyncCommit=$commit"
             )
             run_status=0
-            ALSOFT_DRIVERS=null "${xvfb[@]}" \
+            bounded 900 env ALSOFT_DRIVERS=null "${xvfb[@]}" \
                 "$here/netem/loopback-session.sh" --profile "$profile" -- \
                 "$root/gradlew" -p "$root" --no-daemon --offline --no-configuration-cache --console=plain \
                 "${props[@]}" "$module:runClientGameTest" \
@@ -354,6 +364,10 @@ PY
 )" || result="missing	the row could not be read"
             result_status="${result%%$'\t'*}"
             result_error="${result#*$'\t'}"
+            if ((run_status != 0)); then
+                result_status=failed
+                result_error="process exit $run_status; $result_error"
+            fi
             if [[ "$result_status" == failed ]]; then
                 failed=$((failed + 1))
             elif [[ "$result_status" != ok ]]; then
@@ -371,7 +385,7 @@ done
 
 bin="$root/testkit/build/install/quicraft-testkit/bin/quicraft-testkit"
 if [[ ! -x "$bin" ]]; then
-    "$root/gradlew" -p "$root" -q :testkit:installDist
+    bounded 1200 "$root/gradlew" -p "$root" -q :testkit:installDist
 fi
 
 summary_status=0

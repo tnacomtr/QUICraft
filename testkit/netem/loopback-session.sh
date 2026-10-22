@@ -61,28 +61,24 @@ done
 netem_args "$profile" >/dev/null || die "unknown netem profile '$profile'"
 (($# > 0)) || usage
 
-if [[ "${QUICRAFT_LOOPBACK_NETNS:-0}" != 1 ]]; then
-    command -v unshare >/dev/null 2>&1 \
-        || die "unshare is required (util-linux); this helper will not run a session without a private netns"
-    command -v ip >/dev/null 2>&1 || die "ip from iproute2 is required"
-    command -v tc >/dev/null 2>&1 || die "tc from iproute2 is required"
-    if ! unshare --user --map-root-user --net -- true 2>/dev/null; then
-        die "cannot create a user+network namespace: 'unshare --user --map-root-user --net' failed." \
-            "Unprivileged user namespaces are probably disabled (kernel.unprivileged_userns_clone=0 or an" \
-            "AppArmor/seccomp policy). Enable them or run this on a host that allows it; the session" \
-            "is not started unshaped."
-    fi
-    export QUICRAFT_LOOPBACK_NETNS=1
-    exec unshare --user --map-root-user --net -- "$0" --profile "$profile" -- "$@"
-fi
-
-# Inside the private namespace: root is the mapped user, so ip/tc are allowed here and only here.
-ip link set dev lo up || die "could not bring loopback up in the private netns"
 args="$(netem_args "$profile")"
+command -v unshare >/dev/null || die "unshare is required"
+command -v ip >/dev/null || die "ip is required"
+command -v tc >/dev/null || die "tc is required"
+# No re-entry flag, environment variable or public inner mode can skip namespace creation.
+exec unshare --user --map-root-user --net -- bash -euo pipefail -c '
+die() { echo "error: $*" >&2; exit 1; }
+profile="$1"; args="$2"; shift 2
+[[ "$(ip -o link show | wc -l)" -eq 1 ]] || die "namespace must contain only lo"
+before="$(ip -o link show dev lo)"
+[[ "$before" != *",UP"* && "$before" != *"<UP"* ]] || die "lo was already UP"
+ip link set dev lo up || die "could not bring private lo up"
+after="$(ip -o link show dev lo)"
+[[ "$after" == *",UP"* || "$after" == *"<UP"* ]] || die "lo did not transition DOWN to UP"
 if [[ -n "$args" ]]; then
     # shellcheck disable=SC2086 # the profile is a deliberate word list for tc
     tc qdisc add dev lo root netem $args \
-        || die "tc could not attach '$args' to lo; the session is not started unshaped"
+        || die "tc could not attach netem to lo; the session is not started unshaped"
     if ! tc qdisc show dev lo | grep -q netem; then
         die "tc reported success but lo carries no netem qdisc; refusing unshaped evidence"
     fi
@@ -92,3 +88,4 @@ else
 fi
 
 exec "$@"
+' loopback-session "$profile" "$args" "$@"
