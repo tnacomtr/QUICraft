@@ -37,6 +37,7 @@ import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
 import rs.sudoe.quicraft.core.connect.TransportSelection;
 import rs.sudoe.quicraft.core.connect.V3Plan;
+import rs.sudoe.quicraft.core.multistream.JoinDiag;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.ReceiveTrace;
 import rs.sudoe.quicraft.core.routing.Lane;
@@ -165,6 +166,10 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
     /** Protocol-swap retry delay, event loop only; capped to avoid polling a stalled game at 1 kHz. */
     private long decoderRetryMillis = 1;
     private volatile AckSink ackSink = (lane, sequence) -> lanes.applied(lane, sequence);
+    /** This join's marks, or null when {@code -Dquicraft.v3.joindiag} is off. */
+    private final JoinDiag diag;
+    /** Whether the first configuration packet after activation was marked; event loop only. */
+    private boolean firstActivePacketMarked;
 
     V3Client(Connection connection, QuicBridgeChannel channel, EventLoop loop, V3Connection v3, V3Plan plan,
             RoutingTable table, int protocolNumber, boolean quicOnly, ClientV3State files, String logicalHost, int logicalPort,
@@ -183,6 +188,24 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         this.offlineTest = Boolean.getBoolean(OFFLINE_TEST_PROPERTY);
         this.loop = loop; // the channel is not registered yet when this is built
         this.codec = new LaneCodec(channel, table, decodedBytes::addAndGet);
+        this.diag = v3.joinDiag();
+    }
+
+    /** This join's marks, or null when the diagnostics are off (used by the play-login hook). */
+    @Nullable JoinDiag joinDiag() {
+        return diag;
+    }
+
+    /**
+     * The first configuration packet arrived after activation: from here the lanes carry the game.
+     * One-shot, and only a mark.
+     */
+    void firstActivePacket() {
+        if (firstActivePacketMarked) {
+            return;
+        }
+        firstActivePacketMarked = true;
+        JoinDiag.mark(diag, "first configuration packet after activation");
     }
 
     /**
@@ -353,6 +376,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
                 return; // the join was over before the game reached configuration
             }
             state = State.BINDING;
+            JoinDiag.mark(diag, "V3Client.enterConfiguration");
             long offerWaitNanos = 0;
             if (plan.pinState() == TransportSelection.PinState.CHANGED) {
                 long rtt = v3.smoothedRttMillis();
@@ -368,7 +392,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             session = new BindingSession(BindingStateMachine.Role.CLIENT, v3::exporterValue, shared,
                     onlineMode ? BindingStateMachine.MODE_ONLINE : BindingStateMachine.MODE_OFFLINE, protocolNumber,
                     shardCount, plan.fingerprintBytes(), plan.routingDigest(), System::nanoTime, offerWaitNanos, this,
-                    loop, loop::inEventLoop);
+                    loop, loop::inEventLoop, diag);
             wipeSecret();
             payloads = new BindingPayloads(session, this, this);
             payloads.onConfigurationEntered(System.nanoTime());
@@ -715,6 +739,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             traceDeliveryStartedNanos = System.nanoTime();
         }
         deliveredPackets++;
+        firstActivePacket();
     }
 
     /** Called by the external-arm harness after its chunk quiet window, not once per chunk batch. */
@@ -774,6 +799,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
 
     @Override
     public void activateInbound() {
+        JoinDiag.mark(diag, "activation (activateInbound)");
         // 12.12/12.13: the whole cutover, in this one task, inside the read that carried SERVER_SWITCH.
         ByteBuf remainder = null;
         try {
@@ -904,6 +930,7 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
             return;
         }
         state = State.ACTIVE;
+        JoinDiag.mark(diag, "lanes started");
         QuicraftFabric.LOG.info("QUICraft: multi-stream active to {}", v3.remoteAddress());
         // The packets the exchange held, in order, now as records.
         List<Object> held = new ArrayList<>(payloads.releaseQueued());
@@ -1074,6 +1101,8 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
      */
     private void cleanUp() {
         exchangeEnded = true;
+        // The join is over, whichever way it ended: its marks go out once, here or at play login.
+        JoinDiag.finish(diag);
         // The held packets first: closing the session drops its quiescence queue.
         List<Object> held = new ArrayList<>(deferred);
         deferred.clear();

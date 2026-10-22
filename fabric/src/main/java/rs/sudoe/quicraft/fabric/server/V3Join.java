@@ -27,6 +27,7 @@ import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ConfigurationTask;
+import net.minecraft.server.network.ServerConfigurationPacketListenerImpl;
 import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.bridge.BindingPayloads;
 import rs.sudoe.quicraft.bridge.CipherCutover;
@@ -37,6 +38,7 @@ import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.binding.BindingDriver;
 import rs.sudoe.quicraft.core.binding.BindingSession;
 import rs.sudoe.quicraft.core.binding.BindingStateMachine;
+import rs.sudoe.quicraft.core.multistream.JoinDiag;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.ReceiveTrace;
@@ -53,6 +55,7 @@ import rs.sudoe.quicraft.fabric.mixin.CipherBaseAccessor;
 import rs.sudoe.quicraft.fabric.mixin.CipherDecoderAccessor;
 import rs.sudoe.quicraft.fabric.mixin.ConnectionAccessor;
 import rs.sudoe.quicraft.fabric.mixin.PacketEncoderAccessor;
+import rs.sudoe.quicraft.fabric.mixin.ServerConfigurationPacketListenerImplAccessor;
 
 import rs.sudoe.quicraft.fabric.net.BindingDecodeContext;
 import rs.sudoe.quicraft.fabric.net.BindingPayload;
@@ -101,6 +104,8 @@ public final class V3Join implements BindingDecodeContext.Gate {
     private final ReceiveBudget backlogShare;
     private final JoinState state = new JoinState();
     private final SecretHolder secrets = new SecretHolder();
+    /** This connection's join marks, or null when {@code -Dquicraft.v3.joindiag} is off. */
+    private final JoinDiag diag;
 
     private BindingPayloads payloads;
     /** Stable connection origin, retained across listener swaps and preactivation queueing. */
@@ -131,6 +136,10 @@ public final class V3Join implements BindingDecodeContext.Gate {
     private OutboundFilter filter;
     private ChannelFuture lastBindingWrite;
     private ByteBuf remainder;
+    /** The one hold task of this join, for the wake-up's identity check; event loop only. */
+    private ConfigurationTask holdTaskInstance;
+    /** Whether the hold task's first tick after release was marked; written on the server thread. */
+    private volatile boolean holdTickMarked;
 
     private V3Join(QuicBridgeChannel channel, V3Connection connection, MinecraftServer server, byte[] fingerprint,
             ReceiveBudget node) {
@@ -145,6 +154,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
         this.connection = connection;
         this.server = server;
         this.fingerprint = fingerprint;
+        this.diag = connection.joinDiag();
     }
 
     // --- Attaching and finding the join.
@@ -176,6 +186,20 @@ public final class V3Join implements BindingDecodeContext.Gate {
                 // The listener's own handshake deadline remains.
             }
         }
+    }
+
+    /** This join's marks, or null when {@code -Dquicraft.v3.joindiag} is off. */
+    public @Nullable JoinDiag joinDiag() {
+        return diag;
+    }
+
+    /**
+     * Hook (play login, the spawn succeeded): the join's phases are complete, so its one line is
+     * written. Never throws, and does nothing when the marks are off.
+     */
+    public void playLogin() {
+        JoinDiag.mark(diag, "play login");
+        JoinDiag.finish(diag);
     }
 
     /** The join of a game connection, or null when it is not {@code /3} (TCP, {@code /2}). */
@@ -245,7 +269,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
 
     /** The task that holds the configuration stage's finish until activation (12.4). */
     ConfigurationTask holdTask() {
-        return new ConfigurationTask() {
+        ConfigurationTask task = new ConfigurationTask() {
             @Override
             public void start(java.util.function.Consumer<Packet<?>> sender) {
                 // Nothing to send: the exchange runs on the loop and the stage waits here.
@@ -253,7 +277,13 @@ public final class V3Join implements BindingDecodeContext.Gate {
 
             @Override
             public boolean tick() {
-                return hold.open();
+                boolean open = hold.open();
+                if (open && !holdTickMarked) {
+                    // The join marks: how long the stage still waited for its next tick.
+                    holdTickMarked = true;
+                    JoinDiag.mark(diag, "hold task first tick after release");
+                }
+                return open;
             }
 
             @Override
@@ -261,11 +291,14 @@ public final class V3Join implements BindingDecodeContext.Gate {
                 return HOLD_TYPE;
             }
         };
+        holdTaskInstance = task;
+        return task;
     }
 
     // --- The exchange.
 
     private void start() throws Exception {
+        JoinDiag.mark(diag, "configuration entered");
         if (!state.startBinding()) {
             throw new IllegalStateException("binding already started or failed");
         }
@@ -558,7 +591,72 @@ public final class V3Join implements BindingDecodeContext.Gate {
         if (!state.activate()) {
             return;
         }
+        JoinDiag.mark(diag, "ACTIVE");
         hold.release();
+        JoinDiag.mark(diag, "hold.release()");
+        // The diagnostics fix: the released task goes on now instead of at the next tick. The tick
+        // stays the authority if this never runs (see ConfigurationWake).
+        wakeConfiguration();
+    }
+
+    /**
+     * Advances the configuration stage right after {@code hold.release()}, exactly as its next tick
+     * would, so the join does not wait up to a tick for Finish Configuration. Only if the connection
+     * is still open and its listener still runs this join's hold task; the vanilla tick remains for
+     * every other case, and any failure here falls back to it.
+     */
+    private void wakeConfiguration() {
+        try {
+            ConfigurationWake wake = new ConfigurationWake(new ConfigurationWake.Stage() {
+                @Override
+                public boolean open() {
+                    return holdTaskStillCurrent();
+                }
+
+                @Override
+                public void advance() {
+                    advanceConfiguration();
+                }
+            }, server::execute);
+            wake.schedule();
+        } catch (Throwable t) {
+            Hooks.failed("configuration wake", t);
+        }
+    }
+
+    /** Whether the released hold task is still the one this listener waits on; server thread only. */
+    private boolean holdTaskStillCurrent() {
+        if (!channel.isOpen() || state.failed()) {
+            return false;
+        }
+        ConfigurationTask expected = holdTaskInstance;
+        if (expected == null) {
+            return false;
+        }
+        Connection game = channel.pipeline().get(Connection.class);
+        if (game == null || !(game.getPacketListener() instanceof ServerConfigurationPacketListenerImpl)) {
+            return false;
+        }
+        ServerConfigurationPacketListenerImpl listener =
+                (ServerConfigurationPacketListenerImpl) game.getPacketListener();
+        return ((ServerConfigurationPacketListenerImplAccessor) listener).quicraft$currentTask() == expected;
+    }
+
+    /** What the vanilla tick does with the released task: tick it, then finish it. Server thread only. */
+    private void advanceConfiguration() {
+        Connection game = channel.pipeline().get(Connection.class);
+        if (game == null || !(game.getPacketListener() instanceof ServerConfigurationPacketListenerImpl)) {
+            return;
+        }
+        ServerConfigurationPacketListenerImplAccessor listener =
+                (ServerConfigurationPacketListenerImplAccessor) game.getPacketListener();
+        ConfigurationTask current = listener.quicraft$currentTask();
+        if (current == null || current != holdTaskInstance) {
+            return;
+        }
+        if (current.tick()) {
+            listener.quicraft$finishCurrentTask(current.type());
+        }
     }
 
     /** The lane layer as {@link OutboundHold} uses it. */
@@ -749,6 +847,9 @@ public final class V3Join implements BindingDecodeContext.Gate {
         if (leftover != null) {
             leftover.release();
         }
+        // The connection is gone: whatever was reached is written out once, for joins that never
+        // got as far as play.
+        JoinDiag.finish(diag);
     }
 
     // --- Failure.
@@ -793,6 +894,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
         } catch (Throwable t) {
             QuicraftFabric.LOG.debug("QUICraft: closing a failed multi-stream join", t);
         }
+        JoinDiag.finish(diag);
     }
 
     /** Closes a {@code /3} connection whose hook threw before it could tell the exchange. Never throws. */

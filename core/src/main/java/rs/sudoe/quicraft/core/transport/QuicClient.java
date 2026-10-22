@@ -37,6 +37,7 @@ import javax.net.ssl.SSLEngine;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.multistream.JoinDiag;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
 import rs.sudoe.quicraft.core.multistream.PreambleV2;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
@@ -869,6 +870,8 @@ public final class QuicClient {
         private volatile boolean retrying;
         /** Nanos at which the first connect started; the handshake time is measured from it. */
         private volatile long connectStart;
+        /** This attempt's join marks, or null when {@code -Dquicraft.v3.joindiag} is off. */
+        private JoinDiag diag;
 
         V3Attempt(Channel udp, InetSocketAddress remote, List<Object> server, EarlyFlight early,
                 CompletableFuture<V3Connection> result, V3Dial dial) {
@@ -884,12 +887,16 @@ public final class QuicClient {
         void start() {
             result.whenComplete((stream, error) -> {
                 if (result.isCancelled() || error != null) {
+                    // No join follows a failed attempt, so its one line is written here.
+                    JoinDiag.finish(diag);
                     abandon();
                 }
             });
             if (result.isDone()) {
                 return; // cancelled while the socket opened
             }
+            diag = JoinDiag.create(JoinDiag.Side.CLIENT);
+            JoinDiag.mark(diag, "connect start");
             connectStart = System.nanoTime();
             connect();
         }
@@ -947,6 +954,7 @@ public final class QuicClient {
                 }
                 long handshake = System.nanoTime() - connectStart;
                 QuicChannel connection = (QuicChannel) f.getNow();
+                JoinDiag.mark(diag, "QUIC handshake done");
                 // The abandoned connection shares the socket with the retry: it must not close it.
                 connection.closeFuture().addListener(closed -> {
                     if (connection != abandoned) {
@@ -1092,6 +1100,7 @@ public final class QuicClient {
                             stream.start();
                             raw.write(out);
                             raw.flush();
+                            JoinDiag.mark(diag, "preamble+handshake flight written");
                             early.markSent();
                             lastEarly = "sent";
                             sent.complete(stream);
@@ -1126,6 +1135,7 @@ public final class QuicClient {
                         stream.start();
                         raw.write(ByteBuffer.wrap(PreambleV2.encode(null)));
                         raw.flush();
+                        JoinDiag.mark(diag, "preamble+handshake flight written");
                         beforeConnectCompletionForTests();
                         if (!result.complete(stream)) {
                             stream.close(); // cancelled meanwhile

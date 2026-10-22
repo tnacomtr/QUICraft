@@ -7,6 +7,7 @@ import net.minecraft.network.Connection;
 import net.minecraft.network.DisconnectionDetails;
 import net.minecraft.network.chat.Component;
 import rs.sudoe.quicraft.bridge.GameLanes;
+import rs.sudoe.quicraft.core.multistream.JoinDiag;
 import rs.sudoe.quicraft.fabric.Hooks;
 
 /**
@@ -48,6 +49,24 @@ public final class V3Hooks {
         }
         GameLanes lanes = client.lanes();
         return lanes == null ? -1L : lanes.busyMarkForCurrentDelivery();
+    }
+
+    /**
+     * The join reached play: the join marks are complete, so their one line is written here (or,
+     * when play is never reached, when the attempt ends). Never throws.
+     */
+    public static void playLogin(Connection connection) {
+        try {
+            V3Client client = Transports.v3(connection);
+            if (client == null) {
+                return;
+            }
+            JoinDiag diag = client.joinDiag();
+            JoinDiag.mark(diag, "play login");
+            JoinDiag.finish(diag);
+        } catch (Throwable ignored) {
+            // Diagnostics never reach the join.
+        }
     }
 
     /** Hello arrived. False cancels vanilla's handling: the {@code /3} attempt is over. */

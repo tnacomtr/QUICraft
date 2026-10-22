@@ -20,6 +20,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import rs.sudoe.quicraft.core.Faults;
 import rs.sudoe.quicraft.core.Protocol;
+import rs.sudoe.quicraft.core.multistream.JoinDiag;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.NStreamSession;
 import rs.sudoe.quicraft.core.multistream.SessionResources;
@@ -374,6 +375,11 @@ public final class V3ConnectionImpl implements V3Connection, QuicByteStream.List
     @Override
     public boolean handshakeComplete() {
         return handshakeComplete;
+    }
+
+    @Override
+    public JoinDiag joinDiag() {
+        return JoinDiag.of(connection);
     }
 
     // --- QuicByteStream (stream 0 as the game sees it).

@@ -3,6 +3,7 @@ package rs.sudoe.quicraft.core.transport;
 
 import java.nio.ByteBuffer;
 import java.util.function.Consumer;
+import rs.sudoe.quicraft.core.multistream.JoinDiag;
 import rs.sudoe.quicraft.core.multistream.LaneGame;
 import rs.sudoe.quicraft.core.multistream.MultistreamSession;
 import rs.sudoe.quicraft.core.multistream.SessionContext;
@@ -145,4 +146,12 @@ public interface V3Connection extends QuicByteStream {
      * this is false.
      */
     boolean handshakeComplete();
+
+    /**
+     * This connection's join marks of {@code -Dquicraft.v3.joindiag}, or null when that switch is off
+     * (the default). Recording a mark never changes what goes on the wire.
+     */
+    default JoinDiag joinDiag() {
+        return null;
+    }
 }
