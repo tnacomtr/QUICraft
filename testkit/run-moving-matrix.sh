@@ -164,6 +164,7 @@ if [[ -e "$out_dir" ]]; then
 fi
 mkdir -p "$out_dir" || die "cannot create $out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
+mkdir -p "$out_dir/runner-logs" || die "cannot create $out_dir/runner-logs"
 
 echo "== moving matrix: $total_runs runs ($rounds round(s) x $profile_count profile(s) x $arm_count arms)"
 run_budget=$(matrix_run_budget "$move_seconds")
@@ -222,13 +223,13 @@ for ((round = 0; round < rounds; round++)); do
             echo "== [$index/$total_runs] $stem ($(date -u +%H:%M:%SZ))"
             run_status=0
             bounded_outer "$run_budget" "$here/run-external-arms.sh" "${arm_args[@]}" "${common_args[@]}" \
-                >"$out_dir/$stem.runner.log" 2>&1 || run_status=$?
+                >"$out_dir/runner-logs/$stem.log" 2>&1 || run_status=$?
             if ((run_status == 0)); then
                 printf '%s\t%s\t%s\tok\t%s.json\n' "$profile" "$token" "$round" "$stem" >>"$status_file"
             else
                 failed=$((failed + 1))
                 printf '%s\t%s\t%s\tfailed\t%s.json\n' "$profile" "$token" "$round" "$stem" >>"$status_file"
-                echo "==   failed (status $run_status); runner log: $out_dir/$stem.runner.log" >&2
+                echo "==   failed (status $run_status); runner log: $out_dir/runner-logs/$stem.log" >&2
             fi
         done
     done
