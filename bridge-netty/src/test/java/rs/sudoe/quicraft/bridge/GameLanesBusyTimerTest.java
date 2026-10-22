@@ -2,6 +2,7 @@
 package rs.sudoe.quicraft.bridge;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -98,6 +99,13 @@ class GameLanesBusyTimerTest {
         void deliver(long sequence, List<Object> packets, boolean bundle) {
             lanes.deliver(Lane.WORLD, sequence, packets, bundle);
         }
+    }
+
+    @Test
+    void busyTimerIsOnUnlessThePropertyIsFalse() {
+        // The test JVM does not set quicraft.v3.batchTimerBusy, so the shipped default applies.
+        assertTrue(System.getProperty("quicraft.v3.batchTimerBusy") != null
+                || GameLanes.BUSY_TIMER_PROPERTY, "the busy batch timer must default to on");
     }
 
     @Test

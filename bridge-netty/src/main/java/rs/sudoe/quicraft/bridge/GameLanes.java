@@ -338,8 +338,8 @@ public final class GameLanes implements LaneGame {
     private volatile boolean closed;
     private volatile Session session;
     private final boolean traceWrites = ReceiveTrace.enabled();
-    /** Client chunk-batch busy timer switch ({@code -Dquicraft.v3.batchTimerBusy}), read once. */
-    static final boolean BUSY_TIMER_PROPERTY = Boolean.getBoolean("quicraft.v3.batchTimerBusy");
+    /** Client chunk-batch busy timer switch ({@code -Dquicraft.v3.batchTimerBusy=false} turns it off; default on), read once. */
+    static final boolean BUSY_TIMER_PROPERTY = !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy"));
     /**
      * Whether the busy timer runs on this instance. When false nothing below reads the clock or writes a
      * counter, so the off path costs nothing extra.

@@ -129,8 +129,10 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
         providers.gradleProperty("quicraft.armStallDiag").orNull?.let { property("quicraft.v3.stalldiag", it) }
         // The busy-timer variant (-Pquicraft.armVariant=busy) is the same arm with the client-side
         // prototype timer on; the row then says busyTimer=true and needs it, so both are set here.
-        if (providers.gradleProperty("quicraft.armVariant").orNull == "busy") {
-            property("quicraft.v3.batchTimerBusy", "true")
+        // The busy timer is the product default; the plain variant switches it off explicitly.
+        if (arm == "quic3") {
+            property("quicraft.v3.batchTimerBusy",
+                if (providers.gradleProperty("quicraft.armVariant").orNull == "busy") "true" else "false")
         }
         // -Pquicraft.armCoalesce=true|false forces write coalescing; unset keeps the default (/3 on, /2 off).
         providers.gradleProperty("quicraft.armCoalesce").orNull?.let { property("quicraft.coalesceWrites", it) }
@@ -148,8 +150,9 @@ loom.runs.matching { it.name == "clientGameTest" }.configureEach {
         if (providers.gradleProperty("quicraft.desyncTransport").orNull == "quic3") {
             property("quicraft.multistream.offlineTest", "true")
         }
-        if (providers.gradleProperty("quicraft.desyncVariant").orNull == "busy") {
-            property("quicraft.v3.batchTimerBusy", "true")
+        if (providers.gradleProperty("quicraft.desyncTransport").orNull == "quic3") {
+            property("quicraft.v3.batchTimerBusy",
+                if (providers.gradleProperty("quicraft.desyncVariant").orNull == "busy") "true" else "false")
         }
     }
     // Opt-in: online-mode login against the testkit's mock session server. The real client reads
