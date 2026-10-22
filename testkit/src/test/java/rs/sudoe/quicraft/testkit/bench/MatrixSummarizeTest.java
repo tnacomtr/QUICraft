@@ -72,6 +72,46 @@ class MatrixSummarizeTest {
         assertTrue(text.contains("| clean | quic3 | 1 | 1 | 0 | 0 | 1 | INCOMPLETE |"), text);
     }
 
+    @Test
+    void hopTableReportsCompleteLegsAndRejectsAnIncompleteHopRun() throws IOException {
+        writeRaw("clean-tcp.json", "clean", "clean",
+                hopRow(RunFixtures.tcp(10, 100, 1), 1, 300, 330, 6, null),
+                hopRow(RunFixtures.tcp(10, 100, 1), 2, 320, 350, 6, null));
+        writeRaw("clean-quic3.json", "clean", "clean",
+                hopRow(RunFixtures.quic3(10, 100, 1), 1, 200, 240, 6, null),
+                hopRow(RunFixtures.quic3(10, 100, 1), 2, 250, 260, 3, "leg 3 did not reach 90% within 30 s"));
+        Path markdown = dir.resolve("summary.md");
+        assertEquals(1, summarize(markdown, "clean"));
+        String text = Files.readString(markdown, StandardCharsets.UTF_8);
+        assertTrue(text.contains("Teleport-hop table"), text);
+        assertTrue(text.contains("| clean | TCP | hop fill median (ms) | 310.0 | 300.0 | 320.0 | 2 |"), text);
+        assertTrue(text.contains("| clean | QUIC /3 | hop fill median (ms) | 200.0 | 200.0 | 200.0 | 1 |"), text);
+        assertTrue(text.contains("| clean | TCP | hop fill p95 (ms) | 340.0 | 330.0 | 350.0 | 2 |"), text);
+        assertTrue(text.contains("successful hop run that is incomplete: 1"), text);
+    }
+
+    @Test
+    void rowsWithoutHopFieldsGetNoHopTable() throws IOException {
+        write("clean-tcp.json", "clean", "clean", RunFixtures.tcp(10, 100, 1));
+        write("clean-quic3.json", "clean", "clean", RunFixtures.quic3(20, 200, 2));
+        Path markdown = dir.resolve("summary.md");
+        summarize(markdown, "clean");
+        assertFalse(Files.readString(markdown, StandardCharsets.UTF_8).contains("Teleport-hop table"));
+    }
+
+    /** A real fixture row with the teleport-hop fields the external arm writer adds. */
+    private static JsonObject hopRow(RunResult fixture, int runIndex, double median, double p95, int legs, String error) {
+        JsonObject row = GSON.toJsonTree(fixture).getAsJsonObject();
+        row.addProperty("run", runIndex);
+        row.addProperty("hop", true);
+        row.addProperty("hopRequested", 6);
+        row.addProperty("hopCount", legs);
+        row.addProperty("hopFillMsMedian", median);
+        row.addProperty("hopFillMsP95", p95);
+        row.add("hopError", error == null ? com.google.gson.JsonNull.INSTANCE : new com.google.gson.JsonPrimitive(error));
+        return row;
+    }
+
     private void writeManifest(int rounds, String status, boolean all) throws IOException {
         // Fixtures currently use round zero; keep manifest identities tied to the row, not filenames.
         for (String file : List.of("tcp.json", "q2.json", "q3.json")) {

@@ -25,13 +25,15 @@ _ROOT = os.path.dirname(os.path.dirname(_TESTS))
 RUNNER = os.path.join(_ROOT, "testkit/run-external-arms.sh")
 MERGE = os.path.join(_ROOT, "testkit/merge-arm-samples.py")
 REAL_MOD = os.path.join(_ROOT, "fabric/src/gametest/resources/fabric.mod.json")
+DEADLINE = os.path.join(_ROOT, "testkit/lib/deadline.sh")
+OFFLINE_OPS = os.path.join(_ROOT, "testkit/offline-ops.py")
 SOURCES = (RUNNER, MERGE, REAL_MOD)
 TEMPBASE = "/tmp/opencode"
 BASH = shutil.which("bash") or "/bin/bash"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 ENTRY = "rs.sudoe.quicraft.fabric.gametest.ExternalArmGameTest"
 ARM_SUFFIX = {"tcp": "tcp", "quic2": "quic-2", "quic3": "quic-3"}
-SAFE_TOOLS = ("mktemp", "cp", "cmp", "mkdir", "mv", "rm", "sleep", "tail", "dirname", "cat")
+SAFE_TOOLS = ("mktemp", "cp", "cmp", "mkdir", "mv", "rm", "sleep", "tail", "dirname", "cat", "setsid", "timeout", "env")
 
 STUB = r"""
 import hashlib, json, os, sys
@@ -80,7 +82,8 @@ if name == "netem-attach.sh":
 if name == "docker":
     environment = {key: os.environ.get(key, "") for key in
                    ("FABRIC_ONLINE_MODE", "REAL_FABRIC_ONLINE_MODE",
-                     "REAL_FABRIC_MULTISTREAM", "REAL_FABRIC_PORT", "QUICRAFT_JAVA_OPTS")}
+                     "REAL_FABRIC_MULTISTREAM", "REAL_FABRIC_PORT", "QUICRAFT_JAVA_OPTS",
+                     "QUICRAFT_OPS_JSON")}
     append("docker-env.jsonl", json.dumps(environment, sort_keys=True))
     if "logs" in args:
         print("fake /3 send trace phase=disconnect")
@@ -171,6 +174,11 @@ class Fixture(unittest.TestCase):
         for name in ("docker", "git", "flock"):
             os.symlink(stub, os.path.join(self.fakebin, name))
         os.symlink(sys.executable, os.path.join(self.fakebin, "python3"))
+        # The runner only requires xvfb-run to exist; this stub runs the command it is given.
+        xvfb = os.path.join(self.fakebin, "xvfb-run")
+        with open(xvfb, "w", encoding="utf-8") as handle:
+            handle.write('#!/bin/sh\nwhile [ $# -gt 0 ]; do case "$1" in -a) shift;; -s) shift 2;; *) break;; esac; done\nexec "$@"\n')
+        os.chmod(xvfb, 0o700)
         for name in SAFE_TOOLS:
             target = shutil.which(name)
             if target is None:
@@ -179,6 +187,11 @@ class Fixture(unittest.TestCase):
         os.symlink(stub, os.path.join(self.tmp, "gradlew"))
         for name in ("status-ping.py", "netem-attach.sh"):
             os.symlink(stub, os.path.join(self.testkit, name))
+        # The runner sources lib/deadline.sh (its budgets), so the copied tree needs the real one.
+        os.makedirs(os.path.join(self.testkit, "lib"))
+        shutil.copyfile(DEADLINE, os.path.join(self.testkit, "lib", "deadline.sh"))
+        # --hop builds the ops.json entry with this helper; the copied tree needs the real one.
+        shutil.copyfile(OFFLINE_OPS, os.path.join(self.testkit, "offline-ops.py"))
 
         self.mod = os.path.join(self.tmp, "mod.json")
         shutil.copyfile(REAL_MOD, self.mod)
@@ -294,6 +307,9 @@ class RunnerArgumentsTest(Fixture):
             ("missing_value", ["--arm"], "missing value for --arm"),
             ("unknown_argument", ["--arm", "tcp", "--run", "0", "--out-dir", "out",
                                   "--bogus"], "unknown argument '--bogus'"),
+            ("hop_and_move", ["--arm", "tcp", "--run", "0", "--out-dir", "out",
+                              "--hop", "--move"],
+             "--hop and --move are mutually exclusive"),
         )
         for name, argv, fragment in rows:
             with self.subTest(name=name):
@@ -379,6 +395,7 @@ class RunnerRunTest(Fixture):
         self.assertEqual(environment["REAL_FABRIC_ONLINE_MODE"], "false")
         self.assertEqual(environment["REAL_FABRIC_MULTISTREAM"], "true")  # tcp arm; quic2 runs false
         self.assertEqual(environment["REAL_FABRIC_PORT"], self.port)
+        self.assertEqual(environment["QUICRAFT_OPS_JSON"], "")  # no ops file outside --hop
 
         downs = self.down_calls()
         self.assertEqual(len(downs), 1)
@@ -414,6 +431,11 @@ class RunnerRunTest(Fixture):
             "quicraft.armWarmup": "false",
             "quicraft.armCommit": COMMIT,
             "quicraft.armPlaySeconds": "20",
+            "quicraft.armMove": "false",
+            "quicraft.armMoveSeconds": "60",
+            "quicraft.armHop": "false",
+            "quicraft.armVariant": "plain",
+            "quicraft.armStallDiag": "false",
         })
         self.assertEqual([name for name in os.listdir(os.path.join(self.tmp, "tmp"))
                           if name.startswith("quicraft-arm-")], [])
@@ -451,6 +473,25 @@ class RunnerRunTest(Fixture):
         self.assertIn("-Pquicraft.armPlaySeconds=3", client)
         self.assertIn("-Pquicraft.armNetem=clean", client)
         self.assertRegex(self.project_of(self.up_call()), r"^quicraft-arm-quic3-7-[0-9a-f]{12}$")
+
+    def test_hop_run_reaches_gradle_with_its_own_stem_and_no_move(self):
+        result = self.run_runner(["--arm", "tcp", "--run", "3", "--hop",
+                                  "--out-dir", self.out_dir, "--port", self.port])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self.out_dir, "tcp-clean-hop-run3.json")))
+        client = self.calls("gradlew")[-1]
+        self.assertIn("-Pquicraft.armHop=true", client)
+        self.assertIn("-Pquicraft.armMove=false", client)
+        self.assertTrue(any(arg.endswith("tcp-clean-hop-run3.json") and arg.startswith("-Pquicraft.armOut=")
+                            for arg in client), client)
+        environment = self.docker_environments()[0]
+        self.assertEqual(json.loads(environment["QUICRAFT_OPS_JSON"]), [{
+            "uuid": "2654e3c3-150d-3857-a426-0b141796a4e0",
+            "name": "Player0",
+            "level": 4,
+            "bypassesPlayerLimit": False,
+        }])
+
 
     def test_failed_row_fails_and_still_tears_down(self):
         self.write_state("client-mode.txt", "failrow\n")
@@ -642,3 +683,29 @@ class MergeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OfflineOpsTest(unittest.TestCase):
+    """The offline UUID is java's nameUUIDFromBytes("OfflinePlayer:<name>"): checked on the known Notch value."""
+
+    def ops(self, name):
+        result = subprocess.run([sys.executable, "-I", OFFLINE_OPS, name],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_notch_has_the_known_offline_uuid(self):
+        self.assertEqual(self.ops("Notch"), [{
+            "uuid": "b50ad385-829d-3141-a216-7e7d7539ba7f",
+            "name": "Notch",
+            "level": 4,
+            "bypassesPlayerLimit": False,
+        }])
+
+    def test_bad_names_are_refused(self):
+        for name in ("", "two words"):
+            with self.subTest(name=name):
+                result = subprocess.run([sys.executable, "-I", OFFLINE_OPS, name],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 2)
+

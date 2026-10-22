@@ -11,6 +11,11 @@ rm -f /srv/mods/quicraft-fabric.jar
 if [ "${QUICRAFT_PLUGIN:-true}" = true ]; then
     cp /srv/quicraft/quicraft-fabric.jar /srv/mods/
 fi
+# Hop runs (testkit/run-external-arms.sh --hop) pass the offline client's ops.json entry, verbatim.
+# Unset or empty: no ops file, as before.
+if [ -n "${QUICRAFT_OPS_JSON:-}" ]; then
+    printf '%s' "$QUICRAFT_OPS_JSON" > /srv/ops.json
+fi
 # 26.1.2 ignores these unless all three are set.
 mock="${MOCK_SESSION_URL:-http://mocksession:8080}"
 # shellcheck disable=SC2086 # JAVA_OPTS is a list of flags

@@ -74,6 +74,19 @@ public class ExternalArmGameTest implements FabricClientGameTest {
     private static final long QUIET_NANOS = 2_000_000_000L;
     private static final int JOIN_TIMEOUT_TICKS = 20 * 90;
     private static final int CHUNK_TIMEOUT_TICKS = 20 * 60;
+    // Teleport hops (-Pquicraft.armHop=true). Each leg is one server teleport, `tp @s x y z` sent as a
+    // client command (the offline ops.json entry gives Player0 level 4, see testkit/run-external-arms.sh):
+    // x alternates between x0 and x0 + 240 so every destination stays inside the pregenerated area
+    // (PREGEN_TILES=3: +-384 blocks around spawn); y is 2 blocks above the start height, z the start z.
+    private static final int HOP_LEGS = 6;
+    private static final double HOP_LEG_BLOCKS = 240.0;
+    private static final double HOP_TELEPORT_ABOVE_METRES = 2.0;
+    private static final double HOP_FILL_SHARE = 0.9;
+    private static final long HOP_TIMEOUT_NANOS = 30_000_000_000L;
+    /** The offline user name the arm client logs in with (its ops.json entry is the same name). */
+    private static final String HOP_USER = "Player0";
+    /** The fixture's server view distance (testkit/docker/fabric/server.properties); the effective view. */
+    private static final int HOP_VIEW_CHUNKS = 8;
     /** Payloads of the pings this test sent, so only our pongs count as round trips. */
     private static final Set<Long> SENT = ConcurrentHashMap.newKeySet();
     /** The connector's status-query hook name ({@code ClientConnect}'s platform). */
@@ -182,9 +195,11 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         });
         // Play window: idle, or moving with -Pquicraft.armMove=true. A play ping every 5 ticks in
         // both, so the RTT samples are comparable.
-        Window window = playWindow(context, o);
+        HopRun hop = o.hop ? hopRun(context) : null;
+        Window window = o.hop ? hop.window() : playWindow(context, o);
         if (window == null) {
-            return failedRow(o, "disconnected during play");
+            return failedRow(o, hop != null && hop.error() != null && !DISCONNECTED.equals(hop.error())
+                    ? hop.error() : "disconnected during play");
         }
         for (int t = 0; ArmClock.rtts.size() < window.sent && t < 40; t++) {
             context.waitTick(); // 2 s grace for the last pongs
@@ -222,15 +237,19 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         JsonObject row = baseRow(o);
         boolean movedOk = !o.move || (window.distance >= MIN_MOVE_METRES_PER_SECOND * window.seconds
                 && window.chunks >= Math.ceil(MIN_MOVE_CHUNKS_PER_SECOND * window.seconds));
-        boolean startOk = !o.move || (Math.abs(window.start.x - START_CENTER_X) <= START_AREA_METRES
+        boolean startOk = !(o.move || o.hop) || (Math.abs(window.start.x - START_CENTER_X) <= START_AREA_METRES
                 && Math.abs(window.start.z - START_CENTER_Z) <= START_AREA_METRES);
-        boolean ok = mismatch == null && sorted.length > 0 && movedOk && startOk;
+        boolean hopOk = hop == null || hop.complete();
+        boolean ok = mismatch == null && sorted.length > 0 && movedOk && startOk && hopOk;
         if (mismatch == null && !startOk) {
             mismatch = String.format(Locale.ROOT, "the moving window started outside the fixed spawn area: %.1f, %.1f",
                     window.start.x, window.start.z);
         } else if (mismatch == null && !movedOk) {
             mismatch = String.format(Locale.ROOT, "the moving window proved no movement: %.2f m, %d chunks",
                     window.distance, window.chunks);
+        } else if (mismatch == null && !hopOk) {
+            mismatch = "hop run incomplete: " + (hop.error() != null ? hop.error()
+                    : hop.legs().size() + " of " + HOP_LEGS + " legs");
         }
         row.addProperty("ok", ok);
         add(row, "phasesMs", phases);
@@ -261,6 +280,9 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         row.addProperty("moveTicks", window.ticks);
         row.addProperty("moveStallTicks", window.stallTicks);
         row.addProperty("moveMaxTickMs", window.maxTickMs);
+        if (hop != null) {
+            addHopFields(row, hop);
+        }
         if (o.move) {
             row.addProperty("moveStartX", window.start.x);
             row.addProperty("moveStartY", window.start.y);
@@ -377,6 +399,204 @@ public class ExternalArmGameTest implements FabricClientGameTest {
                 (System.nanoTime() - startNanos) / 1_000_000_000.0, distance, stallTicks, maxTickMs, start);
     }
 
+    /** One teleport leg: the fill time counts from the tp command (ms). */
+    private record Leg(double fillMs, long chunks) {}
+
+    /** The error text of a hop run whose connection was lost; run() reports it as a lost connection. */
+    private static final String DISCONNECTED = "disconnected";
+
+    /**
+     * The hop window: the legs completed, the window's own measures, and why the run stopped early
+     * (null when every leg completed). {@code window} is null only when the run stopped before any play.
+     */
+    private record HopRun(Window window, List<Leg> legs, String error, int view, int need) {
+        boolean complete() {
+            return error == null && legs.size() == HOP_LEGS;
+        }
+    }
+
+    /** One client tick: a ping every PING_EVERY_TICKS. */
+    private static final class Pacer {
+        int sent;
+        int ticks;
+        int stallTicks;
+        double maxTickMs;
+
+        /** The local player's position after the tick, or null when the connection is gone. */
+        Vec3 tick(ClientGameTestContext context) {
+            boolean ping = ticks % PING_EVERY_TICKS == 0;
+            long tickStart = System.nanoTime();
+            Vec3 position = context.computeOnClient(c -> {
+                if (c.getConnection() == null || c.player == null) {
+                    return null;
+                }
+                if (ping) {
+                    long now = System.nanoTime();
+                    SENT.add(now);
+                    c.getConnection().send(new ServerboundPingRequestPacket(now));
+                }
+                return c.player.position();
+            });
+            if (position == null) {
+                return null;
+            }
+            if (ping) {
+                sent++;
+            }
+            ticks++;
+            context.waitTick();
+            double tickMs = (System.nanoTime() - tickStart) / 1_000_000.0;
+            if (tickMs > STALL_TICK_MS) {
+                stallTicks++;
+            }
+            maxTickMs = Math.max(maxTickMs, tickMs);
+            return position;
+        }
+    }
+
+    /**
+     * Teleport hops, after the join and the initial view fill. The client must be the offline user
+     * Player0 (the server's ops.json grants it level 4). Each leg sends `tp @s` as a client command and
+     * counts its fill time, from just before the command, until 90% of the circle of columns around
+     * the destination is loaded. A leg that does not get there within HOP_TIMEOUT_NANOS stops the run.
+     */
+    private static HopRun hopRun(ClientGameTestContext context) {
+        int view = effectiveViewChunks(context);
+        int expected = circleColumns(view);
+        int need = (int) Math.ceil(HOP_FILL_SHARE * expected);
+        String user = context.computeOnClient(c -> c.getUser().getName());
+        if (!HOP_USER.equals(user)) {
+            return new HopRun(null, List.of(), "the client's user is " + user + ", not " + HOP_USER
+                    + " (the ops.json entry the hop run needs)", view, need);
+        }
+        long startChunks = ArmClock.chunks.get();
+        long runStart = System.nanoTime();
+        Pacer pacer = new Pacer();
+        Vec3 start = context.computeOnClient(c -> c.player == null ? Vec3.ZERO : c.player.position());
+        Vec3 at = start;
+        String error = null;
+        // The initial view must already be at least 90% loaded before the first leg.
+        long deadline = System.nanoTime() + HOP_TIMEOUT_NANOS;
+        while (loadedColumns(context, floorChunk(at.x), floorChunk(at.z), view) < need) {
+            if (System.nanoTime() > deadline) {
+                error = "initial view below 90% of " + expected + " columns in the view circle after 30 s";
+                break;
+            }
+            at = pacer.tick(context);
+            if (at == null) {
+                return new HopRun(null, List.of(), DISCONNECTED, view, need);
+            }
+        }
+        List<Leg> legs = new ArrayList<>();
+        double x0 = start.x;
+        double z0 = start.z;
+        double y = start.y + HOP_TELEPORT_ABOVE_METRES;
+        double distance = 0;
+        Vec3 last = at;
+        for (int leg = 0; error == null && leg < HOP_LEGS; leg++) {
+            double targetX = leg % 2 == 0 ? x0 + HOP_LEG_BLOCKS : x0;
+            String command = String.format(Locale.ROOT, "tp @s %.3f %.3f %.3f", targetX, y, z0);
+            int targetChunkX = floorChunk(targetX);
+            int targetChunkZ = floorChunk(z0);
+            // t0: right before the command is sent; the client sends it on its own thread.
+            long legStart = System.nanoTime();
+            long legChunks = ArmClock.chunks.get();
+            context.runOnClient(c -> c.getConnection().sendCommand(command));
+            double fillMs = -1;
+            long fillChunks = 0;
+            while (fillMs < 0) {
+                if (loadedColumns(context, targetChunkX, targetChunkZ, view) >= need) {
+                    fillMs = millis(System.nanoTime() - legStart);
+                    fillChunks = ArmClock.chunks.get() - legChunks;
+                    break;
+                }
+                if (System.nanoTime() - legStart > HOP_TIMEOUT_NANOS) {
+                    error = String.format(Locale.ROOT, "leg %d did not reach 90%% of %d columns in the view circle"
+                            + " within 30 s", leg, expected);
+                    break;
+                }
+                Vec3 position = pacer.tick(context);
+                if (position == null) {
+                    return new HopRun(null, legs, DISCONNECTED, view, need);
+                }
+                distance += Math.hypot(position.x - last.x, position.z - last.z);
+                last = position;
+            }
+            if (error == null) {
+                legs.add(new Leg(fillMs, fillChunks));
+            }
+        }
+        Window window = new Window(pacer.sent, pacer.ticks, ArmClock.chunks.get() - startChunks,
+                (System.nanoTime() - runStart) / 1_000_000_000.0, distance, pacer.stallTicks, pacer.maxTickMs, start);
+        return new HopRun(window, legs, error, view, need);
+    }
+
+    /**
+     * The effective view distance: the client's render distance, capped at the fixture server's view
+     * distance (vanilla sends only the chunks the smaller of the two allows).
+     */
+    private static int effectiveViewChunks(ClientGameTestContext context) {
+        int rendered = context.computeOnClient(c -> c.options.renderDistance().get());
+        return Math.min(rendered, HOP_VIEW_CHUNKS);
+    }
+
+    /**
+     * Integer columns (dx, dz) with dx^2 + dz^2 <= view^2: the circle vanilla streams around the
+     * player (197 for view 8). A square of (2v+1)^2 is never fully loaded, so the circle is counted.
+     */
+    static int circleColumns(int view) {
+        int count = 0;
+        for (int dx = -view; dx <= view; dx++) {
+            for (int dz = -view; dz <= view; dz++) {
+                if (dx * dx + dz * dz <= view * view) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    /** Loaded client columns inside the view circle around a chunk column. */
+    private static int loadedColumns(ClientGameTestContext context, int cx, int cz, int view) {
+        return context.computeOnClient(c -> {
+            if (c.level == null) {
+                return 0;
+            }
+            int loaded = 0;
+            for (int dx = -view; dx <= view; dx++) {
+                for (int dz = -view; dz <= view; dz++) {
+                    if (dx * dx + dz * dz <= view * view && c.level.getChunkSource().hasChunk(cx + dx, cz + dz)) {
+                        loaded++;
+                    }
+                }
+            }
+            return loaded;
+        });
+    }
+
+    /** The chunk column of a block coordinate. */
+    private static int floorChunk(double blocks) {
+        return (int) Math.floor(blocks) >> 4;
+    }
+
+    /** Hop measures for the row: per-leg arrays in order, plus the fill median and p95 (completed legs). */
+    private static void addHopFields(JsonObject row, HopRun hop) {
+        double[] fill = hop.legs().stream().mapToDouble(Leg::fillMs).toArray();
+        double[] sorted = hop.legs().stream().mapToDouble(Leg::fillMs).sorted().toArray();
+        row.addProperty("hopMode", "teleport");
+        row.addProperty("hopLegMetres", HOP_LEG_BLOCKS);
+        row.addProperty("hopRequested", HOP_LEGS);
+        row.addProperty("hopCount", hop.legs().size());
+        row.addProperty("hopViewDistance", hop.view());
+        row.addProperty("hopExpectedColumns", circleColumns(hop.view()));
+        row.addProperty("hopNeedColumns", hop.need());
+        add(row, "hopFillMs", fill);
+        row.addProperty("hopFillMsMedian", percentile(sorted, 0.5));
+        row.addProperty("hopFillMsP95", percentile(sorted, 0.95));
+        add(row, "hopChunks", hop.legs().stream().mapToDouble(leg -> leg.chunks()).toArray());
+        row.add("hopError", hop.error() != null ? new com.google.gson.JsonPrimitive(hop.error()) : JsonNull.INSTANCE);
+    }
+
     /** One status request over TCP (handshake, request, response); returns the status JSON. */
     private static String statusJson(InetSocketAddress server) throws IOException {
         try (java.net.Socket socket = new java.net.Socket()) {
@@ -454,6 +674,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         });
         row.addProperty("buildCommit", o.commit);
         row.addProperty("variant", o.variant);
+        row.addProperty("hop", o.hop);
         row.addProperty("busyTimer", o.arm.equals("quic3")
                 && !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")));
         row.add("net", JsonNull.INSTANCE);
@@ -544,7 +765,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
     }
 
     private record Options(String arm, String server, String host, int port, Path out, String netem, int run,
-            boolean warmup, String commit, int playSeconds, boolean move, int moveSeconds, String variant) {
+            boolean warmup, String commit, int playSeconds, boolean move, int moveSeconds, String variant,
+            boolean hop) {
         static Options read(String arm) {
             check(Set.of("tcp", "quic2", "quic3").contains(arm), "quicraft.gametest.arm must be tcp, quic2 or quic3");
             String server = System.getProperty("quicraft.gametest.armServer", "");
@@ -580,12 +802,16 @@ public class ExternalArmGameTest implements FabricClientGameTest {
                     "the busy variant needs the busy timer on (the default) and the plain variant needs"
                             + " -Dquicraft.v3.batchTimerBusy=false");
             check(!variant.equals("busy") || arm.equals("quic3"), "only the quic3 arm has a busy-timer variant");
+            String hop = System.getProperty("quicraft.gametest.armHop", "false");
+            check(hop.equals("true") || hop.equals("false"), "quicraft.gametest.armHop must be true or false, got " + hop);
+            check(!(hop.equals("true") && move.equals("true")), "quicraft.gametest.armHop and armMove are mutually exclusive");
             if (arm.equals("quic3")) {
                 check(Boolean.getBoolean("quicraft.multistream.offlineTest"),
                         "quic3 needs -Dquicraft.multistream.offlineTest=true on the client");
             }
             return new Options(arm, server, server.substring(0, colon), port, Path.of(out), netem, run,
-                    Boolean.parseBoolean(warmup), commit, play, Boolean.parseBoolean(move), moveSeconds, variant);
+                    Boolean.parseBoolean(warmup), commit, play, Boolean.parseBoolean(move), moveSeconds, variant,
+                    Boolean.parseBoolean(hop));
         }
 
         Mode mode() {

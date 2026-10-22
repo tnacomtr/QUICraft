@@ -57,7 +57,7 @@ public final class MatrixSummarize {
     private static final Gson GSON = new Gson();
 
     /** One measured run plus the /3 variant its writer recorded, so variants never mix silently. */
-    private record ParsedRun(RunResult run, String variant) {}
+    private record ParsedRun(RunResult run, String variant, JsonObject raw) {}
 
     /** Metric fields a run must carry; Gson would otherwise deserialize a missing one as zero. */
     private static final List<String> REQUIRED_NUMBERS = List.of("joinMs", "chunkLoadMs", "rttMedianMs");
@@ -137,6 +137,7 @@ public final class MatrixSummarize {
         int variantRuns = 0;
         int mislabeledRuns = 0;
         int invalidMovingRuns = 0;
+        int invalidHopRuns = 0;
         int invalidFiles = 0;
         int unclassifiedFiles = 0;
         List<RunResult> all = new ArrayList<>();
@@ -228,7 +229,12 @@ public final class MatrixSummarize {
                         invalidMovingRuns++;
                         continue;
                     }
-                    byProfile.get(profile).add(new ParsedRun(run, variant));
+                    if (run.ok() && !run.disconnected() && HopSummary.isHop(raw) && !HopSummary.complete(raw)) {
+                        // A successful hop run with a missing leg, an error or a non-finite fill is not hop evidence.
+                        invalidHopRuns++;
+                        continue;
+                    }
+                    byProfile.get(profile).add(new ParsedRun(run, variant, raw));
                     all.add(run);
                     if (manifest != null && run.ok() && !run.disconnected()
                             && (run.transportVersion() != TransportVersion.QUIC_3
@@ -241,14 +247,15 @@ public final class MatrixSummarize {
         if (all.isEmpty() && manifest == null) {
             System.err.println("no usable measured runs under " + dir);
             if (incompatibleRuns + malformedRuns + invalidMetricRuns + invalidFiles
-                    + unclassifiedFiles + variantRuns + mislabeledRuns + invalidMovingRuns > 0) {
+                    + unclassifiedFiles + variantRuns + mislabeledRuns + invalidMovingRuns + invalidHopRuns > 0) {
                 System.err.println("rejected evidence: incompatible=" + incompatibleRuns
                         + " malformed=" + malformedRuns + " invalidMetrics=" + invalidMetricRuns
                         + " unreadableArtifacts=" + invalidFiles
                         + " unclassifiedArtifacts=" + unclassifiedFiles
                         + " variantMismatches=" + variantRuns
                         + " mislabeledVariants=" + mislabeledRuns
-                        + " nonMovingRuns=" + invalidMovingRuns);
+                        + " nonMovingRuns=" + invalidMovingRuns
+                        + " incompleteHopRuns=" + invalidHopRuns);
             }
             return 1;
         }
@@ -311,7 +318,7 @@ public final class MatrixSummarize {
         // A disconnect means the join did not survive the bench window, so an ok flag alongside it
         // is contradictory evidence. Either way the matrix may not pass.
         int rejectedEvidence = incompatibleRuns + malformedRuns + invalidMetricRuns + variantRuns
-                + mislabeledRuns + invalidMovingRuns;
+                + mislabeledRuns + invalidMovingRuns + invalidHopRuns;
         boolean rejected = !artifactsValid || rejectedEvidence > 0 || failedRuns > 0 || disconnects > 0;
         String gate = anyFailClosed || rejected ? "FAIL-CLOSED" : complete ? "PASS" : "INCOMPLETE";
 
@@ -357,6 +364,9 @@ public final class MatrixSummarize {
         if (variantMode) {
             appendArmStats(md, profiles, byProfile, variants);
         }
+        if (byProfile.values().stream().flatMap(List::stream).anyMatch(run -> HopSummary.isHop(run.raw()))) {
+            appendHopStats(md, profiles, byProfile, variantMode ? variants : List.of());
+        }
         if (invalidFiles > 0) {
             md.append("Unreadable JSON files skipped: ").append(invalidFiles).append('\n');
         }
@@ -373,6 +383,7 @@ public final class MatrixSummarize {
                     .append(", run outside the requested /3 variants: ").append(variantRuns)
                     .append(", variant/timer label mismatch: ").append(mislabeledRuns)
                     .append(", successful moving run that did not move: ").append(invalidMovingRuns)
+                    .append(", successful hop run that is incomplete: ").append(invalidHopRuns)
                     .append(")\n");
         }
         md.append("Failed measured runs: ").append(failedRuns)
@@ -675,6 +686,74 @@ public final class MatrixSummarize {
             md.append("| ").append(String.join(" | ", pair)).append(" |\n");
         }
         md.append('\n');
+    }
+
+    /** The hop fields the table reports, as {row field, table label}. */
+    private static final List<String[]> HOP_FIELDS = List.of(
+            new String[] {"hopFillMsMedian", "hop fill median (ms)"},
+            new String[] {"hopFillMsP95", "hop fill p95 (ms)"});
+
+    /**
+     * Teleport-hop table: per arm and profile, the per-run fill median and p95 over the six legs with
+     * their min-max, and paired round-by-round deltas against TCP. Complete hop runs only.
+     */
+    private static void appendHopStats(StringBuilder md, List<String> profiles,
+            Map<String, List<ParsedRun>> byProfile, List<String> variants) {
+        md.append("Teleport-hop table: each run's fill median and p95 over its six legs (ms, from a leg's first")
+                .append(" tick until 90% of the columns around its final position are loaded). Complete hop")
+                .append(" runs only; a pair needs both arms in the same round.\n\n");
+        md.append("| Profile | Arm | Metric | Median | Min | Max | n |\n");
+        md.append("| --- | --- | --- | --- | --- | --- | --- |\n");
+        List<String[]> pairs = new ArrayList<>();
+        for (String profile : profiles) {
+            List<ParsedRun> runs = byProfile.get(profile);
+            for (String[] field : HOP_FIELDS) {
+                Metric metric = new Metric(field[1], null, false);
+                ArmValues tcp = hopValues(runs, TransportVersion.TCP, null, field[0]);
+                appendArmRow(md, profile, "TCP", metric, tcp);
+                if (variants.isEmpty()) {
+                    ArmValues arm = hopValues(runs, TransportVersion.QUIC_3, null, field[0]);
+                    appendArmRow(md, profile, "QUIC /3", metric, arm);
+                    appendPair(pairs, profile, "QUIC /3", metric, tcp, arm);
+                }
+                for (String variant : variants) {
+                    ArmValues arm = hopValues(runs, TransportVersion.QUIC_3, variant, field[0]);
+                    String label = "QUIC /3 " + variant;
+                    appendArmRow(md, profile, label, metric, arm);
+                    appendPair(pairs, profile, label, metric, tcp, arm);
+                }
+            }
+        }
+        md.append('\n');
+        md.append("| Profile | Arm | Metric | Paired Δ vs TCP median (ms) | Δ min..max (ms) | Δ% median | Pairs |\n");
+        md.append("| --- | --- | --- | --- | --- | --- | --- |\n");
+        for (String[] pair : pairs) {
+            md.append("| ").append(String.join(" | ", pair)).append(" |\n");
+        }
+        md.append('\n');
+    }
+
+    /** One arm's complete hop values for one field; the same filters as armValues. */
+    private static ArmValues hopValues(List<ParsedRun> runs, TransportVersion transport, String variant, String field) {
+        List<Double> values = new ArrayList<>();
+        Map<Integer, Double> byRound = new LinkedHashMap<>();
+        for (ParsedRun parsed : runs) {
+            RunResult run = parsed.run();
+            if (!HopSummary.isHop(parsed.raw()) || !HopSummary.complete(parsed.raw())
+                    || run.transportVersion() != transport || !run.ok() || run.disconnected()) {
+                continue;
+            }
+            if (variant != null && !variant.equals(parsed.variant())) {
+                continue;
+            }
+            double value = HopSummary.number(parsed.raw(), field);
+            if (!Double.isFinite(value) || value < 0) {
+                continue;
+            }
+            values.add(value);
+            byRound.putIfAbsent(run.run(), value);
+        }
+        return new ArmValues(values, byRound);
     }
 
     private static void appendArmRow(StringBuilder md, String profile, String arm, Metric metric, ArmValues values) {

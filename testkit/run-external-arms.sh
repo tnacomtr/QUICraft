@@ -48,12 +48,14 @@ processed="$root/fabric-26x/build/resources/gametest/fabric.mod.json"
 compose_files=("$here/docker/compose.yaml" "$here/docker/compose.real-fabric.yaml")
 lock_file="$root/.gradle/quicraft-gametest-resources.lock"
 ready_timeout="${QUICRAFT_ARM_READY_TIMEOUT:-180}"
+# Client budget basis for --hop: initial fill 30 s + climb + 6 legs x 30 s, with margin.
+HOP_WINDOW_SECONDS=240
 
 usage() {
     {
         echo "usage: run-external-arms.sh --arm tcp|quic2|quic3 --run N [--warmup] --out-dir DIR"
         echo "                              [--port 25565] [--play-seconds S] [--netem PROFILE]"
-        echo "                              [--move [--move-seconds S]] [--busy-timer] [--stall-diag]"
+        echo "                              [--move [--move-seconds S] | --hop] [--busy-timer] [--stall-diag]"
         echo
         echo "One fresh Fabric server container and one fresh client JVM per invocation."
         echo "  --arm           tcp | quic2 | quic3 (required)"
@@ -65,6 +67,7 @@ usage() {
         echo "  --netem         clean (default) | loss | delay | delayloss | reorder | jitter | slow"
         echo "  --move          sprint in a wide arc during the play window (default: idle)"
         echo "  --move-seconds  moving window length (default: 60); only with --move"
+        echo "  --hop           six teleport legs of 240 m after the initial view fill (tp @s, offline user Player0 with an ops entry) (mutually exclusive with --move)"
         echo "  --busy-timer    /3 only: the client-side busy batch timer variant (default: plain)"
         echo "  --stall-diag    turn on core's /3 stall watchdog for this client JVM"
         echo "  --coalesce      -Dquicraft.coalesceWrites=true on server and client"
@@ -95,6 +98,7 @@ coalesce=""
 coalesce_max=""
 move=false
 move_seconds="60"
+hop=false
 variant="plain"
 stall_diag=false
 
@@ -122,6 +126,10 @@ while (($# > 0)); do
             (($# >= 2)) || refuse "missing value for --move-seconds"
             move_seconds="$2"
             shift 2
+            ;;
+        --hop)
+            hop=true
+            shift
             ;;
         --busy-timer)
             variant="busy"
@@ -196,6 +204,9 @@ fi
 if [[ "$move" != true && "$move_seconds" != 60 ]]; then
     refuse "--move-seconds only applies with --move"
 fi
+if [[ "$hop" == true && "$move" == true ]]; then
+    refuse "--hop and --move are mutually exclusive"
+fi
 case "$netem" in
     clean | loss | delay | delayloss | reorder | jitter | slow) ;;
     *) refuse "--netem must be clean, loss, delay, delayloss, reorder, jitter or slow, got '$netem'" ;;
@@ -256,6 +267,9 @@ out_dir="$(cd "$out_dir" && pwd)"
 file_stem="$arm-$netem"
 if [[ "$move" == true ]]; then
     file_stem="$file_stem-move"
+fi
+if [[ "$hop" == true ]]; then
+    file_stem="$file_stem-hop"
 fi
 if [[ "$variant" == busy ]]; then
     file_stem="$file_stem-busy"
@@ -400,6 +414,13 @@ if [[ "$arm" == quic2 ]]; then
     server_multistream=false
 fi
 export REAL_FABRIC_MULTISTREAM="$server_multistream" REAL_FABRIC_PORT="$port" REAL_FABRIC_COALESCE="$coalesce" REAL_FABRIC_COALESCE_MAX="$coalesce_max"
+# --hop: the offline client (user Player0) needs op level 4 to run `tp`; every other run gets no ops file.
+if [[ "$hop" == true ]]; then
+    ops_json="$(python3 -I "$here/offline-ops.py" Player0)" || die "could not build the ops.json entry for --hop"
+    export QUICRAFT_OPS_JSON="$ops_json"
+else
+    export QUICRAFT_OPS_JSON=""
+fi
 echo "== compose up ($project): fabric mocksession"
 project_started=true
 if ! bounded 1200 "${compose[@]}" up -d --build fabric mocksession; then
@@ -486,6 +507,7 @@ client=(
     "-Pquicraft.armPlaySeconds=$play_seconds"
     "-Pquicraft.armMove=$move"
     "-Pquicraft.armMoveSeconds=$move_seconds"
+    "-Pquicraft.armHop=$hop"
     "-Pquicraft.armVariant=$variant"
     "-Pquicraft.armStallDiag=$stall_diag"
     ${coalesce:+"-Pquicraft.armCoalesce=$coalesce"}
@@ -497,6 +519,8 @@ echo "== client: ${client[*]}" >>"$client_log"
 client_status=0
 window_seconds=$play_seconds
 [[ "$move" == true ]] && window_seconds=$move_seconds
+# Worst case of the hop window: the initial fill (30 s), the climb, and six legs of 30 s each.
+[[ "$hop" == true ]] && window_seconds=$HOP_WINDOW_SECONDS
 bounded "$(client_run_budget "$window_seconds")" env ALSOFT_DRIVERS=null "${xvfb[@]}" "${client[@]}" >>"$client_log" 2>&1 || client_status=$?
 if ((client_status != 0)); then
     keep_client_log=true
