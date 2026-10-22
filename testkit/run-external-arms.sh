@@ -493,7 +493,9 @@ client=(
 echo "== client: ${client[*]}"
 echo "== client: ${client[*]}" >>"$client_log"
 client_status=0
-bounded "$(client_run_budget "$move_seconds")" env ALSOFT_DRIVERS=null "${xvfb[@]}" "${client[@]}" >>"$client_log" 2>&1 || client_status=$?
+window_seconds=$play_seconds
+[[ "$move" == true ]] && window_seconds=$move_seconds
+bounded "$(client_run_budget "$window_seconds")" env ALSOFT_DRIVERS=null "${xvfb[@]}" "${client[@]}" >>"$client_log" 2>&1 || client_status=$?
 if ((client_status != 0)); then
     keep_client_log=true
     die "runClientGameTest exited with status $client_status (log: $client_log); row is not passing evidence"

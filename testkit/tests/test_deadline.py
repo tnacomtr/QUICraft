@@ -41,6 +41,16 @@ class DeadlineTest(unittest.TestCase):
         self.assertEqual(b - a, 540)
         self.assertGreater(c, a)
 
+    def test_the_client_deadline_follows_the_idle_window_unless_moving(self):
+        runner = os.path.join(_ROOT, "testkit/run-external-arms.sh")
+        with open(runner) as f:
+            text = f.read()
+        self.assertIn("window_seconds=$play_seconds", text)
+        self.assertIn('[[ "$move" == true ]] && window_seconds=$move_seconds', text)
+        self.assertIn('bounded "$(client_run_budget "$window_seconds")"', text)
+        r = run(f". {LIB}; client_run_budget 400")
+        self.assertEqual(r.stdout.strip(), "700", r.stderr)
+
     def test_a_term_ignoring_descendant_is_killed_by_the_inner_group_kill(self):
         with tempfile.TemporaryDirectory() as d:
             pidfile = os.path.join(d, "pid")

@@ -60,10 +60,11 @@ public class ExternalArmGameTest implements FabricClientGameTest {
     // Sustained-load evidence: at least 0.5 horizontal metres/second and one new chunk/5 seconds.
     private static final double MIN_MOVE_METRES_PER_SECOND = 0.5;
     /**
-     * The moving path must start in the same place for every arm. The testkit server is a fixed-seed
-     * world whose spawn is at the origin and the vanilla spawn radius is 10 blocks, so a start more
-     * than this far from the origin means the world is not the expected one: the row fails closed
-     * instead of comparing arms that walked over different terrain. The start is recorded either way.
+     * A bound on where the moving path may start, not an exact start. The testkit server is a
+     * fixed-seed world whose spawn is at the origin and the vanilla spawn radius is 10 blocks, so a
+     * start further from the origin than this means the world is not the expected one and the row
+     * fails closed. Accepted starts can still differ by tens of blocks (and in terrain), so arms are
+     * comparable only as statistics over rounds; the start is recorded in every row.
      */
     private static final double START_AREA_METRES = 32.0;
     private static final double MIN_MOVE_CHUNKS_PER_SECOND = 0.2;
