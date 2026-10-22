@@ -63,18 +63,28 @@ public final class JoinDiag {
 
     /**
      * One diagnostics instance for a connection of this side, or {@code null} when the property is
-     * off. Never throws.
+     * off. Never throws: a failed allocation or a broken switch only means no marks for this
+     * connection, and the join carries on.
      */
     public static JoinDiag create(Side side) {
-        return create(side, ENABLED, System::nanoTime, JoinDiag::log);
+        try {
+            return create(side, ENABLED, System::nanoTime, JoinDiag::log);
+        } catch (Throwable diagnostic) {
+            return null;
+        }
     }
 
-    /** The enabled switch and the sinks are parameters here so tests can drive both. */
-    static JoinDiag create(Side side, boolean enabled, LongSupplier clock, Consumer<String> sink) {
+    /** The enabled switch and the sinks are parameters here so tests can drive both. Never throws. */
+    public static JoinDiag create(Side side, boolean enabled, LongSupplier clock, Consumer<String> sink) {
         if (!enabled || side == null || clock == null || sink == null) {
             return null;
         }
-        return new JoinDiag(side, clock, sink);
+        try {
+            return new JoinDiag(side, clock, sink);
+        } catch (Throwable diagnostic) {
+            // No marks for this connection; the join itself is unaffected.
+            return null;
+        }
     }
 
     /** Ties one connection's marks to its Netty channel, so the stream and the platform find them. */

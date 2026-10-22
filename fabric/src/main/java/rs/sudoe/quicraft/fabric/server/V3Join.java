@@ -356,7 +356,7 @@ public final class V3Join implements BindingDecodeContext.Gate {
             Forward forward = new Forward();
             session = new BindingSession(BindingStateMachine.Role.SERVER, connection::exporterValue, shared,
                     mode, protocol, shardCount, fingerprint, table.digest(), System::nanoTime, 0L, forward,
-                    channel.eventLoop(), channel.eventLoop()::inEventLoop);
+                    channel.eventLoop(), channel.eventLoop()::inEventLoop, diag);
             payloads = new BindingPayloads(session, new Platform(), this::sendBindingPayload);
             forward.target = payloads;
         } finally {

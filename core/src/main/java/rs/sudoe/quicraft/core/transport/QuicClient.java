@@ -31,6 +31,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.net.ssl.SSLEngine;
@@ -65,6 +66,7 @@ public final class QuicClient {
     private static volatile long testGraceFloorNanos;
     /** Tests only: pauses immediately before a successful connect future is completed. */
     private static volatile Runnable testBeforeConnectCompletion;
+    private static volatile Supplier<JoinDiag> testJoinDiagSource;
     private static volatile EventLoopGroup group;
 
     private QuicClient() {}
@@ -534,6 +536,20 @@ public final class QuicClient {
         testBeforeConnectCompletion = hook;
     }
 
+    /**
+     * Tests only: where an attempt's join marks come from, so a test can hand the attempt one
+     * instance and see that the adapter receives exactly that one. {@code null} restores the
+     * property-gated factory.
+     */
+    static void setJoinDiagSourceForTests(Supplier<JoinDiag> source) {
+        testJoinDiagSource = source;
+    }
+
+    private static Supplier<JoinDiag> joinDiagSource() {
+        Supplier<JoinDiag> source = testJoinDiagSource;
+        return source == null ? () -> JoinDiag.create(JoinDiag.Side.CLIENT) : source;
+    }
+
     private static void beforeConnectCompletionForTests() {
         Runnable hook = testBeforeConnectCompletion;
         if (hook != null) {
@@ -895,7 +911,7 @@ public final class QuicClient {
             if (result.isDone()) {
                 return; // cancelled while the socket opened
             }
-            diag = JoinDiag.create(JoinDiag.Side.CLIENT);
+            diag = joinDiagSource().get();
             JoinDiag.mark(diag, "connect start");
             connectStart = System.nanoTime();
             connect();
@@ -907,7 +923,9 @@ public final class QuicClient {
                     .handler(new ChannelInboundHandlerAdapter() {
                         @Override
                         public void handlerAdded(ChannelHandlerContext ctx) {
-                            quic.set((QuicChannel) ctx.channel());
+                            QuicChannel channel = (QuicChannel) ctx.channel();
+                            quic.set(channel);
+                            JoinDiag.attach(channel, diag);
                         }
 
                         @Override

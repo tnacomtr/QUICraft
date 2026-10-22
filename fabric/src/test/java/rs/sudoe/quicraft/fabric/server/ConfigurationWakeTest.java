@@ -15,7 +15,7 @@ import org.junit.jupiter.api.Test;
  */
 class ConfigurationWakeTest {
     /** The released task as the server thread sees it, plus what the vanilla tick would do. */
-    private static final class FakeStage implements ConfigurationWake.Stage {
+    private static class FakeStage implements ConfigurationWake.Stage {
         boolean open = true;
         int advanced;
         int ticks;
@@ -124,6 +124,66 @@ class ConfigurationWakeTest {
     }
 
     @Test
+    void tickBeforeWakeLeavesNoDoubleAdvance() {
+        // The vanilla tick runs first (e.g., a busy server tick before the scheduled wake).
+        stage.tick(); // the tick finishes the stage
+        assertFalse(stage.open, "the tick finished the task");
+        assertEquals(1, stage.ticks);
+        assertEquals(0, stage.advanced, "the tick does not call advance()");
+
+        // The wake still runs once, but sees the stage is no longer open.
+        ConfigurationWake wake = wake();
+        wake.schedule();
+        serverThread.get(0).run();
+        assertEquals(0, stage.advanced, "no double-advance when tick came first");
+        assertEquals(1, stage.ticks);
+    }
+
+    @Test
+    void listenerOrTaskReplacedBeforeWakeRuns() {
+        // Simulates the listener finishing or replacing the task before our wake reaches it.
+        stage.open = false; // listener/task no longer current
+        ConfigurationWake wake = wake();
+        wake.schedule();
+        serverThread.get(0).run();
+        assertEquals(0, stage.advanced, "no advance when listener/task was replaced");
+    }
+
+    @Test
+    void partialAdvancementThenExceptionLeavesVanillaTickWorking() {
+        // The advance throws after doing some work: the tick must still advance it.
+        FakeStage throwingAfterPartial = new FakeStage() {
+            @Override
+            public void advance() {
+                advanced++;
+                if (advanced > 0) {
+                    throw new IllegalStateException("after partial");
+                }
+            }
+        };
+        ConfigurationWake wake = new ConfigurationWake(throwingAfterPartial, serverThread::add);
+        wake.schedule();
+        serverThread.get(0).run();
+        assertEquals(1, throwingAfterPartial.advanced, "partial advancement happened");
+        throwingAfterPartial.tick();
+        assertEquals(1, throwingAfterPartial.ticks, "the tick still finishes the stage");
+        assertFalse(throwingAfterPartial.open);
+    }
+
+    @Test
+    void diagnosticsOffDoesNotAffectTheWake() {
+        // When JoinDiag is off, the stage behaves identically.
+        FakeStage stageOff = new FakeStage();
+        ConfigurationWake wake = new ConfigurationWake(stageOff, serverThread::add);
+        wake.schedule();
+        serverThread.get(0).run();
+        assertEquals(1, stageOff.advanced);
+        assertEquals(0, stageOff.ticks);
+        stageOff.tick();
+        assertEquals(1, stageOff.ticks);
+    }
+
+    @Test
     void aServerThatRefusesTheTaskDoesNothing() {
         ConfigurationWake wake = new ConfigurationWake(stage, task -> {
             throw new IllegalStateException("shutting down");
@@ -133,5 +193,43 @@ class ConfigurationWakeTest {
         assertEquals(0, stage.advanced);
         stage.tick();
         assertEquals(1, stage.ticks, "the vanilla tick still advances the stage");
+    }
+
+    @Test
+    void tickBeforeWakeLeavesTheTickAsAuthority() {
+        stage.open = true;
+        stage.tick(); // the tick finishes first
+        assertEquals(1, stage.ticks, "tick ran first");
+        assertFalse(stage.open, "the tick finished the stage");
+
+        ConfigurationWake wake = wake();
+        wake.schedule();
+        serverThread.get(0).run(); // wake sees open=false, does nothing
+        assertEquals(0, stage.advanced, "only the tick finished; advance() was never called");
+        assertEquals(1, stage.ticks, "no extra tick from the wake");
+    }
+
+    @Test
+    void listenerOrTaskReplacedBeforeWakeDoesNotAdvance() {
+        stage.open = false; // replaced by the listener or finished by another task
+        ConfigurationWake wake = wake();
+        wake.schedule();
+        serverThread.get(0).run();
+        assertEquals(0, stage.advanced, "a replaced task is not advanced again");
+    }
+
+    @Test
+    void exceptionAfterPartialAdvanceLeavesTickAsAuthority() {
+        // The stage's open() passes but advance() throws: the tick must still finish it.
+        stage.throwOnAdvance = true;
+        ConfigurationWake wake = wake();
+        wake.schedule();
+        serverThread.get(0).run(); // swallowed
+
+        assertEquals(0, stage.advanced, "the failed wake did not complete the advance");
+        stage.throwOnAdvance = false; // restore for the tick
+        stage.tick();
+        assertEquals(1, stage.ticks, "the tick finishes the stage after a failed wake");
+        assertFalse(stage.open);
     }
 }

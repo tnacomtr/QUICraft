@@ -33,19 +33,39 @@ public final class JoinDiagScope {
         JoinDiag.mark(current(), name);
     }
 
-    /** Makes {@code diag} current for this thread until {@link Scope#close()}. Never throws. */
+    /**
+     * Makes {@code diag} current for this thread until {@link Scope#close()}. Never throws, and a
+     * failure never leaves a thread-local behind: the scope is allocated before anything is
+     * installed, and if the installation itself fails the previous value is restored.
+     */
     public static Scope open(@Nullable JoinDiag diag) {
         if (diag == null) {
             return Scope.NONE;
         }
         JoinDiag previous;
+        Scope scope;
         try {
             previous = CURRENT.get();
-            CURRENT.set(diag);
+            // Allocate before installing: a failed allocation must not strand the thread-local.
+            scope = new Scope(previous);
         } catch (Throwable broken) {
             return Scope.NONE;
         }
-        return new Scope(previous);
+        try {
+            CURRENT.set(diag);
+        } catch (Throwable broken) {
+            try {
+                if (previous == null) {
+                    CURRENT.remove();
+                } else {
+                    CURRENT.set(previous);
+                }
+            } catch (Throwable ignored) {
+                // Nothing more can be done; the join still needs no scope.
+            }
+            return Scope.NONE;
+        }
+        return scope;
     }
 
     /** One open scope; closing restores whatever was current before it. */
