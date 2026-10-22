@@ -77,12 +77,17 @@ final class NRig implements AutoCloseable {
 
     static final RoutingTable TABLE = RoutingTableLoader.parse(tableJson());
 
-    static final long OUTBOUND_BYTES = 4L << 20;
+    /**
+     * 8 MiB, not 4: the pools charge each record its footprint, 2 * encoded + 1 KiB (13.20), and the send driver
+     * needs one maximum record's footprint plus 64 KiB of ACK headroom and the 2 KiB slice under the smallest cap.
+     * 8 MiB keeps the same wire capacity the 4 MiB pools gave before footprint charging.
+     */
+    static final long OUTBOUND_BYTES = 8L << 20;
 
     /** One stored system clock: the no-arg resources and timing helpers must share this exact supplier. */
     static final LongSupplier SYSTEM_CLOCK = System::nanoTime;
 
-    /** Small test pools: a 4 MiB outbound node, IP, account and connection cap, cumulative accounting. */
+    /** Small test pools: an 8 MiB outbound node, IP, account and connection cap, cumulative accounting. */
     static SessionResources resources() {
         return resources(SYSTEM_CLOCK);
     }

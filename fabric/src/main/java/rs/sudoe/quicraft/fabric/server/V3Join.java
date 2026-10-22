@@ -541,7 +541,10 @@ public final class V3Join implements BindingDecodeContext.Gate {
                 backlogShare, AckBacklog.MAX_PACKETS, AckBacklog.MAX_BYTES);
         // 13.4: the platform reads the live compression state once, here, and the session keeps it.
         connection.activate(lanes, protocol, PacketLaneCodec.compressionEnabled(pipeline), account, control);
-        causalContext().bindSession(connection, connection.session());
+        MultistreamSession bound = connection.session();
+        causalContext().bindSession(connection, bound);
+        // 13.20: the chunk producer asks this before it starts a batch; a null or non-stream session stays unpaused.
+        ChunkPause.attach(channel, () -> bound instanceof NStreamSession stream && stream.outboundPressure());
         sinkActive = true;
         // 12.13: what was queued during the exchange goes out as records, whole units in order. A
         // submission that fails takes every unit it did not hand over with it and gives their node

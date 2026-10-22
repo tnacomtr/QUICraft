@@ -1955,9 +1955,34 @@ before this revision can run.
     non-fatally if it cannot fit. A partial record's remaining allocation is thereby
     charged before its next read; complete buffered records need no speculative grant.
      Outbound queues use a separate capped node pool, never the inbound pool or its admission
-    shares. Each connection is limited to 1024 packets or 16 MiB unsent data, including
-    binding quiescence bytes and bytes handed to QUIC but not yet released from its send
-     buffers. Backpressure before either cap; an unpausable producer fails `0x12`.
+    shares. Each connection is limited to 16384 queued records or 16 MiB of charged
+    footprint, whichever is reached first. A queued record's footprint is
+    `2 * encodedBytes + 1024` (the encoded copy, the retained payload copy and a per-record
+    allowance for the bookkeeping objects the byte count does not see). The node and
+    identity pools below charge the same footprint, so a connection that holds many tiny
+    records cannot pin memory the pools do not see. The footprint covers binding
+    quiescence bytes and bytes accepted by the transport write path but not yet released
+    by it; bytes QUIC holds after accepting them are bounded by its congestion and
+    flow-control windows and are not counted. `queueByteLimit` MUST be at least the
+    footprint of a maximum-size record (2 MiB + 128 encoded bytes, 4,195,584) plus 64 KiB
+    (4,261,120); a profile below that is rejected. A bundle run whose footprint exceeds that
+    of one maximum-size record is refused whole (`0x12`, nothing written).
+    The constants are provisional; retained heap per record is not yet measured.
+    **Producer pause.** At 8 MiB of footprint (high watermark) the connection reports
+    outbound pressure, and stays under pressure until it drains to 4 MiB (low watermark).
+    While under pressure the server MUST NOT start new chunk batches or other deferrable
+    bulk units; units already started finish, and causal order is unchanged. The hard caps
+    still hold: a submission that would exceed either cap, from a producer that cannot
+    pause, fails `0x12` as before.
+    **Release deadline.** While under pressure, the connection closes `0x12` if the
+    transport releases no outbound bytes for 30 seconds (not shorter than the QUIC idle
+    timeout, so a short network outage that TCP would survive does not close it) on the
+    local monotonic clock; any released byte renews the deadline. Selecting, enqueueing and
+    unrelated ACKs do not count. A slow but progressing peer is never closed for queue depth
+    alone. Residual, stated honestly: a peer that keeps releasing a trickle of bytes (for
+    example on REALTIME only) renews the deadline, so its backlog stays pinned below the
+    hard caps; that memory is bounded by the per-connection caps and by the
+    footprint-charged node and identity pools, which shed outbound holders under pressure.
       Provisional outbound defaults: 256 MiB node, 32 MiB per source IP and 32 MiB per
       authenticated account, enforcing all applicable caps, including queued binding bytes.
       Pre-authentication uses IP; account caps supplement, not replace, IP caps. Measure then
@@ -2127,7 +2152,7 @@ before this revision can run.
      shared pressure caused by other peers remains `0x12` even when this peer also holds
      bytes. OUTBOUND queues, the pending-ACK caps and the server binding queue are NEVER
      peer-attributable: they fill from the local game producer's volume plus an honest
-     slow or lossy link, so their per-connection caps (1024 packets/16 MiB, 128 entries/
+     slow or lossy link, so their per-connection caps (16384 records/16 MiB footprint, 128 entries/
      64 KiB, 32 packets/64 KiB), deadline expiries and unpausable-producer aborts close
      `0x12`. A peer that stops reading is handled by the outbound 10-second wait and
      shedding above, never by `0x11`. Residual, stated honestly: any chatty peer has

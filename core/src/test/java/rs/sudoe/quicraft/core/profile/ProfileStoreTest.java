@@ -20,7 +20,7 @@ class ProfileStoreTest {
     Path dir;
 
     private static ServerProfile other() {
-        return new ServerProfile(40_000, 3, 128L << 20, 0.05, 2048, 4L << 20, 6, 3, 1);
+        return new ServerProfile(40_000, 3, 128L << 20, 0.05, 2048, 16L << 20, 6, 3, 1);
     }
 
     private static void assertSame(ServerProfile expected, ServerProfile actual) {
@@ -60,7 +60,7 @@ class ProfileStoreTest {
         store.save(other());
         byte[] before = Files.readAllBytes(file);
 
-        ServerProfile bad = new ServerProfile(40_000, 9, 128L << 20, 0.05, 2048, 4L << 20, 6, 3, 1);
+        ServerProfile bad = new ServerProfile(40_000, 9, 128L << 20, 0.05, 2048, 16L << 20, 6, 3, 1);
         assertThrows(IllegalArgumentException.class, () -> store.save(bad));
 
         assertTrue(java.util.Arrays.equals(before, Files.readAllBytes(file)), "the old override is untouched");
@@ -73,7 +73,7 @@ class ProfileStoreTest {
     @Test
     void thePerPrefixCapsRoundTripThroughTheStore() throws IOException {
         Path file = dir.resolve("profile.properties");
-        ServerProfile tuned = new ServerProfile(40_000, 3, 128L << 20, 0.05, 2048, 4L << 20, 6, 3, 1, 9, 3L << 20);
+        ServerProfile tuned = new ServerProfile(40_000, 3, 128L << 20, 0.05, 2048, 16L << 20, 6, 3, 1, 9, 3L << 20);
         new ProfileStore(file, ServerProfileTest.valid()).save(tuned);
 
         ServerProfile restored = new ProfileStore(file, ServerProfileTest.valid()).load();
@@ -86,7 +86,7 @@ class ProfileStoreTest {
     void aFileWrittenBeforeThePerPrefixCapsLoadsTheDefaultsForThem() throws IOException {
         Path file = dir.resolve("profile.properties");
         String oldFormat = "maxConnections=40000\nmaxLanes=3\nnodeBudgetBytes=134217728\npreLoginPoolFraction=0.05\n"
-                + "queuePacketLimit=2048\nqueueByteLimit=4194304\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n";
+                + "queuePacketLimit=2048\nqueueByteLimit=16777216\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n";
         Files.write(file, oldFormat.getBytes(StandardCharsets.UTF_8));
         ServerProfile defaults = ServerProfileTest.valid();
 
@@ -96,12 +96,31 @@ class ProfileStoreTest {
         assertEquals(40_000, loaded.maxConnections, "the rest of the old file still loads");
     }
 
+    /**
+     * /3 is unreleased, so no file predates the 16384 default. An explicit queuePacketLimit, including 1024, loads
+     * exactly as written and never falls back to the default.
+     */
+    @Test
+    void anExplicitQueuePacketLimitLoadsAsWritten() throws IOException {
+        Path file = dir.resolve("profile.properties");
+        String text = "maxConnections=40000\nmaxLanes=3\nnodeBudgetBytes=134217728\npreLoginPoolFraction=0.05\n"
+                + "queuePacketLimit=1024\nqueueByteLimit=16777216\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n";
+        Files.write(file, text.getBytes(StandardCharsets.UTF_8));
+        ServerProfile defaults = new ServerProfile(50_000, 5, 256L << 20, 0.10, 16384, 16L << 20, 8, 4, 2);
+
+        assertEquals(1024, new ProfileStore(file, defaults).load().queuePacketLimit);
+
+        Files.write(file, text.replace("queuePacketLimit=1024", "queuePacketLimit=2048")
+                .getBytes(StandardCharsets.UTF_8));
+        assertEquals(2048, new ProfileStore(file, defaults).load().queuePacketLimit);
+    }
+
     /** The shard cap dropped from 6 to 5 for the ACK stream: an old override loads as 5, never disables /3. */
     @Test
     void anOverrideWrittenForTheOldCapOfSixLoadsAsFiveAndOtherBadValuesStillFail() throws IOException {
         Path file = dir.resolve("profile.properties");
         String text = "maxConnections=40000\nmaxLanes=6\nnodeBudgetBytes=134217728\npreLoginPoolFraction=0.05\n"
-                + "queuePacketLimit=2048\nqueueByteLimit=4194304\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n";
+                + "queuePacketLimit=2048\nqueueByteLimit=16777216\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n";
         Files.write(file, text.getBytes(StandardCharsets.UTF_8));
         ServerProfile loaded = new ProfileStore(file, ServerProfileTest.valid()).load();
         assertEquals(5, loaded.maxLanes);
@@ -113,7 +132,7 @@ class ProfileStoreTest {
     void aMalformedPerPrefixCapFailsToLoadAndNamesTheField() throws IOException {
         Path file = dir.resolve("profile.properties");
         String text = "maxConnections=40000\nmaxLanes=3\nnodeBudgetBytes=134217728\npreLoginPoolFraction=0.05\n"
-                + "queuePacketLimit=2048\nqueueByteLimit=4194304\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n"
+                + "queuePacketLimit=2048\nqueueByteLimit=16777216\ncontrolWeight=6\nrealtimeWeight=3\nchunkWeight=1\n"
                 + "sessionCallsPerPrefix=many\n";
         Files.write(file, text.getBytes(StandardCharsets.UTF_8));
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
