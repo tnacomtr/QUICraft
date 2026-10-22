@@ -51,15 +51,19 @@ public final class QuicraftClient implements ClientModInitializer {
             instance = this;
             if (mode != Mode.TCP_ONLY && !"false".equals(System.getProperty("quicraft.warmup"))) {
                 // -Dquicraft.warmup=false switches it off. One-time QUIC initialisation (natives, event loop, TLS stack) off the first join.
-                Thread warm = new Thread(() -> {
-                    try {
-                        QuicClient.warmUp();
-                    } catch (Throwable ignored) {
-                        // warming only
-                    }
-                }, "quicraft-warmup");
-                warm.setDaemon(true);
-                warm.start();
+                try {
+                    Thread warm = new Thread(() -> {
+                        try {
+                            QuicClient.warmUp();
+                        } catch (Throwable ignored) {
+                            // warming only
+                        }
+                    }, "quicraft-warmup");
+                    warm.setDaemon(true);
+                    warm.start();
+                } catch (Throwable ignored) {
+                    // a launch failure only means no warm-up; it never reaches the initializer
+                }
             }
             if (multistream) {
                 multistreamConnector(); // opens the pin files and runs the startup expiry (12.15)

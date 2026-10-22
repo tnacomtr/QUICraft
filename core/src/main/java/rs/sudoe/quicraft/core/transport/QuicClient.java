@@ -22,6 +22,7 @@ import io.netty.handler.codec.quic.SslEarlyDataReadyEvent;
 import io.netty.handler.ssl.SslHandshakeCompletionEvent;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.ScheduledFuture;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -43,10 +44,12 @@ import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.multistream.JoinDiag;
 import rs.sudoe.quicraft.core.multistream.MultistreamProtocolException;
 import rs.sudoe.quicraft.core.multistream.PreambleV2;
+import rs.sudoe.quicraft.core.routing.RoutingRegistry;
 import rs.sudoe.quicraft.core.routing.RoutingTable;
 import rs.sudoe.quicraft.core.tls.Fingerprint;
 import rs.sudoe.quicraft.core.tls.FingerprintTrustManager;
 import rs.sudoe.quicraft.core.tls.FingerprintTrustManager.FingerprintMismatchException;
+import rs.sudoe.quicraft.core.tls.ServerIdentity;
 
 /** Opens QUIC connections and their v1 stream (docs/protocol.md §5, §8). */
 public final class QuicClient {
@@ -519,6 +522,87 @@ public final class QuicClient {
         } catch (Throwable ignored) {
             // warming only: the first real dial pays the cost it would have paid anyway
         }
+        try {
+            loopbackRoundTrip();
+        } catch (Throwable ignored) {
+            // warming only: a failed round trip leaves every later dial as it would have been
+        }
+    }
+
+    /** The protocol whose shipped routing table the warm-up's loopback server and dial use. */
+    private static final int WARM_PROTOCOL = 775;
+    /** The hard bound on the warm-up's loopback handshake. */
+    private static final long WARM_TIMEOUT_MILLIS = 2000;
+
+    /**
+     * One in-process /3 round trip against a throwaway listener on 127.0.0.1 (ephemeral port) with
+     * an in-memory certificate: the same listener and dial as production, so the UDP socket, the
+     * QUIC and TLS handshake and the /3 preamble run once before the first real join. Nothing is
+     * stored: the dial's TLS context is uncached (bypassResumption), it runs without 0-RTT and
+     * without join marks, and its 0-RTT state is forgotten at the end. Every resource is released.
+     */
+    private static void loopbackRoundTrip() {
+        if (!QuicSupport.hasMaxFlowControlWindows() || !QuicSupport.hasKeyingMaterialExport()) {
+            return;
+        }
+        RoutingTable table = RoutingRegistry.forProtocol(WARM_PROTOCOL).orElse(null);
+        if (table == null) {
+            return;
+        }
+        QuicServer server = null;
+        CompletableFuture<V3Connection> dial = null;
+        V3Connection connection = null;
+        InetSocketAddress target = null;
+        Fingerprint fingerprint = null;
+        try {
+            ServerIdentity identity = ServerIdentity.generate();
+            fingerprint = identity.fingerprint();
+            server = QuicServer.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), identity,
+                    TransportConfig.DEFAULT, stream -> { }, protocol -> table);
+            target = server.localAddress();
+            dial = warmDial(target, fingerprint, table);
+            connection = dial.get(WARM_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (Throwable ignored) {
+            // warming only
+        } finally {
+            if (dial != null && !dial.cancel(true) && connection == null
+                    && dial.isDone() && !dial.isCompletedExceptionally()) {
+                connection = dial.getNow(null); // completed just as the bound ran out
+            }
+            if (connection != null) {
+                try {
+                    connection.close();
+                } catch (Throwable ignored) {
+                    // the connection is released on its own event loop
+                }
+            }
+            if (target != null) {
+                EarlyCache.INSTANCE.forget(EarlyCache.server(target, fingerprint, Protocol.ALPN_V3));
+            }
+            if (server != null) {
+                try {
+                    server.close();
+                } catch (Throwable ignored) {
+                    // best effort; the listener's own group is shut down by close
+                }
+            }
+        }
+    }
+
+    /**
+     * The production /3 dial ({@code connectV3} with the same bootstrap, config and TLS handling as
+     * a real dial) with its join marks off and no 0-RTT: a dial that never reads or writes a cache.
+     */
+    private static CompletableFuture<V3Connection> warmDial(InetSocketAddress remote, Fingerprint fingerprint,
+            RoutingTable table) {
+        return connectV3(codec -> new Bootstrap().group(group()).channel(NioDatagramChannel.class)
+                .handler(codec).bind(0),
+                remote, fingerprint, table, TransportConfig.DEFAULT.withMultistream(), null, true, null);
+    }
+
+    /** Resets the once-per-process warm-up so a test can run it again. Tests only. */
+    static void resetWarmUpForTests() {
+        WARMED.set(false);
     }
 
     /**
