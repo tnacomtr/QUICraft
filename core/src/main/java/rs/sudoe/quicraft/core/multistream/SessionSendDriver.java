@@ -138,11 +138,31 @@ public final class SessionSendDriver {
      */
     private static final int RECORD_OVERHEAD = RecordCodec.COMPACT_MAX_HEADER + 3 + 8;
 
+    /**
+     * Per-record allowance for the bookkeeping objects that the encoded byte count does not see (13.20). Each
+     * queued record's footprint is {@code 2 * encodedBytes + RECORD_BOOKKEEPING}: the encoded copy, the retained
+     * payload copy, and this allowance. The constants are provisional until retained heap is measured.
+     */
+    static final long RECORD_BOOKKEEPING = 1024L;
+
+    /** The queue footprint of one record of {@code encodedBytes} (13.20). */
+    static long footprintOf(long encodedBytes) {
+        return 2L * encodedBytes + RECORD_BOOKKEEPING;
+    }
+
+    /**
+     * How long the connection may stay under outbound pressure with no released outbound bytes before it closes
+     * 0x12 (13.20). Pressure starts at half the byte limit and clears at a quarter of it, so it does not flap.
+     */
+    private static final long RELEASE_DEADLINE_NANOS = 10_000_000_000L;
+
     /** One outbound charge: a sequenced record, or a pending ACK_JOIN that will become one. */
     private static final class Charge {
         final long bytes;
         Record record;
         byte[] encoded;
+        /** The queue footprint this charge counts while queued, released once its last slice is released (13.20). */
+        long footprint;
         boolean continues;
         long ticket;
         boolean requested;
@@ -180,9 +200,20 @@ public final class SessionSendDriver {
         }
     }
 
+    /** One slice handed to the transport: its charge and its encoded length, for release progress (13.20). */
+    private static final class SliceToken {
+        final Charge charge;
+        final int bytes;
+
+        SliceToken(Charge charge, int bytes) {
+            this.charge = charge;
+            this.bytes = bytes;
+        }
+    }
+
     /**
      * A pending ACK_JOIN: its payload and its charge, which transfers to the record when sequenced.
-     * Its queue count is {@code queuedBytes}, the estimate counted from creation until it is sequenced.
+     * Its queue footprint is {@code queuedBytes}, the estimate counted from creation until it is sequenced.
      */
     private static final class PendingAck {
         final byte[] payload;
@@ -224,7 +255,7 @@ public final class SessionSendDriver {
     private long sliceHeld;
     private final ArrayDeque<Charge> orphans = new ArrayDeque<Charge>();
     private final IdentityHashMap<Record, Charge> byRecord = new IdentityHashMap<Record, Charge>();
-    private final Map<Long, Charge> tokens = new HashMap<Long, Charge>();
+    private final Map<Long, SliceToken> tokens = new HashMap<Long, SliceToken>();
     /** The ACK headroom: bytes and entries of ACK charges created and not yet released (13.19). */
     private final long ackByteLimit;
     /** The largest record wire size, and so the largest bundle run, the connection can write (13.12). */
@@ -235,7 +266,12 @@ public final class SessionSendDriver {
     private long nextToken = 1;
     private int queuedRecords;
     private final SendTrace trace = ReceiveTrace.enabled() ? new SendTrace() : null;
+    /** The queue footprint (13.20) of every sequenced or pending record not yet fully released by the transport. */
     private long queuedBytes;
+    /** True from footprint {@code >= limit/2} until footprint {@code <= limit/4} (13.20). */
+    private boolean pressured;
+    /** The start of the release deadline: the later of the last released byte and the moment pressure began. */
+    private long releaseMarkNanos;
     private boolean closed;
     /** True once {@link #close()} returned every charge; with deferred release this can trail {@code closed}. */
     private boolean released;
@@ -465,6 +501,36 @@ public final class SessionSendDriver {
     /** Records sequenced but not yet fully written. */
     public synchronized int queuedRecords() {
         return queuedRecords;
+    }
+
+    /** The queue footprint in bytes (13.20): what queued and transport-held records count against the byte limit. */
+    synchronized long queuedFootprint() {
+        return queuedBytes;
+    }
+
+    /**
+     * True while the connection is under outbound pressure (13.20): the producers must not start deferrable bulk
+     * units. Thread-safe and cheap; the server thread reads it before it encodes a batch.
+     */
+    public synchronized boolean underPressure() {
+        return pressured;
+    }
+
+    /**
+     * Closes 0x12 when the connection has been under pressure for the release deadline with no released outbound
+     * bytes (13.20). Called from the connection's periodic tick; it starts no timer of its own. Returns true when
+     * this call closed the driver.
+     */
+    public synchronized boolean checkReleaseDeadline() {
+        if (closed || !pressured) {
+            return false;
+        }
+        if (clock.getAsLong() - releaseMarkNanos < RELEASE_DEADLINE_NANOS) {
+            return false;
+        }
+        noteRefusal("release-deadline", -1, 0);
+        closeWith(CLOSE_RESOURCE);
+        return true;
     }
 
     /**
@@ -697,9 +763,9 @@ public final class SessionSendDriver {
             return false;
         }
         long now = clock.getAsLong();
-        long queued = payload.length + RECORD_OVERHEAD;
-        if (overflows(1, queued)) {
-            closeOverflow(1, queued, -1);
+        long estimate = payload.length + RECORD_OVERHEAD;
+        if (overflows(1, estimate)) {
+            closeOverflow(1, estimate, -1);
             return false;
         }
         if (!pool.admissible(account, chargedBytes)) {
@@ -717,12 +783,14 @@ public final class SessionSendDriver {
         }
         ackEntriesHeld++;
         ackBytesHeld += chargedBytes;
+        long footprint = footprintOf(estimate);
         queuedRecords++;
-        queuedBytes += queued;
+        queuedBytes += footprint;
         Charge charge = new Charge(chargedBytes);
         charge.ack = true;
         request(charge);
-        pendingAcks.put(id, new PendingAck(payload, charge, now, queued));
+        pendingAcks.put(id, new PendingAck(payload, charge, now, footprint));
+        reviewPressure();
         return true;
     }
 
@@ -1312,13 +1380,13 @@ public final class SessionSendDriver {
         byte[] slice = Arrays.copyOfRange(charge.encoded, selection.offset(),
                 selection.offset() + selection.length());
         long token = nextToken++;
-        tokens.put(token, charge);
+        tokens.put(token, new SliceToken(charge, slice.length));
         charge.outstanding++;
         if (selection.last()) {
             charge.finished = true;
             byRecord.remove(selection.record());
+            // The record leaves the count here; its footprint stays until the transport releases its last slice (13.20).
             queuedRecords--;
-            queuedBytes -= charge.encoded.length;
         }
         Write write = new Write(token, selection.record().streamIndex(), slice, selection.last());
         write.traceSelectedNanos = selectedNanos;
@@ -1339,12 +1407,12 @@ public final class SessionSendDriver {
 
     /** The transport released the send buffer of this slice; its record's charge is released once (13.12). */
     public synchronized void released(long token) {
-        settle(token);
+        settle(token, true);
     }
 
     /** The write of this slice failed; the charge is released once, as for a release (13.12). */
     public synchronized void failed(long token) {
-        settle(token);
+        settle(token, false);
     }
 
     /**
@@ -1362,8 +1430,8 @@ public final class SessionSendDriver {
         batches.abort();
         // Releases every owner charge exactly once, the REALTIME slice included (it is the owner's first charge).
         pool.cancel(owner);
-        for (Charge charge : tokens.values()) {
-            charge.released = true;
+        for (SliceToken slice : tokens.values()) {
+            slice.charge.released = true;
         }
         for (Charge charge : byRecord.values()) {
             charge.released = true;
@@ -1375,6 +1443,7 @@ public final class SessionSendDriver {
         // poll() refuses a closed driver and released()/failed() find no token, so nothing can decrement below zero.
         queuedRecords = 0;
         queuedBytes = 0;
+        pressured = false;
         realtimeOrder.clear();
         orphans.clear();
         pendingAcks.clear();
@@ -1403,7 +1472,7 @@ public final class SessionSendDriver {
 
     private String describeRefusal(String check, int stream, long recordBytes) {
         return "check=" + check + " stream=" + stream + " queuedRecords=" + queuedRecords
-                + " queuedBytes=" + queuedBytes + " queuePacketLimit=" + profile.queuePacketLimit
+                + " queuedFootprint=" + queuedBytes + " queuePacketLimit=" + profile.queuePacketLimit
                 + " queueByteLimit=" + profile.queueByteLimit + " recordBytes=" + recordBytes;
     }
 
@@ -1459,19 +1528,53 @@ public final class SessionSendDriver {
     }
 
     /**
+     * Renews the release deadline (13.20) when outbound bytes were actually released while under pressure. The
+     * deadline never starts before the pressure does, so the mark is only ever moved forward here.
+     */
+    private void noteReleased() {
+        if (pressured) {
+            releaseMarkNanos = clock.getAsLong();
+        }
+    }
+
+    /**
+     * Applies the pressure hysteresis (13.20) to the current footprint: pressure begins at half the byte limit, clears
+     * at a quarter, and its deadline starts from the moment it begins.
+     */
+    private void reviewPressure() {
+        long limit = profile.queueByteLimit;
+        if (!pressured) {
+            if (queuedBytes >= limit / 2) {
+                pressured = true;
+                releaseMarkNanos = clock.getAsLong();
+            }
+        } else if (queuedBytes <= limit / 4) {
+            pressured = false;
+        }
+    }
+
+    /**
      * Settles one slice. The record's charge is released once it was fully written and its last
      * outstanding slice has completed, whatever the completion order.
      */
-    private void settle(long token) {
-        Charge charge = tokens.remove(token);
-        if (charge == null) {
+    private void settle(long token, boolean completed) {
+        SliceToken slice = tokens.remove(token);
+        if (slice == null) {
             return;
         }
+        Charge charge = slice.charge;
         charge.outstanding--;
+        if (completed && slice.bytes > 0) {
+            noteReleased();
+        }
         if (!charge.finished || charge.outstanding > 0 || charge.released) {
             return;
         }
         charge.released = true;
+        // The footprint leaves the queue accounting only when the transport no longer holds the record (13.20).
+        queuedBytes -= charge.footprint;
+        charge.footprint = 0;
+        reviewPressure();
         releaseCharge(charge);
         if (accounting == SessionResources.Accounting.CUMULATIVE) {
             ranking.progress(owner, charge.progress);
@@ -1539,8 +1642,10 @@ public final class SessionSendDriver {
         } else {
             toOffer.addLast(charge);
         }
+        charge.footprint = footprintOf(encoded.length);
         queuedRecords++;
-        queuedBytes += encoded.length;
+        queuedBytes += charge.footprint;
+        reviewPressure();
         pump();
     }
 
@@ -1561,6 +1666,7 @@ public final class SessionSendDriver {
             charge.encoded = encodings.get(i);
             charge.continues = i < records.size() - 1;
             charge.progress = charge.encoded.length;
+            charge.footprint = footprintOf(charge.encoded.length);
             if (first == null) {
                 first = charge;
             } else {
@@ -1571,8 +1677,9 @@ public final class SessionSendDriver {
             traceEnqueued(charge);
             toOffer.addLast(charge);
             queuedRecords++;
-            queuedBytes += charge.encoded.length;
+            queuedBytes += charge.footprint;
         }
+        reviewPressure();
         pump();
     }
 
@@ -1710,16 +1817,20 @@ public final class SessionSendDriver {
         return false;
     }
 
-    /** The queue limit that a producer overflow of {@code records} and {@code bytes} would exceed, or null. */
-    private String overflowCheck(int records, long bytes) {
+    /**
+     * The queue limit that a producer overflow of {@code records} records of {@code encodedBytes} in total would
+     * exceed, or null (13.20). The byte check adds the overflow's footprint to the queued footprint.
+     */
+    private String overflowCheck(int records, long encodedBytes) {
         if (queuedRecords + records > profile.queuePacketLimit) {
             return "queue-packet-limit";
         }
-        return queuedBytes + bytes > profile.queueByteLimit ? "queue-byte-limit" : null;
+        long footprint = queuedBytes + 2L * encodedBytes + RECORD_BOOKKEEPING * records;
+        return footprint > profile.queueByteLimit ? "queue-byte-limit" : null;
     }
 
-    private boolean overflows(int records, long bytes) {
-        return overflowCheck(records, bytes) != null;
+    private boolean overflows(int records, long encodedBytes) {
+        return overflowCheck(records, encodedBytes) != null;
     }
 
 
@@ -1754,7 +1865,10 @@ public final class SessionSendDriver {
         byRecord.put(record, charge);
         traceEnqueued(charge);
         toOffer.addLast(charge);
-        queuedBytes += encoded.length - pending.queuedBytes;
+        // The estimate counted from creation is replaced by the sequenced record's footprint (13.20).
+        charge.footprint = footprintOf(encoded.length);
+        queuedBytes += charge.footprint - pending.queuedBytes;
+        reviewPressure();
         return handle;
     }
 
@@ -1764,6 +1878,7 @@ public final class SessionSendDriver {
         orphans.addLast(pending.charge);
         queuedRecords--;
         queuedBytes -= pending.queuedBytes;
+        reviewPressure();
     }
 
     private boolean expiredAt(PendingAck pending, long now) {

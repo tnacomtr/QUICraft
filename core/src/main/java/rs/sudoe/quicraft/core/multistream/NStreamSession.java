@@ -1573,10 +1573,20 @@ public final class NStreamSession implements MultistreamSession {
         resources.dispatchShed();
     }
 
+    /**
+     * True while this connection's outbound queue is under pressure (13.20): producers must not start deferrable bulk
+     * units. Thread-safe; the server thread reads it before it encodes a batch.
+     */
+    public boolean outboundPressure() {
+        return sendDriver.underPressure();
+    }
+
     private void updateWritability() {
         int queued = sendDriver.queuedRecords();
         int limit = resources.profile().queuePacketLimit;
-        boolean next = writable ? queued < limit * 3 / 4 : queued <= limit / 4;
+        // Pressure (13.20) is not writable too: record count alone does not bound the retained bytes.
+        boolean next = !sendDriver.underPressure()
+                && (writable ? queued < limit * 3 / 4 : queued <= limit / 4);
         if (next != writable) {
             writable = next;
             LaneGame current = game;
@@ -1678,6 +1688,8 @@ public final class NStreamSession implements MultistreamSession {
             }
         }
         sendDriver.expireAcks();
+        // A stalled outbound queue closes the driver 0x12 (13.20); afterWork then fails this session with it.
+        sendDriver.checkReleaseDeadline();
         drainNow();
         if (closed) {
             return;

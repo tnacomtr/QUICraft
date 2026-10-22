@@ -49,8 +49,11 @@ public final class SessionResources {
     public static final long OUTBOUND_ACCOUNT_BYTES = 32L << 20;
     /** 13.12 per-connection unsent-byte cap. */
     public static final long OUTBOUND_CONNECTION_BYTES = 16L << 20;
-    /** 13.12 per-connection unsent-packet cap. */
-    public static final int OUTBOUND_CONNECTION_PACKETS = 1024;
+    /**
+     * 13.20 per-connection queued-record cap, a backstop. Each record's footprint is at least 1024 bytes, so the
+     * 16 MiB footprint byte limit binds first for any record with a non-empty payload.
+     */
+    public static final int OUTBOUND_CONNECTION_PACKETS = 16384;
     /** 13.12 provisional inbound excess per-IP and per-account caps. */
     public static final long INBOUND_IP_BYTES = 16L << 20;
     public static final long INBOUND_ACCOUNT_BYTES = 16L << 20;

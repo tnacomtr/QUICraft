@@ -96,12 +96,17 @@ class SessionSendDriverTest {
          * so the pool cap is raised by {@link #TEST_SLICE} and the budget is unchanged.
          */
         Rig(int shards, int queuePackets, long connectionCap) throws Exception {
+            this(shards, queuePackets, connectionCap, 1L << 40);
+        }
+
+        /** A rig with the given queue footprint byte limit (13.20); the connection cap is as in the other constructors. */
+        Rig(int shards, int queuePackets, long connectionCap, long queueBytes) throws Exception {
             boolean large = connectionCap >= ReceiveSlots.BYTES_PER_STREAM + AckJoinTracker.MAX_BYTES;
             slice = large ? SessionSendDriver.DEFAULT_REALTIME_SLICE_BYTES : TEST_SLICE;
             NodePools node = new NodePools(1L << 40, 0, 1L << 40, 10, false, 0);
             pool = new OutboundPool(node, 1L << 40, 1L << 40, large ? connectionCap : connectionCap + TEST_SLICE,
                     ranking.view(now::get));
-            ServerProfile profile = new ServerProfile(1, 1, 1024, .5, queuePackets, 1L << 40, 4, 4, 4);
+            ServerProfile profile = new ServerProfile(1, 1, 1024, .5, queuePackets, queueBytes, 4, 4, 4);
             if (large) {
                 driver = new SessionSendDriver(SessionContext.of(shards), profile, pool, ranking, owner,
                         InetAddress.getLoopbackAddress(), null, now::get);
@@ -625,7 +630,7 @@ class SessionSendDriverTest {
         assertFalse(driver.submit(frame(40), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
         assertTrue(driver.isClosed());
         String reason = driver.lastCloseReason();
-        assertTrue(reason.startsWith("check=queue-byte-limit stream=-1 queuedRecords=0 queuedBytes=0 "), reason);
+        assertTrue(reason.startsWith("check=queue-byte-limit stream=-1 queuedRecords=0 queuedFootprint=0 "), reason);
         assertTrue(reason.contains(" queueByteLimit=10 "), reason);
         assertTrue(reason.endsWith(" recordBytes=" + size), reason);
     }
@@ -660,7 +665,7 @@ class SessionSendDriverTest {
         assertFalse(driver.isClosed(), "a sealed refusal is not a close");
         assertEquals(0, driver.closeCode());
         String reason = driver.lastCloseReason();
-        assertTrue(reason.startsWith("check=sealed stream=-1 queuedRecords=0 queuedBytes=0 "), reason);
+        assertTrue(reason.startsWith("check=sealed stream=-1 queuedRecords=0 queuedFootprint=0 "), reason);
         assertTrue(reason.contains(" queuePacketLimit=100 "), reason);
     }
 
@@ -2750,5 +2755,185 @@ class SessionSendDriverTest {
         scripted.reading(10_000_000_000L, 5_000_000_000L, true);
         ranking.disconnect(owner);
         assertEquals(4, scripted.taken(), "the connection was still registered after the failed cleanup");
+    }
+
+    // --- 13.20 queue footprint, producer pause and release deadline. All time is the rig's fake clock. ---
+
+    /** The content of a record whose frame is about one MiB. */
+    private static final int ONE_MIB_CONTENT = 1 << 20;
+    /** The default record and byte caps (13.20). */
+    private static final long DEFAULT_QUEUE_BYTES = 16L << 20;
+    private static final long RELEASE_DEADLINE = 10_000_000_000L;
+
+    /** Polls and settles every slice of the next record, in order (13.20). */
+    private static void releaseNextRecord(SessionSendDriver driver) {
+        SessionSendDriver.Write write;
+        do {
+            write = driver.poll(stream -> true);
+            assertNotNull(write, "a queued record must be selectable");
+            driver.released(write.token());
+        } while (!write.last());
+    }
+
+    @Test
+    void thousandsOfSmallRecordsAreAcceptedAndTheAccountingDrainsToZero() throws Exception {
+        Rig rig = new Rig(2, SessionResources.OUTBOUND_CONNECTION_PACKETS, 1L << 40, DEFAULT_QUEUE_BYTES);
+        SessionSendDriver driver = rig.driver;
+        for (int i = 0; i < 1500; i++) {
+            assertTrue(driver.submit(frame(5), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned(), "record " + i);
+        }
+        assertFalse(driver.isClosed(), "1500 tiny records are under both caps");
+        assertEquals(1500, driver.queuedRecords());
+        assertFalse(driver.underPressure());
+        drainAndRelease(driver);
+        assertEquals(0, driver.queuedRecords());
+        assertEquals(0, driver.queuedFootprint(), "every footprint is released once the transport releases it");
+        assertFalse(driver.isClosed());
+    }
+
+    @Test
+    void theDefaultRecordCapRefusesRecordSixteenThousandAndFiveWithQueuePacketLimit() throws Exception {
+        assertEquals(16384, SessionResources.OUTBOUND_CONNECTION_PACKETS);
+        // The byte limit is lifted here so that the record count, the check under test, is the one that binds.
+        Rig rig = new Rig(2, SessionResources.OUTBOUND_CONNECTION_PACKETS, 1L << 40, 1L << 40);
+        SessionSendDriver driver = rig.driver;
+        for (int i = 0; i < SessionResources.OUTBOUND_CONNECTION_PACKETS; i++) {
+            assertTrue(driver.submit(frame(5), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned(), "record " + i);
+        }
+        assertFalse(driver.submit(frame(5), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        assertTrue(driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertTrue(driver.lastCloseReason().startsWith(
+                "check=queue-packet-limit stream=-1 queuedRecords=16384 "), driver.lastCloseReason());
+    }
+
+    @Test
+    void theByteCapCountsTwiceTheEncodedBytesPlusBookkeeping() throws Exception {
+        // Eight records of 1,035,468 bytes encode to 7.9 MiB: a 15.8 MiB footprint, under the 16 MiB limit.
+        Rig fits = new Rig(1, 1000, 1L << 40, DEFAULT_QUEUE_BYTES);
+        for (int i = 0; i < 8; i++) {
+            assertTrue(fits.driver.submit(frame(1_035_468), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0).isAssigned());
+        }
+        assertFalse(fits.driver.isClosed(), "7.9 MiB encoded is 15.8 MiB of footprint");
+        // Nine one-MiB records encode to 9 MiB: twice that is past 16 MiB, so the byte limit refuses the set.
+        Rig over = new Rig(1, 1000, 1L << 40, DEFAULT_QUEUE_BYTES);
+        for (int i = 0; i < 9 && !over.driver.isClosed(); i++) {
+            over.driver.submit(frame(ONE_MIB_CONTENT), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        }
+        assertTrue(over.driver.isClosed(), "a 9 MiB encoded set is past the 16 MiB footprint limit");
+        assertTrue(over.driver.lastCloseReason().startsWith("check=queue-byte-limit "), over.driver.lastCloseReason());
+    }
+
+    @Test
+    void pressureStartsAtEightMibAndClearsOnlyAtFourMib() throws Exception {
+        Rig rig = new Rig(1, 1000, 1L << 40, DEFAULT_QUEUE_BYTES);
+        SessionSendDriver driver = rig.driver;
+        for (int i = 0; i < 3; i++) {
+            driver.submit(frame(ONE_MIB_CONTENT), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        }
+        assertFalse(driver.underPressure(), "six MiB of footprint is below the eight MiB line");
+        driver.submit(frame(ONE_MIB_CONTENT), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        assertTrue(driver.underPressure(), "eight MiB of footprint starts the pressure");
+        releaseNextRecord(driver);
+        assertTrue(driver.underPressure(), "pressure does not clear at six MiB");
+        releaseNextRecord(driver);
+        assertTrue(driver.underPressure(), "pressure does not clear just above four MiB");
+        releaseNextRecord(driver);
+        assertFalse(driver.underPressure(), "pressure clears at four MiB");
+        assertTrue(driver.queuedFootprint() <= (4L << 20));
+    }
+
+    @Test
+    void aPressuredConnectionWithNoReleaseClosesAtTheDeadline() throws Exception {
+        Rig rig = new Rig(1, 1000, 1L << 40, DEFAULT_QUEUE_BYTES);
+        SessionSendDriver driver = rig.driver;
+        for (int i = 0; i < 4; i++) {
+            driver.submit(frame(ONE_MIB_CONTENT), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        }
+        assertTrue(driver.underPressure());
+        rig.now.addAndGet(9_000_000_000L);
+        releaseNextRecord(driver);
+        rig.now.addAndGet(RELEASE_DEADLINE - 100_000_000L);
+        assertFalse(driver.checkReleaseDeadline(), "a release at nine seconds renews the deadline");
+        assertFalse(driver.isClosed());
+        rig.now.addAndGet(200_000_000L);
+        assertTrue(driver.checkReleaseDeadline(), "ten seconds after the last release closes the connection");
+        assertTrue(driver.isClosed());
+        assertEquals(SessionSendDriver.CLOSE_RESOURCE, driver.closeCode());
+        assertTrue(driver.lastCloseReason().startsWith("check=release-deadline stream=-1 "), driver.lastCloseReason());
+        assertEquals(0, driver.queuedFootprint(), "a close releases the footprint");
+    }
+
+    @Test
+    void selectionWithoutReleaseDoesNotRenewTheDeadline() throws Exception {
+        Rig rig = new Rig(1, 1000, 1L << 40, DEFAULT_QUEUE_BYTES);
+        SessionSendDriver driver = rig.driver;
+        for (int i = 0; i < 4; i++) {
+            driver.submit(frame(ONE_MIB_CONTENT), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        }
+        rig.now.addAndGet(9_000_000_000L);
+        assertNotNull(driver.poll(stream -> true), "a slice is selected but never released");
+        rig.now.addAndGet(RELEASE_DEADLINE);
+        assertTrue(driver.checkReleaseDeadline(), "selection alone never counts as release");
+    }
+
+    @Test
+    void noPressureNeverClosesOnTheReleaseDeadline() throws Exception {
+        Rig rig = new Rig(1, 1000, 1L << 40, DEFAULT_QUEUE_BYTES);
+        SessionSendDriver driver = rig.driver;
+        driver.submit(frame(5), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        rig.now.addAndGet(10L * 60 * 1_000_000_000L);
+        assertFalse(driver.checkReleaseDeadline());
+        assertFalse(driver.isClosed());
+    }
+
+    @Test
+    void aBundleThatWouldExceedTheByteCapIsRefusedWhole() throws Exception {
+        Rig refused = new Rig(1, 1000, 1L << 40, 16L << 10);
+        List<OutboundPacket> big = new ArrayList<OutboundPacket>();
+        for (int i = 0; i < 3; i++) {
+            big.add(frame(2000));
+        }
+        StreamSequencer.Fence[] scopes = {StreamSequencer.Fence.ORDINARY_CONTROL,
+            StreamSequencer.Fence.ORDINARY_CONTROL, StreamSequencer.Fence.ORDINARY_CONTROL};
+        refused.driver.submitBundle(frame(5), big, scopes, frame(5));
+        assertTrue(refused.driver.isClosed());
+        assertTrue(refused.driver.lastCloseReason().startsWith("check=queue-byte-limit "), refused.driver.lastCloseReason());
+        assertEquals(0, refused.driver.queuedRecords(), "no member of the refused bundle was queued");
+        assertEquals(0, refused.driver.queuedFootprint());
+
+        Rig fits = new Rig(1, 1000, 1L << 40, 16L << 10);
+        List<OutboundPacket> small = new ArrayList<OutboundPacket>();
+        for (int i = 0; i < 3; i++) {
+            small.add(frame(100));
+        }
+        assertEquals(5, fits.driver.submitBundle(frame(5), small, scopes, frame(5)).size());
+        assertFalse(fits.driver.isClosed());
+    }
+
+    @Test
+    void aDroppedPendingAckReleasesItsFootprint() throws Exception {
+        Rig rig = new Rig(1, 1000, 1L << 40, DEFAULT_QUEUE_BYTES);
+        SessionSendDriver driver = rig.driver;
+        assertTrue(driver.createAck(1, frame(2).frame(), 16));
+        assertEquals(1, driver.queuedRecords());
+        assertTrue(driver.queuedFootprint() > 0);
+        rig.now.addAndGet(AckJoinTracker.DEADLINE_NANOS);
+        driver.expireAcks();
+        assertEquals(0, driver.queuedRecords());
+        assertEquals(0, driver.queuedFootprint(), "a dropped ACK gives back its footprint");
+    }
+
+    @Test
+    void closingWithQueuedRecordsZeroesTheFootprint() throws Exception {
+        Rig rig = new Rig(1, 1000, 1L << 40, DEFAULT_QUEUE_BYTES);
+        for (int i = 0; i < 4; i++) {
+            rig.driver.submit(frame(ONE_MIB_CONTENT), StreamSequencer.Fence.ORDINARY_CONTROL, 0, 0);
+        }
+        assertTrue(rig.driver.queuedFootprint() > (8L << 20));
+        rig.driver.close();
+        assertEquals(0, rig.driver.queuedRecords());
+        assertEquals(0, rig.driver.queuedFootprint());
+        assertFalse(rig.driver.underPressure());
     }
 }

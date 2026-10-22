@@ -64,7 +64,7 @@ public final class ProfileStore {
                 clampLanes(intValue(p, "maxLanes")),
                 longValue(p, "nodeBudgetBytes"),
                 doubleValue(p, "preLoginPoolFraction"),
-                intValue(p, "queuePacketLimit"),
+                queuePacketLimit(p),
                 longValue(p, "queueByteLimit"),
                 intValue(p, "controlWeight"),
                 intValue(p, "realtimeWeight"),
@@ -74,6 +74,18 @@ public final class ProfileStore {
                 optionalLong(p, "declaredBytesPerPrefix", defaults.declaredBytesPerPrefix));
         value.validate();
         return value;
+    }
+
+    /**
+     * The queued-record cap of the default before 13.20, which was 1024. The override file has no version key, so an
+     * override that still holds exactly this value is treated as the old default and replaced by the current default.
+     * Only the loaded snapshot changes; the file itself is left as it is until the next save.
+     */
+    static final int LEGACY_QUEUE_PACKET_LIMIT = 1024;
+
+    private int queuePacketLimit(Properties p) {
+        int limit = intValue(p, "queuePacketLimit");
+        return limit == LEGACY_QUEUE_PACKET_LIMIT ? defaults.queuePacketLimit : limit;
     }
 
     /**
