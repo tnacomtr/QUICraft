@@ -454,7 +454,8 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         });
         row.addProperty("buildCommit", o.commit);
         row.addProperty("variant", o.variant);
-        row.addProperty("busyTimer", !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")));
+        row.addProperty("busyTimer", o.arm.equals("quic3")
+                && !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")));
         row.add("net", JsonNull.INSTANCE);
         row.add("quic", JsonNull.INSTANCE);
         return row;
@@ -572,10 +573,12 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             String variant = System.getProperty("quicraft.gametest.armVariant", "plain");
             check(variant.equals("plain") || variant.equals("busy"),
                     "quicraft.gametest.armVariant must be plain or busy, got " + variant);
-            check(!variant.equals("busy") || !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")),
-                    "the busy variant needs -Dquicraft.v3.batchTimerBusy=true on the client");
-            check(variant.equals("busy") || !!"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")),
-                    "the plain variant needs -Dquicraft.v3.batchTimerBusy=false");
+            // The busy timer is the product default: on unless -Dquicraft.v3.batchTimerBusy=false. Only the
+            // /3 arm has the two variants; the busy one must run with it on, the plain one with it off.
+            boolean busyOn = !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy"));
+            check(!arm.equals("quic3") || busyOn == variant.equals("busy"),
+                    "the busy variant needs the busy timer on (the default) and the plain variant needs"
+                            + " -Dquicraft.v3.batchTimerBusy=false");
             check(!variant.equals("busy") || arm.equals("quic3"), "only the quic3 arm has a busy-timer variant");
             if (arm.equals("quic3")) {
                 check(Boolean.getBoolean("quicraft.multistream.offlineTest"),
