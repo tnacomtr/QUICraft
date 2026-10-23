@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.transport;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
@@ -272,13 +273,64 @@ public final class QuicServer implements Closeable {
     }
 
     /**
-     * The warm-up's throwaway listener: as {@link #bind(InetSocketAddress, ServerIdentity,
-     * TransportConfig, StreamAcceptor, V3Listener)} on one socket, marked warm so it creates no
-     * {@link JoinDiag}: its connections are not joins. Used only by {@link QuicClient#warmUp()}.
+     * Tests only: delays the warm bind's completion by this many milliseconds, so a test can make
+     * the bind complete after the warm-up's deadline; 0 is off. It runs inside the warm listener's
+     * channel initializer and never on the production bind path.
      */
-    static QuicServer bindWarm(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
-            StreamAcceptor acceptor, V3Listener v3) throws Exception {
-        return bind(address, 1, identity, config, acceptor, v3, true);
+    static volatile long warmBindDelayMillisForTests;
+
+    /**
+     * The warm-up's throwaway listener, bound without blocking: as {@link #bind(InetSocketAddress,
+     * ServerIdentity, TransportConfig, StreamAcceptor, V3Listener)} on one socket, marked warm so
+     * it creates no {@link JoinDiag}, but it returns as soon as the bind is submitted and completes
+     * the future when the socket is bound, so the caller can bound its wait with its own deadline.
+     * The production bind path is unchanged. A caller that gives up registers its own cleanup on
+     * the future; the listener's group is shut down here when the bind fails, and
+     * {@link #closeWithoutWaiting()} releases a listener that completes late. The warm path only.
+     */
+    static CompletableFuture<QuicServer> bindWarmAsync(InetSocketAddress address, ServerIdentity identity,
+            TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested) throws Exception {
+        V3Listener v3 = enableV3(v3Requested);
+        if (v3 != null) {
+            config = config.withMultistream();
+        }
+        Shared shared = new Shared(1, identity, config, acceptor, v3, true);
+        EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
+        CompletableFuture<QuicServer> ready = new CompletableFuture<QuicServer>();
+        ChannelFuture bound;
+        try {
+            bound = new Bootstrap().group(group).channel(NioDatagramChannel.class)
+                    .handler(new ChannelInitializer<Channel>() {
+                        @Override
+                        protected void initChannel(Channel ch) throws Exception {
+                            long delay = warmBindDelayMillisForTests;
+                            if (delay > 0) {
+                                try {
+                                    Thread.sleep(delay);
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                }
+                            }
+                            ch.pipeline().addLast(IngressGuard.forConfig(shared.ingress),
+                                    codec(shared, Codecs.LOCAL_CONNECTION_ID_LENGTH, null, 0));
+                        }
+                    })
+                    .bind(address);
+        } catch (Exception | Error e) {
+            group.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
+            throw e;
+        }
+        bound.addListener(f -> {
+            if (f.isSuccess()) {
+                List<Channel> single = new ArrayList<>(1);
+                single.add(bound.channel());
+                ready.complete(new QuicServer(group, single, shared));
+            } else {
+                group.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
+                ready.completeExceptionally(f.cause());
+            }
+        });
+        return ready;
     }
 
     /** As above, with {@code warm} marking a warm-up listener (see {@link Shared#warm}). */
@@ -546,7 +598,7 @@ public final class QuicServer implements Closeable {
          */
         final AtomicIntegerArray droppedMalformed;
         /**
-         * A warm-up listener ({@link #bindWarm}): none of its connections is a join, so it creates
+         * A warm-up listener ({@link #bindWarmAsync}): none of its connections is a join, so it creates
          * no {@link JoinDiag} and leaves the global diagnostics of real joins untouched.
          */
         final boolean warm;
@@ -1466,6 +1518,21 @@ public final class QuicServer implements Closeable {
             for (Channel channel : channels) {
                 channel.close().awaitUninterruptibly(timeout, java.util.concurrent.TimeUnit.MILLISECONDS);
             }
+        }
+    }
+
+    /**
+     * Closes this listener without waiting for any close to finish. A warm bind that completes
+     * after the warm-up's deadline is released from its own bind listener, on the listener's event
+     * loop, where waiting would deadlock; a caller that has already timed out must not block on
+     * it. The warm path only.
+     */
+    void closeWithoutWaiting() {
+        for (Channel channel : channels) {
+            channel.close();
+        }
+        if (group != null) {
+            group.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
     }
 

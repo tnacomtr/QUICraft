@@ -25,12 +25,14 @@ import io.netty.util.concurrent.ScheduledFuture;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -503,9 +505,12 @@ public final class QuicClient {
      * 127.0.0.1 (ephemeral port, in-memory certificate, the production listener and dial, {@code /3}).
      * Early data and session resumption are off on both ends, so the round trip offers and stores no
      * token, session ticket or first flight and writes no shared cache; it takes no join marks and
-     * publishes no early-data outcome. The whole body is bounded by {@link #WARM_TIMEOUT_MILLIS},
-     * once per process, and it never throws: a failure leaves every later dial exactly as it would
-     * have been without the call.
+     * publishes no early-data outcome. The whole body is bounded by one
+     * {@link #WARM_TIMEOUT_MILLIS} deadline from its start: identity generation, the bind, the
+     * dial and the handshake wait each get only the time remaining, and what completes after the
+     * deadline is cleaned up rather than left behind (a late listener is closed; a late identity
+     * is dropped). Once per process, and it never throws: a failure leaves every later dial
+     * exactly as it would have been without the call.
      */
     public static void warmUp() {
         if (!WARMED.compareAndSet(false, true)) {
@@ -532,6 +537,8 @@ public final class QuicClient {
     static volatile long warmTimeoutMillisForTests;
     /** Tests only: a dial target that never answers, so the warm handshake cannot complete. */
     static volatile InetSocketAddress warmTargetForTests;
+    /** Tests only: runs inside identity generation, e.g. to stall it past the warm-up's deadline. */
+    static volatile Runnable warmIdentityDelayForTests;
 
     /**
      * The warm-up's transport config: early data and session resumption off on both ends, so no
@@ -571,9 +578,14 @@ public final class QuicClient {
      * an in-memory certificate: the same listener and dial as production, so the UDP socket, the
      * QUIC and TLS handshake and the /3 preamble run once before the first real join. Nothing is
      * kept: both ends run with early data and resumption off, the dial's TLS context is uncached
-     * (bypassResumption), it takes no join marks and the listener creates none. The body shares one
-     * deadline ({@link #WARM_TIMEOUT_MILLIS} from its start) and every close is bounded by
-     * {@link #WARM_CLOSE_MILLIS}.
+     * (bypassResumption), it takes no join marks and the listener creates none.
+     *
+     * <p>The body has one deadline ({@link #WARM_TIMEOUT_MILLIS} from its start) and every
+     * blocking step waits only for the time remaining: the identity is generated on a daemon
+     * thread and awaited, the bind is submitted without blocking and awaited, and the dial is
+     * awaited. What completes after the deadline is cleaned up rather than left behind: a late
+     * listener is closed as soon as its bind completes, a late identity is dropped (it holds no
+     * resource), and every close is bounded by {@link #WARM_CLOSE_MILLIS}.
      */
     private static void loopbackRoundTrip() {
         long timeoutMillis = warmTimeoutMillisForTests > 0 ? warmTimeoutMillisForTests : WARM_TIMEOUT_MILLIS;
@@ -590,13 +602,36 @@ public final class QuicClient {
         V3Connection connection = null;
         AtomicReference<Channel> socket = new AtomicReference<Channel>();
         try {
-            ServerIdentity identity = ServerIdentity.generate();
-            if (deadline - System.nanoTime() <= 0) {
-                return; // the one deadline also covers identity generation and the bind
+            CompletableFuture<ServerIdentity> identityFuture = warmIdentity();
+            ServerIdentity identity;
+            try {
+                identity = identityFuture.get(remainingMillis(deadline), TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                return; // the deadline passed: a late identity is simply dropped
             }
             Fingerprint fingerprint = identity.fingerprint();
-            server = QuicServer.bindWarm(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), identity,
-                    warmConfig(), stream -> { }, protocol -> table);
+            CompletableFuture<QuicServer> listener = QuicServer.bindWarmAsync(
+                    new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), identity, warmConfig(),
+                    stream -> { }, protocol -> table);
+            try {
+                server = listener.get(remainingMillis(deadline), TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                // The deadline passed (or the bind failed). If the bind still completes
+                // successfully, release that listener where it completes: waiting there would
+                // deadlock on its own event loop, so the release never blocks.
+                listener.whenComplete((late, failure) -> {
+                    if (late != null) {
+                        late.closeWithoutWaiting();
+                    }
+                });
+                return;
+            }
             InetSocketAddress target = warmTargetForTests;
             dial = warmDial(target != null ? target : server.localAddress(), fingerprint, table, socket);
             connection = dial.get(remainingMillis(deadline), TimeUnit.MILLISECONDS);
@@ -635,6 +670,29 @@ public final class QuicClient {
                 }
             }
         }
+    }
+
+    /**
+     * Identity generation off the warm-up thread, so it is only ever awaited for the time left: a
+     * daemon thread, so a slow key generation can never hold the process or the deadline. A result
+     * that arrives after the deadline is dropped; it holds no resource to release.
+     */
+    private static CompletableFuture<ServerIdentity> warmIdentity() {
+        return CompletableFuture.supplyAsync(() -> {
+            Runnable delay = warmIdentityDelayForTests;
+            if (delay != null) {
+                delay.run();
+            }
+            try {
+                return ServerIdentity.generate();
+            } catch (GeneralSecurityException e) {
+                throw new CompletionException(e);
+            }
+        }, task -> {
+            Thread thread = new Thread(task, "quicraft-warmup-identity");
+            thread.setDaemon(true);
+            thread.start();
+        });
     }
 
     /**

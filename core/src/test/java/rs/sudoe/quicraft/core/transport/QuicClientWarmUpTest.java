@@ -25,6 +25,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import rs.sudoe.quicraft.core.Protocol;
 import rs.sudoe.quicraft.core.QuicSupport;
+import rs.sudoe.quicraft.core.connect.ClientConnector;
+import rs.sudoe.quicraft.core.connect.ConnectDecision;
 import rs.sudoe.quicraft.core.connect.FailureCache;
 import rs.sudoe.quicraft.core.discovery.Advertisement;
 import rs.sudoe.quicraft.core.discovery.AdvertisementCache;
@@ -134,31 +136,39 @@ class QuicClientWarmUpTest {
                 "the warm-up published a global early-data outcome");
     }
 
+    /**
+     * The warm-up reaches neither cache: {@link QuicClient} holds no reference to them; the
+     * client's wiring owns them and hands them to {@link ClientConnector}. So seed them through
+     * the real production connector and assert through its public API that the instances a
+     * subsequent real dial uses are untouched. The shared static state the warm-up does hold
+     * (early tokens) is covered above.
+     */
     @Test
-    void warmUpLeavesTheSeededFailureAndAdvertisementCachesUntouched() throws Exception {
+    void warmUpLeavesTheProductionFailureAndAdvertisementCachesUntouched() throws Exception {
         assumeWarmable();
         QuicClient.resetWarmUpForTests();
-        FailureCache failures = FailureCache.load(dir.resolve("warm-failures.properties"));
         AdvertisementCache adverts = new AdvertisementCache();
+        FailureCache failures = FailureCache.load(dir.resolve("warm-failures.properties"));
+        ClientConnector connector = new ClientConnector(adverts, failures);
         InetAddress address = InetAddress.getLoopbackAddress();
         int port = 25565;
         Fingerprint fingerprint = Fingerprint.of(new byte[] {0x6a});
-        failures.recordFailure(address, port, fingerprint);
-        assertFalse(failures.allows(address, port, fingerprint), "the seeded failure did not take");
         InetSocketAddress server = new InetSocketAddress(address, port);
         Advertisement advertised = Advertisement.v1(port, fingerprint);
         adverts.record(server, Optional.of(advertised));
-        assertTrue(adverts.fresh(server).isPresent(), "the seeded advertisement did not take");
+        failures.recordFailure(address, advertised.port(), advertised.fingerprint());
+        assertEquals(ClientConnector.Plan.VANILLA_TCP, connector.plan(server, ConnectDecision.Mode.AUTO),
+                "the seeded advertisement plus the seeded failure did not back off");
         long roundTripsBefore = QuicClient.warmRoundTripsForTests();
 
         QuicClient.warmUp();
 
         assertEquals(roundTripsBefore + 1, QuicClient.warmRoundTripsForTests(),
                 "the warm-up's loopback round trip did not complete");
-        assertFalse(failures.allows(address, port, fingerprint), "the warm-up cleared the seeded failure");
-        Optional<Advertisement> after = adverts.fresh(server);
-        assertTrue(after.isPresent(), "the warm-up removed the seeded advertisement");
-        assertEquals(advertised, after.get(), "the warm-up changed the seeded advertisement");
+        assertEquals(ClientConnector.Plan.VANILLA_TCP, connector.plan(server, ConnectDecision.Mode.AUTO),
+                "the warm-up cleared the production failure cache");
+        assertEquals(Optional.of(advertised), connector.advertisements().fresh(server),
+                "the warm-up changed the production advertisement cache");
     }
 
     @Test
@@ -190,6 +200,130 @@ class QuicClientWarmUpTest {
             added = socketsAdded(fds, socketsBefore);
         }
         assertTrue(added.isEmpty(), "sockets left open by a warm-up that could not finish: " + added);
+    }
+
+    @Test
+    void aStalledIdentityGenerationIsBoundedAndLeavesNoNonDaemonThread() throws Exception {
+        assumeWarmable();
+        QuicClient.resetWarmUpForTests();
+        Thread.sleep(300); // an earlier test's socket may still be closing
+        Set<String> threadsBefore = nonDaemonThreads();
+        long roundTripsBefore = QuicClient.warmRoundTripsForTests();
+        QuicClient.warmIdentityDelayForTests = () -> {
+            try {
+                Thread.sleep(5000); // identity generation outlives the warm-up's 2 s deadline
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        };
+        try {
+            long start = System.nanoTime();
+            assertDoesNotThrow(QuicClient::warmUp);
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            assertTrue(elapsedMillis < 3000,
+                    "a warm-up whose identity generation stalled took " + elapsedMillis + " ms");
+            assertEquals(roundTripsBefore, QuicClient.warmRoundTripsForTests(),
+                    "a warm-up whose identity generation stalled still completed a round trip");
+        } finally {
+            QuicClient.warmIdentityDelayForTests = null;
+        }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        Set<String> added = newThreads(threadsBefore);
+        while (!added.isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(100);
+            added = newThreads(threadsBefore);
+        }
+        assertTrue(added.isEmpty(), "non-daemon threads left by a warm-up whose identity stalled: " + added);
+    }
+
+    @Test
+    void aStalledBindIsBoundedAndItsLateListenerIsClosed() throws Exception {
+        assumeWarmable();
+        Path fds = Paths.get("/proc/self/fd");
+        assumeTrue(Files.isDirectory(fds), "needs /proc/self/fd");
+        QuicClient.resetWarmUpForTests();
+        Thread.sleep(300); // an earlier test's socket may still be closing
+        Set<String> socketsBefore = openSockets(fds);
+        long roundTripsBefore = QuicClient.warmRoundTripsForTests();
+        QuicServer.warmBindDelayMillisForTests = 3000;
+        try {
+            long start = System.nanoTime();
+            assertDoesNotThrow(QuicClient::warmUp);
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            assertTrue(elapsedMillis < 3000, "a warm-up whose bind stalled took " + elapsedMillis + " ms");
+            assertEquals(roundTripsBefore, QuicClient.warmRoundTripsForTests(),
+                    "a warm-up whose bind stalled still completed a round trip");
+        } finally {
+            QuicServer.warmBindDelayMillisForTests = 0;
+        }
+        // The bind completes about 1 s after warmUp returned; the late listener must close then.
+        awaitNoNewSockets(fds, socketsBefore, 6);
+    }
+
+    @Test
+    void aLateHandshakeCompletionAfterTheDeadlineLeavesNoSocket() throws Exception {
+        assumeWarmable();
+        Path fds = Paths.get("/proc/self/fd");
+        assumeTrue(Files.isDirectory(fds), "needs /proc/self/fd");
+        QuicClient.resetWarmUpForTests();
+        Thread.sleep(300); // an earlier test's socket may still be closing
+        Set<String> socketsBefore = openSockets(fds);
+        long roundTripsBefore = QuicClient.warmRoundTripsForTests();
+        QuicClient.setWarmTimeoutMillisForTests(200);
+        QuicClient.setBeforeConnectCompletionForTests(() -> {
+            try {
+                Thread.sleep(1000); // the handshake completes well after the deadline
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        try {
+            assertDoesNotThrow(QuicClient::warmUp);
+            assertEquals(roundTripsBefore, QuicClient.warmRoundTripsForTests(),
+                    "a warm round trip that completed after the deadline was still counted");
+        } finally {
+            QuicClient.setWarmTimeoutMillisForTests(0);
+            QuicClient.setBeforeConnectCompletionForTests(null);
+        }
+        awaitNoNewSockets(fds, socketsBefore, 6);
+    }
+
+    @Test
+    void aConcurrentRealJoinSucceedsAndKeepsItsOwnEarlyOutcome() throws Exception {
+        assumeWarmable();
+        QuicClient.resetWarmUpForTests();
+        EarlyCache cache = EarlyCache.INSTANCE;
+        List<Object> sentinel = EarlyCache.server(
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 25565),
+                Fingerprint.of(new byte[] {0x7c, 0x11}), Protocol.ALPN_V3);
+        cache.putToken(sentinel, new byte[] {1, 2, 3});
+        QuicClient.setLastEarlyOutcomeForTests("seeded by the test");
+        ServerIdentity identity = ServerIdentity.generate();
+        Thread warm = new Thread(QuicClient::warmUp, "quicraft-warmup-test");
+        warm.setDaemon(true);
+        try (QuicServer server = QuicServer.bind(Loopback.anyLocal(), identity, TransportConfig.DEFAULT,
+                stream -> { }, protocol -> V3ConnectionTest.TABLE)) {
+            InetSocketAddress target = server.localAddress();
+            warm.start();
+            V3Connection connection = QuicClient.connectV3(target, identity.fingerprint(),
+                    V3ConnectionTest.TABLE, null).get(10, TimeUnit.SECONDS);
+            assertNotNull(connection, "a real dial beside the warm-up did not connect");
+            List<Object> real = EarlyCache.server(target, identity.fingerprint(), Protocol.ALPN_V3);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (!cache.hasToken(real) && System.nanoTime() < deadline) {
+                Thread.sleep(50); // the server's preamble and its /3 token arrive after connect
+            }
+            connection.close();
+            warm.join(5000);
+            assertFalse(warm.isAlive(), "the concurrent warm-up did not finish");
+            assertEquals("not requested", QuicClient.lastEarlyOutcome(),
+                    "the real dial's early-data outcome is not the one published");
+            assertTrue(cache.hasToken(real), "the real /3 dial recorded no early token");
+            assertTrue(cache.hasToken(sentinel), "the warm-up removed the seeded early token");
+        } finally {
+            QuicClient.forgetSessions();
+            warm.join(1000);
+        }
     }
 
     @Test
@@ -233,6 +367,18 @@ class QuicClientWarmUpTest {
         Set<String> added = openSockets(fds);
         added.removeAll(before);
         return added;
+    }
+
+    /** Waits, bounded, until the process holds no socket descriptor it did not hold before. */
+    private static void awaitNoNewSockets(Path fds, Set<String> before, long timeoutSeconds)
+            throws IOException, InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        Set<String> added = socketsAdded(fds, before);
+        while (!added.isEmpty() && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+            added = socketsAdded(fds, before);
+        }
+        assertTrue(added.isEmpty(), "sockets left open by the warm-up: " + added);
     }
 
     private static Set<String> newThreads(Set<String> before) {
