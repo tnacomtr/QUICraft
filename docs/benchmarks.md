@@ -1517,3 +1517,50 @@ negotiated `quicraft/3`, 5 streams and routing table `quicraft-routing-p775-s2` 
 
 21 of 21 runs passed, 0 disconnects, 0 mismatches (commit `e6e2ea20`). One round is a smoke-level proof; more rounds
 and longer sessions are still open.
+
+## Clean-link push: warm-up, teleport-hop chunk fill and chunk pacing experiments (2026-10-23)
+
+Goal: /3 faster than TCP on a clean link for join, idle chunk load, chunk fill while moving, and RTT. **Not reached.**
+Every number below is a paired per-round difference against TCP from `testkit/run-hop-matrix.sh` (fresh server container
+and client JVM per cell, headless Xvfb, TCP / /3 plain / /3 busy interleaved per round, clean profile, 0 disconnects,
+0 stall ticks in every cell).
+
+Hop mode: after the initial view fill the server teleports the player (`tp @s`, 240 m, ping-pong, six legs per run);
+a leg's fill time runs from its first tick until 90% of the columns of the circle around the new position are loaded
+(render distance 5, 73 of 81 columns).
+
+**Baseline on `feat` with warm-up v2 (n=10 rounds, `hop-feat-warm-10`)**
+
+| Metric | TCP median | /3 plain | /3 busy | busy paired delta (min..max) |
+| --- | --- | --- | --- | --- |
+| join (ms) | 1316 | 1470 | 1451 | +121 (-361..+688), +9.6% |
+| idle chunk load (ms) | 4825 | 7352 | 5202 | +385 (+53..+989), +8.0% |
+| hop fill median (ms) | 325 | 598 | 351 | +30 (-22..+66), +9.2% |
+| hop fill p95 (ms) | 506 | 841 | 514 | +32 (-55..+107), +6.3% |
+| play RTT median (ms) | 1.2 | 2.3 | 9.9 | +7.3 (-3.4..+18.9) |
+
+Join before warm-up v2 (n=5, `hop-clean-1`): TCP 1283, busy 1574 (+301). Warm-up v2 is a loopback self-handshake on a
+daemon thread at client start (no real-server contact, early data and resumption off, one 2 s deadline, reviewed and
+cleared); it cuts roughly 150 ms of the join gap. The remaining gap is client cold start plus costs TCP pays too.
+
+**Chunk pacing experiments (hop fill, busy arm, paired median vs TCP, n=5 each)**
+
+| Build | Policy | Delta |
+| --- | --- | --- |
+| `470f7f42` | busy timer counts every lane's decode and handoff | +43 ms |
+| `41c8ce31` | counts full-chunk decode and handoff only, in delivery order | +33.5 ms |
+| `c796efd6` | main-thread apply cost with a guard | +28.6 ms (no gain) |
+| `8aa1b842` | plus equal-weight adaptation, cap 32 chunks/tick | **+104 ms (worse)**, reverted |
+
+Raising the requested chunk rate does not help: batches are serial (the next one waits for the client's batch ACK and
+the next server tick), a bigger batch takes longer to deliver (62-155 ms against 34-37 ms for TCP at 25-30 chunks),
+and the client applies the chunks of two hops at once. The 8aa1b842 policy also made busy RTT worse.
+
+Per-batch delivery (server batch submit to client batch finish): TCP 20-25 ms median, /3 busy about 30 ms with a heavy
+tail. In the traced example the server IO thread sends two chunk frames 3 ms after the submit, is then occupied for about
+12 ms (untraced work, most likely vanilla encoding and compression of the following packets), and sends the rest at
+17-22 ms. That serial per-batch overhead of about 5 ms times 6-7 batches per leg is the 30 ms hop gap.
+
+Honest summary: /3 busy is about 6-10% slower than TCP on a clean loopback link for join, idle chunk load and hop fill;
+its play RTT has a long tail while chunks arrive. Plain /3 is far behind on chunk load (the busy timer is needed and is
+the default). No claim of a clean-link win is made.
