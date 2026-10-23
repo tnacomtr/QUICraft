@@ -77,6 +77,8 @@ import rs.sudoe.quicraft.fabric.net.PacketLaneCodec;
  * except {@link #holdTask}'s tick, which only reads a flag.</p>
  */
 public final class V3Join implements BindingDecodeContext.Gate {
+    /** Experiment only until delay/loss proof: aggregate CHUNK submissions across vanilla encoder tasks. */
+    private static final boolean CHUNK_BATCH_CORK = Boolean.getBoolean("quicraft.v3.chunkBatchCork");
     private static final AttributeKey<V3Join> KEY = AttributeKey.valueOf("quicraft.v3join");
     private static final String PACKET_HANDLER = "packet_handler";
     private static final String DECRYPT = "decrypt";
@@ -950,7 +952,14 @@ public final class V3Join implements BindingDecodeContext.Gate {
                     CausalSendContext.currentEnvelope(ctx.channel()));
             if (traceWrites) unit.traceWriteStartedNanos = System.nanoTime();
             OutboundUnit outer = unitInFlight;
+            NStreamSession cork = null;
             try {
+                if (active && CHUNK_BATCH_CORK && connection.session() instanceof NStreamSession stream) {
+                    cork = stream;
+                }
+                if (cork != null && msg instanceof net.minecraft.network.protocol.game.ClientboundChunkBatchStartPacket) {
+                    cork.chunkBatchCork(true);
+                }
                 if (unit.envelope() == null) {
                     throw new IllegalStateException("filtered GAME write has no causal envelope");
                 }
@@ -978,6 +987,14 @@ public final class V3Join implements BindingDecodeContext.Gate {
             } catch (Throwable t) {
                 promise.tryFailure(t);
                 fail("binding outbound filter: " + describe(t), t);
+            } finally {
+                if (cork != null && msg instanceof net.minecraft.network.protocol.game.ClientboundChunkBatchFinishedPacket) {
+                    try {
+                        cork.chunkBatchCork(false);
+                    } catch (Throwable t) {
+                        fail("binding chunk batch uncork: " + describe(t), t);
+                    }
+                }
             }
         }
 

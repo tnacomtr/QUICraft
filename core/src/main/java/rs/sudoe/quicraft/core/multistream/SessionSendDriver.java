@@ -292,6 +292,10 @@ public final class SessionSendDriver {
     private int pendingGrants;
     private long nextToken = 1;
     private int queuedRecords;
+    /** Local CHUNK aggregation only; never changes sequencing, reservations or REALTIME policy. */
+    private boolean chunkCorked;
+    private long chunkCorkDeadline;
+    static final long CHUNK_CORK_NANOS = 10_000_000L;
     private final SendTrace trace = ReceiveTrace.enabled() ? new SendTrace() : null;
     /** The queue footprint (13.20) of every sequenced or pending record not yet fully released by the transport. */
     private long queuedBytes;
@@ -1419,6 +1423,17 @@ public final class SessionSendDriver {
     }
 
     /**
+     * Opt-in platform batch aggregation. Keep CHUNK bytes in the charged driver while the platform
+     * encodes a batch, rather than flushing each chunk between encoder tasks. Finish releases the
+     * cohort. A missing finish makes it eligible after 10 ms; size, pressure and grant waits release
+     * early so aggregation cannot obstruct the existing pool/backpressure progress rules.
+     */
+    public synchronized void chunkBatchCork(boolean begin) {
+        chunkCorked = begin && !closed && !sealed;
+        if (chunkCorked) chunkCorkDeadline = clock.getAsLong() + CHUNK_CORK_NANOS;
+    }
+
+    /**
      * Selects the next slice to write, or returns null when nothing is granted, ready and writable.
      * The caller writes the slice, then reports its outcome with {@link #released(long)} or
      * {@link #failed(long)}.
@@ -1433,7 +1448,14 @@ public final class SessionSendDriver {
             return null;
         }
         pump();
-        SendScheduler.Selection selection = scheduler.pollSelection(writable);
+        if (chunkCorked && (clock.getAsLong() - chunkCorkDeadline >= 0 || pressured || pendingGrants > 0
+                || queuedBytes >= footprintOf(SendScheduler.QUANTUM_BYTES)
+                || queuedRecords >= Math.max(1, profile.queuePacketLimit / 2))) {
+            chunkCorked = false;
+        }
+        SendScheduler.Selection selection = scheduler.pollSelection(chunkCorked
+                ? stream -> (stream < FIRST_CHUNK || stream == context.ackIndex()) && writable.test(stream)
+                : writable);
         if (selection == null) {
             return null;
         }

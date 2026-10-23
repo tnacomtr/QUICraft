@@ -1513,6 +1513,18 @@ public final class NStreamSession implements MultistreamSession {
         scheduleDrain();
     }
 
+    /** Local, opt-in server chunk aggregation; no wire or timer-feedback change. */
+    public void chunkBatchCork(boolean begin) {
+        sendDriver.chunkBatchCork(begin);
+        if (begin) {
+            // Also wake an otherwise idle sender when a producer failed to emit its finish marker.
+            loop.schedule(() -> guarded(this::drainNow), SessionSendDriver.CHUNK_CORK_NANOS,
+                    TimeUnit.NANOSECONDS);
+        } else {
+            scheduleDrain();
+        }
+    }
+
     private void scheduleDrain() {
         if (closed || !drainScheduled.compareAndSet(false, true)) {
             return;

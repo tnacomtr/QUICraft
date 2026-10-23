@@ -43,6 +43,125 @@ import rs.sudoe.quicraft.core.routing.ProtocolState;
 import rs.sudoe.quicraft.core.time.StallClock;
 
 class SessionSendDriverTest {
+    @Test void chunkBatchCorkNeverHoldsReadyAckStreamTraffic() throws Exception {
+        Rig rig = new Rig(2, 100);
+        try {
+            rig.driver.chunkBatchCork(true);
+            rig.driver.submit(frame(5), StreamSequencer.Fence.ACK_TRAILING, 0, 0);
+            rig.driver.submit(frame(100), StreamSequencer.Fence.CHUNK_ACK, 0, 0);
+            SessionSendDriver.Write ack = rig.driver.poll(stream -> true);
+            assertNotNull(ack);
+            assertEquals(rig.driver.context().ackIndex(), ack.stream());
+            rig.driver.released(ack.token());
+            assertNull(rig.driver.poll(stream -> true));
+            rig.driver.chunkBatchCork(false);
+            assertEquals(1, drainAndRelease(rig.driver).writes.size());
+        } finally {
+            rig.driver.close();
+        }
+    }
+
+    @Test void chunkBatchCorkYieldsWhenAChargeWaitsForThePool() throws Exception {
+        ExactCapRig rig = new ExactCapRig(4096, 1024, 64);
+        try {
+            rig.driver.chunkBatchCork(true);
+            rig.driver.submit(frame(900), StreamSequencer.Fence.CHUNK, 0, 0);
+            rig.driver.submit(frame(900), StreamSequencer.Fence.CHUNK, 1, 1);
+            assertTrue(rig.driver.awaitingGrant());
+            assertEquals(2, drainAndRelease(rig.driver).writes.size());
+            assertEquals(0, rig.driver.queuedFootprint());
+        } finally {
+            rig.driver.close();
+        }
+    }
+
+    @Test void chunkBatchCorkHoldsOnlyChunksAndKeepsTheirFootprintUntilRelease() throws Exception {
+        Rig rig = new Rig(2, 100);
+        try {
+            rig.driver.chunkBatchCork(true);
+            rig.driver.submit(frame(100), StreamSequencer.Fence.CHUNK, 0, 0);
+            long charged = rig.driver.queuedFootprint();
+            assertNull(rig.driver.poll(stream -> true));
+            assertEquals(charged, rig.driver.queuedFootprint());
+            rig.driver.submit(frame(5), StreamSequencer.Fence.REALTIME, 0, 0);
+            SessionSendDriver.Write realtime = rig.driver.poll(stream -> true);
+            assertNotNull(realtime);
+            assertEquals(LogicalStream.REALTIME, realtime.stream());
+            rig.driver.released(realtime.token());
+            assertEquals(charged, rig.driver.queuedFootprint());
+            rig.driver.chunkBatchCork(false);
+            assertEquals(1, drainAndRelease(rig.driver).writes.size());
+            assertEquals(0, rig.driver.queuedFootprint());
+        } finally {
+            rig.driver.close();
+        }
+    }
+
+    @Test void chunkBatchCorkOffAndOnProduceIdenticalStreamBytes() throws Exception {
+        Rig off = new Rig(2, 100);
+        Rig on = new Rig(2, 100);
+        try {
+            on.driver.chunkBatchCork(true);
+            for (Rig rig : new Rig[] {off, on}) {
+                rig.driver.submit(frame(5), StreamSequencer.Fence.VIEW, 0, 0);
+                rig.driver.submit(frame(100), StreamSequencer.Fence.CHUNK, 0, 0);
+                rig.driver.submit(frame(200), StreamSequencer.Fence.CHUNK, 1, 1);
+                rig.driver.submit(frame(5), StreamSequencer.Fence.GLOBAL, 0, 0);
+            }
+            // Disabled path can send immediately; enabled path sends the view but not its chunks.
+            Drain original = drainAndRelease(off.driver);
+            Drain prefix = drainAndRelease(on.driver);
+            assertEquals(1, prefix.writes.size());
+            on.driver.chunkBatchCork(false);
+            Drain suffix = drainAndRelease(on.driver);
+            for (int stream = 0; stream < original.perStream.length; stream++) {
+                ByteArrayOutputStream actual = new ByteArrayOutputStream();
+                actual.write(prefix.perStream[stream].toByteArray());
+                actual.write(suffix.perStream[stream].toByteArray());
+                assertArrayEquals(original.perStream[stream].toByteArray(), actual.toByteArray());
+            }
+        } finally {
+            off.driver.close();
+            on.driver.close();
+        }
+    }
+
+    @Test void chunkBatchCorkExpiresWithoutFinishAndDoesNotExpireANewerBatchEarly() throws Exception {
+        Rig rig = new Rig(2, 100);
+        try {
+            rig.driver.chunkBatchCork(true);
+            rig.now.addAndGet(SessionSendDriver.CHUNK_CORK_NANOS / 2);
+            rig.driver.chunkBatchCork(true);
+            rig.driver.submit(frame(100), StreamSequencer.Fence.CHUNK, 0, 0);
+            rig.now.addAndGet(SessionSendDriver.CHUNK_CORK_NANOS / 2);
+            assertNull(rig.driver.poll(stream -> true));
+            rig.now.addAndGet(SessionSendDriver.CHUNK_CORK_NANOS / 2);
+            assertEquals(1, drainAndRelease(rig.driver).writes.size());
+        } finally {
+            rig.driver.close();
+        }
+    }
+
+    @Test void chunkBatchCorkYieldsAtSizePressureAndPacketBounds() throws Exception {
+        Rig[] rigs = {new Rig(2, 100), new Rig(2, 100, 1L << 40, 2000), new Rig(2, 2)};
+        try {
+            for (int i = 0; i < rigs.length; i++) {
+                Rig rig = rigs[i];
+                rig.driver.chunkBatchCork(true);
+                rig.driver.submit(frame(i == 0 ? SendScheduler.QUANTUM_BYTES : 100),
+                        StreamSequencer.Fence.CHUNK, 0, 0);
+                Drain writes = drainAndRelease(rig.driver);
+                assertFalse(writes.writes.isEmpty(), "bound " + i);
+                for (SessionSendDriver.Write write : writes.writes) {
+                    assertTrue(write.bytes().length <= SendScheduler.QUANTUM_BYTES);
+                }
+                assertEquals(0, rig.driver.queuedFootprint());
+            }
+        } finally {
+            for (Rig rig : rigs) rig.driver.close();
+        }
+    }
+
     @Test void optInTraceFollowsRealQueueAndSelectionWithoutChangingDrainOrder() throws Exception {
         String previous = System.getProperty("quicraft.v3.trace");
         System.setProperty("quicraft.v3.trace", "true");
