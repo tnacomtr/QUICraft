@@ -1557,9 +1557,23 @@ the next server tick), a bigger batch takes longer to deliver (62-155 ms against
 and the client applies the chunks of two hops at once. The 8aa1b842 policy also made busy RTT worse.
 
 Per-batch delivery (server batch submit to client batch finish): TCP 20-25 ms median, /3 busy about 30 ms with a heavy
-tail. In the traced example the server IO thread sends two chunk frames 3 ms after the submit, is then occupied for about
-12 ms (untraced work, most likely vanilla encoding and compression of the following packets), and sends the rest at
-17-22 ms. That serial per-batch overhead of about 5 ms times 6-7 batches per leg is the 30 ms hop gap.
+tail. The server IO thread spends about the same time per chunk packet on both arms (about 1 ms: TCP 33.6 ms over 32
+tasks per batch, /3 15.9 ms over 16 packets), so the extra per-batch time is not encoding or compression. In the traced
+example the server writes two chunk frames 3 ms after the submit, the wire then stays idle for about 12 ms, and the rest
+goes out in one burst at 17-22 ms; the working hypothesis (not yet confirmed) is that the session drain queues behind the
+remaining write tasks on the IO loop. About 5 ms extra per batch times 6-7 batches per leg is the 30 ms hop gap.
+
+**RTT during hops (paired per round against TCP, n=10, `hop-feat-warm-10`)**
+
+| Metric | TCP | /3 plain | /3 busy |
+| --- | --- | --- | --- |
+| RTT p95 median of runs (ms) | 35.4 | 6.2 | 60.0 |
+| paired delta vs TCP, median (min..max) | | -21.9 (-58.0..-2.8) | +31.0 (-42.1..+61.1) |
+| rounds where /3 is lower | | 10 of 10 | 3 of 10 |
+| RTT median (ms) | 1.2 | 2.3 | 9.9 |
+
+Plain /3 keeps pings fast while chunks stream (multi-stream does what it was designed for); the busy timer, which is
+what makes chunk loading fast, gives that tail back. Idle RTT median is a loss for both /3 variants.
 
 Honest summary: /3 busy is about 6-10% slower than TCP on a clean loopback link for join, idle chunk load and hop fill;
 its play RTT has a long tail while chunks arrive. Plain /3 is far behind on chunk load (the busy timer is needed and is
