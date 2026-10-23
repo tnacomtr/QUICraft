@@ -1596,3 +1596,52 @@ Fusing every submit made chunk fill and load worse (hop fill busy 405 ms, plain 
 looked like it fixed the busy RTT tail (p95 22 ms), but that came with slower chunk delivery. Fusing REALTIME packets only
 (`hop-rtfuse-on`) did not move the tail (busy RTT median 7.5 ms, p95 29.5 ms against TCP 22.0 ms; hop fill 352 ms, idle
 chunk load +10%). Both variants are rejected; the apparent RTT gain of the first is a throughput effect.
+
+## Impaired-link hop matrix, n=10 per profile (2026-10-23, commit e09c8b7d)
+
+Same harness as the clean-link n=10 run above (`testkit/run-hop-matrix.sh --rounds 10`, one profile per invocation, fresh
+server container and client JVM per cell, headless, 0 disconnects and `Matrix /3 gate: PASS` in every profile). Results in
+`testkit/results/hop-imp10-<profile>/`. Medians over 10 runs per arm; "plain" is the wall-time batch timer, "busy" the
+default. Paired deltas are per-round (/3 minus TCP); the range is min..max over the 10 rounds.
+
+| Profile | Metric | TCP | /3 plain | /3 busy | Paired Δ busy (range) |
+| --- | --- | --- | --- | --- | --- |
+| delayloss | join (ms) | 2018 | 2488 | 2501 | +397 (-1006..+863) |
+| delayloss | idle chunk load (ms) | 127,900 | 16,684 | 16,520 | -110,929 (-137,125..-91,142) |
+| delayloss | hop fill median (ms) | 17,775 | 1,830 | 1,851 | -15,669 (-17,293..-13,610) |
+| delayloss | RTT during hops (ms) | 157.0 | 250.1 | 846.0 | +687 (+291..+952) |
+| slow | join (ms) | 2220 | 2653 | 2535 | +280 (-693..+957) |
+| slow | idle chunk load (ms) | 151,244 | 27,538 | 39,008 | -112,406 (-125,829..-100,864) |
+| slow | hop fill median (ms) | 18,550 | 3,199 | 5,210 | -13,353 (-15,498..-12,421) |
+| slow | RTT during hops (ms) | 171.0 | 356.0 | 2,311 | +2,135 (+2,074..+2,257) |
+| jitter | join (ms) | 1387 | 1565 | 1546 | +181 (-104..+410) |
+| jitter | idle chunk load (ms) | 33,074 | 10,854 | 5,842 | -27,145 (-30,910..-22,867) |
+| jitter | hop fill median (ms) | 3,736 | 990 | 478 | -3,262 (-3,684..-2,978) |
+| jitter | RTT during hops (ms) | 22.7 | 24.8 | 46.8 | +20.4 (+3.8..+39.6) |
+| reorder | join (ms) | 1339 | 1519 | 1550 | +202 (+94..+325) |
+| reorder | idle chunk load (ms) | 13,902 | 7,466 | 5,570 | -8,068 (-10,273..-3,133) |
+| reorder | hop fill median (ms) | 1,484 | 610 | 446 | -1,002 (-1,539..-440) |
+| reorder | RTT during hops (ms) | 20.8 | 22.2 | 30.2 | +9.1 (+3.4..+24.6) |
+| delay | join (ms) | 2032 | 2435 | 2393 | +415 (+309..+894) |
+| delay | idle chunk load (ms) | 8,212 | 9,452 | 7,611 | -624 (-1,339..-198) |
+| delay | hop fill median (ms) | 656 | 877 | 684 | +36 (-25..+95) |
+| delay | RTT during hops (ms) | 152.2 | 152.1 | 153.3 | +1.2 (-6.2..+11.4) |
+| loss | join (ms) | 1311 | 1480 | 1489 | +176 (-71..+557) |
+| loss | idle chunk load (ms) | 5,298 | 7,869 | 5,294 | +89 (-582..+842) |
+| loss | hop fill median (ms) | 368 | 585 | 375 | +2 (-69..+74) |
+| loss | RTT during hops (ms) | 1.4 | 2.2 | 16.4 | +14.8 (-2.2..+29.7) |
+
+What the numbers say:
+
+- **Chunk delivery.** /3 is far ahead of TCP wherever the link has jitter or combined delay and loss: delayloss -87% idle
+  load and -89% hop fill, slow -74% and -72% (busy) or -82% and -83% (plain), jitter -82% and -88% (busy), reorder -58%
+  and -70% (busy). Every round favoured /3 in these four profiles. On pure delay busy is a small win on idle load (-7%) and
+  a tie on hop fill; on pure loss busy ties TCP (+1.7% idle load, +0.7% hop fill) and plain is slower (+54%, +67%).
+- **Join is slower on every profile**, +150 to +415 ms (+11% to +24%); the ranges include zero only on loss, slow, jitter
+  and delayloss.
+- **RTT during chunk transfer is the problem.** Plain stays close to TCP except on slow (+185 ms) and delayloss (+88 ms).
+  Busy is worse everywhere: +9 to +20 ms on low-latency profiles, +687 ms on delayloss and +2.1 s (13.5x TCP) on slow.
+  Busy converts chunk speed into queueing on the realtime lane; it is not acceptable as the default on a constrained link.
+- Older seven-profile numbers (n=2, commit c944278a) and the n=3 moving matrix above agree in direction on the large
+  gaps; this n=10 matrix supersedes them for the teleport-hop workload. The moving-walk (continuous sprint) matrix was not
+  re-run.
