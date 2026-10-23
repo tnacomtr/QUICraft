@@ -52,6 +52,55 @@ final class NettyQuicByteStream extends ChannelInboundHandlerAdapter implements 
         this.channel = channel;
         channel.config().setAutoRead(false);
         channel.pipeline().addLast(this);
+        if (PATH_DIAG) {
+            startPathDiag();
+        }
+    }
+
+    /** Diagnostics only ({@code -Dquicraft.v3.pathdiag=true}): 250 ms samples of quiche path state and stream backlog. */
+    private static final boolean PATH_DIAG = Boolean.getBoolean("quicraft.v3.pathdiag");
+    private static final int PATH_DIAG_MAX_LINES = 20_000;
+    private static final java.util.concurrent.atomic.AtomicInteger PATH_DIAG_LINES =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private static final io.netty.util.AttributeKey<Boolean> PATH_DIAG_OWNER =
+            io.netty.util.AttributeKey.valueOf("quicraft.pathdiag.owner");
+    private static final java.util.logging.Logger DIAG_LOG = java.util.logging.Logger.getLogger("QUICraft");
+
+    private void startPathDiag() {
+        try {
+            final boolean owner = channel.parent().attr(PATH_DIAG_OWNER).setIfAbsent(Boolean.TRUE) == null;
+            channel.eventLoop().scheduleAtFixedRate(() -> {
+                try {
+                    if (!channel.isActive() || PATH_DIAG_LINES.get() >= PATH_DIAG_MAX_LINES) {
+                        return;
+                    }
+                    long pending = inFlight.get();
+                    if (pending > 0) {
+                        PATH_DIAG_LINES.incrementAndGet();
+                        DIAG_LOG.info("QUICraft pathdiag stream=" + channel.streamId() + " t="
+                                + System.nanoTime() / 1_000_000 + " inFlight=" + pending
+                                + " writable=" + channel.isWritable());
+                    }
+                    if (owner) {
+                        channel.parent().collectPathStats(0).addListener(f -> {
+                            if (!f.isSuccess() || PATH_DIAG_LINES.incrementAndGet() > PATH_DIAG_MAX_LINES) {
+                                return;
+                            }
+                            io.netty.handler.codec.quic.QuicConnectionPathStats ps =
+                                    (io.netty.handler.codec.quic.QuicConnectionPathStats) f.getNow();
+                            DIAG_LOG.info("QUICraft pathdiag path t=" + System.nanoTime() / 1_000_000
+                                    + " rtt=" + ps.rtt() + " cwnd=" + ps.cwnd() + " delivery=" + ps.deliveryRate()
+                                    + " sent=" + ps.sent() + " lost=" + ps.lost() + " sentBytes=" + ps.sentBytes()
+                                    + " lostBytes=" + ps.lostBytes() + " pmtu=" + ps.pmtu());
+                        });
+                    }
+                } catch (Throwable diagnostic) {
+                    // diagnostics never affect the session
+                }
+            }, 250, 250, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (Throwable diagnostic) {
+            // diagnostics never affect the session
+        }
     }
 
     io.netty.handler.codec.quic.QuicChannel connection() {

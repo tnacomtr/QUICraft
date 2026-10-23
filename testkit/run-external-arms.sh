@@ -300,7 +300,7 @@ project_started=false
 client_log=""
 keep_client_log=false
 server_trace=false
-if [[ " ${QUICRAFT_JAVA_OPTS:-} " == *" -Dquicraft.v3.trace=true "* ]]; then
+if [[ " ${QUICRAFT_JAVA_OPTS:-} " == *" -Dquicraft.v3.trace=true "* || " ${QUICRAFT_JAVA_OPTS:-} " == *" -Dquicraft.v3.pathdiag=true "* ]]; then
     server_trace=true
 fi
 
