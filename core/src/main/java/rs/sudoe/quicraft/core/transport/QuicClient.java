@@ -506,11 +506,12 @@ public final class QuicClient {
      * Early data and session resumption are off on both ends, so the round trip offers and stores no
      * token, session ticket or first flight and writes no shared cache; it takes no join marks and
      * publishes no early-data outcome. The whole body is bounded by one
-     * {@link #WARM_TIMEOUT_MILLIS} deadline from its start: identity generation, the bind, the
-     * dial and the handshake wait each get only the time remaining, and what completes after the
-     * deadline is cleaned up rather than left behind (a late listener is closed; a late identity
-     * is dropped). Once per process, and it never throws: a failure leaves every later dial
-     * exactly as it would have been without the call.
+     * {@link #WARM_TIMEOUT_MILLIS} deadline from its start: identity generation, the listener's
+     * startup and bind, and the dial and handshake wait each get only the time remaining, and
+     * what completes after the deadline is cleaned up rather than left behind (a late listener is
+     * disposed of, TLS context included; a late identity is dropped). Once per process, and it
+     * never throws: a failure leaves every later dial exactly as it would have been without the
+     * call.
      */
     public static void warmUp() {
         if (!WARMED.compareAndSet(false, true)) {
@@ -582,10 +583,11 @@ public final class QuicClient {
      *
      * <p>The body has one deadline ({@link #WARM_TIMEOUT_MILLIS} from its start) and every
      * blocking step waits only for the time remaining: the identity is generated on a daemon
-     * thread and awaited, the bind is submitted without blocking and awaited, and the dial is
-     * awaited. What completes after the deadline is cleaned up rather than left behind: a late
-     * listener is closed as soon as its bind completes, a late identity is dropped (it holds no
-     * resource), and every close is bounded by {@link #WARM_CLOSE_MILLIS}.
+     * thread and awaited, the listener's whole startup (its TLS context included) and bind run on
+     * another and are awaited, and the dial is awaited. What completes after the deadline is
+     * cleaned up rather than left behind: a late listener is disposed of, closing it and releasing
+     * its TLS context, as soon as its startup and bind complete; a late identity is dropped (it
+     * holds no resource); and every close is bounded by {@link #WARM_CLOSE_MILLIS}.
      */
     private static void loopbackRoundTrip() {
         long timeoutMillis = warmTimeoutMillisForTests > 0 ? warmTimeoutMillisForTests : WARM_TIMEOUT_MILLIS;
@@ -622,12 +624,14 @@ public final class QuicClient {
                 if (e instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                 }
-                // The deadline passed (or the bind failed). If the bind still completes
-                // successfully, release that listener where it completes: waiting there would
-                // deadlock on its own event loop, so the release never blocks.
+                // The deadline passed (or the bind failed). Cancelling marks the bind abandoned: a
+                // listener its startup still produces is disposed of where it completes, and one
+                // that completed just as the bound ran out is disposed of here; neither is waited
+                // for, which on the listener's own event loop would deadlock.
+                listener.cancel(false);
                 listener.whenComplete((late, failure) -> {
                     if (late != null) {
-                        late.closeWithoutWaiting();
+                        late.disposeWarm();
                     }
                 });
                 return;

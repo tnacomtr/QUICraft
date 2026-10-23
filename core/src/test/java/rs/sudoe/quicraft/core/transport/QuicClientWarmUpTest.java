@@ -20,7 +20,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import rs.sudoe.quicraft.core.Protocol;
@@ -261,6 +263,53 @@ class QuicClientWarmUpTest {
     }
 
     @Test
+    void aStalledTlsStartupIsBoundedAndItsLateListenerIsDisposed() throws Exception {
+        assumeWarmable();
+        Path fds = Paths.get("/proc/self/fd");
+        assumeTrue(Files.isDirectory(fds), "needs /proc/self/fd");
+        QuicClient.resetWarmUpForTests();
+        Thread.sleep(300); // an earlier test's socket may still be closing
+        Set<String> socketsBefore = openSockets(fds);
+        long roundTripsBefore = QuicClient.warmRoundTripsForTests();
+        long disposalsBefore = QuicServer.warmLateDisposalsForTests();
+        CountDownLatch startupReached = new CountDownLatch(1);
+        AtomicBoolean startupFinished = new AtomicBoolean();
+        QuicServer.warmStartupBlockForTests = () -> {
+            startupReached.countDown();
+            try {
+                Thread.sleep(3000); // the TLS context and bind outlive the warm-up's 2 s deadline
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                startupFinished.set(true);
+            }
+        };
+        try {
+            long start = System.nanoTime();
+            assertDoesNotThrow(QuicClient::warmUp);
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            assertTrue(elapsedMillis < 3000,
+                    "a warm-up whose TLS startup stalled took " + elapsedMillis + " ms");
+            assertTrue(startupReached.await(1, TimeUnit.SECONDS), "the warm TLS startup was never reached");
+            assertEquals(roundTripsBefore, QuicClient.warmRoundTripsForTests(),
+                    "a warm-up whose TLS startup stalled still completed a round trip");
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(6);
+            while (!startupFinished.get() && System.nanoTime() < deadline) {
+                Thread.sleep(25);
+            }
+            assertTrue(startupFinished.get(), "the stalled TLS startup never finished");
+            while (QuicServer.warmLateDisposalsForTests() <= disposalsBefore && System.nanoTime() < deadline) {
+                Thread.sleep(25);
+            }
+            assertTrue(QuicServer.warmLateDisposalsForTests() > disposalsBefore,
+                    "the TLS startup that completed after the deadline was not disposed of");
+        } finally {
+            QuicServer.warmStartupBlockForTests = null;
+        }
+        awaitNoNewSockets(fds, socketsBefore, 6);
+    }
+
+    @Test
     void aLateHandshakeCompletionAfterTheDeadlineLeavesNoSocket() throws Exception {
         assumeWarmable();
         Path fds = Paths.get("/proc/self/fd");
@@ -269,19 +318,29 @@ class QuicClientWarmUpTest {
         Thread.sleep(300); // an earlier test's socket may still be closing
         Set<String> socketsBefore = openSockets(fds);
         long roundTripsBefore = QuicClient.warmRoundTripsForTests();
-        QuicClient.setWarmTimeoutMillisForTests(200);
+        // The hook runs only once the handshake has completed and the dial is about to return; the
+        // latch proves this test reached that stage instead of spending the deadline before the
+        // dial. The 1500 ms deadline leaves identity and the TLS startup ample room, and the hook
+        // then holds the completion well past it.
+        CountDownLatch handshakeReached = new CountDownLatch(1);
+        CountDownLatch releaseHandshake = new CountDownLatch(1);
+        QuicClient.setWarmTimeoutMillisForTests(1500);
         QuicClient.setBeforeConnectCompletionForTests(() -> {
+            handshakeReached.countDown();
             try {
-                Thread.sleep(1000); // the handshake completes well after the deadline
+                releaseHandshake.await(10, TimeUnit.SECONDS); // completes well after the deadline
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         });
         try {
             assertDoesNotThrow(QuicClient::warmUp);
+            assertTrue(handshakeReached.await(2, TimeUnit.SECONDS),
+                    "the warm dial never reached the handshake completion; identity/startup consumed the deadline");
             assertEquals(roundTripsBefore, QuicClient.warmRoundTripsForTests(),
                     "a warm round trip that completed after the deadline was still counted");
         } finally {
+            releaseHandshake.countDown();
             QuicClient.setWarmTimeoutMillisForTests(0);
             QuicClient.setBeforeConnectCompletionForTests(null);
         }
