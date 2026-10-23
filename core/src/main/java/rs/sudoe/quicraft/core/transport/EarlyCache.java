@@ -45,6 +45,11 @@ final class EarlyCache {
         return tokens.containsKey(server);
     }
 
+    /** The tokens held, for tests. */
+    synchronized int tokenCount() {
+        return tokens.size();
+    }
+
     synchronized byte[] flight(List<Object> server, String joinInputs) {
         byte[] f = flights.get(key(server, joinInputs));
         return f == null ? null : f.clone();

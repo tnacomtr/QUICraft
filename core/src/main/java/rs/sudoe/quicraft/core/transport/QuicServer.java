@@ -4,6 +4,7 @@ package rs.sudoe.quicraft.core.transport;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
@@ -105,6 +106,9 @@ public final class QuicServer implements Closeable {
     private final List<Channel> channels;
     /** Everything node-wide, one set per listener, shared by every socket's codec. */
     private final Shared shared;
+    /** Whether this listener was disposed of unopened, so a late completion only ever does it once. */
+    private final java.util.concurrent.atomic.AtomicBoolean warmDisposed =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     private QuicServer(EventLoopGroup group, List<Channel> channels, Shared shared) {
         this.group = group;
@@ -214,6 +218,15 @@ public final class QuicServer implements Closeable {
         return shared.unconfirmed.abandoned.get();
     }
 
+    /** Server-side {@link JoinDiag} instances created so far, for tests: a warm listener creates none. */
+    private static final java.util.concurrent.atomic.AtomicLong SERVER_JOIN_DIAGS =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** {@link #SERVER_JOIN_DIAGS}, for tests. */
+    static long serverJoinDiagsForTests() {
+        return SERVER_JOIN_DIAGS.get();
+    }
+
     /** Binds {@code address} and runs QUIC on core's own thread, one UDP socket. */
     public static QuicServer bind(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
             StreamAcceptor acceptor) throws Exception {
@@ -259,6 +272,133 @@ public final class QuicServer implements Closeable {
     /** As the {@code socketCount} bind above, for a {@code /3} listener (13.1) or a {@code /2} one. */
     public static QuicServer bind(InetSocketAddress address, int socketCount, ServerIdentity identity,
             TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested) throws Exception {
+        return bind(address, socketCount, identity, config, acceptor, v3Requested, false);
+    }
+
+    /**
+     * Tests only: delays the warm bind's completion by this many milliseconds, so a test can make
+     * the bind complete after the warm-up's deadline; 0 is off. It runs inside the warm listener's
+     * channel initializer and never on the production bind path.
+     */
+    static volatile long warmBindDelayMillisForTests;
+
+    /**
+     * Tests only: runs on the warm bind's startup thread, before the TLS context is built, and may
+     * block, so a test can stall that startup past the warm-up's deadline; null is off. It never
+     * runs on the production bind path.
+     */
+    static volatile Runnable warmStartupBlockForTests;
+
+    /** Warm listeners disposed of because they completed after their caller gave up, for tests. */
+    private static final java.util.concurrent.atomic.AtomicLong WARM_LATE_DISPOSALS =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** {@link #WARM_LATE_DISPOSALS}, for tests. */
+    static long warmLateDisposalsForTests() {
+        return WARM_LATE_DISPOSALS.get();
+    }
+
+    /**
+     * The warm-up's throwaway listener, started without blocking: as {@link #bind(InetSocketAddress,
+     * ServerIdentity, TransportConfig, StreamAcceptor, V3Listener)} on one socket, marked warm so
+     * it creates no {@link JoinDiag}, but the whole startup, including the TLS context
+     * {@link Shared} builds, runs on a daemon thread and the future completes when the socket is
+     * bound, so the caller can bound its wait with its own deadline. The production bind path is
+     * unchanged. A caller that gives up cancels the future, which marks the bind abandoned; a
+     * listener it still produces is then disposed of where it completes ({@link #disposeWarm()}),
+     * never waited for by the caller. The warm path only.
+     */
+    static CompletableFuture<QuicServer> bindWarmAsync(InetSocketAddress address, ServerIdentity identity,
+            TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested) {
+        CompletableFuture<QuicServer> ready = new CompletableFuture<QuicServer>();
+        startWarmDaemon("quicraft-warmup-listener",
+                () -> startWarmListener(ready, address, identity, config, acceptor, v3Requested));
+        return ready;
+    }
+
+    /**
+     * Runs one warm-up step on a daemon thread, like the identity step, so a stalled step can
+     * never hold the process or the warm-up's deadline.
+     */
+    private static void startWarmDaemon(String name, Runnable task) {
+        Thread thread = new Thread(task, name);
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    /**
+     * The warm bind's startup, on its daemon thread: the part of the bind that costs time (the
+     * TLS context) as well as the bind itself, so a stalled TLS initialisation can never bypass the
+     * warm-up's deadline. {@code ready} is the only way out; a listener this produces after the
+     * caller cancelled the future is disposed of here, on this thread.
+     */
+    private static void startWarmListener(CompletableFuture<QuicServer> ready, InetSocketAddress address,
+            ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested) {
+        Shared shared = null;
+        EventLoopGroup group = null;
+        try {
+            Runnable block = warmStartupBlockForTests;
+            if (block != null) {
+                block.run();
+            }
+            V3Listener v3 = enableV3(v3Requested);
+            TransportConfig startupConfig = v3 != null ? config.withMultistream() : config;
+            shared = new Shared(1, identity, startupConfig, acceptor, v3, true);
+            group = Codecs.newGroup("quicraft-server", 1);
+            final Shared startedShared = shared;
+            final EventLoopGroup startedGroup = group;
+            ChannelFuture bound = new Bootstrap().group(group).channel(NioDatagramChannel.class)
+                    .handler(new ChannelInitializer<Channel>() {
+                        @Override
+                        protected void initChannel(Channel ch) throws Exception {
+                            long delay = warmBindDelayMillisForTests;
+                            if (delay > 0) {
+                                try {
+                                    Thread.sleep(delay);
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                }
+                            }
+                            ch.pipeline().addLast(IngressGuard.forConfig(startedShared.ingress),
+                                    codec(startedShared, Codecs.LOCAL_CONNECTION_ID_LENGTH, null, 0));
+                        }
+                    })
+                    .bind(address);
+            bound.addListener(f -> {
+                if (f.isSuccess()) {
+                    List<Channel> single = new ArrayList<>(1);
+                    single.add(bound.channel());
+                    QuicServer server = new QuicServer(startedGroup, single, startedShared);
+                    if (!ready.complete(server)) {
+                        // The caller gave up while this startup ran: release what it never receives.
+                        server.disposeWarm();
+                    }
+                } else {
+                    startedGroup.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS)
+                            .addListener(ignored -> startedShared.releaseSsl());
+                    ready.completeExceptionally(f.cause());
+                }
+            });
+        } catch (Throwable t) {
+            Shared failedShared = shared;
+            EventLoopGroup failedGroup = group;
+            if (failedGroup != null) {
+                failedGroup.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS)
+                        .addListener(ignored -> {
+                            if (failedShared != null) {
+                                failedShared.releaseSsl();
+                            }
+                        });
+            } else if (failedShared != null) {
+                failedShared.releaseSsl();
+            }
+            ready.completeExceptionally(t);
+        }
+    }
+
+    /** As above, with {@code warm} marking a warm-up listener (see {@link Shared#warm}). */
+    private static QuicServer bind(InetSocketAddress address, int socketCount, ServerIdentity identity,
+            TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested, boolean warm) throws Exception {
         V3Listener v3 = enableV3(v3Requested);
         if (v3 != null) {
             config = config.withMultistream();
@@ -277,7 +417,7 @@ public final class QuicServer implements Closeable {
             count = 1;
         }
         if (count <= 1) {
-            Shared shared = new Shared(1, identity, config, acceptor, v3);
+            Shared shared = new Shared(1, identity, config, acceptor, v3, warm);
             EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
             try {
                 Channel channel = new Bootstrap().group(group).channel(NioDatagramChannel.class)
@@ -300,9 +440,9 @@ public final class QuicServer implements Closeable {
         ChannelOption<Boolean> reusePort = ReusePort.OPTION;
         if (reusePort == null || !ReusePort.SUPPORTED) {
             LOG.info("SO_REUSEPORT is unavailable here; binding one UDP socket instead of " + count);
-            return bind(address, identity, config, acceptor, v3);
+            return bind(address, 1, identity, config, acceptor, v3, warm);
         }
-        Shared shared = new Shared(count, identity, config, acceptor, v3);
+        Shared shared = new Shared(count, identity, config, acceptor, v3, warm);
         SocketDispatcher dispatcher = new SocketDispatcher(shared, count);
         EventLoopGroup group = Codecs.newGroup("quicraft-server", count);
         List<Channel> channels = new ArrayList<>(count);
@@ -374,7 +514,7 @@ public final class QuicServer implements Closeable {
             throw new IllegalArgumentException("one loop per socket and at least one socket are required, got "
                     + loops.size() + " loops and " + sockets.size() + " sockets");
         }
-        Shared shared = new Shared(sockets.size(), identity, config, acceptor, v3);
+        Shared shared = new Shared(sockets.size(), identity, config, acceptor, v3, false);
         SocketDispatcher dispatcher = sockets.size() > 1 ? new SocketDispatcher(shared, sockets.size()) : null;
         List<Channel> channels = new ArrayList<>(sockets.size());
         boolean inLoop = false;
@@ -520,8 +660,29 @@ public final class QuicServer implements Closeable {
          * (docs/protocol.md §11).
          */
         final AtomicIntegerArray droppedMalformed;
+        /**
+         * A warm-up listener ({@link #bindWarmAsync}): none of its connections is a join, so it creates
+         * no {@link JoinDiag} and leaves the global diagnostics of real joins untouched.
+         */
+        final boolean warm;
+        /** The native TLS context was released; disposing a warm listener only ever does it once. */
+        private final java.util.concurrent.atomic.AtomicBoolean sslReleased =
+                new java.util.concurrent.atomic.AtomicBoolean();
 
-        Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor, V3Listener v3)
+        /** Releases the native TLS context once, after the codecs that use it are down. */
+        void releaseSsl() {
+            if (sslReleased.compareAndSet(false, true)) {
+                try {
+                    // QuicheQuicSslContext is reference counted; the SslContext type does not say so.
+                    ReferenceCountUtil.release(ssl);
+                } catch (Throwable ignored) {
+                    // the native context goes with the process if this ever fails
+                }
+            }
+        }
+
+        Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor, V3Listener v3,
+                boolean warm)
                 throws Exception {
             this.config = config;
             this.nodeBudget = config.nodeBudget != null ? config.nodeBudget
@@ -533,6 +694,7 @@ public final class QuicServer implements Closeable {
             this.sessionResources = v3 != null ? SessionResources.production(config.resourcePools) : null;
             this.acceptor = acceptor;
             this.v3 = v3;
+            this.warm = warm;
             this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.droppedForwards = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.droppedMalformed = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
@@ -947,9 +1109,10 @@ public final class QuicServer implements Closeable {
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
-                        if (shared.v3 != null) {
+                        if (shared.v3 != null && !shared.warm) {
                             // One marks instance per /3 connection: attached before anything of the
                             // connection runs, so the game's side finds it once it has the channel.
+                            SERVER_JOIN_DIAGS.incrementAndGet();
                             JoinDiag diag = JoinDiag.create(JoinDiag.Side.SERVER);
                             JoinDiag.attach(connection, diag);
                             JoinDiag.mark(diag, "connection accepted");
@@ -1415,6 +1578,48 @@ public final class QuicServer implements Closeable {
                 channel.close().awaitUninterruptibly(2, java.util.concurrent.TimeUnit.SECONDS);
             }
         }
+    }
+
+    /**
+     * As {@link #close()}, but every wait is bounded by {@code timeoutMillis} (each channel, and
+     * the group): the warm-up's throwaway listener must never block it. The warm path only.
+     */
+    void close(long timeoutMillis) {
+        long timeout = Math.max(0, timeoutMillis);
+        if (group != null) {
+            for (Channel channel : channels) {
+                channel.close().awaitUninterruptibly(timeout, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
+            group.shutdownGracefully(0, timeout, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .awaitUninterruptibly(timeout, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } else {
+            for (Channel channel : channels) {
+                channel.close().awaitUninterruptibly(timeout, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
+        }
+    }
+
+    /**
+     * Disposes of a warm listener and everything it built: it closes the sockets without waiting
+     * (it runs on the listener's own event loop where waiting would deadlock, and a caller that has
+     * already timed out must not block on it) and releases the native TLS context once the group is
+     * down. Exactly once, so a late completion and a late caller cannot both clean it up. The warm
+     * path only.
+     */
+    void disposeWarm() {
+        if (!warmDisposed.compareAndSet(false, true)) {
+            return;
+        }
+        for (Channel channel : channels) {
+            channel.close();
+        }
+        if (group != null) {
+            group.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .addListener(ignored -> shared.releaseSsl());
+        } else {
+            shared.releaseSsl();
+        }
+        WARM_LATE_DISPOSALS.incrementAndGet();
     }
 
     /**

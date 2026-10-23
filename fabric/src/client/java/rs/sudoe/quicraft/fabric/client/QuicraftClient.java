@@ -9,6 +9,7 @@ import org.jspecify.annotations.Nullable;
 import rs.sudoe.quicraft.core.QuicSupport;
 import rs.sudoe.quicraft.core.connect.ClientConnector;
 import rs.sudoe.quicraft.core.connect.ConnectDecision.Mode;
+import rs.sudoe.quicraft.core.transport.QuicClient;
 import rs.sudoe.quicraft.core.connect.FailureCache;
 import rs.sudoe.quicraft.core.discovery.AdvertisementCache;
 import rs.sudoe.quicraft.fabric.Hooks;
@@ -48,6 +49,25 @@ public final class QuicraftClient implements ClientModInitializer {
             failures = FailureCache.load(configDir.resolve("quic-failures.properties"));
             connector = new ClientConnector(advertisements, failures);
             instance = this;
+            if (mode != Mode.TCP_ONLY) {
+                try {
+                    // -Dquicraft.warmup=false switches it off. One-time QUIC initialisation (natives, event loop,
+                    // TLS stack) off the first join.
+                    if (!"false".equals(System.getProperty("quicraft.warmup"))) {
+                        Thread warm = new Thread(() -> {
+                            try {
+                                QuicClient.warmUp();
+                            } catch (Throwable ignored) {
+                                // warming only
+                            }
+                        }, "quicraft-warmup");
+                        warm.setDaemon(true);
+                        warm.start();
+                    }
+                } catch (Throwable ignored) {
+                    // a property or launch failure only means no warm-up; it never reaches the initializer
+                }
+            }
             if (multistream) {
                 multistreamConnector(); // opens the pin files and runs the startup expiry (12.15)
             }
