@@ -1641,7 +1641,8 @@ What the numbers say:
   and delayloss.
 - **RTT during chunk transfer is the problem.** Plain stays close to TCP except on slow (+185 ms) and delayloss (+88 ms).
   Busy is worse everywhere: +9 to +20 ms on low-latency profiles, +687 ms on delayloss and +2.1 s (13.5x TCP) on slow.
-  Busy converts chunk speed into queueing on the realtime lane; it is not acceptable as the default on a constrained link.
+  RTT inflates under busy; the mechanism (network queue filled by faster sending, or queueing inside the /3 stack) is under
+  investigation and not yet measured. Busy is not acceptable as the default on a constrained link until it is fixed.
 - Older seven-profile numbers (n=2, commit c944278a) and the n=3 moving matrix above agree in direction on the large
   gaps; this n=10 matrix supersedes them for the teleport-hop workload. The moving-walk (continuous sprint) matrix was not
   re-run.

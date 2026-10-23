@@ -43,3 +43,12 @@ carries the 0-RTT delivery fix. main and feat/phase4-alpha are on 0.1.0-alpha.3-
 - Both hosts sit at Realtox Media behind RCS Technologies (AS203446). Routes entering through RCS drop UDP 25565
   (also 19132, 27015); 25564, 25566 and 443 pass. Routes entering through LWLcom pass. The client falls back to TCP
   as designed. Not a QUICraft bug; the owner may raise it with Realtox.
+
+## /3 default blocker: busy RTT on constrained links (2026-10-23)
+- n=10 hop matrix (docs/benchmarks.md, a180eb82): busy RTT during chunk transfer is +687 ms on delayloss and +2.1 s
+  (13.5x TCP) on slow; plain is +185 ms on slow. Chunk delivery is 58-89% faster than TCP on delayloss/slow/jitter/reorder.
+- Mechanism not yet measured. Plan (advisor): sample quiche srtt/min_rtt/cwnd/in-flight and unsent chunk bytes server-side
+  on one busy slow run; srtt ~ play RTT means network bufferbloat (delay-based chunk backpressure), srtt ~ base but play
+  RTT high means in-stack queueing (bound unsent CHUNK bytes to ~1-2 cwnd, REALTIME urgency). Gate: busy RTT <= TCP+25% on
+  slow/delayloss with >=60% of the chunk win, n=5, then clean n=10 no regression. Kill: two fixes without a pass -> adaptive
+  guard. Blocks making /3 default, not current work. Join +150..415 ms is a separate round-trip-count track.
