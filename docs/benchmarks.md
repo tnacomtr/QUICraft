@@ -1578,3 +1578,21 @@ what makes chunk loading fast, gives that tail back. Idle RTT median is a loss f
 Honest summary: /3 busy is about 6-10% slower than TCP on a clean loopback link for join, idle chunk load and hop fill;
 its play RTT has a long tail while chunks arrive. Plain /3 is far behind on chunk load (the busy timer is needed and is
 the default). No claim of a clean-link win is made.
+
+**Paired intervals for the n=10 baseline (`hop-feat-warm-10`, 95% bootstrap CI of the paired median, busy against TCP)**
+
+| Metric | Paired median | 95% CI |
+| --- | --- | --- |
+| join (ms) | +121 | -19..+230 (not significant) |
+| idle chunk load (ms) | +385 | +92..+477 |
+| hop fill median (ms) | +30 | -1..+59 (borderline) |
+| RTT median (ms) | +7.3 | +3.4..+12.0 |
+| RTT p95 during hops (ms) | +31 | -4..+60 (not significant) |
+| RTT p95 during hops, /3 plain (ms) | -21.9 | -43..-10 (/3 better) |
+
+**Submit-drain fusion experiments (server owner loop, `-Dquicraft.v3.fuseDrain`, default off, n=5)**
+
+Fusing every submit made chunk fill and load worse (hop fill busy 405 ms, plain 750 ms; idle chunk load plain 8.8 s) and
+looked like it fixed the busy RTT tail (p95 22 ms), but that came with slower chunk delivery. Fusing REALTIME packets only
+(`hop-rtfuse-on`) did not move the tail (busy RTT median 7.5 ms, p95 29.5 ms against TCP 22.0 ms; hop fill 352 ms, idle
+chunk load +10%). Both variants are rejected; the apparent RTT gain of the first is a throughput effect.
