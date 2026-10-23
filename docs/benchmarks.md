@@ -1454,7 +1454,7 @@ before the wake was +480 ms in the matrix above). Per phase, /3 costs about +85 
 +115 ms from login to the first configuration packet; configuration to play is about equal. The vanilla spawn
 preparation task (about 330-400 ms between the tags build and Finish Configuration) is paid by TCP too.
 
-### QUIC client warm-up (branch `agent/p5-warmup`, not merged)
+### QUIC client warm-up v1 (branch `agent/p5-warmup`, superseded by warm-up v2, which is merged: see the 2026-10-23 clean-link section)
 
 A daemon thread at client start builds a throwaway TLS context and engine so the natives, event loop and TLS stack
 are initialised before the first connect (`-Dquicraft.warmup=false` disables it). Clean link, n=5 per arm, interleaved
