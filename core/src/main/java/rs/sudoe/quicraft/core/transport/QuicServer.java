@@ -214,6 +214,15 @@ public final class QuicServer implements Closeable {
         return shared.unconfirmed.abandoned.get();
     }
 
+    /** Server-side {@link JoinDiag} instances created so far, for tests: a warm listener creates none. */
+    private static final java.util.concurrent.atomic.AtomicLong SERVER_JOIN_DIAGS =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    /** {@link #SERVER_JOIN_DIAGS}, for tests. */
+    static long serverJoinDiagsForTests() {
+        return SERVER_JOIN_DIAGS.get();
+    }
+
     /** Binds {@code address} and runs QUIC on core's own thread, one UDP socket. */
     public static QuicServer bind(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
             StreamAcceptor acceptor) throws Exception {
@@ -259,6 +268,22 @@ public final class QuicServer implements Closeable {
     /** As the {@code socketCount} bind above, for a {@code /3} listener (13.1) or a {@code /2} one. */
     public static QuicServer bind(InetSocketAddress address, int socketCount, ServerIdentity identity,
             TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested) throws Exception {
+        return bind(address, socketCount, identity, config, acceptor, v3Requested, false);
+    }
+
+    /**
+     * The warm-up's throwaway listener: as {@link #bind(InetSocketAddress, ServerIdentity,
+     * TransportConfig, StreamAcceptor, V3Listener)} on one socket, marked warm so it creates no
+     * {@link JoinDiag}: its connections are not joins. Used only by {@link QuicClient#warmUp()}.
+     */
+    static QuicServer bindWarm(InetSocketAddress address, ServerIdentity identity, TransportConfig config,
+            StreamAcceptor acceptor, V3Listener v3) throws Exception {
+        return bind(address, 1, identity, config, acceptor, v3, true);
+    }
+
+    /** As above, with {@code warm} marking a warm-up listener (see {@link Shared#warm}). */
+    private static QuicServer bind(InetSocketAddress address, int socketCount, ServerIdentity identity,
+            TransportConfig config, StreamAcceptor acceptor, V3Listener v3Requested, boolean warm) throws Exception {
         V3Listener v3 = enableV3(v3Requested);
         if (v3 != null) {
             config = config.withMultistream();
@@ -277,7 +302,7 @@ public final class QuicServer implements Closeable {
             count = 1;
         }
         if (count <= 1) {
-            Shared shared = new Shared(1, identity, config, acceptor, v3);
+            Shared shared = new Shared(1, identity, config, acceptor, v3, warm);
             EventLoopGroup group = Codecs.newGroup("quicraft-server", 1);
             try {
                 Channel channel = new Bootstrap().group(group).channel(NioDatagramChannel.class)
@@ -300,9 +325,9 @@ public final class QuicServer implements Closeable {
         ChannelOption<Boolean> reusePort = ReusePort.OPTION;
         if (reusePort == null || !ReusePort.SUPPORTED) {
             LOG.info("SO_REUSEPORT is unavailable here; binding one UDP socket instead of " + count);
-            return bind(address, identity, config, acceptor, v3);
+            return bind(address, 1, identity, config, acceptor, v3, warm);
         }
-        Shared shared = new Shared(count, identity, config, acceptor, v3);
+        Shared shared = new Shared(count, identity, config, acceptor, v3, warm);
         SocketDispatcher dispatcher = new SocketDispatcher(shared, count);
         EventLoopGroup group = Codecs.newGroup("quicraft-server", count);
         List<Channel> channels = new ArrayList<>(count);
@@ -374,7 +399,7 @@ public final class QuicServer implements Closeable {
             throw new IllegalArgumentException("one loop per socket and at least one socket are required, got "
                     + loops.size() + " loops and " + sockets.size() + " sockets");
         }
-        Shared shared = new Shared(sockets.size(), identity, config, acceptor, v3);
+        Shared shared = new Shared(sockets.size(), identity, config, acceptor, v3, false);
         SocketDispatcher dispatcher = sockets.size() > 1 ? new SocketDispatcher(shared, sockets.size()) : null;
         List<Channel> channels = new ArrayList<>(sockets.size());
         boolean inLoop = false;
@@ -520,8 +545,14 @@ public final class QuicServer implements Closeable {
          * (docs/protocol.md §11).
          */
         final AtomicIntegerArray droppedMalformed;
+        /**
+         * A warm-up listener ({@link #bindWarm}): none of its connections is a join, so it creates
+         * no {@link JoinDiag} and leaves the global diagnostics of real joins untouched.
+         */
+        final boolean warm;
 
-        Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor, V3Listener v3)
+        Shared(int sockets, ServerIdentity identity, TransportConfig config, StreamAcceptor acceptor, V3Listener v3,
+                boolean warm)
                 throws Exception {
             this.config = config;
             this.nodeBudget = config.nodeBudget != null ? config.nodeBudget
@@ -533,6 +564,7 @@ public final class QuicServer implements Closeable {
             this.sessionResources = v3 != null ? SessionResources.production(config.resourcePools) : null;
             this.acceptor = acceptor;
             this.v3 = v3;
+            this.warm = warm;
             this.accepted = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.droppedForwards = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
             this.droppedMalformed = sockets > 1 ? new AtomicIntegerArray(sockets) : null;
@@ -947,9 +979,10 @@ public final class QuicServer implements Closeable {
                 .handler(new ChannelInitializer<QuicChannel>() {
                     @Override
                     protected void initChannel(QuicChannel connection) {
-                        if (shared.v3 != null) {
+                        if (shared.v3 != null && !shared.warm) {
                             // One marks instance per /3 connection: attached before anything of the
                             // connection runs, so the game's side finds it once it has the channel.
+                            SERVER_JOIN_DIAGS.incrementAndGet();
                             JoinDiag diag = JoinDiag.create(JoinDiag.Side.SERVER);
                             JoinDiag.attach(connection, diag);
                             JoinDiag.mark(diag, "connection accepted");
@@ -1413,6 +1446,25 @@ public final class QuicServer implements Closeable {
             // Hosted: the loop is the platform's. Bounded wait, in case it is already gone.
             for (Channel channel : channels) {
                 channel.close().awaitUninterruptibly(2, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    /**
+     * As {@link #close()}, but every wait is bounded by {@code timeoutMillis} (each channel, and
+     * the group): the warm-up's throwaway listener must never block it. The warm path only.
+     */
+    void close(long timeoutMillis) {
+        long timeout = Math.max(0, timeoutMillis);
+        if (group != null) {
+            for (Channel channel : channels) {
+                channel.close().awaitUninterruptibly(timeout, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
+            group.shutdownGracefully(0, timeout, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .awaitUninterruptibly(timeout, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } else {
+            for (Channel channel : channels) {
+                channel.close().awaitUninterruptibly(timeout, java.util.concurrent.TimeUnit.MILLISECONDS);
             }
         }
     }

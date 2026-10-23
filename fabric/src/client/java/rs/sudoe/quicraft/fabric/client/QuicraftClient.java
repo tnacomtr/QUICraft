@@ -49,20 +49,23 @@ public final class QuicraftClient implements ClientModInitializer {
             failures = FailureCache.load(configDir.resolve("quic-failures.properties"));
             connector = new ClientConnector(advertisements, failures);
             instance = this;
-            if (mode != Mode.TCP_ONLY && !"false".equals(System.getProperty("quicraft.warmup"))) {
-                // -Dquicraft.warmup=false switches it off. One-time QUIC initialisation (natives, event loop, TLS stack) off the first join.
+            if (mode != Mode.TCP_ONLY) {
                 try {
-                    Thread warm = new Thread(() -> {
-                        try {
-                            QuicClient.warmUp();
-                        } catch (Throwable ignored) {
-                            // warming only
-                        }
-                    }, "quicraft-warmup");
-                    warm.setDaemon(true);
-                    warm.start();
+                    // -Dquicraft.warmup=false switches it off. One-time QUIC initialisation (natives, event loop,
+                    // TLS stack) off the first join.
+                    if (!"false".equals(System.getProperty("quicraft.warmup"))) {
+                        Thread warm = new Thread(() -> {
+                            try {
+                                QuicClient.warmUp();
+                            } catch (Throwable ignored) {
+                                // warming only
+                            }
+                        }, "quicraft-warmup");
+                        warm.setDaemon(true);
+                        warm.start();
+                    }
                 } catch (Throwable ignored) {
-                    // a launch failure only means no warm-up; it never reaches the initializer
+                    // a property or launch failure only means no warm-up; it never reaches the initializer
                 }
             }
             if (multistream) {

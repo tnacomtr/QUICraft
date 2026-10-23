@@ -230,7 +230,7 @@ public final class QuicClient {
         TransportConfig effective = config.withMultistream();
         return connectV3(codec -> new Bootstrap().group(group()).channel(NioDatagramChannel.class)
                 .handler(JoinDatagramProbe.wrap(codec, diag)).bind(0),
-                remote, fingerprint, table, effective, early, bypassResumption, diag);
+                remote, fingerprint, table, effective, early, bypassResumption, diag, false);
     }
 
     /**
@@ -285,7 +285,7 @@ public final class QuicClient {
                     }
                     throw setupFailure;
                 }
-            }, remote, fingerprint, table, config.withMultistream(), early, bypassResumption, diag);
+            }, remote, fingerprint, table, config.withMultistream(), early, bypassResumption, diag, false);
             // The hosted socket becomes channel-owned on registration, but a failed/cancelled
             // attempt may fail before the channel factory ever takes ownership of it.
             result.whenComplete((connection, error) -> {
@@ -358,7 +358,7 @@ public final class QuicClient {
 
     private static CompletableFuture<V3Connection> connectV3(UdpFactory udpFactory, InetSocketAddress remote,
             Fingerprint fingerprint, RoutingTable table, TransportConfig config, EarlyFlight early,
-            boolean bypassResumption, JoinDiag diag) {
+            boolean bypassResumption, JoinDiag diag, boolean warm) {
         CompletableFuture<V3Connection> result = new CompletableFuture<V3Connection>();
         try {
             // bypassResumption: a context cached nowhere, so the stored tickets stay untouched and
@@ -387,7 +387,7 @@ public final class QuicClient {
                 JoinDiag.mark(diag, "UDP socket open");
                 V3Attempt attempt = new V3Attempt(opened.channel(), remote,
                         EarlyCache.server(remote, fingerprint, Protocol.ALPN_V3),
-                        config.earlyData && config.sessionResumption ? early : null, result, dial, diag);
+                        config.earlyData && config.sessionResumption ? early : null, result, dial, diag, warm);
                 attempt.start();
             });
         } catch (Throwable t) {
@@ -493,14 +493,19 @@ public final class QuicClient {
 
     private static final java.util.concurrent.atomic.AtomicBoolean WARMED =
             new java.util.concurrent.atomic.AtomicBoolean();
+    /** Warm-up round trips that returned a connection, for tests. */
+    private static final java.util.concurrent.atomic.AtomicLong WARM_ROUND_TRIPS =
+            new java.util.concurrent.atomic.AtomicLong();
 
     /**
-     * Warms the parts of a first QUIC dial that cost time but carry no state: the native library,
-     * the client event loop and the TLS stack (a throwaway context and engine, built for a made-up
-     * fingerprint and never cached). It opens no socket, starts no handshake, writes no pin and
-     * offers or stores no session ticket, so it cannot change what a later dial does; it only moves
-     * the one-time initialisation off the join. Once per process, never throws, and a failure
-     * leaves every later dial exactly as it would have been without the call.
+     * Warms the parts of a first QUIC dial that cost time but carry no join state: the native
+     * library, the client event loop and the TLS stack, by running one loopback round trip on
+     * 127.0.0.1 (ephemeral port, in-memory certificate, the production listener and dial, {@code /3}).
+     * Early data and session resumption are off on both ends, so the round trip offers and stores no
+     * token, session ticket or first flight and writes no shared cache; it takes no join marks and
+     * publishes no early-data outcome. The whole body is bounded by {@link #WARM_TIMEOUT_MILLIS},
+     * once per process, and it never throws: a failure leaves every later dial exactly as it would
+     * have been without the call.
      */
     public static void warmUp() {
         if (!WARMED.compareAndSet(false, true)) {
@@ -511,18 +516,6 @@ public final class QuicClient {
                 return;
             }
             group();
-            Tls tls = new Tls(Fingerprint.of(new byte[] {0}), false, Protocol.ALPN_V3);
-            io.netty.handler.codec.quic.QuicSslEngine engine = tls.context.newEngine(
-                    io.netty.buffer.ByteBufAllocator.DEFAULT, "warmup.invalid", 1);
-            try {
-                engine.getSession();
-            } finally {
-                io.netty.util.ReferenceCountUtil.release(engine);
-            }
-        } catch (Throwable ignored) {
-            // warming only: the first real dial pays the cost it would have paid anyway
-        }
-        try {
             loopbackRoundTrip();
         } catch (Throwable ignored) {
             // warming only: a failed round trip leaves every later dial as it would have been
@@ -531,17 +524,60 @@ public final class QuicClient {
 
     /** The protocol whose shipped routing table the warm-up's loopback server and dial use. */
     private static final int WARM_PROTOCOL = 775;
-    /** The hard bound on the warm-up's loopback handshake. */
+    /** The bound on the warm-up's body, from its start: identity generation, bind, dial and handshake wait. */
     private static final long WARM_TIMEOUT_MILLIS = 2000;
+    /** The bound on each close in the warm-up's cleanup: the client's socket and the listener. */
+    private static final long WARM_CLOSE_MILLIS = 500;
+    /** Tests only: overrides {@link #WARM_TIMEOUT_MILLIS}; 0 uses the shipped bound. */
+    static volatile long warmTimeoutMillisForTests;
+    /** Tests only: a dial target that never answers, so the warm handshake cannot complete. */
+    static volatile InetSocketAddress warmTargetForTests;
+
+    /**
+     * The warm-up's transport config: early data and session resumption off on both ends, so no
+     * early token is issued or stored, no session ticket is read or kept and no 0-RTT flight is
+     * offered. Every other value is the production default.
+     */
+    private static TransportConfig warmConfig() {
+        return TransportConfig.builder().earlyData(false).sessionResumption(false).build();
+    }
+
+    /** The warm-up's config, for tests: the round trip's isolation from early data and resumption. */
+    static TransportConfig warmConfigForTests() {
+        return warmConfig();
+    }
+
+    /** Warm-up round trips that returned a connection, for tests. */
+    static long warmRoundTripsForTests() {
+        return WARM_ROUND_TRIPS.get();
+    }
+
+    /**
+     * Tests only: a bound for the warm-up body, e.g. 1 ms to prove that a round trip which cannot
+     * finish nevertheless returns at once; 0 restores {@link #WARM_TIMEOUT_MILLIS}.
+     */
+    static void setWarmTimeoutMillisForTests(long millis) {
+        warmTimeoutMillisForTests = Math.max(0, millis);
+    }
+
+    /** The milliseconds left until {@code deadlineNanos}, at least 1 so a wait still gets a turn. */
+    private static long remainingMillis(long deadlineNanos) {
+        long left = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+        return Math.max(1, left);
+    }
 
     /**
      * One in-process /3 round trip against a throwaway listener on 127.0.0.1 (ephemeral port) with
      * an in-memory certificate: the same listener and dial as production, so the UDP socket, the
      * QUIC and TLS handshake and the /3 preamble run once before the first real join. Nothing is
-     * stored: the dial's TLS context is uncached (bypassResumption), it runs without 0-RTT and
-     * without join marks, and its 0-RTT state is forgotten at the end. Every resource is released.
+     * kept: both ends run with early data and resumption off, the dial's TLS context is uncached
+     * (bypassResumption), it takes no join marks and the listener creates none. The body shares one
+     * deadline ({@link #WARM_TIMEOUT_MILLIS} from its start) and every close is bounded by
+     * {@link #WARM_CLOSE_MILLIS}.
      */
     private static void loopbackRoundTrip() {
+        long timeoutMillis = warmTimeoutMillisForTests > 0 ? warmTimeoutMillisForTests : WARM_TIMEOUT_MILLIS;
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         if (!QuicSupport.hasMaxFlowControlWindows() || !QuicSupport.hasKeyingMaterialExport()) {
             return;
         }
@@ -552,16 +588,19 @@ public final class QuicClient {
         QuicServer server = null;
         CompletableFuture<V3Connection> dial = null;
         V3Connection connection = null;
-        InetSocketAddress target = null;
-        Fingerprint fingerprint = null;
+        AtomicReference<Channel> socket = new AtomicReference<Channel>();
         try {
             ServerIdentity identity = ServerIdentity.generate();
-            fingerprint = identity.fingerprint();
-            server = QuicServer.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), identity,
-                    TransportConfig.DEFAULT, stream -> { }, protocol -> table);
-            target = server.localAddress();
-            dial = warmDial(target, fingerprint, table);
-            connection = dial.get(WARM_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            if (deadline - System.nanoTime() <= 0) {
+                return; // the one deadline also covers identity generation and the bind
+            }
+            Fingerprint fingerprint = identity.fingerprint();
+            server = QuicServer.bindWarm(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), identity,
+                    warmConfig(), stream -> { }, protocol -> table);
+            InetSocketAddress target = warmTargetForTests;
+            dial = warmDial(target != null ? target : server.localAddress(), fingerprint, table, socket);
+            connection = dial.get(remainingMillis(deadline), TimeUnit.MILLISECONDS);
+            WARM_ROUND_TRIPS.incrementAndGet();
         } catch (Throwable ignored) {
             // warming only
         } finally {
@@ -576,12 +615,21 @@ public final class QuicClient {
                     // the connection is released on its own event loop
                 }
             }
-            if (target != null) {
-                EarlyCache.INSTANCE.forget(EarlyCache.server(target, fingerprint, Protocol.ALPN_V3));
+            Channel udp = socket.get();
+            if (udp != null) {
+                try {
+                    // Bounded: the throwaway socket must never hold the warm-up. A socket that did
+                    // not close on its own is closed without a further wait.
+                    if (!udp.closeFuture().awaitUninterruptibly(WARM_CLOSE_MILLIS, TimeUnit.MILLISECONDS)) {
+                        udp.close();
+                    }
+                } catch (Throwable ignored) {
+                    // the socket is closed by its own event loop
+                }
             }
             if (server != null) {
                 try {
-                    server.close();
+                    server.close(WARM_CLOSE_MILLIS);
                 } catch (Throwable ignored) {
                     // best effort; the listener's own group is shut down by close
                 }
@@ -591,13 +639,18 @@ public final class QuicClient {
 
     /**
      * The production /3 dial ({@code connectV3} with the same bootstrap, config and TLS handling as
-     * a real dial) with its join marks off and no 0-RTT: a dial that never reads or writes a cache.
+     * a real dial) with its join marks off, early data and resumption off and no early flight: a
+     * dial that never reads or writes a cache and never publishes an early-data outcome. The UDP
+     * socket it binds is handed to {@code socket}, so the caller can bound its close.
      */
     private static CompletableFuture<V3Connection> warmDial(InetSocketAddress remote, Fingerprint fingerprint,
-            RoutingTable table) {
-        return connectV3(codec -> new Bootstrap().group(group()).channel(NioDatagramChannel.class)
-                .handler(codec).bind(0),
-                remote, fingerprint, table, TransportConfig.DEFAULT.withMultistream(), null, true, null);
+            RoutingTable table, AtomicReference<Channel> socket) {
+        return connectV3(codec -> {
+            ChannelFuture opened = new Bootstrap().group(group()).channel(NioDatagramChannel.class)
+                    .handler(codec).bind(0);
+            socket.set(opened.channel());
+            return opened;
+        }, remote, fingerprint, table, warmConfig().withMultistream(), null, true, null, true);
     }
 
     /** Resets the once-per-process warm-up so a test can run it again. Tests only. */
@@ -706,6 +759,11 @@ public final class QuicClient {
      */
     public static String lastEarlyOutcome() {
         return lastEarly;
+    }
+
+    /** Tests only: sets the published outcome, so a test can see it survive a warm-up. */
+    static void setLastEarlyOutcomeForTests(String outcome) {
+        lastEarly = outcome;
     }
 
     /**
@@ -1030,14 +1088,19 @@ public final class QuicClient {
         private volatile long connectStart;
         /** This attempt's join marks, or null when {@code -Dquicraft.v3.joindiag} is off. */
         private final JoinDiag diag;
+        /** A warm-up attempt: it publishes no early-data outcome, it is not a join. */
+        private final boolean warm;
 
         V3Attempt(Channel udp, InetSocketAddress remote, List<Object> server, EarlyFlight early,
-                CompletableFuture<V3Connection> result, V3Dial dial, JoinDiag diag) {
+                CompletableFuture<V3Connection> result, V3Dial dial, JoinDiag diag, boolean warm) {
             this.udp = udp;
             this.remote = remote;
             this.server = server;
             this.early = early;
-            lastEarly = early == null ? "not requested" : "no early-data event";
+            this.warm = warm;
+            if (!warm) {
+                lastEarly = early == null ? "not requested" : "no early-data event";
+            }
             this.result = result;
             this.dial = dial;
             this.diag = diag;
@@ -1219,6 +1282,9 @@ public final class QuicClient {
          * 0-RTT.
          */
         private void sendEarly(QuicChannel connection) {
+            if (warm) {
+                return; // a warm-up attempt publishes no 0-RTT outcome at all
+            }
             if (early == null || retrying || result.isDone() || earlyStream != null) {
                 lastEarly = early == null ? "not requested" : retrying ? "retrying" : result.isDone()
                         ? "attempt already done" : "already sent";
