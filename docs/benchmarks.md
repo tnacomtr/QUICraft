@@ -1684,3 +1684,21 @@ Rejected experiments for the loss gap (both measured, no effect, not merged):
 Busy-RTT diagnosis: quiche srtt was about 155-340 ms for both plain and busy on `slow`, stream in-flight was 0, yet play
 RTT was 325 ms (plain) vs 2,280 ms (busy). The queueing is above the QUIC stack (in /3 or on the client), not network
 bufferbloat. The exact mechanism is not yet identified.
+
+### Why /3 busy inflates RTT, and why plain loses on loss (2026-10-24, diagnosis only)
+
+Busy RTT (slow profile, n=1 with `-Dquicraft.v3.latencydiag=true`, commit f06176d1; TCP 174 / plain 329 / busy 2,204 ms):
+the clientbound pong (packet 62, CONTROL stream, ordinary) sits in the **server** sender between "granted" and "selected":
+busy median 1,005 ms, p90 2,685 ms, max 3,211 ms (119 pongs); plain median 0.1 ms. Request-side delays, client admission and
+application are all under 1 ms at the median. The pong is gated behind CONTROL FIFO plus explicit ACK dependencies
+(`StreamSequencer.java:457-473`, `SendScheduler.java:21-24`); a busy client keeps more batches in flight, so those gates
+stay closed longer. Routing the pong to REALTIME does not help (it keeps the VIEW/ACK gates). A fix needs an independently
+bounded liveness stream that escapes the gameplay frontiers, which is a wire/accounting change and needs maintainer
+sign-off and a security review; it is not implemented. Details: `docs/busy-rtt-diagnosis.md`.
+
+Plain loss gap (loss and clean, 2 rounds, `-Dquicraft.test.batchRateLog=true`): the client's requested chunks per tick
+(`desiredChunksPerTick`) averages 6.7 for plain versus 14.9 for TCP and 16.0 for busy on loss (clean: 9.5 / 17.4 / 15.4);
+median batch size 6 / 14 / 14 (clean 9 / 15 / 13). Plain's wall-time feedback asks for batches less than half of TCP's,
+which explains why plain trails TCP on chunk delivery. In busy logs a batch's wall time is often far above its busy time
+(for example 266 ms wall versus 3.5 ms busy), so waiting between chunk arrivals, not CPU, is what the plain timer charges.
+No fix for this is implemented yet.
