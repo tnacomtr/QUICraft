@@ -134,6 +134,8 @@ for _ in $profiles; do
     profile_count=$((profile_count + 1))
 done
 arm_count=3
+# QUICRAFT_HOP_NO_BUSY=1 runs only tcp and quic3 plain (candidate screening; the summary then lacks busy cells).
+[[ "${QUICRAFT_HOP_NO_BUSY:-0}" == 1 ]] && arm_count=2
 total_runs=$((rounds * profile_count * arm_count))
 estimated=$((total_runs * estimate_seconds))
 
