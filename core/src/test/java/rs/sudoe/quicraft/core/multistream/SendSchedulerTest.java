@@ -61,6 +61,19 @@ class SendSchedulerTest {
         assertEquals(Arrays.asList("2:1", "3:1"), drain(scheduler, ALL));
     }
 
+    @Test void ordinaryControlPongWaitsBehindBatchGateEvenWithRealtimeBudget() {
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
+        // Next batch start waits for the preceding batch join on CHUNK[0].
+        scheduler.offer(rec(0, 1, 2, 1), 10);
+        // The ordinary CONTROL pong has only its CONTROL predecessor, not a direct CHUNK dependency.
+        scheduler.offer(rec(0, 2, 0, 1), 10);
+        scheduler.offer(rec(1, 1), 10);
+        assertEquals(Arrays.asList("1:1"), drain(scheduler, ALL));
+        assertEquals(2, scheduler.size(), "the REALTIME queue does not help a CONTROL pong");
+        scheduler.offer(rec(2, 1), 10);
+        assertEquals(Arrays.asList("2:1", "0:1", "0:2"), drain(scheduler, ALL));
+    }
+
     @Test void urgentRealtimePromotesItsUnsentPrerequisiteChain() {
         SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
         scheduler.offer(rec(3, 1), 10);

@@ -228,6 +228,7 @@ public final class SessionReceiveDriver {
             throw new IllegalStateException("acknowledgement for an unexpected unit on stream " + stream);
         }
         receiver.applied(stream, entry.openerSeq);
+        LaneLatencyTrace.INSTANCE.event(this, "rx-applied", entry.unit.record());
         held[stream] = null;
         executing = null;
         releaseCharge(reservedWorkspace);
@@ -326,6 +327,7 @@ public final class SessionReceiveDriver {
                 return false;
             }
             if (admission.kind() == StreamReceiver.Admission.Kind.ADMITTED) {
+                LaneLatencyTrace.INSTANCE.event(this, "rx-admitted", unit.record());
                 held[entry.stream] = entry;
                 it.remove();
             }
@@ -420,6 +422,7 @@ public final class SessionReceiveDriver {
             return false;
         }
         receiver.enqueued(stream, entry.openerSeq);
+        LaneLatencyTrace.INSTANCE.event(this, "rx-enqueued", entry.unit.record());
         // Q -> D is a local application wait, including held acceptance acknowledgements.
         // Mark the bundle opener; applied() retires the mark at the same time as the slot.
         markWithheld(stream, entry.openerSeq);
