@@ -52,3 +52,8 @@ carries the 0-RTT delivery fix. main and feat/phase4-alpha are on 0.1.0-alpha.3-
   RTT high means in-stack queueing (bound unsent CHUNK bytes to ~1-2 cwnd, REALTIME urgency). Gate: busy RTT <= TCP+25% on
   slow/delayloss with >=60% of the chunk win, n=5, then clean n=10 no regression. Kill: two fixes without a pass -> adaptive
   guard. Blocks making /3 default, not current work. Join +150..415 ms is a separate round-trip-count track.
+
+## /3 default decision (2026-10-24)
+- Default flipped to the plain wall-time batch timer (62eab39e); busy is opt-in `-Dquicraft.v3.batchTimerBusy=true`. The server chunk-batch cork (9e6df973, `-Dquicraft.v3.chunkBatchCork`, `=false` disables) is on by default. Evidence: docs/benchmarks.md "Plain /3 default, server chunk-batch cork, rejected loss experiments".
+- Still behind TCP with plain: clean and loss chunk delivery (+16.5% / +20.9% idle) and join (+98..+870 ms).
+- Open: fresh Sol agents on branches agent/p5-loss2 (plain loss gap) and agent/p5-busyrtt (busy RTT mechanism, in-stack not network); briefs in .agents/plans/brief-p5-loss2.md and brief-p5-busyrtt.md, logs in .agents/opencode-runs/. Unmerged earlier branches: agent/p5-plain-loss (rejected experiments), agent/p5-chunkfeed (traces).
