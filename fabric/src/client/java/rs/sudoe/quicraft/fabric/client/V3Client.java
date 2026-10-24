@@ -263,6 +263,15 @@ final class V3Client implements BindingDriver.Callbacks, BindingPayloads.Payload
         this.handler = handler;
     }
 
+    /** The negotiated CHUNK shard count N (the connection has N + 3 streams in all), 0 if not known. */
+    int shardCount() {
+        try {
+            return v3.sessionContext().shardCount();
+        } catch (RuntimeException e) {
+            return 0;
+        }
+    }
+
     State state() {
         return state;
     }

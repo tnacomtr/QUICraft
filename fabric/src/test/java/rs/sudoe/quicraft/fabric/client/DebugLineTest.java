@@ -21,6 +21,8 @@ class DebugLineTest {
     void aV3ConnectionSaysSingleStreamUntilItsLanesAreActive() {
         assertEquals("QUIC /3 (single stream)", DebugLine.label(true, V3Client.State.BINDING));
         assertEquals("QUIC /3 (single stream)", DebugLine.label(true, V3Client.State.ACTIVATING));
-        assertEquals("QUIC /3 (3 streams)", DebugLine.label(true, V3Client.State.ACTIVE));
+        assertEquals("QUIC /3 (multi-stream)", DebugLine.label(true, V3Client.State.ACTIVE));
+        assertEquals("QUIC /3 (6 streams, 3 chunk)", DebugLine.label(true, V3Client.State.ACTIVE, 3));
+        assertEquals("QUIC /3 (8 streams, 5 chunk)", DebugLine.label(true, V3Client.State.ACTIVE, 5));
     }
 }

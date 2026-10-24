@@ -72,6 +72,12 @@ public final class Transports {
         return client == null ? null : client.state();
     }
 
+    /** The negotiated CHUNK shard count of a {@code /3} connection, 0 on TCP, {@code /2} or unknown. */
+    static int v3Shards(Connection connection) {
+        V3Client client = v3(connection);
+        return client == null ? 0 : client.shardCount();
+    }
+
     static synchronized @Nullable QuicByteStream quic(Connection connection) {
         return QUIC.get(connection);
     }
