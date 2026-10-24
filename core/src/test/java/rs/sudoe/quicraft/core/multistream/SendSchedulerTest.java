@@ -87,6 +87,39 @@ class SendSchedulerTest {
         assertEquals(4, order.size());
     }
 
+    @Test void movingPongToRealtimeStillWaitsForViewGateAndCurrentBatchAck() {
+        StreamSequencer sequencer = new StreamSequencer(3);
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1), 5);
+        Record priorChunk = sequencer.assign(2, StreamSequencer.Fence.CHUNK, NONE, false);
+        Record batchStart = sequencer.assign(0, StreamSequencer.Fence.VIEW, NONE, false);
+        Record install = sequencer.assign(3, StreamSequencer.Fence.CHUNK_ACK, NONE, false);
+        Record finish = sequencer.assign(5, StreamSequencer.Fence.ACK_TRAILING, NONE, false);
+        Record pong = sequencer.assign(1, StreamSequencer.Fence.REALTIME, NONE, false);
+        assertTrue(pong.dependencies().stream().anyMatch(d -> d.streamIndex() == 0
+                && d.sequence() == batchStart.sequence()), "REALTIME still waits for batch-start C");
+        assertTrue(pong.dependencies().stream().anyMatch(d -> d.streamIndex() == 5
+                && d.sequence() == finish.sequence()), "REALTIME also waits for the current batch finish");
+        for (Record record : Arrays.asList(priorChunk, batchStart, install, finish, pong)) {
+            scheduler.offer(record, 10);
+        }
+        assertNull(scheduler.pollSelection(stream -> stream < 2),
+                "routing alone cannot bypass a gated CONTROL/ACK dependency");
+        assertEquals(Arrays.asList("2:1", "0:1", "3:1", "5:1", "1:1"), drain(scheduler, ALL));
+    }
+
+    @Test void removingBatchStartDoesNotRemoveOrdinaryPongsExplicitAckGate() {
+        StreamSequencer sequencer = new StreamSequencer(3);
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1), 5);
+        Record install = sequencer.assign(2, StreamSequencer.Fence.CHUNK_ACK, NONE, false);
+        Record finish = sequencer.assign(5, StreamSequencer.Fence.ACK_TRAILING, NONE, false);
+        Record pong = sequencer.assign(0, StreamSequencer.Fence.ORDINARY_CONTROL, NONE, false);
+        assertTrue(pong.dependencies().stream().anyMatch(d -> d.streamIndex() == 5
+                && d.sequence() == finish.sequence()));
+        for (Record record : Arrays.asList(install, finish, pong)) scheduler.offer(record, 10);
+        assertNull(scheduler.pollSelection(stream -> stream < 2));
+        assertEquals(Arrays.asList("2:1", "5:1", "0:1"), drain(scheduler, ALL));
+    }
+
     @Test void chunksAlwaysProgressUnderSustainedRealtimeLoad() {
         SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
         for (int i = 1; i <= 50; i++) {
