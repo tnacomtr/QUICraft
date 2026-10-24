@@ -1702,3 +1702,26 @@ median batch size 6 / 14 / 14 (clean 9 / 15 / 13). Plain's wall-time feedback as
 which explains why plain trails TCP on chunk delivery. In busy logs a batch's wall time is often far above its busy time
 (for example 266 ms wall versus 3.5 ms busy), so waiting between chunk arrivals, not CPU, is what the plain timer charges.
 No fix for this is implemented yet.
+
+### Plain /3 clean/loss gap: five more candidates screened, none works (2026-10-24)
+
+Goal: /3 plain within +5% of TCP on clean and loss. Screening runs, n=3 rounds, clean (and loss where noted), plain vs
+TCP paired, `-Dquicraft.test.batchRateLog=true`; the metric that decides is the client's requested chunks per tick
+(`desiredChunksPerTick`, TCP 16.7 on clean, plain baseline 9.4). Idle / hop-fill deltas vs TCP on clean:
+
+| Candidate (flag, branch) | Idle | Hop fill | desired/tick | Verdict |
+| --- | --- | --- | --- | --- |
+| plain baseline (cork on) | +16.5% | +39.7% | 9.4 | reference (n=5) |
+| robust isolated-wait timer (`batchTimerRobust`, agent/p5-timer 247e1368) | +20.7% | +28.4% | 9.4 | no effect |
+| harvest synchronous reads (`harvestInlineReads`, agent/p5-gap 739a43c2) | +23.0% | +46.6% | 9.3 | no effect |
+| eager send drain, cork bypassed (`eagerSendDrain`, agent/p5-gap c0658dca) | +75.6% | +137.7% | 4.8 | much worse: confirms the cork matters |
+| initial cwnd 256 packets (server) | +20.1% | +21.7% | 8.7 | no effect (3 runs, wide range) |
+| CUBIC instead of BBR (server) | +24.3% | +41.5% | 9.7 | no effect |
+
+Localization (traced clean plain run, `latencydiag`+`pathdiag`, INFO logging inflates timing): the client is not the
+bottleneck (bytes available to ready 0.06 ms, decode 0.07 ms, fire 0.02 ms median). The chunk bytes themselves reach the
+client spread over a batch: first-to-last arrival median 4.1 ms for about 5 chunks (p75 9.9, p90 42.9 ms). On the server,
+with the cork on, a batch's records are selected within a median 0.28 ms (p90 0.7 ms), so the spread appears **after the
+send scheduler**, between selection and arrival (Netty QUIC channel write/flush, quiche send, ACK clocking, client read
+cadence). Server path srtt on the clean profile is about 5 ms (10 ms with the trace on) while TCP's play RTT is 1.6 ms.
+Next measurement: timestamps at the Netty write, flush and quiche send, and at the client's quiche receive, per record.
