@@ -185,7 +185,7 @@ public class DesyncSessionGameTest implements FabricClientGameTest {
         row.addProperty("transportVersion", o.transport.equals("tcp") ? "TCP" : "QUIC_3");
         row.addProperty("variant", o.variant);
         row.addProperty("busyTimer", o.transport.equals("quic3")
-                && !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")));
+                && Boolean.getBoolean("quicraft.v3.batchTimerBusy"));
         row.addProperty("netemProfile", o.netem);
         row.addProperty("profile", o.profile());
         row.addProperty("buildCommit", o.commit);
@@ -231,8 +231,8 @@ public class DesyncSessionGameTest implements FabricClientGameTest {
                     "quicraft.gametest.desyncVariant must be plain or busy, got " + variant);
             check(!variant.equals("busy") || transport.equals("quic3"),
                     "only the quic3 transport has a busy-timer variant");
-            check(!transport.equals("quic3") || variant.equals("busy") == !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")),
-                    "the busy variant needs the busy timer on (the default), and the plain variant needs -Dquicraft.v3.batchTimerBusy=false");
+            check(!transport.equals("quic3") || variant.equals("busy") == Boolean.getBoolean("quicraft.v3.batchTimerBusy"),
+                    "the busy variant needs -Dquicraft.v3.batchTimerBusy=true, and the plain variant needs it unset or false");
             String netem = System.getProperty("quicraft.gametest.desyncNetem", "");
             check(NETEM.contains(netem), "quicraft.gametest.desyncNetem must be one of " + NETEM);
             int run = Integer.parseInt(System.getProperty("quicraft.gametest.desyncRun", "-1"));

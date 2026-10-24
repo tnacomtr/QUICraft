@@ -102,10 +102,10 @@ class GameLanesBusyTimerTest {
     }
 
     @Test
-    void busyTimerIsOnUnlessThePropertyIsFalse() {
+    void busyTimerIsOffUnlessThePropertyIsTrue() {
         // The test JVM does not set quicraft.v3.batchTimerBusy, so the shipped default applies.
         assertTrue(System.getProperty("quicraft.v3.batchTimerBusy") != null
-                || GameLanes.BUSY_TIMER_PROPERTY, "the busy batch timer must default to on");
+                || !GameLanes.BUSY_TIMER_PROPERTY, "the busy batch timer must default to off (plain wall time)");
     }
 
     @Test

@@ -676,7 +676,7 @@ public class ExternalArmGameTest implements FabricClientGameTest {
         row.addProperty("variant", o.variant);
         row.addProperty("hop", o.hop);
         row.addProperty("busyTimer", o.arm.equals("quic3")
-                && !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy")));
+                && Boolean.getBoolean("quicraft.v3.batchTimerBusy"));
         row.add("net", JsonNull.INSTANCE);
         row.add("quic", JsonNull.INSTANCE);
         return row;
@@ -795,12 +795,12 @@ public class ExternalArmGameTest implements FabricClientGameTest {
             String variant = System.getProperty("quicraft.gametest.armVariant", "plain");
             check(variant.equals("plain") || variant.equals("busy"),
                     "quicraft.gametest.armVariant must be plain or busy, got " + variant);
-            // The busy timer is the product default: on unless -Dquicraft.v3.batchTimerBusy=false. Only the
-            // /3 arm has the two variants; the busy one must run with it on, the plain one with it off.
-            boolean busyOn = !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy"));
+            // The plain (wall-time) timer is the product default; busy is opt-in via -Dquicraft.v3.batchTimerBusy=true.
+            // Only the /3 arm has the two variants; the busy one must run with it on, the plain one with it off.
+            boolean busyOn = Boolean.getBoolean("quicraft.v3.batchTimerBusy");
             check(!arm.equals("quic3") || busyOn == variant.equals("busy"),
-                    "the busy variant needs the busy timer on (the default) and the plain variant needs"
-                            + " -Dquicraft.v3.batchTimerBusy=false");
+                    "the busy variant needs -Dquicraft.v3.batchTimerBusy=true and the plain variant needs"
+                            + " it unset or false");
             check(!variant.equals("busy") || arm.equals("quic3"), "only the quic3 arm has a busy-timer variant");
             String hop = System.getProperty("quicraft.gametest.armHop", "false");
             check(hop.equals("true") || hop.equals("false"), "quicraft.gametest.armHop must be true or false, got " + hop);

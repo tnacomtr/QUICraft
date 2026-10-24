@@ -77,8 +77,8 @@ import rs.sudoe.quicraft.fabric.net.PacketLaneCodec;
  * except {@link #holdTask}'s tick, which only reads a flag.</p>
  */
 public final class V3Join implements BindingDecodeContext.Gate {
-    /** Experiment only until delay/loss proof: aggregate CHUNK submissions across vanilla encoder tasks. */
-    private static final boolean CHUNK_BATCH_CORK = Boolean.getBoolean("quicraft.v3.chunkBatchCork");
+    /** Aggregate CHUNK submissions across vanilla encoder tasks (default on; {@code -Dquicraft.v3.chunkBatchCork=false} turns it off). */
+    private static final boolean CHUNK_BATCH_CORK = !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.chunkBatchCork"));
     private static final AttributeKey<V3Join> KEY = AttributeKey.valueOf("quicraft.v3join");
     private static final String PACKET_HANDLER = "packet_handler";
     private static final String DECRYPT = "decrypt";

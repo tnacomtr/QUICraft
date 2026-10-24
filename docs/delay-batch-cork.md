@@ -45,9 +45,9 @@ They do not prove this second mechanism absent, nor prove the first dominant.
 
 ## Patch and bounds
 
-Server property `-Dquicraft.v3.chunkBatchCork=true` enables CHUNK-only aggregation
-between vanilla start/finish writes in active /3 connections. Default is false
-until measured. Records stay in the existing charged driver queues: no extra
+Server property `-Dquicraft.v3.chunkBatchCork` (default on since 2026-10-24;
+`=false` turns it off) enables CHUNK-only aggregation
+between vanilla start/finish writes in active /3 connections. Records stay in the existing charged driver queues: no extra
 payload-holding queue, sequencing change, dependency change or new memory cap.
 CONTROL, REALTIME and ACK remain independently eligible under the existing
 scheduler. All original quanta, stream FIFOs, footprint and pool accounting

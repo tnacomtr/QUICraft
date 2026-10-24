@@ -14,7 +14,7 @@ import java.util.function.LongSupplier;
  * therefore restarts the batch timer when the batch's first chunk arrives, so it measures what TCP measures. On by
  * default; {@code -Dquicraft.v3.batchTimerFromFirstChunk=false} keeps vanilla timing.
  *
- * <p>Busy timer (default on; {@code -Dquicraft.v3.batchTimerBusy=false} restores the wall-time timer): instead of the wall time from
+ * <p>Busy timer (opt-in with {@code -Dquicraft.v3.batchTimerBusy=true}; default off, the wall-time timer): instead of the wall time from
  * the batch's first chunk, the batch interval is the network-thread busy time the connection spent decoding and
  * firing its packets since the start of the decode of that first chunk's delivery
  * ({@link rs.sudoe.quicraft.bridge.GameLanes#busyMarkForCurrentDelivery()}). Transport
@@ -31,7 +31,7 @@ public final class ChunkPacing {
     /** Client: restart the batch timer when the first chunk arrives. */
     public static final boolean BATCH_TIMER_FROM_FIRST_CHUNK = enabled("quicraft.v3.batchTimerFromFirstChunk");
     /** Client: time the batch by the connection's network-thread busy time instead of wall time. */
-    public static final boolean BATCH_TIMER_BUSY = !"false".equalsIgnoreCase(System.getProperty("quicraft.v3.batchTimerBusy"));
+    public static final boolean BATCH_TIMER_BUSY = Boolean.getBoolean("quicraft.v3.batchTimerBusy");
 
     private final boolean enabled;
     private final boolean busy;

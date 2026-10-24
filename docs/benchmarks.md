@@ -1442,8 +1442,9 @@ Real Fabric client against the external Fabric server, loopback with netem, idle
 
 0 disconnects in every cell. n=2 means the ranges overlap on the clean and loss rows; only the large gaps (delayloss,
 jitter, slow) are conclusive. Play RTT on the clean link: TCP 0.60 ms, /3 about 1.4 ms. On 2026-10-23 the maintainer
-approved making the busy timer the default (`-Dquicraft.v3.batchTimerBusy=false` restores the wall-time timer); the
-`plain` benchmark variant now sets it to false explicitly.
+approved making the busy timer the default. SUPERSEDED 2026-10-24: the default is the plain wall-time timer again
+(`-Dquicraft.v3.batchTimerBusy=true` opts into busy), because busy inflates in-game RTT on constrained links (see the
+impaired-link section below); the arm runner sets the property explicitly for both variants.
 
 ### Clean-link join: where the extra time goes
 
@@ -1646,3 +1647,40 @@ What the numbers say:
 - Older seven-profile numbers (n=2, commit c944278a) and the n=3 moving matrix above agree in direction on the large
   gaps; this n=10 matrix supersedes them for the teleport-hop workload. The moving-walk (continuous sprint) matrix was not
   re-run.
+
+### Plain /3 default, server chunk-batch cork, rejected loss experiments (2026-10-24)
+
+Decision: /3 now defaults to the plain (wall-time) batch timer; busy is opt-in (`-Dquicraft.v3.batchTimerBusy=true`).
+Reason: busy RTT is +2,157 ms vs TCP on `slow` and +688 ms on `delayloss` (n=5, paired), while plain stays at +149 ms and
++72 ms; the chunk-load advantage over TCP on those profiles is kept by plain (-80% / -89% idle).
+
+Server chunk-batch cork (`-Dquicraft.v3.chunkBatchCork`, default on, `=false` disables; `docs/delay-batch-cork.md`).
+It aggregates CHUNK-stream submissions between the vanilla batch start/finish writes. Paired delta vs TCP, /3 plain, n=5
+per profile, commit 9e6df973, hop fill = median over six 240 m legs:
+
+| Profile | Idle chunk load, cork off | cork on | Hop fill, cork off | cork on |
+| --- | --- | --- | --- | --- |
+| delay | +14.7% | -3.7% | +30.7% (+204 ms) | +7.4% (+48 ms) |
+| loss | +54% (n=5, earlier run) | +20.9% | +67% (earlier run) | +32.0% (+127 ms) |
+| clean | +52% (earlier run) | +16.5% | +82% (earlier run) | +39.7% (+130 ms) |
+| reorder | | -36.0% | | -56.9% |
+| jitter | | -71.7% | | -76.2% |
+| delayloss | | -88.8% | | -90.1% |
+| slow | | -80.2% | | -82.9% |
+
+No regression with the cork on: RTT deltas vs TCP on delay +2.7 ms, loss +1.1 ms, clean +1.7 ms, jitter +1.1 ms,
+reorder +2.1 ms, delayloss +72 ms, slow +149 ms; 0 disconnects. Only `delay` was run both ways in the same session
+(first row pair); the "earlier run" cells come from the n=10 matrix above and are a different session, so treat that
+comparison as indicative, not paired.
+
+Still behind TCP with plain: clean and loss chunk delivery (+16.5% / +20.9% idle, +40% / +32% hop fill), and join
+(+98 to +870 ms depending on profile). Busy is level with TCP on loss (idle +1.2%, hop +0.9%) and nearer on clean
+(+11.0% / +10.8%) but costs RTT on constrained links; this is the open trade-off.
+
+Rejected experiments for the loss gap (both measured, no effect, not merged):
+- Applying received chunk packets inline on the receive loop (`-Dquicraft.v3.inlineApplied`, Sol, commit 6b523abf).
+- Lowering the QUIC max_ack_delay (`quicraft.v3.maxAckDelayMs`, commit 2dcac40d); the hypothesis that ACK delay caused
+  the loss penalty is rejected.
+Busy-RTT diagnosis: quiche srtt was about 155-340 ms for both plain and busy on `slow`, stream in-flight was 0, yet play
+RTT was 325 ms (plain) vs 2,280 ms (busy). The queueing is above the QUIC stack (in /3 or on the client), not network
+bufferbloat. The exact mechanism is not yet identified.

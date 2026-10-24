@@ -28,7 +28,7 @@ import rs.sudoe.quicraft.fabric.client.V3Hooks;
  * thread: the chunk handler's HEAD runs there before {@code ensureRunningOnSameThread} hands the packet to the main
  * thread, and the main-thread replay is skipped. An empty batch keeps vanilla timing. Any throw continues as vanilla.
  *
- * <p>By default (turn off with {@code -Dquicraft.v3.batchTimerBusy=false}) the batch interval is instead the
+ * <p>With {@code -Dquicraft.v3.batchTimerBusy=true} (opt-in; default off) the batch interval is instead the
  * connection's network-thread busy time since the batch's first chunk: at chunk_batch_finished the calculator's
  * start time is moved to {@code now - busy}, so {@code onBatchFinished} measures busy time.
  */
