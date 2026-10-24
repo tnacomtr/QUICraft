@@ -180,6 +180,7 @@ public final class ServerReceiveDriver {
             throw new IllegalStateException("acknowledgement for an unexpected unit on stream " + stream);
         }
         receiver.applied(stream, entry.sequence);
+        LaneLatencyTrace.INSTANCE.event(this, "rx-applied", entry.unit.record());
         executing = null;
         releaseCharge(reservedWorkspace);
         // A lapsed wait or an unavailable source leaves the head and its slot retained by the receiver. Keep held[]
@@ -238,6 +239,7 @@ public final class ServerReceiveDriver {
                 return false;
             }
             if (admission.kind() == StreamReceiver.Admission.Kind.ADMITTED) {
+                LaneLatencyTrace.INSTANCE.event(this, "rx-admitted", unit.record());
                 held[entry.stream] = entry;
                 it.remove();
             }
@@ -302,6 +304,7 @@ public final class ServerReceiveDriver {
             return false;
         }
         receiver.enqueued(stream, entry.sequence);
+        LaneLatencyTrace.INSTANCE.event(this, "rx-enqueued", entry.unit.record());
         // From Q until D the peer has done its part. Any delay (including an acceptance
         // backlog or a protocol swap) is ours, not an unseen prerequisite at the peer.
         // StreamReceiver.applied clears this mark, including transitive dependent heads.

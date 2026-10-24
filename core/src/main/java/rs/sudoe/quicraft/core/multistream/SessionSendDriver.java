@@ -1463,6 +1463,12 @@ public final class SessionSendDriver {
         if (charge == null) {
             throw new IllegalStateException("selected record has no charge");
         }
+        if (selection.offset() == 0) {
+            LaneLatencyTrace.INSTANCE.event(this, "tx-selected", selection.record());
+        }
+        if (selection.last()) {
+            LaneLatencyTrace.INSTANCE.event(this, "tx-last-selected", selection.record());
+        }
         long selectedNanos = trace == null ? 0 : System.nanoTime();
         if (trace != null) trace.selected(selection.record().streamIndex(), selection.offset() == 0,
                 selection.last(), charge.traceStartedNanos, charge.traceOfferedNanos, selectedNanos);
@@ -1488,6 +1494,7 @@ public final class SessionSendDriver {
     }
 
     private void traceEnqueued(Charge charge) {
+        LaneLatencyTrace.INSTANCE.event(this, "tx-enqueued", charge.record);
         if (trace == null) return;
         long now = System.nanoTime();
         charge.traceStartedNanos = SendTrace.gameWriteStart(now);
@@ -1892,6 +1899,7 @@ public final class SessionSendDriver {
             it.remove();
             if (!charge.viaMain) {
                 scheduler.offer(charge.record, charge.encoded.length, charge.continues);
+                LaneLatencyTrace.INSTANCE.event(this, "tx-granted", charge.record);
                 if (trace != null) charge.traceOfferedNanos = System.nanoTime();
             }
         }
@@ -1920,6 +1928,7 @@ public final class SessionSendDriver {
             }
             it.remove();
             scheduler.offer(charge.record, charge.encoded.length, charge.continues);
+            LaneLatencyTrace.INSTANCE.event(this, "tx-granted", charge.record);
             if (trace != null) charge.traceOfferedNanos = System.nanoTime();
         }
     }

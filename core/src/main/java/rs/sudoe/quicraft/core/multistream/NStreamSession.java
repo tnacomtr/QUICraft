@@ -752,6 +752,7 @@ public final class NStreamSession implements MultistreamSession {
         try {
             handle = sendDriver.submit(new OutboundPacket(frame), resolved.fence(), resolved.interaction(),
                     resolved.chunkX(), resolved.chunkZ(), dependenciesOf(after));
+            LaneLatencyTrace.INSTANCE.route(sendDriver, packetId, handle);
         } catch (StallClock.UnavailableException e) {
             closeOnUnavailable(e);
             return new SentPacket();

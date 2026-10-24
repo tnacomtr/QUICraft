@@ -61,6 +61,19 @@ class SendSchedulerTest {
         assertEquals(Arrays.asList("2:1", "3:1"), drain(scheduler, ALL));
     }
 
+    @Test void ordinaryControlPongWaitsBehindBatchGateEvenWithRealtimeBudget() {
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
+        // Next batch start waits for the preceding batch join on CHUNK[0].
+        scheduler.offer(rec(0, 1, 2, 1), 10);
+        // The ordinary CONTROL pong has only its CONTROL predecessor, not a direct CHUNK dependency.
+        scheduler.offer(rec(0, 2, 0, 1), 10);
+        scheduler.offer(rec(1, 1), 10);
+        assertEquals(Arrays.asList("1:1"), drain(scheduler, ALL));
+        assertEquals(2, scheduler.size(), "the REALTIME queue does not help a CONTROL pong");
+        scheduler.offer(rec(2, 1), 10);
+        assertEquals(Arrays.asList("2:1", "0:1", "0:2"), drain(scheduler, ALL));
+    }
+
     @Test void urgentRealtimePromotesItsUnsentPrerequisiteChain() {
         SendScheduler scheduler = new SendScheduler(profile(1, 8, 1));
         scheduler.offer(rec(3, 1), 10);
@@ -72,6 +85,39 @@ class SendSchedulerTest {
         assertEquals("0:1", order.get(1), "then the CONTROL fence the REALTIME record waits for");
         assertTrue(order.indexOf("1:1") > order.indexOf("0:1"));
         assertEquals(4, order.size());
+    }
+
+    @Test void movingPongToRealtimeStillWaitsForViewGateAndCurrentBatchAck() {
+        StreamSequencer sequencer = new StreamSequencer(3);
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1), 5);
+        Record priorChunk = sequencer.assign(2, StreamSequencer.Fence.CHUNK, NONE, false);
+        Record batchStart = sequencer.assign(0, StreamSequencer.Fence.VIEW, NONE, false);
+        Record install = sequencer.assign(3, StreamSequencer.Fence.CHUNK_ACK, NONE, false);
+        Record finish = sequencer.assign(5, StreamSequencer.Fence.ACK_TRAILING, NONE, false);
+        Record pong = sequencer.assign(1, StreamSequencer.Fence.REALTIME, NONE, false);
+        assertTrue(pong.dependencies().stream().anyMatch(d -> d.streamIndex() == 0
+                && d.sequence() == batchStart.sequence()), "REALTIME still waits for batch-start C");
+        assertTrue(pong.dependencies().stream().anyMatch(d -> d.streamIndex() == 5
+                && d.sequence() == finish.sequence()), "REALTIME also waits for the current batch finish");
+        for (Record record : Arrays.asList(priorChunk, batchStart, install, finish, pong)) {
+            scheduler.offer(record, 10);
+        }
+        assertNull(scheduler.pollSelection(stream -> stream < 2),
+                "routing alone cannot bypass a gated CONTROL/ACK dependency");
+        assertEquals(Arrays.asList("2:1", "0:1", "3:1", "5:1", "1:1"), drain(scheduler, ALL));
+    }
+
+    @Test void removingBatchStartDoesNotRemoveOrdinaryPongsExplicitAckGate() {
+        StreamSequencer sequencer = new StreamSequencer(3);
+        SendScheduler scheduler = new SendScheduler(profile(1, 8, 1), 5);
+        Record install = sequencer.assign(2, StreamSequencer.Fence.CHUNK_ACK, NONE, false);
+        Record finish = sequencer.assign(5, StreamSequencer.Fence.ACK_TRAILING, NONE, false);
+        Record pong = sequencer.assign(0, StreamSequencer.Fence.ORDINARY_CONTROL, NONE, false);
+        assertTrue(pong.dependencies().stream().anyMatch(d -> d.streamIndex() == 5
+                && d.sequence() == finish.sequence()));
+        for (Record record : Arrays.asList(install, finish, pong)) scheduler.offer(record, 10);
+        assertNull(scheduler.pollSelection(stream -> stream < 2));
+        assertEquals(Arrays.asList("2:1", "5:1", "0:1"), drain(scheduler, ALL));
     }
 
     @Test void chunksAlwaysProgressUnderSustainedRealtimeLoad() {
